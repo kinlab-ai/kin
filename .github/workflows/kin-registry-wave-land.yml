@@ -85,7 +85,7 @@ jobs:
     env:
       # The GitHub-side landing hold, the wave's equivalent of the fleet's
       # kin_main_frozen gate. A captain sets it with
-      #   gh variable set KIN_MAIN_FROZEN --repo firelock-ai/kin --body "<why>"
+      #   gh variable set KIN_MAIN_FROZEN --repo kinlab-ai/kin --body "<why>"
       # and lifts it with `gh variable delete KIN_MAIN_FROZEN`. Any non-empty
       # value holds every wave landing and is reported in the judgment.
       KIN_MAIN_FROZEN: ${{ vars.KIN_MAIN_FROZEN }}
@@ -193,7 +193,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-contents: write
           permission-pull-requests: write

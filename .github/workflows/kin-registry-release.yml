@@ -106,7 +106,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-pull-requests: write
 
@@ -176,7 +176,7 @@ jobs:
       - name: Checkout exact Kin dependency updater
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          repository: firelock-ai/kin-actions
+          repository: kinlab-ai/kin-actions
           ref: ${{ env.KIN_ACTIONS_SHA }}
           path: .kin-actions
           persist-credentials: false
@@ -467,7 +467,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-contents: write
           permission-pull-requests: write

@@ -23,11 +23,11 @@
   "homepage": "https://kinlab.ai",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/firelock-ai/kin.git",
+    "url": "git+https://github.com/kinlab-ai/kin.git",
     "directory": "packages/kin"
   },
   "bugs": {
-    "url": "https://github.com/firelock-ai/kin/issues"
+    "url": "https://github.com/kinlab-ai/kin/issues"
   },
   "keywords": [
     "kin",

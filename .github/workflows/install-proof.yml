@@ -225,7 +225,7 @@ jobs:
             latest_url="$(curl -fsSLI \
               --retry 5 --retry-all-errors --retry-delay 2 \
               -o /dev/null -w '%{url_effective}' \
-              https://github.com/firelock-ai/kin/releases/latest)"
+              https://github.com/kinlab-ai/kin/releases/latest)"
             expected_tag="${latest_url##*/}"
             printf '%s\n' "$latest_url" > latest-release-url.txt
           fi
@@ -234,7 +234,7 @@ jobs:
             *) echo "could not resolve a version tag from '$expected_tag'" >&2; exit 1 ;;
           esac
 
-          tag_refs="$(git ls-remote --tags https://github.com/firelock-ai/kin.git \
+          tag_refs="$(git ls-remote --tags https://github.com/kinlab-ai/kin.git \
             "refs/tags/$expected_tag" "refs/tags/$expected_tag^{}")"
           expected_commit="$(printf '%s\n' "$tag_refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
           if [ -z "$expected_commit" ]; then
@@ -266,7 +266,7 @@ jobs:
           const fs = require("fs");
 
           (async () => {
-            const url = `https://raw.githubusercontent.com/firelock-ai/kin/${process.env.EXPECTED_COMMIT}/Cargo.lock`;
+            const url = `https://raw.githubusercontent.com/kinlab-ai/kin/${process.env.EXPECTED_COMMIT}/Cargo.lock`;
             const response = await fetch(url);
             if (!response.ok) {
               throw new Error(`failed to fetch release Cargo.lock: ${response.status} ${response.statusText}`);
@@ -289,7 +289,7 @@ jobs:
             *) echo "unsupported install-proof runner $RUNNER_OS/$RUNNER_ARCH" >&2; exit 1 ;;
           esac
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://github.com/firelock-ai/kin/releases/download/$expected_tag/$release_asset" \
+            "https://github.com/kinlab-ai/kin/releases/download/$expected_tag/$release_asset" \
             -o "attested-$release_asset"
 
           # The install itself is anonymous. This separate cryptographic lookup
@@ -317,10 +317,10 @@ jobs:
           test "$verified" = true
 
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://github.com/firelock-ai/kin/releases/download/$expected_tag/release-provenance.json" \
+            "https://github.com/kinlab-ai/kin/releases/download/$expected_tag/release-provenance.json" \
             -o release-provenance.json
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://github.com/firelock-ai/kin/releases/download/$expected_tag/release-provenance.json.sha256" \
+            "https://github.com/kinlab-ai/kin/releases/download/$expected_tag/release-provenance.json.sha256" \
             -o release-provenance.json.sha256
 
           RELEASE_ASSET="$release_asset" EXPECTED_TAG="$expected_tag" \

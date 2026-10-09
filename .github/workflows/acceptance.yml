@@ -30,7 +30,7 @@
 # now been wrong in BOTH directions, so it names the command rather than the
 # answer. Ask, do not trust this paragraph:
 #
-#   gh api repos/firelock-ai/kin/rules/branches/main \
+#   gh api repos/kinlab-ai/kin/rules/branches/main \
 #     --jq '.[] | select(.type=="required_status_checks")
 #                 | .parameters.required_status_checks[].context'
 #

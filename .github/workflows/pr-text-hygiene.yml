@@ -14,7 +14,7 @@ name: PR Text Hygiene
 # commit message and deliberately pass.
 #
 # This check is intentionally self-contained. The shared implementation lives in
-# firelock-ai/kin-actions (`public-history-hygiene.yml`, `scan-history: false`),
+# kinlab-ai/kin-actions (`public-history-hygiene.yml`, `scan-history: false`),
 # but every released kin-actions tag predates body scanning, so consuming it by
 # pin would install a check that reads green while inspecting nothing. Migrate
 # to the shared workflow once a kin-actions release carries that input.

@@ -5,7 +5,7 @@ name: Alarm Dry Run
 
 # Proves the cross-repository alarm credential end to end. It mints the same
 # issues-only release App token every alarm job in this repository mints,
-# opens one clearly marked issue on firelock-ai/kin-infra carrying this
+# opens one clearly marked issue on kinlab-ai/kin-infra carrying this
 # repository's label, reads it back, closes it, and reads that back too. No
 # alarm job can be made to do that without a real failure to report.
 #
@@ -15,7 +15,7 @@ name: Alarm Dry Run
 # the workflow file it runs. The `release-tag` Environment admits main alone,
 # so this runs from main or not at all. Trigger it with:
 #
-#   gh api repos/firelock-ai/kin/dispatches -f event_type=alarm-dry-run
+#   gh api repos/kinlab-ai/kin/dispatches -f event_type=alarm-dry-run
 #
 # A mint that fails because kin-infra is not among the installation's selected
 # repositories fails this run at the first step, which is the answer the dry run
@@ -57,7 +57,7 @@ jobs:
       - name: Open one alarm, read it back, close it, read that back
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |

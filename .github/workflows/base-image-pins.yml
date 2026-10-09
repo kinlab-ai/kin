@@ -60,7 +60,7 @@ name: Base Image Pins
 # dispatch is typed rather than branch-selectable because the alarm below
 # reaches the release App key to file on kin-infra, and the authority guard
 # refuses that key beside a dispatch that lets a branch pick the workflow file:
-#   gh api repos/firelock-ai/kin/dispatches -f event_type=base-image-pins
+#   gh api repos/kinlab-ai/kin/dispatches -f event_type=base-image-pins
 on:
   schedule:
     - cron: "23 5 * * 1"
@@ -89,7 +89,7 @@ jobs:
     permissions:
       contents: read
       # The tracking issue is the alarm. It is the only write this job performs,
-      # and it lands on firelock-ai/kin-infra through the App token minted
+      # and it lands on kinlab-ai/kin-infra through the App token minted
       # below rather than through this token, which cannot reach another
       # repository.
       issues: write
@@ -175,7 +175,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           ALARM_TITLE: "Base image pin unreachable: the release build has lost a registry"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -223,7 +223,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           ALARM_TITLE: "Base image pin unreachable: the release build has lost a registry"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

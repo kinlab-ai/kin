@@ -69,7 +69,7 @@ jobs:
       contents: write
       # The alarm, which is the only thing standing between a forgotten release
       # and a rail that is quietly one version behind forever. It lands on
-      # firelock-ai/kin-infra through the App token minted below rather than
+      # kinlab-ai/kin-infra through the App token minted below rather than
       # through this token, which cannot reach another repository.
       issues: write
     steps:
@@ -107,7 +107,7 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-          KIN_ALARM_REPO: firelock-ai/kin-infra
+          KIN_ALARM_REPO: kinlab-ai/kin-infra
           KIN_ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
           KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
         run: |
@@ -212,7 +212,7 @@ jobs:
         if: ${{ always() && steps.plan.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           KIN_PROMOTION_PLAN: ${{ runner.temp }}/promotion-plan.json
         run: |

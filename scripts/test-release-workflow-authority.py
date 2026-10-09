@@ -5974,7 +5974,7 @@ def assert_retired_vfs_runtime_is_absent_from_new_archives(
 
     for workflow, label in ((release, "release.yml"), (rc_build, "rc-build.yml")):
         for forbidden in (
-            "repository: firelock-ai/kin-vfs",
+            "repository: kinlab-ai/kin-vfs",
             "kin-vfs/target/",
             "VFS_TARGET",
             "SHIM_NAME",
@@ -7341,7 +7341,7 @@ def execute_merge_policy_gate(
         environment["MERGE_POLICY_FIXTURE"] = str(fixture)
         environment["MERGE_POLICY_TOKEN"] = token
         environment["MERGE_POLICY_EXPECTED_TOKEN"] = token
-        environment["REPO"] = "firelock-ai/kin"
+        environment["REPO"] = "kinlab-ai/kin"
         return subprocess.run(
             ["bash", "-euo", "pipefail", str(gate)],
             capture_output=True,
@@ -7402,7 +7402,7 @@ def assert_merge_policy_gate(release_train: str) -> None:
     # repository instead of after the token that could not read it.
     unreadable = execute_merge_policy_gate(
         gate,
-        {"full_name": "firelock-ai/kin", "permissions": {"push": False}},
+        {"full_name": "kinlab-ai/kin", "permissions": {"push": False}},
     )
     if unreadable.returncode == 0:
         raise AssertionError(
@@ -8141,7 +8141,7 @@ def execute_tag_readback(
             {
                 "FIXTURE": str(root),
                 "GH_TOKEN": "fixture",
-                "REPO": "firelock-ai/kin",
+                "REPO": "kinlab-ai/kin",
                 "ACTOR": "kin-release-bot[bot]",
                 "TAG": "v9.9.9",
                 "SHA": RELEASE_GATE_FIXTURE_SHA,
@@ -8509,7 +8509,7 @@ def write_attempt_job_fixtures(
             )
         payload = {"jobs": jobs}
         target = (
-            f"repos_firelock-ai_kin_actions_runs_{RECOVERY_FIXTURE_RUN_ID}"
+            f"repos_kinlab-ai_kin_actions_runs_{RECOVERY_FIXTURE_RUN_ID}"
             f"_attempts_{index}_jobs"
         )
         (responses / target).write_text(json.dumps(payload), encoding="utf-8")
@@ -8552,7 +8552,7 @@ def run_recovery_classifier_in(
         {
             "FIXTURE": str(root),
             "GH_TOKEN": "fixture",
-            "REPO": "firelock-ai/kin",
+            "REPO": "kinlab-ai/kin",
             "RUN_ID": RECOVERY_FIXTURE_RUN_ID,
             "ATTEMPTS": str(len(attempt_signatures)),
             "RUNNER_TEMP": str(root),
@@ -8716,7 +8716,7 @@ def execute_recovery_escalation(
             recovery_step_script(release_recovery, RECOVERY_CLASSIFIER_ANCHOR),
             attempt_signatures,
         )
-        release_response = responses / "repos_firelock-ai_kin_releases_tags_v9.9.9"
+        release_response = responses / "repos_kinlab-ai_kin_releases_tags_v9.9.9"
         if release is not None and release_error is not None:
             raise AssertionError("release fixture cannot be both readable and failed")
         if release is not None:
@@ -8735,7 +8735,7 @@ def execute_recovery_escalation(
             {
                 "FIXTURE": str(root),
                 "GH_TOKEN": "fixture",
-                "REPO": "firelock-ai/kin",
+                "REPO": "kinlab-ai/kin",
                 "TAG": "v9.9.9",
                 "SHA": RELEASE_GATE_FIXTURE_SHA,
                 "RUN_ID": RECOVERY_FIXTURE_RUN_ID,
@@ -8775,7 +8775,7 @@ def execute_recovery_escalation(
 
 
 RECOVERY_ALARM_FIXTURE_TOKEN = "alarm-fixture-token"
-RECOVERY_ALARM_FIXTURE_REPO = "firelock-ai/kin-infra"
+RECOVERY_ALARM_FIXTURE_REPO = "kinlab-ai/kin-infra"
 RECOVERY_ALARM_FIXTURE_LABEL = "kin"
 
 
@@ -9158,7 +9158,7 @@ def execute_decline_escalation(
         responses = root / "responses"
         responses.mkdir()
         list_path = responses / (
-            "repos_firelock-ai_kin_actions_workflows_release-tag.yml_runs"
+            "repos_kinlab-ai_kin_actions_workflows_release-tag.yml_runs"
         )
         list_path.write_text(
             json.dumps({"workflow_runs": [{"id": run_id} for run_id, _, _ in prior_runs]}),
@@ -9182,7 +9182,7 @@ def execute_decline_escalation(
                     }
                 ]
             }
-            (responses / f"repos_firelock-ai_kin_actions_runs_{run_id}_jobs").write_text(
+            (responses / f"repos_kinlab-ai_kin_actions_runs_{run_id}_jobs").write_text(
                 json.dumps(payload),
                 encoding="utf-8",
             )
@@ -9227,7 +9227,7 @@ def execute_decline_escalation(
             {
                 "FIXTURE": str(root),
                 "GH_TOKEN": "fixture",
-                "REPO": "firelock-ai/kin",
+                "REPO": "kinlab-ai/kin",
                 "CURRENT_RUN_ID": "99999",
                 "DECLINE_REASON": "unrecovered-latest",
                 "DECLINE_LIMIT": "4",
@@ -11548,7 +11548,7 @@ def main() -> None:
         reusable_spoof[RELEASE],
         "jobs:\n",
         "jobs:\n  paid-hop:\n"
-        "    uses: firelock-ai/kin-actions/.github/workflows/paid-release.yml@"
+        "    uses: kinlab-ai/kin-actions/.github/workflows/paid-release.yml@"
         "0123456789abcdef0123456789abcdef01234567\n",
         "an unknown reusable workflow can hide a paid runner",
     )
@@ -12131,8 +12131,8 @@ def main() -> None:
         'node "$policy_dir/release-intent.mjs"',
         "release branch contains non-generated paths",
         "git restore --source refs/remotes/origin/main",
-        '.headRepositoryOwner.login == "firelock-ai"',
-        '.headRepository.nameWithOwner == "firelock-ai/kin"',
+        '.headRepositoryOwner.login == "kinlab-ai"',
+        '.headRepository.nameWithOwner == "kinlab-ai/kin"',
         "highest_tag",
         "refs/remotes/origin/main:scripts/abandoned-release-tags.json",
         "refs/remotes/origin/main:scripts/select-admissible-release-tag.py",
@@ -15075,7 +15075,7 @@ def main() -> None:
         "permission-actions: read",
         "permission-contents: write",
         'event_type:"kin-release"',
-        "https://api.github.com/repos/firelock-ai/homebrew-kin/dispatches",
+        "https://api.github.com/repos/kinlab-ai/homebrew-kin/dispatches",
         "Update formula ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}",
         "actions/workflows/update-formula.yml/runs?event=repository_dispatch",
         'bash scripts/verify-homebrew-formula.sh "$KIN_TAG"',
@@ -15933,7 +15933,7 @@ def main() -> None:
         (
             "release packaging restores an external kin-vfs checkout",
             "must not build or package retired VFS runtime inputs",
-            {"release": release + "\nrepository: firelock-ai/kin-vfs\n"},
+            {"release": release + "\nrepository: kinlab-ai/kin-vfs\n"},
         ),
         (
             "RC packaging restores a VFS target input",
@@ -18606,7 +18606,7 @@ jobs:
         )
 
     for live_contract in (
-        "Both public npm packages trust only firelock-ai/kin + release.yml + environment",
+        "Both public npm packages trust only kinlab-ai/kin + release.yml + environment",
         "allow `npm publish` through short-lived OIDC, and disallow",
         "publish_npm_canonical",
         "publish_npm_compatibility",
