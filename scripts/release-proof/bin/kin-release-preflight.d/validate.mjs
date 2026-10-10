@@ -155,9 +155,16 @@ import path from "node:path";
 // sits at old lines 1750 to 2161 and new lines 1754 to 2165, and its 412 lines
 // hash to bf1dd52477a0b133d2578a73a8ae3c9cb2e289ccd8e85339ea2817b11858691e at
 // both, so no assertion moved.
+//
+// Moved for the firelock-ai -> kinlab-ai repository transfer, with nothing to
+// port. The hunks between 747950dd and 51f4f0b9 only repoint release download,
+// latest-release, ls-remote and raw Cargo.lock URLs to kinlab-ai/kin, all above
+// the mirrored step; the attestation --repo/--signer-workflow lines are left
+// alone. The mirrored step sits at lines 1754 to 2166 and hashes to
+// 68d39ea447259eef156869a961891a7fc503b7d0a986f4c533f2cf9735f65a02, unchanged, so no assertion moved.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "747950dd57c9c71b14ea5d293632dab147fad241fc7c612818203897af3a70b0",
+  sha256: "51f4f0b948664325a1f60608b2e8c7d80aff595f431cd864bb443d3c357067e2",
 };
 
 class Unreadable extends Error {}

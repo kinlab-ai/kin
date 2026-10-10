@@ -55,7 +55,7 @@ jobs:
             echo "  git commit -s --amend              # amend only the last commit"
             echo "  git rebase --signoff HEAD~N        # add sign-off to last N commits"
             echo ""
-            echo "Full instructions: https://github.com/firelock-ai/kin/blob/main/CONTRIBUTING.md#dco-sign-off"
+            echo "Full instructions: https://github.com/kinlab-ai/kin/blob/main/CONTRIBUTING.md#dco-sign-off"
             exit 1
           fi
 

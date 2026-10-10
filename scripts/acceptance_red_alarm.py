@@ -5,7 +5,7 @@
 """Judge a completed Acceptance run on main and say whether anyone must be told.
 
 `Product Acceptance` is not a required context on main. Read live from
-`GET /repos/firelock-ai/kin/rules/branches/main` on 2026-08-30 the required set is
+`GET /repos/kinlab-ai/kin/rules/branches/main` on 2026-08-30 the required set is
 six contexts, cargo-deny, DCO Sign-off, Fast gate build and tests, Fast gate lint
 and policy, gitleaks (full history) and PR text hygiene, which is FIR-2815's
 thinned fast gate. So a red Acceptance blocks no landing, and after the landing
@@ -439,7 +439,7 @@ def self_test():
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", help="Acceptance run id to judge")
-    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "firelock-ai/kin"))
+    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "kinlab-ai/kin"))
     parser.add_argument("--dry-run", action="store_true",
                         help="judge and print, touch no issue")
     parser.add_argument("--self-test", action="store_true")

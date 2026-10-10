@@ -88,7 +88,7 @@ for attempt in $(seq 1 18); do
       npm audit signatures --json --include-attestations > "$tmp/audit.json" 2> "$tmp/audit.err"
   ) && node "$root/scripts/verify-npm-attestation.mjs" \
     "$tmp/audit.json" "$package" "$version" "$local_integrity" \
-    "https://github.com/firelock-ai/kin" ".github/workflows/release.yml" \
+    "https://github.com/kinlab-ai/kin" ".github/workflows/release.yml" \
     "$expected_ref" "$expected_commit"; then
     echo "Verified exact npm bytes and provenance for ${package}@${version}"
     exit 0

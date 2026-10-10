@@ -9,13 +9,13 @@ a lane deciding whether it is safe to land needs to read that list without an AP
 second copy of a live GitHub ruleset, and on 2026-09-03 it had already drifted: the sentence said
 six required contexts and named `DCO Sign-off`, `PR text hygiene`, `cargo-deny`,
 `gitleaks (full history)`, `Fast gate lint and policy` and `Fast gate build and tests`, while
-`GET /repos/firelock-ai/kin/rules/branches/main` answered with seven, the sixth-plus-one being
+`GET /repos/kinlab-ai/kin/rules/branches/main` answered with seven, the sixth-plus-one being
 `MCP surface contract`. Nothing had compared the two since whoever added that context did.
 
 This is the comparison. It reads the sentence out of `AGENTS.md` rather than keeping its own copy
 of the expected list, because a second hardcoded copy in this file would be exactly the bug it
 exists to catch: it would drift from the doc the same way the doc drifted from GitHub. It also
-reads the API path (`/repos/firelock-ai/kin/rules/branches/main`) out of that same sentence rather
+reads the API path (`/repos/kinlab-ai/kin/rules/branches/main`) out of that same sentence rather
 than hardcoding it, so a doc that names the wrong path fails this check by 404 rather than by
 silently comparing against a path nobody wrote down.
 
@@ -342,7 +342,7 @@ def run(agents_md_path, token=None, opener=None):
 
 REAL_DOC_TEXT_SEVEN = (
     "kin is a classic direct-merge repo. Seven required contexts on main, read from "
-    "`/repos/firelock-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, "
+    "`/repos/kinlab-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, "
     "`cargo-deny`, `gitleaks (full history)`, `Fast gate lint and policy`, "
     "`Fast gate build and tests` and `MCP surface contract`. Commit with `git commit -s`."
 )
@@ -351,7 +351,7 @@ REAL_DOC_TEXT_SEVEN = (
 # lane's fix: six named, GitHub's seventh (`MCP surface contract`) absent.
 REGRESSION_DOC_TEXT_SIX = (
     "kin is a classic direct-merge repo. Six required contexts on main, read from "
-    "`/repos/firelock-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, "
+    "`/repos/kinlab-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, "
     "`cargo-deny`, `gitleaks (full history)`, `Fast gate lint and policy` and "
     "`Fast gate build and tests`. Commit with `git commit -s`."
 )
@@ -507,7 +507,7 @@ def self_test():
     # parse_sentence
     count_word, api_path, items = parse_sentence(REAL_DOC_TEXT_SEVEN)
     check("parses today's sentence: count word", count_word == "Seven")
-    check("parses today's sentence: api path", api_path == "/repos/firelock-ai/kin/rules/branches/main")
+    check("parses today's sentence: api path", api_path == "/repos/kinlab-ai/kin/rules/branches/main")
     check("parses today's sentence: seven items in order", items == REAL_LIVE_SEVEN)
 
     try:
@@ -519,7 +519,7 @@ def self_test():
     # fetch_required_contexts, offline via injected openers. sleep is always the no-op stub here:
     # a retryable control must prove the retry happened (via the opener's own call counter, not
     # via elapsed time), and it must not make --self-test slow.
-    fetched = fetch_required_contexts("/repos/firelock-ai/kin/rules/branches/main",
+    fetched = fetch_required_contexts("/repos/kinlab-ai/kin/rules/branches/main",
                                        opener=_returns(REAL_RULES_PAYLOAD), sleep=_no_sleep)
     check("fetch extracts all seven contexts, ignoring unrelated rule types", fetched == REAL_LIVE_SEVEN)
 

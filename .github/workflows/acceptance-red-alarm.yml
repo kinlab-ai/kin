@@ -2,7 +2,7 @@ name: Acceptance Red Alarm
 
 # `Product Acceptance` is not a required context on main, so a red Acceptance
 # blocks no landing, and until this workflow existed nothing watched it after the
-# landing either. Read live from `GET /repos/firelock-ai/kin/rules/branches/main`
+# landing either. Read live from `GET /repos/kinlab-ai/kin/rules/branches/main`
 # on 2026-08-30, main requires six contexts, cargo-deny, DCO Sign-off, Fast gate
 # build and tests, Fast gate lint and policy, gitleaks (full history) and PR text
 # hygiene, which is FIR-2815's thinned fast gate. Acceptance is not among them.

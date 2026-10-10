@@ -15,7 +15,7 @@ from types import ModuleType
 from typing import Any, Sequence
 
 
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 CI_WORKFLOW_NAME = "CI"
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 CI_REQUIRED_JOB = "Fast gate lint and policy"
@@ -1183,7 +1183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
         if args.repository != EXPECTED_REPOSITORY:
-            raise AttesterError("attester repository is not firelock-ai/kin")
+            raise AttesterError("attester repository is not kinlab-ai/kin")
         if args.command == "validate":
             result = validate_for_attestation(
                 event_file=args.event_file,

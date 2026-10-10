@@ -37,7 +37,7 @@ const OTHER_SHA = 'b'.repeat(40);
 const ARCHIVE_A = '1'.repeat(64);
 const ARCHIVE_B = '2'.repeat(64);
 const ARCHIVE_UNJUDGED = '3'.repeat(64);
-const REPO = 'firelock-ai/kin';
+const REPO = 'kinlab-ai/kin';
 
 // Shaped on a real record: .kin-coord/preflight/20260820T112905Z/preflight.json
 // carried schema kin.release-preflight.v1, verdict PASS, citable false, lane
@@ -445,7 +445,7 @@ test('fetchEvidence fails closed on transport and server failure', async () => {
         throw new Error('socket hang up');
       },
     }),
-    /could not reach firelock-ai\/kin .*socket hang up/,
+    /could not reach kinlab-ai\/kin .*socket hang up/,
   );
   await assert.rejects(
     fetchEvidence(SHA, PREFLIGHT_RECORD, {
@@ -1229,7 +1229,7 @@ test('main fails closed when the release surface cannot be read', async () => {
         '/releases?': { ok: false, status: 502, statusText: 'Bad Gateway' },
       }),
     }),
-    /could not list the releases of firelock-ai\/kin: HTTP 502 Bad Gateway/,
+    /could not list the releases of kinlab-ai\/kin: HTTP 502 Bad Gateway/,
   );
 });
 
@@ -1373,7 +1373,7 @@ test('main fails closed when the release listing cannot be reached', async () =>
         return stubFetch(releaseRoutes())(url);
       },
     }),
-    /could not reach GitHub to list the releases of firelock-ai\/kin: socket hang up/,
+    /could not reach GitHub to list the releases of kinlab-ai\/kin: socket hang up/,
   );
 });
 

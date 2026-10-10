@@ -384,7 +384,7 @@ jobs:
             >/dev/null
           echo "Requested bounded automatic retry for Release run ${RUN_ID}."
 
-      # The alert below lands on firelock-ai/kin-infra rather than on this
+      # The alert below lands on kinlab-ai/kin-infra rather than on this
       # repository's public issue tab, and the workflow token cannot write to
       # another repository, so the two steps that touch the alarm mint their
       # own App token carrying issues: write on this repository and kin-infra
@@ -412,7 +412,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           REPO: ${{ github.repository }}
         run: |
@@ -469,7 +469,7 @@ jobs:
           # the issue calls, which touch the alarm repository, use the App token.
           GH_TOKEN: ${{ github.token }}
           ALARM_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.resolve.outputs.tag }}

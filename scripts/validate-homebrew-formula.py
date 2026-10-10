@@ -88,7 +88,7 @@ class RubyLineScan:
 
 def expected_url(artifact: str) -> str:
     return (
-        f"https://github.com/firelock-ai/kin/releases/download/v#{{version}}/{artifact}"
+        f"https://github.com/kinlab-ai/kin/releases/download/v#{{version}}/{artifact}"
     )
 
 

@@ -16,7 +16,7 @@ from types import ModuleType
 from typing import Any, Sequence
 
 
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 EXPECTED_WORKFLOW_PATH = ".github/workflows/kin-registry-release.yml"
 # Kept as its own ordered tuple rather than importing verify-kin-registry-wave-
 # head.py's ALLOWED_PATHS frozenset: this constant is serialized as
@@ -175,7 +175,7 @@ def _validate_candidate(
     if value.get("schema") != 1:
         raise ArtifactError("candidate manifest schema is not 1")
     if repository != EXPECTED_REPOSITORY or value.get("repository") != repository:
-        raise ArtifactError("candidate repository is not firelock-ai/kin")
+        raise ArtifactError("candidate repository is not kinlab-ai/kin")
     policy_sha = _require_sha("expected policy sha", policy_sha)
     base = _require_sha("expected candidate base", base)
     if policy_sha != base:
@@ -412,7 +412,7 @@ def finalize_no_change(
     policy_sha = _require_sha("no-change policy sha", policy_sha)
     base = _require_sha("no-change base", base)
     if repository != EXPECTED_REPOSITORY:
-        raise ArtifactError("no-change repository is not firelock-ai/kin")
+        raise ArtifactError("no-change repository is not kinlab-ai/kin")
     if policy_sha != base:
         raise ArtifactError("no-change base differs from the workflow policy sha")
     if workflow_path != EXPECTED_WORKFLOW_PATH:

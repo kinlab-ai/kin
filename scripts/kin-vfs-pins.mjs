@@ -31,7 +31,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-export const VFS_REPOSITORY = 'firelock-ai/kin-vfs';
+export const VFS_REPOSITORY = 'kinlab-ai/kin-vfs';
 export const VFS_CORE = 'kin-vfs-core';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;

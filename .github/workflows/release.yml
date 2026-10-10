@@ -15,7 +15,7 @@ permissions:
 # tags" limits v* creation/update/deletion to the release captain, while the
 # protected `release` environment automatically admits only v* tags.
 # Every credential-bearing or public-write job below must keep that environment.
-# Both public npm packages trust only firelock-ai/kin + release.yml + environment
+# Both public npm packages trust only kinlab-ai/kin + release.yml + environment
 # `release`, allow `npm publish` through short-lived OIDC, and disallow
 # traditional tokens. Keep both publish jobs on that exact protected identity.
 

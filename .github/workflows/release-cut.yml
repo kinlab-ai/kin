@@ -212,7 +212,7 @@ jobs:
           # owner plus repositories narrows the installation token to this one
           # repository; owner alone would widen it to every repo the org-wide
           # install can reach.
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-contents: write
 
@@ -281,7 +281,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-actions: write
 
@@ -401,7 +401,7 @@ jobs:
       # install is package-manager-shaped, and CodeQL's
       # actions/cache-poisoning/poisonable-step query flags exactly that
       # shape running once an untrusted artifact is already in the workspace
-      # (alert firelock-ai/kin#145). This step never reads the archive, so
+      # (alert kinlab-ai/kin#145). This step never reads the archive, so
       # there is no reason for it to run after it lands.
       # Was inline in "Judge the archive" below, which is one step too late.
       # The language-server install underneath bounds npm with GNU timeout, a
@@ -694,7 +694,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-contents: write
 
@@ -850,7 +850,7 @@ jobs:
   # job timeout, which is the silent hang this repository refuses everywhere
   # else. So the switch is explicit and follows the same shape ci.yml already
   # uses for vars.KIN_HEAVY_RUNNER: a captain sets
-  #   gh variable set KIN_STRANGER_RUNNER --repo firelock-ai/kin --body "kin-stranger"
+  #   gh variable set KIN_STRANGER_RUNNER --repo kinlab-ai/kin --body "kin-stranger"
   # when the runner is registered, and clears it when it goes away.
   #
   # It reads the API key and no other secret, and it publishes nothing: the
@@ -1117,7 +1117,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
           permission-contents: write
 

@@ -75,7 +75,7 @@ UNREADABLE = "UNREADABLE"
 TOPIC = "published-store-upgrade"
 
 PUBLISHED_VERSION = "0.7.21"
-RELEASE_URL = "https://github.com/firelock-ai/kin/releases/download/v%s/%s"
+RELEASE_URL = "https://github.com/kinlab-ai/kin/releases/download/v%s/%s"
 # The release's own checksums-sha256.txt, pinned so a replaced asset fails here
 # instead of grading the binary under test against a store nobody published.
 PUBLISHED_ARCHIVES = {

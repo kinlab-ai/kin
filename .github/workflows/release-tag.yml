@@ -1898,7 +1898,7 @@ jobs:
           # the kin repository alone. owner + repositories narrows the installation
           # token to just these repos; setting owner without repositories would
           # instead widen it to every repo the org-wide install can reach.
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
 
       - name: Create release tag ref

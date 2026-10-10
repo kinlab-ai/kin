@@ -7,7 +7,7 @@ name: Merge Queue Ejection Notice
 # healthy change that simply never merges, which is indistinguishable from one
 # still waiting its turn.
 #
-# The shared implementation lives in firelock-ai/kin-actions and has run on that
+# The shared implementation lives in kinlab-ai/kin-actions and has run on that
 # repo's own pull requests since the defect was first observed there, where PR
 # #26 was admitted, built, and ejected twice before anyone noticed. This repo
 # had the same blind spot and no consumer.
@@ -35,4 +35,4 @@ jobs:
   notice:
     permissions:
       pull-requests: write
-    uses: firelock-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.34
+    uses: kinlab-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.34

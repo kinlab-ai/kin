@@ -31,11 +31,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/firelock-ai/kin.git"
+    "url": "git+https://github.com/kinlab-ai/kin.git"
   },
   "homepage": "https://kinlab.ai",
   "bugs": {
-    "url": "https://github.com/firelock-ai/kin/issues"
+    "url": "https://github.com/kinlab-ai/kin/issues"
   },
   "license": "Apache-2.0",
   "publishConfig": {

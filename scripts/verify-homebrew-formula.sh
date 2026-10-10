@@ -26,8 +26,8 @@ if [[ ! -r "$validator" ]]; then
   exit 2
 fi
 
-formula_url="${KIN_HOMEBREW_FORMULA_URL:-https://raw.githubusercontent.com/firelock-ai/homebrew-kin/main/Formula/kin.rb}"
-release_base_url="${KIN_HOMEBREW_RELEASE_BASE_URL:-https://github.com/firelock-ai/kin/releases/download/v${version}}"
+formula_url="${KIN_HOMEBREW_FORMULA_URL:-https://raw.githubusercontent.com/kinlab-ai/homebrew-kin/main/Formula/kin.rb}"
+release_base_url="${KIN_HOMEBREW_RELEASE_BASE_URL:-https://github.com/kinlab-ai/kin/releases/download/v${version}}"
 max_wait_seconds="${KIN_HOMEBREW_VERIFY_MAX_WAIT_SECONDS:-1800}"
 max_attempts="${KIN_HOMEBREW_VERIFY_MAX_ATTEMPTS:-90}"
 poll_seconds="${KIN_HOMEBREW_VERIFY_POLL_SECONDS:-20}"
@@ -115,7 +115,7 @@ fetch_public() {
 }
 
 fail_verification() {
-  echo "::error::Public firelock-ai/homebrew-kin Formula/kin.rb did not exactly match Kin v${version} after ${checks} checks (wall-clock limit ${max_wait_seconds}s). Dispatch is best-effort; the release cannot pass until the public formula version, platform URLs, and SHA-256 values match the public release. Last validation error: ${last_error}. Check https://github.com/firelock-ai/homebrew-kin/actions." >&2
+  echo "::error::Public kinlab-ai/homebrew-kin Formula/kin.rb did not exactly match Kin v${version} after ${checks} checks (wall-clock limit ${max_wait_seconds}s). Dispatch is best-effort; the release cannot pass until the public formula version, platform URLs, and SHA-256 values match the public release. Last validation error: ${last_error}. Check https://github.com/kinlab-ai/homebrew-kin/actions." >&2
   exit 1
 }
 
@@ -154,7 +154,7 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
         python3 "$validator" "$version" --files \
           "$formula_path" "${sidecar_paths[@]}" 2>&1
       )"; then
-        echo "Confirmed public firelock-ai/homebrew-kin Formula/kin.rb exactly matches Kin v${version} and all four public release checksums"
+        echo "Confirmed public kinlab-ai/homebrew-kin Formula/kin.rb exactly matches Kin v${version} and all four public release checksums"
         exit 0
       fi
       last_error="${validation_error:-the exact formula validator failed without a diagnostic}"

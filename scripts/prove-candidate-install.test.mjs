@@ -11,7 +11,7 @@ import { matrixRows, buildJobBody } from './check-rc-build-drift.mjs';
 
 function fixture(platform = 'win32', arch = 'x64') {
   const [artifact, target] = PLATFORMS[`${platform}:${arch}`];
-  const e = { platform, arch, artifact, commit: 'a'.repeat(40), lock: 'b'.repeat(64), version: '0.8.0', repository: 'firelock-ai/kin', runId: '123', attempt: '1' };
+  const e = { platform, arch, artifact, commit: 'a'.repeat(40), lock: 'b'.repeat(64), version: '0.8.0', repository: 'kinlab-ai/kin', runId: '123', attempt: '1' };
   const bytes = Buffer.from('the exact candidate archive');
   const identity = { schema: 'kin.update-build.v1', version: e.version, commit: e.commit, clean: true,
     source_known: true, dependency_provenance: e.lock, graph_snapshot_version: 18 };

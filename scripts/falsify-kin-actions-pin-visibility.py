@@ -41,7 +41,7 @@ COMPANION_KIN_REGISTRY_RELEASE = (
     "    steps:\n"
     "      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
     "        with:\n"
-    "          repository: firelock-ai/kin-actions\n"
+    "          repository: kinlab-ai/kin-actions\n"
     "          ref: ${{ env.KIN_ACTIONS_SHA }}\n"
 )
 
@@ -110,7 +110,7 @@ def main() -> int:
                 "recognized.yml": (
                     "jobs:\n"
                     "  notify:\n"
-                    "    uses: firelock-ai/kin-actions/.github/workflows/"
+                    "    uses: kinlab-ai/kin-actions/.github/workflows/"
                     "notify-approver.yml@v0.1.34\n"
                 ),
                 "kin-registry-release.yml": COMPANION_KIN_REGISTRY_RELEASE,
@@ -125,7 +125,7 @@ def main() -> int:
             {
                 "commentary.yml": (
                     "# The shared implementation lives in "
-                    "firelock-ai/kin-actions.\n"
+                    "kinlab-ai/kin-actions.\n"
                     "jobs:\n"
                     "  x:\n"
                     "    steps:\n"
@@ -176,7 +176,7 @@ def main() -> int:
                     "      - uses: actions/checkout@"
                     "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0\n"
                     "        with:\n"
-                    "          repository: firelock-ai/kin-actions\n"
+                    "          repository: kinlab-ai/kin-actions\n"
                     "          ref: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"
                 ),
                 "kin-registry-release.yml": COMPANION_KIN_REGISTRY_RELEASE,

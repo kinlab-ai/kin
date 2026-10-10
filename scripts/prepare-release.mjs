@@ -134,7 +134,7 @@ async function git(args) {
 }
 
 async function associatedPullRequest(sha) {
-  const repository = process.env.GITHUB_REPOSITORY || 'firelock-ai/kin';
+  const repository = process.env.GITHUB_REPOSITORY || 'kinlab-ai/kin';
   try {
     const { stdout } = await run(
       'gh',

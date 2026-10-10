@@ -36,7 +36,7 @@ on:
   # string, so naming it here would trip the guard this workflow obeys.
   # which is why release-tag.yml takes its manual path the same way. Trigger a
   # sweep by hand with:
-  #   gh api repos/firelock-ai/kin/dispatches -f event_type=advisory-sweep
+  #   gh api repos/kinlab-ai/kin/dispatches -f event_type=advisory-sweep
   repository_dispatch:
     types: [advisory-sweep]
 
@@ -115,7 +115,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
 
       - name: Checkout trusted main with bump-branch authority
@@ -127,7 +127,7 @@ jobs:
 
       # A second, narrower mint for the alarm alone. The bump-branch token above
       # carries contents and pull-request authority on this repository; the
-      # unfixable-advisory issue lives on firelock-ai/kin-infra and needs
+      # unfixable-advisory issue lives on kinlab-ai/kin-infra and needs
       # issues: write there and here and nothing else, so it gets a token that
       # holds exactly that. A mint that fails fails the sweep loudly.
       - name: Mint the alarm token, issues only, this repository and kin-infra
@@ -368,7 +368,7 @@ jobs:
         if: steps.plan.outputs.unfixable != '0'
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
@@ -408,7 +408,7 @@ jobs:
         if: steps.plan.outcome == 'success' && steps.plan.outputs.unfixable == '0'
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |

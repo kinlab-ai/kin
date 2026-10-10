@@ -6,8 +6,8 @@ name: Publish Release Follow-Ups
 # This callback runs from reviewed default-branch workflow bytes only after the
 # tag-only Release workflow has fully completed successfully. It has no cloud
 # credential and cannot write Kin contents; its single capability is minting a
-# short-lived GitHub App token scoped only to firelock-ai/homebrew-kin and
-# firelock-ai/kin-infra. It requests both downstream publishers and proves the
+# short-lived GitHub App token scoped only to kinlab-ai/homebrew-kin and
+# kinlab-ai/kin-infra. It requests both downstream publishers and proves the
 # workflows completed before accepting either public outcome.
 on:
   workflow_run:
@@ -192,7 +192,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_APP_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: |
             homebrew-kin
             kin-infra
@@ -216,7 +216,7 @@ jobs:
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/firelock-ai/homebrew-kin/dispatches \
+            https://api.github.com/repos/kinlab-ai/homebrew-kin/dispatches \
             -d "$payload")"
           if [ "$code" != 204 ]; then
             echo "::error::Homebrew repository dispatch returned HTTP $code"
@@ -248,7 +248,7 @@ jobs:
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/firelock-ai/kin-infra/dispatches \
+            https://api.github.com/repos/kinlab-ai/kin-infra/dispatches \
             -d "$payload")"
           if [ "$code" != 204 ]; then
             echo "::error::installer repository dispatch returned HTTP $code"
@@ -297,7 +297,7 @@ jobs:
             -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/firelock-ai/kin-infra/dispatches \
+            https://api.github.com/repos/kinlab-ai/kin-infra/dispatches \
             -d "$payload")"
           if [ "$code" != 204 ]; then
             echo "::error::image promotion repository dispatch returned HTTP $code"
@@ -331,13 +331,13 @@ jobs:
           downstream_id=""
           for _ in $(seq 1 36); do
             runs="$(gh api \
-              'repos/firelock-ai/homebrew-kin/actions/workflows/update-formula.yml/runs?event=repository_dispatch&per_page=20')"
+              'repos/kinlab-ai/homebrew-kin/actions/workflows/update-formula.yml/runs?event=repository_dispatch&per_page=20')"
             downstream_id="$(jq -r \
               --arg title "$expected_title" --arg dispatched_at "$DISPATCHED_AT" \
               '[.workflow_runs[] | select(.display_title == $title and .created_at >= $dispatched_at)] | sort_by(.created_at) | last | .id // empty' \
               <<< "$runs")"
             if [ -n "$downstream_id" ]; then
-              state="$(gh api "repos/firelock-ai/homebrew-kin/actions/runs/${downstream_id}")"
+              state="$(gh api "repos/kinlab-ai/homebrew-kin/actions/runs/${downstream_id}")"
               status="$(jq -r .status <<< "$state")"
               if [ "$status" = completed ]; then
                 assert_field "Homebrew run ${downstream_id} conclusion" \
@@ -349,7 +349,7 @@ jobs:
                 assert_field "Homebrew run ${downstream_id} head branch" \
                   "$(jq -r .head_branch <<< "$state")" main
                 assert_field "Homebrew run ${downstream_id} repository" \
-                  "$(jq -r .repository.full_name <<< "$state")" firelock-ai/homebrew-kin
+                  "$(jq -r .repository.full_name <<< "$state")" kinlab-ai/homebrew-kin
                 break
               fi
             fi
@@ -390,13 +390,13 @@ jobs:
           downstream_id=""
           for _ in $(seq 1 36); do
             runs="$(gh api \
-              'repos/firelock-ai/kin-infra/actions/workflows/publish-install.yml/runs?event=repository_dispatch&per_page=20')"
+              'repos/kinlab-ai/kin-infra/actions/workflows/publish-install.yml/runs?event=repository_dispatch&per_page=20')"
             downstream_id="$(jq -r \
               --arg title "$expected_title" --arg dispatched_at "$DISPATCHED_AT" \
               '[.workflow_runs[] | select(.display_title == $title and .created_at >= $dispatched_at)] | sort_by(.created_at) | last | .id // empty' \
               <<< "$runs")"
             if [ -n "$downstream_id" ]; then
-              state="$(gh api "repos/firelock-ai/kin-infra/actions/runs/${downstream_id}")"
+              state="$(gh api "repos/kinlab-ai/kin-infra/actions/runs/${downstream_id}")"
               status="$(jq -r .status <<< "$state")"
               if [ "$status" = completed ]; then
                 assert_field "installer run ${downstream_id} conclusion" \
@@ -408,7 +408,7 @@ jobs:
                 assert_field "installer run ${downstream_id} head branch" \
                   "$(jq -r .head_branch <<< "$state")" main
                 assert_field "installer run ${downstream_id} repository" \
-                  "$(jq -r .repository.full_name <<< "$state")" firelock-ai/kin-infra
+                  "$(jq -r .repository.full_name <<< "$state")" kinlab-ai/kin-infra
                 break
               fi
             fi

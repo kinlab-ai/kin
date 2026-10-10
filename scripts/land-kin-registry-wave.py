@@ -62,14 +62,14 @@ from types import ModuleType
 from typing import Any, Callable, Sequence
 
 
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 BOT_LOGIN = "github-actions[bot]"
 BOT_ID = 41898282
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 LOWER_SHA = re.compile(r"^[0-9a-f]{40}$")
 GREEN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 # Ruleset 19746451 "Require status checks on main", read on 2026-09-02 through
-# repos/firelock-ai/kin/rules/branches/main. These have to be PRESENT on the
+# repos/kinlab-ai/kin/rules/branches/main. These have to be PRESENT on the
 # head before a landing so an empty or half-arrived check set never reads as
 # green. release-tag.yml's RULESET_REQUIRED_CHECKS mirror is a superset of this
 # list by contract, and scripts/test-kin-registry-wave-landing.py holds the two

@@ -66,7 +66,7 @@ jobs:
         with:
           app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
-          owner: firelock-ai
+          owner: kinlab-ai
           repositories: kin
 
       - name: Checkout trusted main with release-branch authority
@@ -541,12 +541,12 @@ jobs:
             [
               .[] |
               select(
-                .headRepositoryOwner.login == "firelock-ai" and
-                .headRepository.nameWithOwner == "firelock-ai/kin"
+                .headRepositoryOwner.login == "kinlab-ai" and
+                .headRepository.nameWithOwner == "kinlab-ai/kin"
               )
             ] |
             if length > 1 then
-              error("multiple firelock-ai/kin release-train PRs")
+              error("multiple kinlab-ai/kin release-train PRs")
             else
               .[0].number // ""
             end
@@ -598,8 +598,8 @@ jobs:
               [
                 .[] |
                 select(
-                  .headRepositoryOwner.login == "firelock-ai" and
-                  .headRepository.nameWithOwner == "firelock-ai/kin"
+                  .headRepositoryOwner.login == "kinlab-ai" and
+                  .headRepository.nameWithOwner == "kinlab-ai/kin"
                 )
               ] |
               if length == 1 then
@@ -886,7 +886,7 @@ jobs:
     permissions:
       # Reading prior cycles' markers, and nothing else, needs actions:read.
       # Nothing in this job writes to a branch, a tag, or a pull request. The
-      # alarm lands on firelock-ai/kin-infra through the App token minted
+      # alarm lands on kinlab-ai/kin-infra through the App token minted
       # below rather than through this token, which cannot reach another
       # repository.
       actions: read
@@ -997,7 +997,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.alarm-token.outputs.token }}
           REPO: ${{ github.repository }}
-          ALARM_REPO: firelock-ai/kin-infra
+          ALARM_REPO: kinlab-ai/kin-infra
           ALARM_LABEL: ${{ github.event.repository.name }}
           MARKERS: ${{ steps.history.outputs.markers }}
           THRESHOLD: "4"

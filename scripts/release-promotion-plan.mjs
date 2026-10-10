@@ -276,7 +276,7 @@ export async function buildPlan({
   api,
   judge,
   alarmTitle = ALARM_TITLE,
-  // The alarm issue lives on firelock-ai/kin-infra, not beside the releases it
+  // The alarm issue lives on kinlab-ai/kin-infra, not beside the releases it
   // reports on, so the open-issue lookup goes through a client bound to that
   // repository and its own token. Defaulting to `api` keeps a caller that
   // passes one client reading the alarm where the releases are, which is what

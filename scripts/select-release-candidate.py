@@ -78,7 +78,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 BASE_BRANCH = "main"
 EVIDENCE_REF = "release-evidence"
 PREFLIGHT_RECORD = "preflight.json"
