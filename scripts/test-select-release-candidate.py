@@ -1421,8 +1421,8 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(decision["decision"], selector.ARM)
         self.assertEqual(decision["candidate"], NEWEST)
 
-    def test_a_refusal_exits_one_and_a_broken_read_exits_two(self) -> None:
-        """A refusal and an unreadable snapshot must not share an exit code."""
+    def test_a_refusal_exits_zero_and_a_broken_read_exits_two(self) -> None:
+        """A refusal is a hold and exits 0 with a warning; an unreadable snapshot still fails."""
 
         document = snapshot()
         document["grades"] = {
@@ -1433,8 +1433,9 @@ class CommandLineTests(unittest.TestCase):
             json.dump(document, handle)
             path = handle.name
         refusal = self.run_selector("select", "--snapshot", path)
-        self.assertEqual(refusal.returncode, 1, refusal.stdout)
-        self.assertIn("Release cut refused", refusal.stderr)
+        self.assertEqual(refusal.returncode, 0, refusal.stdout)
+        self.assertEqual(json.loads(refusal.stdout)["decision"], selector.REFUSE)
+        self.assertIn("::warning title=Release cut refused", refusal.stderr)
 
         document.pop("grades")
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:

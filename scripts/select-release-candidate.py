@@ -26,7 +26,8 @@ the decision rests on and answers one of four things:
               already, and stranger.env is what would let the release claim
               first-contact coverage; run the three-arm stranger on that archive
   refuse      no reviewed main commit carrying the version qualifies, named sha
-              by sha with the context that disqualified it
+              by sha with the context that disqualified it; a hold, reported as
+              a warning with exit 0 (only an unreadable read exits non-zero)
 
 The rule, in the order it is applied:
 
@@ -1056,8 +1057,12 @@ def _emit(decision: Decision) -> int:
                 handle.write(f"{key}={'' if value is None else value}\n")
             handle.write(f"reason={decision.reason.replace(chr(10), ' ')}\n")
     if decision.decision == REFUSE:
-        print(f"::error title=Release cut refused::{decision.reason}", file=sys.stderr)
-        return 1
+        # A refusal is a release hold, not a broken run: no candidate qualifies
+        # yet, and the next cycle re-judges. It is surfaced as a warning and in
+        # the published decision artifact; a hold that persists is what
+        # release-hold-alarm.mjs exists to raise. Failing the run here turned
+        # every scheduled cycle into a failure notification while the hold lasted.
+        print(f"::warning title=Release cut refused::{decision.reason}", file=sys.stderr)
     return 0
 
 
