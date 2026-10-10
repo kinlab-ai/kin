@@ -3,12 +3,12 @@
 # Copyright 2026 Firelock, LLC
 """Fail when a kin-actions reference exists that the workflow-pin bot cannot see.
 
-The dedicated `kin-workflow-pin[bot]` App (firelock-ai/kin-actions,
+The dedicated `kin-workflow-pin[bot]` App (kinlab-ai/kin-actions,
 scripts/update-kin-actions-pins.py) rewrites exactly one shape of pin:
 
-    uses: firelock-ai/kin-actions/.github/workflows/<file>.yml@v<semver>
+    uses: kinlab-ai/kin-actions/.github/workflows/<file>.yml@v<semver>
 
-Its manifest (firelock-ai/kin-actions .kin-release/consumers.json) lists the
+Its manifest (kinlab-ai/kin-actions .kin-release/consumers.json) lists the
 workflow paths it owns in this repository, and its own self-check refuses a
 manifest that is not exact. Both of those live in a different repository and
 can only ever police the shape they already recognize. Neither can see a
@@ -21,7 +21,7 @@ workflow. The bot bumped three other files in kin#1450 the same night; this
 one had to be moved by hand in kin#1449, and nothing reported the gap.
 
 This guard runs entirely inside this repository: it scans every workflow file
-for a live reference to `firelock-ai/kin-actions` or a `KIN_ACTIONS`-named
+for a live reference to `kinlab-ai/kin-actions` or a `KIN_ACTIONS`-named
 variable, accepts the one shape the bot owns, and requires everything else to
 be named, with a reason, in the ALLOWLIST below. An unnamed reference fails
 the build. An allowlist entry that no longer matches anything live fails it
@@ -50,7 +50,7 @@ import sys
 from pathlib import Path
 
 BOT_VISIBLE_PIN = re.compile(
-    r"^\s*uses:\s*firelock-ai/kin-actions/\.github/workflows/"
+    r"^\s*uses:\s*kinlab-ai/kin-actions/\.github/workflows/"
     r"[A-Za-z0-9_.-]+\.ya?ml@v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\b"
 )
 
@@ -59,7 +59,7 @@ BOT_VISIBLE_PIN = re.compile(
 # rewrite has to be able to find, and was never built to look for outside a
 # `uses:` scalar.
 REFERENCE_HINTS = (
-    re.compile(r"firelock-ai/kin-actions"),
+    re.compile(r"kinlab-ai/kin-actions"),
     re.compile(r"KIN_ACTIONS"),
 )
 
@@ -79,14 +79,14 @@ ALLOWLIST = [
             "in a job of their own. It is deliberately sha-pinned, matching "
             "every other external action in this file, rather than "
             "tag-pinned like a bot-managed pin. update-kin-actions-pins.py "
-            "only rewrites `uses: firelock-ai/kin-actions/.github/"
+            "only rewrites `uses: kinlab-ai/kin-actions/.github/"
             "workflows/*.yml@vX.Y.Z`; this pin needs a human, or a taught "
             "bot, on every kin-actions release until the mechanism changes."
         ),
     },
     {
         "file": ".github/workflows/kin-registry-release.yml",
-        "match": "repository: firelock-ai/kin-actions",
+        "match": "repository: kinlab-ai/kin-actions",
         "reason": "The checkout that KIN_ACTIONS_SHA (above) pins. Same gap.",
     },
 ]
@@ -141,7 +141,7 @@ def check(root: Path) -> list[str]:
             if not covered:
                 errors.append(
                     f"{relative}:{lineno}: kin-actions reference is not the "
-                    "bot-visible `uses: firelock-ai/kin-actions/.github/"
+                    "bot-visible `uses: kinlab-ai/kin-actions/.github/"
                     "workflows/*.yml@vX.Y.Z` pin and is not named in "
                     f"ALLOWLIST: {line.strip()!r}"
                 )

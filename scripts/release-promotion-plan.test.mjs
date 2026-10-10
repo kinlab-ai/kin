@@ -314,7 +314,7 @@ const listing = (over = {}) => ({
 
 test('buildPlan promotes a held release the gate now passes', async () => {
   const plan = await buildPlan({
-    repository: 'firelock-ai/kin',
+    repository: 'kinlab-ai/kin',
     api: stubApi(listing()),
     judge: async () => ({ stranger: { driver: { endpoint: 'local' } } }),
     now: NOW,
@@ -327,7 +327,7 @@ test('buildPlan promotes a held release the gate now passes', async () => {
 // survive into the plan rather than being flattened to "not proven".
 test('buildPlan carries the gate refusal verbatim and never fails the sweep', async () => {
   const plan = await buildPlan({
-    repository: 'firelock-ai/kin',
+    repository: 'kinlab-ai/kin',
     api: stubApi(listing()),
     judge: async () => {
       throw new Error('evidence/aaa/stranger.env does not exist on the release-evidence branch');
@@ -344,7 +344,7 @@ test('buildPlan carries the gate refusal verbatim and never fails the sweep', as
 // trains a reader to ignore it.
 test('buildPlan turns an unresolvable tag into a wait, not a failure', async () => {
   const plan = await buildPlan({
-    repository: 'firelock-ai/kin',
+    repository: 'kinlab-ai/kin',
     api: stubApi({ '/releases?': [release()], '/issues?': [] }),
     judge: async () => {
       throw new Error('the judge must not be reached for an unresolvable tag');
@@ -362,7 +362,7 @@ for (const count of [99, 100, 101, 200, 201]) {
     );
     const pages = [];
     const plan = await buildPlan({
-      repository: 'firelock-ai/kin',
+      repository: 'kinlab-ai/kin',
       api: async (path) => {
         if (path.startsWith('/releases?')) {
           const page = Number(new URL(path, 'https://api.github.com').searchParams.get('page') ?? 1);
@@ -388,7 +388,7 @@ for (const [name, secondPage, reason] of [
     let judgements = 0;
     await assert.rejects(
       buildPlan({
-        repository: 'firelock-ai/kin',
+        repository: 'kinlab-ai/kin',
         api: async (path) => {
           if (path.startsWith('/releases?')) {
             const page = Number(new URL(path, 'https://api.github.com').searchParams.get('page') ?? 1);
@@ -413,7 +413,7 @@ for (const [name, secondPage, reason] of [
 
 test('buildPlan finds the open alarm by its exact title and nothing else', async () => {
   const withIssue = await buildPlan({
-    repository: 'firelock-ai/kin',
+    repository: 'kinlab-ai/kin',
     api: stubApi({
       ...listing({ published_at: ago(DEFAULT_ALARM_AFTER_MINUTES + 1) }),
       '/issues?': [{ number: 12, title: ALARM_TITLE }],
@@ -429,7 +429,7 @@ test('buildPlan finds the open alarm by its exact title and nothing else', async
   // A near-miss title must not be adopted, or a rename would silently comment
   // on somebody else's issue forever.
   const other = await buildPlan({
-    repository: 'firelock-ai/kin',
+    repository: 'kinlab-ai/kin',
     api: stubApi({
       ...listing({ published_at: ago(DEFAULT_ALARM_AFTER_MINUTES + 1) }),
       '/issues?': [{ number: 12, title: `${ALARM_TITLE} (v0.6.6)` }],
@@ -443,7 +443,7 @@ test('buildPlan finds the open alarm by its exact title and nothing else', async
   assert.equal(other.alarm, 'open');
 });
 
-// The alarm issue lives on firelock-ai/kin-infra, not beside the releases. The
+// The alarm issue lives on kinlab-ai/kin-infra, not beside the releases. The
 // open-issue lookup has to go through the client bound to that repository, or
 // the sweep reads the wrong repository's issues, finds nothing every tick, and
 // opens a fresh alarm each time. The release client here answers the issue
@@ -457,7 +457,7 @@ test('buildPlan reads the open alarm through the alarm client, never the release
     return stubApi(answers)(path);
   };
   const plan = await buildPlan({
-    repository: 'firelock-ai/kin',
+    repository: 'kinlab-ai/kin',
     api: record(releaseReads, {
       ...listing({ published_at: ago(DEFAULT_ALARM_AFTER_MINUTES + 1) }),
       '/issues?': [{ number: 99, title: ALARM_TITLE }],
@@ -480,9 +480,9 @@ test('buildPlan reads the open alarm through the alarm client, never the release
 test('main refuses half an alarm configuration rather than half-applying it', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-promoter-'));
   const out = path.join(dir, 'plan.json');
-  for (const half of [{ alarmRepository: 'firelock-ai/kin-infra' }, { alarmToken: 'app' }]) {
+  for (const half of [{ alarmRepository: 'kinlab-ai/kin-infra' }, { alarmToken: 'app' }]) {
     await assert.rejects(
-      main({ repository: 'firelock-ai/kin', token: 'x', out, log: () => {}, ...half }),
+      main({ repository: 'kinlab-ai/kin', token: 'x', out, log: () => {}, ...half }),
       /KIN_ALARM_REPO and KIN_ALARM_TOKEN must be set together/,
     );
   }
@@ -501,9 +501,9 @@ test('main binds the alarm lookup to the alarm repository and token', async () =
   const requests = [];
   try {
     await main({
-      repository: 'firelock-ai/kin',
+      repository: 'kinlab-ai/kin',
       token: 'release-token',
-      alarmRepository: 'firelock-ai/kin-infra',
+      alarmRepository: 'kinlab-ai/kin-infra',
       alarmToken: 'alarm-token',
       out,
       log: () => {},
@@ -528,11 +528,11 @@ test('main binds the alarm lookup to the alarm repository and token', async () =
   }
   const issueReads = requests.filter((entry) => entry.url.includes('/issues?'));
   assert.equal(issueReads.length, 1);
-  assert.match(issueReads[0].url, /^https:\/\/api\.github\.com\/repos\/firelock-ai\/kin-infra\/issues\?/);
+  assert.match(issueReads[0].url, /^https:\/\/api\.github\.com\/repos\/kinlab-ai\/kin-infra\/issues\?/);
   assert.equal(issueReads[0].authorization, 'Bearer alarm-token');
   const releaseReads = requests.filter((entry) => entry.url.includes('/releases?'));
   assert.ok(releaseReads.length >= 1);
-  assert.match(releaseReads[0].url, /^https:\/\/api\.github\.com\/repos\/firelock-ai\/kin\/releases\?/);
+  assert.match(releaseReads[0].url, /^https:\/\/api\.github\.com\/repos\/kinlab-ai\/kin\/releases\?/);
   assert.equal(releaseReads[0].authorization, 'Bearer release-token');
 });
 
@@ -573,7 +573,7 @@ test('the promoter asks the gate for every record, whatever the environment says
   const out = path.join(dir, 'plan.json');
   try {
     await main({
-      repository: 'firelock-ai/kin',
+      repository: 'kinlab-ai/kin',
       token: 'x',
       out,
       log: () => {},

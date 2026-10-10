@@ -11,7 +11,7 @@ const expected = {
   packageName: '@kinlab/kin',
   version: '1.2.3',
   integrity,
-  repository: 'https://github.com/firelock-ai/kin',
+  repository: 'https://github.com/kinlab-ai/kin',
   workflowPath: '.github/workflows/release.yml',
   ref: 'refs/tags/v1.2.3',
   commit: 'a'.repeat(40),

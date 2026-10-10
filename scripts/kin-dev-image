@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GIT="${KIN_DEV_IMAGE_GIT:-git}"
 DOCKER="${KIN_DEV_IMAGE_DOCKER:-docker}"
 GH="${KIN_DEV_IMAGE_GH:-gh}"
-UPSTREAM_REPOSITORY="firelock-ai/kin"
+UPSTREAM_REPOSITORY="kinlab-ai/kin"
 
 usage() {
   cat >&2 <<'EOF'
@@ -79,7 +79,7 @@ case "$command" in
 
     origin="$($GIT -C "$ROOT" remote get-url origin)"
     case "$origin" in
-      git@github.com:firelock-ai/kin.git|https://github.com/firelock-ai/kin.git|https://github.com/firelock-ai/kin)
+      git@github.com:kinlab-ai/kin.git|https://github.com/kinlab-ai/kin.git|https://github.com/kinlab-ai/kin|git@github.com:firelock-ai/kin.git|https://github.com/firelock-ai/kin.git|https://github.com/firelock-ai/kin)
         ;;
       *)
         echo "error: origin '$origin' is not the canonical $UPSTREAM_REPOSITORY repository" >&2

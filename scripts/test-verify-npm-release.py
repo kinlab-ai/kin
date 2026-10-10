@@ -92,13 +92,13 @@ elif args[:2] == ["audit", "signatures"]:
             "buildDefinition": {
                 "externalParameters": {
                     "workflow": {
-                        "repository": "https://github.com/firelock-ai/kin",
+                        "repository": "https://github.com/kinlab-ai/kin",
                         "path": ".github/workflows/release.yml",
                         "ref": ref,
                     }
                 },
                 "resolvedDependencies": [{
-                    "uri": f"git+https://github.com/firelock-ai/kin@{ref}",
+                    "uri": f"git+https://github.com/kinlab-ai/kin@{ref}",
                     "digest": {"gitCommit": commit},
                 }],
             },

@@ -54,7 +54,7 @@ attester = load_module("kin_registry_wave_attester_tests", ATTESTER_PATH)
 
 
 def valid_payload(
-    *, crate: str = "kin-db", source: str = "firelock-ai/kin-db"
+    *, crate: str = "kin-db", source: str = "kinlab-ai/kin-db"
 ) -> dict[str, str]:
     version = "0.7.69"
     return {
@@ -71,7 +71,7 @@ def valid_context(**overrides: str) -> dict[str, str]:
         "event_name": "repository_dispatch",
         "event_action": "kin-registry-release",
         "actor": "troyjr4103",
-        "repository": "firelock-ai/kin",
+        "repository": "kinlab-ai/kin",
         "default_branch": "main",
         "ref": "refs/heads/main",
         "workflow_sha": "a" * 40,
@@ -261,9 +261,9 @@ def attestation_documents(
         "body": comment_body,
         "created_at": created_at,
         "updated_at": created_at,
-        "issue_url": f"https://api.github.com/repos/firelock-ai/kin/issues/{pull}",
+        "issue_url": f"https://api.github.com/repos/kinlab-ai/kin/issues/{pull}",
         "html_url": (
-            f"https://github.com/firelock-ai/kin/pull/{pull}"
+            f"https://github.com/kinlab-ai/kin/pull/{pull}"
             f"#issuecomment-{comment_id}"
         ),
         "user": {
@@ -423,7 +423,7 @@ def ci_run_document(
     run_attempt: int = 1,
     created_at: str = "2026-08-27T22:00:02Z",
 ) -> dict[str, object]:
-    repository_url = "https://api.github.com/repos/firelock-ai/kin"
+    repository_url = "https://api.github.com/repos/kinlab-ai/kin"
     return {
         "id": run_id,
         "run_attempt": run_attempt,
@@ -469,7 +469,7 @@ def ci_job_document(
         "status": status,
         "conclusion": conclusion,
         "run_url": (
-            f"https://api.github.com/repos/firelock-ai/kin/actions/runs/{run_id}"
+            f"https://api.github.com/repos/kinlab-ai/kin/actions/runs/{run_id}"
         ),
     }
 
@@ -572,7 +572,7 @@ class ValidatorTests(unittest.TestCase):
                 valid_payload(crate="serde", source="serde-rs/serde")
             )
         with self.assertRaisesRegex(validator.ValidationError, "must come from"):
-            validator.validate_payload(valid_payload(source="firelock-ai/kin-model"))
+            validator.validate_payload(valid_payload(source="kinlab-ai/kin-model"))
 
     def test_rejects_unbound_delivery_id(self) -> None:
         payload = valid_payload()
@@ -634,7 +634,7 @@ class AutoMergeTests(unittest.TestCase):
             ],
         ) as runner:
             result = auto_merge.ensure_disabled(
-                repository="firelock-ai/kin",
+                repository="kinlab-ai/kin",
                 branch=head_guard.WAVE_BRANCH,
                 base="main",
             )
@@ -662,7 +662,7 @@ class AutoMergeTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(auto_merge.LandingStateError, "still has"):
                 auto_merge.ensure_disabled(
-                    repository="firelock-ai/kin",
+                    repository="kinlab-ai/kin",
                     branch=head_guard.WAVE_BRANCH,
                     base="main",
                 )
@@ -674,7 +674,7 @@ class AutoMergeTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(auto_merge.LandingStateError, "moved"):
                 auto_merge.ensure_disabled(
-                    repository="firelock-ai/kin",
+                    repository="kinlab-ai/kin",
                     branch=head_guard.WAVE_BRANCH,
                     base="main",
                     expected_number=77,
@@ -1216,7 +1216,7 @@ class InstallationIdentityTests(unittest.TestCase):
                     "total_count": 2,
                     "repositories": [
                         {"full_name": identity.EXPECTED_REPOSITORY},
-                        {"full_name": "firelock-ai/kin-db"},
+                        {"full_name": "kinlab-ai/kin-db"},
                     ],
                 }
             ),

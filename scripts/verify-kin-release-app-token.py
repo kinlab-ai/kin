@@ -13,7 +13,7 @@ from typing import Any, Sequence
 EXPECTED_APP_SLUG = "kin-release-bot"
 EXPECTED_BOT_LOGIN = "kin-release-bot[bot]"
 EXPECTED_BOT_ID = 308181894
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 
 
 class IdentityError(RuntimeError):
@@ -75,7 +75,7 @@ def verify_identity(*, app_slug: str, repository: str) -> dict[str, object]:
         or repositories[0].get("full_name") != repository
     ):
         raise IdentityError(
-            "installation token is not scoped to exactly firelock-ai/kin"
+            "installation token is not scoped to exactly kinlab-ai/kin"
         )
     return {
         "app_slug": app_slug,

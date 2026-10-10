@@ -21,7 +21,7 @@ case "$args" in
   *" rev-parse HEAD") printf '%s\n' "$TEST_COMMIT" ;;
   *" symbolic-ref --quiet --short HEAD") printf '%s\n' main ;;
   *" status --porcelain --untracked-files=all") printf '%s' "${TEST_DIRTY:-}" ;;
-  *" remote get-url origin") printf '%s\n' "${TEST_ORIGIN:-https://github.com/firelock-ai/kin.git}" ;;
+  *" remote get-url origin") printf '%s\n' "${TEST_ORIGIN:-https://github.com/kinlab-ai/kin.git}" ;;
   *" fetch --quiet origin main") ;;
   *" rev-parse ${TEST_COMMIT}^{commit}") printf '%s\n' "$TEST_COMMIT" ;;
   *" merge-base --is-ancestor ${TEST_COMMIT} origin/main") exit "${TEST_ANCESTOR_STATUS:-0}" ;;
@@ -55,7 +55,7 @@ case "$*" in
     touch "$TEST_GH_STATE"
     ;;
   "run list "*"--json databaseId,displayTitle,url,status "*)
-    [ ! -f "$TEST_GH_STATE" ] || printf '123\tDev image %s %s\thttps://github.com/firelock-ai/kin/actions/runs/123\tqueued\n' "$TEST_MODE" "$TEST_COMMIT"
+    [ ! -f "$TEST_GH_STATE" ] || printf '123\tDev image %s %s\thttps://github.com/kinlab-ai/kin/actions/runs/123\tqueued\n' "$TEST_MODE" "$TEST_COMMIT"
     ;;
   "run watch 123 "*)
     exit "${TEST_WATCH_STATUS:-0}"
@@ -111,9 +111,9 @@ echo "==> canary proves a fresh namespaced upload for one exact commit"
 : > "$TEST_GIT_LOG"; : > "$TEST_GH_LOG"
 rm -f "$TEST_GH_STATE"
 bash scripts/kin-dev-image canary "$COMMIT"
-grep -Fxq "workflow run docker.yml --repo firelock-ai/kin --ref main -f commit=${COMMIT} -f mode=canary" "$TEST_GH_LOG"
+grep -Fxq "workflow run docker.yml --repo kinlab-ai/kin --ref main -f commit=${COMMIT} -f mode=canary" "$TEST_GH_LOG"
 grep -Fq "merge-base --is-ancestor ${COMMIT} origin/main" "$TEST_GIT_LOG"
-grep -Fq "run watch 123 --repo firelock-ai/kin --exit-status" "$TEST_GH_LOG"
+grep -Fq "run watch 123 --repo kinlab-ai/kin --exit-status" "$TEST_GH_LOG"
 
 echo "==> an existing canary cannot masquerade as fresh cutover proof"
 : > "$TEST_GH_LOG"
@@ -132,7 +132,7 @@ rm -f "$TEST_GH_STATE"
 TEST_MODE=publish TEST_REFERENCE_TAG="$COMMIT" TEST_ALIASES=false \
   TEST_PUBLICATION=verified_existing \
   bash scripts/kin-dev-image hosted "$COMMIT"
-grep -Fxq "workflow run docker.yml --repo firelock-ai/kin --ref main -f commit=${COMMIT} -f mode=publish" "$TEST_GH_LOG"
+grep -Fxq "workflow run docker.yml --repo kinlab-ai/kin --ref main -f commit=${COMMIT} -f mode=publish" "$TEST_GH_LOG"
 
 echo "==> non-main commit is refused before GitHub dispatch"
 : > "$TEST_GH_LOG"
@@ -155,7 +155,7 @@ if TEST_ORIGIN=https://github.com/example/fork.git bash scripts/kin-dev-image ho
   echo "fork origin unexpectedly dispatched upstream" >&2
   exit 1
 fi
-grep -Fq "not the canonical firelock-ai/kin" "$TMP/origin.out"
+grep -Fq "not the canonical kinlab-ai/kin" "$TMP/origin.out"
 
 echo "==> a green run without digest proof is refused"
 : > "$TEST_GH_LOG"

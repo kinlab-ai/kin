@@ -14,18 +14,18 @@ from typing import Any
 DISPATCH_EVENT = "repository_dispatch"
 SCHEDULE_EVENT = "schedule"
 EXPECTED_ACTION = "kin-registry-release"
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 EXPECTED_DEFAULT_BRANCH = "main"
 ALLOWED_ACTORS = frozenset({"troyjr4103", "kin-release-bot[bot]"})
 ALLOWED_SOURCES = {
-    "kin-blobs": "firelock-ai/kin-blobs",
-    "kin-db": "firelock-ai/kin-db",
-    "kin-infer": "firelock-ai/kin-infer",
-    "kin-lsp": "firelock-ai/kin-lsp",
-    "kin-model": "firelock-ai/kin-model",
-    "kin-search": "firelock-ai/kin-search",
-    "kin-vector": "firelock-ai/kin-vector",
-    "kin-vfs-core": "firelock-ai/kin-vfs",
+    "kin-blobs": "kinlab-ai/kin-blobs",
+    "kin-db": "kinlab-ai/kin-db",
+    "kin-infer": "kinlab-ai/kin-infer",
+    "kin-lsp": "kinlab-ai/kin-lsp",
+    "kin-model": "kinlab-ai/kin-model",
+    "kin-search": "kinlab-ai/kin-search",
+    "kin-vector": "kinlab-ai/kin-vector",
+    "kin-vfs-core": "kinlab-ai/kin-vfs",
 }
 PAYLOAD_KEYS = frozenset(
     {"crate_name", "crate_version", "delivery_id", "source_repo", "source_sha"}

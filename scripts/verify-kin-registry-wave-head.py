@@ -18,13 +18,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-EXPECTED_REPOSITORY = "firelock-ai/kin"
+EXPECTED_REPOSITORY = "kinlab-ai/kin"
 EXPECTED_BASE = "main"
 WAVE_BRANCH = "automation/kin-registry-dependency-wave"
 ATTESTATION_MARKER = "<!-- kin-registry-dependency-admission:v2 -->"
 ATTESTATION_APP_ID = 4370197
 ATTESTATION_APP_SLUG = "kin-release-bot"
-ATTESTATION_APP_OWNER = "firelock-ai"
+ATTESTATION_APP_OWNER = "kinlab-ai"
 ATTESTATION_APP_OWNER_ID = 69090636
 ATTESTATION_CREATOR = "kin-release-bot[bot]"
 ATTESTATION_CREATOR_ID = 308181894
@@ -695,7 +695,7 @@ def _parse_comment_body(body: Any) -> dict[str, str | int]:
         raise AdmissionError("dependency admission comment has no text body")
     match = re.fullmatch(
         re.escape(ATTESTATION_MARKER)
-        + r"\nrepository=(firelock-ai/kin)"
+        + r"\nrepository=(kinlab-ai/kin)"
         + r"\npull=([1-9][0-9]*)"
         + r"\nreview_id=([1-9][0-9]*)"
         + r"\nhead=([0-9a-f]{40})"

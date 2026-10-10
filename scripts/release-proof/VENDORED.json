@@ -6,7 +6,7 @@
     "bin/kin-release-preflight": {"source": "bin/kin-release-preflight", "sha256": "71ca13cdcacde94c1f1cbc67aa351f3bb7c7b13eb0ad525fc6c82bc4d9c302cd"},
     "bin/kin-release-preflight.d/Dockerfile": {"source": "bin/kin-release-preflight.d/Dockerfile", "sha256": "ae616f8898dcf1c093d16f90ce655072a495e29e74d61e3f30733646ae43b394"},
     "bin/kin-release-preflight.d/proof-flow.sh": {"source": "bin/kin-release-preflight.d/proof-flow.sh", "sha256": "9f5412189cd1ff5b7d0bc5adac45deb1ffb61a0ff3804b04f79eb9a3ee0e3451"},
-    "bin/kin-release-preflight.d/validate.mjs": {"source": "bin/kin-release-preflight.d/validate.mjs", "sha256": "b082f68c10ab164f219a895e4acf5e24530e65a2cbe29cbc9220f111f98e3b32"},
+    "bin/kin-release-preflight.d/validate.mjs": {"source": "bin/kin-release-preflight.d/validate.mjs", "sha256": "937e1fc6d9a03e1e3a878b1b8cd1483e3c4855a5fa067906e84cb3bc35edd23b"},
     "bin/kin-evidence-publish": {"source": "bin/kin-evidence-publish", "sha256": "8912fd933ba37e2570ea2ff685a885551543f2a01e3baeb394876121f8811679"},
     "bin/kin-acceptance-suite": {"source": "bin/kin-acceptance-suite", "sha256": "7ce214e6563e227695cf02411762ca5e8d01edf8898634db465ee30f455918f7"}
   }

@@ -29,10 +29,10 @@ function held({ drift = 9, blocking = 'v0.5.18', latest = 'v0.5.17' } = {}) {
     base_tag: blocking,
     drift,
     run_id: '31727271358',
-    run_url: 'https://github.com/firelock-ai/kin/actions/runs/31727271358',
+    run_url: 'https://github.com/kinlab-ai/kin/actions/runs/31727271358',
     main_sha: '6eae51d0000000000000000000000000000000ab',
     failed_release_run_id: '31478318322',
-    failed_release_run_url: 'https://github.com/firelock-ai/kin/actions/runs/31478318322',
+    failed_release_run_url: 'https://github.com/kinlab-ai/kin/actions/runs/31478318322',
     observed_at: '2026-08-12T09:00:00Z',
   };
 }
@@ -276,7 +276,7 @@ for (const previous of [null, clear(), held()]) {
       const outcome = spawnSync('bash', ['-c', finalOutcomeScript()], { encoding: 'utf8', env: {
         ...process.env, RUNNER_TEMP: root, GITHUB_OUTPUT: output,
         RECONCILE_STATUS: failed.status === 0 ? 'success' : 'failure',
-        REPO: 'firelock-ai/kin', GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com',
+        REPO: 'kinlab-ai/kin', GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com',
       } });
       assert.equal(outcome.status, 0, outcome.stderr);
       const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
@@ -322,11 +322,11 @@ test('the workflow opens and updates crash alarms with a loud accurate diagnosti
         'case "$action" in\n' + arm + '\nesac\n';
       const result = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: {
         ...process.env, work: root, decision: filename, action: decision.action, reason: decision.reason,
-        REPO: 'firelock-ai/kin', title: ALARM_TITLE,
+        REPO: 'kinlab-ai/kin', title: ALARM_TITLE,
         // The alarm lives on kin-infra under this repository's label, and the
         // workflow reaches it through a token minted for that alone. The arm
         // must file there, never back on REPO.
-        ALARM_REPO: 'firelock-ai/kin-infra', ALARM_LABEL: 'kin',
+        ALARM_REPO: 'kinlab-ai/kin-infra', ALARM_LABEL: 'kin',
       } });
       assert.equal(result.status, 1, result.stdout + result.stderr);
       assert.equal(result.stderr, '');
@@ -336,13 +336,13 @@ test('the workflow opens and updates crash alarms with a loud accurate diagnosti
       assert.match(
         calls,
         issue
-          ? /issue edit 4242 --repo firelock-ai\/kin-infra --body-file/
-          : /issue create --repo firelock-ai\/kin-infra --title .* --label kin --body-file/,
+          ? /issue edit 4242 --repo kinlab-ai\/kin-infra --body-file/
+          : /issue create --repo kinlab-ai\/kin-infra --title .* --label kin --body-file/,
       );
       // A create or edit routed back to the source repository is the public
       // alarm this change exists to end; kin-infra's name starts with kin's,
       // so the boundary after the name is what tells the two apart.
-      assert.doesNotMatch(calls, /--repo firelock-ai\/kin(\s|$)/m);
+      assert.doesNotMatch(calls, /--repo kinlab-ai\/kin(\s|$)/m);
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -359,7 +359,7 @@ test('the alarm job result overrides missing or stale markers after finalizer or
       for (const previous of ['', JSON.stringify(clear())]) {
         execFileSync('bash', ['-c', script], { env: {
           ...process.env, RUNNER_TEMP: root, RECONCILE_RESULT: result, CURRENT_MARKER: previous,
-          GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com', REPO: 'firelock-ai/kin',
+          GITHUB_RUN_ID: '123', GITHUB_SERVER_URL: 'https://github.com', REPO: 'kinlab-ai/kin',
         } });
         const marker = JSON.parse(fs.readFileSync(path.join(root, 'release-hold-history/current.json'), 'utf8'));
         if (result === 'success') {
@@ -385,7 +385,7 @@ function stagedV0715({ drift, runId, observedAt, mainSha }) {
     ...staged({ drift, blocking: 'v0.7.15', latest: 'v0.7.13' }),
     detail: 'v0.7.15 is already staged on main; tag reconciliation owns the next transition',
     run_id: runId,
-    run_url: `https://github.com/firelock-ai/kin/actions/runs/${runId}`,
+    run_url: `https://github.com/kinlab-ai/kin/actions/runs/${runId}`,
     main_sha: mainSha,
     observed_at: observedAt,
   };

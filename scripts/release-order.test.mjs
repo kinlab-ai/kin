@@ -112,11 +112,11 @@ test('retries transient npm authority failures and fails closed on package 404',
 });
 
 test('distinguishes an absent GitHub Latest release from API failure', async () => {
-  assert.equal(await resolveGitHubLatest('firelock-ai/kin', 'token', {
+  assert.equal(await resolveGitHubLatest('kinlab-ai/kin', 'token', {
     fetchImpl: async () => response(404, { message: 'Not Found' }),
   }), '<none>');
   await assert.rejects(
-    resolveGitHubLatest('firelock-ai/kin', 'token', {
+    resolveGitHubLatest('kinlab-ai/kin', 'token', {
       fetchImpl: async () => response(401, { message: 'Bad credentials' }),
     }),
     /HTTP 401/,

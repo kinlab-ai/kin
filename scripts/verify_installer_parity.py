@@ -21,7 +21,7 @@ from typing import Any
 
 TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-DEFAULT_REPOSITORY = "firelock-ai/kin"
+DEFAULT_REPOSITORY = "kinlab-ai/kin"
 DEFAULT_BASE_URL = "https://get.kinlab.dev"
 
 
