@@ -627,3 +627,42 @@ fn a_restored_checkpoint_keeps_every_base_shape() {
     let after = link_cross_file_incremental(&files, &restored).expect("link after the round trip");
     assert_eq!(override_shapes(&after), override_shapes(&before));
 }
+
+// ── a subscripted base is the class it subscripts ──────────────────────────
+
+/// rich's prompt shape: a generic base and a subclass that names it with a
+/// type argument. `class Confirm(PromptBase[bool])` extends `PromptBase`, so
+/// `Confirm.process_response` overrides `PromptBase.process_response`, and a
+/// change to the base method's signature reaches the override.
+const PROMPT: &str = "\
+from typing import Generic, TypeVar
+
+T = TypeVar('T')
+
+
+class PromptBase(Generic[T]):
+    def process_response(self, value):
+        return value
+
+    def __call__(self, value):
+        return self.process_response(value)
+
+
+class Confirm(PromptBase[bool]):
+    def process_response(self, value):
+        return value == 'y'
+";
+
+#[test]
+fn a_subscripted_base_resolves_to_the_class_it_subscripts() {
+    let files = vec![parse_py("pkg/prompt.py", PROMPT)];
+    for relations in [link(&files), link_certified(&files)] {
+        let confirm = entity_id(&files, "pkg/prompt.py", "Confirm.process_response");
+        let base = entity_id(&files, "pkg/prompt.py", "PromptBase.process_response");
+        assert!(
+            has_override(&relations, confirm, base),
+            "`class Confirm(PromptBase[bool])` overrides `PromptBase.process_response`: {:#?}",
+            overrides_from(&relations, confirm)
+        );
+    }
+}

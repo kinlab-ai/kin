@@ -136,10 +136,17 @@ impl ManagedDocConfig {
     /// Load config from `.kin/assistant-sync.toml`.
     pub fn load(layout: &KinLayout) -> Result<Self> {
         let path = Self::config_path(layout);
-        if !path.exists() {
+        let Some(contents) =
+            crate::store_records::read(layout.root(), &path).map_err(|e| KinError::io(&path, e))?
+        else {
             return Ok(Self::default());
-        }
-        let contents = std::fs::read_to_string(&path).map_err(|e| KinError::io(&path, e))?;
+        };
+        let contents = String::from_utf8(contents).map_err(|e| {
+            KinError::io(
+                &path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            )
+        })?;
         let config: Self = toml::from_str(&contents)?;
         Ok(config)
     }
@@ -148,7 +155,8 @@ impl ManagedDocConfig {
     pub fn save(&self, layout: &KinLayout) -> Result<()> {
         let path = Self::config_path(layout);
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents).map_err(|e| KinError::io(&path, e))?;
+        crate::store_records::write(layout.root(), &path, contents.as_bytes())
+            .map_err(|e| KinError::io(&path, e))?;
         Ok(())
     }
 

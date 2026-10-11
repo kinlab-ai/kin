@@ -3,12 +3,15 @@
 
 //! Guarded creation and removal of declarations.
 //!
-//! Creation has two forms. Anchored creation places a function relative to a
-//! real declaration, bound to that declaration's source base. Unit-addressed
-//! creation names a source unit by language identity and is bound to the
-//! repository base the caller last observed; it is how the first declaration
-//! of an empty repository, and every Go declaration kind, is created. Neither
-//! form accepts a path or an offset.
+//! Creation has two forms. Anchored creation places a declaration relative to
+//! a real one, bound to that declaration's source base: a function beside a
+//! function, and, where the language places members, a method beside a method or in a class, and a
+//! class beside a top-level declaration. Unit-addressed creation names a
+//! source unit by language identity and is bound to the repository base the
+//! caller last observed; it is how the first declaration of an empty
+//! repository, and every Go declaration kind, is created, in every language
+//! whose adapter edits units. Neither form
+//! accepts a path or an offset.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +21,10 @@ use crate::source_unit::{DeclarationKind, ImportSpec, RepositoryBase, SourceUnit
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityPlacement {
+    /// Directly after the anchor, in the scope the anchor is declared in.
     SiblingAfter,
+    /// The last member of the anchor, which is a class.
+    Member,
     NewSourceUnit,
 }
 
@@ -61,7 +67,7 @@ pub enum CreateForm<'a> {
 
 const CREATE_FORMS: &str = "EntityCreate takes one of two forms: addressed to a unit, with \
 repository_base and unit (any supported declaration kind, and the only form for an empty \
-repository), or anchored, with the source_base of a current function and placement";
+repository), or anchored, with the source_base of a current declaration and placement";
 
 fn is_ascii_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
@@ -129,13 +135,17 @@ impl EntityCreate {
         match self.form()? {
             CreateForm::Anchored { source_base, .. } => {
                 source_base.validate()?;
-                if self.kind != DeclarationKind::Function {
-                    return Err(
-                        "anchored EntityCreate creates top-level functions in Rust, Python and \
-                         Go; create other declaration kinds addressed to a unit, with \
-                         repository_base and unit"
-                            .into(),
-                    );
+                if !matches!(
+                    self.kind,
+                    DeclarationKind::Function | DeclarationKind::Method | DeclarationKind::Class
+                ) {
+                    return Err(format!(
+                        "anchored EntityCreate creates a top-level function in {}, and a method \
+                         or a class in {}; create other declaration kinds addressed to a unit, \
+                         with repository_base and unit",
+                        kin_parser::declaration_lifecycle::lifecycle_languages("and"),
+                        kin_parser::member_placement::member_placement_languages("and")
+                    ));
                 }
                 if !self.imports.is_empty() {
                     return Err(
@@ -159,37 +169,43 @@ impl EntityCreate {
                 repository_base.validate()?;
                 unit.validate()?;
                 crate::source_unit::validate_create_imports(unit, &self.imports)?;
-                match unit {
-                    SourceUnit::Go { .. } => {
-                        let expected = self.kind.go()?;
-                        let parsed = kin_parser::go_unit::parse_declaration(&self.body)
-                            .map_err(|error| format!("EntityCreate body: {error}"))?;
-                        if parsed.kind != expected {
-                            return Err(format!(
-                                "EntityCreate kind {} does not match its body, which declares a \
-                                 Go {}",
-                                expected.label(),
-                                parsed.kind.label()
-                            ));
-                        }
-                        // A blank var or const (`var _ Getter = (*Store)(nil)`) is
-                        // named `_` by the caller; its entity takes the derived name
-                        // the reply reports.
-                        let blank = self.name == "_"
-                            && parsed
-                                .names
-                                .first()
-                                .is_some_and(|name| name.starts_with("_ "));
-                        if parsed.names.first() != Some(&self.name) && !blank {
-                            return Err(format!(
-                                "EntityCreate name {:?} must be the body's declared name {:?}: \
-                                 Name, Receiver.Method for a method, the first name of a \
-                                 grouped const or var, or _ for a blank var or const",
-                                self.name,
-                                parsed.names.first().cloned().unwrap_or_default()
-                            ));
-                        }
-                    }
+                let editor = crate::source_unit::unit_editor(unit)?;
+                let language = unit.language();
+                let expected = self.kind.unit();
+                // A syntax problem is said by its line in what was sent,
+                // before the shape of the body is asked about.
+                crate::syntax_gate::refuse_unparseable_code(
+                    language,
+                    self.body.trim(),
+                    &format!("the code sent for {}", self.name),
+                )?;
+                let parsed = editor
+                    .parse_declaration(&self.body)
+                    .map_err(|error| format!("EntityCreate body: {error}"))?;
+                if parsed.kind != expected {
+                    return Err(format!(
+                        "EntityCreate kind {} does not match its body, which declares a {} {}",
+                        expected.label(),
+                        language.profile().display_name,
+                        parsed.kind.label()
+                    ));
+                }
+                // A blank var or const (`var _ Getter = (*Store)(nil)`) is
+                // named `_` by the caller; its entity takes the derived name
+                // the reply reports.
+                let blank = self.name == "_"
+                    && parsed
+                        .names
+                        .first()
+                        .is_some_and(|name| name.starts_with("_ "));
+                if parsed.names.first() != Some(&self.name) && !blank {
+                    return Err(format!(
+                        "EntityCreate name {:?} must be the body's declared name {:?}: Name, \
+                         Receiver.Method for a method, the first name of a grouped const or \
+                         var, or _ for a blank var or const",
+                        self.name,
+                        parsed.names.first().cloned().unwrap_or_default()
+                    ));
                 }
                 Ok(())
             }
@@ -212,12 +228,9 @@ pub fn generated_source_path(
     {
         return Err("new source unit requires one semantic identifier".into());
     }
-    let extension = match language {
-        kin_model::LanguageId::Rust => "rs",
-        kin_model::LanguageId::Python => "py",
-        kin_model::LanguageId::Go => "go",
-        _ => return Err("unsupported lifecycle language".into()),
-    };
+    let extension = kin_parser::declaration_lifecycle::declaration_lifecycle_for(language)
+        .ok_or("unsupported lifecycle language")?
+        .new_unit_extension(&origin.0);
     let parent = std::path::Path::new(&origin.0)
         .parent()
         .ok_or("anchor has no owner directory")?;
@@ -242,16 +255,19 @@ impl EntityRemove {
 }
 
 pub fn entity_create_schema() -> serde_json::Value {
+    let languages = kin_parser::declaration_lifecycle::lifecycle_languages("or");
+    let members = kin_parser::member_placement::member_placement_languages("or");
+    let units = crate::source_unit::unit_language_names();
     serde_json::json!({
         "type":"object",
-        "description":"Create one declaration, in one of two forms, with no path or offset. Addressed to a unit (repository_base and unit): the form for an empty repository and for every Go declaration kind. Kin derives the unit's file, writes its package clause, places the declaration (a method directly after its receiver type or that type's last method, anything else at the end of the unit) and merges imports into the unit's one import block. The operation's target is the declared name. Anchored (source_base and placement): one top-level function in Rust, Python or Go beside a current function, whose UUID is the target. Occupied names, ambiguous placement and stale bases refuse without publication.",
+        "description":format!("Create one declaration in either semantic form. Addressed to a unit (repository_base and unit), in {units}: the form for an empty repository and for every Go declaration kind. Kin resolves the unit, supplies a Go package clause, places the declaration (a Go method directly after its receiver type or that type's last method, anything else at the end of the unit) and merges imports into the unit's import block. The operation's target is the declared name. Anchored (source_base and placement): the anchor's UUID is the target, and its source_base binds the write without its body being resent. One top-level function in {languages} beside a current function. In {members} also a method, with kind method: beside a method of the same class (that method's source_base, placement sibling_after) or as the last member of a class (the class's source_base, placement member); and a class or a function after a top-level class or function (placement sibling_after). The body is the new declaration alone, written at the left margin or as it would sit in the unit: Kin sets it at the indentation of the place it goes. Occupied names, ambiguous placement and stale bases refuse without publication."),
         "properties":{
             "repository_base":crate::source_unit::repository_base_schema(),
             "unit":crate::source_unit::source_unit_schema(),
-            "source_base":crate::source_base::source_base_schema(),
-            "placement":{"type":"string","enum":["sibling_after","new_source_unit"]},
-            "name":{"type":"string","minLength":1,"description":"The declared name as the graph names it: Name, Receiver.Method for a method, the first name of a grouped const or var, or _ for a blank var or const such as var _ Getter = (*Store)(nil), whose entity is named after the assertion (_ Getter = (*Store)(nil))."},
-            "kind":{"type":"string","enum":crate::source_unit::DeclarationKind::WIRE_NAMES,"description":"Go admits function, method, struct, interface, type, const and var; anchored creation admits function. The graph kinds class, type_alias, constant and static_var are accepted as synonyms."},
+            "source_base":crate::source_ticket::write_base_schema(),
+            "placement":{"type":"string","enum":["sibling_after","member","new_source_unit"],"description":"Where the declaration goes. With sibling_after it is written directly after the anchor, in the anchor's scope. With member it becomes the last member of the anchor, which is a class. With new_source_unit it starts a new unit beside the anchor's, for one top-level function."},
+            "name":{"type":"string","minLength":1,"description":"The declared name. Unit form, as the graph names it: Name, Receiver.Method for a method, the first name of a grouped const or var, or _ for a blank var or const such as var _ Getter = (*Store)(nil), whose entity is named after the assertion (_ Getter = (*Store)(nil)). Anchored form: the one identifier the body declares, so a method is named by its own name and not Class.method."},
+            "kind":{"type":"string","enum":crate::source_unit::DeclarationKind::WIRE_NAMES,"description":format!("Go admits function, method, struct, interface, type, const and var; anchored creation admits function, and in {members} method and class. The graph kinds class, type_alias, constant and static_var are accepted as synonyms.")},
             "body":{"type":"string","minLength":1,"description":"Exactly the declaration's source, optionally led by its doc comment: no package clause, imports or sibling declarations."},
             "imports":{"type":"array","items":crate::source_unit::import_spec_schema(),"description":"Unit form: import paths the declaration needs, added to the unit's import block."}
         },
@@ -262,62 +278,13 @@ pub fn entity_create_schema() -> serde_json::Value {
 }
 
 pub fn entity_remove_schema() -> serde_json::Value {
+    let languages = kin_parser::declaration_lifecycle::lifecycle_languages("or");
+    let members = kin_parser::member_placement::member_placement_languages("or");
     serde_json::json!({
         "type":"object",
-        "description":"Remove one source-bound top-level leaf function in Rust, Python or Go, preserving its artifact and siblings. No whole-file removal is admitted.",
-        "properties":{"source_base":crate::source_base::source_base_schema()},
+        "description":format!("Remove one source-bound top-level leaf function in {languages}, with its doc comment, or one method of a class in {members} with whatever is declared inside it, preserving its enclosing unit, its class and its sibling declarations; or one entity Kin holds without parsing it."),
+        "properties":{"source_base":crate::source_ticket::write_base_schema()},
         "required":["source_base"],
-        "additionalProperties":false
-    })
-}
-
-/// The belt's compact forms. They advertise less than the handler accepts (an
-/// import with an alias, the full base schemas) and keep every rule a caller
-/// needs to build a valid operation.
-pub(crate) fn compact_schema(create: bool) -> serde_json::Value {
-    let source_base = serde_json::json!({"type":"object","description":"Unchanged source_base from a current get_entity_source read."});
-    if !create {
-        let mut schema = entity_remove_schema();
-        schema["properties"]["source_base"] = source_base;
-        return schema;
-    }
-    serde_json::json!({
-        "type":"object",
-        "description":"Unit form (empty repository, any Go kind): repository_base and unit, target the name. Anchored form (functions): source_base and placement, target the anchor UUID.",
-        "properties":{
-            "repository_base":COMPACT_REPOSITORY_BASE.clone(),
-            "unit":COMPACT_UNIT.clone(),
-            "source_base":source_base,
-            "placement":{"type":"string","enum":["sibling_after","new_source_unit"]},
-            "name":{"type":"string","description":"Name, or Receiver.Method."},
-            "kind":{"type":"string","enum":crate::source_unit::DeclarationKind::WIRE_NAMES},
-            "body":{"type":"string","minLength":1,"description":"The declaration only: no package clause or imports."},
-            "imports":{"type":"array","items":{"type":"string"},"description":"Import paths it needs."}
-        },
-        "required":["name","kind","body"],
-        "additionalProperties":false
-    })
-}
-
-static COMPACT_REPOSITORY_BASE: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
-    || serde_json::json!({"type":"object","description":"Unchanged repository_base from session, status or the last mutate."}),
-);
-
-static COMPACT_UNIT: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
-    || serde_json::json!({"type":"object","description":"{language:\"go\", package:\".\" or \"internal/store\", name: package name, role:\"source\" or \"test\"}"}),
-);
-
-pub(crate) fn compact_unit_imports_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type":"object",
-        "description":"Add or remove imports on a unit; Kin writes its import block. Target the package name.",
-        "properties":{
-            "repository_base":COMPACT_REPOSITORY_BASE.clone(),
-            "unit":COMPACT_UNIT.clone(),
-            "add":{"type":"array","items":{"type":"string"}},
-            "remove":{"type":"array","items":{"type":"string"}}
-        },
-        "required":["repository_base","unit"],
         "additionalProperties":false
     })
 }
@@ -382,11 +349,11 @@ mod tests {
                 source_base: None,
                 placement: None,
                 repository_base: Some(repository_base()),
-                unit: Some(SourceUnit::Go {
-                    package: "internal/store".into(),
-                    name: "store".into(),
-                    role: crate::source_unit::UnitRole::Source,
-                }),
+                unit: Some(SourceUnit::go(
+                    "internal/store",
+                    "store",
+                    crate::source_unit::UnitRole::Source,
+                )),
                 name: name.into(),
                 kind,
                 body: body.into(),
@@ -471,6 +438,16 @@ mod tests {
             "func (s *Store) Len() int { return 0 }"
         ))
         .contains("Receiver.Method"));
+        // Code that does not parse is refused by the line of its problem.
+        assert_eq!(
+            refused(unit_create(
+                "F",
+                DeclarationKind::Function,
+                "func F() int {\n\treturn g(1\n}"
+            )),
+            "operation #0 ('create'): the code sent for F is not valid Go at line 2, `return \
+             g(1`: `)` is missing"
+        );
         // Kin owns the package clause and the import block.
         assert!(refused(unit_create(
             "F",
@@ -489,11 +466,11 @@ mod tests {
         let Some(crate::McpMutationPayload::EntityCreate(create)) = op.payload.as_mut() else {
             unreachable!()
         };
-        create.unit = Some(SourceUnit::Go {
-            package: "internal/store/store.go".into(),
-            name: "store".into(),
-            role: crate::source_unit::UnitRole::Source,
-        });
+        create.unit = Some(SourceUnit::go(
+            "internal/store/store.go",
+            "store",
+            crate::source_unit::UnitRole::Source,
+        ));
         assert!(refused(op).contains("file"));
         // Both forms at once, or neither, is refused.
         let mut op = unit_create("F", DeclarationKind::Function, "func F() {}");
@@ -516,6 +493,22 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("addressed to a unit"));
+        // A method and a class are anchored kinds too, with a placement of
+        // their own for a class named as the container.
+        for (kind, placement) in [
+            (DeclarationKind::Method, EntityPlacement::SiblingAfter),
+            (DeclarationKind::Method, EntityPlacement::Member),
+            (DeclarationKind::Class, EntityPlacement::SiblingAfter),
+        ] {
+            let mut create = anchored("def added(self):\n    pass");
+            create.kind = kind;
+            create.placement = Some(placement);
+            create.validate().unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(EntityPlacement::Member).unwrap(),
+            "member"
+        );
         let mut create = anchored("fn added() {}");
         create.imports = vec![ImportSpec::Path("std".into())];
         assert!(create.validate().unwrap_err().contains("imports"));
@@ -523,11 +516,7 @@ mod tests {
 
     #[test]
     fn unit_imports_are_closed_and_refuse_ambiguous_changes() {
-        let unit = SourceUnit::Go {
-            package: ".".into(),
-            name: "main".into(),
-            role: crate::source_unit::UnitRole::Source,
-        };
+        let unit = SourceUnit::go(".", "main", crate::source_unit::UnitRole::Source);
         let imports = |add: Vec<&str>, remove: Vec<&str>| crate::source_unit::UnitImports {
             repository_base: repository_base(),
             unit: unit.clone(),
@@ -630,8 +619,81 @@ mod tests {
         for name in ["../escape", "foo/bar", "", "a.py", "a\\b"] {
             assert!(generated_source_path(&origin, kin_model::LanguageId::Python, name).is_err());
         }
+        // A unit beside a TypeScript or JavaScript one takes its owner's
+        // extension; a language without a lifecycle creates no unit.
+        for (owner, language, expected) in [
+            (
+                "src/Button.tsx",
+                kin_model::LanguageId::TypeScript,
+                "src/added.tsx",
+            ),
+            (
+                "src/run.ts",
+                kin_model::LanguageId::TypeScript,
+                "src/added.ts",
+            ),
+            (
+                "lib/run.mjs",
+                kin_model::LanguageId::JavaScript,
+                "lib/added.mjs",
+            ),
+            ("pkg/run.go", kin_model::LanguageId::Go, "pkg/added.go"),
+            ("src/lib.rs", kin_model::LanguageId::Rust, "src/added.rs"),
+        ] {
+            assert_eq!(
+                generated_source_path(&kin_model::FilePathId::new(owner), language, "added")
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+        }
+        assert!(generated_source_path(
+            &kin_model::FilePathId::new("src/Run.java"),
+            kin_model::LanguageId::Java,
+            "added"
+        )
+        .is_err());
+    }
+
+    /// The languages a lifecycle sentence names come from the registry of
+    /// adapter hooks, in registration order, never from a list here.
+    #[test]
+    fn lifecycle_text_names_the_languages_whose_adapters_implement_each_form() {
+        let create = entity_create_schema()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for said in [
+            "Addressed to a unit (repository_base and unit), in typescript, javascript, \
+             python, go, rust:",
+            "One top-level function in TypeScript, JavaScript, Python, Go or Rust beside a \
+             current function.",
+            "In TypeScript, JavaScript, Python, Go or Rust also a method",
+        ] {
+            assert!(create.contains(said), "{said}: {create}");
+        }
+        let remove = entity_remove_schema()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(
-            generated_source_path(&origin, kin_model::LanguageId::JavaScript, "added").is_err()
+            remove.contains(
+                "top-level leaf function in TypeScript, JavaScript, Python, Go or Rust, with its \
+                 doc comment, or one method of a class in TypeScript, JavaScript, Python, Go or \
+                 Rust"
+            ),
+            "{remove}"
         );
+        let mut create = anchored("fn added() {}");
+        create.kind = DeclarationKind::Struct;
+        assert_eq!(
+            create.validate().unwrap_err(),
+            "anchored EntityCreate creates a top-level function in TypeScript, JavaScript, \
+             Python, Go and Rust, and a method or a class in TypeScript, JavaScript, Python, Go \
+             and Rust; create other declaration kinds addressed to a unit, with repository_base \
+             and unit"
+        );
+        assert!(crate::session::ACCEPTED_OPERATION_SHAPES
+            .contains(r#""language": "typescript" | "javascript" | "python" | "go" | "rust","#));
     }
 }

@@ -467,8 +467,12 @@ fn apply_plan_in_memory(
             ..TransactionDelta::default()
         })?;
 
+        let manifests = kin_index::GraphProjectFiles::with_reader(
+            &prospective,
+            crate::source_cas::source_reader_opening(state.blobs.as_ref(), authority_context),
+        );
         let indexed = pipeline
-            .index_any_content(&file_id, &projected, digest)
+            .index_any_content_in(&file_id, &projected, digest, &manifests)
             .with_context(|| format!("reparse renamed exact source {file_id}"))?;
         let kin_index::IndexedAny::EntitySource(mut indexed) = indexed else {
             bail!("renamed source {file_id} no longer classifies as entity source");
@@ -754,6 +758,11 @@ fn rebuild_layouts(
     change: &kin_model::SemanticChange,
 ) -> Result<Vec<FileLayout>> {
     let pipeline = kin_index::IndexPipeline::new();
+    // The recovered tree's own manifests name its units.
+    let manifests = kin_index::TreeProjectFiles::new(
+        &current.tree,
+        crate::source_cas::source_reader_opening(state.blobs.as_ref(), authority_context),
+    );
     let changed = change
         .tree_deltas
         .iter()
@@ -773,7 +782,7 @@ fn rebuild_layouts(
             .ok_or_else(|| anyhow::anyhow!("recovered rename source {file_id} is not a blob"))?;
         let body = load_native_source_blob(authority_context, hash)?;
         let digest = state.blobs.write(&body)?;
-        let indexed = pipeline.index_any_content(&file_id, &body, digest)?;
+        let indexed = pipeline.index_any_content_in(&file_id, &body, digest, &manifests)?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
             bail!("recovered rename source {file_id} is no longer entity source");
         };
@@ -835,7 +844,7 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use kin_model::work::{
         Annotation, AnnotationId, AnnotationKind, IdentityRef, SemanticAnchor, StalenessState,
@@ -846,21 +855,7 @@ mod tests {
     };
 
     fn install_test_registry_override() {
-        static REGISTRY_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
-        let _guard = crate::test_env_lock();
-        let path = REGISTRY_PATH.get_or_init(|| {
-            let root = std::env::temp_dir().join(format!(
-                "kin-daemon-rename-registry-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            let path = root.join("registry.toml");
-            kin_core::registry::KinRegistry { repos: Vec::new() }
-                .save_to(&path)
-                .unwrap();
-            path
-        });
-        kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
+        kin_core::test_env::install_test_registry();
     }
 
     struct RenameFixture {

@@ -3,9 +3,9 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::ids::*;
+pub use crate::metadata_map::MetadataMap;
 
 /// The atomic semantic unit in Kin's graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -111,10 +111,13 @@ pub enum EntityRole {
 }
 
 /// Extensible metadata bag for entities.
+///
+/// The map is shared between copies of an entity until one of them writes;
+/// see [`MetadataMap`]. It is written exactly as the plain map it wraps.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EntityMetadata {
     #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
+    pub extra: MetadataMap,
 }
 
 /// Source location of an entity within a file.

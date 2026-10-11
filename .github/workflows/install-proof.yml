@@ -298,8 +298,8 @@ jobs:
           verified=false
           for attempt in $(seq 1 18); do
             if gh attestation verify "attested-$release_asset" \
-              --repo firelock-ai/kin \
-              --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --repo kinlab-ai/kin \
+              --signer-workflow kinlab-ai/kin/.github/workflows/release.yml \
               --signer-digest "$expected_commit" \
               --source-ref "refs/tags/$expected_tag" \
               --source-digest "$expected_commit" \
@@ -395,8 +395,8 @@ jobs:
           aggregate_verified=false
           for attempt in $(seq 1 18); do
             if gh attestation verify release-provenance.json \
-              --repo firelock-ai/kin \
-              --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --repo kinlab-ai/kin \
+              --signer-workflow kinlab-ai/kin/.github/workflows/release.yml \
               --signer-digest "$expected_commit" \
               --source-ref "refs/tags/$expected_tag" \
               --source-digest "$expected_commit" \
@@ -669,6 +669,9 @@ jobs:
           if (
             meta.embeddings?.vector_enabled !== true ||
             meta.embeddings?.embeddings_enabled !== true ||
+            meta.embeddings?.local_inference_enabled !== false ||
+            meta.embeddings?.external_embeddings_enabled !== true ||
+            meta.embeddings?.provider !== "none" ||
             meta.embeddings?.metal_enabled !== false
           ) {
             throw new Error("installed Windows CLI does not prove the vector feature contract");
@@ -1136,7 +1139,7 @@ jobs:
           kin doctor --json | tee "$captures/kin-doctor.json"
 
           # Drive the absolute installed MCP stdio server through initialize,
-          # tools/list, a real graph-backed semantic_search call, daemon loss,
+          # tools/list, a real graph-backed locate call by name, daemon loss,
           # and a second call that must revive the daemon. Remove the install
           # directory from the child's PATH and clear KIN_DAEMON_BIN: sibling
           # discovery must work on its own, including kin-daemon.exe on Windows.
@@ -1206,16 +1209,16 @@ jobs:
           // startup itself must find the sibling binary without a PATH rescue.
           stopDaemons("before MCP startup");
 
-          const searchArgs = { query: "hello", compact: true, limit: 5 };
+          const searchArgs = { query: "hello", mode: "name", compact: true, limit: 5 };
           // The call takes the shape the launched entry's profile serves: a
           // routed profile lists one `kin` tool, and search goes through it.
-          // Any other profile lists `semantic_search` and is called by name.
+          // Any other profile lists `locate` and is called by name.
           // tools/list must serve the tool the call names, so the listing
           // check below follows the same profile.
           const searchCall = (profile) => (
             typeof profile === "string" && profile.startsWith("agent-routed")
-              ? { name: "kin", arguments: { command: "search", args: searchArgs } }
-              : { name: "semantic_search", arguments: searchArgs }
+              ? { name: "kin", arguments: { command: "locate", args: searchArgs } }
+              : { name: "locate", arguments: searchArgs }
           );
           // What a failure calls the search it made.
           const searchLabel = (call) => (
@@ -1270,13 +1273,33 @@ jobs:
             child.kill("SIGKILL");
             finish(new Error("installed MCP startup/revival proof did not exit within 120 seconds"));
           }, 120_000);
+          // A reply names an entity by its name and the module that holds it,
+          // never by a file, so the seeded function is found as `hello` in
+          // module `probe`.
+          const holdsEntity = (value, name, module) => {
+            if (Array.isArray(value)) return value.some((item) => holdsEntity(item, name, module));
+            if (value && typeof value === "object") {
+              if (value.name === name && value.module === module) return true;
+              return Object.values(value).some((item) => holdsEntity(item, name, module));
+            }
+            return false;
+          };
           const validateSearch = (message, label) => {
             if (!message?.result || message.error || message.result.isError === true) {
               throw new Error(`${label} failed: ${JSON.stringify(message ?? null)}`);
             }
-            const rendered = JSON.stringify(message.result);
-            if (!rendered.includes("hello") || !rendered.includes("probe.py")) {
-              throw new Error(`${label} did not return the seeded hello entity`);
+            const replies = (message.result.content ?? []).flatMap((block) => {
+              try {
+                return [JSON.parse(block?.text)];
+              } catch {
+                return [];
+              }
+            });
+            if (!holdsEntity(replies, "hello", "probe")) {
+              throw new Error(
+                `${label} did not return the seeded hello entity in module probe: ` +
+                JSON.stringify(message.result).slice(0, 500)
+              );
             }
           };
           child.stdout.on("data", (chunk) => {
@@ -1850,8 +1873,11 @@ jobs:
               throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
             }
           };
-          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true ||
+              cliMeta.embeddings?.local_inference_enabled !== false ||
+              cliMeta.embeddings?.external_embeddings_enabled !== true ||
+              cliMeta.embeddings?.metal_enabled !== false || cliMeta.embeddings?.provider !== "none") {
+            throw new Error(`${runnerOs} bench metadata does not prove the engine-free default archive profile`);
           }
           if (!isWindows) {
             validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use kin_index::{
-    FileClassification, FileClassifier, FileEvent, FileWatcher, IndexPipeline, IndexedAny,
+    DeliveryCanary, DeliveryCheck, FileClassification, FileClassifier, FileEvent, FileWatcher,
+    IndexPipeline, IndexedAny,
 };
 use kin_model::layout::ParseCompleteness;
 use kin_model::{
@@ -25,10 +26,77 @@ use crate::state::{
 
 mod source_batch;
 
-pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
+pub(crate) const DISABLE_FILESYSTEM_RECONCILE_ENV: &str =
+    kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV;
 
 /// Callback-delivery deadline, measured after native watcher registration.
+///
+/// Missing it no longer stops the daemon. The watcher comes back with the
+/// unanswered probe recorded as a loss, and the loop recovers that loss with a
+/// complete exact-tree admission while it serves.
 const WATCH_DELIVERY_BOUND: Duration = Duration::from_secs(10);
+
+/// Ceiling of the spacing between complete admissions that recover watcher
+/// losses while the delivery canary has not come back once in between.
+///
+/// A host that stays saturated loses a canary every few seconds, and each loss
+/// owes a complete exact-tree admission. Back to back, those would keep a core
+/// walking the working copy for as long as the host stays busy. Spaced on the
+/// admission-hold ladder instead, from [`ADMISSION_HOLD_BASE`] to this, and reset
+/// the first time a canary is acknowledged. A minute rather than
+/// [`ADMISSION_HOLD_CEILING`], because these passes succeed and each one brings
+/// the graph level with the working copy; the ceiling only bounds how far
+/// behind a busy host's edits can fall.
+const DELIVERY_RECOVERY_SPACING_CEILING: Duration = Duration::from_secs(60);
+
+/// How long to wait before the next complete admission that recovers a watcher
+/// loss, after `recoveries` of them ran with no canary acknowledged in between.
+fn delivery_recovery_spacing(recoveries: u64) -> Duration {
+    let shift = u32::try_from(recoveries.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(31);
+    ADMISSION_HOLD_BASE
+        .saturating_mul(1u32 << shift)
+        .min(DELIVERY_RECOVERY_SPACING_CEILING)
+}
+
+/// How the loop samples its watcher's delivery; see [`DeliveryCanary`].
+///
+/// Always on outside tests. A host that drops watcher events without reporting
+/// it, which macOS FSEvents does under heavy filesystem load, is otherwise
+/// invisible: the loop admits what it is told about and is told nothing. A
+/// fixture that grades one ambient round in isolation turns it off, because a
+/// lost canary's complete exact-tree admission would be a second route to the
+/// state it asserts on.
+fn delivery_canary_for(working_dir: &Path) -> Option<DeliveryCanary> {
+    #[cfg(test)]
+    if let Some(chosen) = delivery_canary_for_test(working_dir) {
+        return chosen;
+    }
+    let _ = working_dir;
+    Some(DeliveryCanary::default())
+}
+
+/// Register the working copy's watcher and sample its shared callback service
+/// within the readiness bound, using the store's actual control directory.
+async fn establish_watcher(layout: &kin_core::KinLayout) -> kin_index::Result<FileWatcher> {
+    let working_dir = layout.working_dir();
+    #[cfg(test)]
+    if let Some(bound) = silent_backend_for_test(working_dir) {
+        return FileWatcher::new_ready_without_delivery_with_control(
+            &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
+            layout.root(),
+            bound,
+        )
+        .await;
+    }
+    FileWatcher::new_ready_with_control(
+        &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
+        layout.root(),
+        WATCH_DELIVERY_BOUND,
+    )
+    .await
+}
 
 // Fixtures spawn the same loop as daemon startup, so their observer includes
 // scheduling and native registration. The narrower delivery deadline starts
@@ -36,17 +104,10 @@ const WATCH_DELIVERY_BOUND: Duration = Duration::from_secs(10);
 #[cfg(test)]
 use crate::daemon::WATCH_ARMING_BOUND;
 
+/// Read through the shared rule, so a sentence that says whether a daemon this
+/// process starts carries the switch answers from the table the daemon obeys.
 fn env_flag_enabled(value: Option<String>) -> bool {
-    value
-        .as_deref()
-        .map(str::trim)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    kin_daemon_spawn::filesystem_reconcile_disabled_by(value.as_deref())
 }
 
 /// Whether this daemon must treat its remote graph as the only write authority.
@@ -307,10 +368,26 @@ enum TreePublication {
     /// that publishes its change, so a tick that publishes first buys nothing
     /// and costs one whole O(store) publication.
     StandaloneUnlessACommitIsWaiting,
+    /// [`StandaloneUnlessACommitIsWaiting`](Self::StandaloneUnlessACommitIsWaiting)
+    /// once the loop has stood down [`MAX_CONSECUTIVE_COMMIT_YIELDS`] rounds in
+    /// a row: the pass still stands down for a commit inside the daemon, and no
+    /// longer for an announcement on disk alone.
+    StandaloneUnlessACommitIsInside,
     /// The caller carries the tree transition in its own transaction. Nothing
     /// is published here, so the caller owns the interval in which the derived
     /// graph holds a tree repository authority has not yet accepted.
     DeferredToCaller,
+}
+
+impl TreePublication {
+    /// Whether this is the ambient watcher path, which stands down for a commit
+    /// or an open merge rather than publishing over it.
+    fn is_ambient(self) -> bool {
+        matches!(
+            self,
+            Self::StandaloneUnlessACommitIsWaiting | Self::StandaloneUnlessACommitIsInside
+        )
+    }
 }
 
 /// State what a watcher could not place inside this repository, or nothing when
@@ -354,8 +431,11 @@ fn repo_path(path: &Path, working_dir: &Path) -> Result<Option<RepoPath>> {
     // events that appear lexically beneath the repository but traverse a
     // directory symlink out of it.
     let canonical_root = working_dir.canonicalize().map_err(DaemonError::Io)?;
-    let canonical_path =
-        kin_index::canonicalize_host_parent_preserving_leaf(path).map_err(DaemonError::Io)?;
+    let canonical_path = kin_index::canonicalize_host_parent_preserving_leaf(
+        &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
+        path,
+    )
+    .map_err(DaemonError::Io)?;
     let relative = canonical_path
         .strip_prefix(&canonical_root)
         .map_err(|error| {
@@ -480,8 +560,11 @@ fn host_entry_matches_entry(
         // looks like once the rules cover it. Retraction untracks rather than
         // deletes, so the file outliving its artifact is the intended end state
         // here and not evidence that the host moved under the admission.
-        let ignore = kin_index::RepositoryIgnore::load(state.layout.working_dir())
-            .map_err(kin_index::IndexError::from)?;
+        let ignore = kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
+            state.layout.working_dir(),
+            &kin_io::Grant::ambient(),
+        ))
+        .map_err(kin_index::IndexError::from)?;
         if ignore.matches(repo_path) {
             return Ok(true);
         }
@@ -645,10 +728,12 @@ fn is_within_graph_only_member(state: &DaemonState, path: &RepoPath) -> Result<b
 /// Who a workspace admission the daemon performed on its own is attributed to.
 ///
 /// Not a person, and deliberately not resolved from one. This actor appears only
-/// on tree admissions the watch loop and the purge path publish without a
-/// caller, so attributing them to whoever last configured a Git identity would
-/// name someone who did not perform them.
-pub(crate) const DAEMON_ADMISSION_ACTOR: &str = "kin-daemon-admission";
+/// on tree admissions: the ones the watch loop and the purge path publish
+/// without a caller, and the ones a command requests through `/commands/admit`,
+/// which run the same seam. Attributing them to whoever last configured a Git
+/// identity would name someone who did not author them. The value lives with
+/// the request type, so the CLI names the same actor the daemon records.
+pub(crate) const DAEMON_ADMISSION_ACTOR: &str = kin_cli::commands::admit::DAEMON_ADMISSION_ACTOR;
 
 /// Returns the authority generation this admission published, or `None` when
 /// the desired tree already matched authority and nothing moved.
@@ -840,11 +925,14 @@ fn refresh_untracked_reading_with(
         .map(|artifact| artifact.path.clone())
         .collect::<Vec<_>>();
     let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
-    let ignore =
-        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let ignore = kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
+        working_dir,
+        &kin_io::Grant::ambient(),
+    ))
+    .map_err(kin_index::IndexError::from)?;
     let started = Instant::now();
     let untracked = kin_index::scan_repository_untracked_paths(
-        working_dir,
+        &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
         &ignore,
         policy.as_ref(),
         tracked_paths.iter(),
@@ -1099,7 +1187,7 @@ fn exact_tree_admission_once(
     // while the host walk is running fails the whole admission instead of
     // having its desired tree replanned onto the newer authority.
     let (expected_roots, policy) = current_authority_admission(state)?;
-    if publication == TreePublication::StandaloneUnlessACommitIsWaiting
+    if publication.is_ambient()
         && crate::api::cached_authority_has_open_merge(state)
             .map_err(|(_, message)| DaemonError::Io(std::io::Error::other(message)))?
     {
@@ -1118,7 +1206,11 @@ fn exact_tree_admission_once(
     let proposes_root_rule =
         observation.is_none_or(|paths| observation_covers_path(paths, &root_rule));
     let ignore = if proposes_root_rule {
-        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?
+        kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
+            working_dir,
+            &kin_io::Grant::ambient(),
+        ))
+        .map_err(kin_index::IndexError::from)?
     } else if let Some(artifact) = previous.artifact_at_path(&root_rule) {
         let TreeEntry::Blob { hash, .. } = artifact.entry else {
             return Err(invalid_tree_transition(
@@ -1231,7 +1323,7 @@ fn exact_tree_admission_once(
         .collect::<Vec<&RepoPath>>();
     let scan = crate::mcp_commit::timed_commit_phase("scan_working_copy", || {
         kin_index::repository::scan_repository_with_native_admission(
-            working_dir,
+            &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
             &ignore,
             policy.as_ref(),
             scan_unignore
@@ -1411,7 +1503,12 @@ fn exact_tree_admission_once(
             &mut relation_deltas,
         )
         .map_err(|error| invalid_tree_transition(error.to_string()))?;
-        entity_deltas.extend(plan_relocated_entities(state, &deltas, &relocations)?);
+        entity_deltas.extend(plan_relocated_entities(
+            state,
+            &previous,
+            &deltas,
+            &relocations,
+        )?);
         let mut live_delta = TransactionDelta {
             entity_deltas,
             relation_deltas,
@@ -1490,13 +1587,24 @@ fn exact_tree_admission_once(
         // itself, because its own admission is unbounded by any observation.
         // Nothing is lost by dropping this transition on the floor, and the
         // whole point is that the commit publishes once for both.
-        if publication == TreePublication::StandaloneUnlessACommitIsWaiting {
-            state
-                .pending_commits
-                .refresh_approaching(state.layout.root());
-        }
-        let yields = publication == TreePublication::StandaloneUnlessACommitIsWaiting
-            && state.pending_commits.any();
+        //
+        // Past the loop's yield bound only a commit already inside the daemon
+        // still takes the publication. Its handler announced itself on its way
+        // to the gate this pass holds, and the gate is first come first served,
+        // so that commit publishes next. An announcement on disk is a client
+        // that has not arrived and may never arrive, and honouring it here
+        // without the bound held ambient admission off for as long as the
+        // announcement stayed fresh.
+        let yields = match publication {
+            TreePublication::StandaloneUnlessACommitIsWaiting => {
+                state
+                    .pending_commits
+                    .refresh_approaching(state.layout.root());
+                state.pending_commits.any()
+            }
+            TreePublication::StandaloneUnlessACommitIsInside => state.pending_commits.inside(),
+            TreePublication::Standalone | TreePublication::DeferredToCaller => false,
+        };
         if defer {
             deferred_tree = Some(admitted);
         } else if yields {
@@ -1724,6 +1832,228 @@ pub(crate) fn prepared_batches_since_for_test(
         .collect()
 }
 
+// Working copies whose watcher backend delivers nothing at all, with the
+// readiness bound it is given. Keyed by working copy because that is all the
+// loop holds when it builds its watcher, and a tempdir is never shared between
+// tests.
+#[cfg(test)]
+static SILENT_BACKENDS_FOR_TEST: std::sync::Mutex<Vec<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Build `working_dir`'s next watcher on a backend that delivers nothing: its
+/// readiness probe goes unanswered for `readiness_bound` and every canary is
+/// lost, the way a saturated FSEvents stream behaves.
+#[cfg(test)]
+// Its callers are the Unix-only real-watcher tests.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn use_silent_backend_for_test(working_dir: &Path, readiness_bound: Duration) {
+    SILENT_BACKENDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((working_dir.to_path_buf(), readiness_bound));
+}
+
+// Working copies whose loop samples delivery differently from a daemon's, or
+// not at all.
+#[cfg(test)]
+static DELIVERY_CANARIES_FOR_TEST: std::sync::Mutex<Vec<(PathBuf, Option<DeliveryCanary>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Sample `working_dir`'s delivery with `canary` instead of the daemon's, or
+/// not at all with `None`, for a fixture that grades one ambient round in
+/// isolation.
+#[cfg(test)]
+pub(crate) fn use_delivery_canary_for_test(working_dir: &Path, canary: Option<DeliveryCanary>) {
+    DELIVERY_CANARIES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((working_dir.to_path_buf(), canary));
+}
+
+#[cfg(test)]
+fn delivery_canary_for_test(working_dir: &Path) -> Option<Option<DeliveryCanary>> {
+    DELIVERY_CANARIES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .rev()
+        .find(|(registered, _)| registered == working_dir)
+        .map(|(_, canary)| *canary)
+}
+
+#[cfg(test)]
+fn silent_backend_for_test(working_dir: &Path) -> Option<Duration> {
+    SILENT_BACKENDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(registered, _)| registered == working_dir)
+        .map(|(_, bound)| *bound)
+}
+
+// How many host notifications the loop drained from its watcher for each
+// repository path, keyed by working copy. Retries the loop injects itself are
+// not counted: this is what the host delivered.
+#[cfg(test)]
+type HostNotificationCounts = HashMap<PathBuf, HashMap<String, u64>>;
+
+#[cfg(test)]
+static HOST_NOTIFICATIONS_FOR_TEST: std::sync::LazyLock<std::sync::Mutex<HostNotificationCounts>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn note_host_notifications_for_test(working_dir: &Path, events: &[FileEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    let mut counts = HOST_NOTIFICATIONS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let counts = counts.entry(working_dir.to_path_buf()).or_default();
+    for event in events {
+        let (FileEvent::Changed(path) | FileEvent::Removed(path)) = event;
+        if let Ok(Some(relative)) = repo_path(path, working_dir) {
+            *counts.entry(relative.to_string()).or_default() += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+fn host_notifications_for_test(working_dir: &Path, path: &str) -> u64 {
+    HOST_NOTIFICATIONS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(working_dir)
+        .and_then(|counts| counts.get(path))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// How long a fixture waits for the loop to receive its host write before it
+/// makes the write again.
+///
+/// Short on purpose. The write it repeats is idempotent and never torn, so
+/// repeating one that was only late costs nothing, while a saturated host
+/// drops about nineteen in twenty notifications and a fixture that tried every
+/// couple of seconds measurably ran out of its bound.
+#[cfg(test)]
+pub(crate) const HOST_NOTIFICATION_PATIENCE: Duration = Duration::from_millis(250);
+
+/// What the loop had received for some paths just before a fixture's host
+/// write, so the fixture can tell a notification the host dropped from one the
+/// loop received.
+///
+/// A saturated macOS host drops watcher events and reports none of it, so a
+/// fixture that waits on one real notification fails on a busy machine for a
+/// reason that has nothing to do with the round under test. The remedy here is
+/// narrow on purpose. The write is made again only while the loop has received
+/// no notification for one of the paths since the mark, and it is a real host
+/// write, never a synthetic event. Once the loop has drained a notification for
+/// every path the fixture only waits, so a loop that received an event and then
+/// mishandled it still fails exactly as before.
+#[cfg(test)]
+pub(crate) struct HostNotificationMark {
+    working_dir: PathBuf,
+    paths: Vec<(String, u64)>,
+}
+
+#[cfg(test)]
+impl HostNotificationMark {
+    /// Take the mark for the host paths a write is about to touch. Call it
+    /// before the first write, so a notification that arrives quickly is not
+    /// mistaken for one received before it.
+    pub(crate) fn take(working_dir: &Path, host_paths: &[&Path]) -> Self {
+        Self {
+            working_dir: working_dir.to_path_buf(),
+            paths: host_paths
+                .iter()
+                .map(|host| {
+                    let path = repo_path(host, working_dir)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            panic!("{} is not inside {}", host.display(), working_dir.display())
+                        })
+                        .to_string();
+                    let before = host_notifications_for_test(working_dir, &path);
+                    (path, before)
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether the loop has received a notification for every path since the
+    /// mark.
+    pub(crate) fn heard(&self) -> bool {
+        self.paths
+            .iter()
+            .all(|(path, before)| host_notifications_for_test(&self.working_dir, path) > *before)
+    }
+
+    /// Wait up to `bound` for `done` after the fixture's first write, making
+    /// the write again with `rewrite` whenever the loop has gone
+    /// [`HOST_NOTIFICATION_PATIENCE`] since the last one without receiving it.
+    ///
+    /// `rewrite` must leave the same bytes and must not expose a torn file to a
+    /// pass reading concurrently: replace by rename, or hold coordination, which
+    /// a pass needs before it reads anything.
+    pub(crate) async fn await_with_rewrites<T>(
+        &self,
+        state: &DaemonState,
+        mut rewrite: impl FnMut(),
+        hold_coordination: bool,
+        done: impl std::future::Future<Output = T>,
+        bound: Duration,
+    ) -> Option<T> {
+        let mut done = std::pin::pin!(done);
+        let deadline = tokio::time::Instant::now() + bound;
+        let mut last_write = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                value = &mut done => return Some(value),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if !self.heard() && now.duration_since(last_write) >= HOST_NOTIFICATION_PATIENCE {
+                eprintln!(
+                    "the loop received no host notification for {:?} within {:?}; the host \
+                     dropped or delayed it, so the same write is made again",
+                    self.paths
+                        .iter()
+                        .map(|(path, _)| path.as_str())
+                        .collect::<Vec<_>>(),
+                    HOST_NOTIFICATION_PATIENCE
+                );
+                if hold_coordination {
+                    let _coordination = state.coordination_gate.lock().await;
+                    rewrite();
+                } else {
+                    rewrite();
+                }
+                last_write = tokio::time::Instant::now();
+            }
+        }
+    }
+}
+
+/// Replace `path` with `contents` by rename, so a pass reading it at the same
+/// moment sees either the old bytes or the new ones and never a torn file. The
+/// staging file is written in the store's control directory, which the loop
+/// never admits.
+#[cfg(test)]
+// Its callers are the Unix-only real-watcher tests.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn replace_by_rename_for_test(working_dir: &Path, path: &Path, contents: &[u8]) {
+    let staging = working_dir
+        .join(".kin")
+        .join(format!("rewrite-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&staging, contents).unwrap();
+    std::fs::rename(&staging, path).unwrap();
+}
+
 // A one-shot interleaving at the exact capture/publication boundary. The
 // address key prevents a concurrent unrelated repository from consuming it.
 #[cfg(test)]
@@ -1821,6 +2151,7 @@ fn note_transition_paths(
 /// needs anything from it.
 fn plan_relocated_entities(
     state: &DaemonState,
+    before: &kin_model::ResolvedTree,
     deltas: &[TreeDelta],
     relocations: &[(FilePathId, FilePathId)],
 ) -> Result<Vec<kin_model::EntityDelta>> {
@@ -1834,6 +2165,7 @@ fn plan_relocated_entities(
     let module_relocations = crate::repository_commit::plan_session_module_relocations(
         state.blobs.as_ref(),
         &authority,
+        before,
         deltas,
     )?;
     for (from_id, to_id) in relocations {
@@ -1918,7 +2250,7 @@ fn level_graph_with_authority(state: &DaemonState) -> Result<Option<AuthorityLev
     let deltas = kin_core::exact_tree_correction(&live_tree, &authority_tree)?;
     evict_enrichment_for_removed_paths(state, &deltas)?;
     let relocations = path_relocations_in(&deltas);
-    let relocated_entities = plan_relocated_entities(state, &deltas, &relocations)?;
+    let relocated_entities = plan_relocated_entities(state, &live_tree, &deltas, &relocations)?;
     let mut moved_coverage = crate::repository_commit::plan_moved_source_coverage_withdrawals(
         state.graph.as_ref(),
         &relocations,
@@ -2162,8 +2494,11 @@ fn admit_file_event_with_exact_tree(
     let file_id = semantic_file_id(&repo_path);
     let in_graph = state.graph.artifact_id_at_path(&repo_path).is_some();
     let tracked = in_graph || admitted_paths.contains(&repo_path);
-    let ignore =
-        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let ignore = kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
+        working_dir,
+        &kin_io::Grant::ambient(),
+    ))
+    .map_err(kin_index::IndexError::from)?;
     if !in_graph && ignore.matches(&repo_path) {
         // The rules exclude this path and graph truth no longer carries it. If
         // the preceding transition is what took it out, it is a retraction and
@@ -2777,7 +3112,7 @@ fn persist_non_entity_enrichment_in(
 /// without embedding support has no surface that asks for this coverage, and
 /// an uncalled function fails the deny-warnings build on exactly those
 /// feature subsets.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Result<usize> {
     ensure_non_entity_enrichment_coverage_in(state.graph.as_ref(), state.blobs.as_ref())
 }
@@ -2787,7 +3122,7 @@ pub(crate) fn ensure_non_entity_enrichment_coverage(state: &DaemonState) -> Resu
 ///
 /// Each record goes through the graph's upserts, and each upsert queues its
 /// artifact for embedding. That is right for a record new to a running graph.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn ensure_non_entity_enrichment_coverage_in(
     graph: &kin_db::InMemoryGraph,
     blobs: &kin_blobs::BlobStore,
@@ -2817,7 +3152,7 @@ fn ensure_non_entity_enrichment_coverage_in(
 }
 
 /// What one non-entity enrichment coverage pass did.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NonEntityCoverage {
     /// Records the pass wrote.
@@ -2852,7 +3187,7 @@ pub(crate) struct NonEntityCoverage {
 ///
 /// Additive and in memory only: no existing record or entity changes, and
 /// nothing is persisted.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub(crate) fn ensure_non_entity_enrichment_coverage_in_snapshot(
     snapshot: &mut kin_db::GraphSnapshot,
     blobs: &kin_blobs::BlobStore,
@@ -2911,7 +3246,7 @@ pub(crate) fn ensure_non_entity_enrichment_coverage_in_snapshot(
 /// `install` receives the record derived for each path that carries none and
 /// reports whether it wrote it. One walk behind every caller is what keeps the
 /// records they derive for the same tree and bodies identical.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn cover_missing_non_entity_facets(
     tree: &kin_model::ResolvedTree,
     blobs: &kin_blobs::BlobStore,
@@ -3466,7 +3801,31 @@ async fn sweep_expired_intents(state: &DaemonState) {
 /// Eight rounds is under a second at the daemon's default cadence, and it is
 /// several orders of magnitude longer than the gap between a commit announcing
 /// itself and reaching the gate, which is the gap this yield exists to cover.
+///
+/// It bounds both places a round stands down: the hold-off before the round
+/// takes the gate ([`wait_out_imminent_commit`]) and the check at the pass's
+/// publication ([`ambient_publication`]). Bounding only the first left a fresh
+/// on-disk announcement able to stand every later round down at its
+/// publication, so a `kin commit` killed after announcing held ambient admission
+/// off for the whole [`kin_daemon_spawn::APPROACHING_COMMIT_STALE_AFTER`], and
+/// any other command that started a daemon then waited out its whole startup
+/// catch-up patience on a catch-up that never ran.
 const MAX_CONSECUTIVE_COMMIT_YIELDS: u32 = 8;
+
+/// How an ambient round publishes after standing down `consecutive_yields`
+/// rounds in a row.
+///
+/// Under [`MAX_CONSECUTIVE_COMMIT_YIELDS`] a round stands down for any commit
+/// the daemon knows of, inside it or announced on disk. At the bound it stands
+/// down only for a commit inside the daemon, whose handler is on its way to the
+/// gate the round holds and publishes next.
+fn ambient_publication(consecutive_yields: u32) -> TreePublication {
+    if consecutive_yields < MAX_CONSECUTIVE_COMMIT_YIELDS {
+        TreePublication::StandaloneUnlessACommitIsWaiting
+    } else {
+        TreePublication::StandaloneUnlessACommitIsInside
+    }
+}
 
 /// The largest share of a publication that is worth spending to avoid one.
 const COMMIT_YIELD_GRACE_SHARE: u32 = 8;
@@ -3621,6 +3980,16 @@ fn hold_next_round_at_for_test(
     (reached_by_test, released_by_test)
 }
 
+/// Withdraw every hold asked for on `state` that no round has reached yet.
+#[cfg(all(test, unix))]
+fn cancel_round_holds_for_test(state: &DaemonState) {
+    let owner = state as *const DaemonState as usize;
+    ROUND_HOLDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|hold| hold.owner != owner);
+}
+
 /// Where a round passes `point`: waits there if a test asked it to.
 #[cfg(test)]
 async fn round_hold_point_for_test(state: &DaemonState, point: RoundHoldPoint) {
@@ -3686,9 +4055,14 @@ async fn park_reconcile_loop(
 /// 4. Projects overlay mutations back to files (overlay -> file)
 ///
 /// The loop runs on a tokio task and shares state through `DaemonState`.
-/// The reconcile loop's one-shot promise of verified watcher callback delivery.
+/// The reconcile loop's one-shot promise that its watcher is registered and
+/// its delivery is accounted for.
 ///
-/// Fired only after the watcher acknowledges its control probe. Dropping it closes the
+/// Fired once the watcher is registered and its control probe has either been
+/// acknowledged or, unanswered within the bound, recorded as a loss the loop
+/// recovers with a complete exact-tree admission. Either way no write that
+/// lands after the endpoint appears goes unaccounted for: it is delivered, or
+/// the loss that dropped it is disclosed and recovered. Dropping it closes the
 /// channel, which tells endpoint publication that no watch exists rather than
 /// fabricating an `Armed` result. A loop can end before it ever builds a watcher
 /// — filesystem reconcile switched off, a bare checkout, a watcher the host
@@ -3885,10 +4259,13 @@ pub(crate) fn plan_catch_up(state: &DaemonState, since: SystemTime) -> Result<Ca
     let (_, policy) = current_authority_admission(state)?;
     let previous = state.graph.resolved_tree();
     let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
-    let ignore =
-        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
-    let changes = kin_index::scan_working_copy_changes_since(
+    let ignore = kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
         working_dir,
+        &kin_io::Grant::ambient(),
+    ))
+    .map_err(kin_index::IndexError::from)?;
+    let changes = kin_index::scan_working_copy_changes_since(
+        &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
         &ignore,
         policy.as_ref(),
         previous
@@ -4318,8 +4695,10 @@ pub(crate) fn spans_a_fresh_parse_does_not_reproduce(
 /// daemon life. A store whose files were committed through Kin pays a tree walk
 /// and no parses at all.
 pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<LayoutBackfill> {
+    let tree = state.graph.resolved_tree();
+    crate::source_cas::restage_naming_manifests(state, &tree);
     derive_missing_source_layouts(
-        &state.graph.resolved_tree(),
+        &tree,
         state.blobs.as_ref(),
         |file_id| {
             Ok(if state.graph.get_file_layout(file_id)?.is_some() {
@@ -4356,7 +4735,7 @@ pub(crate) fn backfill_missing_file_layouts(state: &DaemonState) -> Result<Layou
 /// absent here so canonical startup still observes and repairs or refuses them.
 /// Fresh layouts arrive without graph mutations or embedding work; the later
 /// startup pass sees them present and does not parse their bodies again.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub(crate) fn restore_missing_source_layouts_in_snapshot(
     snapshot: &mut kin_db::GraphSnapshot,
     blobs: &kin_blobs::BlobStore,
@@ -4438,7 +4817,11 @@ fn derive_missing_source_layouts(
 ) -> Result<LayoutBackfill> {
     let mut report = LayoutBackfill::default();
     let pipeline = IndexPipeline::new();
+    // The tree's own manifests name its units.
+    let project = kin_index::TreeProjectFiles::from_blobs(tree, blobs);
 
+    // The paths that carry no facet yet, in path order.
+    let mut owed = Vec::new();
     for artifact in tree.artifacts_by_path() {
         let Some(path) = artifact.path.as_utf8() else {
             continue;
@@ -4472,43 +4855,74 @@ fn derive_missing_source_layouts(
             }
             SourceLayoutFacet::Missing => {}
         }
-
         // `TreeEntry` carries kin-model's hash and the blob store speaks
         // kin-blobs', so the identity crosses that boundary by bytes, exactly
         // as the historical rebuild crosses it.
-        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
-        let Ok(content) = blobs.read(&body_hash) else {
-            debug!(
-                file = %file_id,
-                "no CAS body for an admitted artifact, so its parse observation stays unpublished"
-            );
-            report.unreadable += 1;
-            continue;
-        };
-        // Content decides the facet, exactly as admission decides it: a path
-        // whose extension says source but whose bytes are opaque belongs to
-        // another facet and must not grow an entity-source layout here.
-        if !matches!(
-            FileClassifier::classify_with_content(Path::new(path), &content),
-            FileClassification::EntitySource
-        ) {
-            continue;
-        }
+        owed.push((
+            artifact,
+            path,
+            file_id,
+            kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+        ));
+    }
 
-        let indexed = match pipeline.index_file_content_with_tests(&file_id, &content, body_hash) {
-            Ok(indexed) => indexed.indexed_file,
-            Err(error) => {
-                debug!(
-                    file = %file_id,
-                    error = %error,
-                    "graph-owned source could not be indexed, so its parse observation stays \
-                     unpublished rather than being guessed"
-                );
+    // Each owed file is read and parsed on its own, so the parses run in
+    // parallel; what they found is published below in path order, as a
+    // sequential walk publishes it. A Git import leaves every source file
+    // owed, and one parse after another held a 4,561-file repository's
+    // daemon for most of a minute before it served anything.
+    enum Parsed {
+        Unreadable,
+        NotSource,
+        Indexed(Box<kin_index::IndexedFile>, usize),
+    }
+    let parsed: Vec<Parsed> = {
+        use rayon::prelude::*;
+        owed.par_iter()
+            .map(|(_, path, file_id, body_hash)| {
+                let Ok(content) = blobs.read(body_hash) else {
+                    debug!(
+                        file = %file_id,
+                        "no CAS body for an admitted artifact, so its parse observation stays unpublished"
+                    );
+                    return Parsed::Unreadable;
+                };
+                // Content decides the facet, exactly as admission decides it: a
+                // path whose extension says source but whose bytes are opaque
+                // belongs to another facet and must not grow an entity-source
+                // layout here.
+                if !matches!(
+                    FileClassifier::classify_with_content(Path::new(path), &content),
+                    FileClassification::EntitySource
+                ) {
+                    return Parsed::NotSource;
+                }
+                match pipeline.index_file_content_in(file_id, &content, *body_hash, &project) {
+                    Ok(indexed) => Parsed::Indexed(Box::new(indexed.indexed_file), content.len()),
+                    Err(error) => {
+                        debug!(
+                            file = %file_id,
+                            error = %error,
+                            "graph-owned source could not be indexed, so its parse observation \
+                             stays unpublished rather than being guessed"
+                        );
+                        Parsed::Unreadable
+                    }
+                }
+            })
+            .collect()
+    };
+
+    for ((artifact, _, file_id, _), parsed) in owed.into_iter().zip(parsed) {
+        let (indexed, content_len) = match parsed {
+            Parsed::Unreadable => {
                 report.unreadable += 1;
                 continue;
             }
+            Parsed::NotSource => continue,
+            Parsed::Indexed(indexed, content_len) => (indexed, content_len),
         };
-        let mut completeness = indexed.file_layout.parse_completeness;
+        let mut completeness = indexed.file_layout.parse_completeness.clone();
 
         let mut entities = entities_for(&file_id)?;
         // The live file query is id-sorted before this stable span sort.
@@ -4547,7 +4961,7 @@ fn derive_missing_source_layouts(
             ));
         }
         let layout =
-            kin_core::build_entity_file_layout(&file_id, &entities, content.len(), completeness);
+            kin_core::build_entity_file_layout(&file_id, &entities, content_len, completeness);
         if install(layout, stale > 0 || missing > 0)? {
             report.published += 1;
         }
@@ -4579,7 +4993,7 @@ pub async fn run_loop(
 /// that same strict reader over every admitted source, so the one pass also
 /// covers a source none of the planners named, such as one whose declarations
 /// an older parser minted.
-async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()> {
+pub(crate) async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()> {
     // Under the gate every other graph-authority mutation takes, including the
     // watcher tick, commit and checkout, and held from planning through the
     // final restore: the census names what the pass must cover, and a mutation
@@ -4743,6 +5157,13 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
         .cloned()
         .collect();
     if failures.is_empty() && !owed.is_empty() {
+        // What the live graph holds before the pass touches it, which is what
+        // this start loaded from repository authority: the census above and
+        // the layout backfill read the graph's semantics and write none of
+        // them. Captured only on a start that re-derives, so a healthy store
+        // pays nothing for it.
+        let loaded =
+            crate::local_repository_authority::SemanticDomains::capture(state.graph.as_ref());
         // Each file is counted under the first cause that names it, so the
         // three counts add up to the files re-derived.
         #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4805,16 +5226,37 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
                  version produced; the commit records their bytes either way"
             );
         }
+        let mut withheld = Vec::new();
         if unresolved.is_empty() {
-            if let Err(error) = state
+            // Every coherent source is installed. A unit that still disagrees
+            // with its own bytes after its re-derivation is a defect in how
+            // that unit is read, and it is held partly parsed with its reason
+            // rather than keeping the whole repository from being served.
+            match state
                 .reconciler
                 .write()
                 .await
-                .restore_canonical_source_state(state.graph.as_ref(), state.blobs.as_ref())
-            {
-                failures.push(format!(
+                .restore_canonical_source_state_withholding(
+                    state.graph.as_ref(),
+                    state.blobs.as_ref(),
+                ) {
+                Ok(held) => withheld = held,
+                Err(error) => failures.push(format!(
                     "canonical source and dependency reconstruction failed: {error}"
-                ));
+                )),
+            }
+            if !withheld.is_empty() {
+                warn!(
+                    units = withheld
+                        .iter()
+                        .map(|source| format!("{} ({})", source.file, source.reason))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    "these units still disagree with their own bytes after re-derivation; each \
+                     is held as a partly parsed entity with that reason and gets no editable \
+                     projection, and the rest of the repository is served"
+                );
+                hold_partly_parsed(state, &withheld);
             }
         } else {
             failures.push(format!(
@@ -4833,6 +5275,7 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
             let unparsed: BTreeSet<&str> = unparseable
                 .iter()
                 .map(|failure| failure.path.as_str())
+                .chain(withheld.iter().map(|source| source.file.0.as_str()))
                 .collect();
             let rederived: Vec<&RepoPath> = owed
                 .iter()
@@ -4864,6 +5307,7 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
                 "re-derived the owed source files; this daemon now serves them from their \
                  current bytes, and the next commit records the result durably"
             );
+            record_startup_rederivation(state, &loaded, &counts.paths);
             state
                 .background_work
                 .reconcile()
@@ -4882,6 +5326,108 @@ async fn repair_canonical_semantics_at_startup(state: &DaemonState) -> Result<()
             failures.join("; ")
         )))
     }
+}
+
+/// Hold what the startup repair re-derived for the next commit to record.
+///
+/// Authority keeps the older derivation until a commit records the new one.
+/// Without this record the first repository command reads what the repair took
+/// out as something the daemon lost and refuses, on every start, because every
+/// start repairs the same store; and an MCP commit, which plans from
+/// authority's own graph, re-derives its edit against dependents the strict
+/// reader refuses for still holding the older derivation.
+///
+/// Taken while the caller still holds the coordination gate it held before the
+/// repair began, so the live graph before the pass held exactly what the start
+/// loaded from authority. A transition that cannot be planned is logged rather
+/// than failing the start: the daemon still serves what it re-derived.
+fn record_startup_rederivation(
+    state: &DaemonState,
+    loaded: &crate::local_repository_authority::SemanticDomains,
+    files: &[String],
+) {
+    let repaired =
+        crate::local_repository_authority::SemanticDomains::capture(state.graph.as_ref());
+    let transition = match crate::local_repository_authority::plan_workspace_graph_transition(
+        loaded.target(),
+        repaired.target(),
+    ) {
+        Ok(transition) => transition,
+        Err(error) => {
+            warn!(
+                %error,
+                "could not record what the startup repair re-derived, so a repository command \
+                 on this daemon may read it as lost authority until the daemon is replaced"
+            );
+            return;
+        }
+    };
+    let mut files = files
+        .iter()
+        .filter_map(|file| RepoPath::from_utf8(file.clone()).ok())
+        .collect::<Vec<_>>();
+    files.sort();
+    let record = crate::local_repository_authority::StartupRederivation::new(&transition, files);
+    if !record.is_empty() {
+        info!(
+            files = record.files.len(),
+            entities = record.entities.len(),
+            relations = record.relations.len(),
+            entities_removed = record.entities_removed.len(),
+            relations_removed = record.relations_removed.len(),
+            "holding what the startup repair re-derived for the next commit to record; \
+             repository commands read it as the repair rather than as a loss"
+        );
+    }
+    if let Ok(mut held) = state.startup_rederivation.lock() {
+        *held = record;
+    }
+}
+
+/// Record each withheld unit as partly parsed, with the check it failed.
+///
+/// The unit keeps the declarations the graph holds for it. Its layout is the
+/// record readers consult for how completely a unit was read, so the reason
+/// lands there: `list_file_entities` and the doctor's parse coverage then
+/// report the unit partial and say why, instead of the daemon refusing to
+/// serve. A unit with no layout gets one built from the declarations the graph
+/// holds. Each failure to record is logged and never stops the start.
+fn hold_partly_parsed(state: &DaemonState, withheld: &[kin_reconcile::StaleCanonicalSource]) {
+    for source in withheld {
+        let completeness = ParseCompleteness::Partial(format!(
+            "held partly parsed: {}; it has no editable projection until it is re-derived",
+            source.reason
+        ));
+        let layout = match state.graph.get_file_layout(&source.file) {
+            Ok(Some(mut layout)) => {
+                layout.parse_completeness = completeness;
+                layout
+            }
+            Ok(None) => {
+                let entities = state
+                    .graph
+                    .query_entities(&EntityFilter {
+                        file_path: Some(source.file.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default();
+                let len = entities
+                    .iter()
+                    .filter_map(|entity| entity.span.as_ref().map(|span| span.end_byte))
+                    .max()
+                    .unwrap_or(0);
+                kin_core::build_entity_file_layout(&source.file, &entities, len, completeness)
+            }
+            Err(error) => {
+                warn!(unit = %source.file, %error, "could not read this unit's layout to record why it is held partly parsed");
+                continue;
+            }
+        };
+        if let Err(error) = state.graph.upsert_file_layout(&layout) {
+            warn!(unit = %source.file, %error, "could not record why this unit is held partly parsed");
+        }
+    }
+    state.bump_version();
 }
 
 /// Finish canonical local repair before any host catch-up or normal serving.
@@ -4997,7 +5543,7 @@ pub async fn run_loop_armed(
         return Ok(());
     }
     let mut watcher = tokio::select! {
-        result = FileWatcher::new_ready(working_dir, WATCH_DELIVERY_BOUND) => {
+        result = establish_watcher(&state.layout) => {
             match result {
                 Ok(watcher) => watcher,
                 Err(error) => {
@@ -5010,6 +5556,18 @@ pub async fn run_loop_armed(
         }
         _ = startup_cancel.changed() => return Ok(()),
     };
+    if !watcher.delivery_proven() && watcher.lost_events().generation > 0 {
+        // Serving anyway is the point. The probe went unanswered, which a
+        // saturated macOS host does to every event for seconds at a time, and a
+        // daemon that refused to start over it left the user with no graph at
+        // all. The loss is recorded, so the first tick persists and discloses it
+        // and recovers it with a complete exact-tree admission.
+        warn!(
+            bound_s = WATCH_DELIVERY_BOUND.as_secs(),
+            "the watcher did not acknowledge its readiness probe; serving with delivery \
+             unproven and recovering with a complete exact-tree admission"
+        );
+    }
     // Read while the watcher is already reporting and before the endpoint can
     // be published, so the catch-up window and the watch meet rather than leave
     // a seam between them.
@@ -5141,6 +5699,14 @@ pub async fn run_loop_armed(
     // neither may turn the normal 100ms poll into a complete-tree retry loop.
     let mut watcher_recovery_after: Option<Instant> = None;
     let mut watcher_recovery_attempts = 0_u64;
+    // Complete admissions that recovered a watcher loss with no delivery canary
+    // acknowledged since, and the earliest the next may start. Kept apart from
+    // the failure ladder above because these passes succeed: what they space is
+    // a host that keeps dropping events, not an admission that keeps failing.
+    let delivery_canary = delivery_canary_for(working_dir);
+    let mut delivery_recoveries_unverified = 0_u64;
+    let mut delivery_recovery_not_before: Option<Instant> = None;
+    let mut delivery_unverifiable_disclosed = false;
     // Up while `pending_events` holds anything this loop is still going to
     // attempt, across rounds; see [`QueuedEventsMark`].
     let mut queued_mark = QueuedEventsMark::default();
@@ -5254,7 +5820,10 @@ pub async fn run_loop_armed(
             );
             incoming_events.extend(due_retries.into_iter().map(FileEvent::Changed));
         }
-        incoming_events.extend(watcher.drain());
+        let drained = watcher.drain();
+        #[cfg(test)]
+        note_host_notifications_for_test(working_dir, &drained);
+        incoming_events.extend(drained);
         // An event the watcher could not place inside this repository never
         // reaches anything below, so this loop is the only place that can say it
         // happened. Silence here is the whole defect: a repository reached
@@ -5274,12 +5843,32 @@ pub async fn run_loop_armed(
                 .reconcile()
                 .record_event_skipped(disclosure, tick_started);
         }
+        // Sampled before the loss below is disclosed, so a canary lost this
+        // tick is persisted and recovered in the same tick.
+        if let Some(canary) = delivery_canary.as_ref() {
+            match watcher.verify_delivery(tick_started, canary) {
+                DeliveryCheck::Verified => {
+                    delivery_recoveries_unverified = 0;
+                    delivery_recovery_not_before = None;
+                }
+                DeliveryCheck::Unverifiable if !delivery_unverifiable_disclosed => {
+                    info!(
+                        "this watcher cannot sample its own delivery, so an event its backend \
+                         drops without reporting it goes unnoticed until the next complete \
+                         admission"
+                    );
+                    delivery_unverifiable_disclosed = true;
+                }
+                _ => {}
+            }
+        }
         let loss_persisted =
             disclose_watcher_loss(&state, watcher.lost_events(), &mut disclosed_watcher_loss);
         let watcher_recovery_owed =
             !loss_persisted || crate::watcher_loss::read(&state.layout).recovery_required();
         let watcher_recovery_due = watcher_recovery_owed
-            && watcher_recovery_after.is_none_or(|after| tick_started >= after);
+            && watcher_recovery_after.is_none_or(|after| tick_started >= after)
+            && delivery_recovery_not_before.is_none_or(|after| tick_started >= after);
         if !watcher_recovery_owed {
             watcher_recovery_after = None;
             watcher_recovery_attempts = 0;
@@ -5566,6 +6155,9 @@ pub async fn run_loop_armed(
 
         if watcher_recovery_due {
             info!("recovering lost watcher events with a complete exact-tree admission");
+            // The pass observes the whole tree as it stands when it starts, so
+            // the canary outstanding now asks a question it is about to answer.
+            watcher.restart_delivery_sampling();
             let mut checkpoint_persisted = false;
             // The watch receiver is Send but not Sync. Keep its exclusive
             // borrow across the pass rather than sharing it between tasks.
@@ -5592,6 +6184,11 @@ pub async fn run_loop_armed(
             }
             let recovered = checkpoint_persisted
                 && !crate::watcher_loss::read(&state.layout).recovery_required();
+            if delivery_canary.is_some() {
+                delivery_recoveries_unverified = delivery_recoveries_unverified.saturating_add(1);
+                delivery_recovery_not_before =
+                    Some(now + delivery_recovery_spacing(delivery_recoveries_unverified));
+            }
             if recovered {
                 watcher_recovery_after = None;
                 watcher_recovery_attempts = 0;
@@ -5778,7 +6375,7 @@ pub async fn run_loop_armed(
         let mut exact_admission = match exact_tree_admission_with_reconciler(
             &state,
             Some(&observation),
-            TreePublication::StandaloneUnlessACommitIsWaiting,
+            ambient_publication(commit_yields),
             &mut reconciler,
         ) {
             // A commit entered the daemon while this pass was walking the
@@ -6689,6 +7286,7 @@ mod tests {
     include!("loop_runner/tests/already_held_round.rs");
     include!("loop_runner/tests/offline_tracked_changes.rs");
     include!("loop_runner/tests/single_source_scope.rs");
+    include!("loop_runner/tests/silent_watcher.rs");
 
     #[test]
     fn partial_c_disclosure_persists_and_only_clean_outcomes_settle() {
@@ -6931,6 +7529,10 @@ mod tests {
             "an actual empty semantic delta must not enter graph application"
         );
 
+        // This grades the ambient round that takes one notification. A lost
+        // canary's complete admission would be a second route to the same
+        // retained-parse and layout state, so delivery is not sampled here.
+        use_delivery_canary_for_test(state.layout.working_dir(), None);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
         let runner = tokio::spawn(run_loop_armed(
@@ -7073,17 +7675,29 @@ mod tests {
         };
         // Replacing the inode produces a real host event even when the bytes
         // are unchanged. The final source remains identical in that arm.
-        let replacement = repo.path().join(".kin/stable-notification");
+        let working_dir = state.layout.working_dir().to_path_buf();
+        let notified = HostNotificationMark::take(&working_dir, &[host.as_path()]);
+        let replacement = state.layout.root().join("stable-notification");
         std::fs::write(&replacement, content).unwrap();
         std::fs::rename(&replacement, &host).unwrap();
         drop(coordination);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while (pass.progress() <= before || !controlled_completed())
-            && Instant::now() < deadline
-            && !runner.is_finished()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // A saturated host can drop that event outright and say nothing, so the
+        // same replacement is made again only while the loop has received none.
+        notified
+            .await_with_rewrites(
+                &state,
+                || replace_by_rename_for_test(&working_dir, &host, content.as_bytes()),
+                false,
+                async {
+                    while (pass.progress() <= before || !controlled_completed())
+                        && !runner.is_finished()
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                },
+                Duration::from_secs(60),
+            )
+            .await;
         let finished_before_cancel = runner.is_finished();
         cancel_tx.send(true).ok();
         let terminated = runner.await;
@@ -7471,8 +8085,8 @@ mod tests {
             .unwrap();
     }
 
-    /// The relation ids that point AT `entity`, sorted, which is what a caller
-    /// keeps or loses across a move.
+    /// Incoming source-reference ids, sorted, which an import keeps or loses
+    /// across a move. Module containment is structural, not a caller reference.
     #[cfg(unix)]
     fn incoming_relations(
         state: &Arc<DaemonState>,
@@ -7484,11 +8098,50 @@ mod tests {
             .get_all_relations_for_node(&node)
             .unwrap()
             .into_iter()
-            .filter(|relation| relation.dst == node)
+            .filter(|relation| {
+                relation.dst == node
+                    && matches!(
+                        relation.kind,
+                        kin_model::RelationKind::Calls
+                            | kin_model::RelationKind::Imports
+                            | kin_model::RelationKind::References
+                    )
+            })
             .map(|relation| relation.id)
             .collect::<Vec<_>>();
         incoming.sort();
         incoming
+    }
+
+    /// The fixture must hold real source references alongside its structural
+    /// parent edge, so filtering containment cannot hide a missing caller.
+    #[cfg(unix)]
+    fn assert_moved_target_relation_classes(state: &Arc<DaemonState>, entity: kin_model::EntityId) {
+        let node = kin_model::GraphNodeId::Entity(entity);
+        let kinds = state
+            .graph
+            .get_all_relations_for_node(&node)
+            .unwrap()
+            .into_iter()
+            .filter(|relation| relation.dst == node)
+            .map(|relation| relation.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds.len(),
+            3,
+            "one call, one import and one structural parent"
+        );
+        for expected in [
+            kin_model::RelationKind::Calls,
+            kin_model::RelationKind::Imports,
+            kin_model::RelationKind::Contains,
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|kind| **kind == expected).count(),
+                1,
+                "the fixture must hold one {expected:?}: {kinds:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -7551,8 +8204,9 @@ mod tests {
         let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
         let caller = sole_entity_named(&state, CALLER_PATH, "moved_caller");
         let incoming = incoming_relations(&state, target.id);
-        // The module's `Imports` and the function's `Calls`, which is what
-        // `kin refs moved_target` renders as two referencing entities.
+        // Parsing also holds module containment. The two source references
+        // here are the caller module's Imports and the caller function's Calls.
+        assert_moved_target_relation_classes(&state, target.id);
         assert_eq!(
             incoming.len(),
             2,
@@ -7847,6 +8501,7 @@ mod tests {
         derive_semantics_linked(&state, CALLER_PATH);
 
         let target = sole_entity_named(&state, MOVED_PATH, "moved_target");
+        assert_moved_target_relation_classes(&state, target.id);
         assert_eq!(
             incoming_relations(&state, target.id).len(),
             2,
@@ -8661,11 +9316,19 @@ mod tests {
             startup_diagnostic_write_legacy_marker(&state, &[path]);
         }
         let expected_tree = state.graph.resolved_tree();
+        let source_store = state.layout.root().to_path_buf();
         drop(state);
         // The watched directory never held the source projection. A real
         // deletion notification from fixture setup cannot masquerade as repair.
         let repo = tempfile::tempdir().unwrap();
-        copy_canonical_test_store(&original.path().join(".kin"), &repo.path().join(".kin"));
+        let destination_store = kin_core::layout::reserve_store_root(repo.path()).unwrap();
+        copy_canonical_test_store(&source_store, &destination_store);
+        kin_core::layout::stage_store_placement(
+            &destination_store,
+            &destination_store,
+            repo.path(),
+        )
+        .unwrap();
         let state = Arc::new(
             DaemonState::open(kin_core::KinLayout::discover(repo.path()).unwrap()).unwrap(),
         );
@@ -12942,6 +13605,96 @@ mod tests {
         );
     }
 
+    /// The same bound at the other place a round stands down, its publication.
+    ///
+    /// Honoured there without the bound, an announcement on disk alone stood
+    /// every round down until it went stale. A `kin commit` killed after
+    /// announcing held ambient admission off for a minute, and a query that
+    /// started a daemon inside that minute waited out its whole startup
+    /// catch-up patience on a catch-up that never ran. Past the bound the round
+    /// publishes over a bare announcement, and still yields to a commit inside
+    /// the daemon, which is on its way to the gate the round holds.
+    ///
+    /// Falsify by making `ambient_publication` answer
+    /// `StandaloneUnlessACommitIsWaiting` at every count: the last round then
+    /// stands down for the announcement and publishes nothing.
+    #[test]
+    // A standalone publication emits commit phases; see
+    // `a_tick_that_meets_a_commit_at_its_publication_publishes_nothing`.
+    #[serial_test::serial(commit_phase_capture)]
+    fn past_the_yield_bound_an_announcement_alone_no_longer_takes_the_publication() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(repo.path().join("owed.rs"), b"pub fn owed() -> u32 { 1 }\n").unwrap();
+        let repo_path = test_repo_path("owed.rs");
+        let observation = std::iter::once(repo_path.clone()).collect::<BTreeSet<_>>();
+        announce_approaching_commit(&state, 0);
+        let before = authority_generation(&state);
+
+        let within = exact_tree_admission(
+            &state,
+            Some(&observation),
+            ambient_publication(MAX_CONSECUTIVE_COMMIT_YIELDS - 1),
+        )
+        .unwrap();
+        assert!(
+            within.yielded_authority,
+            "within the bound a fresh announcement takes the publication"
+        );
+        assert_eq!(authority_generation(&state), before);
+
+        let inside = state.pending_commits.announce();
+        let queued = exact_tree_admission(
+            &state,
+            Some(&observation),
+            ambient_publication(MAX_CONSECUTIVE_COMMIT_YIELDS),
+        )
+        .unwrap();
+        assert!(
+            queued.yielded_authority,
+            "past the bound a commit inside the daemon still takes the publication, because it \
+             is on its way to the gate this pass holds and publishes next"
+        );
+        assert_eq!(authority_generation(&state), before);
+        drop(inside);
+
+        let past = exact_tree_admission(
+            &state,
+            Some(&observation),
+            ambient_publication(MAX_CONSECUTIVE_COMMIT_YIELDS),
+        )
+        .unwrap();
+        assert!(
+            kin_daemon_spawn::read_approaching_commit(state.layout.root()).is_some_and(
+                |announced| announced.is_fresh(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                )
+            ),
+            "the announcement is still fresh, so only the bound can have changed the answer"
+        );
+        assert!(
+            !past.yielded_authority,
+            "past the bound an announcement with no commit behind it no longer holds the \
+             publication off"
+        );
+        assert_eq!(
+            authority_generation(&state) - before,
+            1,
+            "the round publishes the path it observed"
+        );
+        assert!(
+            state
+                .graph
+                .resolved_tree()
+                .artifact_at_path(&repo_path)
+                .is_some(),
+            "the derived graph carries the admitted path"
+        );
+    }
+
     /// The grace is worth a fraction of what it protects, never a fixed price.
     /// A repository whose publications are microseconds must not spend half a
     /// second holding off from one.
@@ -13010,6 +13763,7 @@ mod tests {
     async fn canceled_startup_does_not_arm_or_create_a_probe() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
+        let store_root = state.layout.root().to_path_buf();
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
         let (armed_tx, mut armed_rx) = tokio::sync::oneshot::channel();
         tokio::time::timeout(
@@ -13028,13 +13782,11 @@ mod tests {
             armed_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         ));
-        assert!(std::fs::read_dir(repo.path().join(".kin"))
+        assert!(std::fs::read_dir(&store_root).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("watcher-ready-")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with("watcher-ready-")));
         drop(cancel_tx);
     }
 
@@ -13768,18 +14520,23 @@ mod tests {
     /// they do not parse have not been shown to declare nothing.
     ///
     /// The parser returns such a result as an ordinary success carrying an
-    /// incomplete parse state, and the JavaScript extractor emits no module for
-    /// a file it extracted nothing from. Resolving on an empty entity list
-    /// alone therefore dropped the record of a path whose declarations were
-    /// never read, so no later daemon asked about it again.
+    /// incomplete parse state, and an adapter emits no module for a file it
+    /// extracted nothing from. Resolving on an empty entity list alone
+    /// therefore dropped the record of a path whose declarations were never
+    /// read, so no later daemon asked about it again.
+    ///
+    /// The fixture is Rust because its bytes must yield no entity at all. A
+    /// malformed JavaScript file now carries a module surface for the
+    /// value-escape record that lists its unparsed region, so it no longer
+    /// shows the case an empty entity list decided.
     #[test]
     fn a_marked_path_whose_bytes_do_not_parse_stays_owed_and_is_retried() {
         let repo = tempfile::tempdir().unwrap();
         let state = open_test_state(&repo);
-        let broken = repo.path().join("broken.js");
-        std::fs::write(&broken, b"((( function\n").unwrap();
+        let broken = repo.path().join("broken.rs");
+        std::fs::write(&broken, b"fn (((\n").unwrap();
         admit_file_event(&state, &FileEvent::Changed(broken)).unwrap();
-        let path = RepoPath::from_utf8("broken.js".to_string()).unwrap();
+        let path = RepoPath::from_utf8("broken.rs".to_string()).unwrap();
         let artifact = state
             .graph
             .resolved_tree()
@@ -13795,7 +14552,7 @@ mod tests {
             .expect("the tree's body is in CAS");
         let parsed = IndexPipeline::new()
             .index_file_content_with_tests(
-                &FilePathId::new("broken.js"),
+                &FilePathId::new("broken.rs"),
                 &body,
                 kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
             )
@@ -13808,7 +14565,7 @@ mod tests {
             parsed.parse_state,
             parsed.entities.len()
         );
-        startup_diagnostic_write_legacy_marker(&state, &["broken.js"]);
+        startup_diagnostic_write_legacy_marker(&state, &["broken.rs"]);
 
         for pass in ["first", "second"] {
             assert_eq!(
@@ -13822,7 +14579,7 @@ mod tests {
             let still_owed: Vec<String> = serde_json::from_slice(&written).unwrap();
             assert_eq!(
                 still_owed,
-                vec!["broken.js".to_string()],
+                vec!["broken.rs".to_string()],
                 "the entry stays recorded after the {pass} pass, so a start that fails before \
                  carrying it retries it"
             );
@@ -14246,7 +15003,10 @@ async fn readmit_semantics_for_paths_with(
     let _binding_derivation = crate::binding_history::Derivation::begin(state);
     let working_dir = state.layout.working_dir();
     let tree = state.graph.resolved_tree();
+    crate::source_cas::restage_naming_manifests(state, &tree);
     let enrichment_pipeline = IndexPipeline::new();
+    // The captured tree's own manifests name its units.
+    let project = kin_index::TreeProjectFiles::from_blobs(&tree, state.blobs.as_ref());
     let mut reconciler = state.reconciler.write().await;
     // A complete batch also depends on project inputs and unchanged sources.
     // It must not recapture a newer tree after waiting for the reconciler and
@@ -14385,7 +15145,7 @@ async fn readmit_semantics_for_paths_with(
         // The parser consumes the exact CAS body, not a second host read. The
         // same partial/LKG policy still applies to syntactically incomplete bytes.
         let index =
-            || enrichment_pipeline.index_file_content_with_tests(&file_id, &content, body_hash);
+            || enrichment_pipeline.index_file_content_in(&file_id, &content, body_hash, &project);
         #[cfg(test)]
         let index = || {
             if state.readmission_index_failure.lock().unwrap().as_ref() == Some(&file_id) {

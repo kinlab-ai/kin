@@ -62,6 +62,12 @@ pub struct EntityRef {
     /// opens with, and every answer about that token would be attributed to the
     /// module. The per-entity name queries skip such an entity.
     pub declares_name: bool,
+    /// Whether the entity only declares a callable whose running body is
+    /// another entity's: a Python `@overload` stub, a C prototype. Its
+    /// adapter says (see `kin_parser::declaration_only`). An answer naming
+    /// such a declaration is placed on the definition it declares, when one
+    /// follows it under the same name (see [`EntityIndex::definition_of`]).
+    pub declares_only: bool,
     /// The graph entity's kind.
     ///
     /// A server's reference answer can depend on it: gopls answers a method's
@@ -302,6 +308,10 @@ impl EntityIndex {
     /// change to either would silently shift every lookup by a line, which on
     /// `def` lines means resolving the enclosing scope instead of the method.
     ///
+    /// Equally innermost entities are ambiguous and return no unique owner.
+    /// Shared implementations retain their occurrences through `find_all_at`;
+    /// a target lookup cannot decide which callable identity a location names.
+    ///
     /// The file is the one whose repository path is exactly the URI's path
     /// below the workspace root. The lookup used to take the absolute path
     /// itself as the key, which no repository-relative key ever equals, and
@@ -318,18 +328,58 @@ impl EntityIndex {
     pub fn find_at(&self, uri: &str, line: u32) -> Option<&EntityRef> {
         let entries = self.by_file.get(&self.held_file(uri)?)?;
 
-        entries
+        let rank = |e: &EntityRef| {
+            (
+                e.end_line.saturating_sub(e.start_line),
+                u32::MAX - e.start_line,
+                !e.declares_name,
+            )
+        };
+        let found = entries
             .iter()
             .filter(|e| line >= e.start_line && line <= e.end_line)
-            // Smallest span wins. Ties break on the later start, which is the
-            // more deeply nested of two spans that begin together, so a method
-            // whose body is its whole parent still beats the parent.
-            .min_by_key(|e| {
-                (
-                    e.end_line.saturating_sub(e.start_line),
-                    u32::MAX - e.start_line,
-                )
-            })
+            .min_by_key(|e| rank(e))?;
+        // A shared implementation or two declarations on the same lines do
+        // not name a unique entity. Choosing whichever the graph yielded
+        // first fabricated ownership and made the other caller look empty.
+        (!entries.iter().any(|e| {
+            e.id != found.id && line >= e.start_line && line <= e.end_line && rank(e) == rank(found)
+        }))
+        .then_some(found)
+    }
+
+    /// All equally innermost owners at a position, in entity-id order.
+    ///
+    /// These are census candidates, not proof that a location names any one
+    /// of them. The caller must check admitted byte spans before recording a
+    /// call occurrence; a target or source requiring one owner uses `find_at`
+    /// and reports the ambiguity instead of picking one.
+    pub fn find_all_at(&self, uri: &str, line: u32) -> Vec<&EntityRef> {
+        let Some(entries) = self.held_file(uri).and_then(|file| self.by_file.get(&file)) else {
+            return Vec::new();
+        };
+        let rank = |e: &EntityRef| {
+            (
+                e.end_line.saturating_sub(e.start_line),
+                u32::MAX - e.start_line,
+                !e.declares_name,
+            )
+        };
+        let Some(best) = entries
+            .iter()
+            .filter(|e| line >= e.start_line && line <= e.end_line)
+            .map(rank)
+            .min()
+        else {
+            return Vec::new();
+        };
+        let mut owners: Vec<_> = entries
+            .iter()
+            .filter(|e| line >= e.start_line && line <= e.end_line && rank(e) == best)
+            .collect();
+        owners.sort_by_key(|e| e.id);
+        owners.dedup_by_key(|e| e.id);
+        owners
     }
 
     /// Whether a file this URI names may be a copy of one the index holds.
@@ -404,6 +454,26 @@ impl EntityIndex {
         }
     }
 
+    /// The definition `declaration` declares, when it only declares (see
+    /// [`EntityRef::declares_only`]): the first entity after it in its own
+    /// file under exactly its name that declares a body. A Python
+    /// `@overload` stub is followed by its implementation; a prototype whose
+    /// definition lives in another file has none here.
+    pub fn definition_of(&self, declaration: &EntityRef) -> Option<&EntityRef> {
+        if !declaration.declares_only {
+            return None;
+        }
+        self.by_file
+            .get(&declaration.file_path)?
+            .iter()
+            .filter(|entity| {
+                !entity.declares_only
+                    && entity.name == declaration.name
+                    && entity.start_line > declaration.start_line
+            })
+            .min_by_key(|entity| entity.start_line)
+    }
+
     /// Return every entity in the file at repository-relative `file_path`.
     ///
     /// Only that exact path names the file. A path another one merely ends
@@ -475,6 +545,7 @@ mod installed_copy_tests {
                     name_line: 0,
                     name_col: 0,
                     declares_name: true,
+                    declares_only: false,
                     kind: kin_model::EntityKind::Function,
                 })
                 .collect(),
@@ -522,6 +593,7 @@ mod outside_repository_tests {
                     name_line: 1,
                     name_col: 16,
                     declares_name: true,
+                    declares_only: false,
                     kind: kin_model::EntityKind::Function,
                 })
                 .collect(),
@@ -1142,10 +1214,30 @@ fn prepared_source<'a>(
         Ok(())
     };
     let is_caller = |item: &CallHierarchyItem| {
-        index
+        if index
             .find_at(&item.uri, item.selection_range.start.line)
             .map(|e| e.id)
             == Some(caller.id)
+        {
+            return true;
+        }
+        // Two declarators can share a line while their parsed binding names
+        // and initializer byte spans are distinct. That existing grammar
+        // proof identifies one caller without selecting a line-index tie.
+        // Shared method assignments have no such binding-name proof.
+        index
+            .find_all_at(&item.uri, item.selection_range.start.line)
+            .iter()
+            .any(|owner| owner.id == caller.id)
+            && positions
+                .range(&item.selection_range)
+                .ok()
+                .zip(positions.range(&item.range).ok())
+                .is_some_and(|(selection, enclosing)| {
+                    crate::typescript_call_hierarchy::proves_binding_initializer(
+                        grammars, caller, text, asked, &selection, &enclosing,
+                    )
+                })
     };
     if let [item] = items {
         require_source_uri(&item.uri, &caller.file_path, workspace_root)?;
@@ -1371,6 +1463,27 @@ pub(crate) async fn locations_at(
     line: u32,
     character: u32,
 ) -> Result<Vec<protocol::Location>> {
+    locations_within(
+        server,
+        method,
+        uri,
+        line,
+        character,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+}
+
+/// [`locations_at`] with an allowance of the caller's own, which the server's
+/// pace stretches as it does every request's (see [`crate::pace`]).
+pub(crate) async fn locations_within(
+    server: &LspServer,
+    method: &'static str,
+    uri: &str,
+    line: u32,
+    character: u32,
+    allowance: std::time::Duration,
+) -> Result<Vec<protocol::Location>> {
     if (method == "textDocument/definition" && !server.has_definition())
         || (method == "textDocument/typeDefinition" && !server.has_type_definition())
     {
@@ -1378,7 +1491,7 @@ pub(crate) async fn locations_at(
     }
     let value = server
         .client
-        .request(
+        .request_within(
             method,
             protocol::TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -1386,6 +1499,7 @@ pub(crate) async fn locations_at(
                 },
                 position: Position { line, character },
             },
+            allowance,
         )
         .await?;
     decode_locations(value)
@@ -1511,6 +1625,46 @@ pub(crate) fn answer_names_entity(dst: &EntityRef, range: &protocol::Range) -> b
     range.start.line == dst.name_line
 }
 
+/// Whether an answer [`answer_names_entity`] accepted sits on `dst`'s name
+/// token, read from `positions`, the text of `dst`'s own file.
+///
+/// A parameter is declared on the line that declares its function, so the
+/// line test alone cannot tell the function from its parameters. Pyright
+/// answers a name whose type it cannot place with that name's own
+/// declaration: `self` read inside `Scaffold.route.<locals>.decorator`
+/// answers with the `self` of `def route(self, rule, **options)`, and every
+/// nested function that read a parameter of its parent was recorded as using
+/// the parent as a type. Flask's store held 287 such edges, and a reach
+/// answer listed one as a reference to `Scaffold.route`.
+///
+/// Python only, as [`answer_names_entity`] is, and only for an entity that
+/// declares a name. The column is the one [`SourcePositions::name_column`]
+/// reads from the line, with the signature hint behind it; an answer whose
+/// column the text cannot place keeps the line reading.
+pub(crate) fn answer_on_name_token(
+    dst: &EntityRef,
+    range: &protocol::Range,
+    positions: &crate::source_positions::SourcePositions<'_>,
+) -> bool {
+    if !is_python_source(&dst.file_path) || !dst.declares_name {
+        return true;
+    }
+    let Ok(target_col) = positions.byte_column(&range.start) else {
+        return true;
+    };
+    let name_col = positions
+        .name_column(dst)
+        .ok()
+        .flatten()
+        .unwrap_or(dst.name_col);
+    let name = dst
+        .name
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(dst.name.as_str());
+    target_col >= name_col && target_col < name_col.saturating_add(name.len() as u32)
+}
+
 /// Whether two answers name the same place.
 fn same_location(left: &protocol::Location, right: &protocol::Location) -> bool {
     left.uri == right.uri && left.range.start.line == right.range.start.line
@@ -1576,6 +1730,9 @@ pub(crate) struct ScopedDocuments<'a> {
     provider: Option<DocumentProvider<'a>>,
     open: std::collections::HashSet<String>,
     texts: std::collections::HashMap<String, String>,
+    /// How many documents this scope has handed the server so far, counted
+    /// once each document's open has been written (see [`Self::opened`]).
+    opened: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<'a> ScopedDocuments<'a> {
@@ -1585,7 +1742,21 @@ impl<'a> ScopedDocuments<'a> {
             provider,
             open: std::collections::HashSet::new(),
             texts: std::collections::HashMap::new(),
+            opened: std::sync::Arc::default(),
         }
+    }
+
+    /// A count of the documents this scope has handed the server, read
+    /// without borrowing the scope.
+    ///
+    /// It moves only after an open has been written, so a question that went
+    /// out while it read `n` was answered with at most the first `n` open,
+    /// and one that went out after it moved was answered with all of them.
+    /// A pass that asks ahead of its fold asks again any question that went
+    /// out before a document the fold opened, since the sequential pass would
+    /// have asked it with that document open.
+    pub(crate) fn opened(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.opened)
     }
 
     pub(crate) fn remember(&mut self, file: &str, text: &str) {
@@ -1646,6 +1817,8 @@ impl<'a> ScopedDocuments<'a> {
             debug!(path = %rel_path, error = %error, "failed to open a document for a cross-file query");
             return Err(error);
         }
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         debug!(path = %rel_path, "opened a graph-owned document for a cross-file query");
         Ok(true)
     }
@@ -1816,6 +1989,41 @@ pub(crate) struct MemberBindings<'a> {
     pub(crate) unasked: usize,
 }
 
+/// One identifier the uses-type arm asks about.
+struct UsesTypeAsk {
+    line: u32,
+    col: u32,
+    /// The member expression it is the receiver of, when it is one: the
+    /// member's column and name.
+    member: Option<(String, u32, String)>,
+    /// Where it is asked, in the server's units, when its column falls on
+    /// its line.
+    asked_at: Option<Position>,
+}
+
+/// `textDocument/typeDefinition` at one position, decoded, as the uses-type
+/// arm asks it.
+async fn type_definition_at(
+    server: &LspServer,
+    uri: &str,
+    line: u32,
+    character: u32,
+) -> Result<Vec<protocol::Location>> {
+    let value = server
+        .client
+        .request(
+            "textDocument/typeDefinition",
+            protocol::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.to_string(),
+                },
+                position: Position { line, character },
+            },
+        )
+        .await?;
+    decode_locations(value)
+}
+
 /// Query type definitions for entities referenced in a function's signature/body.
 /// For each resolved type, find it in the graph index and emit UsesType relations.
 ///
@@ -1829,8 +2037,72 @@ pub async fn enrich_entity_uses_type(
     workspace_root: &Path,
     documents: Option<DocumentProvider<'_>>,
 ) -> Result<Vec<Relation>> {
+    Ok(
+        enrich_entity_type_uses(server, entity, index, workspace_root, documents)
+            .await?
+            .relations,
+    )
+}
+
+/// The rule a `UsesType` edge's evidence carries when a type answer at an
+/// identifier minted it.
+pub const TYPE_ANSWER_RULE: &str = "lsp_references";
+
+/// A type answer this pass read as about no declaration, where a build that
+/// compared only lines read it as about `target`: it landed on the line that
+/// declares `target`, off `target`'s name, so it names a parameter declared
+/// there (see [`answer_on_name_token`]). An edge an earlier pass minted from
+/// the same answer at the same identifier is contradicted by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisprovedTypeUse {
+    /// The entity whose identifier was asked about.
+    pub source: EntityId,
+    /// The declaration the answer is not about.
+    pub target: EntityId,
+    /// The identifier that was asked about, in the source file: where the
+    /// evidence of an edge minted from this answer sits, under
+    /// [`TYPE_ANSWER_RULE`].
+    pub site: SourceSpan,
+}
+
+/// What the type questions asked inside one entity came to: the `UsesType`
+/// relations they prove, and the answers they positively disprove.
+#[derive(Debug, Default)]
+pub struct TypeUses {
+    pub relations: Vec<Relation>,
+    pub disproved: Vec<DisprovedTypeUse>,
+}
+
+/// [`enrich_entity_uses_type`], with the answers the pass disproved beside the
+/// relations it proved.
+pub async fn enrich_entity_type_uses(
+    server: &LspServer,
+    entity: &EntityRef,
+    index: &EntityIndex,
+    workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
+) -> Result<TypeUses> {
+    // On the heap, for the reason the file pass is (see
+    // [`crate::file_enrichment::enrich_file_definitions_in`]).
+    Box::pin(uses_type_arm(
+        server,
+        entity,
+        index,
+        workspace_root,
+        documents,
+    ))
+    .await
+}
+
+async fn uses_type_arm(
+    server: &LspServer,
+    entity: &EntityRef,
+    index: &EntityIndex,
+    workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
+) -> Result<TypeUses> {
     if !server.has_type_definition() {
-        return Ok(Vec::new());
+        return Ok(TypeUses::default());
     }
 
     let file_path = workspace_root.join(&entity.file_path);
@@ -1850,11 +2122,14 @@ pub async fn enrich_entity_uses_type(
     // We query real identifier starts within the entity span to catch parameter
     // types, return types, and type references in the body.
     let mut relations = Vec::new();
+    let mut disproved: Vec<DisprovedTypeUse> = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
     let mut scoped_documents = ScopedDocuments::new(server, documents);
     scoped_documents.remember(&entity.file_path, &file_content);
 
     let result = async {
+        // Every identifier this arm asks about, in the order it asks.
+        let mut plan = Vec::new();
         for line in entity.start_line..=entity.end_line {
             let Some(line_text) = lines.get(line as usize) else {
                 continue;
@@ -1868,8 +2143,63 @@ pub async fn enrich_entity_uses_type(
             {
                 continue;
             }
-
             for col in identifier_positions_in_line(line_text) {
+                plan.push(UsesTypeAsk {
+                    line,
+                    col,
+                    member: member_expression_at(line_text, col),
+                    asked_at: positions.scalar_position(line, col).ok(),
+                });
+            }
+        }
+
+        // The first question about each identifier goes out ahead of the
+        // fold, at most the server's window at a time, and its answer comes
+        // back in the order above (see [`crate::concurrency`]). The fold is
+        // the loop this arm always ran, reading each first answer where it
+        // once awaited it.
+        let window = server.in_flight();
+        let opened = scoped_documents.opened();
+        let first = |ask: &UsesTypeAsk| {
+            let (uri, opened) = (&uri, &opened);
+            let (line, character, member) = (
+                ask.line,
+                ask.asked_at.as_ref().map(|position| position.character),
+                ask.member.is_some(),
+            );
+            crate::concurrency::stamped(opened, async move {
+                let Some(character) = character else {
+                    return Err(LspError::Protocol("the identifier was not asked".into()));
+                };
+                if member {
+                    locations_at(server, "textDocument/definition", uri, line, character).await
+                } else {
+                    type_definition_at(server, uri, line, character).await
+                }
+            })
+        };
+        let mut asks = crate::concurrency::Ordered::new(
+            plan.iter().enumerate(),
+            |(index, ask)| {
+                let asked = first(ask);
+                async move { (index, asked.await) }
+            },
+            window.ceiling(),
+        );
+
+        while let Some(issued) = asks.next(window).await {
+            let ask = &plan[issued.answer.0];
+            let (line, col) = (ask.line, ask.col);
+            let character = positions.scalar_position(line, col)?.character;
+            let answer = crate::concurrency::settle(
+                window,
+                &opened,
+                &mut asks,
+                issued.map(|(_, answer)| answer),
+                || first(ask),
+            )
+            .await;
+            let type_def_result = if let Some((_receiver, member_col, member_name)) = &ask.member {
                 // A member expression on a MODULE receiver is answered by its
                 // member, never by the receiver. `express.Router()` asked at
                 // `express` returns the module's own type, `lib/express.js:35`,
@@ -1881,25 +2211,37 @@ pub async fn enrich_entity_uses_type(
                 // Value receivers are untouched. `res` in `res.send(...)` genuinely
                 // tells the enclosing function it uses the Response type, and that
                 // edge is not this pass's mistake.
-                if let Some((_receiver, member_col, member_name)) =
-                    member_expression_at(line_text, col)
-                {
-                    let receiver_definitions = match locations_at(
-                        server,
-                        "textDocument/definition",
-                        &uri,
-                        line,
-                        positions.scalar_position(line, col)?.character,
-                    )
-                    .await
-                    {
-                        Ok(locations) => locations,
-                        // Declined at this position: nothing here, next one.
-                        Err(error) if error.is_declined() => continue,
-                        Err(error) => return Err(error),
-                    };
-                    if receiver_names_a_module(&receiver_definitions, index, &entity.file_path) {
-                        let bindings = member_export_bindings(
+                let receiver_definitions = match answer {
+                    Ok(locations) => locations,
+                    // Declined at this position: nothing here, next one.
+                    Err(error) if error.is_declined() => continue,
+                    Err(error) => return Err(error),
+                };
+                if receiver_names_a_module(&receiver_definitions, index, &entity.file_path) {
+                    let member_at = positions.scalar_position(line, *member_col)?.character;
+                    let joined = asks
+                        .beside(
+                            window,
+                            member_export_bindings(
+                                server,
+                                index,
+                                workspace_root,
+                                &mut scoped_documents,
+                                &entity.file_path,
+                                &uri,
+                                line,
+                                character,
+                                member_at,
+                                member_name,
+                            ),
+                        )
+                        .await;
+                    let mut bindings = joined.output;
+                    if joined.overlapped && bindings.as_ref().is_err_and(LspError::under_load) {
+                        // Asked again alone, as this arm once asked it.
+                        window.congested();
+                        asks.drain().await;
+                        bindings = member_export_bindings(
                             server,
                             index,
                             workspace_root,
@@ -1907,135 +2249,158 @@ pub async fn enrich_entity_uses_type(
                             &entity.file_path,
                             &uri,
                             line,
-                            positions.scalar_position(line, col)?.character,
-                            positions.scalar_position(line, member_col)?.character,
-                            &member_name,
+                            character,
+                            member_at,
+                            member_name,
                         )
-                        .await?;
-                        // This arm reports no partial answer, so a join it
-                        // could not finish is the entity's failure, as it
-                        // was when the unlocated name ended the join.
-                        if bindings.unasked > 0 {
-                            return Err(LspError::Protocol(format!(
-                                "`{member_name}` has {} candidate export(s) whose name could not \
-                                 be located to ask about",
-                                bindings.unasked
-                            )));
-                        }
-                        for candidate in bindings.bound {
-                            if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
-                                continue;
-                            }
-                            relations.push(Relation {
-                                id: deterministic_relation_id(
-                                    RelationKind::UsesType,
-                                    entity.id,
-                                    candidate.id,
-                                ),
-                                kind: RelationKind::UsesType,
-                                src: GraphNodeId::Entity(entity.id),
-                                dst: GraphNodeId::Entity(candidate.id),
-                                confidence: 0.85,
-                                origin: RelationOrigin::Lsp,
-                                created_in: None,
-                                import_source: None,
-                                evidence: query_position_evidence(
-                                    "lsp_member_on_module",
-                                    positions.token(line, member_col)?,
-                                ),
-                            });
-                            debug!(
-                                entity = %entity.name,
-                                member = %member_name,
-                                uses_type = %candidate.name,
-                                "bound a member on a module receiver to its export"
-                            );
-                        }
-                        // The receiver's own type is not this entity's fact, whether
-                        // or not the member bound to anything. Declining here is
-                        // what makes the inflated attribution stop.
-                        continue;
+                        .await;
                     }
-                }
-
-                let type_def_result = server
-                    .client
-                    .request(
-                        "textDocument/typeDefinition",
-                        protocol::TextDocumentPositionParams {
-                            text_document: TextDocumentIdentifier { uri: uri.clone() },
-                            position: positions.scalar_position(line, col)?,
-                        },
-                    )
-                    .await;
-
-                // A declined position has no type to find, and says nothing about
-                // the next one. Stopping here, as this arm used to, ended every Go
-                // entity's pass at its `func` keyword.
-                let locations = match type_def_result {
-                    Ok(value) => decode_locations(value)?,
-                    Err(error) if error.is_declined() => continue,
-                    Err(error) => return Err(error),
-                };
-
-                for loc in &locations {
-                    let target_line = loc.range.start.line;
-                    // Position only. The old fallback took the FILE STEM and looked
-                    // that up by name, so a reference in `sessions.py` could be
-                    // attributed to whatever entity happened to be called
-                    // `sessions`, which is a guess wearing a proven label.
-                    let target = index.find_at(&loc.uri, target_line);
-
-                    if let Some(target_ref) = target {
-                        // The definitions pass reads a Python answer the same
-                        // way: one inside a body, or an empty one naming a
-                        // module, is not about the entity it landed in.
-                        if !answer_names_entity(target_ref, &loc.range) {
+                    let bindings = bindings?;
+                    // This arm reports no partial answer, so a join it
+                    // could not finish is the entity's failure, as it
+                    // was when the unlocated name ended the join.
+                    if bindings.unasked > 0 {
+                        return Err(LspError::Protocol(format!(
+                            "`{member_name}` has {} candidate export(s) whose name could not \
+                             be located to ask about",
+                            bindings.unasked
+                        )));
+                    }
+                    for candidate in bindings.bound {
+                        if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
                             continue;
                         }
-                        // Skip self-references and duplicates.
-                        if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
-                            continue;
-                        }
-
                         relations.push(Relation {
                             id: deterministic_relation_id(
                                 RelationKind::UsesType,
                                 entity.id,
-                                target_ref.id,
+                                candidate.id,
                             ),
                             kind: RelationKind::UsesType,
                             src: GraphNodeId::Entity(entity.id),
-                            dst: GraphNodeId::Entity(target_ref.id),
+                            dst: GraphNodeId::Entity(candidate.id),
                             confidence: 0.85,
                             origin: RelationOrigin::Lsp,
                             created_in: None,
                             import_source: None,
-                            // The queried caller token, not the returned definition
-                            // range in the target's document.
                             evidence: query_position_evidence(
-                                "lsp_references",
-                                positions.token(line, col)?,
+                                "lsp_member_on_module",
+                                positions.token(line, *member_col)?,
                             ),
                         });
                         debug!(
                             entity = %entity.name,
-                            uses_type = %target_ref.name,
-                            "discovered UsesType relation"
+                            member = %member_name,
+                            uses_type = %candidate.name,
+                            "bound a member on a module receiver to its export"
                         );
                     }
+                    // The receiver's own type is not this entity's fact, whether
+                    // or not the member bound to anything. Declining here is
+                    // what makes the inflated attribution stop.
+                    continue;
+                }
+                crate::concurrency::follow_up(window, &mut asks, || {
+                    type_definition_at(server, &uri, line, character)
+                })
+                .await
+            } else {
+                answer
+            };
+
+            // A declined position has no type to find, and says nothing about
+            // the next one. Stopping here, as this arm used to, ended every Go
+            // entity's pass at its `func` keyword.
+            let locations = match type_def_result {
+                Ok(locations) => locations,
+                Err(error) if error.is_declined() => continue,
+                Err(error) => return Err(error),
+            };
+
+            for loc in &locations {
+                let target_line = loc.range.start.line;
+                // Position only. The old fallback took the FILE STEM and looked
+                // that up by name, so a reference in `sessions.py` could be
+                // attributed to whatever entity happened to be called
+                // `sessions`, which is a guess wearing a proven label.
+                let target = index.find_at(&loc.uri, target_line);
+
+                if let Some(target_ref) = target {
+                    // The definitions pass reads a Python answer the same
+                    // way: one inside a body, or an empty one naming a
+                    // module, is not about the entity it landed in.
+                    if !answer_names_entity(target_ref, &loc.range) {
+                        continue;
+                    }
+                    // The name line also declares the entity's parameters,
+                    // and an answer on one of those is not about the entity.
+                    // This arm holds the text of the file it enriches and no
+                    // other, so an answer in another file keeps the line
+                    // reading.
+                    if target_ref.id != entity.id
+                        && target_ref.file_path == entity.file_path
+                        && !answer_on_name_token(target_ref, &loc.range, &positions)
+                    {
+                        // Positively not about `target_ref`: an edge an
+                        // earlier pass minted here from this answer is
+                        // contradicted, and the caller can retire it.
+                        let found = DisprovedTypeUse {
+                            source: entity.id,
+                            target: target_ref.id,
+                            site: positions.token(line, col)?,
+                        };
+                        if !disproved.contains(&found) {
+                            disproved.push(found);
+                        }
+                        continue;
+                    }
+                    // Skip self-references and duplicates.
+                    if target_ref.id == entity.id || !seen_targets.insert(target_ref.id) {
+                        continue;
+                    }
+
+                    relations.push(Relation {
+                        id: deterministic_relation_id(
+                            RelationKind::UsesType,
+                            entity.id,
+                            target_ref.id,
+                        ),
+                        kind: RelationKind::UsesType,
+                        src: GraphNodeId::Entity(entity.id),
+                        dst: GraphNodeId::Entity(target_ref.id),
+                        confidence: 0.85,
+                        origin: RelationOrigin::Lsp,
+                        created_in: None,
+                        import_source: None,
+                        // The queried caller token, not the returned definition
+                        // range in the target's document.
+                        evidence: query_position_evidence(
+                            TYPE_ANSWER_RULE,
+                            positions.token(line, col)?,
+                        ),
+                    });
+                    debug!(
+                        entity = %entity.name,
+                        uses_type = %target_ref.name,
+                        "discovered UsesType relation"
+                    );
                 }
             }
         }
 
-        Ok(relations)
+        Ok(())
     }
     .await;
     let closed = scoped_documents.close_all().await;
     match result {
-        Ok(relations) => {
+        Ok(()) => {
             closed?;
-            Ok(relations)
+            // An answer that proves the edge at another identifier of the
+            // entity leaves the edge standing, whatever one site disproved.
+            Ok(TypeUses {
+                relations,
+                disproved,
+            })
         }
         Err(error) => Err(error),
     }
@@ -2413,6 +2778,7 @@ mod tests {
                 name_line: 10,
                 name_col: 3,
                 declares_name: true,
+                declares_only: false,
                 kind: kin_model::EntityKind::Function,
             },
             EntityRef {
@@ -2425,6 +2791,7 @@ mod tests {
                 name_line: 25,
                 name_col: 3,
                 declares_name: true,
+                declares_only: false,
                 kind: kin_model::EntityKind::Function,
             },
         ];
@@ -2444,6 +2811,78 @@ mod tests {
     }
 
     #[test]
+    fn shared_implementation_positions_have_no_arbitrary_owner() {
+        let first = EntityRef {
+            id: EntityId::new(),
+            name: "Root.render".into(),
+            file_path: "src/lib.js".into(),
+            start_line: 2,
+            start_col: 0,
+            end_line: 5,
+            name_line: 2,
+            name_col: 0,
+            declares_name: true,
+            declares_only: false,
+            kind: kin_model::EntityKind::Method,
+        };
+        let second = EntityRef {
+            id: EntityId::new(),
+            name: "HydrationRoot.render".into(),
+            ..first.clone()
+        };
+        let parent = EntityRef {
+            id: EntityId::new(),
+            name: "lib".into(),
+            start_line: 0,
+            end_line: 20,
+            ..first.clone()
+        };
+        let normal = EntityRef {
+            id: EntityId::new(),
+            name: "normal".into(),
+            start_line: 8,
+            end_line: 10,
+            ..first.clone()
+        };
+        let unnamed = EntityRef {
+            id: EntityId::new(),
+            name: "surface".into(),
+            declares_name: false,
+            declares_only: false,
+            ..normal.clone()
+        };
+        let uri = "file:///project/src/lib.js";
+        let mut expected = vec![first.id, second.id];
+        expected.sort();
+        for entities in [
+            vec![
+                first.clone(),
+                parent.clone(),
+                second.clone(),
+                normal.clone(),
+                unnamed.clone(),
+            ],
+            vec![unnamed, normal.clone(), second, parent.clone(), first],
+        ] {
+            let index = EntityIndex::new(entities, Path::new("/project"));
+            assert!(
+                index.find_at(uri, 3).is_none(),
+                "a target location proves no unique callable identity"
+            );
+            assert_eq!(
+                index
+                    .find_all_at(uri, 3)
+                    .iter()
+                    .map(|e| e.id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(index.find_at(uri, 9).unwrap().id, normal.id);
+            assert_eq!(index.find_at(uri, 16).unwrap().id, parent.id);
+        }
+    }
+
+    #[test]
     fn entity_index_finds_by_name() {
         let entities = vec![EntityRef {
             id: EntityId::new(),
@@ -2455,6 +2894,7 @@ mod tests {
             name_line: 5,
             name_col: 7,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         }];
         let index = EntityIndex::new(entities, Path::new("/project"));
@@ -2492,6 +2932,7 @@ mod innermost_span_tests {
             name_line: start,
             name_col: 4,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         }
     }
@@ -2641,6 +3082,7 @@ mod colliding_path_tests {
             name_line: start,
             name_col: 5,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         }
     }
@@ -2923,6 +3365,7 @@ mod member_on_module_tests {
             name_line: line,
             name_col: 0,
             declares_name,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         }
     }

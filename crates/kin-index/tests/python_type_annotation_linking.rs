@@ -155,12 +155,11 @@ fn a_field_annotation_binds_across_the_file_boundary_through_its_import() {
     // standing in for the other.
     let files = two_file_project();
     let relations = link(&files);
-    let row = entity_id_in(&files, "storage.py", "NoteRow");
 
     assert_eq!(
         reference_confidence(
             &relations,
-            row,
+            entity_id_in(&files, "storage.py", "NoteRow.note"),
             entity_id_in(&files, "parsing.py", "ParsedNote"),
         ),
         Some(IMPORT_RESOLVED_CONFIDENCE),
@@ -169,7 +168,7 @@ fn a_field_annotation_binds_across_the_file_boundary_through_its_import() {
     assert_eq!(
         reference_confidence(
             &relations,
-            row,
+            entity_id_in(&files, "storage.py", "NoteRow.links"),
             entity_id_in(&files, "parsing.py", "WikiLink"),
         ),
         Some(IMPORT_RESOLVED_CONFIDENCE),
@@ -332,7 +331,7 @@ fn a_field_annotation_naming_an_externally_imported_type_keeps_its_external_refe
         "the fixture must carry the receiver-bearing, import-pinned reference under test: {:#?}",
         files[0].relations
     );
-    let client = entity_id_in(&files, "client.py", "Client");
+    let client = entity_id_in(&files, "client.py", "Client.session");
     let mut incremental = kin_index::IncrementalLinker::new();
     for file in &files {
         incremental.add_file(&file.file_path, ArtifactId::new(), &file.entities);

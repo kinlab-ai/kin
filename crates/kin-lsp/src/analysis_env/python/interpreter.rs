@@ -474,7 +474,7 @@ fn save_failure_receipt(
         .open(&temporary)
         .map_err(|error| error.to_string())?;
     file.write_all(bytes)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| kin_blobs::durable::sync_all(&file))
         .map_err(|error| error.to_string())?;
     drop(file);
     let destination = directory.join(diagnostic_name(pinned));

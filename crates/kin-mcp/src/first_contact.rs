@@ -152,7 +152,7 @@ pub fn language_server_advice(edge_coverage: &Value, spelling: Spelling) -> Opti
                 format!(" ({})", servers.join("; "))
             };
             format!(
-                "Missing: cross-file references and overrides for {named}. No language server \
+                "Missing: references and overrides between {named} modules. No language server \
                  for {named}{server} is installed where Kin runs, so Kin could not link them and \
                  these results are a lower bound. To add them, run {} and then {}, so the next \
                  call starts a daemon that finds it.",
@@ -160,14 +160,30 @@ pub fn language_server_advice(edge_coverage: &Value, spelling: Spelling) -> Opti
                 kin_command("daemon stop", spelling),
             )
         }
-        "language_server_unusable" => format!(
-            "Missing: cross-file references and overrides for {named}. A language server for \
-             {named} is installed where Kin runs, but it would not start, so Kin could not link \
-             them and these results are a lower bound. Run {} to see why it will not start.",
-            kin_command("doctor", spelling),
-        ),
+        "language_server_unusable" => match edge_coverage
+            .get(crate::edge_coverage::REFERENCE_ENRICHMENT_REASON_KEY)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        {
+            // The reason is the repair, so it is said here rather than behind
+            // a second command.
+            Some(reason) => format!(
+                "Missing: references and overrides between {named} modules. {}, so Kin could \
+                 not link them and these results are a lower bound. Kin still answers from its \
+                 own parse.",
+                reason.trim_end_matches('.'),
+            ),
+            None => format!(
+                "Missing: references and overrides between {named} modules. A language server \
+                 for {named} is installed where Kin runs, but it would not start, so Kin could \
+                 not link them and these results are a lower bound. Run {} to see why it will \
+                 not start.",
+                kin_command("doctor", spelling),
+            ),
+        },
         "unsupported" => format!(
-            "Missing: cross-file references and overrides for {named}. This Kin build has no \
+            "Missing: references and overrides between {named} modules. This Kin build has no \
              language server support for {named}, so these results are a lower bound, and \
              nothing installed on this machine adds them."
         ),
@@ -199,6 +215,86 @@ pub struct RepositoryIdentity {
     pub warning: Option<String>,
 }
 
+/// Public context binding. It identifies a scope without exposing its storage
+/// coordinates or inventing a semantic repository name from them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticRepositoryIdentity {
+    pub authority_context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+pub const SEMANTIC_SCOPE_WARNING: &str = "This answer covers the bound repository's semantic scope, which differs from the client's current context.";
+
+fn context_digest(context: &str) -> String {
+    kin_blobs::digest(
+        &serde_json::to_vec(&("kin.mcp.repository-context.v1", context))
+            .expect("repository context serializes"),
+    )
+    .to_string()
+}
+
+/// Project an operator identity for an agent answer. Private continuation
+/// authority, graph revision and session checks remain independent of this
+/// presentation identity.
+pub fn semantic_repository_identity(
+    identity: &RepositoryIdentity,
+) -> Option<SemanticRepositoryIdentity> {
+    if identity.root.is_empty() || identity.client_root.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
+    let client = identity
+        .client_root
+        .as_deref()
+        .filter(|client| *client != identity.root);
+    Some(SemanticRepositoryIdentity {
+        authority_context: context_digest(&identity.root),
+        client_context: client.map(context_digest),
+        warning: client.map(|_| SEMANTIC_SCOPE_WARNING.to_string()),
+    })
+}
+
+impl SemanticRepositoryIdentity {
+    /// Check only the captured presentation against this connection. A later
+    /// binding cannot replace the frozen authority; the private page context
+    /// separately decides whether the original graph can still be continued.
+    pub fn matches_client_context(&self, client: Option<&Path>) -> bool {
+        let is_digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !is_digest(&self.authority_context) {
+            return false;
+        }
+        let client = match client {
+            Some(client) => match client.to_str() {
+                Some(client) if !client.is_empty() => Some(client),
+                Some(_) => return false,
+                None => return false,
+            },
+            None => None,
+        };
+        match (&self.client_context, client) {
+            (Some(captured), Some(client)) => {
+                is_digest(captured)
+                    && captured != &self.authority_context
+                    && captured == &context_digest(client)
+                    && self.warning.as_deref() == Some(SEMANTIC_SCOPE_WARNING)
+            }
+            (None, Some(client)) => {
+                self.authority_context == context_digest(client) && self.warning.is_none()
+            }
+            (None, None) => self.warning.is_none(),
+            (Some(_), None) => false,
+        }
+    }
+}
+
 /// The repository block for one answer: `root` always, and the client's own
 /// folder with a warning when the two differ.
 ///
@@ -206,7 +302,7 @@ pub struct RepositoryIdentity {
 /// repository that contains the client's folder never reads as one from the
 /// folder itself. For a folder nested in the repository it ends with how to have
 /// another Kin repository answer, never with creating a repository inside this
-/// one. A folder in the repository's `.kin/runs` directory, where Kin keeps
+/// one. A folder in the repository store's runs directory, where Kin keeps
 /// session workspaces, gets the facts and no remedy: its path alone does not
 /// prove it is a session, so the note claims nothing about what it holds.
 /// `kin mcp start` puts it at the head of every answer on such a connection,
@@ -219,7 +315,7 @@ pub fn repository_identity(root: &Path, client_root: Option<&Path>) -> Repositor
         if in_runs_directory(root, client) {
             format!(
                 "This answer comes from the Kin repository at {}. {} is inside that \
-                 repository's .kin/runs directory, where Kin keeps session workspaces, and has \
+                 repository's Kin runs directory, where Kin keeps session workspaces, and has \
                  no Kin repository of its own.",
                 root.display(),
                 client.display()
@@ -250,11 +346,11 @@ pub fn repository_identity(root: &Path, client_root: Option<&Path>) -> Repositor
     }
 }
 
-/// Whether `client` is inside `root`'s `.kin/runs` directory, where Kin keeps
+/// Whether `client` is inside `root`'s store runs directory, where Kin keeps
 /// session workspaces. This is a fact about the path only; it does not
 /// establish that the folder is a session or what it holds.
 fn in_runs_directory(root: &Path, client: &Path) -> bool {
-    let runs = kin_core::KinLayout::new(root.join(".kin")).runs_dir();
+    let runs = kin_core::KinLayout::for_working_dir(root).runs_dir();
     client != runs && client.starts_with(&runs)
 }
 
@@ -277,6 +373,87 @@ pub fn client_root(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn semantic_identity_is_opaque_and_keeps_the_connection_scope() {
+        let root = Path::new("/private/repository");
+        let client = Path::new("/private/client");
+        let private = repository_identity(root, Some(client));
+        let public = semantic_repository_identity(&private).unwrap();
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert!(!encoded.contains("/private/"));
+        assert!(!encoded.contains("client_root"));
+        assert_eq!(public.warning.as_deref(), Some(SEMANTIC_SCOPE_WARNING));
+        assert!(public.matches_client_context(Some(client)));
+        assert!(!public.matches_client_context(Some(root)));
+        assert!(!public.matches_client_context(Some(Path::new("/other/client"))));
+        assert!(!public.matches_client_context(None));
+
+        let mut different_prose = private.clone();
+        different_prose.warning = Some("private operator detail".into());
+        assert_eq!(
+            semantic_repository_identity(&different_prose),
+            Some(public.clone())
+        );
+        let elsewhere = semantic_repository_identity(&repository_identity(
+            Path::new("/another/repository"),
+            Some(client),
+        ))
+        .unwrap();
+        assert_ne!(public.authority_context, elsewhere.authority_context);
+        assert_eq!(public.client_context, elsewhere.client_context);
+
+        let same = semantic_repository_identity(&repository_identity(root, Some(root))).unwrap();
+        assert!(same.matches_client_context(Some(root)));
+        assert!(same.matches_client_context(None));
+        assert!(!same.matches_client_context(Some(client)));
+        assert!(same.client_context.is_none() && same.warning.is_none());
+        assert!(semantic_repository_identity(&repository_identity(Path::new(""), None)).is_none());
+    }
+
+    #[test]
+    fn semantic_identity_refuses_unbound_or_unsafe_presentations() {
+        let root = Path::new("/repo");
+        let client = Path::new("/client");
+        let public =
+            semantic_repository_identity(&repository_identity(root, Some(client))).unwrap();
+        let value = serde_json::to_value(&public).unwrap();
+        for field in ["root", "client_root", "extra"] {
+            let mut unsafe_value = value.clone();
+            unsafe_value[field] = json!("/private/coordinate");
+            assert!(serde_json::from_value::<SemanticRepositoryIdentity>(unsafe_value).is_err());
+        }
+        for warning in [None, Some("/private/coordinate".into())] {
+            let mut wrong = public.clone();
+            wrong.warning = warning;
+            assert!(!wrong.matches_client_context(Some(client)));
+        }
+        for digest in ["", "/repo", &"z".repeat(64), &"a".repeat(63)] {
+            let mut wrong = public.clone();
+            wrong.authority_context = digest.into();
+            assert!(!wrong.matches_client_context(Some(client)));
+        }
+        let empty = SemanticRepositoryIdentity {
+            authority_context: context_digest(""),
+            client_context: None,
+            warning: None,
+        };
+        assert!(!empty.matches_client_context(Some(Path::new(""))));
+        let mut collapsed = public;
+        collapsed.client_context = Some(collapsed.authority_context.clone());
+        assert!(!collapsed.matches_client_context(Some(root)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_identity_refuses_lossy_client_coordinates() {
+        use std::os::unix::ffi::OsStringExt;
+        let client = PathBuf::from(std::ffi::OsString::from_vec(b"/client-\xff".to_vec()));
+        let public =
+            semantic_repository_identity(&repository_identity(Path::new("/repo"), Some(&client)))
+                .unwrap();
+        assert!(!public.matches_client_context(Some(&client)));
+    }
 
     #[test]
     fn a_command_is_spelled_to_run_where_the_reader_is() {
@@ -315,7 +492,7 @@ mod tests {
             "unproduced_evidence": {"imports": {"this_build_mints_no_entity_level_edge_for": ["Go"]}},
         });
         let advice = language_server_advice(&coverage, Spelling::Kin).unwrap();
-        assert!(advice.starts_with("Missing: cross-file references and overrides for Go."));
+        assert!(advice.starts_with("Missing: references and overrides between Go modules."));
         assert!(advice.contains("(gopls)"), "{advice}");
         assert!(advice.contains("`kin doctor --fix --install-language-servers`"));
         assert!(advice.contains("`kin daemon stop`"));
@@ -337,6 +514,24 @@ mod tests {
             advice.contains("would not start") && advice.contains("`kin doctor`"),
             "{advice}"
         );
+    }
+
+    /// The field report's "would not start": the reason the daemon recorded
+    /// travels in the observation and the advice says it, instead of sending
+    /// the reader to `kin doctor` to find it.
+    #[test]
+    fn a_server_that_will_not_start_names_why() {
+        let reason = "TypeScript enrichment unavailable: `typescript-language-server` refused \
+                      initialize: Could not find a valid TypeScript installation";
+        let coverage = json!({
+            "language": "TypeScript",
+            "reference_enrichment": "language_server_unusable",
+            "reference_enrichment_reason": reason,
+        });
+        let advice = language_server_advice(&coverage, Spelling::Kin).unwrap();
+        assert!(advice.contains(reason), "{advice}");
+        assert!(!advice.contains("would not start"), "{advice}");
+        assert!(advice.contains("lower bound"), "{advice}");
     }
 
     #[test]
@@ -377,6 +572,21 @@ mod tests {
     /// of the envelope, which is the first key of the payload.
     #[test]
     fn the_advice_is_the_first_thing_an_answer_says() {
+        let present = |result: crate::ToolCallResult| {
+            let response = crate::JsonRpcResponse::success(
+                Some(json!(1)),
+                serde_json::to_value(result).unwrap(),
+            );
+            let response = crate::server::present_for_client(
+                response,
+                r#"{"method":"tools/call","params":{"name":"find_references","arguments":{}}}"#,
+                &crate::McpServerConfig {
+                    plain_replies: false,
+                    ..Default::default()
+                },
+            );
+            serde_json::from_value::<crate::ToolCallResult>(response.result.unwrap()).unwrap()
+        };
         let health = json!({"repo_root": "/work"});
         let base = crate::envelope::Envelope::daemon().with_repository(
             &health,
@@ -387,18 +597,18 @@ mod tests {
             "references": [],
             "edge_coverage": {"language": "Go", "reference_enrichment": "no_language_server"},
         });
-        let result = crate::envelope::finalize(
+        let result = present(crate::envelope::finalize(
             crate::types::ToolCallResult::text(payload.to_string()),
             base,
             "find_references",
-        );
+        ));
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         // Served compact by default, the advice is the first bytes after the
         // envelope opens.
         assert!(text.starts_with("{\"_kin\":{\"advice\":\""), "{text}");
         // Asked for the pretty form, it is the first line after the envelope
         // opens.
-        let pretty = crate::envelope::finalize_bounded(
+        let pretty = present(crate::envelope::finalize_bounded(
             crate::types::ToolCallResult::text(payload.to_string()),
             crate::envelope::Envelope::daemon().with_repository(
                 &health,
@@ -410,7 +620,7 @@ mod tests {
                 "compact".to_string(),
                 json!(false),
             )])),
-        );
+        ));
         let crate::types::ContentBlock::Text { text: pretty_text } = &pretty.content[0];
         let mut lines = pretty_text.lines();
         assert_eq!(lines.next(), Some("{"));
@@ -419,22 +629,24 @@ mod tests {
         assert!(first.starts_with("\"advice\": \""), "{pretty_text}");
         let value: Value = serde_json::from_str(text).unwrap();
         let advice = value["_kin"]["advice"].as_str().unwrap();
-        assert!(
-            advice.starts_with(
-                "This answer comes from the Kin repository at /work, not from /work/app"
-            ),
-            "{advice}"
+        assert!(advice.starts_with(SEMANTIC_SCOPE_WARNING), "{advice}");
+        assert!(!advice.contains("cross-file"), "{advice}");
+        assert_eq!(
+            value["_kin"]["repository"],
+            serde_json::to_value(
+                semantic_repository_identity(&repository_identity(
+                    Path::new("/work"),
+                    Some(Path::new("/work/app")),
+                ))
+                .unwrap()
+            )
+            .unwrap()
         );
-        assert!(
-            advice.contains("Missing: cross-file references and overrides for Go"),
-            "{advice}"
-        );
-        assert_eq!(value["_kin"]["repository"]["root"], "/work");
-        assert_eq!(value["_kin"]["repository"]["client_root"], "/work/app");
+        assert!(!text.contains("/work"));
 
         // An answer from the client's own folder, with nothing missing, carries
         // the repository and no advice.
-        let plain = crate::envelope::finalize(
+        let plain = present(crate::envelope::finalize(
             crate::types::ToolCallResult::text(json!({"references": []}).to_string()),
             crate::envelope::Envelope::daemon().with_repository(
                 &health,
@@ -442,11 +654,18 @@ mod tests {
                 Path::to_path_buf,
             ),
             "find_references",
-        );
+        ));
         let crate::types::ContentBlock::Text { text } = &plain.content[0];
         let value: Value = serde_json::from_str(text).unwrap();
         assert!(value["_kin"].get("advice").is_none(), "{text}");
-        assert_eq!(value["_kin"]["repository"], json!({"root": "/work"}));
+        assert_eq!(
+            value["_kin"]["repository"],
+            serde_json::to_value(
+                semantic_repository_identity(&repository_identity(Path::new("/work"), None,))
+                    .unwrap()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -490,59 +709,94 @@ mod tests {
         assert_eq!(unknown.warning, None);
     }
 
-    /// A folder in the repository's `.kin/runs` directory, where a session launcher
+    /// A folder in the repository store's runs directory, where a session launcher
     /// runs its child, is told which repository answered and nothing more: no
     /// remedy creates a repository there, and its path alone is not taken as
-    /// proof of a session. Lookalikes outside `.kin/runs` are ordinary nested
+    /// proof of a session. Lookalikes outside that store are ordinary nested
     /// folders and keep that warning.
     #[test]
     fn a_folder_in_the_runs_directory_gets_the_facts_and_no_remedy() {
-        for client in [
-            "/work/repo/.kin/runs/session-3f2a",
-            "/work/repo/.kin/runs/other",
-        ] {
-            let identity = repository_identity(Path::new("/work/repo"), Some(Path::new(client)));
-            assert_eq!(identity.root, "/work/repo");
-            assert_eq!(identity.client_root.as_deref(), Some(client));
-            let warning = identity
-                .warning
-                .expect("the folder is told which repository answered");
-            assert!(
-                warning.starts_with("This answer comes from the Kin repository at /work/repo."),
-                "{warning}"
-            );
-            assert!(warning.contains(".kin/runs directory"), "{warning}");
-            for remedy in [
-                "git init",
-                "init .",
-                "--repo",
-                "session is",
-                "whole repository",
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let machine = tempfile::tempdir().unwrap();
+        let _env = kin_core::test_env::EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            machine.path().join("registry.toml"),
+        )
+        .without("KIN_STORE")
+        .without("KIN_STORE_LAYOUT")
+        .without("KIN_ALLOW_PARENT_STORE");
+        for external in [false, true] {
+            let root = machine
+                .path()
+                .join(if external { "external-tree" } else { "tree" });
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let store = if external {
+                let store =
+                    kin_core::layout::register_external_store(&root, &machine.path().join("store"))
+                        .unwrap();
+                std::fs::create_dir_all(&store).unwrap();
+                kin_core::layout::write_working_tree_record(&store, &root).unwrap();
+                store
+            } else {
+                let store = root.join(".kin");
+                std::fs::create_dir_all(&store).unwrap();
+                std::fs::write(store.join("version"), "2\n").unwrap();
+                store
+            };
+            let runs = store.join("runs");
+            for name in ["session-3f2a", "other"] {
+                let client = runs.join(name);
+                let identity = repository_identity(&root, Some(&client));
+                assert_eq!(identity.root, root.display().to_string());
+                assert_eq!(identity.client_root, Some(client.display().to_string()));
+                let warning = identity
+                    .warning
+                    .expect("the folder is told which repository answered");
+                assert!(
+                    warning.starts_with(&format!(
+                        "This answer comes from the Kin repository at {}.",
+                        root.display()
+                    )),
+                    "{warning}"
+                );
+                assert!(warning.contains("Kin runs directory"), "{warning}");
+                for remedy in [
+                    "git init",
+                    "init .",
+                    "--repo",
+                    "session is",
+                    "whole repository",
+                ] {
+                    assert!(!warning.contains(remedy), "{client:?}: {remedy}: {warning}");
+                }
+            }
+
+            for client in [
+                root.join("runs/session-3f2a"),
+                root.join(".kin/session-3f2a"),
             ] {
-                assert!(!warning.contains(remedy), "{client}: {remedy}: {warning}");
+                let warning = repository_identity(&root, Some(&client))
+                    .warning
+                    .expect("a nested folder is told");
+                assert!(
+                    warning.contains("no Kin repository of its own"),
+                    "{warning}"
+                );
+                assert!(warning.contains("`kin mcp start --repo`"), "{warning}");
+            }
+            if external {
+                let client = root.join(".kin/runs/session-3f2a");
+                let warning = repository_identity(&root, Some(&client)).warning.unwrap();
+                assert!(warning.contains("`kin mcp start --repo`"), "{warning}");
+            } else {
+                assert!(repository_identity(&root, Some(&runs))
+                    .warning
+                    .expect("the runs directory itself is a nested folder")
+                    .contains("`kin mcp start --repo`"));
             }
         }
-
-        for client in [
-            "/work/repo/runs/session-3f2a",
-            "/work/repo/.kin/session-3f2a",
-        ] {
-            let identity = repository_identity(Path::new("/work/repo"), Some(Path::new(client)));
-            let warning = identity.warning.expect("a nested folder is told");
-            assert!(
-                warning.contains("no Kin repository of its own"),
-                "{warning}"
-            );
-            assert!(warning.contains("`kin mcp start --repo`"), "{warning}");
-        }
-
-        let runs_itself = repository_identity(
-            Path::new("/work/repo"),
-            Some(Path::new("/work/repo/.kin/runs")),
-        );
-        assert!(runs_itself
-            .warning
-            .expect("the runs directory itself is a nested folder")
-            .contains("`kin mcp start --repo`"));
     }
 }

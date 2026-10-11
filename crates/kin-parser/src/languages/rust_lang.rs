@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashSet;
+
 use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, SourceSpan, Visibility};
 use tree_sitter::Tree;
 
+use super::rust_nested::{NestedItem, RustPlan};
+
 use crate::adapter::{
-    collect_error_ranges, compute_fingerprint, make_parser, span_from_node, EditHint,
-    LanguageAdapter,
+    collect_error_ranges, compute_fingerprint, make_parser, EditHint, LanguageAdapter,
 };
 use crate::error::Result;
 use crate::extract::{
@@ -21,8 +24,30 @@ impl LanguageAdapter for RustAdapter {
         LanguageId::Rust
     }
 
+    fn declaration_lifecycle(
+        &self,
+    ) -> Option<&dyn crate::declaration_lifecycle::DeclarationLifecycle> {
+        Some(&super::rust_edit::RustLifecycle)
+    }
+
+    fn member_placement(&self) -> Option<&dyn crate::member_placement::MemberPlacement> {
+        Some(&super::rust_edit::RustPlacement)
+    }
+
+    fn unit_editor(&self) -> Option<&dyn crate::unit_editor::UnitEditor> {
+        Some(&super::rust_edit::RUST_UNITS)
+    }
+
+    fn name_syntax(&self) -> Option<crate::name_syntax::NameSyntax> {
+        Some(crate::name_syntax::RUST)
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["rs"]
+    }
+
+    fn project_manifest(&self) -> Option<crate::project_manifest::ProjectManifest> {
+        Some(crate::project_manifest::CARGO_TOML)
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
@@ -54,7 +79,46 @@ impl LanguageAdapter for RustAdapter {
             })
     }
 
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::rust_declarations::rust_declaration_census(
+            tree, source,
+        ))
+    }
+
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
+        self.extract_in(
+            tree,
+            source,
+            file_id,
+            &crate::project_manifest::UnitContext::default(),
+        )
+    }
+
+    /// A crate root's module takes its crate's name from the Cargo manifests
+    /// of its tree, and a `lib.rs` or `main.rs` they root no target with is a
+    /// plain module (see [`super::rust_crates`]).
+    fn unit_context(
+        &self,
+        file_id: &FilePathId,
+        project: &dyn crate::project_manifest::ProjectFiles,
+    ) -> std::result::Result<
+        crate::project_manifest::UnitContext,
+        crate::project_manifest::UnreadableManifest,
+    > {
+        super::rust_crates::unit_context(file_id, project)
+    }
+
+    fn extract_in(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+        file_id: &FilePathId,
+        unit: &crate::project_manifest::UnitContext,
+    ) -> Result<ParseOutput> {
         let error_ranges = collect_error_ranges(tree);
         let parse_state = if error_ranges.is_empty() {
             ParseState::Valid
@@ -62,34 +126,48 @@ impl LanguageAdapter for RustAdapter {
             ParseState::Incomplete { error_ranges }
         };
 
+        // Definitions nested in function bodies are named and admitted before
+        // the walk, so every callable's call walk knows which nested bodies
+        // now belong to an entity of their own.
+        let mut plan = super::rust_nested::plan(tree, source);
         let mut entities = Vec::new();
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let mut tests = Vec::new();
         let root = tree.root_node();
-        // The file's own module surface is pushed before the walk. Import
-        // linking selects it by the file's module coordinate, not entity order.
-        // Pushing it first still lets the `mod_item` arm enhance this entity
-        // in place when a declared module carries the file's own name;
-        // pushing it afterwards instead left `mod defaults` in `defaults.rs`
-        // minting a SECOND module entity with the same name, the same
-        // generated id and a different span, which a commit's
-        // `semantics_follow_the_bytes` check reads as the graph being behind
-        // its own bytes. A file that declares and imports nothing drops it
-        // again below.
-        let surface = crate::adapter::file_module_surface_name(None, file_id).inspect(|name| {
-            entities.push(crate::adapter::file_module_surface_entity(
-                name.clone(),
-                format!("module {}", file_id.0),
-                &root,
-                source,
-                file_id,
-            ));
-        });
+        // The file's own module surface is pushed before the walk, and import
+        // linking selects it by its whole-unit signature, not entity order. A
+        // declared module that carries the unit's own name, `mod defaults` in
+        // `defaults.rs` or `mod foo;` in the root of crate `foo`, is a second
+        // module inside the unit and stays one: merging it into the surface
+        // replaced the unit's span and signature with that one line, and the
+        // unit then contained nothing. Where the two derive one identity, the
+        // pipeline separates them. A file that declares and imports nothing
+        // drops the surface again below.
+        let surface = unit
+            .module_name
+            .clone()
+            .or_else(|| crate::adapter::file_module_surface_name(None, file_id))
+            .inspect(|name| {
+                entities.push(crate::adapter::file_module_surface_entity(
+                    name.clone(),
+                    format!("module {}", file_id.0),
+                    &root,
+                    source,
+                    file_id,
+                ));
+            });
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            extract_rust_node(&child, source, file_id, &mut entities, &mut relations);
+            extract_rust_node(
+                &child,
+                source,
+                file_id,
+                &plan,
+                &mut entities,
+                &mut relations,
+            );
             if child.kind() == "use_declaration" {
                 if let Some(import) = extract_rust_use(&child, source) {
                     imports.push(import);
@@ -109,6 +187,32 @@ impl LanguageAdapter for RustAdapter {
             // Detect #[test] methods inside impl blocks and mod tests
             extract_rust_tests_from_block(&child, source, &mut tests);
         }
+        for item in &plan.nested {
+            emit_nested_item(item, source, file_id, &plan, &mut entities, &mut relations);
+        }
+        for (owner, trait_name) in &plan.trait_impls {
+            relations.push(ExtractedRelation {
+                site: None,
+                receiver: None,
+                call_shape: None,
+                kind: kin_model::RelationKind::Implements,
+                src_name: owner.clone(),
+                dst_name: trait_name.clone(),
+                import_source: None,
+            });
+        }
+        // Calls no declaration walk reached, such as the ones an item macro
+        // (`thread_local!`, `lazy_static!`) writes at module scope, go to the
+        // innermost entity holding each one, the module surface for module
+        // scope. The walk leaves admitted nested items to their own entities
+        // exactly as a callable's walk does.
+        {
+            let accounted = crate::call_owner::accounted_call_sites(&relations);
+            let mut swept = Vec::new();
+            extract_callable_calls(&root, source, "", None, &plan, &[], &mut swept);
+            crate::call_owner::adopt_unowned_calls(&entities, &accounted, swept, &mut relations);
+        }
+        let nested_definitions = std::mem::take(&mut plan.census);
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -146,17 +250,39 @@ impl LanguageAdapter for RustAdapter {
         // because the walk above needs it in place to merge a same-named
         // `mod` declaration into.
         //
-        // It is hollow only when the walk added nothing beside it AND nothing
-        // merged into it. `declaration_line` is the tell: the surface is minted
-        // with none and the `mod_item` arm sets one, so a file holding just
-        // `pub mod thing {}` under `thing.rs` keeps its real declaration.
-        if surface.is_some()
-            && imports.is_empty()
-            && entities.len() == 1
-            && entities[0].declaration_line.is_none()
-        {
+        // It is hollow only when the walk added nothing beside it. A file
+        // holding just `pub mod thing {}` under `thing.rs` keeps both its
+        // surface and that declaration, which is a module of its own.
+        //
+        // A file whose only content is an item macro (`thread_local!`,
+        // `lazy_static!`) declares nothing either, but its value-escape record
+        // lists what the macro calls and holds, and that record needs an entity
+        // to ride on, as do the calls the macro makes, which the surface owns.
+        //
+        // The record's unparsed regions do not count. They say where the
+        // grammar read nothing, so bytes that parse to a lone error node would
+        // otherwise keep a module entity minted from that error, and parse
+        // coverage would count a file whose bytes produced no declaration.
+        let hollow = surface.as_deref().is_some_and(|surface| {
+            imports.is_empty()
+                && entities.len() == 1
+                && entities[0].declaration_line.is_none()
+                && !relations.iter().any(|relation| {
+                    relation.kind == kin_model::RelationKind::Calls && relation.src_name == surface
+                })
+                && {
+                    let mut record = super::rust_escape::census(tree, source).record;
+                    record.unparsed.clear();
+                    record.is_empty()
+                }
+        });
+        if hollow {
             entities.clear();
         }
+        // The unit's module owns what is declared at its top.
+        let held = crate::module_contains::module_contains(&entities, &relations, file_id);
+        relations.extend(held);
+
         Ok(ParseOutput {
             derived_members: Vec::new(),
             entities,
@@ -165,6 +291,7 @@ impl LanguageAdapter for RustAdapter {
             tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: Some(nested_definitions),
         })
     }
 }
@@ -173,6 +300,7 @@ fn extract_rust_node(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
+    plan: &RustPlan<'_>,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
 ) {
@@ -190,10 +318,10 @@ fn extract_rust_node(
                     span: rust_item_span(node, file_id, source),
                     declaration_line: Some(node.start_position().row as u32),
                 });
-                extract_calls_from_context(node, source, &name, None, relations);
+                extract_callable_calls(node, source, &name, None, plan, &[], relations);
             }
         }
-        "struct_item" => {
+        "struct_item" | "union_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
@@ -218,6 +346,7 @@ fn extract_rust_node(
                         import_source: None,
                     });
                 }
+                extract_rust_fields(node, &name, source, file_id, entities, relations);
             }
         }
         "enum_item" => {
@@ -286,7 +415,7 @@ fn extract_rust_node(
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
                     kind: EntityKind::TraitDef,
-                    name,
+                    name: name.clone(),
                     signature: node_signature(node, source),
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
@@ -294,6 +423,50 @@ fn extract_rust_node(
                     span: rust_item_span(node, file_id, source),
                     declaration_line: Some(node.start_position().row as u32),
                 });
+                // The methods a trait declares, required or provided, are what
+                // a call through a trait object or a bounded generic reaches:
+                // its receiver's type is the trait, never one implementation.
+                // A provided method's body is a callable of its own, where
+                // `self.m()` names the trait's own `m`.
+                for member in super::rust_nested::members(
+                    *node,
+                    &["function_item", "function_signature_item"],
+                ) {
+                    let Some(method) = super::rust_nested::item_name(member, source) else {
+                        continue;
+                    };
+                    let qualified = format!("{name}::{method}");
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Method,
+                        name: qualified.clone(),
+                        signature: node_signature(&member, source),
+                        visibility: detect_rust_visibility(node, source),
+                        doc_summary: extract_doc_comment(&member, source),
+                        fingerprint: compute_fingerprint(&member, source),
+                        span: rust_item_span(&member, file_id, source),
+                        declaration_line: Some(member.start_position().row as u32),
+                    });
+                    if member.kind() == "function_item" {
+                        extract_callable_calls(
+                            &member,
+                            source,
+                            &qualified,
+                            Some(name.as_str()),
+                            plan,
+                            &[],
+                            relations,
+                        );
+                    }
+                    relations.push(ExtractedRelation {
+                        site: None,
+                        receiver: None,
+                        call_shape: None,
+                        kind: kin_model::RelationKind::Contains,
+                        src_name: name.clone(),
+                        dst_name: qualified,
+                        import_source: None,
+                    });
+                }
             }
         }
         "type_item" => {
@@ -311,12 +484,16 @@ fn extract_rust_node(
                 });
             }
         }
-        "const_item" => {
+        "const_item" | "static_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
-                    kind: EntityKind::Constant,
-                    name,
+                    kind: if node.kind() == "const_item" {
+                        EntityKind::Constant
+                    } else {
+                        EntityKind::StaticVar
+                    },
+                    name: name.clone(),
                     signature: node_signature(node, source),
                     visibility: detect_rust_visibility(node, source),
                     doc_summary: extract_doc_comment(node, source),
@@ -324,21 +501,9 @@ fn extract_rust_node(
                     span: rust_item_span(node, file_id, source),
                     declaration_line: Some(node.start_position().row as u32),
                 });
-            }
-        }
-        "static_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::StaticVar,
-                    name,
-                    signature: node_signature(node, source),
-                    visibility: detect_rust_visibility(node, source),
-                    doc_summary: extract_doc_comment(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: rust_item_span(node, file_id, source),
-                    declaration_line: Some(node.start_position().row as u32),
-                });
+                // An initializer runs code (`Lazy::new(|| load())`, a `const fn`
+                // call); its calls are the item's, not nobody's.
+                extract_callable_calls(node, source, &name, None, plan, &[], relations);
             }
         }
         "impl_item" => {
@@ -388,11 +553,13 @@ fn extract_rust_node(
                                 span: rust_item_span(&member, file_id, source),
                                 declaration_line: Some(member.start_position().row as u32),
                             });
-                            extract_calls_from_context(
+                            extract_callable_calls(
                                 &member,
                                 source,
                                 &qualified,
                                 (!type_name.is_empty()).then_some(type_name.as_str()),
+                                plan,
+                                &[],
                                 relations,
                             );
                             // A method declared in `impl Trait for Type` satisfies
@@ -433,14 +600,14 @@ fn extract_rust_node(
         "mod_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                // When the declared module name matches the file's module
-                // surface entity (already pushed before the tree walk), enhance
-                // that entity instead of pushing a duplicate that would produce
-                // an identical EntityId.
-                if let Some(existing) = entities
-                    .iter_mut()
-                    .find(|e| e.kind == EntityKind::Module && e.name == name)
-                {
+                // A module declared twice under one name, as two `cfg` arms
+                // of `mod imp` are, is one module. The unit's own surface,
+                // minted with no declaration line, is never such a
+                // declaration: a `mod` carrying the unit's name is a module
+                // inside it.
+                if let Some(existing) = entities.iter_mut().find(|e| {
+                    e.kind == EntityKind::Module && e.name == name && e.declaration_line.is_some()
+                }) {
                     existing.signature = node_signature(node, source);
                     existing.visibility = detect_rust_visibility(node, source);
                     existing.doc_summary = extract_doc_comment(node, source);
@@ -470,7 +637,7 @@ fn extract_rust_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.children(&mut cursor) {
-                    extract_rust_node(&child, source, file_id, entities, relations);
+                    extract_rust_node(&child, source, file_id, plan, entities, relations);
                 }
             }
         }
@@ -503,6 +670,113 @@ fn extract_rust_node(
         }
         "use_declaration" => {}
         _ => {}
+    }
+}
+
+/// Emit one definition nested in a function body under the name the plan
+/// gave it, with the calls its own body makes.
+fn emit_nested_item(
+    item: &NestedItem<'_>,
+    source: &[u8],
+    file_id: &FilePathId,
+    plan: &RustPlan<'_>,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let node = &item.node;
+    let visibility = if crate::nested::is_local_scope_name(&item.name) {
+        // A name declared in a block is visible in that block and nowhere
+        // else, whatever visibility it is written with.
+        Visibility::Private
+    } else {
+        detect_rust_visibility(node, source)
+    };
+    entities.push(ExtractedEntity {
+        kind: item.kind,
+        name: item.name.clone(),
+        signature: node_signature(node, source),
+        visibility,
+        doc_summary: extract_doc_comment(node, source),
+        fingerprint: compute_fingerprint(node, source),
+        span: rust_item_span(node, file_id, source),
+        declaration_line: Some(node.start_position().row as u32),
+    });
+    let relation = |kind, src_name: &str, dst_name: &str| ExtractedRelation {
+        site: None,
+        receiver: None,
+        call_shape: None,
+        kind,
+        src_name: src_name.to_string(),
+        dst_name: dst_name.to_string(),
+        import_source: None,
+    };
+    match node.kind() {
+        "function_item" | "const_item" | "static_item" => extract_callable_calls(
+            node,
+            source,
+            &item.name,
+            item.owner.as_deref(),
+            plan,
+            &item.inherited,
+            relations,
+        ),
+        "struct_item" | "union_item" | "enum_item" => {
+            for trait_name in extract_derive_traits(node, source) {
+                relations.push(relation(
+                    kin_model::RelationKind::Implements,
+                    &item.name,
+                    &trait_name,
+                ));
+            }
+        }
+        _ => {}
+    }
+    if node.kind() == "enum_item" {
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut cursor = body.walk();
+            for variant in body.children(&mut cursor) {
+                let Some(variant_name) = (variant.kind() == "enum_variant")
+                    .then(|| variant.child_by_field_name("name"))
+                    .flatten()
+                else {
+                    continue;
+                };
+                let qualified = format!(
+                    "{}::{}",
+                    item.name,
+                    variant_name.utf8_text(source).unwrap_or("")
+                );
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::EnumVariant,
+                    name: qualified.clone(),
+                    signature: node_signature(&variant, source),
+                    visibility,
+                    doc_summary: None,
+                    fingerprint: compute_fingerprint(&variant, source),
+                    span: rust_item_span(&variant, file_id, source),
+                    declaration_line: Some(variant.start_position().row as u32),
+                });
+                relations.push(relation(
+                    kin_model::RelationKind::Contains,
+                    &item.name,
+                    &qualified,
+                ));
+            }
+        }
+    }
+    if let Some(owner) = &item.owner {
+        relations.push(relation(
+            kin_model::RelationKind::Contains,
+            owner,
+            &item.name,
+        ));
+    }
+    if let Some(trait_name) = &item.implements {
+        relations.push(relation(
+            kin_model::RelationKind::Implements,
+            &item.name,
+            trait_name,
+        ));
     }
 }
 
@@ -594,6 +868,56 @@ fn is_outer_doc_block(text: &str) -> bool {
     text.starts_with("/**") && !text.starts_with("/***") && text != "/**/"
 }
 
+/// Every named field of a struct or union, as a field entity of its own:
+/// owner-qualified the way a method is (`Account::balance`), contained by its
+/// owner, and spanning its documentation and attributes. A tuple struct's
+/// fields have no names and stay out.
+fn extract_rust_fields(
+    node: &tree_sitter::Node,
+    owner: &str,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for field in body.children(&mut cursor) {
+        if field.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(field_name) = field
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let qualified = format!("{owner}::{field_name}");
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Field,
+            name: qualified.clone(),
+            signature: node_signature(&field, source),
+            visibility: detect_rust_visibility(&field, source),
+            doc_summary: extract_doc_comment(&field, source),
+            fingerprint: compute_fingerprint(&field, source),
+            span: rust_item_span(&field, file_id, source),
+            declaration_line: Some(field.start_position().row as u32),
+        });
+        relations.push(ExtractedRelation {
+            site: None,
+            receiver: None,
+            call_shape: None,
+            kind: kin_model::RelationKind::Contains,
+            src_name: owner.to_string(),
+            dst_name: qualified,
+            import_source: None,
+        });
+    }
+}
+
 /// The doc comments and outer attributes that belong to an item, in source
 /// order, read from the siblings above it.
 ///
@@ -606,36 +930,20 @@ fn is_outer_doc_block(text: &str) -> bool {
 /// (`#![..]`, a different node kind) belong to the enclosing item and end
 /// the walk.
 fn leading_trivia<'a>(node: &tree_sitter::Node<'a>, source: &[u8]) -> Vec<tree_sitter::Node<'a>> {
-    let mut run = Vec::new();
-    let mut prev = node.prev_sibling();
-    while let Some(p) = prev {
-        let owned = match p.kind() {
-            "attribute_item" => true,
-            "line_comment" => {
-                let text = p.utf8_text(source).unwrap_or("");
-                if text.starts_with("//!") {
-                    break;
-                }
-                is_outer_doc_line(text)
-            }
-            "block_comment" => {
-                let text = p.utf8_text(source).unwrap_or("");
-                if text.starts_with("/*!") {
-                    break;
-                }
-                is_outer_doc_block(text)
-            }
-            _ => break,
-        };
-        run.push((p, owned));
-        prev = p.prev_sibling();
-    }
-    // The run was read bottom-up; the ordinary comments above the topmost
-    // owned node are not the item's.
-    while matches!(run.last(), Some((_, false))) {
-        run.pop();
-    }
-    run.into_iter().rev().map(|(node, _)| node).collect()
+    use crate::declaration_extent::{leading_run, Leading};
+    leading_run(node, false, |sibling| {
+        let text = sibling.utf8_text(source).unwrap_or("");
+        match sibling.kind() {
+            "attribute_item" => Leading::Owned,
+            "line_comment" if text.starts_with("//!") => Leading::Stop,
+            "line_comment" if is_outer_doc_line(text) => Leading::Owned,
+            "line_comment" => Leading::Passable,
+            "block_comment" if text.starts_with("/*!") => Leading::Stop,
+            "block_comment" if is_outer_doc_block(text) => Leading::Owned,
+            "block_comment" => Leading::Passable,
+            _ => Leading::Stop,
+        }
+    })
 }
 
 /// The span of a Rust item including the doc comments and outer attributes
@@ -643,14 +951,23 @@ fn leading_trivia<'a>(node: &tree_sitter::Node<'a>, source: &[u8]) -> Vec<tree_s
 /// documentation. The entity's id does not key on this span's start; see
 /// `declaration_line` on `ExtractedEntity`.
 fn rust_item_span(node: &tree_sitter::Node, file_id: &FilePathId, source: &[u8]) -> SourceSpan {
-    let mut span = span_from_node(node, file_id);
-    if let Some(first) = leading_trivia(node, source).first() {
-        let start = first.start_position();
-        span.start_byte = first.start_byte();
-        span.start_line = start.row as u32;
-        span.start_col = start.column as u32;
-    }
-    span
+    crate::declaration_extent::span_with_leading(node, &leading_trivia(node, source), file_id)
+}
+
+/// Where an item's entity span starts: its first doc comment or outer
+/// attribute, or the item itself. Returns (byte, line, column). A reader that
+/// keys a fact to the entity's span starts from here.
+pub(crate) fn rust_item_start(node: &tree_sitter::Node, source: &[u8]) -> (usize, u32, u32) {
+    let first = leading_trivia(node, source)
+        .first()
+        .copied()
+        .unwrap_or(*node);
+    let position = first.start_position();
+    (
+        first.start_byte(),
+        position.row as u32,
+        position.column as u32,
+    )
 }
 
 fn extract_doc_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
@@ -675,20 +992,103 @@ fn extract_doc_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String
     }
 }
 
-/// Extract all function/method calls within a function body.
-fn extract_calls_from_context(
+/// What a walk of one callable's calls carries.
+struct CallScope<'a, 'tree> {
+    /// The entity the calls are attributed to.
+    context_name: &'a str,
+    /// The impl or trait owner `self` and `Self` name.
+    owner: Option<&'a str>,
+    plan: &'a RustPlan<'tree>,
+    /// Names a pattern in the callable binds. A plain call spelling one calls
+    /// the local value, never a nested item of the same name.
+    bound: HashSet<String>,
+}
+
+impl CallScope<'_, '_> {
+    /// A callee as the items nested in enclosing blocks name it: `helper()`
+    /// calls `outer.<locals>.helper` when a block around the call declares it,
+    /// and `Local::new()` calls `outer.<locals>.Local::new`.
+    fn localize(&self, callee: String, stack: &[usize]) -> String {
+        let (first, rest) = match callee.find("::") {
+            Some(at) if !callee[at..].starts_with("::<") => callee.split_at(at),
+            Some(at) => (&callee[..at], ""),
+            None => (callee.as_str(), ""),
+        };
+        let entity = if rest.is_empty() {
+            if self.bound.contains(first) {
+                None
+            } else {
+                self.plan.lookup(stack, first).flatten()
+            }
+        } else {
+            self.plan.lookup_type(stack, first).flatten()
+        };
+        match entity {
+            Some(entity) => {
+                let tail = if rest.is_empty() {
+                    &callee[first.len()..]
+                } else {
+                    rest
+                };
+                format!("{entity}{tail}")
+            }
+            None => callee,
+        }
+    }
+}
+
+/// Extract every call a callable's body makes, leaving the bodies of nested
+/// definitions the plan admits to their own entities.
+fn extract_callable_calls(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
     owner: Option<&str>,
+    plan: &RustPlan<'_>,
+    inherited: &[usize],
     relations: &mut Vec<ExtractedRelation>,
 ) {
+    // Only a file that declares nested items has a call to rewrite, and only
+    // then can a local of the same name shadow one.
+    let mut sites = Vec::new();
+    if plan.has_block_items() {
+        super::rust_nested::binding_sites(*node, &|inner| plan.is_admitted(inner), &mut sites);
+    }
+    let bound = sites
+        .into_iter()
+        .map(|(name, _, _)| name.utf8_text(source).unwrap_or("").to_string())
+        .collect();
+    let scope = CallScope {
+        context_name,
+        owner,
+        plan,
+        bound,
+    };
+    let mut stack = inherited.to_vec();
+    extract_calls_from_context(node, source, &scope, &mut stack, relations);
+}
+
+/// Extract all function/method calls within a function body.
+fn extract_calls_from_context(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    scope: &CallScope<'_, '_>,
+    stack: &mut Vec<usize>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let context_name = scope.context_name;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // A nested definition the plan admits is an entity of its own, and
+        // what is written inside it is its own.
+        if scope.plan.is_admitted(child) {
+            continue;
+        }
         if child.kind() == "call_expression" {
             // The callee is the `function` field
             if let Some(function) = child.child_by_field_name("function") {
-                let (callee_name, receiver) = rust_callee_and_receiver(&function, source, owner);
+                let (callee_name, receiver) =
+                    rust_callee_and_receiver(&function, source, scope, stack);
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
                         // The call expression itself, so a reference row can
@@ -716,18 +1116,19 @@ fn extract_calls_from_context(
             let mut macro_cursor = child.walk();
             for macro_child in child.children(&mut macro_cursor) {
                 if macro_child.kind() == "token_tree" {
-                    extract_calls_from_token_tree(
-                        &macro_child,
-                        source,
-                        context_name,
-                        owner,
-                        relations,
-                    );
+                    extract_calls_from_token_tree(&macro_child, source, scope, stack, relations);
                 }
             }
         }
-        // Recurse into child nodes
-        extract_calls_from_context(&child, source, context_name, owner, relations);
+        // Recurse into child nodes, with the items a block declares in scope.
+        let opens_scope = child.kind() == "block" && scope.plan.declares_items(child);
+        if opens_scope {
+            stack.push(child.id());
+        }
+        extract_calls_from_context(&child, source, scope, stack, relations);
+        if opens_scope {
+            stack.pop();
+        }
     }
 }
 
@@ -772,29 +1173,37 @@ fn site_spanning(
 fn extract_calls_from_token_tree(
     node: &tree_sitter::Node,
     source: &[u8],
-    context_name: &str,
-    owner: Option<&str>,
+    scope: &CallScope<'_, '_>,
+    stack: &[usize],
     relations: &mut Vec<ExtractedRelation>,
 ) {
+    let (context_name, owner) = (scope.context_name, scope.owner);
     let mut cursor = node.walk();
     let tokens: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
 
     for (index, token) in tokens.iter().enumerate() {
         if token.kind() == "token_tree" {
-            extract_calls_from_token_tree(token, source, context_name, owner, relations);
+            // `#[cfg(test)]` and `#![doc(...)]` are attributes, whose
+            // parenthesized groups are arguments to the attribute and not
+            // calls, the way they are outside a macro.
+            if !is_token_tree_attribute(&tokens, index) {
+                extract_calls_from_token_tree(token, source, scope, stack, relations);
+            }
             continue;
         }
         if token.kind() != "identifier" {
             continue;
         }
         // A declaration's name and an interpolated token are not a known
-        // callee. Comments are trivia even inside a token tree, so inspect
-        // the preceding non-comment token rather than only the sibling.
+        // callee: `fn name(..)` and a tuple struct's `struct Name(..)` declare
+        // one, and `#name` or `$name` stands in for one. Comments are trivia
+        // even inside a token tree, so inspect the preceding non-comment token
+        // rather than only the sibling.
         let previous = tokens[..index]
             .iter()
             .rev()
             .find(|previous| !matches!(previous.kind(), "line_comment" | "block_comment"));
-        if previous.is_some_and(|previous| matches!(previous.kind(), "fn" | "#" | "$")) {
+        if previous.is_some_and(|previous| matches!(previous.kind(), "fn" | "struct" | "#" | "$")) {
             continue;
         }
         // A call needs a parenthesized group immediately after the name.
@@ -810,11 +1219,17 @@ fn extract_calls_from_token_tree(
         // no such token there is nothing to attribute the call to, and recording
         // it receiverless would present a dispatch as a bare call.
         let is_method_call = index > 0 && tokens[index - 1].kind() == ".";
+        let mut receiver_start = index.saturating_sub(2);
         let receiver = if is_method_call {
-            let Some(receiver_token) = index.checked_sub(2).and_then(|at| tokens.get(at)) else {
+            if index < 2 {
                 continue;
-            };
-            Some(receiver_token.utf8_text(source).unwrap_or("").to_string())
+            }
+            // The whole receiver chain, `self.store` in `self.store.ok()`, not
+            // just the token before the dot: a receiver recorded as `store`
+            // would read as a local of that name to every tier that types one.
+            receiver_start = token_tree_receiver_start(&tokens, index - 2);
+            let text = &source[tokens[receiver_start].start_byte()..tokens[index - 2].end_byte()];
+            Some(String::from_utf8_lossy(text).into_owned())
         } else {
             None
         };
@@ -825,7 +1240,7 @@ fn extract_calls_from_token_tree(
         // could read the receiver's text; anything else starts at the first
         // segment of its path.
         let call_start = if is_method_call {
-            index - 2
+            receiver_start
         } else {
             // Reconstruct a leading `a::b::` path so qualified callees keep
             // the same shape the call_expression arm extracts.
@@ -843,7 +1258,14 @@ fn extract_calls_from_token_tree(
             }
             start
         };
-        let (callee_name, receiver) = fold_settled_rust_receiver(callee_name, receiver, owner);
+        let (callee_name, receiver) = if receiver.is_some() {
+            fold_settled_rust_receiver(callee_name, receiver, owner)
+        } else {
+            (
+                fold_self_path(scope.localize(callee_name, stack), owner),
+                None,
+            )
+        };
         if is_valid_callee_name(&callee_name) {
             relations.push(ExtractedRelation {
                 // The token run the call is written as, from its leftmost token
@@ -860,6 +1282,45 @@ fn extract_calls_from_token_tree(
                 import_source: None,
             });
         }
+    }
+}
+
+/// Whether the token tree at `index` is the bracketed body of an attribute,
+/// `#[..]` or `#![..]`.
+fn is_token_tree_attribute(tokens: &[tree_sitter::Node], index: usize) -> bool {
+    let opens_with_bracket = tokens[index].child(0).map(|open| open.kind()) == Some("[");
+    let kind_at = |at: Option<usize>| at.and_then(|at| tokens.get(at)).map(|token| token.kind());
+    opens_with_bracket
+        && (kind_at(index.checked_sub(1)) == Some("#")
+            || (kind_at(index.checked_sub(1)) == Some("!")
+                && kind_at(index.checked_sub(2)) == Some("#")))
+}
+
+/// The first token of the receiver chain that ends at `last` inside a macro
+/// token tree: `self . store` for `self.store.ok()`, `a . b (..)` for
+/// `a.b().c()`. A chain link is a name or a delimited group, joined by dots.
+fn token_tree_receiver_start(tokens: &[tree_sitter::Node], last: usize) -> usize {
+    let is_link = |token: &tree_sitter::Node| {
+        matches!(
+            token.kind(),
+            "identifier" | "self" | "super" | "crate" | "token_tree" | "integer_literal"
+        )
+    };
+    let mut start = last;
+    loop {
+        // A call or index group belongs to the name before it: `b (..)`.
+        if tokens[start].kind() == "token_tree"
+            && start > 0
+            && matches!(tokens[start - 1].kind(), "identifier" | "self")
+        {
+            start -= 1;
+            continue;
+        }
+        if start >= 2 && tokens[start - 1].kind() == "." && is_link(&tokens[start - 2]) {
+            start -= 2;
+            continue;
+        }
+        return start;
     }
 }
 
@@ -880,8 +1341,10 @@ fn extract_calls_from_token_tree(
 fn rust_callee_and_receiver(
     function: &tree_sitter::Node,
     source: &[u8],
-    owner: Option<&str>,
+    scope: &CallScope<'_, '_>,
+    stack: &[usize],
 ) -> (String, Option<String>) {
+    let owner = scope.owner;
     if function.kind() == "field_expression" {
         let method = function
             .child_by_field_name("field")
@@ -893,7 +1356,7 @@ fn rust_callee_and_receiver(
         return fold_settled_rust_receiver(method, receiver, owner);
     }
     let name = function.utf8_text(source).unwrap_or("").to_string();
-    (fold_self_path(name, owner), None)
+    (fold_self_path(scope.localize(name, stack), owner), None)
 }
 
 /// Fold a `self.m()` receiver into `Owner::m`, or keep the receiver as written.
@@ -1976,6 +2439,212 @@ pub enum Status {
     // under a module was dropped and module-scoped callers vanished from
     // refs/impact.
 
+    /// Calls written in a nested definition are that definition's, and a call
+    /// in the enclosing body that names a nested item spells its entity.
+    #[test]
+    fn calls_in_nested_definitions_belong_to_them() {
+        let source = br#"
+fn outer() {
+    helper();
+    Fake::new().hit();
+    struct Fake;
+    impl Fake {
+        fn new() -> Self { Self::build() }
+        fn build() -> Self { Fake }
+        fn hit(&self) { self.log(); }
+        fn log(&self) {}
+    }
+    fn helper() { deep(); }
+}
+fn helper() {}
+static CURRENT: u8 = compute();
+"#;
+        let tree = RustAdapter.parse(source).unwrap();
+        let output = RustAdapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+        let mut edges = call_edges(&output);
+        edges.sort_unstable();
+        assert_eq!(
+            edges,
+            vec![
+                ("CURRENT", "compute"),
+                ("outer", "hit"),
+                ("outer", "outer.<locals>.Fake::new"),
+                ("outer", "outer.<locals>.helper"),
+                ("outer.<locals>.Fake::hit", "outer.<locals>.Fake::log"),
+                ("outer.<locals>.Fake::new", "outer.<locals>.Fake::build"),
+                ("outer.<locals>.helper", "deep"),
+            ]
+        );
+        let census = output
+            .nested_definitions
+            .expect("the adapter takes a census");
+        assert!(census.not_admitted.is_empty(), "{census:?}");
+    }
+
+    /// A crate root's module takes the crate name its Cargo manifest gives,
+    /// read the way Rust code writes it, so a row names which crate's root
+    /// holds a declaration: `example_oauth :: main`, never `crate :: main`.
+    /// With no manifest known, only a path laid out as a crate root is named
+    /// by its crate's directory, and any other `main.rs` or `lib.rs` is a
+    /// plain module named by its stem.
+    #[test]
+    fn a_crate_root_module_is_named_by_its_crate() {
+        struct Manifests(Vec<(&'static str, &'static str)>);
+        impl crate::project_manifest::ProjectFiles for Manifests {
+            fn manifest(
+                &self,
+                path: &str,
+            ) -> std::result::Result<
+                Option<std::sync::Arc<str>>,
+                crate::project_manifest::UnreadableManifest,
+            > {
+                Ok(self
+                    .0
+                    .iter()
+                    .find(|(at, _)| *at == path)
+                    .map(|(_, text)| std::sync::Arc::from(*text)))
+            }
+        }
+        let manifests = Manifests(vec![
+            (
+                "examples/oauth/Cargo.toml",
+                "[package]\nname = \"example-oauth\"\nedition = \"2021\"\n",
+            ),
+            (
+                "axum-macros/Cargo.toml",
+                "[package]\nname = \"axum-macros\"\nedition = \"2021\"\n",
+            ),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"tower-http\"\nedition = \"2021\"\n",
+            ),
+        ]);
+        let modules = |path: &str, project: &dyn crate::project_manifest::ProjectFiles| {
+            let source = b"mod typed_path;\npub fn derive_typed_path() {}\n";
+            let file = FilePathId::new(path);
+            let tree = RustAdapter.parse(source).unwrap();
+            let unit = RustAdapter.unit_context(&file, project).unwrap();
+            RustAdapter
+                .extract_in(&tree, source, &file, &unit)
+                .unwrap()
+                .entities
+                .into_iter()
+                .filter(|entity| entity.kind == EntityKind::Module)
+                .map(|entity| entity.name)
+                .collect::<Vec<_>>()
+        };
+        let none = crate::project_manifest::NoProjectFiles;
+        for (path, with_manifests, without) in [
+            ("examples/oauth/src/main.rs", "example_oauth", "oauth"),
+            ("axum-macros/src/lib.rs", "axum_macros", "axum_macros"),
+            ("src/lib.rs", "tower_http", "crate"),
+            ("src/bin/tool/main.rs", "tool", "tool"),
+            ("src/outer/main.rs", "main", "main"),
+            ("axum/src/routing/mod.rs", "routing", "routing"),
+        ] {
+            assert_eq!(
+                modules(path, &manifests),
+                vec![with_manifests, "typed_path"],
+                "{path} with its manifests"
+            );
+            assert_eq!(
+                modules(path, &none),
+                vec![without, "typed_path"],
+                "{path} with no manifest known"
+            );
+        }
+    }
+
+    /// A crate root that declares a module carrying its own crate's name
+    /// keeps both: the root stays the unit's module, with its whole span and
+    /// its whole-unit signature, and still holds its top-level functions, and
+    /// `mod foo;` is a second module with an identity of its own.
+    #[test]
+    fn a_root_declaring_a_module_of_its_own_name_keeps_both_modules() {
+        let source = b"mod foo;\npub fn run() {}\npub fn stop() {}\n";
+        let file = FilePathId::new("foo/src/lib.rs");
+        let tree = RustAdapter.parse(source).unwrap();
+        let output = RustAdapter.extract(&tree, source, &file).unwrap();
+        let foo: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Module && entity.name == "foo")
+            .collect();
+        assert_eq!(foo.len(), 2, "{:?}", output.entities);
+        let root = foo
+            .iter()
+            .find(|entity| crate::module_contains::is_unit_module(entity, &file))
+            .expect("the root keeps its whole-unit signature");
+        assert_eq!(root.span.start_byte, 0);
+        assert_eq!(root.span.end_byte, source.len());
+        let contained: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == kin_model::RelationKind::Contains && relation.src_name == "foo"
+            })
+            .map(|relation| relation.dst_name.as_str())
+            .collect();
+        assert!(contained.contains(&"run"), "{contained:?}");
+        assert!(contained.contains(&"stop"), "{contained:?}");
+
+        // Both begin on the first line, so they derive one identity; the
+        // unit's own module keeps it and the declaration takes its own.
+        let mut entities: Vec<_> = output
+            .entities
+            .iter()
+            .cloned()
+            .map(|entity| entity.into_entity(LanguageId::Rust, &file))
+            .collect();
+        crate::separate_shared_identities(&mut entities, &file);
+        let ids: Vec<_> = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Module && entity.name == "foo")
+            .map(|entity| (entity.id, kin_model::is_file_module_surface(entity)))
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0].0, ids[1].0);
+        assert_eq!(ids.iter().filter(|(_, surface)| *surface).count(), 1);
+    }
+
+    /// A method call inside a macro records its whole receiver chain, so a
+    /// field call is never read as a call through a local of the field's name.
+    #[test]
+    fn a_macro_method_call_keeps_its_whole_receiver_chain() {
+        let source = br#"
+impl Engine {
+    fn check(&self, store: Cache) {
+        assert!(self.store.ok());
+        assert!(store.ok());
+        assert!(self.pick().ok());
+        assert!(self.ready());
+    }
+}
+"#;
+        let tree = RustAdapter.parse(source).unwrap();
+        let output = RustAdapter
+            .extract(&tree, source, &FilePathId::new("src/engine.rs"))
+            .unwrap();
+        let calls: Vec<(&str, Option<&str>)> = output
+            .relations
+            .iter()
+            .filter(|relation| relation.kind == kin_model::RelationKind::Calls)
+            .map(|relation| (relation.dst_name.as_str(), relation.receiver.as_deref()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("ok", Some("self.store")),
+                ("ok", Some("store")),
+                ("Engine::pick", None),
+                ("ok", Some("self.pick()")),
+                ("Engine::ready", None),
+            ]
+        );
+    }
+
     fn call_edges(output: &crate::extract::ParseOutput) -> Vec<(&str, &str)> {
         output
             .relations
@@ -2010,50 +2679,96 @@ pub enum Status {
         assert!(out.imports.is_empty());
     }
 
-    /// `mod defaults` inside `defaults.rs` is ONE module entity, not two.
-    ///
-    /// The `mod_item` arm enhances the file surface in place when the names
-    /// agree, and it can only find a surface that is already in the vector. A
-    /// surface added after the walk left two module entities with the same
-    /// name and the same generated id, and a commit then read the graph as
-    /// behind its own bytes because a reparse produced an entity the graph
-    /// could not hold twice.
+    /// Bytes that parse to nothing but an error node declare nothing either.
+    /// The escape record lists the unparsed region, and that alone must not
+    /// keep a module entity: one minted from an error would let parse coverage
+    /// count a file whose bytes produced no declaration.
     #[test]
-    fn a_module_declared_under_its_own_file_name_stays_one_entity() {
+    fn an_unparseable_rust_file_produces_no_entity() {
+        let source = b"fn (((\n";
+        let tree = RustAdapter.parse(source).unwrap();
+        assert!(tree.root_node().has_error());
+        let out = RustAdapter
+            .extract(&tree, source, &FilePathId::new("broken.rs"))
+            .unwrap();
+        assert!(
+            out.entities.is_empty(),
+            "an unparseable file produced {:?}",
+            entity_names(&out, EntityKind::Module)
+        );
+        assert!(!matches!(out.parse_state, ParseState::Valid));
+    }
+
+    /// A file holding only an item macro declares nothing, but its escape
+    /// record lists the call the macro hides, so the file keeps the module
+    /// surface that record rides on.
+    #[test]
+    fn an_item_macro_only_file_keeps_the_surface_its_escape_record_needs() {
+        let source = b"thread_local! {\n    static CURRENT: Store = make_store();\n}\n";
+        let tree = RustAdapter.parse(source).unwrap();
+        let out = RustAdapter
+            .extract(&tree, source, &FilePathId::new("src/current.rs"))
+            .unwrap();
+        assert_eq!(entity_names(&out, EntityKind::Module), vec!["current"]);
+    }
+
+    /// `mod defaults` inside `defaults.rs` is a module inside the unit, beside
+    /// the unit's own module `defaults`, not merged into it.
+    ///
+    /// Merging gave the unit's module the declaration's span and signature, so
+    /// the unit contained nothing and its top-level functions lost their
+    /// module. The declaration keeps its own span, excluding its siblings, and
+    /// where the two derive one identity the pipeline separates them.
+    #[test]
+    fn a_module_declared_under_its_own_file_name_is_a_module_inside_the_unit() {
         let adapter = RustAdapter;
         let source =
             b"// leading sibling context\npub mod defaults {\n    pub fn commands() -> String {\n        String::new()\n    }\n}\npub fn outside() { sibling_only(); }\n";
+        let file = FilePathId::new("src/defaults.rs");
         let tree = adapter.parse(source).unwrap();
-        let out = adapter
-            .extract(&tree, source, &FilePathId::new("src/defaults.rs"))
-            .unwrap();
-        let modules: Vec<_> = out
+        let out = adapter.extract(&tree, source, &file).unwrap();
+        assert_eq!(
+            entity_names(&out, EntityKind::Module),
+            vec!["defaults", "defaults"]
+        );
+        let unit = out
             .entities
             .iter()
-            .filter(|entity| entity.kind == EntityKind::Module)
-            .collect();
-        assert_eq!(
-            modules.len(),
-            1,
-            "the declared module merged into the surface: {:?}",
-            entity_names(&out, EntityKind::Module)
-        );
-        assert_eq!(modules[0].name, "defaults");
-        assert!(
-            modules[0].declaration_line.is_some(),
-            "the surviving entity has to be the one the declaration enhanced"
-        );
+            .find(|entity| crate::module_contains::is_unit_module(entity, &file))
+            .expect("the unit keeps its own module");
+        assert_eq!(unit.span.start_byte, 0);
+        assert_eq!(unit.span.end_byte, source.len());
+        let declared = out
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Module && entity.declaration_line.is_some())
+            .expect("the declaration is a module of its own");
         assert!(entity_names(&out, EntityKind::Function).contains(&"commands"));
-        let span = &modules[0].span;
+        let span = &declared.span;
         let body = std::str::from_utf8(&source[span.start_byte..span.end_byte]).unwrap();
         assert!(body.starts_with("pub mod defaults {"), "{body}");
         assert!(body.ends_with("\n}"), "{body}");
         assert!(!body.contains("sibling_only"), "{body}");
         assert!(!body.contains("leading sibling"), "{body}");
+        let held: Vec<&str> = out
+            .relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == kin_model::RelationKind::Contains
+                    && relation.src_name == "defaults"
+                    && relation.site.as_ref().is_some_and(|site| {
+                        site.syntactic_role
+                            == Some(crate::extract::RelationSyntacticRole::ModuleContains)
+                    })
+            })
+            .map(|relation| relation.dst_name.as_str())
+            .collect();
+        assert!(held.contains(&"outside"), "{held:?}");
     }
 
     /// The parse-hole rule still holds for a file whose only entity would be a
-    /// surface nothing declared.
+    /// surface nothing declared: a file declaring one module keeps it, beside
+    /// the unit's own.
     #[test]
     fn a_module_only_file_keeps_its_declaration_when_nothing_else_is_declared() {
         let adapter = RustAdapter;
@@ -2064,9 +2779,13 @@ pub enum Status {
             .unwrap();
         assert_eq!(
             entity_names(&out, EntityKind::Module),
-            vec!["thing"],
+            vec!["thing", "thing"],
             "a real declaration is not a hollow surface"
         );
+        assert!(out
+            .entities
+            .iter()
+            .any(|entity| entity.kind == EntityKind::Module && entity.declaration_line.is_some()));
     }
 
     #[test]
@@ -2252,5 +2971,36 @@ impl Summary {
             "an inherent method satisfies no trait, so nothing shields it from a \
              dead-code report: {implements:?}"
         );
+    }
+
+    /// A named struct field is a field entity of its own, owner-qualified,
+    /// contained by its struct, and spanning its documentation and
+    /// attributes; a tuple struct's unnamed fields stay out.
+    #[test]
+    fn named_struct_fields_are_field_entities() {
+        let source = b"pub struct Account {\n    /// The balance.\n    #[serde(default)]\n    pub balance: i64,\n    owner: String,\n}\n\npub struct Pair(i64, i64);\n";
+        let tree = RustAdapter.parse(source).unwrap();
+        let output = RustAdapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+        let fields: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Field)
+            .collect();
+        let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, ["Account::balance", "Account::owner"]);
+        let balance = fields[0];
+        assert_eq!(
+            &source[balance.span.start_byte..balance.span.end_byte],
+            b"/// The balance.\n    #[serde(default)]\n    pub balance: i64"
+        );
+        assert_eq!(balance.visibility, Visibility::Public);
+        assert_eq!(fields[1].visibility, Visibility::Private);
+        assert!(output.relations.iter().any(|relation| {
+            relation.kind == kin_model::RelationKind::Contains
+                && relation.src_name == "Account"
+                && relation.dst_name == "Account::owner"
+        }));
     }
 }

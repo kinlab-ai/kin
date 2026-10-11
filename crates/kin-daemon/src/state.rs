@@ -100,6 +100,22 @@ impl ChangeStore for HostedAuthorityHistory<'_> {
     }
 }
 
+/// Whether `graph` holds prior-local binding debt on any admitted source.
+///
+/// Debt sits at each source artifact's reserved relation identity, so this
+/// asks for exactly those identities rather than scanning every relation.
+pub(crate) fn holds_local_binding_debt(graph: &kin_db::InMemoryGraph) -> bool {
+    use kin_model::EntityStore as _;
+    graph.resolved_tree().artifacts().any(|artifact| {
+        matches!(
+            graph.lookup_relation_by_id(&kin_index::binding_debt::local_binding_debt_id(
+                artifact.artifact_id
+            )),
+            Ok(kin_model::RelationLookup::Present(_))
+        )
+    })
+}
+
 fn hosted_materialization_error(detail: impl Into<String>) -> kin_db::KinDbError {
     kin_db::KinDbError::StorageError(detail.into())
 }
@@ -359,19 +375,20 @@ pub(crate) struct DurableVectorTestBackend {
 struct DurableVectorTestState {
     artifacts: HashMap<(String, u64, u32, [u8; 32]), kin_db::PersistedVectorArtifact>,
     corrupt_loads: HashSet<String>,
+    loads: u64,
     next_cursor: u64,
     // Save counters and fault injection. Every reader is an `embeddings` test
     // below, so a featureless build neither writes nor reads these three.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     saves: u64,
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     last_expected_cursor: Option<kin_db::VectorArtifactCursor>,
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     next_save_fault: Option<DurableVectorSaveFault>,
 }
 
 /// Every variant is constructed by an `embeddings` test and by nothing else.
-#[cfg(all(test, feature = "embeddings"))]
+#[cfg(all(test, any(feature = "embeddings", feature = "external-embeddings")))]
 #[derive(Debug, Clone, Copy)]
 enum DurableVectorSaveFault {
     ConflictInstallWinner,
@@ -407,7 +424,7 @@ impl DurableVectorTestBackend {
             .expect("test graph snapshot must publish")
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub(crate) fn publish_snapshot(
         &self,
         repo_id: &str,
@@ -422,7 +439,7 @@ impl DurableVectorTestBackend {
             .expect("test graph snapshot must publish")
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub(crate) fn corrupt_vector_loads(&self, repo_id: &str) {
         self.vectors
             .lock()
@@ -460,7 +477,27 @@ impl DurableVectorTestBackend {
         state.corrupt_loads.insert(repo_id.to_string());
     }
 
-    #[cfg(feature = "embeddings")]
+    pub(crate) fn vector_load_count(&self) -> u64 {
+        self.vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .loads
+    }
+
+    pub(crate) fn vector_artifact_fingerprints(&self) -> Vec<[u8; 32]> {
+        let mut fingerprints: Vec<_> = self
+            .vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .artifacts
+            .values()
+            .map(|artifact| artifact.artifact_sha256)
+            .collect();
+        fingerprints.sort();
+        fingerprints
+    }
+
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub(crate) fn vector_save_count(&self) -> u64 {
         self.vectors
             .lock()
@@ -468,7 +505,7 @@ impl DurableVectorTestBackend {
             .saves
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub(crate) fn last_expected_vector_cursor(&self) -> Option<kin_db::VectorArtifactCursor> {
         self.vectors
             .lock()
@@ -476,7 +513,7 @@ impl DurableVectorTestBackend {
             .last_expected_cursor
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn inject_next_save_fault(&self, fault: DurableVectorSaveFault) {
         self.vectors
             .lock()
@@ -484,7 +521,7 @@ impl DurableVectorTestBackend {
             .next_save_fault = Some(fault);
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn current_vector_artifact(&self, repo_id: &str) -> Option<kin_db::PersistedVectorArtifact> {
         let binding = self.current_binding(repo_id).ok()?;
         self.vectors
@@ -495,7 +532,7 @@ impl DurableVectorTestBackend {
             .cloned()
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn corrupt_current_vector_indexed_count(&self, repo_id: &str) {
         let binding = self
             .current_binding(repo_id)
@@ -573,10 +610,11 @@ impl StorageBackend for DurableVectorTestBackend {
                 "repo {repo_id}: vector artifact binding does not match current graph authority"
             )));
         }
-        let state = self
+        let mut state = self
             .vectors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.loads += 1;
         let Some(persisted) = state
             .artifacts
             .get(&Self::artifact_key(repo_id, binding))
@@ -631,7 +669,7 @@ impl StorageBackend for DurableVectorTestBackend {
             .vectors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         {
             state.last_expected_cursor = Some(expected);
         }
@@ -645,9 +683,9 @@ impl StorageBackend for DurableVectorTestBackend {
                 observed_cursor: installed,
             };
         }
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         let fault = state.next_save_fault.take();
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         {
             if matches!(fault, Some(DurableVectorSaveFault::ConflictWithoutCursor)) {
                 return kin_db::VectorArtifactSaveOutcome::NotCommitted {
@@ -671,7 +709,7 @@ impl StorageBackend for DurableVectorTestBackend {
         }
         let cursor = kin_db::VectorArtifactCursor::from_backend_generation(state.next_cursor);
         state.next_cursor += 1;
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         {
             state.saves += 1;
         }
@@ -684,7 +722,7 @@ impl StorageBackend for DurableVectorTestBackend {
                 artifact_sha256,
             },
         );
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         {
             if matches!(fault, Some(DurableVectorSaveFault::ConflictInstallWinner)) {
                 return kin_db::VectorArtifactSaveOutcome::NotCommitted {
@@ -703,7 +741,7 @@ impl StorageBackend for DurableVectorTestBackend {
                 };
             }
         }
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         let acknowledged_sha256 =
             if matches!(fault, Some(DurableVectorSaveFault::CommittedWrongDigest)) {
                 let mut wrong = artifact_sha256;
@@ -712,7 +750,7 @@ impl StorageBackend for DurableVectorTestBackend {
             } else {
                 artifact_sha256
             };
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
         let acknowledged_sha256 = artifact_sha256;
         kin_db::VectorArtifactSaveOutcome::Committed {
             cursor,
@@ -881,7 +919,7 @@ pub const RECON_PARKED: u8 = 2;
 /// loss guarantee is Unix-specific.
 #[cfg(unix)]
 pub(crate) fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(path).and_then(|directory| directory.sync_all())
+    std::fs::File::open(path).and_then(|directory| kin_blobs::durable::sync_all(&directory))
 }
 
 #[cfg(not(unix))]
@@ -1314,7 +1352,7 @@ fn write_mcp_transaction_bytes(
         before_phase(McpTransactionWritePhase::Write)?;
         file.write_all(bytes)?;
         before_phase(McpTransactionWritePhase::FileSync)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
         before_phase(McpTransactionWritePhase::Rename)?;
         std::fs::rename(&tmp, path)?;
         owns_tmp = false;
@@ -1396,11 +1434,12 @@ impl CoordinationEventLog {
             std::fs::create_dir_all(parent)?;
         }
         if !path.exists() {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?
-                .sync_data()?;
+            kin_blobs::durable::sync_data(
+                &std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?,
+            )?;
             if let Some(parent) = path.parent() {
                 sync_directory_metadata(parent)?;
             }
@@ -1419,7 +1458,7 @@ impl CoordinationEventLog {
                 .map_or(0, |index| index + 1);
             let file = std::fs::OpenOptions::new().write(true).open(&path)?;
             file.set_len(repaired_len as u64)?;
-            file.sync_data()?;
+            kin_blobs::durable::sync_data(&file)?;
             bytes.truncate(repaired_len);
             repaired_tail = true;
         }
@@ -1537,7 +1576,7 @@ impl CoordinationEventLog {
             .open(&self.path)?;
         let persist_result = (|| -> std::io::Result<()> {
             file.write_all(&bytes)?;
-            file.sync_data()?;
+            kin_blobs::durable::sync_data(&file)?;
             if !path_existed {
                 if let Some(parent) = self.path.parent() {
                     sync_directory_metadata(parent)?;
@@ -1548,7 +1587,7 @@ impl CoordinationEventLog {
         if let Err(error) = persist_result {
             self.poisoned.store(true, Ordering::Release);
             let _ = file.set_len(original_len);
-            let _ = file.sync_data();
+            let _ = kin_blobs::durable::sync_data(&file);
             return Err(error);
         }
         *next = next.saturating_add(1);
@@ -1571,7 +1610,7 @@ impl CoordinationEventLog {
                 .truncate(true)
                 .open(&temp)?;
             file.write_all(format!("{count}\n").as_bytes())?;
-            file.sync_data()?;
+            kin_blobs::durable::sync_data(&file)?;
             drop(file);
             std::fs::rename(&temp, &self.failure_marker)?;
             if let Some(parent) = self.failure_marker.parent() {
@@ -2180,6 +2219,19 @@ impl LspWorkGuard {
         self.resolve(resolved);
     }
 
+    /// These attempts reached a validated permanent coverage gap. The caller
+    /// keeps their semantic debt and refuses native completion; only work
+    /// accounting settles, under the ordinary generation and failure cutoff.
+    pub(crate) fn resolve_terminal_reference_files(&mut self, files: &[String], generation: u64) {
+        let pending = self.items.len();
+        self.resolve_files(files, generation);
+        if self.items.len() < pending && self.items.is_empty() {
+            // All captured file attempts were accounted for. Do not turn the
+            // deliberately paused gap into an abandoned pre-capture sweep.
+            self.complete();
+        }
+    }
+
     /// A complete current sweep can also retire work for a source that was
     /// removed. Missing entities alone never establish this: the predicate must
     /// inspect the captured admitted tree, and the ordinary failure cutoff holds.
@@ -2276,6 +2328,47 @@ mod lsp_failed_work_tests {
 
     fn file(name: &str, generation: u64) -> LspWorkItem {
         LspWorkItem::file(name, generation)
+    }
+
+    #[test]
+    fn lsp_failed_work_terminal_reference_settlement_preserves_unrelated_and_concurrent_failures() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        drop(tracker.reserve_for(file("terminal.ts", 4)));
+        drop(tracker.reserve_for(file("unrelated.ts", 4)));
+        let mut work = tracker.reserve_for(LspWorkItem::Sweep {
+            source_generation: 4,
+        });
+        work.bind_files(["terminal.ts".into()], 4);
+        drop(tracker.reserve_for(file("terminal.ts", 4)));
+        work.resolve_terminal_reference_files(&["terminal.ts".into()], 4);
+        drop(work);
+        assert_eq!(
+            tracker.failed_items(),
+            vec![file("terminal.ts", 4), file("unrelated.ts", 4)]
+        );
+        assert_eq!(tracker.pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lsp_failed_work_terminal_reference_settlement_needs_a_bound_current_file() {
+        let tracker = Arc::new(LspWorkTracker::default());
+        let mut before_capture = tracker.reserve_for(LspWorkItem::Sweep {
+            source_generation: 4,
+        });
+        before_capture.resolve_terminal_reference_files(&["terminal.ts".into()], 4);
+        drop(before_capture);
+        let mut newer = tracker.reserve_for(file("terminal.ts", 5));
+        newer.resolve_terminal_reference_files(&["terminal.ts".into()], 4);
+        drop(newer);
+        assert_eq!(
+            tracker.failed_items(),
+            vec![
+                file("terminal.ts", 5),
+                LspWorkItem::Sweep {
+                    source_generation: 4
+                }
+            ]
+        );
     }
 
     #[test]
@@ -2463,7 +2556,6 @@ impl TemporalScope {
 /// Maximum attempts to capture one repo's entity/relation authority without
 /// straddling a graph mutation.
 const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
-const DERIVED_MEMBER_SPINE_GAP: &str = kin_spine::SPINE_CANDIDATE_REPRESENTATION_GAP;
 
 /// Fixed upper bound for hosted repository reload coordination.
 ///
@@ -2536,6 +2628,9 @@ struct SpineGraphCapture {
     hosted_publication_cursor: Option<Option<kin_db::SnapshotCursor>>,
     root_hash: String,
     entries: Vec<kin_spine::EntityEntry>,
+    /// Each captured entity's language and whether it is an inferred member,
+    /// which the local spine keeps beside `entries`.
+    facts: kin_spine::RepoGraphFacts,
     entities: Vec<kin_model::Entity>,
     relations: Vec<kin_model::Relation>,
 }
@@ -2788,8 +2883,12 @@ const STARTUP_PIN_FAILURE_DETAIL_LIMIT: usize = 8;
 #[derive(Debug, Default)]
 struct StartupPinFailures {
     refused: usize,
-    duplicate_identities: usize,
     detailed: usize,
+    /// Rows naming another location of a repository whose authority is
+    /// already selected: this daemon's own, or an earlier row's. Not a
+    /// refusal, because the repository is represented; see
+    /// [`StartupPinFailures::record_other_location`].
+    other_locations: usize,
 }
 
 impl StartupPinFailures {
@@ -2812,28 +2911,32 @@ impl StartupPinFailures {
         );
     }
 
-    fn record_duplicate_identity(
-        &mut self,
-        repo_id: &str,
-        path: &std::path::Path,
-        manifest_repo_id: &str,
-    ) {
-        self.refused += 1;
-        self.duplicate_identities += 1;
-        if self.detailed >= STARTUP_PIN_FAILURE_DETAIL_LIMIT {
-            return;
-        }
-        self.detailed += 1;
-        warn!(
-            repo_id = %repo_id,
+    /// A row naming another location of a repository whose authority is
+    /// already selected.
+    ///
+    /// Two locations of one repository are what a copied or adopted store
+    /// produces, and the spine keys authority by repository identity, so
+    /// registering both would let one silently overwrite the other. One is
+    /// selected: this daemon's own store for its own repository, otherwise
+    /// the earliest registry row. The repository is represented, so the
+    /// authority set stays complete and no cross-repo edge is invalidated.
+    fn record_other_location(&mut self, path: &std::path::Path, manifest_repo_id: &str) {
+        self.other_locations += 1;
+        debug!(
             path = %path.display(),
             manifest_repo_id = %manifest_repo_id,
-            already_pinned_as = %manifest_repo_id,
-            "two registry paths hold one repository identity; the later one is not pinned"
+            "another location of a repository whose authority is already selected; not pinned"
         );
     }
 
     fn emit_summary(&self, registry_rows: usize, self_rows_skipped: usize, pinned: usize) {
+        if self.other_locations > 0 {
+            info!(
+                other_locations = self.other_locations,
+                pinned,
+                "registry rows naming another location of a selected repository were not pinned"
+            );
+        }
         if self.refused == 0 {
             return;
         }
@@ -2842,7 +2945,6 @@ impl StartupPinFailures {
             self_rows_skipped,
             pinned,
             refused = self.refused,
-            duplicate_identities = self.duplicate_identities,
             detailed = self.detailed,
             suppressed = self.refused.saturating_sub(self.detailed),
             remediation = "run `kin registry clean` to remove rows whose paths no longer contain .kin; review incompatible stores separately",
@@ -3663,6 +3765,91 @@ pub(crate) enum ReadBlocker {
     PendingAdmission,
 }
 
+/// Test-only report of the moment one read parks in
+/// [`DaemonState::wait_for_graph_authority_drain`], what it waits out there,
+/// and the deadline it waits under.
+///
+/// That wait returns only once its blocker lifts or its deadline passes. A
+/// test that holds graph authority can therefore prove a read issued inside
+/// the hold will not give up for as long as the deadline allows by seeing the
+/// read parked with that deadline ahead, rather than by sleeping and checking
+/// that the read had not finished.
+///
+/// The report belongs to the read's own task: the test runs the read inside
+/// [`ParkedReadProbe::scope`](parked_read_probe::ParkedReadProbe::scope), and a
+/// park reports only where that task-local is set. Any other task waiting on
+/// the same clock, such as a status sample or the reconcile loop, reports
+/// nothing.
+#[cfg(test)]
+pub(crate) mod parked_read_probe {
+    use std::sync::Arc;
+
+    use super::ReadBlocker;
+
+    type Parks = Arc<tokio::sync::watch::Sender<Option<ParkedRead>>>;
+
+    tokio::task_local! {
+        static PROBED_READ: Parks;
+    }
+
+    /// One park of the probed read.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct ParkedRead {
+        /// What the read is waiting out.
+        pub(crate) blocker: ReadBlocker,
+        /// When the read's wait ends if the blocker has not lifted by then.
+        pub(crate) deadline: tokio::time::Instant,
+    }
+
+    /// A test's end of one probed read. The reference-read tests that use it
+    /// are Unix-only, like the rest of the real-watcher loop tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) struct ParkedReadProbe {
+        parks: Parks,
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    impl ParkedReadProbe {
+        pub(crate) fn new() -> Self {
+            Self {
+                parks: Arc::new(tokio::sync::watch::Sender::new(None)),
+            }
+        }
+
+        /// Run `read` as the probed read: each park inside its task reports
+        /// here.
+        pub(crate) fn scope<F: std::future::Future>(
+            &self,
+            read: F,
+        ) -> impl std::future::Future<Output = F::Output> {
+            PROBED_READ.scope(Arc::clone(&self.parks), read)
+        }
+
+        /// The probed read's park once it waits out `blocker`, including one
+        /// already reported.
+        pub(crate) async fn parked_on(&self, blocker: ReadBlocker) -> ParkedRead {
+            let mut parks = self.parks.subscribe();
+            let park = *parks
+                .wait_for(|park| park.is_some_and(|park| park.blocker == blocker))
+                .await
+                .expect("the probe holds the sender");
+            park.expect("wait_for returns only a park that matched")
+        }
+
+        /// The last park reported, if any.
+        pub(crate) fn last(&self) -> Option<ParkedRead> {
+            *self.parks.borrow()
+        }
+    }
+
+    /// Record a park of the probed read, when this task runs one.
+    pub(super) fn report(blocker: ReadBlocker, deadline: tokio::time::Instant) {
+        let _ = PROBED_READ.try_with(|parks| {
+            parks.send_replace(Some(ParkedRead { blocker, deadline }));
+        });
+    }
+}
+
 /// Marks one entity/relation mutation batch as in flight.
 ///
 /// Writers publish both edges of the batch through a shared clock. Xref readers
@@ -3672,6 +3859,16 @@ pub(crate) enum ReadBlocker {
 /// fail-closed until the last batch finishes.
 pub(crate) struct GraphAuthorityMutationGuard {
     clock: Arc<GraphAuthorityClock>,
+}
+
+/// The coordination gate held together with an enrichment write's turn, from
+/// [`DaemonState::coordinate_enrichment_write`].
+///
+/// Fields drop in order: the turn first, so reads resume as soon as the write
+/// lands, then the coordination gate.
+pub(crate) struct EnrichmentWriteTurn<'a> {
+    _exclusion: crate::live_read_gate::EnrichmentExclusion,
+    _coordination: tokio::sync::MutexGuard<'a, ()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3753,13 +3950,13 @@ impl Drop for GraphAuthorityMutationGuard {
 /// that is not in the merkle root, and the stamp it carries is re-verified
 /// wherever it is reused, so nothing downstream accepts a checkpoint on weaker
 /// evidence than before.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Default)]
 struct VectorCheckpointAuthorityMatch {
     derived: Mutex<Option<(u64, ResolvedTree)>>,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 impl VectorCheckpointAuthorityMatch {
     /// True when this exact pair has already been derived. A poisoned lock
     /// answers false, so the caller reopens authority rather than trusting an
@@ -3867,6 +4064,9 @@ const HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH: &str = "kin-hosted-vector-producer-v
 /// proof admits a wider numeric profile. Local sidecars retain their existing
 /// model/pipeline-only compatibility contract; this stricter fence is for
 /// storage-backed artifacts that can move between hosts.
+const HOSTED_VECTOR_NO_PRODUCER: &str =
+    "the embeddings model slot is none; no numerical producer is selected";
+
 /// The one numerical producer this process admits for a hosted vector
 /// artifact, together with the profile identity that names it.
 ///
@@ -3880,16 +4080,6 @@ struct HostedVectorProducerPolicy {
     allowed: kin_db::EmbeddingProducerSet,
 }
 
-/// The profile half of the policy on its own.
-///
-/// Gated on the two features that build its call sites: the sidecar refresh in
-/// `flush_embed_progress` (`embeddings`) and the sidecar write in
-/// `persist_vector_sidecar` (`vector`). A featureless build constructs neither.
-#[cfg(any(feature = "embeddings", feature = "vector"))]
-fn hosted_vector_producer_profile() -> std::result::Result<String, String> {
-    hosted_vector_producer_policy().map(|policy| policy.profile)
-}
-
 fn hosted_vector_producer_policy() -> std::result::Result<HostedVectorProducerPolicy, String> {
     let normalized = |name: &str, default: &str| {
         std::env::var(name)
@@ -3900,7 +4090,10 @@ fn hosted_vector_producer_policy() -> std::result::Result<HostedVectorProducerPo
     };
     hosted_vector_producer_policy_for(
         &normalized("KIN_EMBED_HYBRID", "off"),
-        &normalized("KIN_EMBED_PROVIDER", "local"),
+        &normalized(
+            "KIN_MODEL_EMBEDDINGS_PROVIDER",
+            &normalized("KIN_EMBED_PROVIDER", "none"),
+        ),
         &normalized("KIN_EMBED_BACKEND", "auto"),
         &normalized("KIN_INFER_CPU_BACKEND", "auto"),
         std::env::var_os("KIN_INFER_NO_FOLD").is_some(),
@@ -3921,6 +4114,9 @@ fn hosted_vector_producer_policy_for(
     no_fold: bool,
     rope_per_element: bool,
 ) -> std::result::Result<HostedVectorProducerPolicy, String> {
+    if provider == "none" {
+        return Err(HOSTED_VECTOR_NO_PRODUCER.into());
+    }
     if !matches!(hybrid, "off" | "0" | "false" | "no") {
         return Err(format!(
             "hosted vector persistence requires one numerical producer, but KIN_EMBED_HYBRID={hybrid} admits both CPU and accelerator vectors"
@@ -3934,8 +4130,8 @@ fn hosted_vector_producer_policy_for(
     // that deployment ever writes. An unrecognized provider falls back to the
     // local route, which is what KinDB itself does with it.
     let producer = match provider {
-        "openai" | "lmstudio" | "lm-studio" | "openai-compat" | "openai-compatible"
-        | "compatible" => kin_db::EmbeddingProducer::Remote,
+        "external" | "openai" | "lmstudio" | "lm-studio" | "openai-compat"
+        | "openai-compatible" | "compatible" => kin_db::EmbeddingProducer::Remote,
         _ => {
             match requested_backend {
                 "cpu" => kin_db::EmbeddingProducer::Cpu,
@@ -3974,6 +4170,7 @@ struct HostedVectorArtifactAuthority {
 #[derive(Debug, Clone)]
 enum HostedVectorPersistenceState {
     NotHosted,
+    NotSelected,
     Unsupported {
         detail: String,
     },
@@ -4010,7 +4207,10 @@ impl HostedVectorPersistenceState {
             Self::Empty { authority }
             | Self::Ready { authority, .. }
             | Self::RepairableCorrupt { authority, .. } => Some(*authority),
-            Self::NotHosted | Self::Unsupported { .. } | Self::Indeterminate { .. } => None,
+            Self::NotHosted
+            | Self::NotSelected
+            | Self::Unsupported { .. }
+            | Self::Indeterminate { .. } => None,
             #[cfg(feature = "vector")]
             Self::ConflictReloading { .. } => None,
         }
@@ -4227,6 +4427,9 @@ pub struct DaemonState {
     /// its complete batch so detached xref reads cannot certify an intermediate
     /// graph state before the writer publishes its normal version/root update.
     graph_authority_clock: Arc<GraphAuthorityClock>,
+    /// Turns between read attempts of the live graph and enrichment writes, so
+    /// a read is never spanned by the sweep and never waits for it to end.
+    live_read_gate: Arc<crate::live_read_gate::LiveReadGate>,
     /// Mode captured when the daemon state is created. Requests use this
     /// stable value instead of re-reading process-global environment mid-run.
     pub coordination_mode: std::sync::RwLock<kin_mcp::CoordinationEnforcementMode>,
@@ -4238,6 +4441,10 @@ pub struct DaemonState {
     pub coordination_event_persist_failures: AtomicU64,
     /// When the daemon was started (for uptime reporting).
     pub started_at: Instant,
+    /// This daemon's own process id, read once when its state is built. The
+    /// status reply names the daemon that answered from it, so no tool route
+    /// reads the process namespace for it.
+    pub process_id: u32,
     /// Whether the daemon has been initialized (snapshot loaded or first reconciliation done).
     pub is_initialized: AtomicBool,
     /// Current reconciliation status (RECON_IDLE or RECON_PROCESSING).
@@ -4260,6 +4467,9 @@ pub struct DaemonState {
     /// permanent repair wedge without letting an uncertain writer overwrite a
     /// winner it cannot identify.
     hosted_vector_persistence: Mutex<HostedVectorPersistenceState>,
+    #[cfg(test)]
+    hosted_vector_producer_policy_for_test:
+        Option<std::result::Result<HostedVectorProducerPolicy, String>>,
     /// The hosted binding a durable vector save was refused against, and why.
     ///
     /// A retrieval-authority mismatch is a property of the binding rather than
@@ -4507,7 +4717,7 @@ pub struct DaemonState {
     /// here reproduces that arrival without racing it, and also counts how many
     /// reopens a sequence of flushes actually paid for. Production installs no
     /// hook.
-    #[cfg(all(test, feature = "embeddings"))]
+    #[cfg(all(test, any(feature = "embeddings", feature = "external-embeddings")))]
     vector_checkpoint_reopen_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Serializes hosted repo registration and all-repo edge refresh passes.
     /// The backend independently keeps a pass-wide incomplete lease; this gate
@@ -4613,7 +4823,7 @@ pub struct DaemonState {
     pub persist_lock: Mutex<()>,
     /// Last `(generation, live exact tree)` pair proved to match committed
     /// workspace authority for a vector checkpoint. Read under `persist_lock`.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch,
     /// Why the last vector checkpoint was refused, held until a later
     /// checkpoint lands.
@@ -4637,7 +4847,7 @@ pub struct DaemonState {
     ///
     /// Recording the refusal is what gives the retry something to fire on and
     /// gives every embedding surface a cause to name while the gap is open.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     deferred_vector_checkpoint: std::sync::Mutex<Option<String>>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
@@ -4700,6 +4910,12 @@ pub struct DaemonState {
     /// to assert the second whenever it saw the boolean, which was false on
     /// every gcs-backed or KIN_DAEMON_DISABLE_LSP daemon.
     pub lsp_enrichment_enabled: bool,
+    /// Why enrichment was switched off for this daemon, decided once at start
+    /// with [`Self::lsp_enrichment_enabled`]. `None` while enrichment is on.
+    ///
+    /// Named in the answer to a sweep request, because the ways out differ and
+    /// a caller that cannot tell them apart offers one of them to all three.
+    pub lsp_enrichment_switched_off_by: Option<kin_daemon_spawn::EnrichmentSwitchedOffBy>,
     /// How far the running cold sweep has got, and how many have finished.
     ///
     /// A sweep is asynchronous and takes minutes on a real repository, and until
@@ -4739,6 +4955,9 @@ pub struct DaemonState {
     pub lsp_sweep_running: AtomicBool,
     /// Accepted enrichment, including startup demand, queued and active work.
     pub lsp_work: Arc<LspWorkTracker>,
+    /// Commands waiting to read a language-server sweep's final status, which
+    /// a daemon asked to retire stays up for.
+    pub sweep_waiters: crate::sweep_waiters::SweepWaiters,
     /// A sweep that was asked for while one was already running.
     ///
     /// The running pass lists every entity and builds its file grouping and its
@@ -4821,6 +5040,19 @@ pub struct DaemonState {
     /// files that proved them, so the next sweep proves them again.
     pub(crate) lsp_settled_guesses:
         std::sync::Mutex<std::collections::BTreeSet<kin_model::RelationId>>,
+    /// What this daemon's startup repair re-derived in the live graph while
+    /// repository authority still holds the older derivation: the freshness
+    /// check every repository command runs reads it as the repair rather than
+    /// as a loss, and the next MCP commit records it. Written by the repair and
+    /// emptied by the commit that records it. Held only in memory: a daemon
+    /// that ends first leaves authority as it was, and the next start repairs
+    /// it again.
+    pub(crate) startup_rederivation:
+        std::sync::Mutex<crate::local_repository_authority::StartupRederivation>,
+    /// Why the last enrichment publication into local repository authority
+    /// failed, until one succeeds. A refusal that depends on it names it, so
+    /// a caller is not told to repeat what the failure will refuse again.
+    pub(crate) lsp_publication_failure: std::sync::Mutex<Option<String>>,
     /// Name-only guesses a language server contradicted at their call site
     /// and this daemon retired from its live graph, counted per relation kind
     /// under the label the relation census counts them by, since the census
@@ -5021,6 +5253,9 @@ pub struct CachedLocateRanking {
     /// against the same query that produced page zero.
     pub query: String,
     pub entities: Vec<kin_cli::commands::locate::LocateEntity>,
+    /// MCP owner proofs and gaps observed with this ranking, keyed by returned
+    /// entity UUID. A continuation never refreshes them from a later graph.
+    pub semantic_owners: HashMap<String, kin_mcp::semantic_owners::RecordedOwners>,
     /// File-level ranking and diagnostics describe the same held query. File
     /// granularity reads `files[]` as its answer, so dropping it on a cursor
     /// page turns a populated page zero into an empty continuation.
@@ -5055,6 +5290,14 @@ pub struct CachedLocateRanking {
     /// cannot silently look healthier than page zero.
     pub semantic_coverage: Option<kin_cli::commands::locate::SemanticCoverage>,
     pub degradations: Vec<kin_cli::commands::locate::RetrievalDegradation>,
+    /// The retrieval arm that built the held ranking, when it is not the
+    /// default, and what its candidate scorer did. Held for the reason the
+    /// degradations are: a cursor page must not read as an answer its arm's
+    /// scorer did not abstain on when page zero said it did.
+    pub arm: (
+        Option<String>,
+        Option<kin_cli::commands::locate::scorer::ScorerReport>,
+    ),
     /// Which public result surface page zero used. A cursor supplies the cache
     /// key directly, so the continuation must not reinterpret a held file
     /// ranking as entity granularity, or vice versa.
@@ -5160,6 +5403,11 @@ thread_local! {
     static FLUSH_WORKSPACE_GRAPH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// How many source bodies the ingestion CAS hydrate writes under one device
+/// barrier: enough to amortize the barrier to nothing, few enough that a
+/// batch of large bodies stays a modest allocation.
+const HYDRATE_BATCH_BODIES: usize = 512;
+
 impl DaemonState {
     /// Workspace identity pinned when this local daemon opened repository
     /// authority. Mutation routes must use this instead of reparsing a mutable
@@ -5184,7 +5432,7 @@ impl DaemonState {
         self.local_kindb_capability.as_ref().map(Arc::clone)
     }
 
-    /// The creation-time replay-semantics version this daemon's own store
+    /// The creation-time version and derivation this daemon's own pinned store
     /// records, for declaration beside history this daemon publishes.
     ///
     /// Read through the startup-pinned handle rather than by resolving `.kin`
@@ -5193,15 +5441,26 @@ impl DaemonState {
     /// sender that declared another store's number would make a receiver keep a
     /// record over history that number never spoke for.
     ///
-    /// `None` on a hosted daemon, which owns no such record, and `None` on a
-    /// local store whose record is absent or will not parse, because a sender
+    /// Unknown on a hosted daemon, which owns no such record, and on a local
+    /// store whose record is absent or will not parse, because a sender
     /// that cannot read its own record has nothing to declare. Both leave the
     /// receiver discarding its own record, which is what every transfer did
     /// before the wire carried this at all.
-    pub(crate) fn local_hydration_creation_version(&self) -> Option<u32> {
-        self.local_kindb_capability
-            .as_ref()
-            .and_then(|capability| capability.read().created_under())
+    pub(crate) fn local_hydration_creation_provenance(
+        &self,
+    ) -> kin_remote::repository_transfer::SourceHydrationProvenance {
+        let Some(capability) = self.local_kindb_capability.as_ref() else {
+            return Default::default();
+        };
+        // Read version and identity together from the startup-pinned store.
+        let read = capability.read();
+        kin_remote::repository_transfer::SourceHydrationProvenance {
+            semantics: read.created_under(),
+            derivation: read
+                .creation_derivation()
+                .filter(|identity| kin_core::hydration_semantics::is_derivation_identity(identity))
+                .map(str::to_owned),
+        }
     }
 
     /// Clone the complete repository identity/storage capability pinned when
@@ -5324,6 +5583,71 @@ impl DaemonState {
         GraphAuthorityMutationGuard {
             clock: Arc::clone(&self.graph_authority_clock),
         }
+    }
+
+    /// Begin one read attempt of `graph`, so no enrichment write lands inside
+    /// it. A session's historical graph is never written by enrichment, and its
+    /// reads take no pass.
+    ///
+    /// Hold the pass from the attempt's epoch sample through its last
+    /// certification check. A read nested in another read's attempt in the
+    /// same task shares that attempt's hold and begins at once. Every wait for
+    /// a writer lets the task's hold go first ([`Self::release_live_read_hold`]).
+    pub(crate) async fn enter_live_read(
+        &self,
+        graph: &kin_db::InMemoryGraph,
+    ) -> Option<crate::live_read_gate::LiveReadPass> {
+        if !std::ptr::eq(graph, self.graph.as_ref()) {
+            return None;
+        }
+        Some(self.live_read_gate.enter_read().await)
+    }
+
+    /// Let the current task's hold on the live graph go before it waits for a
+    /// writer or naps between attempts, outer passes included, so no
+    /// enrichment write waits on a read that is itself waiting. The task's next
+    /// attempt takes the hold again.
+    pub(crate) fn release_live_read_hold(&self) {
+        self.live_read_gate.release_current();
+    }
+
+    /// Take the coordination gate and an enrichment write's turn together.
+    ///
+    /// Every write the language-server enrichment path makes to the live graph
+    /// runs under one of these instead of the coordination gate alone, so it
+    /// lands between read attempts rather than inside one. It waits for the
+    /// attempts in flight holding nothing, takes the gate, and claims the turn
+    /// only if no attempt began meanwhile, giving the gate straight back
+    /// otherwise, so it never holds the gate while it waits for reads. Past
+    /// [`crate::live_read_gate::ENRICHMENT_WRITE_PATIENCE`] new attempts queue
+    /// behind it, except while it waits for the gate itself.
+    pub(crate) async fn coordinate_enrichment_write(&self) -> EnrichmentWriteTurn<'_> {
+        let mut wait = self.live_read_gate.wait_for_turn();
+        loop {
+            wait.reads_drained().await;
+            let coordination = match self.coordination_gate.try_lock() {
+                Ok(coordination) => coordination,
+                Err(_) => {
+                    // A reconcile pass or commit holds the gate, and it may be
+                    // waiting on a read of its own.
+                    wait.stand_aside();
+                    self.coordination_gate.lock().await
+                }
+            };
+            if let Some(exclusion) = wait.claim() {
+                return EnrichmentWriteTurn {
+                    _exclusion: exclusion,
+                    _coordination: coordination,
+                };
+            }
+            drop(coordination);
+        }
+    }
+
+    /// The turn-taking state itself, for tests that hold a read in flight.
+    #[cfg(test)]
+    pub(crate) fn live_read_gate_for_test(&self) -> &Arc<crate::live_read_gate::LiveReadGate> {
+        &self.live_read_gate
     }
 
     /// Return a stable graph-authority epoch only when no mutation batch spans
@@ -5483,15 +5807,21 @@ impl DaemonState {
         deadline: tokio::time::Instant,
         scope: SettleScope,
     ) -> GraphAuthorityDrain {
+        // Never wait for a writer while holding enrichment writes back,
+        // whichever read in this task took the hold.
+        self.release_live_read_hold();
         let clock = &self.graph_authority_clock;
         if self.read_blocker(scope).is_none() {
             return GraphAuthorityDrain::NoWriter;
         }
         loop {
             let drained = clock.drained.notified();
-            if self.read_blocker(scope).is_none() {
+            #[cfg_attr(not(test), allow(unused_variables))]
+            let Some(blocker) = self.read_blocker(scope) else {
                 return GraphAuthorityDrain::Drained;
-            }
+            };
+            #[cfg(test)]
+            parked_read_probe::report(blocker, deadline);
             if tokio::time::timeout_at(deadline, drained).await.is_err() {
                 return match self.read_blocker(scope) {
                     None => GraphAuthorityDrain::Drained,
@@ -5671,7 +6001,7 @@ impl DaemonState {
     ///
     /// A failure is logged and the open continues with whatever was derived,
     /// which leaves a stamped sidecar to the per-key salvage it had before.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn restore_non_entity_coverage(
         mut snapshot: kin_db::GraphSnapshot,
         blobs: &BlobStore,
@@ -5863,7 +6193,7 @@ impl DaemonState {
         let write_result = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
             std::fs::rename(&tmp, path)?;
             if let Some(parent) = path.parent() {
                 sync_directory_metadata(parent)?;
@@ -6003,6 +6333,7 @@ impl DaemonState {
         repo_id: &str,
         graph: &kin_db::InMemoryGraph,
         binding: Option<kin_db::VectorArtifactBinding>,
+        producer_policy: std::result::Result<HostedVectorProducerPolicy, String>,
     ) -> (VectorSidecarOpen, HostedVectorPersistenceState) {
         // A hosted reload is a replacement, not an overlay. This function is
         // also used after a backend CAS conflict, when the live graph can still
@@ -6010,6 +6341,26 @@ impl DaemonState {
         // first authority probe so every failure below leaves queries on the
         // graph path rather than silently serving a stale in-memory sidecar.
         graph.reset_vector_index();
+        let producer_policy = match producer_policy {
+            Ok(policy) => policy,
+            Err(detail) if detail == HOSTED_VECTOR_NO_PRODUCER => {
+                return (
+                    VectorSidecarOpen::default(),
+                    HostedVectorPersistenceState::NotSelected,
+                );
+            }
+            Err(detail) => {
+                let _ = Self::clear_hosted_vector_projection(layout);
+                return (
+                    VectorSidecarOpen {
+                        discarded: Some(detail.clone()),
+                        salvage: None,
+                    },
+                    HostedVectorPersistenceState::Unsupported { detail },
+                );
+            }
+        };
+
         if !backend.supports_vector_artifacts() {
             if let Err(error) = Self::clear_hosted_vector_projection(layout) {
                 let reason = format!(
@@ -6035,20 +6386,6 @@ impl DaemonState {
                 },
             );
         }
-
-        let producer_policy = match hosted_vector_producer_policy() {
-            Ok(policy) => policy,
-            Err(detail) => {
-                let _ = Self::clear_hosted_vector_projection(layout);
-                return (
-                    VectorSidecarOpen {
-                        discarded: Some(detail.clone()),
-                        salvage: None,
-                    },
-                    HostedVectorPersistenceState::Unsupported { detail },
-                );
-            }
-        };
 
         let Some(binding) = binding else {
             let reason =
@@ -6384,6 +6721,7 @@ impl DaemonState {
                 &self.cached_repo_id,
                 self.graph.as_ref(),
                 Some(binding),
+                self.hosted_vector_producer_policy(),
             );
             Ok(state)
         })();
@@ -6534,7 +6872,7 @@ impl DaemonState {
         {
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(b"complete\n")?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
         }
         if let Err(error) = std::fs::rename(&tmp_path, marker) {
             let _ = std::fs::remove_file(&tmp_path);
@@ -6587,6 +6925,7 @@ impl DaemonState {
         blobs: &BlobStore,
     ) -> Result<usize> {
         let mut hydrated = HashSet::new();
+        let mut missing = Vec::new();
         for artifact in tree.artifacts() {
             let Some(hash) = artifact.entry.blob_identity() else {
                 // Gitlinks identify another repository commit and deliberately
@@ -6618,31 +6957,46 @@ impl DaemonState {
                 }
                 Err(error) => return Err(DaemonError::Blob(error)),
             }
+            missing.push((hash, &artifact.path));
+        }
 
-            let authoritative = authority.load_source_blob(hash)?.ok_or_else(|| {
-                DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
-                    "workspace artifact {} references source body {} absent from repository authority",
-                    artifact.path, hash
-                )))
-            })?;
-
-            let installed_hash = blobs.write(&authoritative)?;
-            if installed_hash != hash {
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "repository authority body {} hydrated under unexpected derived CAS identity {}",
-                        hash, installed_hash
-                    ),
-                )));
+        // Written in batches. Each body is as durable as a single write makes
+        // it, but a batch pays for its bytes' device barrier once rather than
+        // once a body (see `BlobStore::write_many`): on a 6,960-body repository
+        // hydrating one body at a time spent 85 of the daemon's 105 startup
+        // seconds in those barriers.
+        for batch in missing.chunks(HYDRATE_BATCH_BODIES) {
+            let mut bodies = Vec::with_capacity(batch.len());
+            for (hash, path) in batch {
+                bodies.push(authority.load_source_blob(*hash)?.ok_or_else(|| {
+                    DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                        "workspace artifact {} references source body {} absent from repository authority",
+                        path, hash
+                    )))
+                })?);
             }
-            let installed = blobs.read(&hash)?;
-            if installed != authoritative {
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    format!(
-                        "derived ingestion CAS did not retain exact repository authority body {}",
-                        hash
-                    ),
-                )));
+            let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+            let installed_hashes = blobs.write_many(&refs)?;
+            for (((hash, _), installed_hash), authoritative) in
+                batch.iter().zip(installed_hashes).zip(&bodies)
+            {
+                if installed_hash != *hash {
+                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                        format!(
+                            "repository authority body {} hydrated under unexpected derived CAS identity {}",
+                            hash, installed_hash
+                        ),
+                    )));
+                }
+                let installed = blobs.read(hash)?;
+                if installed != *authoritative {
+                    return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                        format!(
+                            "derived ingestion CAS did not retain exact repository authority body {}",
+                            hash
+                        ),
+                    )));
+                }
             }
         }
         // Hydration is a bulk import: the store defers each blob's directory
@@ -6752,10 +7106,12 @@ impl DaemonState {
     /// actually there, so the identity always describes what was actually
     /// opened. The registry id is kept only to name the row in a log.
     ///
-    /// Two rows resolving to one repository identity is the one case this still
-    /// refuses. It means two registry paths hold the same repository, a copied
-    /// checkout being the usual cause, and registering both would silently let
-    /// one overwrite the other's graph authority under the same spine key.
+    /// Two rows resolving to one repository identity are two locations of one
+    /// repository, a copied or adopted store being the usual cause. Registering
+    /// both would silently let one overwrite the other's graph authority under
+    /// the same spine key, so exactly one is selected: this daemon's own store
+    /// for its own repository, otherwise the earliest row. The others are not
+    /// pinned and are not refusals, because the repository is represented.
     fn pin_registered_local_repository_authorities(
         layout: &KinLayout,
     ) -> (Vec<RegisteredLocalRepositoryAuthority>, bool) {
@@ -6774,8 +7130,18 @@ impl DaemonState {
             .root()
             .canonicalize()
             .unwrap_or_else(|_| layout.root().to_path_buf());
+        // A store kept outside its working tree is not under it, so this
+        // daemon's own row is also recognized by its working tree.
+        let current_working_dir = layout
+            .working_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| layout.working_dir().to_path_buf());
         let mut pinned: Vec<RegisteredLocalRepositoryAuthority> = Vec::new();
-        let mut pinned_identities = HashSet::new();
+        // This daemon's own repository is selected before any row: another
+        // location of it, such as a store adopted from this one, is never
+        // pinned as a sibling that would replace the primary under its key.
+        let own_identity = kin_core::registry::published_repository_identity(layout.working_dir());
+        let mut pinned_identities: HashSet<String> = own_identity.iter().cloned().collect();
         let mut failures = StartupPinFailures::default();
         let mut self_rows_skipped = 0usize;
         let mut adopted_identities = 0usize;
@@ -6785,12 +7151,15 @@ impl DaemonState {
                 .path
                 .canonicalize()
                 .unwrap_or_else(|_| repo.path.clone());
-            if repo_root == current_kin_root || current_kin_root.starts_with(&repo_root) {
+            if repo_root == current_kin_root
+                || current_kin_root.starts_with(&repo_root)
+                || repo_root == current_working_dir
+            {
                 self_rows_skipped += 1;
                 continue;
             }
 
-            let sibling_layout = KinLayout::new(repo.path.join(".kin"));
+            let sibling_layout = KinLayout::for_working_dir(&repo.path);
             let binding =
                 match kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_layout) {
                     Ok(binding) => binding,
@@ -6801,7 +7170,7 @@ impl DaemonState {
                 };
             let manifest_repo_id = binding.repository_id().as_str().to_string();
             if !pinned_identities.insert(manifest_repo_id.clone()) {
-                failures.record_duplicate_identity(&repo.id, &repo.path, &manifest_repo_id);
+                failures.record_other_location(&repo.path, &manifest_repo_id);
                 continue;
             }
             if manifest_repo_id != repo.id {
@@ -6847,6 +7216,11 @@ impl DaemonState {
         })?;
         if resolved.as_path() == layout.working_dir() {
             return Ok(layout);
+        }
+        // A store kept outside its tree stays where it is; only the spelling
+        // of the tree it serves is resolved.
+        if layout.is_external() {
+            return Ok(KinLayout::external(layout.root().to_path_buf(), resolved));
         }
         Ok(KinLayout::new(resolved.join(".kin")))
     }
@@ -7132,7 +7506,17 @@ impl DaemonState {
             changes_in_store = graph_section.changes_in_store,
             "resolved the workspace base graph"
         );
-        let resumable_files = resumable_enrichment_files(
+        let owed_files = crate::owed_enrichment::load(&layout);
+        let uncertain_native_marks =
+            lease
+                .workspace_enrichment_marks(&workspace_id)
+                .iter()
+                .any(|mark| {
+                    owed_files.get(&mark.path).is_some_and(|entry| {
+                        entry.reference_uncertainty && entry.blob == mark.body.to_string()
+                    })
+                });
+        let mut resumable_files = resumable_enrichment_files(
             lease.workspace_enrichment_marks(&workspace_id),
             &workspace_snapshot.resolved_tree,
             &workspace_snapshot.entities,
@@ -7140,6 +7524,11 @@ impl DaemonState {
             workspace_snapshot.resolution_records.values(),
             kin_core::lsp_scope::upgrade_recorded(&layout),
         );
+        resumable_files.retain(|path, body| {
+            !owed_files
+                .get(path)
+                .is_some_and(|entry| entry.reference_uncertainty && entry.blob == body.to_string())
+        });
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
         let generation = lease.roots().generation;
@@ -7153,11 +7542,11 @@ impl DaemonState {
         // text index and validates the vector sidecar against its own
         // retrieval authority, and a sidecar written after the embed pass was
         // stamped with these records present.
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         let mut workspace_snapshot = phases.record("non_entity_coverage", || {
             Self::restore_non_entity_coverage(workspace_snapshot, &blobs)
         });
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         phases.record("source_layout_coverage", || -> Result<()> {
             let coverage = crate::loop_runner::restore_missing_source_layouts_in_snapshot(
                 &mut workspace_snapshot,
@@ -7173,7 +7562,7 @@ impl DaemonState {
             }
             Ok(())
         })?;
-        #[cfg(not(feature = "embeddings"))]
+        #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
         phases.skipped("non_entity_coverage");
         let graph = phases
             .record("graph_text_index", || {
@@ -7249,6 +7638,12 @@ impl DaemonState {
         // The relation half of the durability baseline, read from the same
         // snapshot at the same instant so the two describe one graph.
         let loaded_relation_count = graph.relation_count();
+        // Held binding debt is re-examined only inside an enrichment
+        // publication, and a settled store opens with nothing to publish, so
+        // debt this build can prove settled would otherwise wait for an
+        // unrelated edit. A store that opens holding debt owes one publication.
+        let binding_debt_owes_a_publication =
+            !locate_only && holds_local_binding_debt(graph.as_ref());
 
         let coordination_events = CoordinationEventLog::open(&layout, &cached_repo_id)?;
         let coordination_event_persist_failures = coordination_events.persisted_failure_count();
@@ -7263,6 +7658,7 @@ impl DaemonState {
             coordination_gate: tokio::sync::Mutex::new(()),
             prepared_publication: Arc::new(crate::prepared_publication::ServingFence::default()),
             graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
+            live_read_gate: Arc::new(crate::live_read_gate::LiveReadGate::default()),
             coordination_mode: std::sync::RwLock::new(
                 kin_mcp::CoordinationEnforcementMode::from_env(),
             ),
@@ -7271,11 +7667,14 @@ impl DaemonState {
                 coordination_event_persist_failures,
             ),
             started_at: Instant::now(),
+            process_id: std::process::id(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
             publication_control: None,
             hosted_vector_persistence: Mutex::new(HostedVectorPersistenceState::NotHosted),
+            #[cfg(test)]
+            hosted_vector_producer_policy_for_test: None,
             hosted_vector_binding_refusal: Mutex::new(None),
             hosted_authority_envelope: false,
             hosted_authority_flush_refusals: AtomicU64::new(0),
@@ -7293,7 +7692,7 @@ impl DaemonState {
             graph_authority_storage_backend: false,
             snapshot_generation: AtomicU64::new(generation),
             post_commit_finalization_pending: AtomicBool::new(false),
-            enrichment_bookkeeping_pending: AtomicBool::new(false),
+            enrichment_bookkeeping_pending: AtomicBool::new(binding_debt_owes_a_publication),
             #[cfg(test)]
             finalization_fail_once: AtomicBool::new(false),
             #[cfg(test)]
@@ -7351,7 +7750,7 @@ impl DaemonState {
             admission_runs: crate::repository_admit::AdmissionRuns::default(),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
-            #[cfg(all(test, feature = "embeddings"))]
+            #[cfg(all(test, any(feature = "embeddings", feature = "external-embeddings")))]
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
             spine_refresh_gate: crate::hosted_spine_cost::SpineRefreshGate::default(),
             spine_gate_read_wait_micros: std::sync::atomic::AtomicU64::new(0),
@@ -7370,9 +7769,9 @@ impl DaemonState {
             xref_graph_cache: crate::api::XrefHeadGraphCache::default(),
             graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             deferred_vector_checkpoint: std::sync::Mutex::new(None),
             last_save: std::sync::Mutex::new(Instant::now()),
             flush_in_flight_since: std::sync::Mutex::new(None),
@@ -7387,6 +7786,7 @@ impl DaemonState {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             lsp_enrichment_enabled: false,
+            lsp_enrichment_switched_off_by: None,
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
@@ -7394,6 +7794,7 @@ impl DaemonState {
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_work: Arc::new(LspWorkTracker::default()),
+            sweep_waiters: crate::sweep_waiters::SweepWaiters::default(),
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -7401,10 +7802,12 @@ impl DaemonState {
             lsp_pending_marks: std::sync::Mutex::new(Default::default()),
             lsp_marks_committed: AtomicU64::new(0),
             lsp_unprovable: std::sync::Mutex::new(Default::default()),
-            lsp_owed_files: std::sync::Mutex::new(Default::default()),
+            lsp_owed_files: std::sync::Mutex::new(owed_files),
             lsp_retry_owed_now: AtomicBool::new(false),
             lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
             lsp_settled_guesses: std::sync::Mutex::new(Default::default()),
+            startup_rederivation: std::sync::Mutex::new(Default::default()),
+            lsp_publication_failure: std::sync::Mutex::new(None),
             census_settled_retirements: std::sync::Mutex::new(Default::default()),
             lsp_current_contexts: std::sync::Mutex::new(Default::default()),
             lsp_unrecorded_validations: std::sync::Mutex::new(Default::default()),
@@ -7496,6 +7899,10 @@ impl DaemonState {
                 workspace_id,
             );
         }
+        if uncertain_native_marks {
+            state.mark_reference_uncertainty_pending();
+            state.save_snapshot_reporting_enrichment()?;
+        }
         state.register_daemon_system_session();
         // The first settled status reading, taken here because this is the last
         // instant before the daemon can start embedding. A background pass holds
@@ -7519,7 +7926,7 @@ impl DaemonState {
         repo_id: &str,
         allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
-        Self::open_with_backend_internal(layout, backend, repo_id, allowed_repo_ids, None)
+        Self::open_with_backend_internal(layout, backend, repo_id, allowed_repo_ids, None, None)
     }
 
     /// Open hosted authority beneath the fleet publication contract.
@@ -7546,7 +7953,56 @@ impl DaemonState {
             repo_id,
             allowed_repo_ids,
             Some(publication_control),
+            None,
         )
+    }
+
+    /// Positive vector-artifact fixtures select a CPU producer explicitly, without
+    /// changing the process environment or initializing an inference engine.
+    #[cfg(test)]
+    pub(crate) fn open_with_backend_for_vector_test(
+        layout: KinLayout,
+        backend: Box<dyn StorageBackend>,
+        repo_id: &str,
+        allowed_repo_ids: Option<HashSet<String>>,
+    ) -> Result<Self> {
+        Self::open_with_backend_with_producer_for_test(
+            layout,
+            backend,
+            repo_id,
+            allowed_repo_ids,
+            "built-in",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_backend_with_producer_for_test(
+        layout: KinLayout,
+        backend: Box<dyn StorageBackend>,
+        repo_id: &str,
+        allowed_repo_ids: Option<HashSet<String>>,
+        provider: &str,
+    ) -> Result<Self> {
+        let policy =
+            hosted_vector_producer_policy_for("off", provider, "cpu", "pure-rust", false, false);
+        Self::open_with_backend_internal(
+            layout,
+            backend,
+            repo_id,
+            allowed_repo_ids,
+            None,
+            Some(policy),
+        )
+    }
+
+    fn hosted_vector_producer_policy(
+        &self,
+    ) -> std::result::Result<HostedVectorProducerPolicy, String> {
+        #[cfg(test)]
+        if let Some(policy) = self.hosted_vector_producer_policy_for_test.as_ref() {
+            return policy.clone();
+        }
+        hosted_vector_producer_policy()
     }
 
     fn open_with_backend_internal(
@@ -7555,6 +8011,7 @@ impl DaemonState {
         repo_id: &str,
         allowed_repo_ids: Option<HashSet<String>>,
         publication_control: Option<Arc<crate::publication_lease::PublicationControl>>,
+        producer_policy_override: Option<std::result::Result<HostedVectorProducerPolicy, String>>,
     ) -> Result<Self> {
         // Per repository, never the layout's one text-index directory. A hosted
         // daemon serves many repositories through one layout, so a shared
@@ -7678,6 +8135,9 @@ impl DaemonState {
             repo_id,
             graph.as_ref(),
             hosted_vector_binding,
+            producer_policy_override
+                .clone()
+                .unwrap_or_else(hosted_vector_producer_policy),
         );
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
@@ -7711,6 +8171,7 @@ impl DaemonState {
             coordination_gate: tokio::sync::Mutex::new(()),
             prepared_publication: Arc::new(crate::prepared_publication::ServingFence::default()),
             graph_authority_clock: Arc::new(GraphAuthorityClock::default()),
+            live_read_gate: Arc::new(crate::live_read_gate::LiveReadGate::default()),
             coordination_mode: std::sync::RwLock::new(
                 kin_mcp::CoordinationEnforcementMode::from_env(),
             ),
@@ -7719,11 +8180,14 @@ impl DaemonState {
                 coordination_event_persist_failures,
             ),
             started_at: Instant::now(),
+            process_id: std::process::id(),
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             publication_control,
             hosted_vector_persistence: Mutex::new(hosted_vector_persistence),
+            #[cfg(test)]
+            hosted_vector_producer_policy_for_test: producer_policy_override,
             hosted_vector_binding_refusal: Mutex::new(None),
             hosted_authority_envelope,
             hosted_authority_flush_refusals: AtomicU64::new(0),
@@ -7799,7 +8263,7 @@ impl DaemonState {
             admission_runs: crate::repository_admit::AdmissionRuns::default(),
             #[cfg(test)]
             spine_initialization_test_hook: Mutex::new(None),
-            #[cfg(all(test, feature = "embeddings"))]
+            #[cfg(all(test, any(feature = "embeddings", feature = "external-embeddings")))]
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
             spine_refresh_gate: crate::hosted_spine_cost::SpineRefreshGate::default(),
             spine_gate_read_wait_micros: std::sync::atomic::AtomicU64::new(0),
@@ -7818,9 +8282,9 @@ impl DaemonState {
             xref_graph_cache: crate::api::XrefHeadGraphCache::default(),
             graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             deferred_vector_checkpoint: std::sync::Mutex::new(None),
             last_save: std::sync::Mutex::new(Instant::now()),
             flush_in_flight_since: std::sync::Mutex::new(None),
@@ -7835,6 +8299,7 @@ impl DaemonState {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             lsp_enrichment_enabled: false,
+            lsp_enrichment_switched_off_by: None,
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
@@ -7842,6 +8307,7 @@ impl DaemonState {
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_work: Arc::new(LspWorkTracker::default()),
+            sweep_waiters: crate::sweep_waiters::SweepWaiters::default(),
             lsp_sweep_pending: AtomicBool::new(false),
             lsp_enriched_marker_epoch: AtomicU64::new(0),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -7853,6 +8319,8 @@ impl DaemonState {
             lsp_retry_owed_now: AtomicBool::new(false),
             lsp_evidence_unrecorded: std::sync::Mutex::new(Default::default()),
             lsp_settled_guesses: std::sync::Mutex::new(Default::default()),
+            startup_rederivation: std::sync::Mutex::new(Default::default()),
+            lsp_publication_failure: std::sync::Mutex::new(None),
             census_settled_retirements: std::sync::Mutex::new(Default::default()),
             lsp_current_contexts: std::sync::Mutex::new(Default::default()),
             lsp_unrecorded_validations: std::sync::Mutex::new(Default::default()),
@@ -10219,7 +10687,7 @@ impl DaemonState {
     /// second one, and it reads it as a separate step after the read's own
     /// pass. A pass on another request can build the spine in between, and a
     /// pass that succeeds clears the slot, so an empty slot is a deferral too:
-    /// a missing record never means the spine is off. A derived-member refusal
+    /// a missing record never means the spine is off. A standing refusal
     /// comes back as recorded, opening with its code, and
     /// `kin_spine::DaemonSpine::from_read` tells that standing refusal apart
     /// from a deferral. `None` comes back only for a spine that is switched off
@@ -10227,6 +10695,15 @@ impl DaemonState {
     /// instead. The routes call this on every read and use it only when the
     /// read found no spine, so a deferral lasts only until a read builds the
     /// spine.
+    /// How many other repositories this daemon's spine would federate beside
+    /// its own: the sibling repositories the registry pinned at startup. A
+    /// spine that refuses this repository's graph on a daemon with none of them
+    /// would have held this repository alone, so its refusal hides no
+    /// reference from another one.
+    pub(crate) fn spine_peer_repositories(&self) -> usize {
+        self.registered_local_repository_authorities.len()
+    }
+
     pub(crate) fn spine_initialization_deferral(&self) -> Option<String> {
         #[cfg(test)]
         if let Some(seam) = Self::spine_deferral_read_seam(None) {
@@ -10309,13 +10786,9 @@ impl DaemonState {
     /// Whether the spine's registered primary watermark is the live graph root
     /// and the primary's cross-repo edges were materialized at it.
     fn primary_spine_registration_is_current(&self, spine: &dyn kin_spine::SpineBackend) -> bool {
-        // Matching roots do not prove that an older publisher preserved member
-        // derivation authority; force capture/refusal even at the same root.
-        if self.graph.list_all_entities().map_or(true, |entities| {
-            entities.iter().any(kin_model::is_derived_member)
-        }) {
-            return false;
-        }
+        // This process is the only publisher of its local spine, and every
+        // registration it makes carries the graph facts that mark an inferred
+        // member a candidate, so a matching root is the whole question.
         let live_root = hex::encode(self.graph.compute_root_hash());
         spine.root_hash(&self.cached_repo_id).as_deref() == Some(live_root.as_str())
             // Every graph-authority mutation invalidates the primary's edges
@@ -10370,11 +10843,6 @@ impl DaemonState {
                             error = %capture_error,
                             "spine re-registration deferred until primary graph authority is stable"
                         );
-                        if capture_error.starts_with(DERIVED_MEMBER_SPINE_GAP) {
-                            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                                capture_error,
-                            )));
-                        }
                         return Ok(());
                     }
                 };
@@ -10383,9 +10851,10 @@ impl DaemonState {
                 spine.root_hash(primary_repo_id).as_deref() != Some(capture.root_hash.as_str());
             if root_moved {
                 publication.reassert_before_mutation()?;
-                spine.register_repo(
+                spine.register_repo_with_facts(
                     primary_repo_id,
                     std::mem::take(&mut capture.entries),
+                    std::mem::take(&mut capture.facts),
                     &capture.root_hash,
                 );
             }
@@ -10575,14 +11044,30 @@ impl DaemonState {
             let entity_ids = snapshot.entities.keys().copied().collect::<HashSet<_>>();
             let mut entities = snapshot.entities.into_values().collect::<Vec<_>>();
             entities.sort_by_key(|entity| entity.id);
-            if let Some(entity) = entities
-                .iter()
-                .find(|entity| kin_model::is_derived_member(entity))
-            {
-                return Err(format!(
-                    "{DERIVED_MEMBER_SPINE_GAP}: repo {repo_id} contains inferred member {}. The current spine format cannot preserve candidate authority. Local Kin queries and generator edits remain available. Federation requires versioned candidate-status support before this graph can be published.",
-                    entity.id
-                ));
+            let facts = kin_spine::RepoGraphFacts::from_entities(&entities);
+            // An inferred member enters the local spine as a candidate: the
+            // facts registered beside the entries mark it, and every
+            // cross-repo edge into or out of it reads `name_only`. A durable
+            // publication has no field that marks one, so it withholds the
+            // members and the edges sourced at them and publishes the rest of
+            // the graph. A member it withholds is absent from the publication,
+            // so an answer anchored on it reads its cross-repo authority as
+            // incomplete, and no other answer does.
+            let withheld = if self.storage_backend.is_some() {
+                entities
+                    .iter()
+                    .filter(|entity| facts.is_derived_member(&entity.id))
+                    .map(|entity| entity.id)
+                    .collect::<HashSet<_>>()
+            } else {
+                HashSet::new()
+            };
+            if !withheld.is_empty() {
+                debug!(
+                    repo_id,
+                    withheld = withheld.len(),
+                    "durable spine publication withholds inferred members it cannot mark as candidates"
+                );
             }
             let mut relations = snapshot
                 .relations
@@ -10591,14 +11076,14 @@ impl DaemonState {
                     matches!(
                         relation.kind,
                         kin_model::RelationKind::Calls | kin_model::RelationKind::References
-                    ) && relation
-                        .src
-                        .as_entity()
-                        .is_some_and(|source| entity_ids.contains(&source))
+                    ) && relation.src.as_entity().is_some_and(|source| {
+                        entity_ids.contains(&source) && !withheld.contains(&source)
+                    })
                 })
                 .collect::<Vec<_>>();
             relations.sort_by_key(|relation| relation.id.to_string());
-            let entries = Self::entities_to_spine_entries(repo_id, &entities);
+            let mut entries = Self::entities_to_spine_entries(repo_id, &entities);
+            entries.retain(|entry| !withheld.contains(&entry.entity_id));
             let capture = SpineGraphCapture {
                 repo_id: repo_id.to_string(),
                 graph: Arc::clone(&graph),
@@ -10606,6 +11091,7 @@ impl DaemonState {
                 hosted_publication_cursor,
                 root_hash,
                 entries,
+                facts,
                 entities,
                 relations,
             };
@@ -10820,7 +11306,7 @@ impl DaemonState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(interval);
     }
 
-    #[cfg(all(test, feature = "embeddings"))]
+    #[cfg(all(test, any(feature = "embeddings", feature = "external-embeddings")))]
     pub(crate) fn set_vector_checkpoint_reopen_test_hook(
         &self,
         hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -10831,7 +11317,7 @@ impl DaemonState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
 
-    #[cfg(all(test, feature = "embeddings"))]
+    #[cfg(all(test, any(feature = "embeddings", feature = "external-embeddings")))]
     fn run_vector_checkpoint_reopen_hook(&self) {
         let hook = self
             .vector_checkpoint_reopen_test_hook
@@ -11031,9 +11517,10 @@ impl DaemonState {
         for capture in &mut captures {
             let entity_count = capture.entries.len();
             publication.reassert_before_mutation()?;
-            backend.register_repo(
+            backend.register_repo_with_facts(
                 &capture.repo_id,
                 std::mem::take(&mut capture.entries),
+                std::mem::take(&mut capture.facts),
                 &capture.root_hash,
             );
             info!(
@@ -11789,9 +12276,6 @@ impl DaemonState {
                         error = %error,
                         "skipping cross-repo refresh: graph authority capture failed"
                     );
-                    if error.starts_with(DERIVED_MEMBER_SPINE_GAP) {
-                        return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(error)));
-                    }
                 }
             }
         }
@@ -11831,9 +12315,10 @@ impl DaemonState {
         // only the following all-source pass may clear it again.
         for repo in &mut prepared {
             publication.reassert_before_mutation()?;
-            spine.register_repo(
+            spine.register_repo_with_facts(
                 &repo.repo_id,
                 std::mem::take(&mut repo.entries),
+                std::mem::take(&mut repo.facts),
                 &repo.root_hash,
             );
         }
@@ -12670,6 +13155,18 @@ impl DaemonState {
             })
     }
 
+    /// A deliberately unselected model is configuration, not a failed checkpoint.
+    /// Explicit embedding operations still require the durable capability above.
+    pub(crate) fn embed_persistence_unavailable(&self) -> bool {
+        !self.can_persist_embed_progress_locally() && !self.hosted_embedding_slot_not_selected()
+    }
+
+    pub(crate) fn hosted_embedding_slot_not_selected(&self) -> bool {
+        self.hosted_vector_persistence
+            .lock()
+            .is_ok_and(|state| matches!(*state, HostedVectorPersistenceState::NotSelected))
+    }
+
     pub fn hosted_vector_persistence_health(&self) -> Option<HostedVectorPersistenceHealth> {
         self.storage_backend.as_ref()?;
         let state = self
@@ -12686,10 +13183,16 @@ impl DaemonState {
         // the process rather than of the artifact, so it is reported wherever
         // a hosted store exists to be fenced, and left absent exactly when the
         // policy itself cannot resolve one.
-        let producer_profile = hosted_vector_producer_policy()
+        let producer_profile = self
+            .hosted_vector_producer_policy()
             .ok()
             .map(|policy| policy.profile);
         let health = match &*state {
+            HostedVectorPersistenceState::NotSelected => HostedVectorPersistenceHealth {
+                status: "not_selected".to_string(),
+                detail: Some(HOSTED_VECTOR_NO_PRODUCER.into()),
+                ..HostedVectorPersistenceHealth::default()
+            },
             HostedVectorPersistenceState::NotHosted => HostedVectorPersistenceHealth {
                 status: "unsupported".to_string(),
                 detail: Some("hosted vector persistence state was not initialized".to_string()),
@@ -13320,7 +13823,10 @@ impl DaemonState {
         })
     }
 
-    #[cfg(any(feature = "embeddings", feature = "vector"))]
+    #[cfg(any(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn reject_remote_backend_embed_persistence(&self, operation: &str) -> Result<()> {
         if self.can_persist_embed_progress_locally() {
             return Ok(());
@@ -13391,6 +13897,7 @@ impl DaemonState {
             &self.cached_repo_id,
             self.graph.as_ref(),
             Some(binding),
+            self.hosted_vector_producer_policy(),
         );
         let recovered_authority = recovered.writable_authority();
         let recovered_cursor = recovered_authority.map(|authority| authority.cursor);
@@ -13585,7 +14092,7 @@ impl DaemonState {
                 "vector artifact index",
             )?,
         };
-        let producer_policy = hosted_vector_producer_policy().map_err(|reason| {
+        let producer_policy = self.hosted_vector_producer_policy().map_err(|reason| {
             DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
                 "refusing durable vector artifact save without a single numerical producer: {reason}"
             )))
@@ -13630,7 +14137,7 @@ impl DaemonState {
                             detail: reason.clone(),
                         };
                     }
-                    #[cfg(feature = "embeddings")]
+                    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
                     self.record_deferred_vector_checkpoint(reason.clone());
                     return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(reason)));
                 }
@@ -13649,7 +14156,7 @@ impl DaemonState {
                             detail: reason.clone(),
                         };
                     }
-                    #[cfg(feature = "embeddings")]
+                    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
                     self.record_deferred_vector_checkpoint(reason.clone());
                     return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(reason)));
                 }
@@ -13675,7 +14182,7 @@ impl DaemonState {
                 let base_reason = format!(
                     "durable vector artifact was not committed for snapshot cursor {generation}: {error}"
                 );
-                #[cfg(feature = "embeddings")]
+                #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
                 self.record_deferred_vector_checkpoint(base_reason.clone());
                 if let Ok(mut installed) = self.hosted_vector_persistence.lock() {
                     *installed = HostedVectorPersistenceState::ConflictReloading {
@@ -13712,7 +14219,7 @@ impl DaemonState {
                         detail: reason.clone(),
                     };
                 }
-                #[cfg(feature = "embeddings")]
+                #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
                 self.record_deferred_vector_checkpoint(reason.clone());
                 Err(DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))
             }
@@ -13961,9 +14468,15 @@ impl DaemonState {
             // is acknowledged here either, and the caller is told, because a
             // sweep that took this for a publication would record its files as
             // enriched over relations authority never received.
-            let Some(published_generation) =
-                self.publish_local_workspace_enrichment(expected_gen)?
-            else {
+            let published = self.publish_local_workspace_enrichment(expected_gen);
+            if let Ok(mut failure) = self.lsp_publication_failure.lock() {
+                match &published {
+                    Ok(Some(_)) => *failure = None,
+                    Ok(None) => {}
+                    Err(error) => *failure = Some(error.to_string()),
+                }
+            }
+            let Some(published_generation) = published? else {
                 debug!(
                     generation = expected_gen,
                     "held enrichment publication while a merge is open on this workspace"
@@ -14025,7 +14538,7 @@ impl DaemonState {
     /// graph/workspace authority; concurrent semantic or tree changes stay
     /// pending for the normal authority-aware persistence path rather than
     /// recreating a local graph.kndb checkpoint.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub fn flush_embed_progress(&self) -> Result<usize> {
         self.reject_remote_backend_embed_persistence("embed progress persistence")?;
         let _persist_guard = self
@@ -14071,7 +14584,10 @@ impl DaemonState {
         let hosted_producer_profile = self
             .storage_backend
             .as_ref()
-            .map(|_| hosted_vector_producer_profile())
+            .map(|_| {
+                self.hosted_vector_producer_policy()
+                    .map(|policy| policy.profile)
+            })
             .transpose()
             .map_err(|reason| DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))?;
         let checkpointed = kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
@@ -14108,7 +14624,7 @@ impl DaemonState {
 
     /// Remember that a vector checkpoint was refused, so the work it left in
     /// memory can be retried and named rather than silently abandoned.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn record_deferred_vector_checkpoint(&self, reason: String) {
         if let Ok(mut deferred) = self.deferred_vector_checkpoint.lock() {
             *deferred = Some(reason);
@@ -14116,7 +14632,7 @@ impl DaemonState {
     }
 
     /// Retire the record once a checkpoint has actually written the sidecar.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn clear_deferred_vector_checkpoint(&self) {
         if let Ok(mut deferred) = self.deferred_vector_checkpoint.lock() {
             *deferred = None;
@@ -14132,7 +14648,7 @@ impl DaemonState {
     /// rendering the shortfall as ordinary pending work on the next open. A
     /// poisoned lock answers `None`: an unreadable record is not evidence of a
     /// deferral, and the retry below is what closes the gap either way.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub fn deferred_vector_checkpoint(&self) -> Option<String> {
         self.deferred_vector_checkpoint
             .lock()
@@ -14140,7 +14656,7 @@ impl DaemonState {
             .and_then(|deferred| deferred.clone())
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
     pub fn deferred_vector_checkpoint(&self) -> Option<String> {
         None
     }
@@ -14158,18 +14674,18 @@ impl DaemonState {
     /// the authority proof is the whole reason the first attempt refused, so a
     /// retry that skipped it would checkpoint exactly the state the refusal was
     /// protecting against.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub fn retry_deferred_vector_checkpoint(&self) -> Option<Result<usize>> {
         self.deferred_vector_checkpoint()?;
         Some(self.flush_embed_progress())
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
     pub fn retry_deferred_vector_checkpoint(&self) -> Option<Result<usize>> {
         None
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
     pub fn flush_embed_progress(&self) -> Result<usize> {
         Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
             "this Kin build does not include embedding support".to_string(),
@@ -14201,7 +14717,10 @@ impl DaemonState {
         let hosted_producer_profile = self
             .storage_backend
             .as_ref()
-            .map(|_| hosted_vector_producer_profile())
+            .map(|_| {
+                self.hosted_vector_producer_policy()
+                    .map(|policy| policy.profile)
+            })
             .transpose()
             .map_err(|reason| DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))?;
         kin_db::SnapshotManager::save_vector_index_for_graph(
@@ -14212,7 +14731,7 @@ impl DaemonState {
         .map_err(DaemonError::from)?;
         let generation = self.snapshot_generation.load(Ordering::SeqCst);
         self.persist_hosted_vector_artifact(generation)?;
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         self.clear_deferred_vector_checkpoint();
         Ok(())
     }
@@ -14381,6 +14900,37 @@ impl DaemonState {
             .map_err(|(_, message)| DaemonError::Graph(kin_db::KinDbError::StorageError(message)))
     }
 
+    pub(crate) fn mark_reference_uncertainty_pending(&self) {
+        self.enrichment_bookkeeping_pending
+            .store(true, Ordering::SeqCst);
+        self.mark_dirty();
+    }
+
+    pub(crate) fn enrichment_bookkeeping_owes_publication(&self) -> bool {
+        self.enrichment_bookkeeping_pending.load(Ordering::SeqCst)
+    }
+
+    fn reference_uncertain_paths(
+        &self,
+        snapshot: &kin_db::GraphSnapshot,
+    ) -> std::collections::BTreeSet<String> {
+        let Ok(owed) = self.lsp_owed_files.lock() else {
+            return Default::default();
+        };
+        owed.iter().filter(|(path, entry)| {
+            let Ok(path) = RepoPath::from_utf8(path.to_string()) else { return false; };
+            entry.reference_uncertainty
+                && snapshot.resolved_tree.artifact_at_path(&path)
+                    .is_some_and(|artifact| matches!(&artifact.entry, TreeEntry::Blob { hash, .. } if hash.to_string() == entry.blob))
+                && snapshot.resolution_records.values().any(|record|
+                    record.as_context_validation().is_some_and(|validation| match &validation.state {
+                        kin_model::ContextValidationState::Validated { context } =>
+                            entry.context.as_deref() == Some(kin_model::ResolutionRecordId::proof_context(context).to_string().as_str()),
+                        _ => false,
+                    }))
+        }).map(|(path, _)| path.clone()).collect()
+    }
+
     /// Prove the derived graph still matches workspace authority at this
     /// generation, publish the language-server relations authority does not
     /// hold yet, and report the generation the workspace ends at.
@@ -14499,6 +15049,18 @@ impl DaemonState {
             .lock()
             .map(|held| held.clone())
             .unwrap_or_default();
+        let uncertain_paths = self.reference_uncertain_paths(&live_snapshot);
+        if !uncertain_paths.is_empty() {
+            crate::owed_enrichment::persist_checked(
+                &self.layout,
+                &*self
+                    .lsp_owed_files
+                    .lock()
+                    .map_err(|_| exact_source_storage_error("owed enrichment lock is poisoned"))?,
+            )
+            .map_err(DaemonError::from)?;
+        }
+        let held_marks = lease.workspace_enrichment_marks(&workspace_id).to_vec();
         let pending_marks = self
             .lsp_pending_marks
             .lock()
@@ -14564,7 +15126,7 @@ impl DaemonState {
                 &|digest| authority.load_source_blob(digest),
             )?;
         let mirrored_debts = published_debts;
-        let (marks, unmarkable) = Self::enrichment_marks_to_commit(
+        let (mut marks, unmarkable) = Self::enrichment_marks_to_commit(
             &pending_marks,
             &workspace.tree,
             &live_snapshot,
@@ -14583,13 +15145,70 @@ impl DaemonState {
                 }
             }
         }
-        let semantic_delta = if marks.is_empty() {
+        marks.retain(|mark| !uncertain_paths.contains(&mark.path));
+        let retire_uncertain = held_marks
+            .iter()
+            .any(|mark| uncertain_paths.contains(&mark.path));
+        let semantic_delta = if marks.is_empty() && !retire_uncertain {
             semantic_delta
         } else {
+            let mut native_marks = marks.clone();
+            if retire_uncertain {
+                // Reapply only exact held proofs that still match the actual
+                // successor. No old mark is restamped or promoted to new inputs.
+                let mut relations: std::collections::HashMap<_, _> = authority_snapshot
+                    .relations
+                    .iter()
+                    .map(|(id, relation)| (*id, relation))
+                    .collect();
+                for delta in semantic_delta.relation_deltas() {
+                    match delta.new_state() {
+                        Some(relation) => {
+                            relations.insert(relation.id, relation);
+                        }
+                        None => {
+                            relations.remove(&delta.target_id());
+                        }
+                    }
+                }
+                let mut records: std::collections::BTreeMap<_, _> = authority_snapshot
+                    .resolution_records
+                    .iter()
+                    .map(|(id, record)| (*id, record))
+                    .collect();
+                for delta in semantic_delta.resolution_record_deltas() {
+                    match delta.new_state() {
+                        Some(record) => {
+                            records.insert(record.id(), record);
+                        }
+                        None => {
+                            records.remove(&delta.target_id());
+                        }
+                    }
+                }
+                let compatible = resumable_enrichment_files(
+                    &held_marks,
+                    &workspace.tree,
+                    &authority_snapshot.entities,
+                    relations.values().copied(),
+                    records.values().copied(),
+                    kin_core::lsp_scope::upgrade_recorded(&self.layout),
+                );
+                native_marks.extend(
+                    held_marks
+                        .iter()
+                        .filter(|held| {
+                            !uncertain_paths.contains(&held.path)
+                                && compatible.contains_key(&held.path)
+                                && !marks.iter().any(|new| new.path == held.path)
+                        })
+                        .cloned(),
+                );
+            }
             semantic_delta
                 .with_enrichment_marks(kin_model::EnrichmentMarksDelta {
-                    retire_all: false,
-                    marks: marks.clone(),
+                    retire_all: retire_uncertain,
+                    marks: native_marks,
                 })
                 .map_err(|error| {
                     DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
@@ -14652,6 +15271,7 @@ impl DaemonState {
                 &retired_references,
                 &retired_records,
             )?;
+            self.rebind_binding_witness_when_level(authority_snapshot);
             return Ok(Some(expected_generation));
         }
         // Decided after the delta, so a flush with nothing new to publish still
@@ -14710,6 +15330,7 @@ impl DaemonState {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let receipt = authority
             .commit_repository_transaction_with_binding_history(
@@ -14894,6 +15515,40 @@ impl DaemonState {
         self.enrichment_bookkeeping_pending
             .store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Rebind the authority's binding witness after an enrichment publication
+    /// found nothing to carry, when the live graph is exactly the authority
+    /// graph again.
+    ///
+    /// A sweep over a file it already finished can accept language-server
+    /// evidence and retract it in the same pass, when the file's call-site
+    /// ledger settles the site otherwise. Each write withdrew the live witness,
+    /// and with nothing to publish no commit's finalization rebinds it, so the
+    /// daemon that ran the sweep read every answer as unproven while a restart
+    /// over the same store read it as checked. Only exact semantic equality
+    /// rebinds, the rule every other rebinding follows: a live graph still
+    /// holding an accepted edge authority lacks stays unproven.
+    fn rebind_binding_witness_when_level(&self, authority: kin_db::GraphSnapshot) {
+        use kin_model::EntityStore as _;
+        if authority.verified_binding_history.is_none()
+            || !matches!(
+                self.graph.binding_history_observation(),
+                kin_model::BindingHistoryObservation::Unproven
+            )
+            || self.graph.entity_count() != authority.entities.len()
+            || self.graph.relation_count() != authority.relations.len()
+        {
+            return;
+        }
+        match kin_db::InMemoryGraph::from_snapshot_without_text_index(authority) {
+            Ok(admitted) => {
+                self.graph.restore_binding_history_from(&admitted);
+            }
+            Err(error) => {
+                debug!(%error, "the authority graph could not be rebuilt to rebind its witness");
+            }
+        }
     }
 
     /// Forget the settled guesses a publication carried. Ids settled while it
@@ -15390,7 +16045,7 @@ impl DaemonState {
             let mut file = std::fs::File::create(&tmp_path).map_err(DaemonError::Io)?;
             file.write_all(generation.to_string().as_bytes())
                 .map_err(DaemonError::Io)?;
-            file.sync_all().map_err(DaemonError::Io)?;
+            kin_blobs::durable::sync_all(&file).map_err(DaemonError::Io)?;
         }
         if let Err(error) = std::fs::rename(&tmp_path, &gen_path) {
             let _ = std::fs::remove_file(&tmp_path);
@@ -16103,10 +16758,40 @@ mod tests {
     /// A fixture that hardcoded one runtime would pass on the platform that
     /// resolves it and fail on the other, so the healthy fixture asks the same
     /// policy the fence asks rather than writing the answer down twice.
-    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hosted_vectors_with_an_explicit_none_slot_keep_graph_serving_without_a_producer() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "hosted-none-slot-control";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("graph_only_control", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+        let policy =
+            hosted_vector_producer_policy_for("off", "none", "cpu", "pure-rust", false, false);
+        assert!(policy.as_ref().unwrap_err().contains("slot is none"));
+        let (sidecar, persistence) = DaemonState::load_hosted_vector_artifact(
+            &layout, &backend, repo_id, &graph, None, policy,
+        );
+        assert!(matches!(
+            persistence,
+            HostedVectorPersistenceState::NotSelected
+        ));
+        assert!(sidecar.discarded.is_none());
+        assert!(graph.get_entity(&entity.id).unwrap().is_some());
+        assert_eq!(graph.embedding_status().indexed, 0);
+        assert!(!layout.kindb_vector_index_path().exists());
+        assert_eq!(backend.vector_load_count(), 0);
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+        assert_eq!(backend.vector_save_count(), 0);
+    }
+
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn admitted_hosted_producers() -> kin_db::EmbeddingProducerSet {
-        hosted_vector_producer_policy()
-            .expect("a test process must resolve a single numerical producer")
+        hosted_vector_producer_policy_for("off", "built-in", "cpu", "pure-rust", false, false)
+            .expect("the fixture explicitly selects one CPU producer")
             .allowed
     }
 
@@ -16115,7 +16800,7 @@ mod tests {
     /// Panics rather than returning if every producer is admitted, because a
     /// refusal test against a fence that refuses nothing would pass while
     /// proving nothing.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn a_disallowed_hosted_producer() -> kin_db::EmbeddingProducer {
         let allowed = admitted_hosted_producers();
         [
@@ -16129,7 +16814,7 @@ mod tests {
         .expect("the hosted fence admits every producer, so nothing can be refused")
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn install_checkpoint_vector(
         state: &DaemonState,
         entity_id: EntityId,
@@ -16355,8 +17040,13 @@ mod tests {
         let repo_id = "durable-hosted-vector-worker";
         backend.publish_graph(repo_id, &kin_db::InMemoryGraph::new(), 0);
 
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend),
+            repo_id,
+            None,
+        )
+        .unwrap();
 
         assert!(
             state.can_persist_embed_progress_locally(),
@@ -16382,7 +17072,7 @@ mod tests {
     /// adjacency is what `materialize_hosted_repository_snapshot` rebuilds and
     /// what the retrieval authority folds, and a store with no edges has an
     /// empty one either way and can tell the two apart from nothing.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn publish_hosted_repository_v6_store(
         storage: &std::path::Path,
         label: &str,
@@ -16458,6 +17148,7 @@ mod tests {
                 merge_transaction_delta: None,
                 sealed_observation: None,
                 collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
             }
         };
         transaction
@@ -16472,7 +17163,7 @@ mod tests {
     /// Load one vector for `entity` into `state`'s graph and leave nothing on
     /// disk, so the next flush has an index to publish and no sidecar to
     /// shortcut through. The shape every hosted persistence test here uses.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn load_one_vector_into(state: &DaemonState, layout: &KinLayout, entity: &Entity) {
         let descriptor = kin_db::vector::IndexDescriptor {
             model_id: Some("fixture-embedder-v1".to_string()),
@@ -16510,7 +17201,7 @@ mod tests {
     /// `InMemoryGraph::from_snapshot` had rebuilt. The two could never be equal
     /// on a store with an edge, so this save was refused for the life of every
     /// hosted process and no store on the fleet ever held a vector.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn a_hosted_repository_v6_store_with_an_edge_can_persist_its_vector_artifact() {
         let working = tempfile::tempdir().unwrap();
@@ -16520,7 +17211,7 @@ mod tests {
             publish_hosted_repository_v6_store(storage.path(), "hosted-v6-vector-save");
         let backend = DurableVectorTestBackend::new(storage.path());
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             &repo_id,
@@ -16556,7 +17247,7 @@ mod tests {
     /// A legacy hosted store may carry its top-level graph without persisted
     /// derived adjacency. The graph loader repairs that shape, so the binding
     /// must normalize it before hashing or an edge makes every flush refuse.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn a_legacy_hosted_store_with_missing_adjacency_can_persist_its_vector_artifact() {
         let working = tempfile::tempdir().unwrap();
@@ -16582,7 +17273,7 @@ mod tests {
         assert!(snapshot.repository_authority.is_none());
         backend.publish_snapshot(repo_id, &snapshot, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -16607,7 +17298,7 @@ mod tests {
     /// worker's drain gate, let go of the vectors the refusal stranded, and put
     /// nothing on the backend. Then retire all of it when the binding is
     /// replaced.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn a_refused_hosted_binding_stands_the_worker_down_and_releases_its_stranded_vectors() {
         let working = tempfile::tempdir().unwrap();
@@ -16620,7 +17311,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -16695,7 +17386,7 @@ mod tests {
     /// first refusal released its index and overlap loaded another batch. The
     /// repeated refusal must release that later batch too, even though it does
     /// not repeat the warning.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn a_repeated_hosted_binding_refusal_releases_late_vectors() {
         let working = tempfile::tempdir().unwrap();
@@ -16708,7 +17399,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -16783,7 +17474,7 @@ mod tests {
     /// background worker reaches its next checkpoint. That checkpoint must
     /// release the late batch and park the drain instead of leaving the batch
     /// resident for the process lifetime.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[tokio::test]
     async fn a_hosted_worker_refusal_releases_a_late_vector_at_its_checkpoint() {
         let working = tempfile::tempdir().unwrap();
@@ -16796,7 +17487,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -16844,7 +17535,7 @@ mod tests {
     /// The real worker task must survive a refused binding, observe a rebind,
     /// and continue waking. Explicit pause keeps this lifecycle test independent
     /// of a model or accelerator while the refusal checkpoint still executes.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[tokio::test]
     async fn a_hosted_worker_survives_refusal_and_observes_rebind() {
         let working = tempfile::tempdir().unwrap();
@@ -16857,7 +17548,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
         let state = Arc::new(
-            DaemonState::open_with_backend(
+            DaemonState::open_with_backend_for_vector_test(
                 layout.clone(),
                 Box::new(backend.clone()),
                 repo_id,
@@ -16936,7 +17627,7 @@ mod tests {
     /// The release is not unconditional. A vector index is all-or-nothing, so
     /// dropping one that is already durable would cost this daemon its vector
     /// search and reclaim nothing.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn releasing_stranded_vectors_leaves_an_index_the_artifact_already_holds() {
         let working = tempfile::tempdir().unwrap();
@@ -16949,7 +17640,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -16983,8 +17674,13 @@ mod tests {
         let backend = DurableVectorTestBackend::new(storage.path());
         let repo_id = "durable-hosted-vector-graph-successor";
         let first_cursor = backend.publish_graph(repo_id, &kin_db::InMemoryGraph::new(), 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend),
+            repo_id,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             state
                 .hosted_vector_persistence_health()
@@ -17006,7 +17702,7 @@ mod tests {
         assert!(state.can_persist_embed_progress_locally());
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_checkpoint_reopens_from_the_backend_artifact_after_restart() {
         let working = tempfile::tempdir().unwrap();
@@ -17019,7 +17715,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -17057,7 +17753,7 @@ mod tests {
         let restarted_working = tempfile::tempdir().unwrap();
         let restarted_layout = kin_core::init(restarted_working.path()).unwrap().layout;
 
-        let reopened = DaemonState::open_with_backend(
+        let reopened = DaemonState::open_with_backend_for_vector_test(
             restarted_layout,
             Box::new(backend.clone()),
             repo_id,
@@ -17084,7 +17780,7 @@ mod tests {
     /// The compatibility validator this replaced proves an artifact is
     /// internally coherent and then discards exactly this evidence, so under
     /// it this save committed.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_save_refuses_an_index_produced_by_a_disallowed_runtime() {
         let working = tempfile::tempdir().unwrap();
@@ -17097,7 +17793,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -17158,7 +17854,7 @@ mod tests {
 
     /// The same path with an admitted producer must COMMIT, or the refusal
     /// above is measuring the fixture rather than the fence.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_save_commits_an_index_produced_by_an_admitted_runtime() {
         let working = tempfile::tempdir().unwrap();
@@ -17171,7 +17867,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -17213,7 +17909,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_not_committed_reloads_observed_winner_before_retry() {
         let working = tempfile::tempdir().unwrap();
@@ -17225,9 +17921,13 @@ mod tests {
         let entity = test_entity("conflict_vector", "src/conflict.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
-                .unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::ConflictInstallWinner);
 
@@ -17265,7 +17965,7 @@ mod tests {
         assert!(state.deferred_vector_checkpoint().is_none());
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_not_committed_without_cursor_reloads_missing_before_retry() {
         let working = tempfile::tempdir().unwrap();
@@ -17277,9 +17977,13 @@ mod tests {
         let entity = test_entity("conflict_no_cursor", "src/conflict_none.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
-                .unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::ConflictWithoutCursor);
 
@@ -17303,7 +18007,7 @@ mod tests {
         assert!(state.deferred_vector_checkpoint().is_none());
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_lost_ack_stays_indeterminate_until_exact_reopen() {
         let working = tempfile::tempdir().unwrap();
@@ -17315,9 +18019,13 @@ mod tests {
         let entity = test_entity("lost_ack_vector", "src/lost_ack.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
-                .unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::IndeterminateInstalled);
 
@@ -17337,7 +18045,7 @@ mod tests {
 
         let reopened_working = tempfile::tempdir().unwrap();
         let reopened_layout = kin_core::init(reopened_working.path()).unwrap().layout;
-        let reopened = DaemonState::open_with_backend(
+        let reopened = DaemonState::open_with_backend_for_vector_test(
             reopened_layout,
             Box::new(backend.clone()),
             repo_id,
@@ -17353,7 +18061,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_indeterminate_without_install_reopens_as_missing() {
         let working = tempfile::tempdir().unwrap();
@@ -17365,9 +18073,13 @@ mod tests {
         let entity = test_entity("indeterminate_missing", "src/indeterminate_missing.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
-                .unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::IndeterminateNotInstalled);
 
@@ -17380,9 +18092,13 @@ mod tests {
 
         let reopened_working = tempfile::tempdir().unwrap();
         let reopened_layout = kin_core::init(reopened_working.path()).unwrap().layout;
-        let reopened =
-            DaemonState::open_with_backend(reopened_layout, Box::new(backend), repo_id, None)
-                .unwrap();
+        let reopened = DaemonState::open_with_backend_for_vector_test(
+            reopened_layout,
+            Box::new(backend),
+            repo_id,
+            None,
+        )
+        .unwrap();
         assert!(reopened.can_persist_embed_progress_locally());
         assert_eq!(
             reopened
@@ -17392,7 +18108,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_committed_digest_mismatch_is_not_acknowledged() {
         let working = tempfile::tempdir().unwrap();
@@ -17404,9 +18120,13 @@ mod tests {
         let entity = test_entity("wrong_ack_digest", "src/wrong_ack.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
-                .unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::CommittedWrongDigest);
 
@@ -17419,7 +18139,7 @@ mod tests {
         assert!(backend.current_vector_artifact(repo_id).is_some());
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_inner_indexed_count_mismatch_discards_and_keeps_repair_cursor() {
         let working = tempfile::tempdir().unwrap();
@@ -17431,9 +18151,13 @@ mod tests {
         let entity = test_entity("inner_count_vector", "src/inner_count.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state =
-            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
-                .unwrap();
+        let state = DaemonState::open_with_backend_for_vector_test(
+            layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
         install_checkpoint_vector(&state, entity.id);
         state.flush_embed_progress().unwrap();
         drop(state);
@@ -17441,9 +18165,13 @@ mod tests {
 
         let reopened_working = tempfile::tempdir().unwrap();
         let reopened_layout = kin_core::init(reopened_working.path()).unwrap().layout;
-        let reopened =
-            DaemonState::open_with_backend(reopened_layout, Box::new(backend), repo_id, None)
-                .unwrap();
+        let reopened = DaemonState::open_with_backend_for_vector_test(
+            reopened_layout,
+            Box::new(backend),
+            repo_id,
+            None,
+        )
+        .unwrap();
         assert_eq!(reopened.graph.embedding_status().indexed, 0);
         assert!(
             reopened
@@ -17460,7 +18188,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn hosted_vector_checkpoint_refuses_a_graph_generation_that_moved_remotely() {
         let working = tempfile::tempdir().unwrap();
@@ -17510,7 +18238,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn corrupt_hosted_vector_artifact_keeps_graph_serving_and_repairs_with_trusted_cursor() {
         let working = tempfile::tempdir().unwrap();
@@ -17523,7 +18251,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
 
-        let state = DaemonState::open_with_backend(
+        let state = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -17549,7 +18277,7 @@ mod tests {
 
         backend.corrupt_vector_loads(repo_id);
         DaemonState::clear_hosted_vector_projection(&layout).unwrap();
-        let reopened = DaemonState::open_with_backend(
+        let reopened = DaemonState::open_with_backend_for_vector_test(
             layout.clone(),
             Box::new(backend.clone()),
             repo_id,
@@ -17604,9 +18332,13 @@ mod tests {
 
         let repaired_working = tempfile::tempdir().unwrap();
         let repaired_layout = kin_core::init(repaired_working.path()).unwrap().layout;
-        let repaired =
-            DaemonState::open_with_backend(repaired_layout, Box::new(backend), repo_id, None)
-                .unwrap();
+        let repaired = DaemonState::open_with_backend_for_vector_test(
+            repaired_layout,
+            Box::new(backend),
+            repo_id,
+            None,
+        )
+        .unwrap();
         assert_eq!(repaired.graph.embedding_status().indexed, 1);
         assert_eq!(
             repaired
@@ -18199,7 +18931,7 @@ mod tests {
         assert_eq!(DaemonState::window_from_millis(0), None);
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn tree_with_path(path: &str) -> ResolvedTree {
         ResolvedTree::from_artifacts([ResolvedArtifact::new(
             ArtifactId::new(),
@@ -18215,7 +18947,7 @@ mod tests {
     /// embed is not dominated by authority reopens; a batch that changes either
     /// must still pay for a full reopen, because the retained answer is no
     /// longer about the state being checkpointed.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn vector_checkpoint_authority_match_holds_only_for_the_derived_pair() {
         let tree = tree_with_path("src/lib.rs");
@@ -18243,7 +18975,7 @@ mod tests {
     /// An empty tree is a real repository state (a workspace with no admitted
     /// artifacts), not a "nothing derived yet" sentinel, so it must be told
     /// apart from the un-derived state above.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn vector_checkpoint_authority_match_distinguishes_empty_tree_from_no_record() {
         let retained = VectorCheckpointAuthorityMatch::default();
@@ -18263,7 +18995,7 @@ mod tests {
     /// reopening at all. Reuse across unchanged batches is the entire mechanism,
     /// so a flush that quietly kept reopening would be indistinguishable from
     /// the unfixed path by any test of the type alone.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn flush_embed_progress_derives_the_authority_match_once_and_then_reuses_it() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -18310,7 +19042,7 @@ mod tests {
     /// authority, retains, and then serializes must all be the same tree, so a
     /// mutation landing inside that window has to be refused and has to leave
     /// nothing retained.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn flush_embed_progress_refuses_a_live_tree_that_moved_during_the_reopen() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -18385,7 +19117,7 @@ mod tests {
     /// refusal: the sidecar must be absent while the refusal stands, the
     /// refusal must be recorded with its cause, and the retry must land the
     /// vectors once the divergence closes, with the count intact on both sides.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn a_refused_vector_checkpoint_is_retried_and_its_vectors_survive() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -18946,6 +19678,9 @@ mod tests {
 
     #[test]
     fn coordination_event_log_repairs_partial_tail_and_marks_stream_ineligible() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().join(".kin"));
         let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
@@ -18966,7 +19701,7 @@ mod tests {
             .open(log.path())
             .unwrap();
         file.write_all(b"{\"schema\":\"partial").unwrap();
-        file.sync_data().unwrap();
+        kin_blobs::durable::sync_data(&file).unwrap();
         drop(file);
 
         let reopened = CoordinationEventLog::open(&layout, "test-repo").unwrap();
@@ -19038,7 +19773,7 @@ mod tests {
             .open(log.path())
             .unwrap();
         file.write_all(&existing).unwrap();
-        file.sync_data().unwrap();
+        kin_blobs::durable::sync_data(&file).unwrap();
         drop(file);
         drop(log);
 
@@ -19568,9 +20303,19 @@ mod tests {
         );
     }
 
+    /// One inferred member used to refuse its whole repository, and any
+    /// registered sibling then turned that refusal into a gap on every answer
+    /// read from the repository. The member now enters the local spine with
+    /// the rest of the graph, marked a candidate by the facts registered beside
+    /// the entries, and a cross-repo edge out of it carries the candidate
+    /// confidence the local graph gives it. A legacy member, recognized by its
+    /// note rather than a derivation record, is the same member.
     #[test]
     #[serial_test::serial]
-    fn derived_member_spine_publication_refuses_and_invalidates_prior_authority() {
+    fn a_repository_with_an_inferred_member_still_enters_the_spine() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use kin_model::{
             GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
         };
@@ -19600,12 +20345,9 @@ mod tests {
             let repo_dir = tempfile::tempdir().unwrap();
             let init = kin_core::init(repo_dir.path()).unwrap();
             let state = test_state(init.layout, repo_dir.path());
-            let repo = state.cached_repo_id.as_str();
+            let repo = state.cached_repo_id.clone();
             let normal = test_entity("normal", "normal.rs");
             state.graph.upsert_entity(&normal).unwrap();
-            assert!(state
-                .capture_spine_repo(repo, Arc::clone(&state.graph))
-                .is_ok());
             let mut candidate = typed.clone();
             if legacy {
                 candidate
@@ -19615,6 +20357,7 @@ mod tests {
                 candidate.doc_summary =
                     Some("Derived from a loop over `names`; no literal `get` declaration".into());
             }
+            assert!(kin_model::is_derived_member(&candidate));
             state.graph.upsert_entity(&candidate).unwrap();
             let relation = Relation {
                 id: RelationId::new(),
@@ -19631,50 +20374,76 @@ mod tests {
                 }],
             };
             state.graph.upsert_relation(&relation).unwrap();
-            let refusal = state
-                .capture_spine_repo(repo, Arc::clone(&state.graph))
-                .err()
-                .unwrap();
-            assert!(refusal.contains("spine_candidate_representation_gap"));
-            assert!(!refusal.contains("; "));
-            assert!(refusal.contains("Local Kin queries and generator edits remain available"));
-            // Reproduce an older publisher at the exact SAME graph root. This
-            // proves a matching watermark cannot bypass the new capture gate.
+
+            let capture = state
+                .capture_spine_repo(&repo, Arc::clone(&state.graph))
+                .expect("an inferred member no longer refuses its repository");
+            assert!(capture
+                .entries
+                .iter()
+                .any(|entry| entry.entity_id == candidate.id));
+            assert!(capture.facts.is_derived_member(&candidate.id));
+            assert!(!capture.facts.is_derived_member(&normal.id));
+            assert!(capture
+                .relations
+                .iter()
+                .any(|captured| captured.id == relation.id));
+
+            // A JavaScript sibling the member's call reaches, already
+            // registered and refreshed, as a startup pass would leave it.
             let spine = Arc::new(kin_spine::InMemorySpineBackend::new());
-            spine.register_repo(
-                repo,
-                DaemonState::entities_to_spine_entries(repo, &[candidate.clone(), normal]),
-                &hex::encode(state.graph.compute_root_hash()),
-            );
-            let foreign = test_entity("target", "target.rs");
-            spine.register_repo(
+            let mut foreign = test_entity("target", "target.js");
+            foreign.language = LanguageId::JavaScript;
+            let registry = vec![repo.clone(), "foreign".to_string()];
+            spine.register_repo_with_facts(
                 "foreign",
-                DaemonState::entities_to_spine_entries("foreign", &[foreign]),
+                DaemonState::entities_to_spine_entries("foreign", std::slice::from_ref(&foreign)),
+                kin_spine::RepoGraphFacts::from_entities(std::slice::from_ref(&foreign)),
                 "foreign-root",
             );
-            let registry = vec![repo.to_string(), "foreign".to_string()];
-            spine.refresh_cross_repo_edges("foreign", &[], &[], &registry);
-            spine.refresh_cross_repo_edges(repo, &[candidate.clone()], &[relation], &registry);
-            let before = spine.cross_repo_xref_response(repo, &candidate.id);
-            assert!(before.authority_complete_for(repo, &candidate.id));
-            assert!(!before.edges.is_empty());
-            assert!(before.edges.iter().all(|edge| edge.confidence >= 0.9));
+            spine.refresh_cross_repo_edges(
+                "foreign",
+                std::slice::from_ref(&foreign),
+                &[],
+                &registry,
+            );
             assert!(state.spine.set(spine.clone()).is_ok());
-            let mut publication = HostedPublicationGuard::local();
-            let error = state
-                .reregister_primary_at_current_root(spine.as_ref(), &mut publication)
-                .unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("spine_candidate_representation_gap"));
-            assert!(!spine.authority_complete());
-            let after = spine.cross_repo_xref_response(repo, &candidate.id);
-            assert!(!after.authority_complete_for(repo, &candidate.id));
-            assert!(state.ensure_spine().is_none());
-            assert!(state
-                .spine_unavailable_reason()
-                .contains("spine_candidate_representation_gap"));
-            assert!(state.graph.get_entity(&candidate.id).unwrap().is_some());
+            assert!(
+                state.ensure_spine().is_some(),
+                "the spine is ready over a graph that holds an inferred member: {}",
+                state.spine_unavailable_reason()
+            );
+            assert!(spine.authority_complete());
+            assert_eq!(
+                spine.root_hash(&repo).as_deref(),
+                Some(hex::encode(state.graph.compute_root_hash()).as_str())
+            );
+            let member = spine.cross_repo_xref_response(&repo, &candidate.id);
+            assert!(member.authority_complete_for(&repo, &candidate.id));
+            assert_eq!(member.edges.len(), 1, "{member:?}");
+            let edge = &member.edges[0];
+            assert_eq!(
+                (edge.dst_repo.as_str(), edge.dst_entity),
+                ("foreign", foreign.id)
+            );
+            assert_eq!(edge.confidence, kin_spine::DERIVED_MEMBER_EDGE_CONFIDENCE);
+            assert_eq!(
+                kin_index::RelationResolution::from_confidence(edge.confidence),
+                kin_index::RelationResolution::NameOnly,
+                "the spine edge reads as the candidate the local graph reads"
+            );
+            assert_eq!(
+                kin_spine::DERIVED_MEMBER_EDGE_CONFIDENCE,
+                kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE
+            );
+            let ordinary = spine.cross_repo_xref_response(&repo, &normal.id);
+            assert!(ordinary.authority_complete_for(&repo, &normal.id));
+
+            // A read at the same root reuses the registration rather than
+            // capturing the whole graph again, which an inferred member used
+            // to force on every read.
+            assert!(state.primary_spine_registration_is_current(spine.as_ref()));
+
             let local =
                 kin_index::relation_read::relations_for_read(state.graph.as_ref(), &candidate.id)
                     .unwrap();
@@ -19682,6 +20451,72 @@ mod tests {
                 .iter()
                 .all(|edge| !kin_index::RelationResolution::of(edge).is_proven()));
         }
+    }
+
+    /// A durable publication has no field that marks a candidate, so a hosted
+    /// capture withholds the inferred member and the edges sourced at it and
+    /// keeps the rest of the graph, instead of refusing the repository.
+    #[test]
+    #[serial_test::serial]
+    fn a_hosted_capture_withholds_only_the_inferred_member() {
+        use kin_db::LocalFileBackend;
+        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+        let storage = tempfile::tempdir().unwrap();
+        let v2_root = storage.path().join("v2");
+        std::fs::create_dir(&v2_root).unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let allowed: HashSet<String> = ["kin".to_string()].into_iter().collect();
+        let state = DaemonState::open_with_backend(
+            init.layout,
+            Box::new(LocalFileBackend::new(&v2_root)),
+            "kin",
+            Some(allowed),
+        )
+        .unwrap();
+        let normal = test_entity("normal", "src/normal.rs");
+        let mut member = test_entity("member", "src/generated.rs");
+        member.metadata.extra.insert(
+            kin_model::derivation::ENTITY_DERIVATION_KEY.to_string(),
+            serde_json::json!({}),
+        );
+        state
+            .graph
+            .batch_upsert_entities(&[normal.clone(), member.clone()])
+            .unwrap();
+        let call = |src: kin_model::EntityId| Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(kin_model::EntityId::new()),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some("kin_db".into()),
+            evidence: Vec::new(),
+        };
+        let (from_normal, from_member) = (call(normal.id), call(member.id));
+        state.graph.upsert_relation(&from_normal).unwrap();
+        state.graph.upsert_relation(&from_member).unwrap();
+
+        let capture = state
+            .capture_spine_repo("kin", Arc::clone(&state.graph))
+            .expect("a hosted capture never refuses a repository over one member");
+        let entries = capture
+            .entries
+            .iter()
+            .map(|entry| entry.entity_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(entries, HashSet::from([normal.id]));
+        let relations = capture
+            .relations
+            .iter()
+            .map(|relation| relation.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(relations, HashSet::from([from_normal.id]));
+        // The member stays a local entity, so a call to it is never read as
+        // an unresolved cross-repo import.
+        assert!(capture.entities.iter().any(|entity| entity.id == member.id));
     }
 
     #[test]
@@ -19750,6 +20585,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_initialization_retries_after_busy_primary_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -19792,6 +20630,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn concurrent_spine_callers_share_one_truthful_initialization() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::sync::{mpsc, Condvar};
 
         let registry_dir = tempfile::tempdir().unwrap();
@@ -19862,6 +20703,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_initialization_revalidates_at_the_publication_edge() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -19934,6 +20778,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_registration_follows_graph_authority_after_a_mutation() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -20005,6 +20852,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cross_repo_authority_recovers_after_a_mutation_that_leaves_the_root_in_place() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -20059,9 +20909,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_mutation_that_leaves_the_root_in_place_leaves_a_sibling_complete() {
-        let (sibling_dir, sibling_id) = committed_spine_sibling("remote_call");
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        // Store discovery and registry reads share one context from init onward.
+        let (sibling_dir, sibling_id) = committed_spine_sibling("remote_call");
         kin_core::registry::KinRegistry {
             repos: vec![kin_core::registry::RegisteredRepo {
                 id: sibling_id.clone(),
@@ -20070,12 +20926,11 @@ mod tests {
                 last_commit: String::new(),
                 dependencies: vec![],
                 dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
             }],
         }
         .save_to(&registry_path)
         .unwrap();
-        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-            .without("KIN_DISABLE_SPINE");
 
         let primary_dir = tempfile::tempdir().unwrap();
         let primary_init = kin_core::init(primary_dir.path()).unwrap();
@@ -20123,6 +20978,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_mutation_that_moves_the_root_brings_a_sibling_current() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        // Store discovery and registry reads share one context from init onward.
         let primary_dir = tempfile::tempdir().unwrap();
         let primary_init = kin_core::init(primary_dir.path()).unwrap();
         let primary_repo_id = primary_init.repository_id.as_str().to_string();
@@ -20130,8 +20993,6 @@ mod tests {
             &primary_repo_id,
             &["shared_target", "added_by_the_mutation"],
         );
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry {
             repos: vec![kin_core::registry::RegisteredRepo {
                 id: sibling_id.clone(),
@@ -20140,12 +21001,11 @@ mod tests {
                 last_commit: String::new(),
                 dependencies: vec![],
                 dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
             }],
         }
         .save_to(&registry_path)
         .unwrap();
-        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-            .without("KIN_DISABLE_SPINE");
 
         let state = test_state(primary_init.layout, primary_dir.path());
         assert_eq!(state.cached_repo_id, primary_repo_id);
@@ -20335,6 +21195,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_init_materializes_cross_repo_edges() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use kin_db::InMemoryGraph;
         use kin_model::{
             GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
@@ -20345,6 +21208,11 @@ mod tests {
         // cross-repo reference by matching the imported-symbol evidence on the
         // primary's relation against an indexed entity name, so the sibling
         // entity is named with the real symbol the reference imports.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        // Store discovery and registry reads share one context from init onward.
         let external_id = kin_model::EntityId::new();
         let imported_symbol = "remote_call";
 
@@ -20407,8 +21275,6 @@ mod tests {
 
         // Pin the sibling through startup registry configuration before the
         // primary daemon state becomes externally visible.
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry {
             repos: vec![kin_core::registry::RegisteredRepo {
                 id: sibling_id.clone(),
@@ -20417,12 +21283,11 @@ mod tests {
                 last_commit: String::new(),
                 dependencies: vec![],
                 dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
             }],
         }
         .save_to(&registry_path)
         .unwrap();
-        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-            .without("KIN_DISABLE_SPINE");
 
         // The primary repo: a caller entity plus an unresolved cross-repo call
         // tagged with the sibling repo as its import source.
@@ -20560,15 +21425,16 @@ mod tests {
     /// what that precondition is for.
     #[cfg(test)]
     fn registered_sibling_fixture() -> SiblingFixture {
-        let sibling_parent = tempfile::tempdir().unwrap();
-        let sibling_root = sibling_parent.path().join("sibling-checkout");
-        std::fs::create_dir_all(&sibling_root).unwrap();
-        kin_core::init(&sibling_root).unwrap();
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         let spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
             .without("KIN_DISABLE_SPINE");
-        kin_migrate::update_registry(&sibling_root, 1).unwrap();
+        // Store discovery and registry reads share one context from init onward.
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        kin_core::init(&sibling_root).unwrap();
+        kin_migrate::update_registry(&sibling_root, 1, None).unwrap();
         SiblingFixture {
             _sibling_parent: sibling_parent,
             _registry_dir: registry_dir,
@@ -20580,6 +21446,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn startup_pin_failures_emit_bounded_detail_and_complete_counts() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let primary_dir = tempfile::tempdir().unwrap();
         let primary_init = kin_core::init(primary_dir.path()).unwrap();
         let registry_dir = tempfile::tempdir().unwrap();
@@ -20597,6 +21466,7 @@ mod tests {
                 last_commit: String::new(),
                 dependencies: vec![],
                 dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
             });
         }
         kin_core::registry::KinRegistry { repos }
@@ -20654,6 +21524,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_clean_sibling_pin_emits_no_failure_diagnostics() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let _fixture = registered_sibling_fixture();
         let primary_dir = tempfile::tempdir().unwrap();
         let primary_init = kin_core::init(primary_dir.path()).unwrap();
@@ -20675,10 +21548,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn disabling_the_spine_skips_the_registry_pin_pass_at_construction() {
-        let primary_dir = tempfile::tempdir().unwrap();
-        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
+        let mut spine_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+                .with("KIN_DISABLE_SPINE", "1");
+        // Store discovery and registry reads share one context from init onward.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
         let stale_root = registry_dir.path().join("stale-sibling");
         std::fs::create_dir_all(stale_root.join(".kin")).unwrap();
         std::fs::write(stale_root.join(".kin/VERSION"), b"1").unwrap();
@@ -20690,13 +21570,11 @@ mod tests {
                 last_commit: String::new(),
                 dependencies: vec![],
                 dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
             }],
         }
         .save_to(&registry_path)
         .unwrap();
-        let mut spine_env =
-            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-                .with("KIN_DISABLE_SPINE", "1");
 
         let (disabled, disabled_events) =
             capture_pin_events(|| test_state(primary_init.layout.clone(), primary_dir.path()));
@@ -20846,6 +21724,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_capture_stopped_at_its_bound_is_bounded_rather_than_incomplete() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         // Held, not dropped: the fixture owns the registry guard, and dropping it
         // early would unset KIN_REGISTRY_PATH before the daemon reads it.
         let _fixture = registered_sibling_fixture();
@@ -20904,6 +21785,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_sibling_that_fails_to_load_is_incomplete_and_never_bounded() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let fixture = registered_sibling_fixture();
 
         let primary_dir = tempfile::tempdir().unwrap();
@@ -20924,7 +21808,12 @@ mod tests {
         // Break the sibling AFTER it pinned. Pinning reads the manifest at
         // startup; loading reads the graph later, and only the second happens
         // inside the capture loop.
-        std::fs::remove_dir_all(fixture.sibling_root.join(".kin")).unwrap();
+        std::fs::remove_dir_all(
+            kin_core::layout::locate_store(&fixture.sibling_root)
+                .expect("registered sibling retains its store until this fault")
+                .root(),
+        )
+        .unwrap();
 
         let _ = state.ensure_spine();
         let report = state
@@ -20948,11 +21837,19 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn spine_pins_the_sibling_that_kin_init_actually_registered() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use kin_db::InMemoryGraph;
         use kin_model::{
             GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
         };
 
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        // Store discovery and registry reads share one context from init onward.
         let external_id = kin_model::EntityId::new();
         let imported_symbol = "remote_call";
 
@@ -21013,11 +21910,7 @@ mod tests {
         // Register through the production writer. `kin init` calls exactly this
         // (kin-cli `commands/init.rs`), so whatever identity the registry ends up
         // carrying is the identity a real install carries.
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-            .without("KIN_DISABLE_SPINE");
-        kin_migrate::update_registry(&sibling_root, 1).unwrap();
+        kin_migrate::update_registry(&sibling_root, 1, None).unwrap();
 
         // The sibling id the spine will key on is whatever the production writer
         // just recorded. Reading it back rather than restating it is what keeps
@@ -21107,14 +22000,14 @@ mod tests {
         );
     }
 
-    /// The one case pinning still refuses: two registry rows resolving to one
-    /// repository identity.
+    /// Two registry rows resolving to one repository identity are two
+    /// locations of one repository, a copied or reused store being the usual
+    /// cause.
     ///
-    /// Two paths holding the same repository, a copied checkout being the usual
-    /// cause, would register twice under one spine key and let the second
-    /// overwrite the first's graph authority. Refusing the later row and marking
-    /// the authority set incomplete is the conservative answer, and it is the
-    /// only refusal left in a pass that used to refuse everything.
+    /// Registering both would put two authorities under one spine key and let
+    /// the second overwrite the first's graph authority, so exactly one is
+    /// pinned: the earliest row. The repository is represented, so the set is
+    /// complete and no cross-repo edge is invalidated for the whole spine.
     ///
     /// Exercised against `pin_registered_local_repository_authorities` directly
     /// rather than through the spine, because both halves of what it decides,
@@ -21122,16 +22015,20 @@ mod tests {
     /// and nothing downstream reports the second one on its own.
     #[test]
     #[serial_test::serial]
-    fn two_registry_rows_for_one_repository_pin_once_and_report_incomplete() {
+    fn two_registry_rows_for_one_repository_pin_once_and_report_complete() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        // Store discovery and registry reads share one context from init onward.
         let sibling_parent = tempfile::tempdir().unwrap();
         let sibling_root = sibling_parent.path().join("sibling-checkout");
         std::fs::create_dir_all(&sibling_root).unwrap();
         kin_core::init(&sibling_root).unwrap();
 
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        let _registry_env =
-            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
         // One repository, two rows. Distinct ids on purpose: `upsert` dedupes on
         // id, so this is the shape a registry actually reaches when the same
         // repository is registered from two paths.
@@ -21144,6 +22041,7 @@ mod tests {
                     last_commit: String::new(),
                     dependencies: vec![],
                     dependencies_recorded_by: None,
+                    dependencies_manifest_recorded_at: None,
                 },
                 kin_core::registry::RegisteredRepo {
                     id: "sibling-checkout-copy".to_string(),
@@ -21152,6 +22050,7 @@ mod tests {
                     last_commit: String::new(),
                     dependencies: vec![],
                     dependencies_recorded_by: None,
+                    dependencies_manifest_recorded_at: None,
                 },
             ],
         }
@@ -21170,9 +22069,62 @@ mod tests {
             pinned.iter().map(|p| p.repo_id.clone()).collect::<Vec<_>>()
         );
         assert!(
-            incomplete,
-            "a refused duplicate row must leave the authority set reported incomplete"
+            !incomplete,
+            "another location of a pinned repository is not a refusal, and must not report the \
+             authority set incomplete"
         );
+    }
+
+    /// Another location of this daemon's own repository, such as a store
+    /// reused from this one, is never pinned as a sibling: it would replace
+    /// the primary under its own spine key.
+    #[test]
+    #[serial_test::serial]
+    fn another_location_of_the_primary_repository_is_never_pinned() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        // Store discovery and registry reads share one context from init onward.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let copy_parent = tempfile::tempdir().unwrap();
+        let copy_root = copy_parent.path().join("reused-copy");
+        std::fs::create_dir_all(&copy_root).unwrap();
+        let status = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(primary_init.layout.root())
+            .arg(copy_root.join(".kin"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        kin_core::layout::remove_working_tree_record(&copy_root.join(".kin")).unwrap();
+
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: primary_init.repository_id.as_str().to_string(),
+                path: copy_root.clone(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+                dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+
+        let (pinned, incomplete) =
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout);
+        assert!(
+            pinned.is_empty(),
+            "another location of the primary repository was pinned as a sibling: {:?}",
+            pinned.iter().map(|p| p.repo_id.clone()).collect::<Vec<_>>()
+        );
+        assert!(!incomplete);
     }
 
     /// The healthy control for the refusal above: two rows naming two genuinely
@@ -21184,6 +22136,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn two_registry_rows_for_two_repositories_both_pin_and_report_complete() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        // Store discovery and registry reads share one context from init onward.
         let parent = tempfile::tempdir().unwrap();
         let mut roots = Vec::new();
         for name in ["sibling-one", "sibling-two"] {
@@ -21193,10 +22153,6 @@ mod tests {
             roots.push(root);
         }
 
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        let _registry_env =
-            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
         kin_core::registry::KinRegistry {
             repos: roots
                 .iter()
@@ -21207,6 +22163,7 @@ mod tests {
                     last_commit: String::new(),
                     dependencies: vec![],
                     dependencies_recorded_by: None,
+                    dependencies_manifest_recorded_at: None,
                 })
                 .collect(),
         }
@@ -21233,6 +22190,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn ingest_repo_into_spine_serves_non_empty_xref_from_storage_only() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         // Hosted org-graph demo in miniature, against the PRODUCTION ingest
         // write path. A hosted pod runs one repo and owns no local sibling
         // checkouts and no `registry.toml`: the cross-repo index must be built
@@ -21455,6 +22415,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn hosted_spine_refresh_refuses_a_cross_pod_publication_race() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
 
         let registry_dir = tempfile::tempdir().unwrap();
@@ -21693,6 +22656,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_recovery_only_process_never_serves_reads_while_a_restart_does() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
 
         let registry_dir = tempfile::tempdir().unwrap();
@@ -22071,9 +23037,13 @@ mod tests {
         let linked = parent.path().join("linked-repo");
         std::fs::create_dir(&real).unwrap();
         std::os::unix::fs::symlink(&real, &linked).unwrap();
-        kin_core::init(&real).unwrap();
+        let initialized = kin_core::init(&real).unwrap();
 
-        let unresolved = KinLayout::new(linked.join(".kin"));
+        let unresolved = if initialized.layout.is_external() {
+            KinLayout::external(initialized.layout.root().to_path_buf(), linked.clone())
+        } else {
+            KinLayout::new(linked.join(".kin"))
+        };
         // CONTROL: the layout handed in really does carry the linked spelling.
         // Without this the assertion below would pass just as well on a build
         // that had resolved the root somewhere upstream of the daemon.
@@ -23344,7 +24314,7 @@ mod tests {
         assert!(!state.shutdown_flush_would_wipe_graph());
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn flush_embed_progress_persists_only_vector_sidecar_and_reports_pending() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -23494,7 +24464,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[test]
     fn storage_backend_embed_progress_fails_before_local_snapshot_write() {
         use kin_db::LocalFileBackend;
@@ -25418,6 +26388,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let receipt = authority
             .commit_repository_transaction(transaction)
@@ -25906,6 +26877,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let receipt = authority
             .commit_repository_transaction(transaction)
@@ -25927,6 +26899,197 @@ mod tests {
             .find(|workspace| workspace.workspace_id == binding.workspace_id())
             .map(|workspace| workspace.enrichment_marks.clone())
             .unwrap_or_default()
+    }
+
+    /// Matching inputs under the new formula cannot promote an older mark.
+    #[test]
+    fn owner_scoped_completion_never_promotes_an_older_whole_relation_mark() {
+        let path = "src/sessions.rs";
+        let caller = test_entity("send", path);
+        let entities = std::collections::HashMap::from([(caller.id, caller)]);
+        let body = Hash256::from_bytes([7; 32]);
+        let tree = ResolvedTree::default()
+            .apply(&[TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(path).unwrap(),
+                    TreeEntry::blob(body, false),
+                ),
+            }])
+            .unwrap();
+        let current = kin_model::EnrichmentMark {
+            path: path.into(),
+            body,
+            version: kin_model::ENRICHMENT_PROOF_MARK_VERSION,
+            relations: kin_model::enrichment_proof_inputs_by_file(
+                [path],
+                entities.values(),
+                [],
+                [],
+            )
+            .unwrap()[path],
+        };
+        let resume = |mark: &kin_model::EnrichmentMark| {
+            super::resumable_enrichment_files(
+                std::slice::from_ref(mark),
+                &tree,
+                &entities,
+                [],
+                [],
+                true,
+            )
+        };
+        assert!(resume(&current).contains_key(path));
+        for version in [9, kin_model::ENRICHMENT_PROOF_MARK_VERSION + 1] {
+            let old = kin_model::EnrichmentMark {
+                version,
+                ..current.clone()
+            };
+            assert!(
+                resume(&old).is_empty(),
+                "a matching new digest cannot promote proof version {version}"
+            );
+        }
+        let old = kin_model::EnrichmentMark {
+            version: 9,
+            relations: Hash256::from_bytes([9; 32]),
+            ..current
+        };
+        assert!(
+            resume(&old).is_empty(),
+            "the old whole-relation observation is reasked, never relabelled"
+        );
+    }
+
+    #[test]
+    fn peer_reference_checkpoint_keeps_own_mark_and_reopen_skip_until_own_proof_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(directory.path()).unwrap().layout;
+        let mut caller = test_entity("send", "src/sessions.rs");
+        let mut callee = test_entity("adapter_send", "src/adapters.rs");
+        // A modified shared edge must prove retention of its old local
+        // binding. Seal both declarations to the exact bodies staged below,
+        // as an index admission does; unstamped synthetic declarations cannot
+        // qualify that retention even when the old evidence remains intact.
+        for entity in [&mut caller, &mut callee] {
+            let body = format!("// {}\n", entity.file_origin.as_ref().unwrap().0);
+            entity.metadata.extra.insert(
+                "blob_hash".into(),
+                serde_json::json!(
+                    Hash256::from_bytes(kin_blobs::digest_bytes(body.as_bytes())).to_string()
+                ),
+            );
+        }
+        let mut own = lsp_relation_from(&caller, &callee, "src/sessions.rs");
+        own.kind = kin_model::RelationKind::References;
+        own.evidence[0].parser_rule = Some("lsp_definition".into());
+        let first_mark;
+        {
+            let state = test_state(layout.clone(), directory.path());
+            publish_authority_entities(&state, &[caller.clone(), callee.clone()]);
+            crate::daemon::install_lsp_relations(&state, std::slice::from_ref(&own));
+            let epoch = crate::daemon::current_marker_epoch(&state);
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state,
+                "src/sessions.rs",
+                tree_body(&state, "src/sessions.rs"),
+                epoch,
+            ));
+            state.save_snapshot().unwrap();
+            first_mark = authority_marks(&state).pop().unwrap();
+            assert_eq!(first_mark.version, kin_model::ENRICHMENT_PROOF_MARK_VERSION);
+
+            // The real installer unions a peer reference query into the same
+            // relation identity. Only the peer file is newly completed.
+            let mut peer = own.clone();
+            peer.evidence[0].parser_rule = Some(kin_model::LSP_REFERENCES_RULE.into());
+            crate::daemon::install_lsp_relations(&state, &[peer]);
+            assert_eq!(
+                state
+                    .graph
+                    .get_relation_by_id(&own.id)
+                    .unwrap()
+                    .evidence
+                    .len(),
+                2
+            );
+            assert!(state.lsp_pending_marks.lock().unwrap().is_empty());
+            assert!(crate::daemon::record_sweep_file_completed(
+                &state,
+                "src/adapters.rs",
+                tree_body(&state, "src/adapters.rs"),
+                epoch,
+            ));
+            state.save_snapshot().unwrap();
+            let marks = authority_marks(&state);
+            assert_eq!(marks.len(), 2);
+            assert_eq!(
+                marks.iter().find(|mark| mark.path == "src/sessions.rs"),
+                Some(&first_mark),
+                "the first completion is carried exactly, never refreshed to new inputs"
+            );
+        }
+        for sidecar in ["lsp-accepted-evidence.jsonl", "lsp-enriched-files.json"] {
+            let _ = std::fs::remove_file(layout.root().join(sidecar));
+        }
+        let reopened = test_state(layout.clone(), directory.path());
+        assert_eq!(
+            reopened
+                .lsp_resumed_files
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["src/adapters.rs", "src/sessions.rs"]
+        );
+        assert_eq!(
+            authority_marks(&reopened)
+                .iter()
+                .find(|mark| mark.path == "src/sessions.rs"),
+            Some(&first_mark)
+        );
+        reopened.save_snapshot().unwrap();
+        assert_eq!(
+            authority_marks(&reopened)
+                .iter()
+                .find(|mark| mark.path == "src/sessions.rs"),
+            Some(&first_mark),
+            "an unchanged reopen/flush keeps the exact completed proof"
+        );
+
+        let mut changed = reopened.graph.get_relation_by_id(&own.id).unwrap();
+        changed
+            .evidence
+            .iter_mut()
+            .find(|evidence| evidence.parser_rule.as_deref() == Some("lsp_definition"))
+            .unwrap()
+            .source_span
+            .as_mut()
+            .unwrap()
+            .end_byte += 1;
+        reopened.graph.upsert_relation(&changed).unwrap();
+        reopened.save_snapshot().unwrap();
+        assert_eq!(
+            authority_marks(&reopened)
+                .iter()
+                .map(|mark| mark.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/adapters.rs"],
+            "a changed own proof still retires exactly its file's completion"
+        );
+        drop(reopened);
+        let reopened = test_state(layout, directory.path());
+        assert_eq!(
+            reopened
+                .lsp_resumed_files
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["src/adapters.rs"]
+        );
     }
 
     /// The resume, end to end through repository authority. A sweep finishes
@@ -26103,6 +27266,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let receipt = authority
             .commit_repository_transaction(transaction)

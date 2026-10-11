@@ -868,7 +868,7 @@ pub(crate) fn shim_binding_for(
     let socket = socket
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| root.join(".kin").join("vfs.sock"));
+        .unwrap_or_else(|| kin_core::layout::store_root_for(root).join("vfs.sock"));
     let (listening, detail) = listening(&socket);
     ShimBinding::Bound {
         covers: path_within(at, root),
@@ -2778,7 +2778,7 @@ Options:
             unserved,
             ShimBinding::Bound {
                 root: home.to_path_buf(),
-                socket: Path::new("/home/dev/.kin/vfs.sock").to_path_buf(),
+                socket: kin_core::layout::store_root_for(home).join("vfs.sock"),
                 listening: Tri::No,
                 detail: "nothing answered (fixture)".to_string(),
                 covers: true,

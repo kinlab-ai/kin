@@ -34,6 +34,22 @@ use std::collections::BTreeMap;
 /// is consumed by the inference substrate under its own name. Membership here is
 /// about "does the value get baked into the worker at start" — not about naming.
 pub const BEHAVIOR_ENV_VARS: &[&str] = &[
+    "KIN_MODEL_EMBEDDINGS_PROVIDER",
+    "KIN_MODEL_EMBEDDINGS_MODEL",
+    "KIN_MODEL_EMBEDDINGS_BASE_URL",
+    "KIN_MODEL_EMBEDDINGS_API_KEY_ENV",
+    "KIN_MODEL_RERANKING_PROVIDER",
+    "KIN_MODEL_RERANKING_MODEL",
+    "KIN_MODEL_RERANKING_BASE_URL",
+    "KIN_MODEL_RERANKING_API_KEY_ENV",
+    "KIN_MODEL_ANSWER_COMPLETENESS_PROVIDER",
+    "KIN_MODEL_ANSWER_COMPLETENESS_MODEL",
+    "KIN_MODEL_ANSWER_COMPLETENESS_BASE_URL",
+    "KIN_MODEL_ANSWER_COMPLETENESS_API_KEY_ENV",
+    "KIN_MODEL_CALL_TARGET_PROVIDER",
+    "KIN_MODEL_CALL_TARGET_MODEL",
+    "KIN_MODEL_CALL_TARGET_BASE_URL",
+    "KIN_MODEL_CALL_TARGET_API_KEY_ENV",
     "KIN_RESOURCE_PROFILE",
     "KIN_EMBED_HYBRID",
     "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN",
@@ -56,6 +72,11 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_COCHANGE_MAX_FAN_OUT",
     "KIN_GCS_ENDPOINT",
     "KIN_LANGUAGE_TOOL_SEARCH",
+    // The retrieval arm a description query runs is read per query, but a
+    // running daemon answers with its own environment's arm, so a CLI that
+    // exported a different one must hear that it is not the arm that answered.
+    "KIN_LOCATE_ARM",
+    "KIN_LOCATE_SCORER",
     "EMBED_MAX_SEQ_LEN",
     "STORAGE_EMULATOR_HOST",
 ];

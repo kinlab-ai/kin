@@ -179,7 +179,7 @@ jobs:
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
             | timeout 60 "$KIN" mcp start >"$REPO_ROOT/mcp_out.txt" 2>"$REPO_ROOT/mcp_err.txt" || true
 
-          if ! grep -q "semantic_locate" "$REPO_ROOT/mcp_out.txt"; then
+          if ! grep -q '"name":"locate"' "$REPO_ROOT/mcp_out.txt"; then
             echo "::error::MCP tools/list did not return the expected Kin tool catalog"
             echo "---- mcp_out.txt ----"
             cat "$REPO_ROOT/mcp_out.txt" || true
@@ -189,5 +189,5 @@ jobs:
             cat "$REPO_ROOT/daemon.log" || true
             exit 1
           fi
-          echo "MCP server returned the Kin tool catalog (semantic_locate present)"
+          echo "MCP server returned the Kin tool catalog (locate present)"
           echo "::endgroup::"

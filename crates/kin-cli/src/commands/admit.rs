@@ -60,7 +60,39 @@ pub const ADMIT_SESSION_CLIENT: &str = "kin admit";
 #[serde(deny_unknown_fields)]
 pub struct AdmitRequest {
     pub operation_id: OperationId,
+    /// The actor the admission is recorded under, which is always
+    /// [`DAEMON_ADMISSION_ACTOR`]; see [`AdmitRequest::new`].
     pub actor: AuthorId,
+}
+
+/// The actor every exact-tree admission is recorded under.
+///
+/// An admission publishes no history node and advances no ref. It records a
+/// workspace transition the working copy already made, whether the daemon's
+/// watcher saw it or a command asked for the pass, so the daemon names itself
+/// rather than a person. The daemon reads it from here so the two cannot drift.
+pub const DAEMON_ADMISSION_ACTOR: &str = "kin-daemon-admission";
+
+impl AdmitRequest {
+    /// A request for one complete exact-tree admission.
+    ///
+    /// It names [`DAEMON_ADMISSION_ACTOR`], not the caller's commit author. A
+    /// person's identity is what a commit records, and requiring one here made
+    /// every read that admits first (`kin status`, `kin diff`, the review
+    /// guide and page) refuse to measure the working copy on a host with no
+    /// Git identity, over a field the admission never records.
+    pub fn new() -> Self {
+        Self {
+            operation_id: OperationId::new(),
+            actor: AuthorId::new(DAEMON_ADMISSION_ACTOR),
+        }
+    }
+}
+
+impl Default for AdmitRequest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// What one requested admission did, measured on both sides of the pass.
@@ -477,9 +509,6 @@ async fn wait_for_admission(
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("resolve current directory")?;
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
-    // Refuse before starting or holding a daemon session. An unresolved author
-    // cannot admit anything, and must not leave a liveness lease behind.
-    let actor = crate::commands::require_commit_author_for(&layout)?;
     let base_url = crate::daemon_client::resolve_daemon_url(&layout)
         .await?
         .ok_or_else(|| {
@@ -516,10 +545,7 @@ pub async fn run() -> Result<()> {
     // One operation identity for the whole wait, however many attempts it
     // takes: every attempt after the first joins the pass the first one started
     // rather than asking for another.
-    let request = AdmitRequest {
-        operation_id: OperationId::new(),
-        actor,
-    };
+    let request = AdmitRequest::new();
     let outcome = wait_for_admission(&client, &request).await;
 
     // Release the lease on every path. A leaked lease keeps the daemon awake

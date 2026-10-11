@@ -1,0 +1,191 @@
+# Language conformance fixture: C++. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "cpp"
+
+[sources]
+module = "ledger.cpp"
+helper = "helper.hpp"
+test = "ledger_test.cpp"
+forms = "forms.cpp"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "pass"
+expect = [
+  "Module shop",
+  "Function clamp",
+  "Function total",
+  "Class Account",
+  "Field Account::balance_",
+  "Method Account::deposit",
+  "Method Account::validate",
+  "helper.hpp: Function scale",
+]
+
+[module_name]
+status = "refused"
+reason = "The adapter mints no module entity."
+name = "ledger"
+
+[module_contains]
+status = "refused"
+reason = "The adapter mints no module entity."
+top_level = ["clamp", "total", "Account"]
+
+[declaration_extent]
+status = "fail"
+gaps = ["total"]
+starts = { total = "/** Sum the values" }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "pass"
+enclosing = "total"
+name = "twice"
+
+[call_same_file]
+status = "pass"
+from = "total"
+to = "clamp"
+
+[call_receiver]
+status = "pass"
+from = "Account::deposit"
+to = "Account::validate"
+
+[imports]
+status = "pass"
+module_path = "helper.hpp"
+
+[tests_detected]
+status = "pass"
+name = "LedgerTest::Total"
+runner = "gtest"
+
+[refuse_unparseable]
+status = "pass"
+find = "static int clamp(int value) {"
+replace = "static int clamp(int value {"
+line = 8
+
+[placement_three_forms]
+status = "pass"
+entity = "Account::validate"
+
+[create_remove_spacing]
+status = "partial"
+gaps = ["remove_documented"]
+anchor = "clamp"
+code = '''
+static int clampTwice(int value) {
+    return clamp(clamp(value));
+}'''
+entity = "clampTwice"
+documented = "total"
+doc = "/** Sum the values"
+
+[form_generator]
+status = "n/a"
+reason = "C++ has no generator functions; std::generator is a library type over coroutines."
+
+[form_async]
+status = "n/a"
+reason = "C++ has no async functions."
+
+[form_bound_lambda]
+status = "fail"
+gaps = ["Function|Constant|StaticVar square", "square"]
+expect = ["Function|Constant|StaticVar square"]
+
+[form_default_export]
+status = "n/a"
+reason = "C++ has no default export."
+
+[form_overload]
+status = "pass"
+expect = ["Function parse"]
+
+[form_nested_type]
+status = "pass"
+expect = ["Class Point::Inner", "Method Point::Inner::ping"]
+
+[form_decorated]
+status = "pass"
+expect = ["Method Point::norm"]
+
+[form_field]
+status = "pass"
+expect = ["Field Point::x", "Field Point::y"]
+
+[body_edit_keeps_entities]
+status = "pass"
+entity = "total"
+find = "    int result = 0;\n"
+replace = "    int result = 0;\n    Stats stats;\n    stats.count = values.size();\n"
+
+[route_source]
+status = "partial"
+gaps = ["starts"]
+entity = "total"
+starts = "/** Sum the values"
+
+[route_locate]
+status = "pass"
+query = "total"
+entity = "total"
+
+[route_refs]
+status = "pass"
+entity = "clamp"
+caller = "total"
+
+[route_impact]
+status = "pass"
+in = "helper"
+entity = "scale"
+affected = "total"
+
+[route_context]
+status = "pass"
+entity = "Account"
+mentions = ["Account::deposit", "Account::validate"]
+
+[route_update]
+status = "pass"
+entity = "clamp"
+find = "0"
+replace = "1"
+
+[route_patch]
+status = "pass"
+entity = "Account::validate"
+old_text = "> 0"
+new_text = ">= 0"
+
+[route_body_edit]
+status = "pass"
+entity = "total"
+find = "    int result = 0;\n"
+replace = "    int result = 0;\n    Stats stats;\n    stats.count = values.size();\n"
+
+[route_create_sibling]
+status = "refused"
+reason = "Nothing was written: entity lifecycle currently supports top-level leaf functions in TypeScript, JavaScript, Python, Go and Rust."
+anchor = "clamp"
+code = "static int clampTwice(int value) {\n    return clamp(clamp(value));\n}"
+entity = "clampTwice"
+
+[route_remove]
+status = "refused"
+reason = "Nothing was written: entity lifecycle currently supports top-level leaf functions in TypeScript, JavaScript, Python, Go and Rust."
+entity = "clamp"
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

@@ -6,7 +6,7 @@ import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PLATFORMS, digest, installerHostScope, validateManifest, validateArchive, verifyInstalledComponent, serveArchive, runCommand } from './prove-candidate-install.mjs';
+import { PLATFORMS, validateDefaultArchiveFeatures, digest, installerHostScope, validateManifest, validateArchive, verifyInstalledComponent, serveArchive, runCommand } from './prove-candidate-install.mjs';
 import { matrixRows, buildJobBody } from './check-rc-build-drift.mjs';
 
 function fixture(platform = 'win32', arch = 'x64') {
@@ -136,4 +136,22 @@ test('native install job covers every built archive and uses the real proof driv
   assert.ok(capability.includes('          node scripts/prove-candidate-install.mjs'));
   assert.ok(capability.includes("if: ${{ always() && matrix.covered }}"));
   assert.ok(capability.includes('name: candidate-install-${{ matrix.artifact }}'));
+});
+
+test('default archive feature proof rejects every missing or enabled engine dimension', () => {
+  const meta = { feature_flags: ['vector', 'external-embeddings'], embeddings: {
+    vector_enabled: true, embeddings_enabled: true, local_inference_enabled: false,
+    external_embeddings_enabled: true, metal_enabled: false, provider: 'none' } };
+  validateDefaultArchiveFeatures(meta);
+  for (const [key, value] of [['vector_enabled', false], ['embeddings_enabled', false],
+    ['local_inference_enabled', true], ['external_embeddings_enabled', false],
+    ['metal_enabled', true], ['provider', 'external']]) {
+    const changed = structuredClone(meta); changed.embeddings[key] = value;
+    assert.throws(() => validateDefaultArchiveFeatures(changed), key);
+    delete changed.embeddings[key];
+    assert.throws(() => validateDefaultArchiveFeatures(changed), `${key} missing`);
+  }
+  for (const flag of ['embeddings', 'metal']) {
+    assert.throws(() => validateDefaultArchiveFeatures({ ...meta, feature_flags: [...meta.feature_flags, flag] }));
+  }
 });

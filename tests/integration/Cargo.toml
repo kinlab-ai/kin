@@ -17,6 +17,7 @@ kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-core = { workspace = true }
 kin-parser = { workspace = true }
+kin-io = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
 kin-reconcile = { workspace = true }

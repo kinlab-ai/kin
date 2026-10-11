@@ -429,12 +429,10 @@ impl DraftStore {
             if read_regular(&final_path).is_ok_and(|published| published == bytes) {
                 // Exact published bytes prove this temporary is a duplicate,
                 // not an unacknowledged or unknown attempt to publish.
-                regular_options()
-                    .read(true)
-                    .open(&final_path)
-                    .map_err(io)?
-                    .sync_all()
-                    .map_err(io)?;
+                kin_blobs::durable::sync_all(
+                    &regular_options().read(true).open(&final_path).map_err(io)?,
+                )
+                .map_err(io)?;
                 sync_dir(&self.root).map_err(io)?;
                 std::fs::remove_file(path).map_err(io)?;
                 sync_dir(&self.root).map_err(io)?;
@@ -600,12 +598,13 @@ impl DraftStore {
         if record.draft.request_hash != request_hash {
             return Err(refuse("draft_revision_conflict", "the draft revision is already bound to different work; read it before resolving your text"));
         }
-        regular_options()
-            .read(true)
-            .open(self.record_path(id, revision))
-            .map_err(io)?
-            .sync_all()
-            .map_err(io)?;
+        kin_blobs::durable::sync_all(
+            &regular_options()
+                .read(true)
+                .open(self.record_path(id, revision))
+                .map_err(io)?,
+        )
+        .map_err(io)?;
         sync_dir(&self.root).map_err(io)?;
         Ok(DraftSaved {
             schema: "kin.entity.draft.saved.v1",
@@ -652,7 +651,7 @@ impl DraftStore {
             self.phase(DraftWritePhase::Write)?;
             file.write_all(&bytes).map_err(io)?;
             self.phase(DraftWritePhase::FileSync)?;
-            file.sync_all().map_err(io)?;
+            kin_blobs::durable::sync_all(&file).map_err(io)?;
             self.context.revalidate_pinned_namespace().map_err(io)?;
             self.phase(DraftWritePhase::Publish)?;
             // Link atomically without replacing an existing revision or following
@@ -739,7 +738,7 @@ fn read_regular(path: &Path) -> Result<Vec<u8>> {
 fn sync_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        regular_options().read(true).open(path)?.sync_all()
+        kin_blobs::durable::sync_all(&regular_options().read(true).open(path)?)
     }
     #[cfg(not(unix))]
     {

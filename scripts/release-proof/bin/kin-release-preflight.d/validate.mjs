@@ -146,7 +146,7 @@ import path from "node:path";
 // tool-call step is a producer step, and proof-flow.sh beside this file carries
 // its change: the call and the tools/list check both follow the launched
 // entry's profile, so a routed entry is listed and called as the one `kin`
-// tool and any other profile as `semantic_search`.
+// tool and any other profile as `locate`.
 //
 // Moved again for the first-run proof's status capture, with nothing to port.
 // The one hunk between 0f0180fe and 747950dd is at old lines 926 to 936, where
@@ -156,15 +156,35 @@ import path from "node:path";
 // hash to bf1dd52477a0b133d2578a73a8ae3c9cb2e289ccd8e85339ea2817b11858691e at
 // both, so no assertion moved.
 //
+// Moved again for the agent tool verbs, with the change ported and nothing in
+// the mirrored step. The MCP tool-call step names the search it makes by the
+// served verb: `locate` with `mode: "name"` by name, and the routed `locate`
+// command, in place of `semantic_search` and the routed `search` command. The
+// hunks between 747950dd and 35edcff4 are at lines 1139, 1209, 1212 and 1217
+// to 1218, and no line was added or removed; proof-flow.sh beside this file
+// carries the same call. Extracting the mirrored step from its `- name:` line
+// to the next sibling `- name:` gives lines 1754 to 2166, 413 lines, sha256
+// 68d39ea447259eef156869a961891a7fc503b7d0a986f4c533f2cf9735f65a02 at both.
+// Resynced for the engine-free default archives. The installed feature check
+// now attests local inference absent, HTTP support present, no selected model
+// and no Metal backend; all source, bytes, graph and health assertions remain.
+//
 // Moved for the firelock-ai -> kinlab-ai repository transfer, with nothing to
-// port. The hunks between 747950dd and 51f4f0b9 only repoint release download,
+// port. The hunks between a8eead0d and 036300c5 only repoint release download,
 // latest-release, ls-remote and raw Cargo.lock URLs to kinlab-ai/kin, all above
 // the mirrored step; the attestation --repo/--signer-workflow lines are left
-// alone. The mirrored step sits at lines 1754 to 2166 and hashes to
-// 68d39ea447259eef156869a961891a7fc503b7d0a986f4c533f2cf9735f65a02, unchanged, so no assertion moved.
+// alone. The mirrored step sits at lines 1777 to 2192 and hashes to
+// db5ff73c122e04e037e6936dea9a01847e8b279cf56644b8b6e338314467a6eb, unchanged, so no assertion moved.
+//
+// Moved again for the same transfer, with nothing to port. The hunks between
+// 036300c5 and 91b09212 repoint the two attestation checks, --repo and
+// --signer-workflow, to kinlab-ai/kin, since a release built there is signed
+// by kinlab-ai/kin's release.yml. Both sit above the mirrored step, which
+// still spans lines 1777 to 2192 and hashes to
+// db5ff73c122e04e037e6936dea9a01847e8b279cf56644b8b6e338314467a6eb, unchanged, so no assertion moved.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "51f4f0b948664325a1f60608b2e8c7d80aff595f431cd864bb443d3c357067e2",
+  sha256: "91b092125dfc6f6a926935274651a849ac9a6c02d2dd52c533e5e3a573159d31",
 };
 
 class Unreadable extends Error {}
@@ -378,8 +398,11 @@ const validateEmbeddingCoverage = (coverage, label) => {
 
 check("bench metadata proves vector and embedding support", () => {
   const cliMeta = readJson("kin-build-meta.json");
-  if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-    throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+  if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true ||
+      cliMeta.embeddings?.local_inference_enabled !== false ||
+      cliMeta.embeddings?.external_embeddings_enabled !== true ||
+      cliMeta.embeddings?.metal_enabled !== false || cliMeta.embeddings?.provider !== "none") {
+    throw new Error(`${runnerOs} bench metadata does not prove the engine-free default archive profile`);
   }
 });
 if (!isWindows) {

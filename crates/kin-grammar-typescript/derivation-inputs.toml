@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MIT
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src", "grammar", "build.rs"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "build.rs",
+    "grammar/common/scanner.h",
+    "grammar/tsx/src/parser.c",
+    "grammar/tsx/src/scanner.c",
+    "grammar/tsx/src/tree_sitter/alloc.h",
+    "grammar/tsx/src/tree_sitter/array.h",
+    "grammar/tsx/src/tree_sitter/parser.h",
+    "grammar/typescript/src/parser.c",
+    "grammar/typescript/src/scanner.c",
+    "grammar/typescript/src/tree_sitter/alloc.h",
+    "grammar/typescript/src/tree_sitter/array.h",
+    "grammar/typescript/src/tree_sitter/parser.h",
+    "src/lib.rs",
+]
+
+[[excluded]]
+reason = "highlight, locals and tags queries: src/lib.rs embeds them as HIGHLIGHTS_QUERY, LOCALS_QUERY and TAGS_QUERY, which no crate reads, and nothing in the workspace builds a tree_sitter::Query (no Query::new), so no query is ever loaded"
+files = [
+    "grammar/queries/highlights.scm",
+    "grammar/queries/locals.scm",
+    "grammar/queries/tags.scm",
+]
+
+[[excluded]]
+reason = "metadata for the tree-sitter CLI (scopes, file types, query paths, bindings); neither build.rs nor src reads it"
+files = [
+    "grammar/tree-sitter.json",
+]
+
+[[excluded]]
+reason = "grammar sources and the resolved grammar for `tree-sitter generate`; build.rs compiles none of them and src loads none, so an edit changes a parse only through a regenerated parser.c, which decides"
+files = [
+    "grammar/common/define-grammar.js",
+    "grammar/tsx/grammar.js",
+    "grammar/tsx/src/grammar.json",
+    "grammar/typescript/grammar.js",
+    "grammar/typescript/src/grammar.json",
+]
+
+[[excluded]]
+reason = "node-type catalogues the tree-sitter CLI writes: src/lib.rs embeds them as TYPESCRIPT_NODE_TYPES and TSX_NODE_TYPES, which no crate reads"
+files = [
+    "grammar/tsx/src/node-types.json",
+    "grammar/typescript/src/node-types.json",
+]
+
+[dependencies]
+tree-sitter-language = { decides = ["graph"] }

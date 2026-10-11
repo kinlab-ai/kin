@@ -217,12 +217,75 @@ pub struct EmbeddingPrelude<'a> {
     pub eps: f32,
 }
 
+/// Borrowed weights of one pre-norm decoder layer with RMSNorm, rotary attention
+/// and a SwiGLU feed-forward block (the Llama, Mistral, Qwen2 and Qwen3 shape
+/// without projection biases). Matrices are row-major `[out, in]`, matching
+/// [`GpuCompute::matmul`]'s `B` convention.
+#[derive(Clone, Copy)]
+pub struct DecoderLayerTensors<'a> {
+    /// RMSNorm weight before attention, `[hidden]`.
+    pub attn_norm: &'a [f32],
+    /// `[heads * head_dim, hidden]`.
+    pub q_weight: &'a [f32],
+    /// `[kv_heads * head_dim, hidden]`.
+    pub k_weight: &'a [f32],
+    /// `[kv_heads * head_dim, hidden]`.
+    pub v_weight: &'a [f32],
+    /// Per-head RMSNorm weight for every query head, `[head_dim]` (Qwen3).
+    pub q_head_norm: Option<&'a [f32]>,
+    /// Per-head RMSNorm weight for every key head, `[head_dim]` (Qwen3).
+    pub k_head_norm: Option<&'a [f32]>,
+    /// Attention output projection, `[hidden, heads * head_dim]`.
+    pub o_weight: &'a [f32],
+    /// RMSNorm weight before the feed-forward block, `[hidden]`.
+    pub ffn_norm: &'a [f32],
+    /// `[inter, hidden]`.
+    pub gate_weight: &'a [f32],
+    /// `[inter, hidden]`.
+    pub up_weight: &'a [f32],
+    /// `[hidden, inter]`.
+    pub down_weight: &'a [f32],
+}
+
+/// Shapes shared by every layer of a decoder prefill.
+#[derive(Clone, Copy, Debug)]
+pub struct DecoderPrefillConfig {
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub inter_size: usize,
+    pub rms_eps: f32,
+}
+
+/// Everything a backend needs to run a decoder over a prompt on its own.
+///
+/// `word_embeddings` is the `[vocab, hidden]` token embedding table, so the
+/// backend can gather the prompt's rows straight into device memory.
+/// `rope_cos` and `rope_sin` are the model's `[rope_rows, head_dim]` rotary
+/// tables; positions at or past `rope_rows` are left unrotated, as the reference
+/// path does.
+pub struct DecoderPrefill<'a> {
+    pub token_ids: &'a [u32],
+    pub word_embeddings: &'a [f32],
+    pub layers: &'a [DecoderLayerTensors<'a>],
+    pub config: DecoderPrefillConfig,
+    pub rope_cos: &'a [f32],
+    pub rope_sin: &'a [f32],
+}
+
 /// GPU-accelerated tensor operations for transformer inference.
 ///
 /// Each method mirrors a CPU operation in lib.rs. Implementations
 /// own their device buffers and handle host↔device transfers.
 pub trait GpuCompute: Send + Sync {
     /// Matrix multiply: C = A × B^T. A is [M, K], B is [N, K], result is [M, N].
+    ///
+    /// `b` must be a model weight: a slice that stays alive and unchanged for as
+    /// long as this backend does. A backend may keep `b` on the device across
+    /// calls, keyed by the slice's address, length and a few element values.
+    /// Pass anything computed for this call, such as one attention head's keys or
+    /// values, to [`GpuCompute::matmul_activations`] instead.
     fn matmul(
         &self,
         a: &[f32],
@@ -232,10 +295,65 @@ pub trait GpuCompute: Send + Sync {
         k: usize,
     ) -> Result<Vec<f32>, InferError>;
 
+    /// Runs a whole decoder over a prompt and returns the residual stream at the
+    /// last position after the final layer, before the model's final norm.
+    ///
+    /// Only the last position's hidden state feeds next-token scoring, so a
+    /// backend may skip every computation that position does not depend on,
+    /// such as the last layer's attention output and feed-forward block for the
+    /// other rows. Returns `Ok(None)` to decline, and the caller then runs the
+    /// generic per-operation decoder, which is the reference.
+    fn decoder_prefill_last_hidden(
+        &self,
+        _input: &DecoderPrefill<'_>,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        Ok(None)
+    }
+
+    /// [`GpuCompute::decoder_prefill_last_hidden`] for the last `tail` positions: their
+    /// residual streams after the final layer, before the final norm, row after row as
+    /// `tail * hidden` floats. `tail` is between 1 and the prompt length.
+    ///
+    /// A decision model that reads several positions at the end of a prompt, such as each
+    /// option's closing token and the token after them, needs these rows and no others. The
+    /// default serves `tail == 1` through `decoder_prefill_last_hidden` and declines the rest.
+    fn decoder_prefill_tail_hidden(
+        &self,
+        input: &DecoderPrefill<'_>,
+        tail: usize,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        if tail == 1 {
+            self.decoder_prefill_last_hidden(input)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// [`GpuCompute::matmul`] for a `b` that is computed for this call rather
+    /// than a model weight.
+    ///
+    /// A backend that caches `b` as a weight must upload it fresh here. The
+    /// allocator hands a freed slice's address to later slices, so caching a
+    /// per-call operand leaks a device buffer on every call and can serve a later
+    /// call an earlier call's data when the two share an address, a length and the
+    /// cached element values. The default forwards to `matmul`, which is correct
+    /// for any backend that does not cache `b`.
+    fn matmul_activations(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, InferError> {
+        self.matmul(a, b, m, n, k)
+    }
+
     /// Matrix multiply against multiple weight matrices sharing the same input A.
     ///
     /// Each weight in `weights` is `[n_i, k]` row-major. Returns one `[m, n_i]`
-    /// output vector per weight in the same order.
+    /// output vector per weight in the same order. Every entry of `weights` must
+    /// be a model weight, as for [`GpuCompute::matmul`].
     fn matmul_many(
         &self,
         a: &[f32],
@@ -317,7 +435,8 @@ pub trait GpuCompute: Send + Sync {
     ///
     /// `x` is `[rows, hidden]` row-major; `w_gate`/`w_up` are `[inter, hidden]`,
     /// `w_down` is `[hidden, inter]` (all row-major, matmul-`B^T` convention).
-    /// Returns the `[rows, hidden]` down-projection.
+    /// Returns the `[rows, hidden]` down-projection. The three matrices must be
+    /// model weights, as for [`GpuCompute::matmul`].
     ///
     /// The default implementation chains the existing primitives and is the
     /// numerical reference; accelerator backends override this to keep the whole
@@ -587,6 +706,8 @@ pub trait GpuCompute: Send + Sync {
     /// `[rows, hidden]` / `[hidden]`. Folds the residual add and norm2 into the
     /// FFN's own command buffer so the down-projection never round-trips to host
     /// memory un-normed. The default chains the primitives and is the reference.
+    /// The matrices must be model weights, as for [`GpuCompute::matmul`];
+    /// `gamma` and `beta` may be computed per call.
     #[allow(clippy::too_many_arguments)]
     fn fused_ffn_swiglu_add_norm(
         &self,
@@ -624,7 +745,8 @@ pub trait GpuCompute: Send + Sync {
     /// post-LN transformer (and the structurally identical post-FFN block), folded
     /// so the projection result and the residual sum stay RESIDENT on-device — the
     /// intermediate never round-trips through host memory between the matmul and
-    /// the norm.
+    /// the norm. `weight` must be a model weight, as for [`GpuCompute::matmul`];
+    /// `gamma` and `beta` may be computed per call.
     ///
     /// The default chains the existing primitives and is the numerical reference;
     /// accelerator backends override it to keep the chain resident with a single
@@ -846,7 +968,7 @@ fn should_parallelize(work_items: usize) -> bool {
 /// pure-Rust path with `KIN_INFER_CPU_BACKEND=pure-rust` for bit-reproducible
 /// runs (BLAS differs from the pure-Rust reduction in the last ULPs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CpuBackend {
+pub(crate) enum CpuBackend {
     PureRust,
     #[cfg(all(feature = "accelerate", target_os = "macos"))]
     Accelerate,
@@ -870,7 +992,7 @@ fn select_cpu_backend(override_var: Option<&str>) -> CpuBackend {
     CpuBackend::PureRust
 }
 
-fn cpu_backend() -> CpuBackend {
+pub(crate) fn cpu_backend() -> CpuBackend {
     static BACKEND: std::sync::OnceLock<CpuBackend> = std::sync::OnceLock::new();
     *BACKEND
         .get_or_init(|| select_cpu_backend(std::env::var("KIN_INFER_CPU_BACKEND").ok().as_deref()))

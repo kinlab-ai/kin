@@ -172,7 +172,16 @@ pub enum WorkingCopySurface<'a> {
     Probe(&'a WorkingCopyProbe),
 }
 
-impl WorkingCopySurface<'_> {
+impl<'a> WorkingCopySurface<'a> {
+    /// Private session context from the host capability the server bound.
+    /// An absent probe does not license an ambient-directory fallback.
+    pub(crate) fn session_root(self) -> Option<&'a Path> {
+        match self {
+            Self::Probe(probe) => Some(&probe.root),
+            Self::NotApplicable | Self::Unchecked => None,
+        }
+    }
+
     /// This surface's reading of one path, which is the probe's reading when
     /// there is a probe and the surface's own standing when there is not.
     pub fn observe(self, path: &RepoPath, admitted: Option<&TreeEntry>) -> HostEntryReading {
@@ -214,12 +223,19 @@ impl WorkingCopySource {
 #[derive(Debug, Clone)]
 pub struct WorkingCopyProbe {
     root: PathBuf,
+    grant: kin_io::Grant,
 }
 
 impl WorkingCopyProbe {
     /// A probe over the working directory of one repository.
+    ///
+    /// The probe is a declared boundary: it holds the authority to read that
+    /// working directory, and every read it makes resolves inside it.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            grant: kin_io::Grant::ambient(),
+        }
     }
 
     /// Compare the host entry at `path` with the tree entry graph truth holds
@@ -240,7 +256,7 @@ impl WorkingCopyProbe {
         let Some(relative) = path.as_utf8() else {
             return HostEntryReading::Unobserved;
         };
-        match self.host_content_identity(&self.root.join(relative)) {
+        match self.host_content_identity(Path::new(relative)) {
             Some(observed) if observed == expected => HostEntryReading::Admitted,
             Some(_) => HostEntryReading::Diverged,
             None => HostEntryReading::Unobserved,
@@ -257,27 +273,29 @@ impl WorkingCopyProbe {
     /// written yet, holds graph truth no host entry stands behind, and calling
     /// that a divergence would floor every answer over it. What this reading is
     /// about is a path that IS on the host and holds other bytes.
-    fn host_content_identity(&self, host_path: &Path) -> Option<Hash256> {
-        let metadata = std::fs::symlink_metadata(host_path).ok()?;
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            let target = std::fs::read_link(host_path).ok()?;
-            // Byte-exact link target, matching what an admission stores for a
-            // symlink: the blob under a symlink entry is the target path's own
-            // bytes.
-            return Some(Hash256::from_bytes(kin_blobs::digest_bytes(
-                &symlink_target_bytes(&target)?,
-            )));
+    fn host_content_identity(&self, relative: &Path) -> Option<Hash256> {
+        // Opened per reading, so a checkout written after the probe was built
+        // is still read. Every path resolves inside the working directory: an
+        // absolute path, a climb out, or a link that leaves it reads as no
+        // evidence.
+        let tree = kin_io::WorktreeSource::open(&self.root, &self.grant).ok()?;
+        match tree.kind(relative).ok()?? {
+            kin_io::EntryKind::Link => {
+                let target = tree.link_target(relative).ok()??;
+                // Byte-exact link target, matching what an admission stores for
+                // a symlink: the blob under a symlink entry is the target path's
+                // own bytes.
+                Some(Hash256::from_bytes(kin_blobs::digest_bytes(
+                    &symlink_target_bytes(&target)?,
+                )))
+            }
+            // An entry longer than the probe reads is refused by the bounded
+            // read, which is no evidence rather than a divergence.
+            kin_io::EntryKind::Regular => Some(Hash256::from_bytes(kin_blobs::digest_bytes(
+                &tree.read(relative, MAX_PROBE_BYTES).ok()??,
+            ))),
+            _ => None,
         }
-        if !file_type.is_file() {
-            return None;
-        }
-        if metadata.len() > MAX_PROBE_BYTES {
-            return None;
-        }
-        Some(Hash256::from_bytes(kin_blobs::digest_bytes(
-            &std::fs::read(host_path).ok()?,
-        )))
     }
 }
 

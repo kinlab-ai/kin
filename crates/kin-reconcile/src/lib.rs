@@ -45,5 +45,5 @@ pub use move_bindings::{plan_moved_import_bindings, relocate_binding_obligations
 pub use reconciler::{
     MergePreview, PreparedAdmittedSourceBatch, PreparedBatchAdoption, PreparedBatchSource,
     ReconcileOutcome, ReconcileResult, Reconciler, SemanticDelta, SemanticDeltaKind,
-    StaleCanonicalSource,
+    StaleCanonicalSource, LAYOUT_DIFFERS_FROM_SOURCE,
 };

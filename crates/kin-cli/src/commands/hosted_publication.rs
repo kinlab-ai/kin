@@ -942,7 +942,7 @@ fn write_json_atomically(path: &Path, value: &impl Serialize, label: &str) -> Re
             .with_context(|| format!("create {label} temporary {}", temporary.display()))?;
         file.write_all(&bytes)
             .with_context(|| format!("write {label} temporary {}", temporary.display()))?;
-        file.sync_all()
+        kin_blobs::durable::sync_all(&file)
             .with_context(|| format!("flush {label} temporary {}", temporary.display()))?;
     }
     fs::rename(&temporary, path).with_context(|| {
@@ -955,7 +955,7 @@ fn write_json_atomically(path: &Path, value: &impl Serialize, label: &str) -> Re
     #[cfg(unix)]
     {
         fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
+            .and_then(|directory| kin_blobs::durable::sync_all(&directory))
             .with_context(|| format!("flush {label} directory {}", parent.display()))?;
     }
     Ok(())
@@ -1011,7 +1011,7 @@ pub fn install_no_replace(path: &Path, bytes: &[u8], label: &str) -> Result<bool
                 .with_context(|| format!("create {label} staging file {}", staged.display()))?;
             file.write_all(bytes)
                 .with_context(|| format!("write {label} staging file {}", staged.display()))?;
-            file.sync_all()
+            kin_blobs::durable::sync_all(&file)
                 .with_context(|| format!("flush {label} staging file {}", staged.display()))?;
         }
         match fs::hard_link(&staged, path) {
@@ -1038,7 +1038,7 @@ pub fn install_no_replace(path: &Path, bytes: &[u8], label: &str) -> Result<bool
         // `File::open` on a directory is unavailable on Windows, where the
         // guarantee is the file's own flush plus the atomic link.
         fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
+            .and_then(|directory| kin_blobs::durable::sync_all(&directory))
             .with_context(|| format!("flush {label} directory {}", parent.display()))?;
     }
     Ok(installed)
@@ -1091,7 +1091,7 @@ fn open_or_initialize_source(
     spec: &SourceSpec,
 ) -> Result<Arc<RepositoryAuthorityManager<dyn StorageBackend>>> {
     let kin_dir = source_dir.join(".kin");
-    let already_initialized = match fs::symlink_metadata(&kin_dir) {
+    let legacy_marker_exists = match fs::symlink_metadata(&kin_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!("source store marker is a symlink: {}", kin_dir.display())
         }
@@ -1101,8 +1101,17 @@ fn open_or_initialize_source(
             return Err(error).with_context(|| format!("inspect source {}", kin_dir.display()))
         }
     };
-    let kindb_dir = if already_initialized {
-        kin_core::KinLayout::new(kin_dir).kindb_dir()
+    // Resolve this exact source through the supported central/custom-store
+    // binding as well as the legacy marker. Keep an incomplete legacy marker
+    // on the refusal path instead of treating it as a fresh source.
+    let existing = kin_core::layout::locate_store(source_dir)
+        .or_else(|| legacy_marker_exists.then(|| kin_core::KinLayout::new(kin_dir)));
+    let kindb_dir = if let Some(layout) = existing {
+        // A reused store must hold the history it is about to publish as the
+        // hosted repository's; a partial one holds only its checked-out commit.
+        kin_core::history_state::require_complete_for(&layout, "hosted publication")
+            .map_err(anyhow::Error::msg)?;
+        layout.kindb_dir()
     } else {
         let result = match spec {
             SourceSpec::NativeEmpty { default_branch } => {

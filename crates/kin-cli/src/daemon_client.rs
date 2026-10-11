@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+mod attach_env;
 pub(crate) mod probe_process;
 pub(crate) mod process_executable;
 mod starting_owner;
@@ -561,6 +562,18 @@ impl NonIdempotentAcknowledgement for crate::commands::merge::MergeResponse {
     }
 }
 
+impl NonIdempotentAcknowledgement for crate::commands::branch::BranchResponse {
+    fn acknowledged_operation_id(&self) -> Option<OperationId> {
+        self.operation_id
+    }
+
+    fn has_authoritative_report(&self) -> bool {
+        self.report
+            .as_ref()
+            .is_some_and(|report| report.schema == crate::commands::branch::BRANCH_LIST_SCHEMA)
+    }
+}
+
 impl NonIdempotentAcknowledgement for crate::commands::resolve::ResolveResponse {
     fn acknowledged_operation_id(&self) -> Option<OperationId> {
         self.operation_id
@@ -951,6 +964,149 @@ impl DaemonClient {
                 override_url.is_some(),
             ))),
         }
+    }
+
+    /// A local workspace reader does not inherit another client's temporal session.
+    /// Discovery can start the repository worker, just as an explicit CLI read can.
+    pub async fn connect_for_workspace(command: &str, layout: &KinLayout) -> Result<Self> {
+        let discovered = Self::connect_for_command(command, layout).await?;
+        Self::from_running_workspace(discovered.base_url, layout).await
+    }
+
+    /// Verify a known endpoint without starting a daemon or adopting ambient scope.
+    pub async fn from_running_workspace(
+        base_url: impl Into<String>,
+        layout: &KinLayout,
+    ) -> Result<Self> {
+        let mut client = Self::from_base_url_with_explicit_authority(
+            base_url,
+            resolve_daemon_auth_token_for_layout(layout),
+            None,
+        )?;
+        client.kin_root = Some(layout.root().to_path_buf());
+        let health = client.health().await?;
+        match classify_health_repo(&health, layout.root(), layout.working_dir()) {
+            RepoIdentity::Matches => Ok(client),
+            RepoIdentity::Rejected(reason) | RepoIdentity::Indeterminate(reason) => {
+                anyhow::bail!("workspace daemon identity could not be verified: {reason}")
+            }
+        }
+    }
+
+    /// Bounded graph-owned inventory. Retains the total and optional metadata.
+    pub async fn workspace_entities(
+        &self,
+        repo_id: &str,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value> {
+        anyhow::ensure!(
+            (1..=100).contains(&limit),
+            "entity page limit must be 1..100"
+        );
+        let response = self
+            .send(
+                self.client
+                    .get(format!(
+                        "{}/repos/{}/entities",
+                        self.base_url,
+                        urlencoding::encode(repo_id)
+                    ))
+                    .query(&[
+                        ("query", query.to_string()),
+                        ("order", "importance".to_string()),
+                        ("limit", limit.to_string()),
+                        ("offset", offset.to_string()),
+                        ("include", "ranking,signature,summary".to_string()),
+                    ]),
+                "workspace entity inventory",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self
+                .http_refusal("workspace entity inventory", response)
+                .await);
+        }
+        let value: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            value["repo_id"].as_str() == Some(repo_id),
+            "entity inventory answered for another repository"
+        );
+        anyhow::ensure!(
+            value["entities"].is_array() && value["total"].is_u64(),
+            "entity inventory omitted its page or total"
+        );
+        Ok(value)
+    }
+
+    pub async fn workspace_entity_source(&self, entity_id: &str) -> Result<serde_json::Value> {
+        uuid::Uuid::parse_str(entity_id).context("invalid entity id")?;
+        self.workspace_graph_read(
+            "get_entity_source",
+            serde_json::json!({
+                "entity_id": entity_id, "full_body": true,
+            }),
+        )
+        .await
+    }
+
+    /// One hop of an entity's relations. `direction` is `in`, `out` or
+    /// `both`; anything else is refused before the daemon is asked.
+    pub async fn workspace_entity_neighborhood(
+        &self,
+        entity_id: &str,
+        direction: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        uuid::Uuid::parse_str(entity_id).context("invalid entity id")?;
+        anyhow::ensure!(
+            matches!(direction, "in" | "out" | "both"),
+            "neighborhood direction must be in, out or both"
+        );
+        anyhow::ensure!(
+            (1..=200).contains(&limit),
+            "neighborhood limit must be 1..200"
+        );
+        self.workspace_graph_read(
+            "graph_neighborhood",
+            serde_json::json!({
+                "entity_id": entity_id, "depth": 1, "direction": direction, "limit": limit,
+                "max_chars": 80000,
+            }),
+        )
+        .await
+    }
+
+    // Only the two named, read-only wrappers above reach this transport.
+    async fn workspace_graph_read(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/mcp/tools/call", self.base_url))
+                    .json(&serde_json::json!({"name": name, "arguments": arguments})),
+                name,
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal(name, response).await);
+        }
+        let result: kin_mcp::ToolCallResult =
+            response.json().await.context("parse graph tool response")?;
+        anyhow::ensure!(
+            result.content.len() == 1,
+            "{name} answered with an unsupported content shape"
+        );
+        let kin_mcp::ContentBlock::Text { text } = &result.content[0];
+        anyhow::ensure!(result.is_error != Some(true), "{text}");
+        let value: serde_json::Value =
+            serde_json::from_str(text).context("graph tool did not return JSON")?;
+        anyhow::ensure!(value.is_object(), "graph tool did not return an object");
+        Ok(value)
     }
 
     /// Get the daemon's health response (includes entity count, uptime, etc.).
@@ -1536,9 +1692,66 @@ impl DaemonClient {
             )
             .await?;
         if !resp.status().is_success() {
-            return Err(self.http_refusal("lsp sweep", resp).await);
+            return Err(self.sweep_refusal(resp).await);
         }
         Ok(resp.json().await.context("read lsp sweep response")?)
+    }
+
+    /// [`Self::queue_lsp_sweep`] for a command that will wait on the sweep: the
+    /// daemon keeps itself up, even when asked to retire, until this process
+    /// has read the status that says the sweep ended
+    /// ([`Self::lsp_sweep_status_waiting`]), or this process is gone.
+    pub async fn queue_lsp_sweep_waiting(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send(
+                self.client.post(format!(
+                    "{}/lsp/sweep?waiter={}",
+                    self.base_url,
+                    std::process::id()
+                )),
+                "lsp sweep",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.sweep_refusal(resp).await);
+        }
+        Ok(resp.json().await.context("read lsp sweep response")?)
+    }
+
+    /// A refused sweep request, worded as every other refusal is, and carrying
+    /// the daemon's refusal as a [`SweepRefusal`] when it is a JSON document,
+    /// so `kin daemon sweep` can read why without parsing the sentence.
+    async fn sweep_refusal(&self, response: reqwest::Response) -> anyhow::Error {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let error = daemon_http_error(&self.base_url, "lsp sweep", status, &body);
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(refusal) if refusal.get("error").is_some() => anyhow::Error::new(SweepRefusal {
+                refusal,
+                sentence: error.to_string(),
+            }),
+            _ => error,
+        }
+    }
+
+    /// [`Self::lsp_sweep_status`] read by a command that waits on the sweep it
+    /// asked for with [`Self::queue_lsp_sweep_waiting`]. The read that shows
+    /// the sweep ended releases the daemon to retire.
+    pub async fn lsp_sweep_status_waiting(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send(
+                self.client.get(format!(
+                    "{}/lsp/sweep/status?waiter={}",
+                    self.base_url,
+                    std::process::id()
+                )),
+                "lsp sweep status",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("lsp sweep status", resp).await);
+        }
+        Ok(resp.json().await.context("read lsp sweep status")?)
     }
 
     /// How far the cold sweep has got. See `GET /lsp/sweep/status`.
@@ -1751,6 +1964,27 @@ impl DaemonClient {
         resp.json().await.context("parse daemon overview response")
     }
 
+    pub async fn dependencies(
+        &self,
+        request: &crate::commands::deps::DepsRequest,
+    ) -> Result<crate::commands::deps::DepsResponse> {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/deps", self.base_url))
+                    .json(request),
+                "deps",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal("deps", response).await);
+        }
+        response
+            .json()
+            .await
+            .context("parse daemon dependency response")
+    }
+
     pub async fn dead_code(
         &self,
         request: &crate::commands::dead_code::DeadCodeRequest,
@@ -1827,6 +2061,28 @@ impl DaemonClient {
             return Err(self.http_refusal("path", resp).await);
         }
         resp.json().await.context("parse daemon path response")
+    }
+
+    /// Where each entity is projected in the working copy: the editor's
+    /// materialization call, `POST /projection/places`. No MCP tool serves it.
+    pub async fn projection_places(
+        &self,
+        request: &kin_projection::places::PlacesRequest,
+    ) -> Result<kin_projection::places::PlacesResponse> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/projection/places", self.base_url))
+                    .json(request),
+                "projection places",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("projection places", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon projection places response")
     }
 
     /// Read the same bounded semantic reference page served by MCP.
@@ -2003,12 +2259,82 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn branch_switch_preview(
+        &self,
+        request: &crate::commands::branch::BranchSwitchPreviewRequest,
+    ) -> Result<crate::commands::branch::BranchSwitchPreviewResponse> {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/branch/preview", self.base_url))
+                    .json(request),
+                "branch preview",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal("branch preview", response).await);
+        }
+        response
+            .json()
+            .await
+            .context("parse branch preview response")
+    }
+
+    pub async fn branch_switch_confirm(
+        &self,
+        request: &crate::commands::branch::BranchSwitchConfirmRequest,
+    ) -> Result<crate::commands::branch::BranchResponse> {
+        self.post_non_idempotent_json(
+            "/commands/branch/confirm",
+            request,
+            request.operation_id,
+            "branch confirm",
+        )
+        .await
+    }
+
     pub async fn merge(
         &self,
         request: &crate::commands::merge::MergeRequest,
     ) -> Result<crate::commands::merge::MergeResponse> {
         self.post_non_idempotent_json("/commands/merge", request, request.operation_id, "merge")
             .await
+    }
+
+    /// Read the proposed composition without publishing a merge.
+    pub async fn merge_preview(
+        &self,
+        request: &crate::commands::merge::MergePreviewRequest,
+    ) -> Result<crate::commands::merge::MergePreviewResponse> {
+        let response = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/merge/preview", self.base_url))
+                    .json(request),
+                "merge preview",
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(self.http_refusal("merge preview", response).await);
+        }
+        response
+            .json()
+            .await
+            .context("parse merge preview response")
+    }
+
+    /// Confirm once through the existing guarded, non-retrying write transport.
+    pub async fn merge_confirm(
+        &self,
+        request: &crate::commands::merge::MergeConfirmRequest,
+    ) -> Result<crate::commands::merge::MergeResponse> {
+        self.post_non_idempotent_json(
+            "/commands/merge/confirm",
+            request,
+            request.operation_id,
+            "merge confirm",
+        )
+        .await
     }
 
     pub async fn conflicts(
@@ -2242,66 +2568,6 @@ impl DaemonClient {
             .ok_or_else(|| anyhow::anyhow!("daemon session registration returned no session_id"))
     }
 
-    /// Refresh one agent session's idle window and read it back: its vendor,
-    /// client name and capabilities. `None` when the daemon holds no such
-    /// session, because it ended or was reaped.
-    pub async fn refresh_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<kin_model::session::AgentSession>> {
-        let heartbeat = self
-            .send(
-                self.client.post(format!(
-                    "{}/session/{}/heartbeat",
-                    self.base_url, session_id
-                )),
-                "session heartbeat",
-            )
-            .await?;
-        if heartbeat.status().as_u16() == 404 {
-            return Ok(None);
-        }
-        if !heartbeat.status().is_success() {
-            return Err(self.http_refusal("session heartbeat", heartbeat).await);
-        }
-        let resp = self
-            .send(
-                self.client
-                    .get(format!("{}/session/{}", self.base_url, session_id)),
-                "session read",
-            )
-            .await?;
-        if resp.status().as_u16() == 404 {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            return Err(self.http_refusal("session read", resp).await);
-        }
-        Ok(Some(resp.json().await.context("parse daemon session")?))
-    }
-
-    /// Record an agent toolchain run's admitted write-back as a change,
-    /// attributed to the session that ran it.
-    pub async fn exec_commit(
-        &self,
-        request: &crate::commands::agent_exec::ExecCommitRequest,
-    ) -> Result<crate::commands::agent_exec::ExecCommitResponse> {
-        let resp = self
-            .send(
-                self.client
-                    .post(format!("{}/commands/exec-commit", self.base_url))
-                    .json(request),
-                "exec commit",
-            )
-            .await?;
-        if !resp.status().is_success() {
-            return Err(self.http_refusal("exec commit", resp).await);
-        }
-        resp.json()
-            .await
-            .context("parse daemon exec commit response")
-    }
-
     /// Release a session lease registered by [`Self::start_session`].
     pub async fn end_session(&self, session_id: &str) -> Result<()> {
         let resp = self
@@ -2508,8 +2774,15 @@ fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Diverg
 /// on every host that has never lost a daemon it answers nothing and this
 /// message stays byte for byte what it was.
 fn daemon_send_failure_message(base_url: &str, leaf: &str, kin_root: Option<&Path>) -> String {
-    if let Some(state) = kin_root.and_then(crate::daemon_death::daemon_not_answering) {
-        return crate::daemon_death::dropped_request_sentence(base_url, leaf, &state);
+    if let Some((kin_root, state)) = kin_root.and_then(|kin_root| {
+        crate::daemon_death::daemon_not_answering(kin_root).map(|state| (kin_root, state))
+    }) {
+        return crate::daemon_death::dropped_request_sentence(
+            base_url,
+            leaf,
+            &state,
+            kin_core::enrichment_setting::state_for_store(kin_root),
+        );
     }
     format!(
         "the kin daemon at {base_url} stopped answering while the {leaf} request was in flight; \
@@ -2522,6 +2795,22 @@ fn daemon_send_failure_message(base_url: &str, leaf: &str, kin_root: Option<&Pat
 /// An empty body is its own outcome rather than a refusal with nothing to say,
 /// so that branch names the log to read instead of rendering a status code and
 /// a colon with nothing after it.
+/// A daemon's refusal of a sweep request, as the JSON document it sent, behind
+/// the same sentence any other refusal prints.
+#[derive(Debug)]
+pub(crate) struct SweepRefusal {
+    pub(crate) refusal: serde_json::Value,
+    sentence: String,
+}
+
+impl std::fmt::Display for SweepRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.sentence)
+    }
+}
+
+impl std::error::Error for SweepRefusal {}
+
 fn daemon_http_error(base_url: &str, leaf: &str, status: u16, body: &str) -> anyhow::Error {
     if body.trim().is_empty() {
         anyhow::anyhow!(
@@ -3218,6 +3507,12 @@ fn process_image_path(pid: u32) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+/// The executable `pid` runs, for a status reader to name a daemon's binary,
+/// or `None` when this host cannot say.
+pub(crate) fn process_executable_path(pid: u32) -> Option<String> {
+    process_image_path(pid)
 }
 
 /// The executable image running at `pid` on this Unix host, or `None` when it
@@ -4820,7 +5115,7 @@ where
             dir.display()
         ));
     }
-    if let Err(error) = std::fs::create_dir_all(dir) {
+    if let Err(error) = kin_core::registry::create_kin_dir_all(dir) {
         return SupervisorEndpointRetirement::CoordinationUnavailable(error.to_string());
     }
     let lifecycle = match OpenOptions::new()
@@ -5485,8 +5780,11 @@ fn resolve_idle_timeout_env(
 /// too. An MCP session answers for that itself, with an idle floor it holds
 /// for as long as the session lasts (`kin_mcp::session_idle_floor`), rather
 /// than a one-time raise from here that would outlive the session.
-async fn attach_to_existing_daemon(base_url: &str) -> std::result::Result<(), AutoStartError> {
-    report_behavior_env_ignored_by_existing_daemon(base_url).await
+async fn attach_to_existing_daemon(
+    kin_root: &Path,
+    base_url: &str,
+) -> std::result::Result<(), AutoStartError> {
+    report_behavior_env_ignored_by_existing_daemon(kin_root, base_url).await
 }
 
 /// Say so when this command sets behavior levers the attached daemon cannot
@@ -5504,19 +5802,28 @@ async fn attach_to_existing_daemon(base_url: &str) -> std::result::Result<(), Au
 /// reverse direction (a daemon carrying a lever this command did not set) stays
 /// with the per-command checks, which are already paying for a health read.
 ///
+/// The comparison is against what a daemon for this store would hold had this
+/// command started it: this command's environment with the repository's
+/// recorded settings adopted over it, as the daemon adopts them
+/// (`attach_env`). That is what a restart produces, so a reported divergence is
+/// one the printed remedy clears. `kin ui` does not adopt a repository's
+/// settings into its own environment, and a raw comparison reported each of
+/// them as a divergence that no restart could clear.
+///
 /// Best-effort otherwise: an unreachable daemon or one predating the surface is
 /// silence here, because the command's own request will report a genuine
 /// connectivity failure and reporting it twice names one fault as two.
 async fn report_behavior_env_ignored_by_existing_daemon(
+    kin_root: &Path,
     base_url: &str,
 ) -> std::result::Result<(), AutoStartError> {
-    let cli = kin_core::behavior_env::snapshot_from_process();
-    if !states_a_behavior_lever(&cli) {
+    if !states_a_behavior_lever(&kin_core::behavior_env::snapshot_from_process()) {
         return Ok(());
     }
     let Some(daemon) = fetch_daemon_behavior_env(base_url).await else {
         return Ok(());
     };
+    let cli = attach_env::daemon_behavior_env_for_store(kin_root);
     let divergences = kin_core::behavior_env::compare(&cli, &daemon);
     report_behavior_env_divergence(
         &divergences,
@@ -5665,6 +5972,11 @@ fn daemon_log_len(kin_root: &Path) -> u64 {
 /// before the daemon was spawned). This avoids surfacing the stale tail of a
 /// prior run's log as if it were the cause of this failure. When the failing
 /// process wrote nothing, we say so explicitly rather than echoing old lines.
+///
+/// Every line is stripped of terminal escapes. A daemon writes its log without
+/// them, but one built before that, or run with its stderr on a terminal, did
+/// not, and this text lands in error messages and in `--json` payloads where an
+/// escape byte is noise at best and a repainted terminal at worst.
 fn daemon_log_tail_since(kin_root: &Path, since_offset: u64) -> String {
     let path = daemon_log_path(kin_root);
     let Ok(content) = std::fs::read_to_string(&path) else {
@@ -5681,7 +5993,12 @@ fn daemon_log_tail_since(kin_root: &Path, since_offset: u64) -> String {
         );
     }
     let lines: Vec<&str> = fresh.lines().rev().take(20).collect();
-    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+    lines
+        .into_iter()
+        .rev()
+        .map(crate::commands::commit_progress::strip_ansi)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn canonical_path_string(path: &Path) -> String {
@@ -5776,6 +6093,26 @@ fn classify_health_repo(
         .filter(|id| !id.is_empty());
     let local_identity = local_workspace_identity(kin_root);
 
+    // A copy of a store carries its source's repository and workspace ids, and
+    // a copied in-tree `.kin` carries the source daemon's endpoint too. When
+    // that daemon still runs, it answers with ids that match this copy while
+    // serving the directory it was started for. So a daemon whose matching ids
+    // come with a repo root that resolves to some other directory that exists
+    // serves that other checkout, not this one. A root that resolves to this
+    // directory, or does not resolve at all (another spelling of a path, or a
+    // tree that has since moved), leaves the ids to decide.
+    let serves_another_checkout = || -> Option<String> {
+        let reported = health.repo_root.as_deref()?;
+        let expected = strict_canonical_path(working_dir)?;
+        let resolved = strict_canonical_path(Path::new(reported))?;
+        (resolved != expected).then(|| {
+            format!(
+                "daemon repo mismatch: endpoint serves the same repository's store at {resolved}, \
+                 a different checkout from {expected}"
+            )
+        })
+    };
+
     if let (Some(reported_repo), Some(expected)) = (reported_repo_id, local_identity.as_ref()) {
         if reported_repo != expected.repo_id {
             return RepoIdentity::Rejected(format!(
@@ -5786,13 +6123,15 @@ fn classify_health_repo(
         if let (Some(reported_workspace), Some(expected_workspace)) =
             (reported_workspace_id, expected.workspace_id.as_deref())
         {
-            return if reported_workspace == expected_workspace {
-                RepoIdentity::Matches
-            } else {
+            return if reported_workspace != expected_workspace {
                 RepoIdentity::Rejected(format!(
                     "daemon workspace mismatch: endpoint serves workspace {reported_workspace}, \
                      expected {expected_workspace}"
                 ))
+            } else if let Some(reason) = serves_another_checkout() {
+                RepoIdentity::Rejected(reason)
+            } else {
+                RepoIdentity::Matches
             };
         }
     } else if let (Some(reported_workspace), Some(expected_workspace)) = (
@@ -5801,13 +6140,15 @@ fn classify_health_repo(
             .as_ref()
             .and_then(|identity| identity.workspace_id.as_deref()),
     ) {
-        return if reported_workspace == expected_workspace {
-            RepoIdentity::Matches
-        } else {
+        return if reported_workspace != expected_workspace {
             RepoIdentity::Rejected(format!(
                 "daemon workspace mismatch: endpoint serves workspace {reported_workspace}, \
                  expected {expected_workspace}"
             ))
+        } else if let Some(reason) = serves_another_checkout() {
+            RepoIdentity::Rejected(reason)
+        } else {
+            RepoIdentity::Matches
         };
     }
 
@@ -5861,7 +6202,7 @@ fn health_status_is_serving(status: &str) -> bool {
 /// [`classify_health_repo`] instead and distinguish proven-different from
 /// nothing-established.
 pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<()> {
-    let kin_root = working_dir.join(".kin");
+    let kin_root = kin_core::layout::store_root_for(working_dir);
     match classify_health_repo(health, &kin_root, working_dir) {
         RepoIdentity::Matches => {}
         RepoIdentity::Rejected(reason) | RepoIdentity::Indeterminate(reason) => bail!(reason),
@@ -6187,7 +6528,7 @@ fn refresh_supervisor_startup_notice(sentinel: &Path) -> std::io::Result<()> {
 }
 
 fn ensure_supervisor_startup_namespace(dir: &Path) -> std::io::Result<SupervisorStartupNamespace> {
-    std::fs::create_dir_all(dir)?;
+    kin_core::registry::create_kin_dir_all(dir)?;
     let sentinel = dir.join(SUPERVISOR_STARTUP_FILE);
     loop {
         match std::fs::symlink_metadata(&sentinel) {
@@ -6312,7 +6653,7 @@ fn write_immutable_startup_record<T: Serialize>(path: &Path, record: &T) -> std:
     serde_json::to_writer(&mut file, record).map_err(std::io::Error::other)?;
     file.write_all(b"\n")?;
     file.flush()?;
-    file.sync_all()
+    kin_blobs::durable::sync_all(&file)
 }
 
 fn read_startup_record<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<T> {
@@ -7077,7 +7418,7 @@ async fn acquire_supervisor_startup_lock_in_dir_with_timeout(
     dir: &Path,
     timeout: Duration,
 ) -> Result<SupervisorStartupAcquisition> {
-    std::fs::create_dir_all(dir)
+    kin_core::registry::create_kin_dir_all(dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
     let path = dir.join(SUPERVISOR_STARTUP_FILE);
     let deadline = Instant::now() + timeout;
@@ -7302,11 +7643,32 @@ async fn probe_daemon_endpoint_with_warming_signal(
     warming_signal: std::sync::Arc<AtomicBool>,
     silence_bound: Option<Duration>,
 ) -> EndpointVerdict {
-    let Some(working_dir) = kin_root.parent() else {
+    probe_daemon_endpoint_with_warming_signal_using_client(
+        kin_root,
+        endpoint,
+        timeout,
+        warming_signal,
+        silence_bound,
+        daemon_health_client(),
+        false,
+    )
+    .await
+}
+
+async fn probe_daemon_endpoint_with_warming_signal_using_client(
+    kin_root: &Path,
+    endpoint: LiveDaemonEndpoint,
+    timeout: Duration,
+    warming_signal: std::sync::Arc<AtomicBool>,
+    silence_bound: Option<Duration>,
+    client: reqwest::Client,
+    require_successful_health: bool,
+) -> EndpointVerdict {
+    let Some(working_dir) = kin_core::layout::working_dir_of_store(kin_root) else {
         return EndpointVerdict::Invalid("invalid .kin layout: no parent".to_string());
     };
+    let working_dir = working_dir.as_path();
     let base_url = format!("http://127.0.0.1:{}", endpoint.port);
-    let client = daemon_health_client();
     let started = Instant::now();
     let deadline = started + timeout;
     // Seeded from the signal rather than from `false`, because this call may be
@@ -7349,7 +7711,15 @@ async fn probe_daemon_endpoint_with_warming_signal(
                     warming_signal.store(warming, Ordering::Relaxed);
                 }
                 last_answer = Some(Instant::now());
-                match probe_health_for_repo(&client, &base_url, kin_root, working_dir).await {
+                match probe_health_for_repo_with_policy(
+                    &client,
+                    &base_url,
+                    kin_root,
+                    working_dir,
+                    require_successful_health,
+                )
+                .await
+                {
                     HealthProbe::Matches => return EndpointVerdict::Serving(base_url),
                     // The daemon answered and identified itself as something
                     // else. That is real evidence the record is stale, not a
@@ -7432,18 +7802,26 @@ enum HealthProbe {
     Unanswered(String),
 }
 
-async fn probe_health_for_repo(
+async fn probe_health_for_repo_with_policy(
     client: &reqwest::Client,
     base_url: &str,
     kin_root: &Path,
     working_dir: &Path,
+    require_success: bool,
 ) -> HealthProbe {
     let answered = async {
-        let health: HealthResponse = client
+        let response = client
             .get(format!("{base_url}/health"))
             .send()
             .await
-            .context("probe daemon health")?
+            .context("probe daemon health")?;
+        if require_success && !response.status().is_success() {
+            anyhow::bail!(
+                "daemon health returned non-success HTTP {}",
+                response.status()
+            );
+        }
+        let health: HealthResponse = response
             .error_for_status()
             .context("daemon health returned an error")?
             .json()
@@ -7593,15 +7971,18 @@ const STARTUP_CATCH_UP_PATIENCE: Duration = Duration::from_secs(30);
 /// [`STARTUP_CATCH_UP_PATIENCE`] and by the caller's own deadline, and it stops
 /// as soon as the daemon reports a failed admission, because a refusal is not
 /// going to clear by waiting and the answer that follows says what is owed.
+///
+/// A commit does not wait. See [`waits_for_startup_catch_up`].
 async fn await_startup_catch_up(
     client: &reqwest::Client,
     base_url: &str,
     first: &HealthResponse,
     deadline: Instant,
+    kin_root: &Path,
 ) {
     let owes = |health: &HealthResponse| health.reconcile.changed_path_count > 0;
     let refused = |health: &HealthResponse| health.reconcile.admission_failure_streak > 0;
-    if !owes(first) {
+    if !owes(first) || !waits_for_startup_catch_up(kin_root) {
         return;
     }
     let bound = deadline.min(Instant::now() + STARTUP_CATCH_UP_PATIENCE);
@@ -7624,6 +8005,23 @@ async fn await_startup_catch_up(
             return;
         }
     }
+}
+
+/// Whether this command should wait for a daemon it started to take the
+/// startup catch-up before asking it anything.
+///
+/// Not when this process is a commit that announced itself for this store. The
+/// daemon's reconcile loop reads that announcement and stands its catch-up down
+/// for the commit, because the commit admits the whole working copy itself and
+/// carries the tree in the transaction that publishes its change. A commit that
+/// waited here would wait for a catch-up that is waiting for it, and every
+/// commit that started a daemon over offline edits paid the whole
+/// [`STARTUP_CATCH_UP_PATIENCE`] before its request was even sent. Another
+/// process's announcement does not count: that commit carries its own
+/// admission, and this command is still a query that wants a current answer.
+fn waits_for_startup_catch_up(kin_root: &Path) -> bool {
+    kin_daemon_spawn::read_approaching_commit(kin_root)
+        .is_none_or(|announced| announced.pid != std::process::id())
 }
 
 async fn wait_for_daemon_ready(
@@ -7702,14 +8100,16 @@ async fn wait_for_daemon_ready_with(
                         }
                         .await;
                         match health_result.and_then(|health| {
-                            let working_dir = kin_root
-                                .parent()
+                            let working_dir = kin_core::layout::working_dir_of_store(kin_root)
                                 .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
-                            validate_health_repo(&health, working_dir)?;
+                            validate_health_repo(&health, &working_dir)?;
                             Ok(health)
                         }) {
                             Ok(health) => {
-                                await_startup_catch_up(&client, &base_url, &health, deadline).await;
+                                await_startup_catch_up(
+                                    &client, &base_url, &health, deadline, kin_root,
+                                )
+                                .await;
                                 return Ok(base_url);
                             }
                             Err(err) => last_error = err.to_string(),
@@ -7752,21 +8152,62 @@ async fn wait_for_daemon_ready_with(
     // invocation finds it through the ordinary escalating-patience path.
     let disposition = kin_daemon_spawn::startup_disposition(child)
         .unwrap_or(kin_daemon_spawn::StartupDisposition::Indeterminate);
+    let pid = child.id();
     let reaped = kin_daemon_spawn::terminate_if_proven_dead(child, &disposition);
-    let fate = if reaped {
-        "it had already exited and was reaped"
+    let message = startup_deadline_message(
+        pid,
+        timeout,
+        reaped,
+        daemon_startup_phase(kin_root),
+        &last_error,
+        || daemon_log_tail_since(kin_root, log_offset),
+    );
+    // A daemon that exited is a failed start, whenever it was noticed. Only a
+    // daemon still running is a timeout, so a caller that reads the timeout as
+    // "still loading" is right to.
+    Err(if reaped {
+        DaemonReadinessError::Failed(anyhow!(message))
     } else {
-        "it is still running and was left alone rather than killed for being slow; \
-         wait for it, or stop it with `kin daemon stop`"
-    };
-    Err(DaemonReadinessError::Timeout(format!(
-        "waited {:.1}s: {}; {}; raise KIN_DAEMON_READY_TIMEOUT_SECS if this repository needs \
-         longer to load; recent log:\n{}",
-        timeout.as_secs_f64(),
-        last_error,
-        fate,
-        daemon_log_tail_since(kin_root, log_offset)
-    )))
+        DaemonReadinessError::Timeout(message)
+    })
+}
+
+/// What a caller is told when a daemon it started missed the readiness
+/// deadline.
+///
+/// A daemon still running at the deadline is loading a repository larger than
+/// the wait, which is news about patience and not a failure, so it gets a
+/// short plain explanation: which process, what it is doing, and how to check
+/// on it. It used to get its last twenty log lines as well, which on a large
+/// repository was a wall of timestamps and span paths that `kin init` printed
+/// verbatim and carried into its `--json` document. Only a daemon that exited
+/// gets its log, because there the log is the one account of why, and
+/// `log_tail` is not read at all otherwise.
+fn startup_deadline_message(
+    pid: u32,
+    waited: Duration,
+    reaped: bool,
+    phase: &str,
+    last_error: &str,
+    log_tail: impl FnOnce() -> String,
+) -> String {
+    // Rounded rather than truncated: the wait is measured from after the spawn,
+    // so a 300 s budget would otherwise read as 299 s.
+    let waited = waited.as_secs_f64().round() as u64;
+    if reaped {
+        return format!(
+            "the kin daemon (pid {pid}) exited within {waited}s without becoming ready ({last_error}); \
+             recent log:\n{}",
+            log_tail()
+        );
+    }
+    let doing = phase.strip_prefix("phase: ").unwrap_or(phase);
+    format!(
+        "the kin daemon (pid {pid}) is still loading this repository after {waited}s ({doing}). \
+         It keeps running and serves this repository once it has loaded: `kin status` says \
+         whether it is ready, and `kin daemon stop` ends it. Set KIN_DAEMON_READY_TIMEOUT_SECS to \
+         wait longer"
+    )
 }
 
 /// What the caller should do about the endpoint currently recorded for a repo.
@@ -8442,12 +8883,17 @@ fn supervisor_log_tail_since(path: &Path, since_offset: u64) -> String {
         );
     }
     let lines: Vec<&str> = fresh.lines().rev().take(20).collect();
-    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+    lines
+        .into_iter()
+        .rev()
+        .map(crate::commands::commit_progress::strip_ansi)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn open_supervisor_log() -> Result<File> {
     let dir = supervisor_dir();
-    std::fs::create_dir_all(&dir)
+    kin_core::registry::create_kin_dir_all(&dir)
         .with_context(|| format!("create supervisor state directory {}", dir.display()))?;
     let log_path = supervisor_log_path();
     OpenOptions::new()
@@ -8718,11 +9164,13 @@ fn repo_display_name_for_working_dir(working_dir: &Path) -> String {
 }
 
 fn repo_id_for_kin_root(kin_root: &Path) -> Option<String> {
-    kin_root.parent().map(supervisor_repo_id_for_working_dir)
+    kin_core::layout::working_dir_of_store(kin_root)
+        .map(|working_dir| supervisor_repo_id_for_working_dir(&working_dir))
 }
 
 fn repo_display_name_for_kin_root(kin_root: &Path) -> Option<String> {
-    kin_root.parent().map(repo_display_name_for_working_dir)
+    kin_core::layout::working_dir_of_store(kin_root)
+        .map(|working_dir| repo_display_name_for_working_dir(&working_dir))
 }
 
 fn supervisor_instance_id(pid: u32, port: u16) -> String {
@@ -8790,7 +9238,8 @@ fn supervisor_route_for_repo_if_running(kin_root: &Path) -> Option<String> {
     .ok()?;
 
     let endpoint = trusted_supervisor_endpoint(&route.endpoint)?;
-    let working_dir = kin_root.parent()?;
+    let working_dir = kin_core::layout::working_dir_of_store(kin_root)?;
+    let working_dir = working_dir.as_path();
     let health: HealthResponse = client
         .get(format!("{}/health", endpoint.trim_end_matches('/')))
         .send()
@@ -8804,39 +9253,64 @@ fn supervisor_route_for_repo_if_running(kin_root: &Path) -> Option<String> {
 }
 
 async fn supervisor_route_for_repo_if_running_async(kin_root: &Path) -> Option<String> {
-    let supervisor = live_supervisor_endpoint()?;
-    let supervisor_url = format!("http://127.0.0.1:{}", supervisor.port);
-    let repo_id = repo_id_for_kin_root(kin_root)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .ok()?;
-    let route: SupervisorRouteResponse = with_supervisor_auth(client.get(format!(
+    supervisor_route_for_repo_if_running_using_client(kin_root, client, false).await
+}
+
+async fn typed_supervisor_route_for_repo_if_running_async(kin_root: &Path) -> Option<String> {
+    supervisor_route_for_repo_if_running_using_client(
+        kin_root,
+        typed_route_probe_client().ok()?,
+        true,
+    )
+    .await
+}
+
+async fn supervisor_route_for_repo_if_running_using_client(
+    kin_root: &Path,
+    client: reqwest::Client,
+    require_success: bool,
+) -> Option<String> {
+    let supervisor = live_supervisor_endpoint()?;
+    let supervisor_url = format!("http://127.0.0.1:{}", supervisor.port);
+    supervisor_route_for_repo_at(kin_root, &supervisor_url, client, require_success).await
+}
+
+async fn supervisor_route_for_repo_at(
+    kin_root: &Path,
+    supervisor_url: &str,
+    client: reqwest::Client,
+    require_success: bool,
+) -> Option<String> {
+    let repo_id = repo_id_for_kin_root(kin_root)?;
+    let response = with_supervisor_auth(client.get(format!(
         "{}/repos/{}/route",
         supervisor_url.trim_end_matches('/'),
         urlencoding::encode(&repo_id)
     )))
     .send()
     .await
-    .ok()?
-    .error_for_status()
-    .ok()?
-    .json()
-    .await
     .ok()?;
+    if require_success && !response.status().is_success() {
+        return None;
+    }
+    let route: SupervisorRouteResponse = response.error_for_status().ok()?.json().await.ok()?;
 
     let endpoint = trusted_supervisor_endpoint(&route.endpoint)?;
-    let working_dir = kin_root.parent()?;
-    let health: HealthResponse = client
+    let working_dir = kin_core::layout::working_dir_of_store(kin_root)?;
+    let working_dir = working_dir.as_path();
+    let response = client
         .get(format!("{}/health", endpoint.trim_end_matches('/')))
         .send()
         .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
         .ok()?;
+    if require_success && !response.status().is_success() {
+        return None;
+    }
+    let health: HealthResponse = response.error_for_status().ok()?.json().await.ok()?;
     validate_health_repo(&health, working_dir).ok()?;
     Some(endpoint)
 }
@@ -8847,9 +9321,9 @@ async fn register_repo_daemon_with_supervisor(
     supervisor_url: &str,
     spawned_here: bool,
 ) -> Result<()> {
-    let working_dir = kin_root
-        .parent()
+    let working_dir = kin_core::layout::working_dir_of_store(kin_root)
         .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
+    let working_dir = working_dir.as_path();
     let health: HealthResponse = daemon_health_client()
         .get(format!("{daemon_url}/health"))
         .send()
@@ -8964,12 +9438,7 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
         })
     }
 
-    /// The route `kin doctor`'s `daemon_running` check reports from, verbatim.
-    ///
-    /// Sharing the function rather than reimplementing the lookup is the whole
-    /// point: MCP and `kin doctor` can no longer answer opposite things about
-    /// the same repository at the same instant, because there is only one
-    /// answer to give.
+    /// Preserve the legacy optional supervisor/explicit route API.
     fn route_if_running(
         &self,
         kin_root: PathBuf,
@@ -8977,6 +9446,25 @@ impl kin_daemon_spawn::DaemonSpawnRegistrar for CliSpawnRegistrar {
         Box::pin(
             async move { resolve_daemon_url_if_running_async(&KinLayout::new(kin_root)).await },
         )
+    }
+
+    fn reading_if_running(
+        &self,
+        kin_root: PathBuf,
+        budget: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kin_daemon_spawn::RunningDaemonRouteReading> + Send>,
+    > {
+        Box::pin(async move {
+            let layout = KinLayout::new(kin_root);
+            running_daemon_route_reading_within(
+                &layout,
+                budget,
+                std::env::var("KIN_DAEMON_URL").ok(),
+                typed_supervisor_route_for_repo_if_running_async(layout.root()),
+            )
+            .await
+        })
     }
 }
 
@@ -9017,7 +9505,7 @@ async fn ensure_daemon_running_inner(
         .await
         .map_err(map_supervisor_auto_start_error)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(&base_url).await?;
+        attach_to_existing_daemon(kin_root, &base_url).await?;
         return Ok(base_url);
     }
 
@@ -9026,7 +9514,7 @@ async fn ensure_daemon_running_inner(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(&base_url).await?;
+            attach_to_existing_daemon(kin_root, &base_url).await?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -9039,7 +9527,7 @@ async fn ensure_daemon_running_inner(
         .await
         .map_err(AutoStartError::spawn)?;
     if let Some(base_url) = supervisor_route_for_repo(kin_root, &supervisor_url).await {
-        attach_to_existing_daemon(&base_url).await?;
+        attach_to_existing_daemon(kin_root, &base_url).await?;
         return Ok(base_url);
     }
     match wait_for_existing_daemon(kin_root).await {
@@ -9047,7 +9535,7 @@ async fn ensure_daemon_running_inner(
             register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url, false)
                 .await
                 .map_err(AutoStartError::spawn)?;
-            attach_to_existing_daemon(&base_url).await?;
+            attach_to_existing_daemon(kin_root, &base_url).await?;
             return Ok(base_url);
         }
         ExistingDaemon::Starting(message) | ExistingDaemon::LiveNotReady(message) => {
@@ -9073,9 +9561,9 @@ async fn ensure_daemon_running_inner(
     let _install_spawn_fence =
         crate::commands::update::InstallSpawnFence::acquire_for_daemon_binary(&daemon_bin)
             .map_err(AutoStartError::spawn)?;
-    let working_dir = kin_root
-        .parent()
+    let working_dir = kin_core::layout::working_dir_of_store(kin_root)
         .ok_or_else(|| AutoStartError::InvalidLayout("no parent".to_string()))?;
+    let working_dir = working_dir.as_path();
 
     // The daemon owns port selection: it binds :0 and reports the real bound
     // port via the port file. Passing 0 (rather than a port we reserve here)
@@ -9091,6 +9579,8 @@ async fn ensure_daemon_running_inner(
     let plan = kin_daemon_spawn::DaemonSpawnPlan {
         daemon_bin,
         working_dir: working_dir.to_path_buf(),
+        store_root: kin_core::layout::read_working_tree_record(kin_root)
+            .map(|_| kin_root.to_path_buf()),
         idle_timeout_secs: resolve_idle_timeout_env(
             user_timeout_set,
             idle_timeout_override,
@@ -9228,6 +9718,165 @@ pub async fn resolve_daemon_url_if_running_async(layout: &KinLayout) -> Option<S
     supervisor_route_for_repo_if_running_async(layout.root()).await
 }
 
+/// Requests made by the typed observer never follow redirects. The legacy
+/// health/supervisor clients retain their existing behavior.
+fn typed_route_probe_client() -> std::result::Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_millis(500))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// Typed delegate resolution retains the legacy optional route API while
+/// requiring readiness and repository identity before certifying a new route.
+/// Reserve two thirds of the caller's budget for the recorded-endpoint probe;
+/// a slow supervisor must not hide a serving standalone daemon.
+async fn running_daemon_route_reading_within(
+    layout: &KinLayout,
+    budget: Duration,
+    configured_url: Option<String>,
+    supervisor_route: impl std::future::Future<Output = Option<String>>,
+) -> kin_daemon_spawn::RunningDaemonRouteReading {
+    use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+    if budget.is_zero() {
+        return Reading::Unresolved {
+            detail: "the route probe has no remaining budget".to_string(),
+        };
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    if let Some(url) = configured_url {
+        return probe_running_route_within(layout.root(), &url, budget).await;
+    }
+    let supervisor = tokio::time::timeout(budget / 3, supervisor_route).await;
+    if let Ok(Some(url)) = &supervisor {
+        return probe_running_route_within(
+            layout.root(),
+            url,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+    }
+    // Observe the recorded generation without retiring stale records or
+    // acquiring startup/lifecycle locks. Cleanup belongs to the startup path.
+    let recorded = daemon_endpoint_snapshot(layout.root());
+    let endpoint = match (recorded.pid, recorded.port) {
+        (Some(pid), Some(port)) => {
+            if endpoint_owner_liveness(layout.root(), pid).authorizes_cleanup() {
+                return Reading::Unresolved {
+                    detail: "the recorded endpoint publisher is no longer current; this read-only probe left its records unchanged".to_string(),
+                };
+            }
+            LiveDaemonEndpoint { pid, port }
+        }
+        (None, None)
+            if supervisor.is_ok()
+                && !recorded.pid_exists
+                && !recorded.port_exists
+                && !repo_daemon_owner_path(layout.root()).exists() =>
+        {
+            return Reading::Absent
+        }
+        _ => return Reading::Unresolved {
+            detail:
+                "no complete live repository endpoint or validated supervisor route was established"
+                    .to_string(),
+        },
+    };
+    let client = match typed_route_probe_client() {
+        Ok(client) => client,
+        Err(detail) => return Reading::Unresolved { detail },
+    };
+    let warming = std::sync::Arc::new(AtomicBool::new(false));
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let verdict = tokio::time::timeout(
+        remaining,
+        probe_daemon_endpoint_with_warming_signal_using_client(
+            layout.root(),
+            endpoint,
+            remaining,
+            warming.clone(),
+            None,
+            client,
+            true,
+        ),
+    )
+    .await;
+    match verdict {
+        Ok(EndpointVerdict::Serving(url)) => probe_running_route_within(
+            layout.root(), &url,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        ).await,
+        Ok(EndpointVerdict::Invalid(detail)) => Reading::Unresolved { detail },
+        Ok(EndpointVerdict::LiveNotReady { detail, warming, .. }) => Reading::NotReady { detail, warming },
+        Err(_) => Reading::NotReady {
+            detail: format!("recorded daemon pid {} at loopback port {} has not established readiness for this repository within the probe budget", endpoint.pid, endpoint.port),
+            warming: warming.load(Ordering::Relaxed),
+        },
+    }
+}
+
+/// Explicit URLs keep their legacy behavior in the optional API. The typed
+/// delegate API certifies only loopback routes whose readiness and health
+/// responses identify this repository; it never promotes an unchecked override.
+async fn probe_running_route_within(
+    kin_root: &Path,
+    url: &str,
+    budget: Duration,
+) -> kin_daemon_spawn::RunningDaemonRouteReading {
+    use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+    let Some(url) = trusted_supervisor_endpoint(url) else {
+        return Reading::Unresolved {
+            detail: "the configured route is not a trusted loopback endpoint".to_string(),
+        };
+    };
+    let Some(working_dir) = kin_core::layout::working_dir_of_store(kin_root) else {
+        return Reading::Unresolved {
+            detail: "the repository store has no working directory".to_string(),
+        };
+    };
+    let probe = async {
+        let client = typed_route_probe_client()?;
+        let response = client
+            .get(format!("{}/readiness", url.trim_end_matches('/')))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let readiness = response
+            .json::<ReadinessResponse>()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !status.is_success() || !readiness.ready || readiness.warming {
+            return Ok(Reading::NotReady {
+                detail: format!(
+                    "readiness returned HTTP {status} (ready={}, warming={})",
+                    readiness.ready, readiness.warming
+                ),
+                warming: readiness.warming,
+            });
+        }
+        Ok(
+            match probe_health_for_repo_with_policy(&client, &url, kin_root, &working_dir, true)
+                .await
+            {
+                HealthProbe::Matches => Reading::Serving(url),
+                HealthProbe::Rejected(detail) | HealthProbe::Unanswered(detail) => {
+                    Reading::Unresolved { detail }
+                }
+            },
+        )
+    };
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(reading)) => reading,
+        Ok(Err(detail)) => Reading::Unresolved { detail },
+        Err(_) => Reading::Unresolved {
+            detail: "the route readiness/identity probe exceeded its budget".to_string(),
+        },
+    }
+}
+
 /// What this repository's own record says about its daemon, when supervisor
 /// resolution produced no endpoint.
 ///
@@ -9335,7 +9984,7 @@ pub fn daemon_required_error(command: &str, layout: &KinLayout) -> anyhow::Error
         "KIN_NO_DAEMON is set and no kin daemon is already running for {}, so there is no \
          repository authority to answer {command}; unset KIN_NO_DAEMON and re-run, and kin will \
          start one",
-        layout.root().display()
+        layout.working_dir().display()
     )
 }
 
@@ -9443,12 +10092,13 @@ async fn resolve_daemon_url_inner(
         // named once so neither side can reword it and disarm this.
         Err(err) => {
             let detail = err.to_string();
+            // The store's own setting is read too, because a repository that
+            // switched enrichment off runs no sweep to turn off, and offering
+            // the environment switch there is a lever already pulled.
             let state = if detail.contains(kin_daemon_spawn::ENRICHMENT_UNAVAILABLE_MARKER) {
                 kin_daemon_spawn::EnrichmentState::Unavailable
-            } else if kin_daemon_spawn::enrichment_disabled() {
-                kin_daemon_spawn::EnrichmentState::AlreadyDisabled
             } else {
-                kin_daemon_spawn::EnrichmentState::Available
+                kin_core::enrichment_setting::state_for(layout)
             };
             let mut headline = match kin_daemon_spawn::peek_unwatched_daemon_death(layout.root()) {
                 Some(record) => {
@@ -9491,6 +10141,59 @@ pub(crate) mod urlencoding {
 
 #[cfg(test)]
 mod tests {
+    /// A commit that started its daemon does not wait for the startup catch-up,
+    /// because that catch-up stands down for the commit's own announcement and
+    /// the two would wait on each other until the patience ran out. Any other
+    /// command still waits, including one running beside another process's
+    /// commit.
+    ///
+    /// Falsify by dropping the `waits_for_startup_catch_up` check from
+    /// `await_startup_catch_up`: `kin commit` after an edit made while no daemon
+    /// ran then takes `STARTUP_CATCH_UP_PATIENCE` (30 s) instead of about one,
+    /// which `entity_file_retirement`'s plain-file deletion measures end to end.
+    #[test]
+    fn only_this_processs_own_commit_skips_the_startup_catch_up_wait() {
+        let kin_root = tempfile::tempdir().expect("kin root");
+        assert!(
+            super::waits_for_startup_catch_up(kin_root.path()),
+            "a command with no commit announced waits for a current graph"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs();
+        kin_daemon_spawn::write_approaching_commit(
+            kin_root.path(),
+            &kin_daemon_spawn::ApproachingCommit {
+                pid: std::process::id().wrapping_add(1),
+                announced_unix: now,
+            },
+        );
+        assert!(
+            super::waits_for_startup_catch_up(kin_root.path()),
+            "another process's commit does not make this command a commit"
+        );
+
+        kin_daemon_spawn::write_approaching_commit(
+            kin_root.path(),
+            &kin_daemon_spawn::ApproachingCommit {
+                pid: std::process::id(),
+                announced_unix: now,
+            },
+        );
+        assert!(
+            !super::waits_for_startup_catch_up(kin_root.path()),
+            "this process's own commit admits the working copy itself"
+        );
+
+        kin_daemon_spawn::clear_approaching_commit(kin_root.path());
+        assert!(
+            super::waits_for_startup_catch_up(kin_root.path()),
+            "a withdrawn announcement leaves the wait in place"
+        );
+    }
+
     /// FIR-3037. A degraded daemon is announced when its state CHANGES, not on
     /// every call.
     ///
@@ -10640,6 +11343,72 @@ mod tests {
         );
     }
 
+    /// The tail a caller is shown is plain text, whatever wrote the log. An
+    /// older daemon coloured its log, and those bytes reached `kin init --json`
+    /// through the startup failure it quoted.
+    #[test]
+    fn daemon_log_tail_since_strips_terminal_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            daemon_log_path(dir.path()),
+            "\u{1b}[2m2026-10-10T19:00:00Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+             \u{1b}[2mkin_daemon::state\u{1b}[0m\u{1b}[2m:\u{1b}[0m opened repository authority\n",
+        )
+        .unwrap();
+        let tail = daemon_log_tail_since(dir.path(), 0);
+        assert!(!tail.contains('\u{1b}'), "{tail:?}");
+        assert!(
+            tail.contains("INFO") && tail.contains("opened repository authority"),
+            "{tail:?}"
+        );
+    }
+
+    /// A daemon still loading at the deadline is described, not dumped: which
+    /// process, what it is doing, and how to check on it. Its log is not even
+    /// read, because a slow load has nothing in it the reader needs. A daemon
+    /// that exited keeps its log, which is the one account of why.
+    #[test]
+    fn a_missed_readiness_deadline_explains_a_loading_daemon_and_quotes_only_a_dead_ones_log() {
+        let loading = startup_deadline_message(
+            4242,
+            Duration::from_secs(300),
+            false,
+            "phase: the daemon process is up and loading the repository graph",
+            "daemon did not report its port",
+            || panic!("a daemon still loading has its log left alone"),
+        );
+        assert!(
+            loading.starts_with(
+                "the kin daemon (pid 4242) is still loading this repository after 300s"
+            ),
+            "{loading}"
+        );
+        assert!(
+            loading.contains("(the daemon process is up and loading the repository graph)")
+                && loading.contains("`kin status` says whether it is ready")
+                && loading.contains("`kin daemon stop`")
+                && loading.contains("KIN_DAEMON_READY_TIMEOUT_SECS"),
+            "{loading}"
+        );
+        assert!(
+            !loading.contains("recent log") && !loading.contains('\n'),
+            "{loading}"
+        );
+
+        let exited = startup_deadline_message(
+            4242,
+            Duration::from_secs(300),
+            true,
+            "phase: resolving or spawning the repo daemon process",
+            "daemon did not report its port",
+            || "ERROR incompatible graph schema version".to_string(),
+        );
+        assert!(
+            exited.contains("exited") && exited.contains("incompatible graph schema version"),
+            "{exited}"
+        );
+    }
+
     // ── A busy daemon must never be treated as a dead one ─────────────────
     //
     // The deadlock chain started here. A daemon that did not answer readiness
@@ -11052,6 +11821,458 @@ mod tests {
             }
         });
         (port, server)
+    }
+
+    async fn spawn_typed_route_redirect_fixture(
+        repo: &Path,
+        redirect_at: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let target = axum::Router::new().fallback(move || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                "redirect target"
+            }
+        });
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}", target_listener.local_addr().unwrap());
+        let target_server = tokio::spawn(async move {
+            axum::serve(target_listener, target).await.unwrap();
+        });
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_url = format!("http://{}", origin_listener.local_addr().unwrap());
+        let endpoint = origin_url.clone();
+        let repo_root = strict_canonical_path(repo).unwrap();
+        let origin = axum::Router::new().fallback(
+            move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+                let target_url = target_url.clone();
+                let endpoint = endpoint.clone();
+                let repo_root = repo_root.clone();
+                async move {
+                    let surface = if uri.path().ends_with("/route") {
+                        "route"
+                    } else if uri.path() == "/health" {
+                        "health"
+                    } else {
+                        "readiness"
+                    };
+                    let body = match surface {
+                        "route" => serde_json::json!({"endpoint": endpoint}),
+                        "health" => serde_json::json!({
+                            "status": "ok", "version": "test", "uptime_seconds": 0,
+                            "graph_entity_count": 0, "graph_loaded": true,
+                            "reconciliation_status": "idle", "repo_root": repo_root,
+                            "pid": std::process::id(),
+                        }),
+                        _ => serde_json::json!({"ready": true, "warming": false}),
+                    }
+                    .to_string();
+                    let redirect = surface == redirect_at;
+                    let mut response = axum::http::Response::builder()
+                        .status(if redirect {
+                            axum::http::StatusCode::FOUND
+                        } else {
+                            axum::http::StatusCode::OK
+                        })
+                        .header(axum::http::header::CONTENT_TYPE, "application/json");
+                    if redirect {
+                        response = response.header(axum::http::header::LOCATION, target_url);
+                    }
+                    response.body(axum::body::Body::from(body)).unwrap()
+                }
+            },
+        );
+        let origin_server = tokio::spawn(async move {
+            axum::serve(origin_listener, origin).await.unwrap();
+        });
+        (origin_url, requests, origin_server, target_server)
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_configured_probes_never_follow_or_certify_redirects() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let root = repo.join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        for surface in ["readiness", "health"] {
+            let (url, requests, origin, target) =
+                spawn_typed_route_redirect_fixture(&repo, surface).await;
+            let reading = running_daemon_route_reading_within(
+                &KinLayout::new(root.clone()),
+                Duration::from_millis(150),
+                Some(url),
+                std::future::pending(),
+            )
+            .await;
+            origin.abort();
+            target.abort();
+            assert!(
+                !matches!(reading, Reading::Serving(_)),
+                "a redirected {surface} cannot certify readiness: {reading:?}"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "configured {surface} probe followed a redirect"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_recorded_probes_never_follow_or_certify_redirects() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let root = repo.join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        for surface in ["readiness", "health"] {
+            let (url, requests, origin, target) =
+                spawn_typed_route_redirect_fixture(&repo, surface).await;
+            let port = url.rsplit(':').next().unwrap().parse().unwrap();
+            write_attributed_endpoint_files(&root, current_process_identity().unwrap(), port);
+            let before = endpoint_file_bytes(&root);
+            let reading = running_daemon_route_reading_within(
+                &KinLayout::new(root.clone()),
+                Duration::from_millis(80),
+                None,
+                async { None },
+            )
+            .await;
+            origin.abort();
+            target.abort();
+            assert!(
+                !matches!(reading, Reading::Serving(_)),
+                "a redirected recorded {surface} cannot certify readiness: {reading:?}"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "recorded {surface} probe followed a redirect"
+            );
+            assert_eq!(endpoint_file_bytes(&root), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_supervisor_probes_never_follow_or_accept_redirects() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let root = repo.join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        for surface in ["route", "health"] {
+            let (url, requests, origin, target) =
+                spawn_typed_route_redirect_fixture(&repo, surface).await;
+            let route = supervisor_route_for_repo_at(
+                &root,
+                &url,
+                typed_route_probe_client().unwrap(),
+                true,
+            )
+            .await;
+            origin.abort();
+            target.abort();
+            assert_eq!(
+                route, None,
+                "a redirected supervisor {surface} response cannot establish a route"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "supervisor {surface} probe followed a redirect"
+            );
+        }
+    }
+
+    async fn spawn_route_readiness_response(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let app = axum::Router::new().route(
+            "/readiness",
+            axum::routing::get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (status, body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, requests, server)
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_never_retires_a_stale_generation() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        write_attributed_endpoint_files(&root, recycled_identity_for_this_process(), 51000);
+        let before = endpoint_file_bytes(&root);
+        let reading = running_daemon_route_reading_within(
+            &KinLayout::new(root.clone()),
+            Duration::from_millis(200),
+            None,
+            async { None },
+        )
+        .await;
+        assert!(matches!(reading, Reading::Unresolved { .. }), "{reading:?}");
+        assert_eq!(endpoint_file_bytes(&root), before);
+        assert!(
+            !root.join("daemon.lifecycle").exists() && !root.join("daemon.lock").exists(),
+            "a read-only route probe must not create coordination files"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_refuses_redirected_certification_without_following_it() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let (target, requests, target_server) = spawn_route_readiness_response(
+            axum::http::StatusCode::OK,
+            r#"{"ready":true,"warming":false}"#,
+        )
+        .await;
+        let location = format!("{target}/readiness");
+        let app = axum::Router::new().route(
+            "/readiness",
+            axum::routing::get(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let source_server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let reading = probe_running_route_within(&root, &url, Duration::from_millis(300)).await;
+        source_server.abort();
+        target_server.abort();
+        assert!(matches!(reading, Reading::Unresolved { .. }), "{reading:?}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "typed certification must never follow a redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_finds_a_standalone_daemon_and_preserves_records() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let root = repo.join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_repo_daemon_health(listener, &repo);
+        write_attributed_endpoint_files(&root, current_process_identity().unwrap(), port);
+        let before = endpoint_file_bytes(&root);
+        let reading = running_daemon_route_reading_within(
+            &KinLayout::new(root.clone()),
+            Duration::from_millis(500),
+            None,
+            async { None },
+        )
+        .await;
+        assert_eq!(
+            reading,
+            Reading::Serving(format!("http://127.0.0.1:{port}"))
+        );
+        let despite_slow_supervisor = running_daemon_route_reading_within(
+            &KinLayout::new(root.clone()),
+            Duration::from_millis(500),
+            None,
+            std::future::pending(),
+        )
+        .await;
+        server.abort();
+        assert_eq!(
+            despite_slow_supervisor,
+            Reading::Serving(format!("http://127.0.0.1:{port}"))
+        );
+        assert_eq!(
+            endpoint_file_bytes(&root),
+            before,
+            "a valid standalone route is never retired"
+        );
+    }
+
+    fn endpoint_file_bytes(root: &Path) -> Vec<Vec<u8>> {
+        [
+            root.join("daemon.pid"),
+            root.join("daemon.port"),
+            repo_daemon_owner_path(root),
+        ]
+        .into_iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_keeps_warming_distinct_from_absent_within_budget() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let (url, _, server) = spawn_route_readiness_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"ready":false,"warming":true,"progress":"opening synthetic authority"}"#,
+        )
+        .await;
+        let port = url.rsplit(':').next().unwrap().parse().unwrap();
+        write_attributed_endpoint_files(&root, current_process_identity().unwrap(), port);
+        let before = endpoint_file_bytes(&root);
+        let started = Instant::now();
+        let reading = running_daemon_route_reading_within(
+            &KinLayout::new(root.clone()),
+            Duration::from_millis(80),
+            None,
+            async { None },
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(reading, Reading::NotReady { warming: true, .. }),
+            "{reading:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            endpoint_file_bytes(&root),
+            before,
+            "warming endpoints must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_absence_and_supervisor_timeout_are_different() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let layout = KinLayout::new(root.clone());
+        assert_eq!(
+            running_daemon_route_reading_within(&layout, Duration::from_millis(60), None, async {
+                None
+            },)
+            .await,
+            Reading::Absent
+        );
+        let reading = running_daemon_route_reading_within(
+            &layout,
+            Duration::from_millis(60),
+            None,
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(reading, Reading::Unresolved { .. }), "{reading:?}");
+        std::fs::write(root.join("daemon.pid"), std::process::id().to_string()).unwrap();
+        let incomplete =
+            running_daemon_route_reading_within(&layout, Duration::from_millis(60), None, async {
+                None
+            })
+            .await;
+        assert!(
+            matches!(incomplete, Reading::Unresolved { .. }),
+            "a PID without its port is not absence: {incomplete:?}"
+        );
+        std::fs::write(root.join("daemon.pid"), "not-a-pid").unwrap();
+        std::fs::write(root.join("daemon.port"), "not-a-port").unwrap();
+        let malformed =
+            running_daemon_route_reading_within(&layout, Duration::from_millis(60), None, async {
+                None
+            })
+            .await;
+        assert!(
+            matches!(malformed, Reading::Unresolved { .. }),
+            "malformed endpoint records are uncertainty: {malformed:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.pid")).unwrap(),
+            "not-a-pid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.port")).unwrap(),
+            "not-a-port"
+        );
+        let no_budget = running_daemon_route_reading_within(
+            &layout,
+            Duration::ZERO,
+            None,
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(no_budget, Reading::Unresolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_does_not_certify_untrusted_or_wrong_repository_urls() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let mine = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = mine.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        for url in ["https://example.invalid:443", "", "file:///tmp/daemon"] {
+            let reading = probe_running_route_within(&root, url, Duration::from_millis(100)).await;
+            assert!(
+                matches!(reading, Reading::Unresolved { .. }),
+                "{url}: {reading:?}"
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = serve_repo_daemon_health(listener, other.path());
+        let reading = probe_running_route_within(&root, &url, Duration::from_millis(500)).await;
+        server.abort();
+        assert!(
+            matches!(reading, Reading::Unresolved { .. }),
+            "a different repository cannot authorize routing: {reading:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_route_reading_requires_readiness_even_when_health_would_match() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kin");
+        std::fs::create_dir(&root).unwrap();
+        let (url, _, server) = spawn_route_readiness_response(
+            axum::http::StatusCode::OK,
+            r#"{"ready":false,"warming":true}"#,
+        )
+        .await;
+        let reading = probe_running_route_within(&root, &url, Duration::from_millis(200)).await;
+        server.abort();
+        assert!(
+            matches!(reading, Reading::NotReady { warming: true, .. }),
+            "{reading:?}"
+        );
     }
 
     fn serve_repo_daemon_health(
@@ -13222,6 +14443,63 @@ mod tests {
         );
     }
 
+    /// A copied in-tree store carries its source's ids and its source daemon's
+    /// endpoint. While that daemon runs, it answers the copy's probe with
+    /// matching ids and the source's directory, which exists. That daemon
+    /// serves the source, so the copy must not be routed to it. A root that
+    /// resolves to this directory, or that does not resolve at all, still
+    /// leaves the ids to decide.
+    #[test]
+    fn a_daemon_serving_the_source_of_a_copied_store_is_not_the_copys() {
+        let manifest = serde_json::json!({
+            "kin_version": "test",
+            "repo_id": "11111111-1111-4111-8111-111111111111",
+            "workspace_id": "22222222-2222-4222-8222-222222222222",
+            "created_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string();
+        let source = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        for tree in [source.path(), copy.path()] {
+            std::fs::create_dir_all(tree.join(".kin")).unwrap();
+            std::fs::write(tree.join(".kin/manifest.json"), &manifest).unwrap();
+        }
+        let ids = (
+            Some("11111111-1111-4111-8111-111111111111"),
+            Some("22222222-2222-4222-8222-222222222222"),
+        );
+        let source_daemon = health_naming(
+            ids.0,
+            ids.1,
+            Some(strict_canonical_path(source.path()).unwrap()),
+        );
+        assert!(matches!(
+            classify_health_repo(&source_daemon, &copy.path().join(".kin"), copy.path()),
+            RepoIdentity::Rejected(ref reason) if reason.contains("a different checkout")
+        ));
+        // The same daemon is the source's own.
+        assert_eq!(
+            classify_health_repo(&source_daemon, &source.path().join(".kin"), source.path()),
+            RepoIdentity::Matches
+        );
+        // A root this copy's directory resolves to is this copy's daemon.
+        let own = health_naming(ids.0, ids.1, Some(copy.path().display().to_string()));
+        assert_eq!(
+            classify_health_repo(&own, &copy.path().join(".kin"), copy.path()),
+            RepoIdentity::Matches
+        );
+        // A daemon that reports no repository id is judged the same way.
+        let legacy = health_naming(
+            None,
+            ids.1,
+            Some(strict_canonical_path(source.path()).unwrap()),
+        );
+        assert!(matches!(
+            classify_health_repo(&legacy, &copy.path().join(".kin"), copy.path()),
+            RepoIdentity::Rejected(_)
+        ));
+    }
+
     #[test]
     fn workspace_identity_decides_local_authority_within_a_repository() {
         // Repository identity proves shared history, not local endpoint
@@ -14938,7 +16216,12 @@ mod tests {
 
     #[test]
     fn the_one_endpointless_resolution_names_the_variable_that_caused_it() {
-        let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
+        // The store lives outside the working tree by default. The refusal
+        // names the repository, which is the tree, not the store directory.
+        let layout = KinLayout::external(
+            std::path::PathBuf::from("/tmp/kin-fixture-store"),
+            std::path::PathBuf::from("/tmp/kin-fixture-repo"),
+        );
         let message = daemon_required_error("commit", &layout).to_string();
         assert!(
             message.contains("KIN_NO_DAEMON"),
@@ -14947,6 +16230,10 @@ mod tests {
         assert!(
             message.contains("/tmp/kin-fixture-repo"),
             "the repository with no authority is the subject: {message}"
+        );
+        assert!(
+            !message.contains("/tmp/kin-fixture-store"),
+            "the store directory is not the repository: {message}"
         );
         assert!(
             message.contains("commit"),

@@ -622,7 +622,7 @@ fn unique_tmp_path(path: &Path, seq: u64) -> PathBuf {
 fn write_file_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    kin_blobs::durable::sync_all(&file)?;
     Ok(())
 }
 
@@ -659,7 +659,7 @@ fn write_and_promote(path: &Path, bytes: &[u8]) -> Result<(), SearchError> {
 fn sync_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+            let _ = kin_blobs::durable::sync_all(&dir);
         }
     }
 }
@@ -766,7 +766,7 @@ fn written_image_unreadable(error: SearchError) -> SearchError {
 fn unmapped_read_refused(what: &str) -> SearchError {
     SearchError::IndexError(format!(
         "the text index image the last commit published could not be mapped back, so {what} \
-         is refused until it maps again; every read retries once the image's files are readable"
+         is refused until it maps again; every read retries mapping the committed index image"
     ))
 }
 

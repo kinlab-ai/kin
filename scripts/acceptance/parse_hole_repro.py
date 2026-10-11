@@ -319,6 +319,9 @@ class Suite(object):
         self.kin_home = os.path.join(workdir, "kin-home-%d" % os.getpid())
         os.makedirs(self.kin_home, exist_ok=True)
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         # A scratch KIN_HOME keeps this run off the fleet's stores and the
         # auto-embed opt-out keeps it off the GPU. Neither is a nicety: this
         # suite is meant to run on every pull request beside other work.
@@ -326,6 +329,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:

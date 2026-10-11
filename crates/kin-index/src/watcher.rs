@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use kin_io::WorktreeRoot;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{IndexError, Result};
+
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 /// Events emitted by the file watcher.
 #[derive(Debug, Clone)]
@@ -32,9 +39,14 @@ pub struct EventsOutsideRoot {
     pub last_path: Option<PathBuf>,
 }
 
-/// A watcher backend's own report that it lost events.
+/// What a watcher knows it lost: its backend's own reports, and the delivery
+/// probes of its own that never came back.
 ///
-/// Both backends spell this the same way and neither spelling survives
+/// The second exists because the first is not reliable. See [`DeliveryCanary`]
+/// for the measured case where FSEvents dropped most of a stream's events and
+/// reported none of it.
+///
+/// Both backends spell a report the same way and neither spelling survives
 /// classification. notify 8.2 emits `EventKind::Other` carrying the `Rescan`
 /// flag and NO paths at all, from `inotify.rs` when the kernel queue overflows
 /// and from `fsevent.rs` on `MUST_SCAN_SUBDIRS`. `classify_event` filters
@@ -48,19 +60,21 @@ pub struct EventsOutsideRoot {
 /// before classification. Placing it one line later is the whole defect.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LostEvents {
-    /// How many loss signals this watcher has reported.
+    /// How many loss signals this watcher has recorded, reported by its backend
+    /// or found by its own delivery probes.
     ///
     /// Monotonic within one watcher's life and reset with it, because a new
     /// `FileWatcher` is a new backend registration that has observed nothing.
     /// The generation a store recovers against is durable and lives in the
     /// daemon; it advances from rises in this one and never restarts.
     pub generation: u64,
-    /// The backend's own hint for the most recent loss, when it gave one.
+    /// The cause of the most recent loss, when one is known.
     ///
     /// FSEvents distinguishes a user-dropped queue from a kernel-dropped one
     /// and passes the distinction through `Event::info`; inotify's overflow
     /// carries nothing. Held rather than derived so a report names the cause
-    /// the backend named instead of guessing at it.
+    /// the backend named instead of guessing at it. A loss the watcher found
+    /// itself names the probe that did not come back.
     pub last_reason: Option<String>,
 }
 
@@ -103,7 +117,7 @@ impl RepositoryRoots {
         // path is resolved the way admission resolves it and asked again. The
         // leaf is preserved: a removal names a path that no longer exists, and
         // an event about a symbolic link is about the link and not its target.
-        let resolved = crate::canonicalize_host_parent_preserving_leaf(path).ok()?;
+        let resolved = crate::repository::canonicalize_parent_preserving_leaf(path).ok()?;
         self.strip(&resolved)
     }
 
@@ -185,25 +199,176 @@ fn record_lost_events(lost: &Mutex<LostEvents>, event: &Event) -> bool {
     true
 }
 
-/// An excluded control-file event proves delivery through this watcher's callback.
+/// Record a loss the backend did not report, found by this watcher's own probe.
+///
+/// The same record a backend rescan advances, so everything downstream that
+/// recovers a rescan recovers this too, through the same durable generation and
+/// the same complete exact-tree admission.
+///
+/// Loud on the first of a run and quiet after it, unlike
+/// [`record_lost_events`]. A backend emits a rescan once per overflow, but a host
+/// that stays saturated loses a canary every few seconds for as long as it stays
+/// saturated, and a warning for each would bury the one that explains the
+/// daemon.
+fn record_unreported_loss(lost: &Mutex<LostEvents>, reason: String, loud: bool) {
+    let mut recorded = lost.lock().unwrap_or_else(PoisonError::into_inner);
+    recorded.generation = recorded.generation.saturating_add(1);
+    if loud {
+        warn!(
+            generation = recorded.generation,
+            reason = %reason,
+            "the filesystem watcher's own delivery probe never came back; the backend is \
+             dropping events without reporting a loss, so ambient admission cannot know what \
+             changed and only a complete exact-tree admission can"
+        );
+    } else {
+        debug!(
+            generation = recorded.generation,
+            reason = %reason,
+            "another delivery probe was lost in the same run"
+        );
+    }
+    recorded.last_reason = Some(reason);
+}
+
+/// How a running watcher samples its callback service.
+///
+/// A backend's own loss report is not enough. Measured on macOS 26 with fseventsd
+/// saturated by other processes' churn, an FSEvents stream lost more than nine in
+/// ten of its events for seconds at a time and set none of `MustScanSubDirs`,
+/// `UserDropped` or `KernelDropped` on anything it did deliver. The lost writes
+/// never reached the FSEvents on-disk history either, so no replay from a
+/// remembered event id can bring them back. A watcher that waits for the backend
+/// to confess waits forever, and every edit made in that window is never
+/// admitted.
+///
+/// So the watcher samples delivery itself. It writes a private canary into the
+/// store's control directory, which is excluded control IO and never repository
+/// source, and expects that exact write back through its own callback within
+/// `bound`. A canary that does not come back is recorded exactly like a backend
+/// rescan, and the caller recovers it the same way: a complete exact-tree
+/// admission covers whatever else the backend dropped.
+///
+/// Sampling, not proof of complete recursive delivery. An external control
+/// watch shares the backend and callback with the workspace watch, but its
+/// acknowledgment does not prove delivery for another watched path. A drop
+/// between samples, or one confined to another path, can remain unseen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryCanary {
+    /// How long after one canary is acknowledged the next is written.
+    pub period: Duration,
+    /// How long a written canary may go unacknowledged before its loss is
+    /// recorded.
+    pub bound: Duration,
+}
+
+impl Default for DeliveryCanary {
+    /// Two seconds between canaries and five for each to come back.
+    ///
+    /// The bound sits above the slowest delivery measured on a saturated host,
+    /// about four seconds, so a slow backend is not mistaken for a lossy one. On
+    /// an ordinary host a canary comes back in milliseconds.
+    fn default() -> Self {
+        Self {
+            period: Duration::from_secs(2),
+            bound: Duration::from_secs(5),
+        }
+    }
+}
+
+/// What one [`FileWatcher::verify_delivery`] call found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryCheck {
+    /// This watcher has nowhere private to write a canary, so its delivery
+    /// cannot be sampled.
+    Unverifiable,
+    /// No canary is outstanding and the next one is not due yet.
+    Idle,
+    /// A canary is written and still inside its bound.
+    Pending,
+    /// The outstanding canary came back through the live callback.
+    Verified,
+    /// The outstanding canary did not come back within its bound, and a loss
+    /// was recorded.
+    Lost,
+}
+
+/// The control-file probes one watcher writes, and the one it is waiting for.
+///
+/// Readiness and every later canary share one name prefix, so the callback
+/// excludes all of them from classification, including a late echo of a probe
+/// the watcher has stopped waiting for.
 struct DeliveryProbe {
-    relative_path: PathBuf,
-    acknowledged: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The probe's path scope, distinct from source-event classification.
+    roots: RepositoryRoots,
+    /// A separately registered external control watch carries no source IO.
+    auxiliary: bool,
+    /// The control directory, relative to the probe's roots.
+    directory: PathBuf,
+    /// The file-name prefix every probe of this watcher carries.
+    prefix: String,
+    /// The probe whose callback samples callback delivery now.
+    expected: Option<PathBuf>,
+    /// Whether the expected probe's callback arrived.
+    acknowledged: bool,
+    /// Readiness waits on the first acknowledgment.
+    readiness: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl DeliveryProbe {
-    fn observe(&mut self, event: &Event, roots: &RepositoryRoots) {
+    fn relative(&self, path: &Path) -> Option<PathBuf> {
+        if self.auxiliary {
+            // Accept only the two spellings registered for this control root.
+            // A workspace symlink into it is not an auxiliary probe event.
+            self.roots.strip(path)
+        } else {
+            self.roots.relative(path)
+        }
+    }
+
+    fn observe(&mut self, event: &Event) {
+        let Some(expected) = self.expected.as_ref() else {
+            return;
+        };
         if !event.need_rescan()
             && matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
             && event
                 .paths
                 .iter()
-                .any(|path| roots.relative(path).as_ref() == Some(&self.relative_path))
+                .any(|path| self.relative(path).as_ref() == Some(expected))
         {
-            if let Some(acknowledged) = self.acknowledged.take() {
-                let _ = acknowledged.send(());
+            self.acknowledged = true;
+            if let Some(readiness) = self.readiness.take() {
+                let _ = readiness.send(());
             }
         }
+    }
+
+    /// Whether a repository-relative path is one of this watcher's own probes.
+    fn owns(&self, relative: &Path) -> bool {
+        self.expected.as_deref() == Some(relative)
+            || (relative.parent() == Some(self.directory.as_path())
+                && relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&self.prefix)))
+    }
+
+    /// Wait for `relative` from now on, forgetting any earlier probe.
+    fn expect(&mut self, relative: PathBuf) {
+        self.expected = Some(relative);
+        self.acknowledged = false;
+    }
+
+    /// Whether `relative` is the probe being waited for and it came back.
+    fn acknowledged(&self, relative: &Path) -> bool {
+        self.acknowledged && self.expected.as_deref() == Some(relative)
+    }
+
+    /// Stop waiting for any probe.
+    fn forget(&mut self) {
+        self.expected = None;
+        self.acknowledged = false;
     }
 }
 
@@ -219,14 +384,102 @@ impl Drop for OwnedProbeFile {
     }
 }
 
+/// A canary written and not yet settled.
+struct OutstandingCanary {
+    relative: PathBuf,
+    written_at: Instant,
+    _file: OwnedProbeFile,
+}
+
+/// A running watcher's delivery sampling, driven by its owner's clock.
+struct DeliverySampling {
+    probe: Arc<Mutex<DeliveryProbe>>,
+    /// The resolved control directory canaries are written into.
+    control_dir: PathBuf,
+    sequence: u64,
+    outstanding: Option<OutstandingCanary>,
+    /// When the next canary is due, or `None` for the next check.
+    next_at: Option<Instant>,
+    /// Canaries lost in a row, so only the first of a run is loud.
+    consecutive_losses: u64,
+    /// Whether the last canary could not be written, so a failing control
+    /// directory is reported once rather than on every check.
+    write_failing: bool,
+}
+
+impl DeliverySampling {
+    fn lock_probe(&self) -> std::sync::MutexGuard<'_, DeliveryProbe> {
+        self.probe.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_canary(&mut self, now: Instant, canary: &DeliveryCanary) -> DeliveryCheck {
+        self.sequence = self.sequence.wrapping_add(1);
+        let (relative, path) = {
+            let mut probe = self.lock_probe();
+            let name = format!("{}-{}", probe.prefix, self.sequence);
+            let relative = probe.directory.join(&name);
+            // Expected before it is written, so a callback that arrives before
+            // this function returns still counts.
+            probe.expect(relative.clone());
+            (relative, self.control_dir.join(name))
+        };
+        match std::fs::write(&path, self.sequence.to_le_bytes()) {
+            Ok(()) => {
+                self.write_failing = false;
+                self.outstanding = Some(OutstandingCanary {
+                    relative,
+                    written_at: now,
+                    _file: OwnedProbeFile(path),
+                });
+                DeliveryCheck::Pending
+            }
+            Err(error) => {
+                self.lock_probe().forget();
+                drop(OwnedProbeFile(path));
+                if !self.write_failing {
+                    warn!(
+                        %error,
+                        "could not write the watcher's delivery canary; delivery is not being \
+                         sampled until the control directory accepts it again"
+                    );
+                }
+                self.write_failing = true;
+                self.next_at = Some(now + canary.period);
+                DeliveryCheck::Unverifiable
+            }
+        }
+    }
+}
+
 type WatchCallback = Box<dyn FnMut(std::result::Result<Event, notify::Error>) + Send>;
 
 fn register_native_watcher(root: &Path, callback: WatchCallback) -> Result<RecommendedWatcher> {
+    register_native_watcher_with_control(root, None, callback)
+}
+
+fn register_watch_paths(
+    root: &Path,
+    control: Option<&Path>,
+    mut watch: impl FnMut(&Path, RecursiveMode) -> notify::Result<()>,
+) -> Result<()> {
+    watch(root, RecursiveMode::Recursive)
+        .map_err(|error| IndexError::Watcher(error.to_string()))?;
+    if let Some(control) = control {
+        watch(control, RecursiveMode::NonRecursive).map_err(|error| {
+            IndexError::Watcher(format!("could not watch control directory: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn register_native_watcher_with_control(
+    root: &Path,
+    control: Option<&Path>,
+    callback: WatchCallback,
+) -> Result<RecommendedWatcher> {
     let mut watcher = notify::recommended_watcher(callback)
         .map_err(|error| IndexError::Watcher(error.to_string()))?;
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(|error| IndexError::Watcher(error.to_string()))?;
+    register_watch_paths(root, control, |path, mode| watcher.watch(path, mode))?;
     Ok(watcher)
 }
 
@@ -236,6 +489,9 @@ pub struct FileWatcher {
     receiver: mpsc::Receiver<FileEvent>,
     outside_root: Arc<Mutex<EventsOutsideRoot>>,
     lost: Arc<Mutex<LostEvents>>,
+    /// `None` when there is nowhere private to write a probe.
+    sampling: Option<DeliverySampling>,
+    delivery_proven: bool,
 }
 
 impl FileWatcher {
@@ -244,20 +500,83 @@ impl FileWatcher {
     /// Parser support is enrichment, not admission. The watcher must therefore
     /// report Compose/config files, lockfiles, unsupported languages, binaries,
     /// and symlinks just as reliably as parser-backed source files.
-    pub fn new(root: &Path) -> Result<Self> {
-        Self::new_with_delivery_probe(root, None)
+    pub fn new(root: &WorktreeRoot) -> Result<Self> {
+        Self::new_with_delivery_probe(root.path(), None)
     }
 
-    /// Register the watcher and prove callback delivery before returning it.
-    /// The probe is excluded control IO, never repository source or graph truth.
-    /// Ordinary source events remain queued while the acknowledgment is pending.
-    pub async fn new_ready(root: &Path, bound: std::time::Duration) -> Result<Self> {
-        Self::new_ready_for_path(root, bound, None).await
+    /// Register the watcher and sample callback service before
+    /// returning it. The probe is excluded control IO, never repository source
+    /// or graph truth. Ordinary source events remain queued while the
+    /// acknowledgment is pending.
+    ///
+    /// A probe the backend does not acknowledge within `bound` does not fail
+    /// the watch. The backend was registered and may be delivering late or
+    /// dropping events, and neither is a reason to watch nothing: the watcher
+    /// is returned with the unacknowledged probe recorded in
+    /// [`FileWatcher::lost_events`], so the caller recovers it through the same
+    /// complete exact-tree admission it runs for a backend rescan, and
+    /// [`FileWatcher::verify_delivery`] keeps sampling. Only a watch that cannot
+    /// be registered, or a probe that cannot be written, is an error.
+    pub async fn new_ready(root: &WorktreeRoot, bound: Duration) -> Result<Self> {
+        Self::new_ready_for_path(root.path(), bound, None).await
+    }
+
+    /// Sample callback service using the store's actual control directory.
+    ///
+    /// An external control directory is watched nonrecursively on the same
+    /// backend as the recursive workspace watch. Its events never enter source
+    /// classification. An acknowledgment samples the shared callback service;
+    /// it does not prove recursive delivery throughout the workspace.
+    pub async fn new_ready_with_control(
+        root: &WorktreeRoot,
+        control: &Path,
+        bound: Duration,
+    ) -> Result<Self> {
+        Self::new_ready_with_control_using(
+            root.path(),
+            control,
+            bound,
+            None,
+            register_native_watcher_with_control,
+        )
+        .await
+    }
+
+    /// A watcher whose backend delivers nothing at all, for callers that grade
+    /// what happens when the host drops every event.
+    ///
+    /// Registered through the same readiness path as [`FileWatcher::new_ready`],
+    /// so its readiness probe goes unacknowledged for `bound` and every canary
+    /// it writes is lost, the way a saturated FSEvents stream behaves. It owns
+    /// no host stream and no filesystem watch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn new_ready_without_delivery(root: &WorktreeRoot, bound: Duration) -> Result<Self> {
+        Self::new_ready_using(root.path(), bound, None, |_, callback| {
+            drop(callback);
+            notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                .map_err(|error| IndexError::Watcher(error.to_string()))
+        })
+        .await
+    }
+
+    /// The silent backend control for an explicitly selected store directory.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn new_ready_without_delivery_with_control(
+        root: &WorktreeRoot,
+        control: &Path,
+        bound: Duration,
+    ) -> Result<Self> {
+        Self::new_ready_with_control_using(root.path(), control, bound, None, |_, _, callback| {
+            drop(callback);
+            notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                .map_err(|error| IndexError::Watcher(error.to_string()))
+        })
+        .await
     }
 
     async fn new_ready_for_path(
         root: &Path,
-        bound: std::time::Duration,
+        bound: Duration,
         expected_path: Option<PathBuf>,
     ) -> Result<Self> {
         Self::new_ready_using(root, bound, expected_path, register_native_watcher).await
@@ -265,7 +584,7 @@ impl FileWatcher {
 
     async fn new_ready_using(
         root: &Path,
-        bound: std::time::Duration,
+        bound: Duration,
         expected_path: Option<PathBuf>,
         register: impl FnOnce(&Path, WatchCallback) -> Result<RecommendedWatcher>,
     ) -> Result<Self> {
@@ -273,6 +592,20 @@ impl FileWatcher {
             .canonicalize()
             .map_err(|error| IndexError::Watcher(error.to_string()))?;
         let control_dir = root.join(".kin");
+        if !control_dir.is_dir() {
+            // The store is kept outside this working tree, so the tree holds no
+            // directory of Kin's to write a private probe into, and it may be
+            // read-only. Writing a probe anywhere else in the tree would put a
+            // file in a checkout Kin promised to leave untouched. The watch is
+            // registered, but its delivery is neither proven by a round trip
+            // nor sampled afterwards.
+            tracing::info!(
+                root = %canonical_root.display(),
+                "watching a working tree whose store is kept outside it; delivery is registered \
+                 but not proven by a readiness probe"
+            );
+            return Self::new_with_delivery_probe_using(root, None, register);
+        }
         let canonical_control = control_dir
             .canonicalize()
             .map_err(|error| IndexError::Watcher(error.to_string()))?;
@@ -281,18 +614,68 @@ impl FileWatcher {
                 "watcher readiness control directory is outside the watched root".into(),
             ));
         }
-        let probe_name = format!("watcher-ready-{}", uuid::Uuid::new_v4());
-        let relative_path = canonical_control
-            .strip_prefix(&canonical_root)
-            .expect("the control directory is inside the watched root")
-            .join(&probe_name);
-        let probe_path = canonical_control.join(&probe_name);
+        Self::new_ready_with_control_using(
+            root,
+            &control_dir,
+            bound,
+            expected_path,
+            |root, _, callback| register(root, callback),
+        )
+        .await
+    }
+
+    async fn new_ready_with_control_using(
+        root: &Path,
+        control_dir: &Path,
+        bound: Duration,
+        expected_path: Option<PathBuf>,
+        register: impl FnOnce(&Path, Option<&Path>, WatchCallback) -> Result<RecommendedWatcher>,
+    ) -> Result<Self> {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| IndexError::Watcher(error.to_string()))?;
+        let canonical_control = control_dir
+            .canonicalize()
+            .map_err(|error| IndexError::Watcher(error.to_string()))?;
+        if !canonical_control.is_dir() || canonical_control == canonical_root {
+            return Err(IndexError::Watcher(
+                "watcher readiness requires a distinct control directory".into(),
+            ));
+        }
+        let auxiliary = !canonical_control.starts_with(&canonical_root);
+        let probe_roots = RepositoryRoots::bind(if auxiliary { control_dir } else { root });
+        let prefix = format!("watcher-ready-{}", uuid::Uuid::new_v4());
+        let directory = if auxiliary {
+            PathBuf::new()
+        } else {
+            canonical_control
+                .strip_prefix(&canonical_root)
+                .unwrap()
+                .to_path_buf()
+        };
+        let relative_path = directory.join(&prefix);
+        let probe_path = canonical_control.join(&prefix);
         let (acknowledged, received) = tokio::sync::oneshot::channel();
         let probe = Arc::new(Mutex::new(DeliveryProbe {
-            relative_path: expected_path.unwrap_or(relative_path),
-            acknowledged: Some(acknowledged),
+            roots: probe_roots,
+            auxiliary,
+            directory,
+            prefix,
+            expected: Some(expected_path.unwrap_or(relative_path)),
+            acknowledged: false,
+            readiness: Some(acknowledged),
         }));
-        let watcher = Self::new_with_delivery_probe_using(root, Some(probe), register)?;
+        let mut watcher = Self::new_with_delivery_probe_using(
+            root,
+            Some(Arc::clone(&probe)),
+            |root, callback| {
+                register(
+                    root,
+                    auxiliary.then_some(canonical_control.as_path()),
+                    callback,
+                )
+            },
+        )?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -300,15 +683,19 @@ impl FileWatcher {
             .map_err(|error| {
                 IndexError::Watcher(format!("could not create watcher readiness probe: {error}"))
             })?;
-        let _owned_probe = OwnedProbeFile(probe_path);
+        let owned_probe = OwnedProbeFile(probe_path);
         std::io::Write::write_all(&mut file, b"watcher readiness\n").map_err(|error| {
             IndexError::Watcher(format!("could not write watcher readiness probe: {error}"))
         })?;
+        // macOS emits content-modified events when a written descriptor closes.
+        // Keeping it open would leave retries unable to prove delivery if the
+        // backend missed the initial create event while starting its stream.
+        drop(file);
         let mut received = received;
         let observed = async {
             // Registration can precede backend delivery. Retry only this private
             // probe; repository source is never rewritten to manufacture readiness.
-            let retry_period = std::time::Duration::from_millis(100);
+            let retry_period = Duration::from_millis(100);
             let mut retry =
                 tokio::time::interval_at(tokio::time::Instant::now() + retry_period, retry_period);
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -321,17 +708,45 @@ impl FileWatcher {
                     }
                     _ = retry.tick() => {
                         sequence = sequence.wrapping_add(1);
-                        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))
-                            .and_then(|_| std::io::Write::write_all(&mut file, &sequence.to_le_bytes()))
+                        std::fs::OpenOptions::new().write(true).open(&owned_probe.0)
+                            .and_then(|mut file| std::io::Write::write_all(&mut file, &sequence.to_le_bytes()))
                             .map_err(|error| IndexError::Watcher(format!("could not retry watcher readiness probe: {error}")))?;
                     }
                 }
             }
         };
-        match tokio::time::timeout(bound, observed).await {
-            Ok(result) => result.map(|()| watcher),
-            Err(_) => Err(IndexError::Watcher("watcher did not acknowledge its readiness probe; filesystem edits are not known to be observed".into())),
+        let outcome = tokio::time::timeout(bound, observed).await;
+        drop(owned_probe);
+        // Whatever happened, the readiness probe is no longer the question. A
+        // late echo of it must not be read as a canary's acknowledgment.
+        probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forget();
+        match outcome {
+            Ok(Ok(())) => watcher.delivery_proven = true,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => record_unreported_loss(
+                &watcher.lost,
+                format!(
+                    "the watcher's readiness probe was not acknowledged within {} ms, so delivery \
+                     is unproven and edits made since the watch was registered may have been \
+                     dropped",
+                    bound.as_millis()
+                ),
+                true,
+            ),
         }
+        watcher.sampling = Some(DeliverySampling {
+            probe,
+            control_dir: canonical_control,
+            sequence: 0,
+            outstanding: None,
+            next_at: None,
+            consecutive_losses: 0,
+            write_failing: false,
+        });
+        Ok(watcher)
     }
 
     fn new_with_delivery_probe(
@@ -376,9 +791,15 @@ impl FileWatcher {
                     record_lost_events(&event_lost, &event);
                     if let Some(probe) = &delivery_probe {
                         let mut probe = probe.lock().unwrap_or_else(PoisonError::into_inner);
-                        probe.observe(&event, &event_roots);
+                        probe.observe(&event);
+                        // Auxiliary controls were deliberately subscribed to,
+                        // so they are neither source events nor foreign paths.
+                        // Keep workspace paths in the same callback event.
                         event.paths.retain(|path| {
-                            event_roots.relative(path).as_ref() != Some(&probe.relative_path)
+                            !probe.relative(path).is_some_and(|relative| {
+                                probe.owns(&relative)
+                                    || (probe.auxiliary && event_roots.relative(path).is_none())
+                            })
                         });
                     }
                     let events = classify_event(&event, &event_roots, &event_outside_root);
@@ -407,7 +828,87 @@ impl FileWatcher {
             receiver: rx,
             outside_root,
             lost,
+            sampling: None,
+            delivery_proven: false,
         })
+    }
+
+    /// Whether a readiness probe sampled callback service when this watcher
+    /// started. This does not guarantee delivery for every workspace path.
+    ///
+    /// False for a watcher that was never asked to sample it, for one whose
+    /// store is kept outside the working tree and no control path was supplied,
+    /// and for one whose probe went unacknowledged, which
+    /// [`FileWatcher::lost_events`] then records.
+    pub fn delivery_proven(&self) -> bool {
+        self.delivery_proven
+    }
+
+    /// Sample delivery once, on the owner's clock.
+    ///
+    /// Call it on every tick. It writes a canary when one is due, settles the
+    /// outstanding one when its acknowledgment arrived or its bound ran out,
+    /// and otherwise does nothing. A lost canary advances
+    /// [`FileWatcher::lost_events`] exactly as a backend rescan does, so a
+    /// caller that already recovers rescans recovers this too.
+    pub fn verify_delivery(&mut self, now: Instant, canary: &DeliveryCanary) -> DeliveryCheck {
+        let Some(sampling) = self.sampling.as_mut() else {
+            return DeliveryCheck::Unverifiable;
+        };
+        if let Some(outstanding) = sampling.outstanding.take() {
+            let mut probe = sampling.lock_probe();
+            if probe.acknowledged(&outstanding.relative) {
+                probe.forget();
+                drop(probe);
+                sampling.next_at = Some(now + canary.period);
+                sampling.consecutive_losses = 0;
+                return DeliveryCheck::Verified;
+            }
+            let waited = now.saturating_duration_since(outstanding.written_at);
+            if waited < canary.bound {
+                drop(probe);
+                sampling.outstanding = Some(outstanding);
+                return DeliveryCheck::Pending;
+            }
+            probe.forget();
+            drop(probe);
+            // Sample again at once: the question is now whether delivery has
+            // come back, and waiting a period to ask it only delays the answer.
+            sampling.next_at = None;
+            sampling.consecutive_losses = sampling.consecutive_losses.saturating_add(1);
+            record_unreported_loss(
+                &self.lost,
+                format!(
+                    "the watcher's delivery canary was not acknowledged within {} ms; the \
+                     backend dropped events without reporting a loss",
+                    waited.as_millis()
+                ),
+                sampling.consecutive_losses == 1,
+            );
+            return DeliveryCheck::Lost;
+        }
+        if sampling.next_at.is_some_and(|at| now < at) {
+            return DeliveryCheck::Idle;
+        }
+        sampling.write_canary(now, canary)
+    }
+
+    /// Stop waiting for the outstanding canary and sample afresh on the next
+    /// check.
+    ///
+    /// For a caller about to run a complete exact-tree admission. That pass
+    /// observes the whole tree as it stands when it starts, so it covers every
+    /// drop before it, and the outstanding canary asks a question the pass is
+    /// about to answer. Left standing, a canary the backend dropped just before
+    /// the pass would record a loss the pass already covers and schedule a
+    /// second complete admission for nothing.
+    pub fn restart_delivery_sampling(&mut self) {
+        if let Some(sampling) = self.sampling.as_mut() {
+            if sampling.outstanding.take().is_some() {
+                sampling.lock_probe().forget();
+            }
+            sampling.next_at = None;
+        }
     }
 
     /// Host events this watcher could not place inside the repository it
@@ -419,8 +920,9 @@ impl FileWatcher {
             .clone()
     }
 
-    /// What this watcher's backend has told it that it lost, so a caller can
-    /// disclose a blind spot no path in any event can name.
+    /// What this watcher's backend has told it that it lost, and what its own
+    /// delivery probes found lost, so a caller can disclose a blind spot no
+    /// path in any event can name.
     pub fn lost_events(&self) -> LostEvents {
         self.lost
             .lock()
@@ -772,28 +1274,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_delivery_observes_one_immediate_edit_and_excludes_the_probe() {
+    #[cfg(target_os = "macos")]
+    async fn readiness_retries_content_delivery_when_initial_create_is_missed() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir(repo.path().join(".kin")).unwrap();
-        let source = repo.path().join("tracked.rs");
-        std::fs::write(&source, "pub fn old() {}\n").unwrap();
-        let watcher = FileWatcher::new_ready(repo.path(), std::time::Duration::from_secs(10))
-            .await
-            .unwrap();
+        let watcher = FileWatcher::new_ready_using(
+            repo.path(),
+            // Generous, because a saturated host delays or drops many of the
+            // retries this waits on; a quiet one answers the first.
+            Duration::from_secs(30),
+            None,
+            |root, mut callback| {
+                register_native_watcher(
+                    root,
+                    Box::new(move |result| {
+                        if let Ok(event) = &result {
+                            // Simulate startup missing the create and initial
+                            // write. Only a native content event after a retry
+                            // may reach the exact-path readiness acknowledgment.
+                            if !matches!(
+                                event.kind,
+                                EventKind::Modify(notify::event::ModifyKind::Data(_))
+                            ) || event.paths.iter().any(|path| {
+                                std::fs::read(path)
+                                    .is_ok_and(|bytes| bytes == b"watcher readiness\n")
+                            }) {
+                                return;
+                            }
+                        }
+                        callback(result);
+                    }),
+                )
+            },
+        )
+        .await
+        .expect("the watch registers");
+        assert!(
+            watcher.delivery_proven(),
+            "a closed retry must generate a native content callback"
+        );
+        assert!(
+            watcher.drain().is_empty(),
+            "the probe is excluded control IO"
+        );
         assert_eq!(
             std::fs::read_dir(repo.path().join(".kin")).unwrap().count(),
             0
         );
-        assert!(watcher.drain().iter().all(|event| matches!(event, FileEvent::Changed(path) | FileEvent::Removed(path) if !path.components().any(|part| part.as_os_str() == ".kin"))));
+    }
+
+    /// One write after readiness reaches the queue, or the watcher records that
+    /// its backend dropped it. Never neither.
+    ///
+    /// On a quiet host this is the delivery assertion it always was: readiness
+    /// proves the stream is live, so an immediate edit is not lost to a startup
+    /// race. On a saturated macOS host FSEvents drops most events and reports
+    /// none of it, and no watcher can make that write arrive. What it can do is
+    /// notice, and the canary driven here is how. A watcher that lost the edit
+    /// while every canary came back still fails.
+    #[tokio::test]
+    async fn confirmed_delivery_observes_one_immediate_edit_and_excludes_the_probe() {
+        confirmed_delivery_observes_immediate_edit(false).await;
+    }
+
+    #[tokio::test]
+    async fn external_control_delivery_keeps_the_native_workspace_watch_active() {
+        confirmed_delivery_observes_immediate_edit(true).await;
+    }
+
+    async fn confirmed_delivery_observes_immediate_edit(external: bool) {
+        let repo = tempfile::tempdir().unwrap();
+        let central = tempfile::tempdir().unwrap();
+        let control = if external {
+            central.path().to_path_buf()
+        } else {
+            repo.path().join(".kin")
+        };
+        std::fs::create_dir_all(&control).unwrap();
+        let source = repo.path().join("tracked.rs");
+        std::fs::write(&source, "pub fn old() {}\n").unwrap();
+        let mut watcher = if external {
+            FileWatcher::new_ready_with_control(
+                &worktree(repo.path()),
+                &control,
+                Duration::from_secs(10),
+            )
+            .await
+        } else {
+            FileWatcher::new_ready(&worktree(repo.path()), Duration::from_secs(10)).await
+        }
+        .unwrap();
+        assert_eq!(std::fs::read_dir(&control).unwrap().count(), 0);
+        assert_eq!(repo.path().join(".kin").exists(), !external);
+        let no_control_io = |events: &[FileEvent]| {
+            events.iter().all(|event| matches!(event, FileEvent::Changed(path) | FileEvent::Removed(path) if path.file_name() == source.file_name()))
+        };
+        assert!(no_control_io(&watcher.drain()));
+        let lost_before_the_edit = watcher.lost_events().generation;
+        assert_eq!(
+            lost_before_the_edit,
+            u64::from(!watcher.delivery_proven()),
+            "only an unacknowledged readiness probe may stand as a loss before the edit"
+        );
         std::fs::write(&source, "pub fn changed() {}\n").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let canary = DeliveryCanary {
+            period: Duration::from_millis(250),
+            bound: Duration::from_secs(2),
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if watcher.drain().iter().any(|event| matches!(event, FileEvent::Changed(path) if path.file_name() == source.file_name())) {
-                    break;
+                let events = watcher.drain();
+                assert!(no_control_io(&events), "every probe is excluded control IO");
+                if events.iter().any(|event| matches!(event, FileEvent::Changed(path) if path.file_name() == source.file_name())) {
+                    return "delivered";
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                if watcher.verify_delivery(Instant::now(), &canary) == DeliveryCheck::Lost {
+                    return "reported lost";
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("one write after readiness must reach the callback queue");
+        })
+        .await
+        .expect(
+            "one write after readiness must reach the callback queue, or the watcher must record \
+             that its backend dropped it",
+        );
+        if outcome == "reported lost" {
+            assert!(watcher.lost_events().generation > lost_before_the_edit);
+        }
+        eprintln!("the edit after readiness was {outcome}");
     }
 
     #[test]
@@ -805,27 +1414,644 @@ mod tests {
         std::fs::write(&source, "pub fn source() {}\n").unwrap();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let mut probe = DeliveryProbe {
-            relative_path: relative.clone(),
-            acknowledged: Some(tx),
+            roots: RepositoryRoots::bind(repo.path()),
+            auxiliary: false,
+            directory: PathBuf::from(".kin"),
+            prefix: "watcher-ready-fixture".to_string(),
+            expected: Some(relative.clone()),
+            acknowledged: false,
+            readiness: Some(tx),
         };
         let roots = RepositoryRoots::bind(repo.path());
-        probe.observe(&content_change(vec![source.clone()]), &roots);
+        probe.observe(&content_change(vec![source.clone()]));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         let mut rescan = content_change(vec![repo.path().join(&relative)]);
         rescan.attrs.set_flag(notify::event::Flag::Rescan);
-        probe.observe(&rescan, &roots);
+        probe.observe(&rescan);
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+        assert!(!probe.acknowledged(&relative));
         let mixed = content_change(vec![repo.path().join(&relative), source.clone()]);
-        probe.observe(&mixed, &roots);
+        probe.observe(&mixed);
         assert_eq!(rx.try_recv(), Ok(()));
+        assert!(probe.acknowledged(&relative));
         let events = classify_event(&mixed, &roots, &Mutex::new(EventsOutsideRoot::default()));
         assert!(matches!(events.as_slice(), [FileEvent::Changed(path)] if path == &source));
+        // Every probe the watcher writes is its own, and nothing else is.
+        assert!(probe.owns(&relative));
+        assert!(probe.owns(Path::new(".kin/watcher-ready-fixture-7")));
+        assert!(!probe.owns(Path::new(".kin/watcher-ready-other-7")));
+        assert!(!probe.owns(Path::new("src/watcher-ready-fixture-7")));
+        assert!(!probe.owns(Path::new("source.rs")));
+    }
+
+    /// A watcher whose readiness was acknowledged by hand through its captured
+    /// callback, returned with that callback, so a test decides exactly which
+    /// host events are delivered. The backend is unregistered and owns no host
+    /// stream.
+    async fn hand_driven_ready_watcher(repo: &Path) -> (FileWatcher, WatchCallback) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let callback_slot = Arc::new(Mutex::new(None::<WatchCallback>));
+        let captured = Arc::clone(&callback_slot);
+        let mut startup = Box::pin(FileWatcher::new_ready_using(
+            repo,
+            Duration::from_secs(10),
+            None,
+            move |_, callback| {
+                *captured.lock().unwrap() = Some(callback);
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let probe = std::fs::read_dir(repo.join(".kin"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut callback = callback_slot.lock().unwrap().take().unwrap();
+        callback(Ok(content_change(vec![probe])));
+        let watcher = startup.await.unwrap();
+        assert!(watcher.delivery_proven());
+        (watcher, callback)
+    }
+
+    fn control_entries(repo: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(repo.join(".kin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    fn only_canary(repo: &Path) -> PathBuf {
+        let entries = control_entries(repo);
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one canary is outstanding: {entries:?}"
+        );
+        entries.into_iter().next().unwrap()
+    }
+
+    /// The daemon used to refuse to start when this probe went unanswered, and
+    /// on a saturated macOS host it does go unanswered: FSEvents dropped every
+    /// retry for the whole bound. The watch was registered and may be delivering
+    /// late or dropping, and neither is a reason to watch nothing, so the
+    /// watcher is returned with the probe recorded as a loss, which its caller
+    /// recovers with a complete exact-tree admission.
+    #[tokio::test]
+    async fn a_readiness_probe_the_backend_never_acknowledges_degrades_to_a_recorded_loss() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        // Held and never called, which is what a backend dropping every event
+        // looks like from here.
+        let callback_slot = Arc::new(Mutex::new(None::<WatchCallback>));
+        let captured = Arc::clone(&callback_slot);
+        let watcher = FileWatcher::new_ready_using(
+            repo.path(),
+            Duration::from_millis(300),
+            None,
+            move |_, callback| {
+                *captured.lock().unwrap() = Some(callback);
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            },
+        )
+        .await
+        .expect("an unacknowledged readiness probe must not fail the watch");
+        assert!(
+            callback_slot.lock().unwrap().is_some(),
+            "the backend registered"
+        );
+        assert!(!watcher.delivery_proven());
+        let lost = watcher.lost_events();
+        assert_eq!(
+            lost.generation, 1,
+            "the unanswered probe is recorded exactly like a backend rescan"
+        );
+        assert!(
+            lost.last_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("readiness probe was not acknowledged")),
+            "the record names what went unanswered: {lost:?}"
+        );
+        assert!(
+            control_entries(repo.path()).is_empty(),
+            "the probe is removed"
+        );
+
+        // The test-support backend behaves the same way, and every canary it is
+        // asked to carry is lost as well.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let mut watcher = FileWatcher::new_ready_without_delivery(
+            &worktree(repo.path()),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("a backend that delivers nothing still registers");
+        assert!(!watcher.delivery_proven());
+        assert_eq!(watcher.lost_events().generation, 1);
+        let canary = DeliveryCanary {
+            period: Duration::from_millis(100),
+            bound: Duration::from_millis(200),
+        };
+        let t0 = Instant::now();
+        assert_eq!(watcher.verify_delivery(t0, &canary), DeliveryCheck::Pending);
+        assert_eq!(
+            watcher.verify_delivery(t0 + canary.bound, &canary),
+            DeliveryCheck::Lost
+        );
+        assert_eq!(watcher.lost_events().generation, 2);
+    }
+
+    #[tokio::test]
+    async fn a_canary_the_backend_delivers_is_verified_and_one_it_drops_records_a_loss() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let source = repo.path().join("kept.rs");
+        std::fs::write(&source, "pub fn kept() {}\n").unwrap();
+        let (mut watcher, mut callback) = hand_driven_ready_watcher(repo.path()).await;
+        let canary = DeliveryCanary {
+            period: Duration::from_secs(1),
+            bound: Duration::from_secs(2),
+        };
+        let ms = Duration::from_millis;
+
+        let t0 = Instant::now();
+        assert_eq!(
+            watcher.verify_delivery(t0, &canary),
+            DeliveryCheck::Pending,
+            "the first check after readiness writes a canary"
+        );
+        let delivered = only_canary(repo.path());
+        callback(Ok(content_change(vec![delivered])));
+        assert_eq!(
+            watcher.verify_delivery(t0 + ms(10), &canary),
+            DeliveryCheck::Verified
+        );
+        assert_eq!(watcher.lost_events().generation, 0);
+        assert!(
+            control_entries(repo.path()).is_empty(),
+            "a settled canary is removed"
+        );
+        assert_eq!(
+            watcher.verify_delivery(t0 + ms(500), &canary),
+            DeliveryCheck::Idle,
+            "the next canary waits out the period"
+        );
+
+        // A canary the backend drops, the way FSEvents drops it: no event and no
+        // loss flag, just nothing.
+        let t1 = t0 + ms(1010);
+        assert_eq!(watcher.verify_delivery(t1, &canary), DeliveryCheck::Pending);
+        let dropped = only_canary(repo.path());
+        assert_eq!(
+            watcher.verify_delivery(t1 + ms(1999), &canary),
+            DeliveryCheck::Pending,
+            "inside its bound a canary is only late"
+        );
+        assert_eq!(
+            watcher.verify_delivery(t1 + canary.bound, &canary),
+            DeliveryCheck::Lost
+        );
+        let lost = watcher.lost_events();
+        assert_eq!(
+            lost.generation, 1,
+            "the dropped canary is recorded as a loss"
+        );
+        assert!(
+            lost.last_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("delivery canary was not acknowledged")),
+            "{lost:?}"
+        );
+        assert!(
+            control_entries(repo.path()).is_empty(),
+            "a lost canary is removed"
+        );
+
+        // Sampling resumes at once, and only the fresh canary's own callback
+        // proves delivery; a late echo of the lost one proves nothing.
+        let t2 = t1 + canary.bound;
+        assert_eq!(watcher.verify_delivery(t2, &canary), DeliveryCheck::Pending);
+        let fresh = only_canary(repo.path());
+        assert_ne!(fresh, dropped);
+        callback(Ok(content_change(vec![dropped])));
+        assert_eq!(
+            watcher.verify_delivery(t2 + ms(10), &canary),
+            DeliveryCheck::Pending,
+            "a late echo of a lost canary is not delivery of the fresh one"
+        );
+        callback(Ok(content_change(vec![fresh, source.clone()])));
+        assert_eq!(
+            watcher.verify_delivery(t2 + ms(20), &canary),
+            DeliveryCheck::Verified
+        );
+        assert_eq!(watcher.lost_events().generation, 1);
+
+        // Every probe is excluded control IO, and a source path delivered beside
+        // one still arrives.
+        let events = watcher.drain();
+        assert!(
+            matches!(events.as_slice(), [FileEvent::Changed(path)] if path == &source),
+            "only the source reaches the classified queue: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_sampling_abandons_the_outstanding_canary_without_recording_a_loss() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".kin")).unwrap();
+        let (mut watcher, _callback) = hand_driven_ready_watcher(repo.path()).await;
+        let canary = DeliveryCanary {
+            period: Duration::from_secs(1),
+            bound: Duration::from_secs(2),
+        };
+        let t0 = Instant::now();
+        assert_eq!(watcher.verify_delivery(t0, &canary), DeliveryCheck::Pending);
+        watcher.restart_delivery_sampling();
+        assert!(
+            control_entries(repo.path()).is_empty(),
+            "the abandoned canary is removed"
+        );
+        assert_eq!(
+            watcher.verify_delivery(t0 + Duration::from_secs(5), &canary),
+            DeliveryCheck::Pending,
+            "sampling resumes with a fresh canary at the next check"
+        );
+        assert_eq!(
+            watcher.lost_events().generation,
+            0,
+            "a canary a complete admission is about to cover records no loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_only_watcher_without_a_control_path_cannot_sample_delivery() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut watcher =
+            FileWatcher::new_ready_using(repo.path(), Duration::from_secs(10), None, |_, _| {
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            })
+            .await
+            .unwrap();
+        assert!(!watcher.delivery_proven());
+        assert_eq!(
+            watcher.lost_events().generation,
+            0,
+            "nothing was probed, so nothing is recorded lost"
+        );
+        assert_eq!(
+            watcher.verify_delivery(Instant::now(), &DeliveryCanary::default()),
+            DeliveryCheck::Unverifiable
+        );
+        assert_eq!(
+            std::fs::read_dir(repo.path()).unwrap().count(),
+            0,
+            "nothing is written into a tree whose store is kept elsewhere"
+        );
+    }
+
+    #[test]
+    fn external_control_registration_is_nonrecursive_and_failures_are_errors() {
+        let root = Path::new("/workspace");
+        let control = Path::new("/store");
+        let mut registrations = Vec::new();
+        register_watch_paths(root, Some(control), |path, mode| {
+            registrations.push((path.to_path_buf(), mode));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            registrations,
+            vec![
+                (root.to_path_buf(), RecursiveMode::Recursive),
+                (control.to_path_buf(), RecursiveMode::NonRecursive),
+            ]
+        );
+
+        for failed in [root, control] {
+            let mut attempted = Vec::new();
+            let error = register_watch_paths(root, Some(control), |path, _| {
+                attempted.push(path.to_path_buf());
+                if path == failed {
+                    Err(notify::Error::generic("registration refused"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("registration refused"),
+                "{error}"
+            );
+            assert_eq!(attempted.last().unwrap().as_path(), failed);
+            if failed == root {
+                assert_eq!(
+                    attempted.len(),
+                    1,
+                    "no auxiliary registration follows a refused root"
+                );
+            }
+        }
+    }
+
+    /// Drive the shared callback directly: an auxiliary sample is not a
+    /// workspace event, and it cannot borrow an acknowledgment from another
+    /// path with the same name.
+    #[tokio::test]
+    async fn external_probe_callbacks_keep_source_and_probe_scopes_separate() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let repo = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let callback_slot = Arc::new(Mutex::new(None::<WatchCallback>));
+        let captured = Arc::clone(&callback_slot);
+        let expected_root = repo.path().canonicalize().unwrap();
+        let expected_control = control.path().canonicalize().unwrap();
+        let mut startup = Box::pin(FileWatcher::new_ready_with_control_using(
+            repo.path(),
+            control.path(),
+            Duration::from_secs(10),
+            None,
+            move |root, auxiliary, callback| {
+                assert_eq!(root, expected_root.as_path());
+                assert_eq!(auxiliary, Some(expected_control.as_path()));
+                *captured.lock().unwrap() = Some(callback);
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let readiness = std::fs::read_dir(control.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let source = repo.path().join(readiness.file_name().unwrap());
+        std::fs::write(&source, "source\n").unwrap();
+        let mut callback = callback_slot.lock().unwrap().take().unwrap();
+        callback(Ok(content_change(vec![source.clone()])));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx)))
+                .await
+                .is_pending(),
+            "the workspace's same-named file cannot acknowledge the probe"
+        );
+        callback(Ok(content_change(vec![readiness.clone(), source.clone()])));
+        let mut watcher = startup.await.unwrap();
+        assert!(
+            watcher.delivery_proven(),
+            "only shared callback service was sampled"
+        );
+        assert_eq!(
+            watcher.drain().len(),
+            2,
+            "both source callbacks survive probe exclusion"
+        );
+        assert_eq!(watcher.events_outside_root().count, 0);
+        assert!(!repo.path().join(".kin").exists());
+        assert_eq!(std::fs::read_dir(control.path()).unwrap().count(), 0);
+
+        let canary = DeliveryCanary {
+            period: Duration::from_millis(100),
+            bound: Duration::from_secs(1),
+        };
+        let now = Instant::now();
+        assert_eq!(
+            watcher.verify_delivery(now, &canary),
+            DeliveryCheck::Pending
+        );
+        let probe = std::fs::read_dir(control.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let stranger = foreign.path().join(probe.file_name().unwrap());
+        std::fs::write(&stranger, "foreign\n").unwrap();
+        callback(Ok(content_change(vec![
+            stranger.clone(),
+            readiness.clone(),
+            control.path().join("watcher-loss.json"),
+        ])));
+        assert_eq!(
+            watcher.verify_delivery(now, &canary),
+            DeliveryCheck::Pending,
+            "a foreign same-named file and a late readiness echo cannot settle this canary"
+        );
+        assert!(
+            watcher.drain().is_empty(),
+            "auxiliary control IO never enters the source queue"
+        );
+        assert_eq!(watcher.events_outside_root().count, 1);
+        assert_eq!(watcher.events_outside_root().last_path, Some(stranger));
+
+        let mut rescan = content_change(vec![probe.clone(), source.clone()]);
+        rescan.attrs.set_flag(notify::event::Flag::Rescan);
+        callback(Ok(rescan));
+        assert_eq!(watcher.lost_events().generation, 1);
+        assert_eq!(
+            watcher.verify_delivery(now, &canary),
+            DeliveryCheck::Pending,
+            "a rescan cannot acknowledge a probe"
+        );
+        assert!(
+            matches!(watcher.drain().as_slice(), [FileEvent::Changed(path)] if path == &source)
+        );
+        callback(Ok(backend_loss_signal(None)));
+        assert_eq!(
+            watcher.lost_events().generation,
+            2,
+            "pathless rescans survive every scope filter"
+        );
+        callback(Ok(content_change(vec![probe, source.clone()])));
+        assert_eq!(
+            watcher.verify_delivery(now, &canary),
+            DeliveryCheck::Verified
+        );
+        assert!(
+            matches!(watcher.drain().as_slice(), [FileEvent::Changed(path)] if path == &source)
+        );
+        assert_eq!(
+            watcher.lost_events().generation,
+            2,
+            "acknowledgment never clears a recorded loss"
+        );
+        assert_eq!(watcher.events_outside_root().count, 1);
+    }
+
+    #[tokio::test]
+    async fn silent_external_control_records_readiness_and_canary_losses_without_tree_writes() {
+        let repo = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let mut watcher = FileWatcher::new_ready_without_delivery_with_control(
+            &worktree(repo.path()),
+            control.path(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert!(!watcher.delivery_proven());
+        assert_eq!(watcher.lost_events().generation, 1);
+        let canary = DeliveryCanary {
+            period: Duration::from_millis(100),
+            bound: Duration::from_millis(200),
+        };
+        let now = Instant::now();
+        assert_eq!(
+            watcher.verify_delivery(now, &canary),
+            DeliveryCheck::Pending
+        );
+        assert_eq!(
+            watcher.verify_delivery(now + canary.bound, &canary),
+            DeliveryCheck::Lost
+        );
+        assert_eq!(watcher.lost_events().generation, 2);
+        assert_eq!(std::fs::read_dir(repo.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(control.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn auxiliary_controls_do_not_hide_an_overlapping_workspace_scope() {
+        let control = tempfile::tempdir().unwrap();
+        let root = control.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("kept.py");
+        std::fs::write(&source, "def kept(): pass\n").unwrap();
+        let probe = Arc::new(Mutex::new(DeliveryProbe {
+            roots: RepositoryRoots::bind(control.path()),
+            auxiliary: true,
+            directory: PathBuf::new(),
+            prefix: "watcher-ready-fixture".into(),
+            expected: Some(PathBuf::from("watcher-ready-fixture")),
+            acknowledged: false,
+            readiness: None,
+        }));
+        let callback_slot = Arc::new(Mutex::new(None::<WatchCallback>));
+        let captured = Arc::clone(&callback_slot);
+        let watcher =
+            FileWatcher::new_with_delivery_probe_using(&root, Some(probe), move |_, callback| {
+                *captured.lock().unwrap() = Some(callback);
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            })
+            .unwrap();
+        let mut callback = callback_slot.lock().unwrap().take().unwrap();
+        callback(Ok(content_change(vec![
+            control.path().join("watcher-loss.json"),
+            source.clone(),
+        ])));
+        assert!(
+            matches!(watcher.drain().as_slice(), [FileEvent::Changed(path)] if path == &source)
+        );
+        assert_eq!(watcher.events_outside_root().count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_probe_accepts_its_bound_and_resolved_control_spellings_only() {
+        let base = tempfile::tempdir().unwrap();
+        let control = base.path().join("control");
+        let alias = base.path().join("alias");
+        let unrelated = base.path().join("unrelated");
+        std::fs::create_dir(&control).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        std::os::unix::fs::symlink(&control, &alias).unwrap();
+        let relative = PathBuf::from("watcher-ready-fixture");
+        let mut probe = DeliveryProbe {
+            roots: RepositoryRoots::bind(&alias),
+            auxiliary: true,
+            directory: PathBuf::new(),
+            prefix: "watcher-ready-fixture".into(),
+            expected: Some(relative.clone()),
+            acknowledged: false,
+            readiness: None,
+        };
+        probe.observe(&content_change(vec![unrelated.join(&relative)]));
+        assert!(!probe.acknowledged(&relative));
+        for path in [
+            alias.join(&relative),
+            control.canonicalize().unwrap().join(&relative),
+        ] {
+            probe.expect(relative.clone());
+            probe.observe(&content_change(vec![path]));
+            assert!(probe.acknowledged(&relative));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_control_registration_and_probe_write_failures_do_not_verify_delivery() {
+        let repo = tempfile::tempdir().unwrap();
+        let control = tempfile::tempdir().unwrap();
+        let refused = FileWatcher::new_ready_with_control_using(
+            repo.path(),
+            control.path(),
+            Duration::from_secs(10),
+            None,
+            |_, _, _| Err(IndexError::Watcher("control registration refused".into())),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(error) if error.to_string().contains("control registration refused"))
+        );
+        assert_eq!(
+            std::fs::read_dir(control.path()).unwrap().count(),
+            0,
+            "the probe is written only after both registrations succeed"
+        );
+
+        let replaced = control.path().to_path_buf();
+        let failed_write = FileWatcher::new_ready_with_control_using(
+            repo.path(),
+            control.path(),
+            Duration::from_secs(10),
+            None,
+            move |_, _, _| {
+                std::fs::remove_dir(&replaced).unwrap();
+                std::fs::write(&replaced, "replaced\n").unwrap();
+                notify::recommended_watcher(|_: std::result::Result<Event, notify::Error>| {})
+                    .map_err(|error| IndexError::Watcher(error.to_string()))
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed_write, Err(error) if error.to_string().contains("could not create watcher readiness probe"))
+        );
+        std::fs::remove_file(control.path()).unwrap();
+        std::fs::create_dir(control.path()).unwrap();
+        assert!(
+            FileWatcher::new_ready_with_control(
+                &worktree(repo.path()),
+                repo.path(),
+                Duration::from_secs(10)
+            )
+            .await
+            .is_err(),
+            "the workspace itself is not a private control directory"
+        );
+        assert_eq!(std::fs::read_dir(repo.path()).unwrap().count(), 0);
     }
 
     /// A repository reached through a symlink must report writes through it.
@@ -838,7 +2064,7 @@ mod tests {
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let watcher = FileWatcher::new(&link).unwrap();
+        let watcher = FileWatcher::new(&worktree(&link)).unwrap();
         let ready_path = link.join("watch-ready.rs");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut ready = false;

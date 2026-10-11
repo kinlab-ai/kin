@@ -28,6 +28,10 @@ use kin_spine::{
     collect_unresolved_imports, materialize_edges, resolve_imports, EntityEntry, SpineIndex,
 };
 
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 /// One admitted repository, reduced to the entity and relation state its
 /// first-parent history replays to.
 struct AdmittedRepository {
@@ -167,7 +171,7 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
 
     let blob_store = BlobStore::new(dir.join(".fixture-cas")).unwrap();
     let snapshot = capture_lossless_git_repository(
-        dir,
+        &worktree(dir),
         RepositoryId::new(repository_id).unwrap(),
         &blob_store,
     )

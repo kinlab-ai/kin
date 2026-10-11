@@ -85,7 +85,9 @@ fn assert_marker_precedes_the_write(relative: &str, signature: &str) {
 
 #[test]
 fn the_merge_command_marks_only_refusals_raised_before_its_write() {
-    assert_marker_precedes_the_write("src/repository_merge.rs", "pub(crate) fn execute(");
+    // `execute` is a wrapper. The markers and the authority write both live in
+    // `execute_expected`, which is the function a confirmation also enters.
+    assert_marker_precedes_the_write("src/repository_merge.rs", "fn execute_expected(");
 }
 
 #[test]

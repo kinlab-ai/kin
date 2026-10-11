@@ -6,6 +6,7 @@ mod hnsw;
 pub(crate) use hnsw::VectorIndexPersistenceInfo;
 pub use hnsw::{IndexLoadOutcome, VectorIndex};
 pub use kin_vector::IndexDescriptor;
+pub use kin_vector::PersistTopology;
 
 /// Result of installing a persisted index into a graph via
 /// [`crate::InMemoryGraph::load_vector_index_compatible`].

@@ -106,7 +106,10 @@ fn assert_exact_target(files: &[FileParseData], target: EntityId, kind: Relation
 }
 
 fn assert_no_caller_calls(files: &[FileParseData]) {
-    let caller = caller(files);
+    assert_no_calls_from(files, caller(files));
+}
+
+fn assert_no_calls_from(files: &[FileParseData], caller: EntityId) {
     for (route, relations) in routes(files) {
         let calls: Vec<_> = relations
             .iter()
@@ -383,9 +386,39 @@ fn reexport_witness_survives_checkpoint_but_is_withdrawn_when_the_slice_changes(
 
 #[test]
 fn new_reexport_resolution_refuses_caller_parameter_and_module_rebinding() {
+    // A parameter or a local assignment rebinds the name inside the caller,
+    // so the parser records the call as a gap on that local value and never
+    // hands the linker a call pinned to the package import it hides.
     for source in [
         "from pkg import work\ndef run(work):\n    return work()\n",
         "from pkg import work\ndef run():\n    work = lambda: 2\n    return work()\n",
+    ] {
+        let files = [
+            parse("app.py", source),
+            parse("pkg/__init__.py", "from .impl import work\n"),
+            parse("pkg/impl.py", "def work():\n    return 1\n"),
+        ];
+        let relations = &files[0].relations;
+        assert!(
+            !relations.iter().any(|relation| relation.src_name == "run"
+                && relation.kind == RelationKind::Calls
+                && relation.dst_name == "work"),
+            "a call through a local binding names no declaration: {relations:?}"
+        );
+        assert!(
+            relations.iter().any(|relation| relation.src_name == "run"
+                && kin_parser::is_scoped_call_extraction_incomplete_marker(relation)
+                && relation.receiver.as_deref() == Some("work")),
+            "the call through the local binding stays a named gap: {relations:?}"
+        );
+        assert_no_calls_from(
+            &files,
+            entity(&files, "app.py", "run", EntityKind::Function),
+        );
+    }
+    // A module-level rebinding keeps the call's package pin, and the linker
+    // refuses to resolve through the import it overwrote.
+    for source in [
         "from pkg import work\nwork = None\ndef run():\n    return work()\n",
         "from pkg import work\ndel work\ndef run():\n    return work()\n",
     ] {

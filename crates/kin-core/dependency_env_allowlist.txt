@@ -113,3 +113,14 @@ KIN_CLOCKHALF_CHURN
 # nothing in a kin process reads either name.
 KIN_FIR3064_STORE
 KIN_FIR3064_REPO
+
+# kin-db storage::snapshot tests: child-process sentinel for the CodeRankEmbed
+# model-swap reopen test. Read only by that #[test] function; no product
+# runtime reads it as an operator control.
+KIN_TEST_CODERANKEMBED_SWAP_CHILD
+
+# kin-db storage::snapshot tests: child-process sentinel for the test that
+# reopens a store the default model embedded under its previous serving epoch.
+# Read only by that #[test] function; no product runtime reads it as an
+# operator control.
+KIN_TEST_OLD_DEFAULT_SERVING_CHILD

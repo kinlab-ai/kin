@@ -140,9 +140,8 @@ const MAX_GUARD_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 /// What a semantic-only session points an assistant at instead.
 fn semantic_only_redirect() -> String {
     "use Kin's MCP tools (semantic_locate, semantic_search, get_context_pack, \
-     trace_data_flow, find_references) to discover and read code, kin_mutate on entity ids \
-     to change it, and kin_session_exec to build, test and run it; this session has no \
-     shell and no file tools"
+     trace_data_flow, find_references) to discover and read code, and kin_mutate on entity \
+     ids to change it; this session has no shell and no file tools"
         .to_string()
 }
 

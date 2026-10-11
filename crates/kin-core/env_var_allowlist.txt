@@ -21,6 +21,13 @@ KIN_AGENT_TEST_KIN_BIN
 # Selects a subprocess-only provider fixture in the agent integration tests.
 # No product runtime reads this variable.
 KIN_AGENT_OUTPUT_PARAMETER_TEST_CHILD
+# CLI and daemon test subprocesses use these to initialize an owned repository
+# and return its fixture location. They are read only in tests/common/native_init.rs;
+# no product runtime reads them or exposes them as operator configuration.
+KIN_TEST_NATIVE_REPLICA_BRANCH
+KIN_TEST_NATIVE_REPLICA_PATH
+KIN_TEST_NATIVE_REPOSITORY_INIT_REPORT
+KIN_TEST_NATIVE_REPOSITORY_INIT_ROOT
 # Names the bucket an already-running fake-gcs-server holds, for the #[ignore]d
 # GCS endpoint round-trip in kin-daemon. Nothing runs without it, no runtime
 # behaviour keys on it, and the operator-facing lever it exercises is
@@ -62,7 +69,6 @@ KIN_INIT_STAGE_CREATION_TEST_BARRIER
 KIN_INIT_STAGING_SIGNAL_TEST_PARENT
 KIN_REAL_REPOSITORY
 KIN_SPAN_COHERENCE_FIXTURE
-KIN_TEST_RUNTIME_OWNER_TOKEN
 KIN_UPDATE_TEMP_CLEANUP_CRASH_PARENT
 KIN_UPDATE_TEMP_LEASE_CRASH_MARKER
 KIN_UPDATE_TEMP_LEASE_CRASH_PARENT
@@ -119,8 +125,9 @@ KIN_VECTOR_BENCH_ITERS
 KIN_INFER_NONEXISTENT_FLAG_XYZ
 
 # kin-infer's own test binaries read these directly, in crates/kin-infer/tests/:
-# the embed scale-hang harness, the determinism probe and the batch probes. None
-# is compiled into a running kin, and nothing an operator sets. kin-infer moved
+# the embed scale-hang harness, the determinism probe, the batch probes and the
+# Qwen3 decision parity test. None is compiled into a running kin, and nothing
+# an operator sets. kin-infer moved
 # into crates/ on 2026-09-11; before that the dependency scan read only what a
 # consumer's source named, and kin's source names none of them.
 KIN_EMBED_PIPELINE
@@ -128,6 +135,7 @@ KIN_INFER_DETERMINISM_CHILD
 KIN_INFER_DETERMINISM_CONTENTION
 KIN_INFER_DETERMINISM_GATE
 KIN_INFER_PROBE_MODEL_DIR
+KIN_INFER_QWEN3_DIR
 KIN_SCALE_BATCHES
 KIN_SCALE_BATCH_TOKENS
 KIN_SCALE_MAX_SECS
@@ -181,6 +189,25 @@ KIN_REPLAYWALL_COMMITS
 # test under cfg(test). No product runtime reads this variable.
 KIN_DB_PREPARED_SESSION_FIXTURE
 
+# Read only by the ignored prepared_reference_snapshot_preserves_census test
+# in kin-mcp's trace_pages.rs, under cfg(test). These name its explicitly selected
+# prepared store and repository/workspace identities. No product runtime reads
+# them; keep the fixture input contract outside the operator registry.
+KIN_REFS_PREPARED_REPOSITORY
+KIN_REFS_PREPARED_STORE
+KIN_REFS_PREPARED_WORKSPACE
+
+# Read only inside the ignored prepared_shared_implementation_censuses_are_explicit_after_reopen
+# test in kin-daemon's call_site_ledger.rs. These name its already prepared graph
+# store, repository/workspace identities and matching admitted source; they do
+# not select runtime behavior, and no product code reads them. Keep the fixture
+# input contract outside the operator registry and retain the producer source
+# bytes that the enrichment proof identity includes.
+KIN_SHARED_CALL_STORE
+KIN_SHARED_CALL_REPOSITORY_ID
+KIN_SHARED_CALL_WORKSPACE_ID
+KIN_SHARED_CALL_SOURCE
+
 # kin-buildinfo src/relocation_test.rs: preserves the owned tiny Cargo fixture
 # and its logs when explicitly requested by the relocation regression test.
 # The module is compiled only under cfg(all(test, unix)); no product reads it.
@@ -189,3 +216,19 @@ KIN_BUILDINFO_RELOCATION_EVIDENCE
 # kin-lsp. The test does nothing when it is unset, no runtime behaviour keys on
 # it, and nothing an operator sets.
 KIN_TEST_UV_LOCK
+# Read only by the #[ignore]d value-escape corpus probe in
+# crates/kin-parser/src/value_escape.rs, under #[cfg(test)]. DIR names the
+# repository it parses, NAMES the value names whose occurrences it prints, and
+# FOCI the focals it tallies reflective reach for. The probe does nothing
+# without DIR, reports rather than asserting, no runtime behaviour keys on any
+# of them, and none is an operator-facing lever. Same shape as
+# KIN_RECEIVER_HOP_CORPUS above.
+KIN_ESCAPE_CENSUS_DIR
+KIN_ESCAPE_FOCI
+KIN_ESCAPE_NAMES
+
+# kin-lsp server_process.rs: the ignored owned_runtime_fixture is compiled only
+# under cfg(all(test, unix)). These select its owned lifecycle case and receipt
+# marker; no product runtime reads either variable.
+KIN_RUNTIME_LSP_FIXTURE
+KIN_RUNTIME_LSP_MARKER

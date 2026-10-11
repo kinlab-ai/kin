@@ -60,7 +60,11 @@ pub fn build_and_save_kidx(snapshot_path: &Path, graph: &kin_db::InMemoryGraph) 
 /// manifest. A row that names the path badly is still a row; refusing to
 /// register would lose the repository entirely over a file this function is not
 /// the right place to repair.
-pub fn update_registry(repo_root: &Path, entity_count: usize) -> Result<()> {
+pub fn update_registry(
+    repo_root: &Path,
+    entity_count: usize,
+    held: Option<&kin_core::dependencies::HeldContent>,
+) -> Result<()> {
     let repo_id =
         kin_core::registry::published_repository_identity(repo_root).unwrap_or_else(|| {
             repo_root
@@ -73,7 +77,7 @@ pub fn update_registry(repo_root: &Path, entity_count: usize) -> Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
     kin_core::registry::KinRegistry::update(|registry| {
-        registry.upsert(repo_id, canonical, entity_count);
+        registry.upsert_with_held_content(repo_id, canonical, entity_count, &[], held);
     })
     .map_err(|e| MigrateError::Other(format!("failed to update local registry authority: {e}")))?;
     Ok(())
@@ -119,14 +123,18 @@ mod tests {
     /// a manifest id cannot be confused.
     #[test]
     fn the_registry_records_the_identity_the_repository_publishes() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let parent = tempfile::tempdir().unwrap();
         let repo_root = parent.path().join("some-checkout-directory");
         std::fs::create_dir_all(&repo_root).unwrap();
-        kin_core::init(&repo_root).unwrap();
-
         let registry_path = parent.path().join("registry-home/registry.toml");
         let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
-        update_registry(&repo_root, 7).unwrap();
+        // Registry location also selects its store index; retain one resolver
+        // context from initialization through the identity read.
+        kin_core::init(&repo_root).unwrap();
+        update_registry(&repo_root, 7, None).unwrap();
 
         let published = kin_core::registry::published_repository_identity(&repo_root)
             .expect("an initialized repository publishes an identity");
@@ -158,13 +166,16 @@ mod tests {
     /// entirely over an unreadable file is worse than naming it badly.
     #[test]
     fn a_repository_with_no_manifest_is_still_registered_under_its_directory_name() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let parent = tempfile::tempdir().unwrap();
         let repo_root = parent.path().join("unmanifested-checkout");
         std::fs::create_dir_all(&repo_root).unwrap();
 
         let registry_path = parent.path().join("registry-home/registry.toml");
         let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
-        update_registry(&repo_root, 0).unwrap();
+        update_registry(&repo_root, 0, None).unwrap();
 
         let registry = kin_core::registry::KinRegistry::load_from(&registry_path).unwrap();
         assert_eq!(
@@ -177,6 +188,9 @@ mod tests {
 
     #[test]
     fn update_registry_does_not_panic_on_missing_home() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         // Point the registry authority at a path whose parent directory does
         // not exist yet. That is the condition under test, and it keeps the
@@ -187,7 +201,7 @@ mod tests {
         let registry_path = tmp.path().join("registry-home/registry.toml");
         let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
 
-        update_registry(tmp.path(), 42).unwrap();
+        update_registry(tmp.path(), 42, None).unwrap();
 
         assert!(
             registry_path.exists(),

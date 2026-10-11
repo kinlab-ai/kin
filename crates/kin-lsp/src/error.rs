@@ -38,10 +38,31 @@ pub enum LspError {
     #[error("{reason} (server stderr: {stderr})")]
     ServerFailedWithStderr { reason: String, stderr: String },
 
+    /// A server that started and did not complete the initialize handshake,
+    /// with the whole reason: it refused (with its own message), it exited
+    /// (with its exit status), or it did not answer within the limit, each
+    /// with the end of what it wrote to stderr.
+    ///
+    /// The sentence is complete on its own, because every surface that
+    /// reports a server that cannot start prints it as it is.
+    #[error("{0}")]
+    HandshakeFailed(String),
+
     /// The server answered that the request does not apply where it was asked,
     /// in one of the exact method and message pairs [`declined_answer`] knows.
     #[error("{method} declined: {message}")]
     Declined { method: String, message: String },
+
+    /// The server is still running, but its own state is broken: it fails
+    /// every question the same way, whatever was asked and where, until it is
+    /// restarted. The reason says how that was recognized.
+    ///
+    /// A server in this state answers quickly, so without this a sweep read
+    /// each failure as an answer about one position. On React, tsserver threw
+    /// one assertion while updating its project for 1615 files, and every one
+    /// of them was recorded as settled with no answer.
+    #[error("the server's own state failed and it must restart: {0}")]
+    ServerWedged(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -79,6 +100,8 @@ impl LspError {
                 | LspError::ServerStartFailed(_)
                 | LspError::InitializeFailed(_)
                 | LspError::ServerFailedWithStderr { .. }
+                | LspError::HandshakeFailed(_)
+                | LspError::ServerWedged(_)
         )
     }
 
@@ -101,9 +124,11 @@ impl LspError {
     /// retrying costs a query and learns nothing.
     ///
     /// The one error a server returns itself that is a refusal is a
-    /// TypeScript compiler's internal assertion (see
+    /// TypeScript compiler's internal assertion about the position asked (see
     /// [`typescript_internal_assertion`]): the compiler asserts on the same
-    /// bytes the same way every time.
+    /// bytes the same way every time. An assertion thrown while tsserver
+    /// brings its project up to date is not about the position at all, and
+    /// is a server failure instead (see [`server_state_failure`]).
     ///
     /// Not a refusal: a timeout, a server that stopped answering, and any
     /// other error the server returned itself, which may be load, a restart
@@ -112,7 +137,9 @@ impl LspError {
     pub fn is_refusal(&self) -> bool {
         match self {
             LspError::Protocol(_) | LspError::Json(_) => true,
-            LspError::JsonRpc(error) => typescript_internal_assertion(error),
+            LspError::JsonRpc(error) => {
+                typescript_internal_assertion(error) && server_state_failure(error).is_none()
+            }
             _ => false,
         }
     }
@@ -132,10 +159,22 @@ impl LspError {
         let Self::JsonRpc(error) = self else {
             return false;
         };
-        serde_json::from_str::<serde_json::Value>(error)
-            .ok()
-            .and_then(|error| error.get("code").and_then(serde_json::Value::as_i64))
-            .is_some_and(|code| matches!(code, -32802..=-32800))
+        typescript_lost_the_open_file(error)
+            || serde_json::from_str::<serde_json::Value>(error)
+                .ok()
+                .and_then(|error| error.get("code").and_then(serde_json::Value::as_i64))
+                .is_some_and(|code| matches!(code, -32802..=-32800))
+    }
+
+    /// Whether the server may answer this question if asked it with nothing
+    /// else in flight: it timed out, or the server asked for it again with
+    /// RequestCancelled, ContentModified or ServerCancelled. Those are what a
+    /// server does when it falls behind, so a pass that asked beside other
+    /// questions backs off and asks again alone before it counts one as
+    /// unanswered. A server that stopped answering is not behind, and an
+    /// answer this build refuses is the same answer asked alone.
+    pub fn under_load(&self) -> bool {
+        self.is_retryable() && !self.ends_the_session()
     }
 
     /// The one classification every pass applies, in its one order:
@@ -174,6 +213,89 @@ pub fn typescript_internal_assertion(error: &str) -> bool {
         .next()
         .is_some_and(|first| first.contains("TypeScript Server Error"))
         && lines.any(|line| line.trim_start().starts_with("Debug Failure."))
+}
+
+/// Whether tsserver answered that it holds no source file for the document
+/// the question was about. The sweep opens every file before asking about it,
+/// so this is tsserver's own state having failed, not an answer about the
+/// file: on React it answered every question about one test file this way,
+/// in every sweep, as its project update began asserting, and the file was
+/// held owed to a later pass that answered it. Asked again once the file is
+/// reopened, on a server that is answering, it is answered.
+///
+/// Asked again on the same server, it was not: on React 11,737 definition
+/// questions about one file got this answer over 28 seconds, the file was
+/// held owed, and a fresh server a later pass started answered it in ten. So
+/// it is also a server failure (see [`server_state_failure`]): the server is
+/// retired and the file asked again on its replacement, inside the pass.
+pub fn typescript_lost_the_open_file(error: &str) -> bool {
+    let Ok(error) = serde_json::from_str::<serde_json::Value>(error) else {
+        return false;
+    };
+    let Some(message) = error.get("message").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let mut lines = message.lines();
+    lines
+        .next()
+        .is_some_and(|first| first.contains("TypeScript Server Error"))
+        && lines.any(|line| line.trim_start().starts_with("Could not find source file"))
+}
+
+/// The frames of tsserver's stack that bring a project up to date before any
+/// request is answered: the program is rebuilt and the module resolution
+/// cache is synchronized and watched. Every request passes through them first,
+/// so an assertion raised inside them says nothing about the position asked.
+const TYPESCRIPT_PROJECT_UPDATE_FRAMES: &[&str] = &[
+    "updateGraph",
+    "updateProjectIfDirty",
+    "CachingPerDirectoryResolution",
+    "FailedLookupLocation",
+];
+
+/// Why a JSON-RPC error a server returned says its own state has failed,
+/// rather than that one question could not be answered, or `None`.
+///
+/// The one known today is a TypeScript internal assertion thrown while
+/// tsserver brings its project up to date (see
+/// [`TYPESCRIPT_PROJECT_UPDATE_FRAMES`]). TypeScript 5.7.3 asserted in
+/// `watchFailedLookupLocationOfResolution`, under `updateGraph`, for every
+/// definition query on React for two and a half minutes, until tsserver was
+/// restarted. The assertion is the same whatever was asked, which is how it
+/// differs from one about a position (`getTextOfPropertyName` on
+/// drizzle-orm), which stays a refusal. Other servers are covered by
+/// [`crate::client`]'s repeated-failure rule, which needs no recognizer.
+pub fn server_state_failure(error: &str) -> Option<String> {
+    if typescript_lost_the_open_file(error) {
+        return Some(
+            "TypeScript answered that it holds no source file for a document it was handed, so \
+             its own project state has failed and it fails that document until it restarts"
+                .to_string(),
+        );
+    }
+    if !typescript_internal_assertion(error) {
+        return None;
+    }
+    let message = serde_json::from_str::<serde_json::Value>(error)
+        .ok()?
+        .get("message")?
+        .as_str()?
+        .to_string();
+    let frame = message
+        .lines()
+        .map(str::trim_start)
+        .filter_map(|line| line.strip_prefix("at "))
+        .find(|frame| {
+            let function = frame.split([' ', '(']).next().unwrap_or("");
+            TYPESCRIPT_PROJECT_UPDATE_FRAMES
+                .iter()
+                .any(|update| function.contains(update))
+        })?;
+    let function = frame.split([' ', '(']).next().unwrap_or(frame);
+    Some(format!(
+        "TypeScript asserted while updating its project, in `{function}`, so it fails every \
+         question until it restarts"
+    ))
 }
 
 /// How a known declining message is matched.
@@ -251,7 +373,7 @@ pub fn declined_answer(method: &str, error: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{declined_answer, LspError, QueryErrorClass};
 
     fn rpc(code: i64, message: &str) -> String {
@@ -364,6 +486,110 @@ mod tests {
         ] {
             assert!(!LspError::JsonRpc(other.clone()).is_refusal(), "{other}");
         }
+    }
+
+    #[test]
+    fn a_tsserver_that_lost_the_open_file_is_asked_again() {
+        let lost = rpc(
+            1,
+            "<main> TypeScript Server Error (5.7.3)\nCould not find source file: \
+             '/repo/src/events-test.js'.\nError: Could not find source file: \
+             '/repo/src/events-test.js'.\n    at getValidSourceFile (/env/typescript.js:1:1)",
+        );
+        // A server failure: the client reads the server as gone, so the
+        // file is asked again on a fresh one rather than on this one.
+        let reason = super::server_state_failure(&lost).expect("a server failure");
+        assert!(reason.contains("no source file"), "{reason}");
+        let error = LspError::JsonRpc(lost);
+        assert!(!error.is_refusal());
+        assert!(error.is_retryable());
+        assert!(error.under_load());
+        assert_eq!(error.class(), QueryErrorClass::Failed);
+        // Other errors tsserver returns keep their policy.
+        let no_project = LspError::JsonRpc(rpc(
+            1,
+            "<main> TypeScript Server Error (5.6.3)\nNo Project.",
+        ));
+        assert!(!no_project.is_retryable());
+        let elsewhere = LspError::JsonRpc(rpc(1, "Could not find source file"));
+        assert!(!elsewhere.is_retryable());
+        assert!(super::server_state_failure(&rpc(1, "Could not find source file")).is_none());
+    }
+
+    /// The assertion tsserver threw on React for every definition query for
+    /// two and a half minutes, as typescript-language-server relayed it.
+    pub(crate) fn project_update_assertion() -> String {
+        let at = |function: &str| {
+            format!("\n    at {function} (/env/node_modules/typescript/lib/typescript.js:1:1)")
+        };
+        rpc(
+            1,
+            &format!(
+                "<main> TypeScript Server Error (5.7.3)\nDebug Failure. False expression.\n\
+                 Error: Debug Failure. False expression.{}\n    at Set.forEach (<anonymous>){}{}{}{}{}{}",
+                at("watchFailedLookupLocationOfResolution"),
+                at("watchFailedLookupLocationOfNonRelativeModuleResolutions"),
+                at("Object.startCachingPerDirectoryResolution"),
+                at("InferredProject2.updateGraphWorker"),
+                at("InferredProject2.updateGraph"),
+                at("updateProjectIfDirty"),
+                at("IpcIOSession.getDefinition"),
+            ),
+        )
+    }
+
+    /// An assertion thrown while tsserver brings its project up to date is
+    /// about the server, not the position: it fails every question the same
+    /// way until tsserver restarts, so it ends the session and is retried,
+    /// and is never a refusal that settles the position. Falsify by reading
+    /// every `Debug Failure.` as a refusal: on React 1615 files were settled
+    /// with no answer while tsserver was in this state.
+    #[test]
+    fn a_typescript_assertion_while_updating_the_project_is_a_server_failure() {
+        let wedged = project_update_assertion();
+        let reason = super::server_state_failure(&wedged).expect("recognized");
+        assert!(
+            reason.contains("watchFailedLookupLocationOfResolution"),
+            "{reason}"
+        );
+        assert!(!LspError::JsonRpc(wedged.clone()).is_refusal());
+        for function in [
+            "InferredProject2.updateGraph",
+            "ConfiguredProject2.updateGraphWorker",
+            "updateProjectIfDirty",
+            "Object.finishCachingPerDirectoryResolution",
+        ] {
+            let error = rpc(
+                1,
+                &format!(
+                    "<main> TypeScript Server Error (5.7.3)\nDebug Failure.\n    at {function} \
+                     (/x/typescript.js:1:1)\n    at IpcIOSession.getDefinition (/x/typescript.js:2:2)"
+                ),
+            );
+            assert!(super::server_state_failure(&error).is_some(), "{function}");
+        }
+        // An assertion about the position stays a refusal.
+        let position = rpc(
+            1,
+            "<main> TypeScript Server Error (5.6.3)\nDebug Failure.\nError: Debug Failure.\n    \
+             at getTextOfPropertyName (/repo/node_modules/typescript/lib/typescript.js:17277:16)\n    \
+             at IpcIOSession.getDefinition (/x/typescript.js:2:2)",
+        );
+        assert!(super::server_state_failure(&position).is_none());
+        assert!(LspError::JsonRpc(position).is_refusal());
+        // Only an internal assertion is read this way, whatever else names
+        // the frames.
+        assert!(super::server_state_failure(&rpc(
+            1,
+            "<main> TypeScript Server Error (5.7.3)\nNo Project.\n    at updateGraph (x)"
+        ))
+        .is_none());
+
+        let failed = LspError::ServerWedged(reason);
+        assert!(failed.ends_the_session());
+        assert!(failed.is_retryable());
+        assert!(!failed.is_refusal());
+        assert_eq!(failed.class(), QueryErrorClass::SessionEnded);
     }
 
     #[test]

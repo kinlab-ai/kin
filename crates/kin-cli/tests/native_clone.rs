@@ -148,8 +148,8 @@ fn history(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
     .expect("history JSON")
 }
 
-fn configure_author(repo: &Path) {
-    let path = repo.join(".kin/config.toml");
+fn configure_author(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let path = runtime.layout_for(repo).config_path();
     let mut config = kin_core::KinConfig::load_or_default(&path).unwrap();
     config.default_author = Some("Native Clone Test <native-clone@example.invalid>".to_string());
     config.save(&path).unwrap();
@@ -157,10 +157,11 @@ fn configure_author(repo: &Path) {
 
 fn initialize_source(runtime: &common::IsolatedDaemonRuntime, source: &Path) -> (String, String) {
     fs::create_dir(source).unwrap();
-    let initialized = kin_core::init_replica(source, "trunk").unwrap();
-    let repository = initialized.repository_id.to_string();
-    drop(initialized);
-    configure_author(source);
+    let layout = runtime.initialize_native_replica(source, "trunk");
+    let repository = kin_core::KinManifest::load(&layout.manifest_path())
+        .unwrap()
+        .repo_id;
+    configure_author(runtime, source);
     fs::create_dir(source.join("src")).unwrap();
     fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 42 }\n").unwrap();
     fs::write(source.join("payload.bin"), [0, 255, 128, 10, 0]).unwrap();
@@ -169,7 +170,7 @@ fn initialize_source(runtime: &common::IsolatedDaemonRuntime, source: &Path) -> 
         source,
         &["commit", "-m", "Add native source bodies"],
     ));
-    let port = fs::read_to_string(source.join(".kin/daemon.port")).unwrap();
+    let port = fs::read_to_string(runtime.layout_for(source).root().join("daemon.port")).unwrap();
     (repository, format!("http://127.0.0.1:{}", port.trim()))
 }
 
@@ -177,12 +178,12 @@ fn clone_command(
     runtime: &common::IsolatedDaemonRuntime,
     parent: &Path,
     destination: &Path,
-    source: &Path,
+    source_store: &Path,
     endpoint: &str,
     repository: &str,
     unavailable_daemon: Option<&str>,
 ) -> Output {
-    let token = fs::read_to_string(source.join(".kin/daemon.token")).unwrap();
+    let token = fs::read_to_string(source_store.join("daemon.token")).unwrap();
     let mut command = runtime.kin_command();
     command
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
@@ -198,17 +199,17 @@ fn clone_command(
     command.output().expect("clone native repository")
 }
 
-fn pull(runtime: &common::IsolatedDaemonRuntime, destination: &Path, source: &Path) {
-    transfer(runtime, destination, source, "pull");
+fn pull(runtime: &common::IsolatedDaemonRuntime, destination: &Path, source_store: &Path) {
+    transfer(runtime, destination, source_store, "pull");
 }
 
 fn transfer(
     runtime: &common::IsolatedDaemonRuntime,
     destination: &Path,
-    source: &Path,
+    source_store: &Path,
     verb: &str,
 ) {
-    let token = fs::read_to_string(source.join(".kin/daemon.token")).unwrap();
+    let token = fs::read_to_string(source_store.join("daemon.token")).unwrap();
     require_success(
         runtime
             .kin_command()
@@ -278,19 +279,33 @@ fn assert_exact_replicas(
         );
     }
     assert!(!destination.join(".git").exists());
-    let config_text = fs::read_to_string(destination.join(".kin/config.toml")).unwrap();
-    let token = fs::read_to_string(source.join(".kin/daemon.token")).unwrap();
+    let config_text =
+        fs::read_to_string(clone_runtime.layout_for(destination).config_path()).unwrap();
+    let token = fs::read_to_string(
+        source_runtime
+            .layout_for(source)
+            .root()
+            .join("daemon.token"),
+    )
+    .unwrap();
     assert!(
         !config_text.contains(token.trim()),
         "origin must not persist the peer token"
     );
-    let token = fs::read_to_string(destination.join(".kin/daemon.token")).unwrap();
+    let token = fs::read_to_string(
+        clone_runtime
+            .layout_for(destination)
+            .root()
+            .join("daemon.token"),
+    )
+    .unwrap();
     assert!(
         !config_text.contains(token.trim()),
         "origin must not persist the local token"
     );
     let config =
-        kin_core::KinConfig::load_or_default(&destination.join(".kin/config.toml")).unwrap();
+        kin_core::KinConfig::load_or_default(&clone_runtime.layout_for(destination).config_path())
+            .unwrap();
     assert_eq!(config.remote.default.as_deref(), Some("origin"));
     assert_eq!(config.remote.refs[0].host, kin_core::RemoteHostKind::Peer);
 }
@@ -303,7 +318,13 @@ fn native_clone_adopts_history_projects_bodies_and_pulls_new_paths_and_edits() {
     let source_runtime = common::IsolatedDaemonRuntime::new(&source);
     let clone_runtime = common::IsolatedDaemonRuntime::new(&destination);
     let (repository, endpoint) = initialize_source(&source_runtime, &source);
-    let token = fs::read_to_string(source.join(".kin/daemon.token")).unwrap();
+    let token = fs::read_to_string(
+        source_runtime
+            .layout_for(&source)
+            .root()
+            .join("daemon.token"),
+    )
+    .unwrap();
     let advertisement = reqwest::blocking::Client::new()
         .get(format!("{endpoint}/repos/{repository}/transfer/advertise"))
         .bearer_auth(token.trim())
@@ -324,7 +345,7 @@ fn native_clone_adopts_history_projects_bodies_and_pulls_new_paths_and_edits() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &proxy.endpoint,
         &repository,
         None,
@@ -350,7 +371,11 @@ fn native_clone_adopts_history_projects_bodies_and_pulls_new_paths_and_edits() {
         &source,
         &["commit", "-m", "Edit and extend native source"],
     ));
-    pull(&clone_runtime, &destination, &source);
+    pull(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+    );
     assert_exact_replicas(
         &source_runtime,
         &source,
@@ -358,7 +383,7 @@ fn native_clone_adopts_history_projects_bodies_and_pulls_new_paths_and_edits() {
         &destination,
         &["src/lib.rs", "src/added.rs", "payload.bin"],
     );
-    configure_author(&destination);
+    configure_author(&clone_runtime, &destination);
     fs::write(
         destination.join("from-client.bin"),
         b"\0native client artifact\xff\n",
@@ -373,14 +398,19 @@ fn native_clone_adopts_history_projects_bodies_and_pulls_new_paths_and_edits() {
             "Publish a native artifact from cloned client",
         ],
     ));
-    transfer(&clone_runtime, &destination, &source, "push");
+    transfer(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+        "push",
+    );
     let fetched = scratch.path().join("fetched");
     let fetched_runtime = common::IsolatedDaemonRuntime::new(&fetched);
     require_success(clone_command(
         &fetched_runtime,
         scratch.path(),
         &fetched,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &proxy.endpoint,
         &repository,
         None,
@@ -409,20 +439,27 @@ fn native_clone_preserves_an_empty_repository_without_inventing_history() {
     let source = scratch.path().join("source");
     let destination = scratch.path().join("replica");
     fs::create_dir(&source).unwrap();
-    let initialized = kin_core::init_replica(&source, "trunk").unwrap();
-    let repository = initialized.repository_id.to_string();
-    drop(initialized);
-    configure_author(&source);
     let source_runtime = common::IsolatedDaemonRuntime::new(&source);
+    let layout = source_runtime.initialize_native_replica(&source, "trunk");
+    let repository = kin_core::KinManifest::load(&layout.manifest_path())
+        .unwrap()
+        .repo_id;
+    configure_author(&source_runtime, &source);
     let clone_runtime = common::IsolatedDaemonRuntime::new(&destination);
     require_success(run(&source_runtime, &source, &["admit"]));
     let source_status = status(&source_runtime, &source);
-    let port = fs::read_to_string(source.join(".kin/daemon.port")).unwrap();
+    let port = fs::read_to_string(
+        source_runtime
+            .layout_for(&source)
+            .root()
+            .join("daemon.port"),
+    )
+    .unwrap();
     require_success(clone_command(
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &format!("http://127.0.0.1:{}", port.trim()),
         &repository,
         None,
@@ -455,7 +492,11 @@ fn native_clone_preserves_an_empty_repository_without_inventing_history() {
         &source,
         &["commit", "-m", "Publish the first native path"],
     ));
-    pull(&clone_runtime, &destination, &source);
+    pull(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+    );
     assert_exact_replicas(
         &source_runtime,
         &source,
@@ -502,18 +543,24 @@ fn native_clone_bootstraps_git_history_and_then_pulls_a_native_new_path() {
     let source_runtime = common::IsolatedDaemonRuntime::new(&source);
     let clone_runtime = common::IsolatedDaemonRuntime::new(&destination);
     require_success(run(&source_runtime, &source, &["init", ".", "--json"]));
-    configure_author(&source);
+    configure_author(&source_runtime, &source);
     require_success(run(&source_runtime, &source, &["admit"]));
     let source_status = status(&source_runtime, &source);
     let repository = source_status["repository"]["repository_id"]
         .as_str()
         .unwrap();
-    let port = fs::read_to_string(source.join(".kin/daemon.port")).unwrap();
+    let port = fs::read_to_string(
+        source_runtime
+            .layout_for(&source)
+            .root()
+            .join("daemon.port"),
+    )
+    .unwrap();
     require_success(clone_command(
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &format!("http://127.0.0.1:{}", port.trim()),
         repository,
         None,
@@ -525,7 +572,7 @@ fn native_clone_bootstraps_git_history_and_then_pulls_a_native_new_path() {
         &destination,
         &["src/lib.rs", "payload.bin"],
     );
-    configure_author(&destination);
+    configure_author(&clone_runtime, &destination);
     let source_history = history(&source_runtime, &source);
     let entries = source_history["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
@@ -605,7 +652,11 @@ fn native_clone_bootstraps_git_history_and_then_pulls_a_native_new_path() {
         &source,
         &["commit", "-m", "Introduce a native path after Git import"],
     ));
-    pull(&clone_runtime, &destination, &source);
+    pull(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+    );
     assert_exact_replicas(
         &source_runtime,
         &source,
@@ -630,7 +681,7 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
         Some(&unavailable_endpoint),
@@ -639,12 +690,12 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("durably adopted repository"), "{stderr}");
     assert!(stderr.contains("kin pull"), "{stderr}");
-    let manifest_before = fs::read(destination.join(".kin/manifest.json")).unwrap();
+    let manifest_before = fs::read(clone_runtime.layout_for(&destination).manifest_path()).unwrap();
     let refused = clone_command(
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
         None,
@@ -653,9 +704,13 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
     assert!(String::from_utf8_lossy(&refused.stderr).contains("not empty"));
     assert_eq!(
         manifest_before,
-        fs::read(destination.join(".kin/manifest.json")).unwrap()
+        fs::read(clone_runtime.layout_for(&destination).manifest_path()).unwrap()
     );
-    pull(&clone_runtime, &destination, &source);
+    pull(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+    );
     assert_exact_replicas(
         &source_runtime,
         &source,
@@ -670,7 +725,7 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
         &clone_runtime,
         scratch.path(),
         &occupied,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
         None
@@ -687,7 +742,7 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
             &clone_runtime,
             scratch.path(),
             &link,
-            &source,
+            source_runtime.layout_for(&source).root(),
             &endpoint,
             &repository,
             None
@@ -701,7 +756,7 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
         &clone_runtime,
         scratch.path(),
         &uncreated,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &unavailable_endpoint,
         &repository,
         None,
@@ -716,8 +771,11 @@ fn native_clone_refuses_clobber_and_retains_identity_for_retry_after_startup_fai
 /// What a stopped store's authority says: whether its workspace graph carries
 /// checked binding history, the generation it stands at, how many changes a
 /// daemon's start recorded to re-qualify it, and the change `trunk` names.
-fn stopped_store_reading(repo: &Path) -> (bool, u64, usize, String) {
-    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+fn stopped_store_reading(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+) -> (bool, u64, usize, String) {
+    let layout = runtime.layout_for(repo);
     let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
         .unwrap()
         .open_manager_with_payload_stats()
@@ -778,11 +836,12 @@ fn read_across_a_daemon_start(
     what: &str,
 ) -> ((bool, u64, usize, String), (bool, u64, usize, String)) {
     require_success(run(runtime, repo, &["daemon", "stop"]));
-    let before = stopped_store_reading(repo);
+    let before = stopped_store_reading(runtime, repo);
     require_success(run(runtime, repo, &["graph", "status"]));
     require_success(run(runtime, repo, &["daemon", "stop"]));
-    let after = stopped_store_reading(repo);
-    let log = fs::read_to_string(repo.join(".kin/daemon.log")).unwrap_or_default();
+    let after = stopped_store_reading(runtime, repo);
+    let log =
+        fs::read_to_string(runtime.layout_for(repo).root().join("daemon.log")).unwrap_or_default();
     let said: Vec<&str> = log
         .lines()
         .filter(|line| line.contains("binding history"))
@@ -812,7 +871,7 @@ fn a_daemon_start_after_a_transfer_moves_no_head() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
         None,
@@ -827,7 +886,7 @@ fn a_daemon_start_after_a_transfer_moves_no_head() {
 
     // A person's clone has a commit author, which a daemon's start needs to
     // record anything, so the replica gets one before it is ever restarted.
-    configure_author(&destination);
+    configure_author(&clone_runtime, &destination);
     let (cloned, restarted) = read_across_a_daemon_start(&clone_runtime, &destination, "clone");
     assert_eq!(
         cloned.3,
@@ -842,7 +901,11 @@ fn a_daemon_start_after_a_transfer_moves_no_head() {
         &source,
         &["commit", "-m", "Advance the source"],
     ));
-    pull(&clone_runtime, &destination, &source);
+    pull(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+    );
     let (pulled, restarted) = read_across_a_daemon_start(&clone_runtime, &destination, "pull");
     assert_eq!(pulled.3, source_head(), "the pull serves the source's head");
     assert_moved_nothing("pull", &pulled, &restarted, true);
@@ -854,7 +917,7 @@ fn a_daemon_start_after_a_transfer_moves_no_head() {
         &["src/lib.rs", "payload.bin"],
     );
 
-    configure_author(&destination);
+    configure_author(&clone_runtime, &destination);
     fs::write(
         destination.join("src/lib.rs"),
         b"pub fn answer() -> u8 { 8 }\n",
@@ -865,7 +928,12 @@ fn a_daemon_start_after_a_transfer_moves_no_head() {
         &destination,
         &["commit", "-m", "Advance the replica"],
     ));
-    transfer(&clone_runtime, &destination, &source, "push");
+    transfer(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+        "push",
+    );
     let (received, restarted) = read_across_a_daemon_start(&source_runtime, &source, "push");
     // The origin's workspace stays on the base it had while the push moves
     // trunk past it, and a re-qualification derives every head together with
@@ -874,7 +942,7 @@ fn a_daemon_start_after_a_transfer_moves_no_head() {
     assert_moved_nothing("push", &received, &restarted, false);
     require_success(run(&clone_runtime, &destination, &["daemon", "stop"]));
     assert_eq!(
-        stopped_store_reading(&destination).3,
+        stopped_store_reading(&clone_runtime, &destination).3,
         received.3,
         "the origin serves the head the replica pushed"
     );

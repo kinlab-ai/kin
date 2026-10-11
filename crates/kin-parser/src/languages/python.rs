@@ -14,6 +14,13 @@ use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
     ParseOutput, RelationSite,
 };
+use crate::nested::{
+    is_local_scope_name, local_scope_name, LocalScopeNames, NestedDefinitionCensus,
+    UnadmittedNestedDefinition,
+};
+
+#[path = "python_fields.rs"]
+mod fields;
 
 /// Every public name CPython's `builtins` module binds, sorted so
 /// [`is_python_builtin_name`] can binary-search it.
@@ -196,8 +203,87 @@ impl LanguageAdapter for PythonAdapter {
         LanguageId::Python
     }
 
+    fn declaration_lifecycle(
+        &self,
+    ) -> Option<&dyn crate::declaration_lifecycle::DeclarationLifecycle> {
+        Some(&super::python_edit::PythonLifecycle)
+    }
+
+    fn member_placement(&self) -> Option<&dyn crate::member_placement::MemberPlacement> {
+        Some(&super::python_edit::PythonPlacement)
+    }
+
+    fn unit_editor(&self) -> Option<&dyn crate::unit_editor::UnitEditor> {
+        Some(&super::python_edit::PYTHON_UNITS)
+    }
+
+    fn layout_problems(
+        &self,
+        root: &tree_sitter::Node,
+        source: &[u8],
+        out: &mut Vec<crate::syntax_reading::SyntaxProblem>,
+    ) {
+        super::python_layout::python_layout_problems(root, source, out);
+    }
+
+    fn is_docstring(&self, node: tree_sitter::Node) -> bool {
+        super::python_layout::is_python_docstring(node)
+    }
+
+    /// An `@overload` stub. `typing.overload` declares one signature of a
+    /// function whose implementation follows it under the same name, and the
+    /// stub's own body never runs. Extraction writes each decorator's
+    /// trailing identifier at the head of the signature, so `@t.overload` and
+    /// `@typing.overload` both read `@overload` there.
+    fn declares_only(&self, kind: EntityKind, signature: &str) -> bool {
+        matches!(kind, EntityKind::Function | EntityKind::Method)
+            && crate::declaration_only::leading_decorators(signature)
+                .any(|decorator| decorator == "overload")
+    }
+
+    fn site_syntax(&self) -> Option<crate::site_syntax::SiteSyntax> {
+        Some(crate::site_syntax::PYTHON)
+    }
+
+    fn body_syntax(&self) -> Option<crate::body_syntax::BodySyntax> {
+        Some(crate::body_syntax::PYTHON)
+    }
+
+    fn name_syntax(&self) -> Option<crate::name_syntax::NameSyntax> {
+        Some(crate::name_syntax::PYTHON)
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["py", "pyi"]
+    }
+
+    fn project_manifest(&self) -> Option<crate::project_manifest::ProjectManifest> {
+        Some(crate::project_manifest::PYPROJECT)
+    }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::python_declarations::python_declaration_census(
+            tree, source,
+        ))
+    }
+
+    fn literal_members<'tree>(
+        &self,
+        literal: tree_sitter::Node<'tree>,
+        source: &[u8],
+    ) -> Vec<crate::literal_members::LiteralMember<'tree>> {
+        fields::literal_members(literal, source)
+    }
+
+    fn import_specifier_root(
+        &self,
+        module_path: &str,
+    ) -> crate::import_origin::ImportSpecifierRoot {
+        crate::import_origin::python_specifier_root(module_path)
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
@@ -218,15 +304,12 @@ impl LanguageAdapter for PythonAdapter {
             ParseState::Incomplete { error_ranges }
         };
 
-        let mut entities = Vec::new();
-        let mut relations = Vec::new();
         let mut imports = Vec::new();
         // Names a module-scope guard binds. Not `FileImport`s: see
         // [`collect_python_guarded_imports`] for why admitting them there cost
         // measured recall on a real repository.
         let mut guarded_imports: Vec<FileImport> = Vec::new();
-        let mut call_audit = PythonCallExtractionAudit::default();
-        let mut value_refs = Vec::new();
+        let mut out = PyExtraction::default();
         let root = tree.root_node();
         let mut cursor = root.walk();
 
@@ -235,17 +318,21 @@ impl LanguageAdapter for PythonAdapter {
         // is resolved before the walk because module-scope statements are
         // sourced to the module entity.
         let (module_name, is_package) = python_module_identity(file_id);
+        let module_scope = PyScope {
+            enclosing: (!module_name.is_empty()).then(|| module_name.clone()),
+            ..PyScope::default()
+        };
+        prepare_python_block_class_collisions(&root, source, &module_scope, &mut out);
+        prepare_python_conditional_ambiguities(&root, source, &module_scope, &mut out);
 
         for child in root.children(&mut cursor) {
-            extract_py_node(
+            extract_py_node(&child, source, file_id, &module_scope, &mut out);
+            let nested = admit_python_statement_definitions(
                 &child,
                 source,
                 file_id,
-                None,
-                &mut entities,
-                &mut relations,
-                &mut call_audit,
-                &mut value_refs,
+                &module_scope,
+                &mut out,
             );
             // Extract imports at top level, plus the guarded ones that only
             // bind names for annotations.
@@ -269,8 +356,8 @@ impl LanguageAdapter for PythonAdapter {
                             &child,
                             source,
                             &module_name,
-                            &std::collections::HashSet::new(),
-                            &mut value_refs,
+                            &PyRefScope::within(&[], Some(&nested)),
+                            &mut out.value_refs,
                         );
                     }
                 }
@@ -298,7 +385,7 @@ impl LanguageAdapter for PythonAdapter {
         // package init files produced Module entities, leaving regular modules
         // without a node, which broke per-file graph queries on Python repos.
         if !module_name.is_empty() {
-            entities.push(ExtractedEntity {
+            out.entities.push(ExtractedEntity {
                 kind: EntityKind::Module,
                 name: module_name,
                 signature: if is_package {
@@ -314,16 +401,69 @@ impl LanguageAdapter for PythonAdapter {
             });
         }
 
+        // Calls no declaration walk reached (module-scope code, a lambda's
+        // body there) go to the innermost entity holding each one, the
+        // module for module scope, which is where module-scope references are
+        // already sourced. The walk runs with no enclosing frame, so a name
+        // resolves the way module scope binds it. Records the walk leaves on a
+        // nested scope rather than on a call are not calls and stay out; the
+        // calls it adopts count as walked, so the census below reads a named
+        // one as carried and an unnamed one as not nameable.
+        {
+            let mut accounted = crate::call_owner::accounted_call_sites(&out.relations);
+            accounted.extend(out.call_audit.seen_calls.iter().copied());
+            super::python_declarations::carry_decorator_call_sites(&root, &mut accounted);
+            // A function whose calls are all accounted for is not read twice.
+            let mut walked = walked_python_functions(&root, &out.entities, &accounted);
+            walked.extend(out.ambiguous_definitions.iter().copied());
+            let mut swept = Vec::new();
+            let mut swept_audit = PythonCallExtractionAudit::default();
+            extract_calls_from_context(
+                &root,
+                source,
+                &PyCallScope {
+                    context_name: "",
+                    self_class: None,
+                    receiver_types: &PythonReceiverTypes::new(),
+                    frames: &[],
+                    skip: &walked,
+                },
+                &mut swept,
+                &mut swept_audit,
+            );
+            swept.retain(|relation| {
+                relation.site.as_ref().is_some_and(|site| {
+                    swept_audit
+                        .seen_calls
+                        .contains(&crate::call_owner::site_key(site))
+                })
+            });
+            let sites: Vec<_> = swept
+                .iter()
+                .filter_map(|relation| relation.site.as_ref().map(crate::call_owner::site_key))
+                .collect();
+            for index in crate::call_owner::adopt_unowned_calls(
+                &out.entities,
+                &accounted,
+                swept,
+                &mut out.relations,
+            ) {
+                out.call_audit.seen_calls.insert(sites[index]);
+            }
+        }
+
         // Calls outside the callable walk still count as gaps. Assign them only
         // to a unique innermost declaration. Ambiguous ownership remains global.
         for site in &census.sites {
-            if call_audit
+            if out
+                .call_audit
                 .seen_calls
                 .contains(&(site.start_byte, site.end_byte))
             {
                 continue;
             }
-            let mut owners: Vec<_> = entities
+            let mut owners: Vec<_> = out
+                .entities
                 .iter()
                 .filter(|entity| {
                     entity.span.start_byte <= site.start_byte
@@ -337,7 +477,7 @@ impl LanguageAdapter for PythonAdapter {
                         < second.span.end_byte - second.span.start_byte
                 })
             });
-            relations.push(match owner {
+            out.relations.push(match owner {
                 Some(owner) => {
                     scoped_call_extraction_incomplete_marker(owner.name.clone(), site.clone(), None)
                 }
@@ -345,12 +485,51 @@ impl LanguageAdapter for PythonAdapter {
             });
         }
 
+        // An ambiguous conditional binding is not the first declaration, nor
+        // a same-named import. Preserve its call site as negative evidence.
+        // Explicit function-local imports already carry their own binding and
+        // are independent of a module-level collision.
+        for relation in &mut out.relations {
+            if relation.kind == kin_model::RelationKind::Calls
+                && relation.import_source.is_none()
+                && ((relation.receiver.is_none()
+                    && out.ambiguous_names.contains(&relation.dst_name))
+                    || (relation.receiver.is_none()
+                        && out
+                            .ambiguous_class_bindings
+                            .get(&relation.src_name)
+                            .is_some_and(|bindings| bindings.contains(&relation.dst_name)))
+                    || out
+                        .ambiguous_names
+                        .iter()
+                        .any(|name| relation.dst_name.starts_with(&format!("{name}."))))
+            {
+                if let Some(site) = relation.site.clone() {
+                    *relation = scoped_call_extraction_incomplete_marker(
+                        relation.src_name.clone(),
+                        site,
+                        Some(relation.dst_name.clone()),
+                    );
+                }
+            }
+        }
+        out.value_refs.retain(|reference| {
+            !out.ambiguous_names.contains(&reference.root)
+                && !out
+                    .ambiguous_class_bindings
+                    .get(&reference.src_name)
+                    .is_some_and(|bindings| bindings.contains(&reference.root))
+        });
+        // The lexical walks above resolve names once in their actual Python
+        // scope. Move each owned occurrence to its innermost field after all
+        // declarations are known, without walking the initializer twice.
+        fields::assign_field_sites(&mut out);
         emit_python_value_references(
-            value_refs,
-            &entities,
+            std::mem::take(&mut out.value_refs),
+            &out.entities,
             &imports,
             &guarded_imports,
-            &mut relations,
+            &mut out.relations,
         );
 
         // Annotate Calls/References relations with import_source.
@@ -363,8 +542,14 @@ impl LanguageAdapter for PythonAdapter {
         // whose type the edge declares, and its `dst_name` IS the local binding
         // the import introduced, so skipping it there dropped the pin that
         // tells the linker which module the annotated type came from.
-        for rel in &mut relations {
+        for rel in &mut out.relations {
             if rel.kind == kin_model::RelationKind::Calls && rel.receiver.is_some() {
+                continue;
+            }
+            // A call already carrying the module an enclosing function body
+            // imported its name from keeps it: that local import, not the
+            // file's own, is the binding the call reads.
+            if rel.import_source.is_some() {
                 continue;
             }
             if matches!(
@@ -377,10 +562,17 @@ impl LanguageAdapter for PythonAdapter {
             }
         }
 
-        // Detect test functions (pytest: def test_*)
+        // Detect test functions (pytest: def test_*). Only a module-level
+        // function is one: pytest collects `test_*` from a module's namespace
+        // and a class's, never from inside a function body, so a nested
+        // `test_*` closure, or anything nested in a test and so named
+        // `test_x.<locals>...`, is not a test the runner will ever call.
         let mut tests = Vec::new();
-        for ent in &entities {
-            if ent.kind == EntityKind::Function && ent.name.starts_with("test_") {
+        for ent in &out.entities {
+            if ent.kind == EntityKind::Function
+                && ent.name.starts_with("test_")
+                && !is_local_scope_name(&ent.name)
+            {
                 tests.push(ExtractedTest {
                     name: ent.name.clone(),
                     kind: ExtractedTestKind::Unit,
@@ -394,180 +586,1075 @@ impl LanguageAdapter for PythonAdapter {
             source,
             file_id,
             &imports,
-            &mut relations,
+            &mut out.relations,
+        );
+        super::python_declarations::push_call_extraction_gaps(
+            tree,
+            census.total(),
+            &census.sites,
+            &out.call_audit.seen_calls,
+            &out.entities,
+            &mut out.relations,
         );
         Ok(ParseOutput {
             derived_members: Vec::new(),
-            entities,
-            relations,
+            entities: out.entities,
+            relations: out.relations,
             imports,
             tests,
             parse_state,
             parsed_call_sites: Some(census.total()),
+            nested_definitions: Some(out.census),
         })
     }
 }
 
+/// Everything one Python file's walk accumulates.
+#[derive(Default)]
+struct PyExtraction {
+    entities: Vec<ExtractedEntity>,
+    relations: Vec<ExtractedRelation>,
+    call_audit: PythonCallExtractionAudit,
+    value_refs: Vec<PythonValueRef>,
+    /// Definitions found in a position the walk does not admit.
+    census: NestedDefinitionCensus,
+    /// Local-scope names already admitted, so a second definition under one
+    /// name becomes a census entry rather than a duplicate entity.
+    local_names: LocalScopeNames,
+    /// Every declaration in a conditional same-binding collision, including
+    /// unconditional declarations and imported bindings it can replace.
+    ambiguous_definitions: std::collections::HashSet<usize>,
+    ambiguous_names: std::collections::HashSet<String>,
+    ambiguous_class_bindings: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+/// Where in the file's lexical structure a node sits.
+///
+/// Python gives a definition a different name and a different reach depending
+/// on what holds it. A `def` in a class body is a method, one in a function
+/// body is a local of that function, and a class body is not a scope that the
+/// functions inside it can see. The walk carries all three facts together so
+/// every arm names and binds a definition the same way.
+#[derive(Clone, Default)]
+struct PyScope {
+    /// The class whose body directly holds the node, which makes a `def` there
+    /// a method named `Class.method`.
+    class_ctx: Option<String>,
+    /// The function scopes enclosing the node, outermost first. A class body
+    /// adds none: its methods see the enclosing functions, not the class.
+    frames: Vec<std::rc::Rc<PyFrame>>,
+    /// The class `self` and `cls` name at this point. A closure inside a
+    /// method keeps its method's class, because `self` is the same object
+    /// there; a method of a class nested in that closure names its own.
+    self_class: Option<String>,
+    /// The innermost admitted entity holding the node, which a definition the
+    /// walk records but does not admit is listed under.
+    enclosing: Option<String>,
+}
+
+/// One function scope, as the definitions and names inside it see it.
+struct PyFrame {
+    /// The entity name of the function that opens this scope.
+    entity: String,
+    /// Every name this scope binds itself, from its parameters and its own
+    /// statements, not counting names bound only inside a nested scope. A name
+    /// in this set stops a lookup here, because Python makes a name bound
+    /// anywhere in a function body local to the whole body.
+    bound: std::collections::HashSet<String>,
+    /// Names this scope declares `global`, which skip every enclosing function
+    /// scope and reach the module.
+    globals: std::collections::HashSet<String>,
+    /// Names this scope binds only through a plain `from module import name`,
+    /// each mapped to the module as written. A name bound here in any other
+    /// way as well is a value this scope assigns, and is left out.
+    imports: std::collections::HashMap<String, String>,
+    /// The `def` and `class` statements of this scope, by the name they bind,
+    /// each mapped to the entity name it is admitted under. A redefinition
+    /// maps to the first, which is the one admitted.
+    definitions: std::collections::HashMap<String, String>,
+    /// The shadow set the reference walk has always applied to this
+    /// function: every name bound anywhere in it, nested scopes included.
+    shadowed: std::collections::HashSet<String>,
+    /// The receiver types a call written in this scope dispatches through,
+    /// the enclosing scopes' included, since a closure reads its enclosing
+    /// function's annotated parameters exactly as its own.
+    receiver_types: PythonReceiverTypes,
+}
+
+impl PyFrame {
+    fn for_function(
+        node: &tree_sitter::Node,
+        source: &[u8],
+        entity: &str,
+        parent: Option<&PyFrame>,
+    ) -> Self {
+        let (bound, globals, imports) = collect_python_frame_bindings(node, source);
+        let mut definitions = std::collections::HashMap::new();
+        if let Some(body) = node.child_by_field_name("body") {
+            for_each_python_definition(&body, &mut |definition| {
+                if let Some(raw) = python_definition_raw_name(&definition, source) {
+                    definitions
+                        .entry(raw.clone())
+                        .or_insert_with(|| local_scope_name(entity, &raw));
+                }
+            });
+        }
+        // A name this scope binds again is its own, so an enclosing scope's
+        // declaration of it no longer describes it. That covers a method's
+        // `self`, which names the method's own class rather than whatever an
+        // enclosing method's `self` was.
+        let mut receiver_types: PythonReceiverTypes = parent
+            .map(|parent| {
+                parent
+                    .receiver_types
+                    .iter()
+                    .filter(|(receiver, _)| {
+                        let root = receiver.split('.').next().unwrap_or(receiver);
+                        !bound.contains(root)
+                    })
+                    .map(|(receiver, owner)| (receiver.clone(), owner.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        receiver_types.extend(python_receiver_types(node, source));
+        PyFrame {
+            entity: entity.to_string(),
+            bound,
+            globals,
+            imports,
+            definitions,
+            shadowed: collect_python_local_bindings(node, source),
+            receiver_types,
+        }
+    }
+}
+
+/// The entity name a bare `name` read in the innermost of `frames` refers to,
+/// when it is a definition nested in one of those function scopes.
+///
+/// Python resolves a name in the innermost function scope that binds it, then
+/// outward through the enclosing function scopes, then the module. The walk
+/// stops at the first scope that binds the name at all: a local variable
+/// called `index` hides an enclosing function's nested `def index`, and so
+/// does a `global index`, which sends the name straight to the module. Only a
+/// name bound by a nested `def` or `class` is rewritten; every other name is
+/// left exactly as the source spells it.
+fn resolve_python_local_definition<'a>(
+    frames: &'a [std::rc::Rc<PyFrame>],
+    name: &str,
+) -> Option<&'a str> {
+    match resolve_python_scoped_name(frames, name)? {
+        PythonScopedName::Definition(entity) => Some(entity),
+        PythonScopedName::Imported(_) | PythonScopedName::Value => None,
+    }
+}
+
+/// What an enclosing function scope binds a bare name to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonScopedName<'a> {
+    /// A `def` or `class` the scope nests, by its entity name.
+    Definition(&'a str),
+    /// A plain `from module import name` in the scope's body, by the module
+    /// as written.
+    Imported(&'a str),
+    /// Any other binding: a parameter, an assignment, a loop, `with` or
+    /// `except` target, an aliased import or an `import module`. A call
+    /// through it reaches whatever value the name holds when it runs, never a
+    /// module-level declaration that happens to share the name.
+    Value,
+}
+
+/// The binding a bare `name` read in the innermost of `frames` resolves to,
+/// following Python's scoping rule for function bodies.
+///
+/// The innermost function scope that binds the name decides, then each
+/// enclosing function scope outward. A `global` declaration sends the name
+/// straight to the module. `None` means no function scope binds the name, so
+/// it is a module global or a builtin, which the linker settles against the
+/// module's own declarations, its imports and the builtin table.
+fn resolve_python_scoped_name<'a>(
+    frames: &'a [std::rc::Rc<PyFrame>],
+    name: &str,
+) -> Option<PythonScopedName<'a>> {
+    for frame in frames.iter().rev() {
+        if frame.globals.contains(name) {
+            return None;
+        }
+        if let Some(entity) = frame.definitions.get(name) {
+            return Some(PythonScopedName::Definition(entity.as_str()));
+        }
+        if frame.bound.contains(name) {
+            return Some(match frame.imports.get(name) {
+                Some(module) => PythonScopedName::Imported(module.as_str()),
+                None => PythonScopedName::Value,
+            });
+        }
+    }
+    None
+}
+
+/// The local-scope name of whatever an enclosing function scope binds `name`
+/// to, for a class's base list.
+///
+/// A nested `def` or `class` resolves to its entity, exactly as
+/// [`resolve_python_local_definition`] does. A plain local, such as the
+/// parameter in `def t(base): class C(base): ...`, is a runtime value rather
+/// than a class anything declares, and is spelled `t.<locals>.base`. Left
+/// bare, the linker would read `base` as a module-level or repository-wide
+/// class name and derive a hierarchy through an unrelated class that happens
+/// to share it; spelled this way it names no entity, so the base resolves to
+/// nothing and is disclosed as unresolved.
+fn python_local_binding_name(frames: &[std::rc::Rc<PyFrame>], name: &str) -> Option<String> {
+    for frame in frames.iter().rev() {
+        if frame.globals.contains(name) {
+            return None;
+        }
+        if let Some(entity) = frame.definitions.get(name) {
+            return Some(entity.clone());
+        }
+        if frame.bound.contains(name) {
+            return Some(local_scope_name(&frame.entity, name));
+        }
+    }
+    None
+}
+
+/// What a reference walk needs to decide which name a read binds to.
+struct PyRefScope<'a> {
+    /// The enclosing function scopes, whose nested definitions a bare read
+    /// resolves to.
+    frames: &'a [std::rc::Rc<PyFrame>],
+    /// Names a read here must not bind to a module-level entity.
+    shadowed: std::collections::HashSet<String>,
+    /// Nested definitions the walk must leave to their own entities.
+    skip: Option<&'a std::collections::HashSet<usize>>,
+}
+
+impl<'a> PyRefScope<'a> {
+    /// Inside `frames`, with the nested definitions in `skip` left out.
+    fn within(
+        frames: &'a [std::rc::Rc<PyFrame>],
+        skip: Option<&'a std::collections::HashSet<usize>>,
+    ) -> Self {
+        PyRefScope {
+            frames,
+            shadowed: frames
+                .iter()
+                .flat_map(|frame| frame.shadowed.iter().cloned())
+                .collect(),
+            skip,
+        }
+    }
+
+    /// The name a read of `name` records: the nested definition's entity name
+    /// when it is one, the name itself when it may be module-level, and
+    /// `None` when a local binding hides it.
+    fn root_for(&self, name: &str) -> Option<String> {
+        if let Some(entity) = resolve_python_local_definition(self.frames, name) {
+            return Some(entity.to_string());
+        }
+        (!self.shadowed.contains(name)).then(|| name.to_string())
+    }
+
+    fn skips(&self, node: &tree_sitter::Node) -> bool {
+        self.skip.is_some_and(|skip| skip.contains(&node.id()))
+    }
+}
+
+/// What one function body's call walk needs besides the syntax.
+struct PyCallScope<'a> {
+    /// The entity the calls are attributed to.
+    context_name: &'a str,
+    /// The class `self` and `cls` name here.
+    self_class: Option<&'a str>,
+    receiver_types: &'a PythonReceiverTypes,
+    frames: &'a [std::rc::Rc<PyFrame>],
+    /// Nested definitions whose calls belong to their own entities.
+    skip: &'a std::collections::HashSet<usize>,
+}
+
+/// The name a `def` or `class` statement binds, looking through a decorator
+/// wrapper.
+fn python_definition_raw_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let definition = python_unwrap_decorated(node)?;
+    let name = definition
+        .child_by_field_name("name")?
+        .utf8_text(source)
+        .ok()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The `function_definition` or `class_definition` a statement declares, with
+/// a `decorated_definition` wrapper looked through.
+fn python_unwrap_decorated<'tree>(
+    node: &tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    match node.kind() {
+        "function_definition" | "class_definition" => Some(*node),
+        "decorated_definition" => node.child_by_field_name("definition").or_else(|| {
+            let mut cursor = node.walk();
+            let found = node
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "function_definition" | "class_definition"));
+            found
+        }),
+        _ => None,
+    }
+}
+
+/// Visit every definition statement under `node` that belongs to the scope
+/// `node` is part of: through `if`, `for`, `while`, `with`, `try` and `match`
+/// blocks, but not into another definition, whose own body is its own scope,
+/// nor into a lambda, which holds no statements.
+fn for_each_python_definition<'tree>(
+    node: &tree_sitter::Node<'tree>,
+    visit: &mut dyn FnMut(tree_sitter::Node<'tree>),
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "class_definition" | "decorated_definition" => visit(child),
+            "lambda" => {}
+            _ => for_each_python_definition(&child, visit),
+        }
+    }
+}
+
+/// The entity kind and name a definition gets where `scope` places it, and
+/// the entity that `Contains` it, when one does.
+///
+/// A module-level definition keeps its bare name and a class-body `def` is
+/// `Class.method`, exactly as before definitions nested in functions were
+/// admitted. A definition in a function body is `F.<locals>.name`, and a class
+/// nested in such a class keeps the qualified owner (`F.<locals>.C.D`), which
+/// is CPython's `__qualname__` throughout. A class nested in a module-level
+/// class keeps its bare name, which is what it has always been called.
+fn python_definition_name(
+    scope: &PyScope,
+    raw: &str,
+    is_class: bool,
+) -> (EntityKind, String, Option<String>) {
+    match (&scope.class_ctx, scope.frames.last()) {
+        (Some(cls), _) if !is_class => (
+            EntityKind::Method,
+            format!("{cls}.{raw}"),
+            Some(cls.clone()),
+        ),
+        (Some(cls), _) if is_local_scope_name(cls) => {
+            (EntityKind::Class, format!("{cls}.{raw}"), Some(cls.clone()))
+        }
+        (Some(cls), _) => (EntityKind::Class, raw.to_string(), Some(cls.clone())),
+        (None, Some(frame)) => (
+            if is_class {
+                EntityKind::Class
+            } else {
+                EntityKind::Function
+            },
+            local_scope_name(&frame.entity, raw),
+            Some(frame.entity.clone()),
+        ),
+        (None, None) => (
+            if is_class {
+                EntityKind::Class
+            } else {
+                EntityKind::Function
+            },
+            raw.to_string(),
+            scope.enclosing.clone(),
+        ),
+    }
+}
+
+/// The class a base-list entry names: `Base` for `Base[T]` and `mod.Base`
+/// for `mod.Base[K, V]`, however deeply subscripted; any other entry as it is.
+/// The one reading of a base both the recorded `Extends` relation and the
+/// value-origin facts key a base by, so the two always name it alike.
+pub(crate) fn python_base_class_node(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    while node.kind() == "subscript" {
+        match node.child_by_field_name("value") {
+            Some(value) => node = value,
+            None => break,
+        }
+    }
+    node
+}
+
+/// The base classes a class statement names, as written, keyword arguments
+/// (`metaclass=...`) left out and type arguments (`Base[T]`) dropped.
+fn python_class_bases_as_written(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let Some(args) = node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+    let mut cursor = args.walk();
+    let bases = args
+        .named_children(&mut cursor)
+        .filter(|arg| arg.kind() != "keyword_argument" && arg.kind() != "comment")
+        .map(python_base_class_node)
+        .filter_map(|arg| arg.utf8_text(source).ok().map(str::to_string))
+        .filter(|base| !base.is_empty())
+        .collect();
+    bases
+}
+
+/// Class names nested at module/class scope retain their historical bare
+/// display name. Do not admit a new block class under a name another lexical
+/// owner already holds; that would create an arbitrary linker slot. Function
+/// locals already carry their qualified owner and cannot collide this way.
+fn prepare_python_block_class_collisions(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    module_scope: &PyScope,
+    out: &mut PyExtraction,
+) {
+    struct Candidate {
+        nodes: [usize; 2],
+        name: String,
+        raw: String,
+        owner: Option<String>,
+        owner_scope: usize,
+        class_owner: bool,
+        guarded_class: bool,
+    }
+    fn walk(
+        body: &tree_sitter::Node,
+        source: &[u8],
+        scope: &PyScope,
+        candidates: &mut Vec<Candidate>,
+    ) {
+        for_each_python_definition(body, &mut |definition| {
+            let Some(declaration) = python_unwrap_decorated(&definition) else {
+                return;
+            };
+            let Some(raw) = python_definition_raw_name(&definition, source) else {
+                return;
+            };
+            let is_class = declaration.kind() == "class_definition";
+            let (_, name, _) = python_definition_name(scope, &raw, is_class);
+            candidates.push(Candidate {
+                nodes: [definition.id(), declaration.id()],
+                name: name.clone(),
+                raw,
+                owner: scope.enclosing.clone(),
+                owner_scope: body.id(),
+                class_owner: scope.class_ctx.is_some(),
+                guarded_class: is_class
+                    && definition
+                        .parent()
+                        .is_some_and(|parent| parent.id() != body.id()),
+            });
+            if is_class {
+                if let Some(body) = declaration.child_by_field_name("body") {
+                    walk(
+                        &body,
+                        source,
+                        &PyScope {
+                            class_ctx: Some(name.clone()),
+                            enclosing: Some(name),
+                            ..scope.clone()
+                        },
+                        candidates,
+                    );
+                }
+            }
+        });
+    }
+    let mut candidates = Vec::new();
+    walk(root, source, module_scope, &mut candidates);
+    let mut owners: std::collections::HashMap<&str, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+    for candidate in &candidates {
+        owners
+            .entry(&candidate.name)
+            .or_default()
+            .insert(candidate.owner_scope);
+    }
+    for candidate in &candidates {
+        if candidate.guarded_class
+            && owners
+                .get(candidate.name.as_str())
+                .is_some_and(|owners| owners.len() > 1)
+        {
+            out.ambiguous_definitions.extend(candidate.nodes);
+            if candidate.class_owner {
+                if let Some(owner) = &candidate.owner {
+                    out.ambiguous_class_bindings
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(candidate.raw.clone());
+                }
+            } else {
+                out.ambiguous_names.insert(candidate.name.clone());
+            }
+        }
+    }
+}
+
+/// Find same-binding collisions before admitting any declaration in a lexical
+/// body. A structural block creates no Python scope, but its declaration may
+/// replace another declaration or an import depending on which branch runs.
+/// The linker's name slot cannot represent those alternatives faithfully.
+fn prepare_python_conditional_ambiguities(
+    body: &tree_sitter::Node,
+    source: &[u8],
+    scope: &PyScope,
+    out: &mut PyExtraction,
+) {
+    let mut definitions: std::collections::HashMap<String, Vec<tree_sitter::Node>> =
+        std::collections::HashMap::new();
+    for_each_python_definition(body, &mut |definition| {
+        if let Some(raw) = python_definition_raw_name(&definition, source) {
+            definitions.entry(raw).or_default().push(definition);
+        }
+    });
+    let mut imported = std::collections::HashSet::new();
+    collect_python_scope_import_names(body, source, &mut imported);
+    let (globals, nonlocals) = python_outward_bindings(body, source);
+    if let Some(parameters) = body
+        .parent()
+        .filter(|parent| parent.kind() == "function_definition")
+        .and_then(|parent| parent.child_by_field_name("parameters"))
+    {
+        collect_python_binding_targets(&parameters, source, &mut imported);
+    }
+    let mut classes = Vec::new();
+    for (raw, declarations) in &definitions {
+        for definition in declarations {
+            if let Some(declaration) = python_unwrap_decorated(definition)
+                .filter(|declaration| declaration.kind() == "class_definition")
+            {
+                classes.push((*definition, declaration, raw.clone()));
+            }
+        }
+        let guarded = declarations.iter().any(|declaration| {
+            declaration
+                .parent()
+                .is_none_or(|parent| parent.id() != body.id())
+        });
+        let outward_global =
+            globals.contains(raw) && (scope.class_ctx.is_some() || !scope.frames.is_empty());
+        let outward_nonlocal = nonlocals.contains(raw);
+        if !guarded
+            || (declarations.len() == 1
+                && !imported.contains(raw)
+                && !outward_global
+                && !outward_nonlocal)
+        {
+            continue;
+        }
+        // These definitions retain a lexical qualname but write an outward
+        // binding. A conditional write cannot certify its old target.
+        if outward_global {
+            out.ambiguous_names.insert(raw.clone());
+        }
+        if outward_nonlocal {
+            let target = scope
+                .frames
+                .iter()
+                .rev()
+                .skip(usize::from(scope.class_ctx.is_none()))
+                .filter(|frame| !frame.globals.contains(raw))
+                .find_map(|frame| {
+                    frame.definitions.get(raw).cloned().or_else(|| {
+                        frame
+                            .bound
+                            .contains(raw)
+                            .then(|| local_scope_name(&frame.entity, raw))
+                    })
+                })
+                .unwrap_or_else(|| raw.clone());
+            out.ambiguous_names.insert(target);
+        }
+        for definition in declarations {
+            let Some(declaration) = python_unwrap_decorated(definition) else {
+                continue;
+            };
+            let (_, name, _) =
+                python_definition_name(scope, raw, declaration.kind() == "class_definition");
+            out.ambiguous_names.insert(name);
+            out.ambiguous_definitions.insert(definition.id());
+            out.ambiguous_definitions.insert(declaration.id());
+        }
+    }
+    // A class derived from one of these bindings cannot choose a base from a
+    // repository-wide namesake. Retain its written base census instead. Repeat
+    // so source order cannot decide which dependent class is withheld.
+    loop {
+        let mut changed = false;
+        for (definition, declaration, raw) in &classes {
+            if out.ambiguous_definitions.contains(&definition.id()) {
+                continue;
+            }
+            let ambiguous_base = python_class_bases_as_written(declaration, source)
+                .iter()
+                .any(|written| {
+                    let base = python_local_binding_name(&scope.frames, written)
+                        .unwrap_or_else(|| written.clone());
+                    out.ambiguous_names.contains(&base)
+                        || out
+                            .ambiguous_names
+                            .iter()
+                            .any(|name| base.starts_with(&format!("{name}.")))
+                        || scope
+                            .class_ctx
+                            .as_ref()
+                            .and_then(|owner| out.ambiguous_class_bindings.get(owner))
+                            .is_some_and(|bindings| bindings.contains(written))
+                });
+            if ambiguous_base {
+                let (_, name, _) = python_definition_name(scope, raw, true);
+                out.ambiguous_names.insert(name);
+                out.ambiguous_definitions.insert(definition.id());
+                out.ambiguous_definitions.insert(declaration.id());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Explicit outward binding statements in this lexical body. Nested scopes
+/// declare their own globals/nonlocals and cannot change this body's map.
+fn python_outward_bindings(
+    body: &tree_sitter::Node,
+    source: &[u8],
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    fn walk(
+        node: &tree_sitter::Node,
+        source: &[u8],
+        globals: &mut std::collections::HashSet<String>,
+        nonlocals: &mut std::collections::HashSet<String>,
+    ) {
+        match node.kind() {
+            "function_definition" | "class_definition" | "decorated_definition" | "lambda" => {
+                return
+            }
+            "global_statement" => {
+                collect_python_binding_targets(node, source, globals);
+                return;
+            }
+            "nonlocal_statement" => {
+                collect_python_binding_targets(node, source, nonlocals);
+                return;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(&child, source, globals, nonlocals);
+        }
+    }
+    let mut globals = std::collections::HashSet::new();
+    let mut nonlocals = std::collections::HashSet::new();
+    walk(body, source, &mut globals, &mut nonlocals);
+    (globals, nonlocals)
+}
+
+/// Collect imports and other value bindings for collision detection only,
+/// without promoting guarded imports into the runtime list or entering a
+/// nested scope. A conditional declaration can also replace an assigned value.
+fn collect_python_scope_import_names(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut std::collections::HashSet<String>,
+) {
+    match node.kind() {
+        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_python_binding_targets(&left, source, out);
+            }
+        }
+        "named_expression" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_python_binding_targets(&name, source, out);
+            }
+        }
+        "as_pattern" | "except_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                collect_python_binding_targets(&alias, source, out);
+            }
+        }
+        _ => {}
+    }
+    let imports = match node.kind() {
+        "function_definition" | "class_definition" | "decorated_definition" | "lambda" => return,
+        "import_statement" => extract_py_imports(node, source),
+        "import_from_statement" => extract_py_from_import(node, source).into_iter().collect(),
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_python_scope_import_names(&child, source, out);
+            }
+            return;
+        }
+    };
+    for import in imports {
+        for specifier in import.specifiers {
+            let name = if node.kind() == "import_statement" {
+                specifier.local_name.split('.').next().unwrap_or("")
+            } else {
+                &specifier.local_name
+            };
+            if !name.is_empty() {
+                out.insert(name.to_string());
+            }
+        }
+    }
+}
+
+/// Admit definitions through ordinary statements without entering another
+/// definition's lexical body. Returned nodes belong to their own entity, or
+/// are ambiguous bodies whose calls must remain unknown rather than acquire
+/// an invented enclosing caller.
+fn admit_python_statement_definitions(
+    statement: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    scope: &PyScope,
+    out: &mut PyExtraction,
+) -> std::collections::HashSet<usize> {
+    let mut skipped = std::collections::HashSet::new();
+    if python_unwrap_decorated(statement).is_some() {
+        return skipped;
+    }
+    let mut definitions = Vec::new();
+    for_each_python_definition(statement, &mut |definition| definitions.push(definition));
+    for definition in definitions {
+        if extract_py_node(&definition, source, file_id, scope, out)
+            || out.ambiguous_definitions.contains(&definition.id())
+        {
+            skipped.insert(definition.id());
+        }
+    }
+    skipped
+}
+
+/// Admit every definition in a function body while retaining its lexical scope.
+fn admit_python_body_definitions(
+    function: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    scope: &PyScope,
+    out: &mut PyExtraction,
+) -> std::collections::HashSet<usize> {
+    let mut admitted = std::collections::HashSet::new();
+    let Some(body) = function.child_by_field_name("body") else {
+        return admitted;
+    };
+    prepare_python_conditional_ambiguities(&body, source, scope, out);
+    let mut definitions = Vec::new();
+    for_each_python_definition(&body, &mut |definition| definitions.push(definition));
+    for definition in definitions {
+        if extract_py_node(&definition, source, file_id, scope, out)
+            || out.ambiguous_definitions.contains(&definition.id())
+        {
+            admitted.insert(definition.id());
+        }
+    }
+    admitted
+}
+
+/// Walk one statement, admitting the definition it declares under `scope`.
+///
+/// Returns whether a definition was admitted, which a function body's walk
+/// reads to know which nested bodies now belong to an entity of their own.
 fn extract_py_node(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
-    class_ctx: Option<&str>,
-    entities: &mut Vec<ExtractedEntity>,
-    relations: &mut Vec<ExtractedRelation>,
-    call_audit: &mut PythonCallExtractionAudit,
-    value_refs: &mut Vec<PythonValueRef>,
-) {
+    scope: &PyScope,
+    out: &mut PyExtraction,
+) -> bool {
     match node.kind() {
         "function_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let raw_name = name_node.utf8_text(source).unwrap_or("").to_string();
-                let (kind, name) = if let Some(cls) = class_ctx {
-                    (EntityKind::Method, format!("{}.{}", cls, raw_name))
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return false;
+            };
+            let raw_name = name_node.utf8_text(source).unwrap_or("").to_string();
+            let (kind, name, container) = python_definition_name(scope, &raw_name, false);
+            if out.ambiguous_definitions.contains(&node.id()) {
+                out.census.record(UnadmittedNestedDefinition {
+                    name,
+                    kind,
+                    start_line: node.start_position().row as u32,
+                    enclosing: scope.enclosing.clone(),
+                    bases: Vec::new(),
+                });
+                return false;
+            }
+            // A definition inside a function body is new to the graph, and
+            // its name has to be the only one of its kind in the file.
+            if is_local_scope_name(&name) && !out.local_names.claim(&name) {
+                out.census.record(UnadmittedNestedDefinition {
+                    name,
+                    kind,
+                    start_line: node.start_position().row as u32,
+                    enclosing: scope.enclosing.clone(),
+                    bases: Vec::new(),
+                });
+                return false;
+            }
+            let vis = if raw_name.starts_with('_') {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            };
+            out.entities.push(ExtractedEntity {
+                kind,
+                name: name.clone(),
+                signature: node_signature(node, source),
+                visibility: vis,
+                doc_summary: extract_docstring(node, source),
+                fingerprint: compute_fingerprint(node, source),
+                span: span_from_node(node, file_id),
+                declaration_line: None,
+            });
+
+            let frame = std::rc::Rc::new(PyFrame::for_function(
+                node,
+                source,
+                &name,
+                scope.frames.last().map(|frame| frame.as_ref()),
+            ));
+            let mut frames = scope.frames.clone();
+            frames.push(frame.clone());
+            let body_scope = PyScope {
+                class_ctx: None,
+                frames,
+                self_class: if kind == EntityKind::Method {
+                    scope.class_ctx.clone()
                 } else {
-                    (EntityKind::Function, raw_name.clone())
-                };
-                let vis = if raw_name.starts_with('_') {
+                    scope.self_class.clone()
+                },
+                enclosing: Some(name.clone()),
+            };
+            // Definitions in the body first, so the calls and reads written
+            // inside them are known to be theirs before this function's own
+            // walks run.
+            let nested = admit_python_body_definitions(node, source, file_id, &body_scope, out);
+            extract_calls_from_context(
+                node,
+                source,
+                &PyCallScope {
+                    context_name: &name,
+                    self_class: body_scope.self_class.as_deref(),
+                    receiver_types: &frame.receiver_types,
+                    frames: &body_scope.frames,
+                    skip: &nested,
+                },
+                &mut out.relations,
+                &mut out.call_audit,
+            );
+            extract_value_refs_from_definition(
+                node,
+                source,
+                &name,
+                &PyRefScope::within(&body_scope.frames, Some(&nested)),
+                &mut out.value_refs,
+            );
+            if let Some(container) = container {
+                out.relations.push(ExtractedRelation {
+                    site: Some(python_contains_site(
+                        node,
+                        scope.class_ctx.is_none() && scope.frames.is_empty(),
+                    )),
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: container,
+                    dst_name: name,
+                    import_source: None,
+                });
+            }
+            true
+        }
+        "class_definition" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return false;
+            };
+            let raw_name = name_node.utf8_text(source).unwrap_or("").to_string();
+            let (_, name, container) = python_definition_name(scope, &raw_name, true);
+            if out.ambiguous_definitions.contains(&node.id()) {
+                out.census.record(UnadmittedNestedDefinition {
+                    name,
+                    kind: EntityKind::Class,
+                    start_line: node.start_position().row as u32,
+                    enclosing: scope.enclosing.clone(),
+                    bases: python_class_bases_as_written(node, source),
+                });
+                return false;
+            }
+            if is_local_scope_name(&name) && !out.local_names.claim(&name) {
+                out.census.record(UnadmittedNestedDefinition {
+                    name,
+                    kind: EntityKind::Class,
+                    start_line: node.start_position().row as u32,
+                    enclosing: scope.enclosing.clone(),
+                    bases: python_class_bases_as_written(node, source),
+                });
+                return false;
+            }
+            out.entities.push(ExtractedEntity {
+                kind: EntityKind::Class,
+                name: name.clone(),
+                signature: node_signature(node, source),
+                visibility: if raw_name.starts_with('_') {
                     Visibility::Private
                 } else {
                     Visibility::Public
-                };
-                entities.push(ExtractedEntity {
-                    kind,
-                    name: name.clone(),
-                    signature: node_signature(node, source),
-                    visibility: vis,
-                    doc_summary: extract_docstring(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
-                });
-                // Extract calls within function/method body
-                let receiver_types = python_receiver_types(node, source);
-                extract_calls_from_context(
-                    node,
-                    source,
-                    &name,
-                    class_ctx,
-                    &receiver_types,
-                    relations,
-                    call_audit,
-                );
-                extract_value_refs_from_definition(node, source, &name, value_refs);
-                if let Some(cls) = class_ctx {
-                    relations.push(ExtractedRelation {
-                        site: None,
-                        receiver: None,
-                        call_shape: None,
-                        kind: kin_model::RelationKind::Contains,
-                        src_name: cls.to_string(),
-                        dst_name: name,
-                        import_source: None,
-                    });
+                },
+                doc_summary: extract_docstring(node, source),
+                fingerprint: compute_fingerprint(node, source),
+                span: span_from_node(node, file_id),
+                declaration_line: None,
+            });
+            let class_index = out.entities.len() - 1;
+
+            // Extract base classes
+            if let Some(args) = node.child_by_field_name("superclasses") {
+                let mut is_enum = false;
+                let mut arg_cursor = args.walk();
+                for arg in args.children(&mut arg_cursor) {
+                    // `metaclass=Meta` and other keywords configure the
+                    // class; they are not bases.
+                    if arg.is_named() && !matches!(arg.kind(), "keyword_argument" | "comment") {
+                        // `Base[T]` extends `Base`: the subscript chooses type
+                        // arguments, the class it extends is its value.
+                        let arg = python_base_class_node(arg);
+                        let written = arg.utf8_text(source).unwrap_or("").to_string();
+                        if !written.is_empty() {
+                            const ENUM_BASES: &[&str] = &[
+                                "Enum",
+                                "IntEnum",
+                                "StrEnum",
+                                "Flag",
+                                "IntFlag",
+                                "enum.Enum",
+                                "enum.IntEnum",
+                                "enum.StrEnum",
+                                "enum.Flag",
+                                "enum.IntFlag",
+                            ];
+                            if ENUM_BASES.contains(&written.as_str()) {
+                                is_enum = true;
+                            }
+                            // A base list is evaluated in the scope around the
+                            // class, so `class B(A)` beside a local `class A`
+                            // extends that local class and not a module-level
+                            // `A`, and a base read from a local variable is
+                            // that variable, not a class of the same name.
+                            let base = if arg.kind() == "identifier" {
+                                python_local_binding_name(&scope.frames, &written)
+                                    .unwrap_or(written)
+                            } else {
+                                written
+                            };
+                            out.relations.push(ExtractedRelation {
+                                site: None,
+                                receiver: None,
+                                call_shape: None,
+                                kind: kin_model::RelationKind::Extends,
+                                src_name: name.clone(),
+                                dst_name: base,
+                                import_source: None,
+                            });
+                        }
+                    }
+                }
+                if is_enum {
+                    out.entities[class_index].kind = EntityKind::EnumDef;
                 }
             }
-        }
-        "class_definition" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Class,
-                    name: name.clone(),
-                    signature: node_signature(node, source),
-                    visibility: if name.starts_with('_') {
-                        Visibility::Private
-                    } else {
-                        Visibility::Public
-                    },
-                    doc_summary: extract_docstring(node, source),
-                    fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+            if let Some(container) = container {
+                out.relations.push(ExtractedRelation {
+                    site: Some(python_contains_site(
+                        node,
+                        scope.class_ctx.is_none() && scope.frames.is_empty(),
+                    )),
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: container,
+                    dst_name: name.clone(),
+                    import_source: None,
                 });
+            }
 
-                // Extract base classes
-                if let Some(args) = node.child_by_field_name("superclasses") {
-                    let mut is_enum = false;
-                    let mut arg_cursor = args.walk();
-                    for arg in args.children(&mut arg_cursor) {
-                        if arg.is_named() {
-                            let base = arg.utf8_text(source).unwrap_or("").to_string();
-                            if !base.is_empty() {
-                                const ENUM_BASES: &[&str] = &[
-                                    "Enum",
-                                    "IntEnum",
-                                    "StrEnum",
-                                    "Flag",
-                                    "IntFlag",
-                                    "enum.Enum",
-                                    "enum.IntEnum",
-                                    "enum.StrEnum",
-                                    "enum.Flag",
-                                    "enum.IntFlag",
-                                ];
-                                if ENUM_BASES.contains(&base.as_str()) {
-                                    is_enum = true;
-                                }
-                                relations.push(ExtractedRelation {
-                                    site: None,
-                                    receiver: None,
-                                    call_shape: None,
-                                    kind: kin_model::RelationKind::Extends,
-                                    src_name: name.clone(),
-                                    dst_name: base,
-                                    import_source: None,
-                                });
-                            }
-                        }
-                    }
-                    if is_enum {
-                        if let Some(last) = entities.last_mut() {
-                            last.kind = EntityKind::EnumDef;
-                        }
-                    }
-                }
-
-                // Recurse into class body
-                if let Some(body) = node.child_by_field_name("body") {
-                    let mut body_cursor = body.walk();
-                    for member in body.children(&mut body_cursor) {
-                        extract_py_node(
+            // Recurse into class body. The body is not a scope its methods
+            // can see, so they keep the enclosing function scopes, and its own
+            // statements read those scopes too.
+            let class_scope = PyScope {
+                class_ctx: Some(name.clone()),
+                frames: scope.frames.clone(),
+                self_class: scope.self_class.clone(),
+                enclosing: Some(name.clone()),
+            };
+            if let Some(body) = node.child_by_field_name("body") {
+                prepare_python_conditional_ambiguities(&body, source, &class_scope, out);
+                fields::admit_class_fields(body, source, file_id, &name, out);
+                let mut body_cursor = body.walk();
+                for member in body.children(&mut body_cursor) {
+                    extract_py_node(&member, source, file_id, &class_scope, out);
+                    let nested = admit_python_statement_definitions(
+                        &member,
+                        source,
+                        file_id,
+                        &class_scope,
+                        out,
+                    );
+                    // Class-scope statements that define no entity of their
+                    // own still name values: `handler = cmd_ingest` in a
+                    // class body is a use of `cmd_ingest`, sourced from the
+                    // class.
+                    if !matches!(
+                        member.kind(),
+                        "function_definition" | "class_definition" | "decorated_definition"
+                    ) {
+                        let before = out.value_refs.len();
+                        collect_python_value_refs(
                             &member,
                             source,
-                            file_id,
-                            Some(&name),
-                            entities,
-                            relations,
-                            call_audit,
-                            value_refs,
+                            &name,
+                            &PyRefScope::within(&scope.frames, Some(&nested)),
+                            &mut out.value_refs,
                         );
-                        // Class-scope statements that define no entity of their
-                        // own still name values: `handler = cmd_ingest` in a
-                        // class body is a use of `cmd_ingest`, sourced from the
-                        // class.
-                        if !matches!(
-                            member.kind(),
-                            "function_definition" | "class_definition" | "decorated_definition"
-                        ) {
-                            let before = value_refs.len();
-                            collect_python_value_refs(
-                                &member,
-                                source,
-                                &name,
-                                &std::collections::HashSet::new(),
-                                value_refs,
-                            );
-                            stamp_class_attribute_declaration(
-                                &member,
-                                source,
-                                &mut value_refs[before..],
-                            );
-                        }
+                        stamp_class_attribute_declaration(
+                            &member,
+                            source,
+                            &mut out.value_refs[before..],
+                        );
+                        // Its calls are the class's too. They are read here
+                        // rather than left to the file-wide pass because a
+                        // class body sees the scopes of the function around
+                        // it, so `session_interface = FailingSessionInterface()`
+                        // in a test's local class names the test's local class.
+                        let no_types = PythonReceiverTypes::new();
+                        extract_calls_from_context(
+                            &member,
+                            source,
+                            &PyCallScope {
+                                context_name: &name,
+                                self_class: scope.self_class.as_deref(),
+                                receiver_types: scope
+                                    .frames
+                                    .last()
+                                    .map_or(&no_types, |frame| &frame.receiver_types),
+                                frames: &scope.frames,
+                                skip: &nested,
+                            },
+                            &mut out.relations,
+                            &mut out.call_audit,
+                        );
                     }
                 }
             }
+            true
         }
-        "import_statement" | "import_from_statement" => {}
+        "import_statement" | "import_from_statement" => false,
         "decorated_definition" => {
             // Collect decorator names, then extract the inner definition
             // with decorators prepended to the signature.
@@ -575,11 +1662,10 @@ fn extract_py_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "function_definition" || child.kind() == "class_definition" {
-                    let declaration_index = entities.len();
-                    extract_py_node(
-                        &child, source, file_id, class_ctx, entities, relations, call_audit,
-                        value_refs,
-                    );
+                    let declaration_index = out.entities.len();
+                    if !extract_py_node(&child, source, file_id, scope, out) {
+                        return false;
+                    }
                     // The declaration owns its decorators, including their call
                     // sites. A class extraction can append methods after the
                     // class, so retain the declaration's exact emission index.
@@ -592,7 +1678,22 @@ fn extract_py_node(
                     // follows. What the call can reach is a separate question,
                     // settled by its receiver below.
                     if !decorators.is_empty() {
-                        if let Some(declaration) = entities.get_mut(declaration_index) {
+                        let declaration_name = out.entities[declaration_index].name.clone();
+                        for relation in &mut out.relations {
+                            if relation.kind == kin_model::RelationKind::Contains
+                                && relation.dst_name == declaration_name
+                                && relation.site.as_ref().is_some_and(|site| {
+                                    site.start_byte == child.start_byte()
+                                        && site.end_byte == child.end_byte()
+                                })
+                            {
+                                relation.site = Some(python_contains_site(
+                                    node,
+                                    scope.class_ctx.is_none() && scope.frames.is_empty(),
+                                ));
+                            }
+                        }
+                        if let Some(declaration) = out.entities.get_mut(declaration_index) {
                             let prefix = decorators
                                 .iter()
                                 .map(|decorator| format!("@{}", decorator.name))
@@ -603,40 +1704,75 @@ fn extract_py_node(
                             declaration.span = span_from_node(node, file_id);
                             declaration.fingerprint = compute_fingerprint(node, source);
                         }
-                        if let Some(declaration) = entities.get(declaration_index) {
+                        if let Some(declaration) = out.entities.get(declaration_index) {
                             let src_name = declaration.name.clone();
                             for decorator in &decorators {
                                 if is_valid_callee_name(&decorator.name) {
-                                    relations.push(ExtractedRelation {
+                                    // Evaluated in the scope around the
+                                    // definition, so a bare `@register` that
+                                    // an enclosing function defines names
+                                    // that local definition, one it imports
+                                    // carries that module, and one it binds
+                                    // as a value is a gap, exactly as a bare
+                                    // call written there would be.
+                                    let scoped = match decorator.receiver {
+                                        None => resolve_python_scoped_name(
+                                            &scope.frames,
+                                            &decorator.name,
+                                        ),
+                                        Some(_) => None,
+                                    };
+                                    let (dst_name, import_source) = match scoped {
+                                        Some(PythonScopedName::Definition(entity)) => {
+                                            (entity.to_string(), None)
+                                        }
+                                        Some(PythonScopedName::Imported(module)) => {
+                                            (decorator.name.clone(), Some(module.to_string()))
+                                        }
+                                        Some(PythonScopedName::Value) => {
+                                            out.relations.push(
+                                                scoped_call_extraction_incomplete_marker(
+                                                    src_name.clone(),
+                                                    decorator.site.clone(),
+                                                    Some(decorator.name.clone()),
+                                                ),
+                                            );
+                                            continue;
+                                        }
+                                        None => (decorator.name.clone(), None),
+                                    };
+                                    out.relations.push(ExtractedRelation {
                                         site: Some(decorator.site.clone()),
                                         receiver: decorator.receiver.clone(),
                                         call_shape: None,
                                         kind: kin_model::RelationKind::Calls,
                                         src_name: src_name.clone(),
-                                        dst_name: decorator.name.clone(),
-                                        import_source: None,
+                                        dst_name,
+                                        import_source,
                                     });
                                 }
                             }
                         }
                     }
+                    return true;
                 }
             }
+            false
         }
-        "expression_statement" if class_ctx.is_none() => {
+        "expression_statement" if scope.class_ctx.is_none() && scope.frames.is_empty() => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "assignment" || child.kind() == "assignment_statement" {
-                    extract_py_node(
-                        &child, source, file_id, class_ctx, entities, relations, call_audit,
-                        value_refs,
-                    );
+                    extract_py_node(&child, source, file_id, scope, out);
                 }
             }
+            false
         }
-        "assignment" | "assignment_statement" if class_ctx.is_none() => {
+        "assignment" | "assignment_statement"
+            if scope.class_ctx.is_none() && scope.frames.is_empty() =>
+        {
             if let Some(name) = extract_py_constant_name(node, source) {
-                entities.push(ExtractedEntity {
+                out.entities.push(ExtractedEntity {
                     kind: EntityKind::Constant,
                     name: name.clone(),
                     signature: node_signature(node, source),
@@ -650,9 +1786,40 @@ fn extract_py_node(
                     span: span_from_node(node, file_id),
                     declaration_line: None,
                 });
+                if let Some(value) = node.child_by_field_name("right") {
+                    fields::admit_literal_fields(value, source, file_id, &name, out);
+                }
+                if let Some(module) = &scope.enclosing {
+                    out.relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::Contains,
+                        src_name: module.clone(),
+                        dst_name: name,
+                        site: Some(python_contains_site(
+                            node,
+                            scope.class_ctx.is_none() && scope.frames.is_empty(),
+                        )),
+                        receiver: None,
+                        call_shape: None,
+                        import_source: None,
+                    });
+                }
             }
+            false
         }
-        _ => {}
+        _ => false,
+    }
+}
+
+/// The child declaration, with an explicit lexical-containment role so the
+/// linker can distinguish a module from its same-named declaration.
+fn python_contains_site(node: &tree_sitter::Node, module: bool) -> RelationSite {
+    RelationSite {
+        syntactic_role: Some(if module {
+            crate::extract::RelationSyntacticRole::ModuleContains
+        } else {
+            crate::extract::RelationSyntacticRole::LexicalContains
+        }),
+        ..site_from_node(node)
     }
 }
 
@@ -734,9 +1901,9 @@ fn extract_value_refs_from_definition(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    shadowed: &PyRefScope,
     out: &mut Vec<PythonValueRef>,
 ) {
-    let shadowed = collect_python_local_bindings(node, source);
     if let Some(params) = node.child_by_field_name("parameters") {
         let mut cursor = params.walk();
         for param in params.named_children(&mut cursor) {
@@ -744,23 +1911,23 @@ fn extract_value_refs_from_definition(
             // name sits in a splat pattern while the annotation stays on the
             // same `type` field.
             if let Some(annotation) = param.child_by_field_name("type") {
-                collect_python_type_refs(&annotation, source, context_name, &shadowed, out);
+                collect_python_type_refs(&annotation, source, context_name, shadowed, out);
             }
             if matches!(
                 param.kind(),
                 "default_parameter" | "typed_default_parameter"
             ) {
                 if let Some(value) = param.child_by_field_name("value") {
-                    collect_python_value_refs(&value, source, context_name, &shadowed, out);
+                    collect_python_value_refs(&value, source, context_name, shadowed, out);
                 }
             }
         }
     }
     if let Some(return_type) = node.child_by_field_name("return_type") {
-        collect_python_type_refs(&return_type, source, context_name, &shadowed, out);
+        collect_python_type_refs(&return_type, source, context_name, shadowed, out);
     }
     if let Some(body) = node.child_by_field_name("body") {
-        collect_python_value_refs(&body, source, context_name, &shadowed, out);
+        collect_python_value_refs(&body, source, context_name, shadowed, out);
     }
 }
 
@@ -786,6 +1953,209 @@ fn collect_python_local_bindings(
         bound.remove(&name);
     }
     bound
+}
+
+/// The names one function scope binds itself, and the names it declares
+/// `global`, for resolving a read to the scope that owns it.
+///
+/// Unlike [`collect_python_local_bindings`], which feeds the reference walk's
+/// deliberately broad shadow set, this stops at every nested `def`, `class`
+/// and `lambda`: their parameters and locals belong to their own scope, and
+/// counting them here would let a helper's local variable hide the enclosing
+/// function's nested class of the same name. The nested definition's own name
+/// is bound here, because the `def` statement binds it in this scope.
+///
+/// A `nonlocal` name is left out of both sets, so a lookup continues to the
+/// enclosing function scope that really binds it.
+///
+/// The third result holds the names the scope binds only through a plain
+/// `from module import name`, each with the module as written, so a call
+/// through such a name can carry the module it came from. An aliased import,
+/// an `import module` and any second binding of the same name are values.
+fn collect_python_frame_bindings(
+    function: &tree_sitter::Node,
+    source: &[u8],
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, String>,
+) {
+    struct Bindings {
+        /// Every name bound other than through a plain `from m import name`.
+        values: std::collections::HashSet<String>,
+        /// Names a plain `from m import name` binds, with the module, or
+        /// `None` once two such imports name different modules.
+        imported: std::collections::HashMap<String, Option<String>>,
+        globals: std::collections::HashSet<String>,
+        nonlocals: std::collections::HashSet<String>,
+    }
+
+    fn walk(node: &tree_sitter::Node, source: &[u8], out: &mut Bindings) {
+        match node.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    collect_python_binding_targets(&name, source, &mut out.values);
+                }
+                return;
+            }
+            "lambda" => return,
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    collect_python_binding_targets(&left, source, &mut out.values);
+                }
+            }
+            "named_expression" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    collect_python_binding_targets(&name, source, &mut out.values);
+                }
+            }
+            // `with m as name`, and `except E as name`, whose grammar holds the
+            // name in the clause's own `alias` field rather than an `as_pattern`.
+            "as_pattern" | "except_clause" => {
+                if let Some(alias) = node.child_by_field_name("alias") {
+                    collect_python_binding_targets(&alias, source, &mut out.values);
+                }
+            }
+            // `import a.b` binds `a`; `import a as b` and `from m import x as
+            // b` bind `b`; `from m import x` binds `x`.
+            "import_statement" | "import_from_statement" => {
+                let module = node.child_by_field_name("module_name");
+                let from_module = (node.kind() == "import_from_statement")
+                    .then(|| module.and_then(|m| m.utf8_text(source).ok()))
+                    .flatten()
+                    .filter(|module| !module.is_empty());
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if Some(child.id()) == module.map(|m| m.id()) {
+                        continue;
+                    }
+                    match child.kind() {
+                        "dotted_name" => {
+                            let Some(bound_name) = child
+                                .utf8_text(source)
+                                .ok()
+                                .and_then(|text| text.split('.').next())
+                                .filter(|name| !name.is_empty())
+                            else {
+                                continue;
+                            };
+                            match from_module {
+                                Some(from_module) => {
+                                    let entry = out
+                                        .imported
+                                        .entry(bound_name.to_string())
+                                        .or_insert_with(|| Some(from_module.to_string()));
+                                    if entry.as_deref() != Some(from_module) {
+                                        *entry = None;
+                                    }
+                                }
+                                None => {
+                                    out.values.insert(bound_name.to_string());
+                                }
+                            }
+                        }
+                        "aliased_import" => {
+                            if let Some(alias) = child
+                                .child_by_field_name("alias")
+                                .and_then(|alias| alias.utf8_text(source).ok())
+                                .filter(|alias| !alias.is_empty())
+                            {
+                                out.values.insert(alias.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            "global_statement" => {
+                collect_python_binding_targets(node, source, &mut out.globals);
+                return;
+            }
+            "nonlocal_statement" => {
+                collect_python_binding_targets(node, source, &mut out.nonlocals);
+                return;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(&child, source, out);
+        }
+    }
+
+    let mut out = Bindings {
+        values: std::collections::HashSet::new(),
+        imported: std::collections::HashMap::new(),
+        globals: std::collections::HashSet::new(),
+        nonlocals: std::collections::HashSet::new(),
+    };
+    if let Some(params) = function.child_by_field_name("parameters") {
+        collect_python_binding_targets(&params, source, &mut out.values);
+    }
+    if let Some(body) = function.child_by_field_name("body") {
+        walk(&body, source, &mut out);
+    }
+    let Bindings {
+        values,
+        imported,
+        globals,
+        nonlocals,
+    } = out;
+    let outward = |name: &String| globals.contains(name) || nonlocals.contains(name);
+    let bound = values
+        .iter()
+        .chain(imported.keys())
+        .filter(|name| !outward(name))
+        .cloned()
+        .collect();
+    let imports = imported
+        .into_iter()
+        .filter(|(name, _)| !values.contains(name) && !outward(name))
+        .filter_map(|(name, module)| Some((name, module?)))
+        .collect();
+    (bound, globals, imports)
+}
+
+/// Whether this source read reaches a module import rather than any local or
+/// enclosing function binding. Reuse the adapter's lexical binding census;
+/// defaults/decorators are evaluated outside the definition's body scope.
+pub(crate) fn module_import_read_is_unshadowed(
+    read: tree_sitter::Node<'_>,
+    source: &[u8],
+    name: &str,
+) -> bool {
+    let mut ancestor = read;
+    let mut function_body = false;
+    while let Some(parent) = ancestor.parent() {
+        match parent.kind() {
+            "lambda"
+            | "list_comprehension"
+            | "set_comprehension"
+            | "dictionary_comprehension"
+            | "generator_expression" => return false,
+            "function_definition" => {
+                if parent.child_by_field_name("type_parameters").is_some() {
+                    return false;
+                }
+                if parent.child_by_field_name("body").is_some_and(|body| {
+                    body.start_byte() <= read.start_byte() && read.end_byte() <= body.end_byte()
+                }) {
+                    function_body = true;
+                    let (bound, globals, _) = collect_python_frame_bindings(&parent, source);
+                    if bound.contains(name) || globals.contains(name) {
+                        return false;
+                    }
+                }
+            }
+            // A method sees enclosing functions and the module, not its class's
+            // namespace. Class-body expressions need separate class evidence.
+            "class_definition" if !function_body => return false,
+            _ => {}
+        }
+        ancestor = parent;
+    }
+    true
 }
 
 fn collect_python_scope_bindings(
@@ -884,21 +2254,29 @@ fn collect_python_value_refs(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
-    shadowed: &std::collections::HashSet<String>,
+    shadowed: &PyRefScope,
     out: &mut Vec<PythonValueRef>,
 ) {
+    // A nested definition the walk admitted reads its own names, sourced from
+    // its own entity.
+    if shadowed.skips(node) {
+        return;
+    }
     match node.kind() {
         "identifier" => {
-            if let Ok(name) = node.utf8_text(source) {
-                if !name.is_empty() && !shadowed.contains(name) {
-                    out.push(PythonValueRef {
-                        src_name: context_name.to_string(),
-                        root: name.to_string(),
-                        member: None,
-                        site: site_from_node(node),
-                        attribute: None,
-                    });
-                }
+            if let Some(root) = node
+                .utf8_text(source)
+                .ok()
+                .filter(|name| !name.is_empty())
+                .and_then(|name| shadowed.root_for(name))
+            {
+                out.push(PythonValueRef {
+                    src_name: context_name.to_string(),
+                    root,
+                    member: None,
+                    site: site_from_node(node),
+                    attribute: None,
+                });
             }
         }
         // `X.leaf` reads `X`. Whether it also names `leaf` depends on how `X`
@@ -911,16 +2289,19 @@ fn collect_python_value_refs(
                 .and_then(|n| n.utf8_text(source).ok());
             match (object, leaf) {
                 (Some(object), Some(leaf)) if object.kind() == "identifier" && !leaf.is_empty() => {
-                    if let Ok(root) = object.utf8_text(source) {
-                        if !root.is_empty() && !shadowed.contains(root) {
-                            out.push(PythonValueRef {
-                                src_name: context_name.to_string(),
-                                root: root.to_string(),
-                                member: Some(leaf.to_string()),
-                                site: site_from_node(node),
-                                attribute: None,
-                            });
-                        }
+                    if let Some(root) = object
+                        .utf8_text(source)
+                        .ok()
+                        .filter(|root| !root.is_empty())
+                        .and_then(|root| shadowed.root_for(root))
+                    {
+                        out.push(PythonValueRef {
+                            src_name: context_name.to_string(),
+                            root,
+                            member: Some(leaf.to_string()),
+                            site: site_from_node(node),
+                            attribute: None,
+                        });
                     }
                 }
                 (Some(object), _) => {
@@ -1015,21 +2396,24 @@ fn collect_python_type_refs(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
-    shadowed: &std::collections::HashSet<String>,
+    shadowed: &PyRefScope,
     out: &mut Vec<PythonValueRef>,
 ) {
     match node.kind() {
         "identifier" => {
-            if let Ok(name) = node.utf8_text(source) {
-                if !name.is_empty() && !shadowed.contains(name) {
-                    out.push(PythonValueRef {
-                        src_name: context_name.to_string(),
-                        root: name.to_string(),
-                        member: None,
-                        site: site_from_node(node),
-                        attribute: None,
-                    });
-                }
+            if let Some(root) = node
+                .utf8_text(source)
+                .ok()
+                .filter(|name| !name.is_empty())
+                .and_then(|name| shadowed.root_for(name))
+            {
+                out.push(PythonValueRef {
+                    src_name: context_name.to_string(),
+                    root,
+                    member: None,
+                    site: site_from_node(node),
+                    attribute: None,
+                });
             }
         }
         // `typing.Optional` in a type position binds exactly as `TAG_RE.pattern`
@@ -1042,16 +2426,19 @@ fn collect_python_type_refs(
                 .and_then(|n| n.utf8_text(source).ok());
             match (object, leaf) {
                 (Some(object), Some(leaf)) if object.kind() == "identifier" && !leaf.is_empty() => {
-                    if let Ok(root) = object.utf8_text(source) {
-                        if !root.is_empty() && !shadowed.contains(root) {
-                            out.push(PythonValueRef {
-                                src_name: context_name.to_string(),
-                                root: root.to_string(),
-                                member: Some(leaf.to_string()),
-                                site: site_from_node(node),
-                                attribute: None,
-                            });
-                        }
+                    if let Some(root) = object
+                        .utf8_text(source)
+                        .ok()
+                        .filter(|root| !root.is_empty())
+                        .and_then(|root| shadowed.root_for(root))
+                    {
+                        out.push(PythonValueRef {
+                            src_name: context_name.to_string(),
+                            root,
+                            member: Some(leaf.to_string()),
+                            site: site_from_node(node),
+                            attribute: None,
+                        });
                     }
                 }
                 (Some(object), _) => {
@@ -1066,16 +2453,19 @@ fn collect_python_type_refs(
                 .children(&mut cursor)
                 .filter(|child| child.kind() == "string_content");
             if let (Some(content), None) = (contents.next(), contents.next()) {
-                if let Ok(text) = content.utf8_text(source) {
-                    if is_python_identifier(text) && !shadowed.contains(text) {
-                        out.push(PythonValueRef {
-                            src_name: context_name.to_string(),
-                            root: text.to_string(),
-                            member: None,
-                            site: site_from_node(&content),
-                            attribute: None,
-                        });
-                    }
+                if let Some(root) = content
+                    .utf8_text(source)
+                    .ok()
+                    .filter(|text| is_python_identifier(text))
+                    .and_then(|text| shadowed.root_for(text))
+                {
+                    out.push(PythonValueRef {
+                        src_name: context_name.to_string(),
+                        root,
+                        member: None,
+                        site: site_from_node(&content),
+                        attribute: None,
+                    });
                 }
             }
         }
@@ -1121,8 +2511,14 @@ fn emit_python_value_references(
     guarded_imports: &[FileImport],
     relations: &mut Vec<ExtractedRelation>,
 ) {
-    let defined: std::collections::HashSet<&str> =
-        entities.iter().map(|e| e.name.as_str()).collect();
+    // The file's Module entity is named for the file, and a Python module
+    // binds no name for itself in its own namespace: `repr` read in `repr.py`
+    // is the builtin unless the file declares or imports `repr`.
+    let defined: std::collections::HashSet<&str> = entities
+        .iter()
+        .filter(|e| e.kind != EntityKind::Module)
+        .map(|e| e.name.as_str())
+        .collect();
     let mut module_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut symbol_bound: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for import in imports.iter().chain(guarded_imports) {
@@ -1552,6 +2948,17 @@ struct PythonNamedCallee {
     /// the parser could not pin. `None` for a bare call and for a `self`/`cls`
     /// call, whose owner is already folded into `name`.
     receiver: Option<String>,
+    /// The module an enclosing function body's plain `from module import
+    /// name` bound this bare callee from. The call carries it as its import
+    /// source, because that import, not a module-level declaration sharing
+    /// the name, is what the call reaches.
+    import_source: Option<String>,
+    /// The bare callee names a value an enclosing function scope binds, such
+    /// as a parameter, a local assignment or a loop variable. Its name says
+    /// nothing about which declaration runs, so the call is recorded as a
+    /// resolution gap rather than as an edge a same-named declaration could
+    /// capture.
+    local_value: bool,
 }
 
 /// Resolve the statically named portion of a Python callee. Parentheses are a
@@ -1570,6 +2977,7 @@ fn extract_named_callee(
     source: &[u8],
     class_ctx: Option<&str>,
     receiver_types: &PythonReceiverTypes,
+    frames: &[std::rc::Rc<PyFrame>],
 ) -> Option<PythonNamedCallee> {
     let callee = match function.kind() {
         "parenthesized_expression" => {
@@ -1579,7 +2987,7 @@ fn extract_named_callee(
             if named.next().is_some() {
                 return None;
             }
-            return extract_named_callee(&inner, source, class_ctx, receiver_types);
+            return extract_named_callee(&inner, source, class_ctx, receiver_types, frames);
         }
         "attribute" => {
             let attr = function
@@ -1613,6 +3021,8 @@ fn extract_named_callee(
                     name: format!("{cls}.{attr}"),
                     resolution_proven: true,
                     receiver: None,
+                    import_source: None,
+                    local_value: false,
                 },
                 // The receiver's type is declared here, so the call names one
                 // owner and arrives owner-qualified exactly as a `self.m()`
@@ -1625,6 +3035,8 @@ fn extract_named_callee(
                     name: format!("{owner}.{attr}"),
                     resolution_proven: true,
                     receiver: receiver_text,
+                    import_source: None,
+                    local_value: false,
                 },
                 // Only half proven: the parse settles which class and which
                 // attribute to ask, and whether the repository declares that
@@ -1637,19 +3049,47 @@ fn extract_named_callee(
                     name: format!("{path}.{attr}"),
                     resolution_proven: false,
                     receiver: receiver_text,
+                    import_source: None,
+                    local_value: false,
                 },
                 _ => PythonNamedCallee {
                     name: attr.to_string(),
                     resolution_proven: false,
                     receiver: receiver_text,
+                    import_source: None,
+                    local_value: false,
                 },
             }
         }
-        "identifier" => PythonNamedCallee {
-            name: function.utf8_text(source).ok()?.to_string(),
-            resolution_proven: true,
-            receiver: None,
-        },
+        // A bare call resolves the way Python resolves the name: in the
+        // innermost function scope that binds it, then each enclosing one,
+        // then the module, then the builtins. A class or function an
+        // enclosing function body defines names that nested definition,
+        // whose entity carries the qualified name. A plain `from m import
+        // name` in an enclosing body keeps the name and carries `m`. Any
+        // other local binding holds a runtime value, so the call is left to
+        // its caller to record as a gap: a parameter called `helper` is not
+        // the module's `def helper`. A name no function scope binds keeps
+        // the name it has always had, and the linker settles it against the
+        // module's own declarations, its imports and the builtin table.
+        "identifier" => {
+            let written = function.utf8_text(source).ok()?;
+            let scoped = resolve_python_scoped_name(frames, written);
+            PythonNamedCallee {
+                name: match scoped {
+                    Some(PythonScopedName::Definition(entity)) => entity,
+                    _ => written,
+                }
+                .to_string(),
+                resolution_proven: true,
+                receiver: None,
+                import_source: match scoped {
+                    Some(PythonScopedName::Imported(module)) => Some(module.to_string()),
+                    _ => None,
+                },
+                local_value: scoped == Some(PythonScopedName::Value),
+            }
+        }
         _ => return None,
     };
     is_valid_callee_name(&callee.name).then_some(callee)
@@ -2035,6 +3475,59 @@ fn stamp_class_attribute_declaration(
     }
 }
 
+/// The node ids of the `def` statements an admitted function or method owns,
+/// matched by span, in which every call is already accounted for, so a later
+/// walk over the file can leave them out.
+///
+/// Being admitted is not enough on its own. A class declared in the body has
+/// code outside its methods that no walk reads (the `name = CharField()` of a
+/// model a test declares), and neither does a call nested in the decorator
+/// expression of a definition declared there (`@Library().simple_tag()`), so a
+/// function holding either is read through.
+fn walked_python_functions(
+    root: &tree_sitter::Node,
+    entities: &[ExtractedEntity],
+    accounted: &std::collections::HashSet<(usize, usize)>,
+) -> std::collections::HashSet<usize> {
+    let spans: std::collections::HashSet<(usize, usize)> = entities
+        .iter()
+        .filter(|entity| matches!(entity.kind, EntityKind::Function | EntityKind::Method))
+        .map(|entity| (entity.span.start_byte, entity.span.end_byte))
+        .collect();
+    let mut walked = std::collections::HashSet::new();
+    let mut stack = vec![*root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_definition"
+            && spans.contains(&(node.start_byte(), node.end_byte()))
+            && every_python_call_accounted(&node, accounted)
+        {
+            walked.insert(node.id());
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    walked
+}
+
+/// Whether every `call` node below `node` is in `accounted`.
+fn every_python_call_accounted(
+    node: &tree_sitter::Node,
+    accounted: &std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    let mut stack = vec![*node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call"
+            && !accounted.contains(&(current.start_byte(), current.end_byte()))
+        {
+            return false;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.children(&mut cursor));
+    }
+    true
+}
+
 /// Whether this `call` node is the value a `raise` throws.
 ///
 /// Only the DIRECT operand counts. `raise Wrapper(build())` throws the wrapper;
@@ -2053,25 +3546,45 @@ fn python_call_is_raise_target(call: &tree_sitter::Node) -> bool {
 }
 
 /// Extract all function/method calls within a function/method body.
+///
+/// A nested definition in `scope.skip` is left out entirely: its entity walks
+/// its own body, so a call written there is that entity's call and not the
+/// enclosing function's.
 fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
-    context_name: &str,
-    class_ctx: Option<&str>,
-    receiver_types: &PythonReceiverTypes,
+    scope: &PyCallScope,
     relations: &mut Vec<ExtractedRelation>,
     call_audit: &mut PythonCallExtractionAudit,
 ) {
+    let context_name = scope.context_name;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if scope.skip.contains(&child.id()) {
+            continue;
+        }
         if child.kind() == "call" {
             call_audit
                 .seen_calls
                 .insert((child.start_byte(), child.end_byte()));
             let callee = child.child_by_field_name("function").and_then(|function| {
-                extract_named_callee(&function, source, class_ctx, receiver_types)
+                extract_named_callee(
+                    &function,
+                    source,
+                    scope.self_class,
+                    scope.receiver_types,
+                    scope.frames,
+                )
             });
-            if let Some(callee) = callee {
+            if let Some(callee) = callee.as_ref().filter(|callee| callee.local_value) {
+                // The call reaches whatever the local binding holds. Its name
+                // is known, so the gap withdraws only that name's certainty.
+                relations.push(scoped_call_extraction_incomplete_marker(
+                    context_name.into(),
+                    site_from_node(&child),
+                    Some(callee.name.clone()),
+                ));
+            } else if let Some(callee) = callee {
                 let site = RelationSite {
                     syntactic_role: python_call_is_raise_target(&child)
                         .then_some(crate::extract::RelationSyntacticRole::RaiseTarget),
@@ -2087,7 +3600,7 @@ fn extract_calls_from_context(
                     kind: kin_model::RelationKind::Calls,
                     src_name: context_name.to_string(),
                     dst_name: callee.name.clone(),
-                    import_source: None,
+                    import_source: callee.import_source,
                 });
                 if !callee.resolution_proven {
                     relations.push(scoped_call_extraction_incomplete_marker(
@@ -2122,15 +3635,7 @@ fn extract_calls_from_context(
         }
         // Recurse into child nodes. Positive extraction is unchanged; a nested
         // execution scope above cannot provide caller-specific negative evidence.
-        extract_calls_from_context(
-            &child,
-            source,
-            context_name,
-            class_ctx,
-            receiver_types,
-            relations,
-            call_audit,
-        );
+        extract_calls_from_context(&child, source, scope, relations, call_audit);
     }
 }
 
@@ -2950,6 +4455,36 @@ class Response:
         assert_eq!(classes[0].kind, EntityKind::EnumDef);
     }
 
+    /// A subscripted base names the class it extends: `Confirm(PromptBase[bool])`
+    /// extends `PromptBase`, so the linker can find the base and record that
+    /// `Confirm.process_response` overrides `PromptBase.process_response`.
+    /// A keyword such as `metaclass=` configures the class and is no base.
+    #[test]
+    fn subscripted_bases_extend_the_class_they_subscript() {
+        let adapter = PythonAdapter;
+        let source = b"import typing as t\n\
+class PromptBase(t.Generic[T]):\n    def process_response(self, value): ...\n\
+class Confirm(PromptBase[bool], metaclass=Meta):\n    def process_response(self, value): ...\n\
+class Table(Mapping[str, list[int]]):\n    pass\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("prompt.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let extends: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert_eq!(
+            extends,
+            vec![
+                ("PromptBase", "t.Generic"),
+                ("Confirm", "PromptBase"),
+                ("Table", "Mapping"),
+            ]
+        );
+    }
+
     /// Value references made by `path`, as `(src, dst)` pairs.
     fn value_refs(path: &str, source: &str) -> Vec<(String, String)> {
         let adapter = PythonAdapter;
@@ -3087,14 +4622,14 @@ class Response:
     }
 
     #[test]
-    fn a_class_body_assignment_references_from_the_class() {
+    fn a_class_body_assignment_references_from_its_field() {
         let refs = value_refs(
             "cli.py",
             "def handler(args):\n    return 1\n\nclass Router:\n    default = handler\n",
         );
         assert!(
-            refs.contains(&("Router".to_string(), "handler".to_string())),
-            "expected Router -> handler, got {refs:?}"
+            refs.contains(&("Router.default".to_string(), "handler".to_string())),
+            "expected Router.default -> handler, got {refs:?}"
         );
     }
 
@@ -3330,7 +4865,7 @@ class Response:
             "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from adapters import HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n",
         );
         assert!(
-            edges.contains(&("Response".to_string(), "HTTPAdapter".to_string())),
+            edges.contains(&("Response.connection".to_string(), "HTTPAdapter".to_string())),
             "a guarded import must bind the name its annotation reads, got {edges:?}"
         );
     }
@@ -3342,7 +4877,7 @@ class Response:
             "try:\n    from fast import Codec\nexcept ImportError:\n    from slow import Codec\n\n\nclass Frame:\n    codec: Codec\n",
         );
         assert!(
-            edges.contains(&("Frame".to_string(), "Codec".to_string())),
+            edges.contains(&("Frame.codec".to_string(), "Codec".to_string())),
             "an import behind an ImportError guard must bind, got {edges:?}"
         );
     }
@@ -3384,7 +4919,7 @@ class Response:
             .map(|rel| (rel.src_name.clone(), rel.dst_name.clone()))
             .collect();
         assert!(
-            edges.contains(&("Session".to_string(), "BaseAdapter".to_string())),
+            edges.contains(&("Session.fallback".to_string(), "BaseAdapter".to_string())),
             "and it must still bind the annotation that reads it, got {edges:?}"
         );
     }
@@ -3397,7 +4932,7 @@ class Response:
             "def load():\n    from adapters import HTTPAdapter\n\n    return HTTPAdapter\n\n\nclass Response:\n    connection: HTTPAdapter\n",
         );
         assert!(
-            !edges.contains(&("Response".to_string(), "HTTPAdapter".to_string())),
+            !edges.contains(&("Response.connection".to_string(), "HTTPAdapter".to_string())),
             "a function-local import must not bind a class-body annotation, got {edges:?}"
         );
     }
@@ -3427,7 +4962,7 @@ class Response:
             })
             .collect();
         assert!(
-            declared.contains(&("Response", Some("connection"), "HTTPAdapter")),
+            declared.contains(&("Response.connection", Some("connection"), "HTTPAdapter")),
             "the class body's own annotation must name its attribute, got {declared:?}"
         );
         assert!(
@@ -3505,7 +5040,7 @@ class Response:
             "from typing import Tuple\nfrom parsing import WikiLink\n\n\nclass ParsedNote:\n    links: Tuple[WikiLink, ...] = ()\n",
         );
         assert!(
-            edges.contains(&("ParsedNote".to_string(), "WikiLink".to_string())),
+            edges.contains(&("ParsedNote.links".to_string(), "WikiLink".to_string())),
             "a dataclass field type must reference its element type, got {edges:?}"
         );
     }
@@ -3555,7 +5090,7 @@ class Response:
             "from parsing import Note\n\n\nclass Holder:\n    note: \"Note\" = None\n",
         );
         assert!(
-            edges.contains(&("Holder".to_string(), "Note".to_string())),
+            edges.contains(&("Holder.note".to_string(), "Note".to_string())),
             "a quoted forward reference must reference its class, got {edges:?}"
         );
     }

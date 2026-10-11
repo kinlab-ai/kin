@@ -12,28 +12,22 @@
 //! together they cover {bare call, module-attribute call, method call} x
 //! {same-file, cross-file}.
 
-use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData};
-use kin_model::{ArtifactId, Entity, EntityId, FilePathId, RelationKind};
-use kin_parser::{LanguageAdapter, PythonAdapter};
+use kin_index::{link_cross_file as link_cross_file_with_identities, FileParseData, IndexPipeline};
+use kin_model::{ArtifactId, EntityId, FilePathId, RelationKind};
 
 fn parse_py(file_path: &str, source: &str) -> FileParseData {
-    let adapter = PythonAdapter;
     let file_id = FilePathId::new(file_path);
     let bytes = source.as_bytes();
-    let tree = adapter.parse(bytes).expect("parse");
-    let output = adapter.extract(&tree, bytes, &file_id).expect("extract");
-
-    let entities: Vec<Entity> = output
-        .entities
-        .into_iter()
-        .map(|e| e.into_entity_with_source(adapter.language_id(), &file_id, Some(bytes)))
-        .collect();
+    let indexed = IndexPipeline::new()
+        .index_file_content_with_tests(&file_id, bytes, kin_blobs::digest(bytes))
+        .expect("real source-bound indexing")
+        .indexed_file;
 
     FileParseData {
         file_path: file_path.to_string(),
-        entities,
-        relations: output.relations,
-        imports: output.imports,
+        entities: indexed.entities,
+        relations: indexed.extracted_relations,
+        imports: indexed.imports,
     }
 }
 

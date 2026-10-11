@@ -11,12 +11,12 @@
 //! product published during it read as an embed pass that was working and
 //! recording nothing.
 //!
-//! `kin init` is what usually pays it. The command's enrichment phase starts a
-//! daemon, and that daemon's background embed worker queues everything the
-//! index is missing as soon as its first reconcile lands, so on a repository
-//! with parseable content the fetch happens inside `kin init` rather than
-//! between it and a later `kin embed`. Wording on every surface says so, since
-//! the earlier phrasing put the cost on a command the user had not run yet.
+//! Nothing fetches it until someone asks. `kin embed` asks, and so does
+//! answering yes to the model question in `kin setup`, which records consent for
+//! the first embed pass that needs it (the one `kin init` starts, on a machine
+//! that answered yes). A machine where nobody asked, or where setup recorded
+//! "not on this machine", downloads nothing: the background pass stays off and
+//! every surface says that `kin embed` is the way to turn it on.
 //!
 //! This module is the one place that knows where those bytes land, how many of
 //! them have landed, and what to say about it. Its probes are local filesystem
@@ -82,11 +82,11 @@ pub struct EmbedModelFetch {
     /// names a local directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_fetch_reason: Option<String>,
-    /// `kin setup` recorded that this machine does not download the model, and
-    /// it is not in the cache, so nothing embeds until someone runs `kin embed`.
-    /// `no_fetch_reason` carries the sentence; this says which of its causes it
-    /// is, because only this one is a choice a query should name the way back
-    /// from.
+    /// Nobody has asked this machine to download the model, or `kin setup`
+    /// recorded that it does not, and the model is not in the cache, so nothing
+    /// embeds until someone runs `kin embed`. `no_fetch_reason` carries the
+    /// sentence; this says which of its causes it is, because only this one is a
+    /// choice a query should name the way back from.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub declined: bool,
     /// `HF_HOME`, when it is set and names a root the embedding loader does not
@@ -119,9 +119,9 @@ impl EmbedModelFetch {
             .as_deref()
             .map(crate::retrieval_profile::snapshot_present)
             .unwrap_or(false);
-        // A machine whose `kin setup` run declined the fetch owes no download,
-        // and every surface that reads `no_fetch_reason` then reports a choice
-        // rather than a gap. That is the whole value of asking: a health check
+        // A machine where nobody asked for the model, or whose `kin setup` run
+        // declined it, owes no download, and every surface that reads
+        // `no_fetch_reason` then reports a choice rather than a gap. That is the whole value of asking: a health check
         // reads the decision the wizard recorded, and never makes one.
         //
         // Two conditions, and both are the point. A model already in the cache
@@ -364,18 +364,38 @@ impl EmbedModelFetch {
 /// The model id the embedder will resolve, mirroring `kin-db`'s own read of
 /// `KIN_EMBED_MODEL_ID` (trimmed, and empty read as unset).
 pub fn configured_model_id() -> String {
-    non_empty_env("KIN_EMBED_MODEL_ID").unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string())
+    non_empty_env("KIN_MODEL_EMBEDDINGS_MODEL")
+        .or_else(|| non_empty_env("KIN_EMBED_MODEL_ID"))
+        .unwrap_or_else(|| DEFAULT_EMBED_MODEL_ID.to_string())
 }
 
 /// Why this configuration fetches nothing from the hub, when it fetches
 /// nothing.
 ///
-/// Two shapes reach the embedder without a download. A remote provider embeds
-/// over HTTP and never loads local weights, and a model id that already names a
-/// directory is loaded from it in place (`kin-db` `embed/mod.rs`, where a
-/// `is_dir()` id short-circuits the hub path). Reporting either as a pending
-/// download would announce egress that will never happen.
+/// Three shapes fetch nothing. A build without the `embeddings` feature has no
+/// embedder at all. A remote provider embeds over HTTP and never loads local
+/// weights, and a model id that already names a directory is loaded from it in
+/// place (`kin-db` `embed/mod.rs`, where a `is_dir()` id short-circuits the hub
+/// path). Reporting any of them as a pending download would announce egress
+/// that will never happen, and `kin doctor` would probe the model host for it.
 fn no_fetch_reason(model_id: &str) -> Option<String> {
+    if !kin_db::embed::embedding_slot_enabled() {
+        return Some(
+            "the embeddings model slot is none: graph retrieval works without a model or download"
+                .into(),
+        );
+    }
+    if non_empty_env("KIN_MODEL_EMBEDDINGS_PROVIDER").as_deref() == Some("external") {
+        return Some(
+            "the external provider embeds over HTTP, so no model is fetched to this machine".into(),
+        );
+    }
+    if !cfg!(feature = "embeddings") {
+        return Some(
+            "this build has no embedding model: it ranks on entity cards and downloads nothing"
+                .to_string(),
+        );
+    }
     if let Some(provider) = remote_provider() {
         return Some(format!(
             "the {provider} provider embeds over HTTP, so no model is fetched to this machine"
@@ -395,34 +415,52 @@ fn no_fetch_reason(model_id: &str) -> Option<String> {
 const MODEL_FETCH_TABLE: &str = "embedding";
 const MODEL_FETCH_KEY: &str = "model_fetch";
 
-/// Recorded when the answer was "later, whenever I ask for it": the default,
-/// and the one that keeps first contact fast.
+/// Recorded when the answer was yes, download it when it is first needed, and
+/// by `kin embed`. It is the only answer that lets anything download the model:
+/// nothing is fetched during setup, and the first embed pass that needs the
+/// model fetches it.
 ///
-/// Recorded rather than left absent so a re-run of the wizard can pre-select
-/// the answer already given, and so `deferred` and "never asked" stay
-/// distinguishable.
+/// The value keeps its original spelling so a `setup.toml` written by an
+/// earlier release still reads as the consent it recorded.
 pub const MODEL_FETCH_DEFERRED: &str = "deferred";
 
 /// Recorded when the answer was "not on this machine": an air-gapped host, or
 /// one that will never spend the egress.
 pub const MODEL_FETCH_DECLINED: &str = "declined";
 
-/// Whether [`MODEL_FETCH_DECLINED`] was recorded for this machine, as the
-/// reason every status surface prints.
+/// Why this machine downloads nothing on its own, as the reason every status
+/// surface prints, or `None` when someone asked for the model.
 ///
-/// Silent on every failure: a machine that never ran setup has nothing
-/// recorded, and a `setup.toml` that will not parse is reported with its real
-/// message by `kin setup`, not by a status line.
+/// Only a recorded yes ([`MODEL_FETCH_DEFERRED`]) lets a download happen. A
+/// machine that never answered, whose Kin home does not resolve, or whose
+/// `setup.toml` will not parse downloads nothing, and says so; `kin setup`
+/// reports an unparseable file with its real message.
 fn declined_model_fetch_reason() -> Option<String> {
-    let recorded = recorded_model_fetch(&crate::commands::setup::kin_dir().ok()?)?;
-    (recorded == MODEL_FETCH_DECLINED).then(|| {
-        "`kin setup` recorded that this machine does not fetch it, so nothing is downloaded; \
-         `kin embed` starts the fetch if you change your mind"
-            .to_string()
-    })
+    let recorded = crate::commands::setup::kin_dir()
+        .ok()
+        .and_then(|home| recorded_model_fetch(&home));
+    not_requested_reason(recorded.as_deref())
 }
 
-/// Install the gate that stops this process from downloading a declined model.
+/// The reason for a recorded model-fetch decision, `None` for a yes.
+fn not_requested_reason(recorded: Option<&str>) -> Option<String> {
+    match recorded {
+        Some(MODEL_FETCH_DEFERRED) => None,
+        Some(MODEL_FETCH_DECLINED) => Some(
+            "`kin setup` recorded that this machine does not fetch it, so nothing is \
+             downloaded; `kin embed` starts the fetch if you change your mind"
+                .to_string(),
+        ),
+        _ => Some(
+            "it downloads only when someone asks for it, and nobody has on this machine, so \
+             nothing is downloaded; `kin embed` starts the fetch"
+                .to_string(),
+        ),
+    }
+}
+
+/// Install the gate that stops this process from downloading a model nobody
+/// asked for.
 ///
 /// `kin` and `kin-daemon` call this first thing. Every embed trigger, the
 /// daemon's background pass, a query, `kin init`'s first embed pass and
@@ -438,28 +476,56 @@ fn model_fetch_gate(model_id: &str) -> Result<(), String> {
     model_fetch_gate_in(crate::commands::setup::kin_dir().ok().as_deref(), model_id)
 }
 
-/// The gate's decision for the Kin home at `kin_home`.
+/// The gate's decision for the Kin home at `kin_home`: a download goes ahead
+/// only when a yes is recorded there.
 fn model_fetch_gate_in(kin_home: Option<&Path>, model_id: &str) -> Result<(), String> {
-    let declined = kin_home.and_then(recorded_model_fetch).as_deref() == Some(MODEL_FETCH_DECLINED);
-    if !declined {
-        return Ok(());
+    match kin_home.and_then(recorded_model_fetch).as_deref() {
+        Some(MODEL_FETCH_DEFERRED) => Ok(()),
+        Some(MODEL_FETCH_DECLINED) => Err(format!(
+            "semantic search is off: `kin setup` recorded that this machine does not download \
+             the {model_id} search model, so it was not fetched; `kin embed` downloads it and \
+             turns semantic search on"
+        )),
+        _ => Err(format!(
+            "semantic search is off: the {model_id} search model downloads only when someone \
+             asks for it, and nobody has on this machine, so it was not fetched; `kin embed` \
+             downloads it and turns semantic search on"
+        )),
     }
-    Err(format!(
-        "semantic search is off: `kin setup` recorded that this machine does not download the \
-         {model_id} search model, so it was not fetched; `kin embed` downloads it and turns \
-         semantic search on"
-    ))
 }
 
-/// Why an embed pass must not start on its own here: the download was declined
-/// and the model is not in the cache.
+/// Why `kin embed` cannot index anything with this build and configuration, or
+/// `None` when it can.
 ///
-/// `None` whenever starting one would download nothing, or nobody declined. The
-/// recorded decision is read first, so a machine that never declined pays one
-/// small file read and no cache walk.
+/// One answer for every surface that would recommend `kin embed` and for the
+/// command itself, so a recommendation is never made for a pass that is then
+/// refused. On a build with a local model an unselected slot is not a reason:
+/// running `kin embed` selects the built-in provider for the repository before
+/// anything else happens. On any other build, an unselected slot or a built-in
+/// one leaves nothing that could embed.
+pub fn embed_pass_unavailable_reason() -> Option<String> {
+    if cfg!(feature = "embeddings") && !kin_db::embed::embedding_slot_enabled() {
+        return None;
+    }
+    kin_db::embed::embedding_unavailable_reason()
+}
+
+/// Why an embed pass must not start on its own here: nobody asked for the
+/// model download, or it was declined, and the model is not in the cache.
+///
+/// `None` whenever starting one would download nothing, or someone asked. The
+/// recorded decision is read first, so a machine that said yes pays one small
+/// file read and no cache walk.
 pub fn declined_and_absent() -> Option<String> {
-    let kin_home = crate::commands::setup::kin_dir().ok()?;
-    if recorded_model_fetch(&kin_home).as_deref() != Some(MODEL_FETCH_DECLINED) {
+    if !kin_db::embed::embedding_slot_enabled() {
+        return Some(
+            "the embeddings model slot is none; select a provider to enable model work".into(),
+        );
+    }
+    let recorded = crate::commands::setup::kin_dir()
+        .ok()
+        .and_then(|home| recorded_model_fetch(&home));
+    if recorded.as_deref() == Some(MODEL_FETCH_DEFERRED) {
         return None;
     }
     let fetch = EmbedModelFetch::probe(false);
@@ -470,11 +536,12 @@ pub fn declined_and_absent() -> Option<String> {
 
 /// Record consent to the download, because someone asked for embeddings.
 ///
-/// `kin embed` is the way back from a declined download, and every surface that
-/// reports the decline names it. Returns `true` when this changed a recorded
-/// decline, so the command can say it did.
+/// `kin embed` is how a machine where nobody asked, or that declined, turns the
+/// model on, and every surface that reports either names it. Returns `true`
+/// when this recorded a consent that was not there, so the command can say it
+/// did.
 pub fn consent_to_model_fetch(kin_home: &Path) -> anyhow::Result<bool> {
-    if recorded_model_fetch(kin_home).as_deref() != Some(MODEL_FETCH_DECLINED) {
+    if recorded_model_fetch(kin_home).as_deref() == Some(MODEL_FETCH_DEFERRED) {
         return Ok(false);
     }
     record_model_fetch(kin_home, MODEL_FETCH_DEFERRED)?;
@@ -1022,11 +1089,58 @@ mod tests {
         assert_eq!(endpoint_host(), "huggingface.co");
     }
 
+    /// A build without embeddings has nothing to fetch, whatever the
+    /// environment names, so nothing reports a download or probes for one.
+    #[cfg(not(feature = "embeddings"))]
+    #[test]
+    #[serial_test::serial]
+    fn a_build_without_embeddings_fetches_nothing() {
+        let mut provider = kin_core::test_env::EnvVarGuard::unset("KIN_MODEL_EMBEDDINGS_PROVIDER")
+            .without("KIN_MODEL_EMBEDDINGS_MODEL")
+            .without("KIN_EMBED_PROVIDER")
+            .without("KIN_EMBED_MODEL_ID")
+            .without("KIN_EMBED_OPENAI_MODEL");
+        assert!(!kin_db::embed::embedding_slot_enabled());
+        let reason =
+            no_fetch_reason(DEFAULT_EMBED_MODEL_ID).expect("unselected slot fetches nothing");
+        assert!(reason.contains("model slot is none"), "{reason}");
+        for busy in [false, true] {
+            let fetch = EmbedModelFetch::probe(busy);
+            assert!(!fetch.fetching && !fetch.declined && !fetch.present);
+            assert_eq!(fetch.cache_dir, None, "an unselected slot probes no cache");
+            assert_eq!(fetch.fetched_bytes, 0);
+            assert_eq!(fetch.retrieval_clause(), None);
+        }
+
+        provider.apply("KIN_MODEL_EMBEDDINGS_PROVIDER", Some("built-in"));
+        assert!(kin_db::embed::embedding_slot_enabled());
+        let reason = no_fetch_reason(DEFAULT_EMBED_MODEL_ID).expect("nothing to fetch");
+        assert!(reason.contains("no embedding model"), "{reason}");
+        for busy in [false, true] {
+            let fetch = EmbedModelFetch::probe(busy);
+            assert!(
+                !fetch.fetching && !fetch.declined && !fetch.present,
+                "an unsupported local model neither downloads nor claims a declined fetch"
+            );
+            assert_eq!(
+                fetch.cache_dir, None,
+                "an unsupported model probes no cache"
+            );
+            assert_eq!(fetch.fetched_bytes, 0);
+            assert_eq!(fetch.retrieval_clause(), None);
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
     #[test]
     #[serial_test::serial]
     fn a_remote_provider_and_a_local_directory_both_cancel_the_fetch() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let mut provider = kin_core::test_env::EnvVarGuard::unset("KIN_EMBED_PROVIDER");
+        let mut provider = kin_core::test_env::EnvVarGuard::unset("KIN_MODEL_EMBEDDINGS_PROVIDER")
+            .without("KIN_MODEL_EMBEDDINGS_MODEL")
+            .without("KIN_EMBED_MODEL_ID")
+            .without("KIN_EMBED_OPENAI_MODEL")
+            .with("KIN_EMBED_PROVIDER", "local");
         assert_eq!(no_fetch_reason(DEFAULT_EMBED_MODEL_ID), None);
 
         provider.apply("KIN_EMBED_PROVIDER", Some("lmstudio"));
@@ -1039,7 +1153,7 @@ mod tests {
         provider.apply("KIN_EMBED_PROVIDER", Some("warp-drive"));
         assert_eq!(no_fetch_reason(DEFAULT_EMBED_MODEL_ID), None);
 
-        provider.apply::<_, &str>("KIN_EMBED_PROVIDER", None);
+        provider.apply("KIN_EMBED_PROVIDER", Some("local"));
         assert!(no_fetch_reason(&temp.path().display().to_string())
             .expect("a local model directory cancels the fetch")
             .contains("local model directory"));
@@ -1070,33 +1184,55 @@ mod tests {
         assert!(refusal.contains("`kin embed`"), "{refusal}");
     }
 
-    /// Everything that is not a decline downloads as it always did: the
-    /// recommended answer, no answer at all, and no resolvable home.
+    /// A download goes ahead only after someone said yes. No answer at all and
+    /// no resolvable home both download nothing, and say that `kin embed` is
+    /// the way to ask.
     #[test]
-    fn the_gate_allows_every_answer_but_a_decline() {
+    fn the_gate_allows_only_a_recorded_yes() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(
+        for unasked in [
             model_fetch_gate_in(Some(home.path()), DEFAULT_EMBED_MODEL_ID),
-            Ok(())
-        );
+            model_fetch_gate_in(None, DEFAULT_EMBED_MODEL_ID),
+        ] {
+            let refusal = unasked.expect_err("nobody asked, so nothing downloads");
+            assert!(refusal.contains("nobody has on this machine"), "{refusal}");
+            assert!(refusal.contains("`kin embed`"), "{refusal}");
+        }
         record_model_fetch(home.path(), MODEL_FETCH_DEFERRED).unwrap();
         assert_eq!(
             model_fetch_gate_in(Some(home.path()), DEFAULT_EMBED_MODEL_ID),
             Ok(())
         );
-        assert_eq!(model_fetch_gate_in(None, DEFAULT_EMBED_MODEL_ID), Ok(()));
     }
 
-    /// `kin embed` is the way back, so it records consent over a decline and
-    /// leaves every other answer alone.
+    /// Every status surface reads the same reasons: none for a yes, the
+    /// decline's own sentence for a decline, and one for a machine nobody asked.
     #[test]
-    fn asking_for_embeddings_turns_a_decline_into_consent() {
+    fn only_a_yes_leaves_no_reason_to_report() {
+        assert_eq!(not_requested_reason(Some(MODEL_FETCH_DEFERRED)), None);
+        let declined = not_requested_reason(Some(MODEL_FETCH_DECLINED)).unwrap();
+        assert!(declined.contains("`kin setup` recorded"), "{declined}");
+        for unasked in [None, Some("something a later release wrote")] {
+            let reason = not_requested_reason(unasked).unwrap();
+            assert!(reason.contains("nobody has on this machine"), "{reason}");
+            assert!(reason.contains("`kin embed`"), "{reason}");
+        }
+    }
+
+    /// `kin embed` is the way to ask, so it records consent over no answer and
+    /// over a decline, and leaves a yes alone.
+    #[test]
+    fn asking_for_embeddings_records_consent() {
         let home = tempfile::tempdir().unwrap();
+        assert!(consent_to_model_fetch(home.path()).unwrap());
+        assert_eq!(
+            recorded_model_fetch(home.path()).as_deref(),
+            Some(MODEL_FETCH_DEFERRED)
+        );
         assert!(
             !consent_to_model_fetch(home.path()).unwrap(),
-            "nothing to change"
+            "a yes is already recorded"
         );
-        assert_eq!(recorded_model_fetch(home.path()), None);
 
         record_model_fetch(home.path(), MODEL_FETCH_DECLINED).unwrap();
         assert!(consent_to_model_fetch(home.path()).unwrap());

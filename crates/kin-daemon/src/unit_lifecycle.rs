@@ -20,10 +20,10 @@ use kin_mcp::entity_lifecycle::EntityCreate;
 use kin_mcp::source_unit::{RepositoryBase, SourceUnit, UnitImports, UnitRole};
 use kin_mcp::{McpMutationOperation, McpMutationPayload};
 use kin_model::{
-    Entity, EntityKind, EntityStore, FileLayout, FilePathId, Hash256, LanguageId, LocatedEntry,
-    RepoPath, TransactionDelta, TreeDelta, TreeEntry,
+    EntityKind, EntityStore, FileLayout, FilePathId, Hash256, LanguageId, LocatedEntry, RepoPath,
+    TransactionDelta, TreeDelta, TreeEntry,
 };
-use kin_parser::go_unit::{GoDeclaration, GoDeclarationKind, GoImport, GoUnitEdit};
+use kin_parser::unit_editor::{UnitDeclaration, UnitEdit, UnitEditor, UnitImport};
 
 use crate::local_repository_authority::LocalRepositoryAuthorityContext;
 use crate::repository_commit::load_native_source_blob;
@@ -86,121 +86,75 @@ pub(crate) fn repository_base_from(
     RepositoryBase::from_workspace(workspace).ok()
 }
 
-/// One package member the graph already holds.
+/// One member of a unit's namespace the graph already holds.
 struct Member {
     name: String,
     kind: EntityKind,
 }
 
-/// What one Go package directory already declares, read from graph truth.
+/// What one directory's units of a language already declare, read from
+/// graph truth: the members of the namespace named `name`, and the unit
+/// names its source and test units declare.
 #[derive(Default)]
-struct GoPackage {
+struct DirectoryUnits {
     members: Vec<Member>,
-    /// Package clause names the directory's files carry, by role.
-    source_packages: BTreeSet<String>,
-    test_packages: BTreeSet<String>,
-}
-
-fn go_package_of(entity: &Entity) -> Option<&str> {
-    entity
-        .metadata
-        .extra
-        .get("go_package")
-        .and_then(serde_json::Value::as_str)
-}
-
-fn is_test_file(path: &str) -> bool {
-    path.ends_with("_test.go")
+    source_units: BTreeSet<String>,
+    test_units: BTreeSet<String>,
 }
 
 fn directory_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(directory, _)| directory)
 }
 
-fn go_package(before: &kin_db::GraphSnapshot, directory: &str, name: &str) -> GoPackage {
-    let mut package = GoPackage::default();
+/// The units of `language` in the directory of the unit at `path`, and the
+/// members of the namespace the unit named `name` declares into: every unit
+/// of the directory where the language shares one namespace across them,
+/// else the unit's own.
+fn directory_units(
+    before: &kin_db::GraphSnapshot,
+    editor: &dyn UnitEditor,
+    language: LanguageId,
+    path: &str,
+    name: &str,
+) -> DirectoryUnits {
+    let directory = directory_of(path);
+    let mut units = DirectoryUnits::default();
     for entity in before.entities.values() {
         let Some(origin) = entity.file_origin.as_ref() else {
             continue;
         };
-        if entity.language != LanguageId::Go
-            || !origin.0.ends_with(".go")
-            || directory_of(&origin.0) != directory
-        {
+        if entity.language != language || directory_of(&origin.0) != directory {
             continue;
         }
-        let declared = go_package_of(entity);
+        let own_namespace = editor.directory_shares_names() || origin.0 == path;
+        let declared = editor.declared_unit(entity);
         if let Some(declared) = declared {
-            if is_test_file(&origin.0) {
-                package.test_packages.insert(declared.to_string());
+            if editor.is_test_unit(&origin.0) {
+                units.test_units.insert(declared.to_string());
             } else {
-                package.source_packages.insert(declared.to_string());
+                units.source_units.insert(declared.to_string());
             }
         }
-        if kin_model::is_file_module_surface(entity) {
+        if kin_model::is_file_module_surface(entity) || !own_namespace {
             continue;
         }
-        // An external test package (`<name>_test`) shares the directory but not
-        // the namespace.
+        // A test unit's own namespace (Go's external test package) shares
+        // the directory but not the namespace.
         if declared.is_none_or(|declared| declared == name) {
-            package.members.push(Member {
+            units.members.push(Member {
                 name: entity.name.clone(),
                 kind: entity.kind,
             });
         }
     }
-    package
-}
-
-/// The package clause names one Go directory may hold: one package in its
-/// source files, and that package or its external test package `<name>_test`
-/// in its test files.
-fn go_directory_package(
-    sources: &BTreeSet<String>,
-    tests: &BTreeSet<String>,
-) -> Result<(), String> {
-    let listed = |names: &BTreeSet<String>| names.iter().cloned().collect::<Vec<_>>().join(", ");
-    if sources.len() > 1 {
-        return Err(format!(
-            "its directory would hold source packages {}, and a Go package directory holds one",
-            listed(sources)
-        ));
-    }
-    let base = match sources.iter().next() {
-        Some(source) => source.clone(),
-        None => {
-            let bases = tests
-                .iter()
-                .map(|test| test.strip_suffix("_test").unwrap_or(test).to_string())
-                .collect::<BTreeSet<_>>();
-            if bases.len() > 1 {
-                return Err(format!(
-                    "its directory's test units would declare unrelated packages {}",
-                    listed(tests)
-                ));
-            }
-            match bases.into_iter().next() {
-                Some(base) => base,
-                None => return Ok(()),
-            }
-        }
-    };
-    let external = format!("{base}_test");
-    if let Some(foreign) = tests
-        .iter()
-        .find(|test| **test != base && **test != external)
-    {
-        return Err(format!(
-            "its test units may declare package {base} or {external}, not {foreign}"
-        ));
-    }
-    Ok(())
+    units
 }
 
 struct PlannedUnit<'a> {
     unit: &'a SourceUnit,
+    editor: &'static dyn UnitEditor,
     creates: Vec<&'a EntityCreate>,
-    add: Vec<GoImport>,
+    add: Vec<UnitImport>,
     remove: Vec<String>,
 }
 
@@ -227,7 +181,6 @@ pub(crate) fn plan_unit_operations(
     state: &DaemonState,
     authority_context: &LocalRepositoryAuthorityContext,
     prospective: &kin_db::InMemoryGraph,
-    pipeline: &kin_index::IndexPipeline,
     operations: &[McpMutationOperation],
     layouts: &mut Vec<FileLayout>,
 ) -> Result<BTreeSet<RepoPath>, String> {
@@ -249,6 +202,7 @@ pub(crate) fn plan_unit_operations(
                     path.clone(),
                     PlannedUnit {
                         unit,
+                        editor: kin_mcp::source_unit::unit_editor(unit)?,
                         creates: Vec::new(),
                         add: Vec::new(),
                         remove: Vec::new(),
@@ -270,12 +224,12 @@ pub(crate) fn plan_unit_operations(
                 planned.creates.push(create);
                 planned
                     .add
-                    .extend(create.imports.iter().map(|import| import.go()));
+                    .extend(create.imports.iter().map(|import| import.unit()));
             }
             UnitRequest::Imports(imports) => {
                 planned
                     .add
-                    .extend(imports.add.iter().map(|import| import.go()));
+                    .extend(imports.add.iter().map(|import| import.unit()));
                 planned.remove.extend(
                     imports
                         .remove
@@ -287,25 +241,43 @@ pub(crate) fn plan_unit_operations(
     }
 
     let before = prospective.to_snapshot();
-    // One Go directory holds one package, plus that package's external test
-    // package in test files. Checked across the graph and every unit this
-    // transaction plans, so one transaction cannot publish a mixed directory
-    // that no single unit would reveal.
-    let mut directories: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>, &SourceUnit)> =
-        BTreeMap::new();
+    // Which unit names may share a directory is the language's to say (one
+    // Go package and its external test package). Checked across the graph
+    // and every unit this transaction plans, so one transaction cannot
+    // publish a mixed directory that no single unit would reveal.
+    let mut directories: BTreeMap<
+        String,
+        (
+            BTreeSet<String>,
+            BTreeSet<String>,
+            &SourceUnit,
+            &dyn UnitEditor,
+        ),
+    > = BTreeMap::new();
     for (path, planned) in &units {
         let directory = directory_of(&path.to_string()).to_string();
-        let (sources, tests, _) = directories.entry(directory.clone()).or_insert_with(|| {
-            let held = go_package(&before, &directory, planned.unit.package_name());
-            (held.source_packages, held.test_packages, planned.unit)
+        let (sources, tests, _, _) = directories.entry(directory.clone()).or_insert_with(|| {
+            let held = directory_units(
+                &before,
+                planned.editor,
+                planned.unit.language(),
+                &path.to_string(),
+                planned.unit.package_name(),
+            );
+            (
+                held.source_units,
+                held.test_units,
+                planned.unit,
+                planned.editor,
+            )
         });
         match planned.unit.role() {
             UnitRole::Source => sources.insert(planned.unit.package_name().to_string()),
             UnitRole::Test => tests.insert(planned.unit.package_name().to_string()),
         };
     }
-    for (sources, tests, unit) in directories.values() {
-        go_directory_package(sources, tests).map_err(|error| {
+    for (sources, tests, unit, editor) in directories.values() {
+        editor.check_directory(sources, tests).map_err(|error| {
             format!(
                 "{} is occupied: {error}; no unit was written",
                 unit.describe()
@@ -319,14 +291,16 @@ pub(crate) fn plan_unit_operations(
     // transaction.
     let mut created_names: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut created_types: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
-    let mut parsed_creates: BTreeMap<*const EntityCreate, GoDeclaration> = BTreeMap::new();
+    let mut parsed_creates: BTreeMap<*const EntityCreate, UnitDeclaration> = BTreeMap::new();
     for (path, planned) in &units {
         let package = (
             directory_of(&path.to_string()).to_string(),
             planned.unit.package_name().to_string(),
         );
         for create in &planned.creates {
-            let declaration = kin_parser::go_unit::parse_declaration(&create.body)
+            let declaration = planned
+                .editor
+                .parse_declaration(&create.body)
                 .map_err(|error| format!("EntityCreate {}: {error}", create.name))?;
             let names = created_names.entry(package.clone()).or_default();
             for name in &declaration.names {
@@ -337,10 +311,7 @@ pub(crate) fn plan_unit_operations(
                     ));
                 }
             }
-            if matches!(
-                declaration.kind,
-                GoDeclarationKind::Struct | GoDeclarationKind::Interface | GoDeclarationKind::Type
-            ) {
+            if declaration.kind.declares_type() {
                 created_types
                     .entry(package.clone())
                     .or_default()
@@ -357,7 +328,13 @@ pub(crate) fn plan_unit_operations(
         let path_text = path.to_string();
         let directory = directory_of(&path_text).to_string();
         let name = planned.unit.package_name();
-        let package = go_package(&before, &directory, name);
+        let package = directory_units(
+            &before,
+            planned.editor,
+            planned.unit.language(),
+            &path_text,
+            name,
+        );
         let package_key = (directory.clone(), name.to_string());
         for create in &planned.creates {
             let declaration = &parsed_creates[&(*create as *const EntityCreate)];
@@ -408,7 +385,7 @@ pub(crate) fn plan_unit_operations(
                 ))
             }
         };
-        let edit = GoUnitEdit {
+        let edit = UnitEdit {
             declarations: planned
                 .creates
                 .iter()
@@ -417,7 +394,9 @@ pub(crate) fn plan_unit_operations(
             add_imports: planned.add.clone(),
             remove_imports: planned.remove.clone(),
         };
-        let outcome = kin_parser::go_unit::edit_unit(existing.as_deref(), name, &edit)
+        let outcome = planned
+            .editor
+            .edit(existing.as_deref(), name, &edit)
             .map_err(|error| format!("{}: {error}", planned.unit.describe()))?;
         if existing.as_deref() == Some(outcome.source.as_slice()) {
             // Idempotent import management: nothing to publish for this unit.
@@ -452,9 +431,13 @@ pub(crate) fn plan_unit_operations(
                     planned.unit.describe()
                 )
             })?;
-        let indexed = pipeline
-            .index_any_content(&file_id, &outcome.source, digest)
-            .map_err(|error| format!("parse {}: {error}", planned.unit.describe()))?;
+        let manifests = kin_index::GraphProjectFiles::with_reader(
+            prospective,
+            crate::source_cas::source_reader_opening(state.blobs.as_ref(), authority_context),
+        );
+        let indexed =
+            kin_index::shared_index::index_any(&file_id, &outcome.source, digest, &manifests)
+                .map_err(|error| format!("parse {}: {error}", planned.unit.describe()))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
             return Err(format!(
                 "{} does not classify as entity source",
@@ -501,7 +484,7 @@ fn validate_unit_footprint(
     file: &FilePathId,
     old_body: Option<&[u8]>,
     new_body: &[u8],
-    created: &[GoDeclaration],
+    created: &[UnitDeclaration],
 ) -> Result<(), String> {
     let mut held = BTreeSet::new();
     for old in before.entities.values().filter(|entity| {
@@ -577,8 +560,11 @@ pub(crate) fn requested_names(operations: &[McpMutationOperation]) -> BTreeSet<S
             continue;
         };
         match create.unit_target() {
-            Some((_, SourceUnit::Go { .. })) => {
-                if let Ok(declaration) = kin_parser::go_unit::parse_declaration(&create.body) {
+            Some((_, unit)) => {
+                if let Some(declaration) = kin_mcp::source_unit::unit_editor(unit)
+                    .ok()
+                    .and_then(|editor| editor.parse_declaration(&create.body).ok())
+                {
                     names.extend(declaration.names);
                 }
             }

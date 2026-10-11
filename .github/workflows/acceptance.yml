@@ -103,7 +103,7 @@ jobs:
     # and runs in full on the merge queue and on every main commit; the release
     # mint refuses a sha whose required checks are not green, so what this
     # proves still has to be true before a tag, only later than it used to be.
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
     # The heavy-runner switch, matching ci.yml's compile-heavy jobs.
     # `vars.KIN_HEAVY_RUNNER` names the runner; unset or empty resolves to
     # `ubuntu-latest`, so this workflow is always runnable without the variable.
@@ -461,6 +461,7 @@ jobs:
 
       # Cargo.lock and .cargo/config.toml together pin kin-* deps to public
       # source until every crate is registry-published.
+      # Acceptance grades the default archive feature profile.
       - name: Build kin + kin-daemon (release)
         run: cargo build --release --locked --bin kin --bin kin-daemon
 

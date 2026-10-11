@@ -27,9 +27,14 @@ use uuid::Uuid;
 use crate::error::{GitError, Result};
 use crate::history_spool::{SemanticChangeSpool, SemanticChangeSpoolWriter};
 use crate::lossless::{
-    validate_snapshot, GitObjectFormat, LosslessGitRepository, SharedObjectClosure,
+    validate_snapshot, CaptureScope, GitObjectFormat, LosslessGitRepository, SharedObjectClosure,
 };
 use crate::sealed_observation::{AdmittedContentSummary, SealedTreeObservation};
+
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 const GIT_ARTIFACT_NAMESPACE: Uuid = Uuid::from_bytes([
     0x6b, 0x69, 0x6e, 0x2d, 0x67, 0x69, 0x74, 0x2d, 0x61, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74,
@@ -132,6 +137,12 @@ pub struct SemanticGitImportPlan {
     pub workspace_seed: GitWorkspaceSeed,
     pub ref_mutations: Vec<RefMutation>,
     pub default_ref_mutation: Option<DefaultRefMutation>,
+    /// The snapshot's history boundary, carried exactly. A commit named here
+    /// is imported as a root: its parents were not captured, so no change for
+    /// them exists and none is claimed.
+    pub history_boundary: BTreeSet<GitObjectId>,
+    /// The scope the snapshot was captured over.
+    pub scope: CaptureScope,
 }
 
 /// The plan fields every Git source proof reads.
@@ -156,6 +167,10 @@ pub trait ProvedPlanFacts {
     fn proved_refs(&self) -> &RepositoryRefState;
     fn proved_head(&self) -> &WorkspaceHead;
     fn proved_workspace_seed(&self) -> &GitWorkspaceSeed;
+    /// Commits the snapshot took without their parents. Empty for a complete
+    /// capture.
+    fn proved_history_boundary(&self) -> &BTreeSet<GitObjectId>;
+    fn proved_scope(&self) -> CaptureScope;
 }
 
 impl ProvedPlanFacts for SemanticGitImportPlan {
@@ -188,6 +203,12 @@ impl ProvedPlanFacts for SemanticGitImportPlan {
     }
     fn proved_workspace_seed(&self) -> &GitWorkspaceSeed {
         &self.workspace_seed
+    }
+    fn proved_history_boundary(&self) -> &BTreeSet<GitObjectId> {
+        &self.history_boundary
+    }
+    fn proved_scope(&self) -> CaptureScope {
+        self.scope
     }
 }
 
@@ -225,6 +246,8 @@ pub struct ProvedImportClosure {
     pub refs: RepositoryRefState,
     pub head: WorkspaceHead,
     pub workspace_seed: GitWorkspaceSeed,
+    pub history_boundary: BTreeSet<GitObjectId>,
+    pub scope: CaptureScope,
 }
 
 impl ProvedImportClosure {
@@ -246,6 +269,8 @@ impl ProvedImportClosure {
             refs: plan.refs,
             head: plan.head,
             workspace_seed: plan.workspace_seed,
+            history_boundary: plan.history_boundary,
+            scope: plan.scope,
         }
     }
 }
@@ -281,6 +306,12 @@ impl ProvedPlanFacts for ProvedImportClosure {
     fn proved_workspace_seed(&self) -> &GitWorkspaceSeed {
         &self.workspace_seed
     }
+    fn proved_history_boundary(&self) -> &BTreeSet<GitObjectId> {
+        &self.history_boundary
+    }
+    fn proved_scope(&self) -> CaptureScope {
+        self.scope
+    }
 }
 
 impl SemanticGitImportPlan {
@@ -292,7 +323,14 @@ impl SemanticGitImportPlan {
             objects: self.external_objects.clone(),
             refs: self.refs.clone(),
             head: self.head.clone(),
+            history_boundary: self.history_boundary.clone(),
+            scope: self.scope,
         }
+    }
+
+    /// Whether this plan imports the complete reachable history.
+    pub fn is_complete_history(&self) -> bool {
+        self.scope == CaptureScope::Reachable && self.history_boundary.is_empty()
     }
 
     /// Rebuild the plan from its exact raw-object/ref state and require a
@@ -353,13 +391,7 @@ impl SemanticGitImportPlan {
         blob_store: &BlobStore,
         bindings: Vec<HistoricalSemanticBinding<'_>>,
     ) -> Result<Self> {
-        let snapshot = LosslessGitRepository {
-            repository_id: self.repository_id.clone(),
-            object_format: self.object_format,
-            objects: self.external_objects.clone(),
-            refs: self.refs.clone(),
-            head: self.head.clone(),
-        };
+        let snapshot = self.raw_snapshot();
         let mut comparison = HeldPlanComparison::new(&self, Enrichment::None, EXACT_UNENRICHED)?;
         let derived = derive_semantic_git_history(
             &snapshot,
@@ -1151,6 +1183,8 @@ fn build_semantic_git_import_plan(
         workspace_seed: derived.workspace_seed,
         ref_mutations: derived.ref_mutations,
         default_ref_mutation: derived.default_ref_mutation,
+        history_boundary: snapshot.history_boundary.clone(),
+        scope: snapshot.scope,
     })
 }
 
@@ -1169,17 +1203,23 @@ fn parse_commits(
         let commit = gix::objs::CommitRef::from_bytes(&body, hash_kind).map_err(|error| {
             GitError::InvalidSnapshot(format!("decode commit {}: {error}", record.object.oid))
         })?;
-        let parsed = ParsedCommit {
-            tree: git_object_id(commit.tree())?,
-            parents: commit
+        // A boundary commit is imported as a root. Its parents were not
+        // captured, so naming them would claim history the snapshot does not
+        // hold; closure validation has already proved the boundary is exactly
+        // the captured commits whose parents were left out.
+        let parents = if snapshot.history_boundary.contains(&record.object.oid) {
+            Vec::new()
+        } else {
+            commit
                 .parents()
                 .map(git_object_id)
-                .collect::<Result<Vec<_>>>()?,
+                .collect::<Result<Vec<_>>>()?
+        };
+        let parsed = ParsedCommit {
+            tree: git_object_id(commit.tree())?,
+            parents,
             timestamp: normalized_timestamp(commit.time().ok().map(|time| time.seconds)),
-            author: AuthorId::new(normalize_display_bytes(
-                b"git-author-v1:",
-                commit.author.as_ref(),
-            )),
+            author: git_author(&commit),
             message: normalize_display_bytes(b"git-message-v1:", commit.message.as_ref()),
         };
         if commits.insert(record.object.oid, parsed).is_some() {
@@ -1443,15 +1483,17 @@ fn split_raw_entry(entry: Option<RawTreeEntry>) -> (Option<TreeEntry>, Option<Gi
 /// Resolve a commit's exact tree from its first parent's and the leaves that
 /// differ, carrying artifact identity across the transition.
 ///
-/// The identity rule is the one the whole-tree resolution applied, unchanged,
-/// so a repository admitted before this derivation and one admitted after it
-/// derive the same artifact identities, the same tree deltas and the same
-/// change identities: a path the first parent carries keeps that parent's
-/// identity whatever happens to its entry; a path it does not carry takes the
-/// identity of the one artifact in a secondary parent with exactly the same
-/// entry, when that match is unique in both directions and the first parent
-/// does not still hold it; and every other new path is introduced under an
-/// identity derived from this commit and the path.
+/// A path the first parent carries keeps that parent's identity whatever
+/// happens to its entry. A path it does not carry takes the identity of the
+/// one artifact in a secondary parent with exactly the same entry, when that
+/// match is unique in both directions and the first parent does not still
+/// hold it. In a commit that is not a merge, a new path of an entity Kin holds
+/// without parsing it takes the identity of the one such path the commit
+/// removes with exactly the same entry, when that pair is unique in both
+/// directions: the entity moved, and the transition is one update from the
+/// old path to the new. Every other new path is introduced under an identity
+/// derived from this commit and the path. The move rule arrived with
+/// hydration semantics 49, so a store admitted before it is behind.
 ///
 /// The deltas are sorted by artifact identity, as before, and the tree is
 /// built by applying them to the first parent's, which is the transition the
@@ -1526,6 +1568,40 @@ fn resolve_tree_transition(
             }
         }
     }
+    // A commit that is not a merge and removes one unparsed entity's path
+    // while adding one other with the identical entry, the same content and
+    // mode, moved that entity: the added path keeps its identity, as an entity
+    // of code keeps its own across a move. Only an exact, unambiguous pair
+    // counts, and never source Kin parses, whose identity is its entities'.
+    let unparsed = |path: &kin_model::RepoPath| {
+        path.as_utf8()
+            .is_some_and(|place| !kin_model::is_entity_source_path(place))
+    };
+    let mut moved_from = HashMap::<TreeEntry, Vec<ArtifactId>>::new();
+    let mut moved_to = HashMap::<TreeEntry, usize>::new();
+    if secondary_parents.is_empty() {
+        for change in &changes {
+            match (change.old, change.new) {
+                (Some(old), None) if unparsed(&change.path) => moved_from
+                    .entry(old)
+                    .or_default()
+                    .push(first_parent_id(&change.path)?),
+                (None, Some(new)) if unparsed(&change.path) => {
+                    *moved_to.entry(new).or_default() += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    let moved = |path: &kin_model::RepoPath, new: &TreeEntry| {
+        (unparsed(path) && moved_to.get(new) == Some(&1))
+            .then(|| moved_from.get(new))
+            .flatten()
+            .and_then(|ids| match ids.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            })
+    };
     let mut assigned = BTreeSet::new();
     let mut deltas = Vec::with_capacity(changes.len());
     for change in changes {
@@ -1557,7 +1633,7 @@ fn resolve_tree_transition(
                             && !reserved
                             && !assigned.contains(candidate)
                     });
-                let artifact_id = match candidate {
+                let artifact_id = match candidate.or_else(|| moved(&path, &new)) {
                     Some(candidate) => candidate,
                     None => {
                         let derived = introduced_artifact_id(introducing_commit, &path);
@@ -1625,8 +1701,9 @@ fn resolve_tree_transition(
 /// on a single graph root.
 ///
 /// This runs only for a path the parent tree has no identity for. Continuity
-/// across a commit comes from reusing the first parent's id, and across a merge
-/// from the secondary-candidate matching above; neither is changed here. So the
+/// across a commit comes from reusing the first parent's id, across a merge
+/// from the secondary-candidate matching above, and across a move of an
+/// unparsed entity from the exact pair above; none is changed here. So the
 /// commit in the key is the commit that *introduced* the path, and the id stays
 /// a fact about where content entered history rather than about where the file
 /// currently sits.
@@ -1871,6 +1948,34 @@ fn normalized_timestamp(seconds: Option<i64>) -> Timestamp {
     )
 }
 
+/// An imported commit's author as Git means it: the name and address,
+/// `Name <email>`, which is the form a native change records from Git's own
+/// configuration.
+///
+/// The author's time is not part of who they are. The change carries the
+/// commit's time in its own timestamp, and the commit's exact bytes stay in the
+/// lossless Git objects every import keeps. A name or address that is not UTF-8
+/// is read lossily, because this string is for a reader and the exact bytes are
+/// kept there. A line Git itself cannot parse as a signature has no name to
+/// take, so its text is kept as it reads.
+fn git_author(commit: &gix::objs::CommitRef<'_>) -> AuthorId {
+    match commit.author() {
+        Ok(signature) => AuthorId::from_name_and_email(
+            &String::from_utf8_lossy(signature.name),
+            &String::from_utf8_lossy(signature.email),
+        ),
+        Err(_) => AuthorId::new(String::from_utf8_lossy(commit.author.as_ref()).trim()),
+    }
+}
+
+/// The author an earlier import recorded: the commit's whole author
+/// line, time and offset included, or that line in hexadecimal when it was not
+/// UTF-8. Proving a store that import wrote re-derives its history under this
+/// rule, because those changes' identities were computed over it.
+pub(crate) fn legacy_git_author(raw_author_line: &[u8]) -> AuthorId {
+    AuthorId::new(normalize_display_bytes(b"git-author-v1:", raw_author_line))
+}
+
 fn normalize_display_bytes(prefix: &[u8], bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_string(),
@@ -1947,7 +2052,7 @@ mod tests {
     #[cfg(unix)]
     use crate::admission_history::AdmittedSemanticGitImportPlan;
     use crate::lossless::capture_lossless_git_repository;
-    use crate::test_support::fixture_git;
+    use crate::test_support::{fixture_git, FixtureGitBatch};
 
     #[cfg(unix)]
     struct SemanticFixture {
@@ -1977,8 +2082,6 @@ mod tests {
             let root = tempdir().unwrap();
             let repo = root.path().join("source");
             fs::create_dir(&repo).unwrap();
-            git_ok(&repo, ["init", "--initial-branch=main"]);
-            configure_git(&repo);
 
             write(&repo, "Cargo.toml", b"[package]\nname = \"mixed\"\n");
             write(&repo, "src/lib.rs", b"pub fn rust_value() -> u8 { 7 }\n");
@@ -2036,7 +2139,13 @@ mod tests {
             fs::set_permissions(&executable, permissions).unwrap();
             symlink("config/app.yaml", repo.join("config-link")).unwrap();
 
-            git_ok(&repo, ["add", "--all"]);
+            // Each batch is the same Git invocations, in the same order, as
+            // separate launches would be; a batch ends wherever the next step
+            // needs a file written first.
+            let mut seed = FixtureGitBatch::new();
+            seed.git(["init", "--initial-branch=main"]);
+            configure_git_steps(&mut seed);
+            seed.git(["add", "--all"]).run_in(&repo);
             let non_utf8_blob = git_stdin_text(
                 &repo,
                 ["hash-object", "-w", "--stdin"],
@@ -2046,23 +2155,22 @@ mod tests {
             index_entry.extend_from_slice(b"odd-\xff.bin\0");
             git_stdin_ok(&repo, ["update-index", "-z", "--index-info"], &index_entry);
             let gitlink = "4242424242424242424242424242424242424242";
-            git_ok(
-                &repo,
-                [
+            let mut initial_batch = FixtureGitBatch::new();
+            initial_batch
+                .git([
                     "update-index",
                     "--add",
                     "--cacheinfo",
                     &format!("160000,{gitlink},vendor/sub"),
-                ],
-            );
-            git_ok(&repo, ["commit", "-m", "initial exact tree"]);
-            let initial = git_text(&repo, ["rev-parse", "HEAD"]);
-            let initial_symlink_blob = git_text(&repo, ["rev-parse", "HEAD:config-link"]);
+                ])
+                .git(["commit", "-m", "initial exact tree"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git_stdout(["rev-parse", "HEAD:config-link"])
+                .git(["commit", "--allow-empty", "-m", "empty checkpoint"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git(["switch", "-c", "one"]);
+            let [initial, initial_symlink_blob, empty] = batch_lines(initial_batch.run_in(&repo));
 
-            git_ok(&repo, ["commit", "--allow-empty", "-m", "empty checkpoint"]);
-            let empty = git_text(&repo, ["rev-parse", "HEAD"]);
-
-            git_ok(&repo, ["switch", "-c", "one"]);
             write(&repo, "branch-one.txt", b"unique branch one\n");
             write(&repo, "same-a.bin", b"ambiguous shared body\n");
             write(&repo, ".gitignore", b"*.scratch\n*.branch-one\n");
@@ -2070,21 +2178,21 @@ mod tests {
             let mut permissions = fs::metadata(&executable).unwrap().permissions();
             permissions.set_mode(0o644);
             fs::set_permissions(&executable, permissions).unwrap();
-            git_ok(
-                &repo,
-                [
+            let mut one_batch = FixtureGitBatch::new();
+            one_batch
+                .git([
                     "add",
                     "branch-one.txt",
                     "same-a.bin",
                     "scripts/tool.sh",
                     ".gitignore",
-                ],
-            );
-            git_ok(&repo, ["commit", "-m", "branch one"]);
-            let one = git_text(&repo, ["rev-parse", "HEAD"]);
+                ])
+                .git(["commit", "-m", "branch one"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git(["switch", "main"])
+                .git(["switch", "-c", "two"]);
+            let [one] = batch_lines(one_batch.run_in(&repo));
 
-            git_ok(&repo, ["switch", "main"]);
-            git_ok(&repo, ["switch", "-c", "two"]);
             write(&repo, "branch-two.txt", b"unique branch two\n");
             write(&repo, "same-b.bin", b"ambiguous shared body\n");
             fs::remove_file(repo.join("config/.gitignore")).unwrap();
@@ -2095,31 +2203,30 @@ mod tests {
             );
             fs::remove_file(repo.join("config-link")).unwrap();
             symlink("compose.yaml", repo.join("config-link")).unwrap();
-            git_ok(
-                &repo,
-                [
+            let mut two_batch = FixtureGitBatch::new();
+            two_batch
+                .git([
                     "add",
                     "branch-two.txt",
                     "same-b.bin",
                     "config-link",
                     "config/.gitignore",
                     "config/.kinignore",
-                ],
-            );
-            git_ok(&repo, ["commit", "-m", "branch two"]);
-            let two = git_text(&repo, ["rev-parse", "HEAD"]);
+                ])
+                .git(["commit", "-m", "branch two"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git(["switch", "main"])
+                .git(["switch", "-c", "three"]);
+            let [two] = batch_lines(two_batch.run_in(&repo));
 
-            git_ok(&repo, ["switch", "main"]);
-            git_ok(&repo, ["switch", "-c", "three"]);
             write(&repo, "branch-three.txt", b"unique branch three\n");
-            git_ok(&repo, ["add", "branch-three.txt"]);
-            git_ok(&repo, ["commit", "-m", "branch three"]);
-            let three = git_text(&repo, ["rev-parse", "HEAD"]);
-
-            git_ok(&repo, ["switch", "main"]);
-            git_ok(
-                &repo,
-                [
+            let mut three_batch = FixtureGitBatch::new();
+            three_batch
+                .git(["add", "branch-three.txt"])
+                .git(["commit", "-m", "branch three"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git(["switch", "main"])
+                .git([
                     "merge",
                     "--no-ff",
                     "one",
@@ -2127,8 +2234,8 @@ mod tests {
                     "three",
                     "-m",
                     "octopus merge",
-                ],
-            );
+                ]);
+            let [three] = batch_lines(three_batch.run_in(&repo));
             // The merge's own tree carries one more file than any parent: the
             // exact body of `config/.gitignore`, which the merge removes
             // relative to its first parent while branches one and three still
@@ -2136,24 +2243,24 @@ mod tests {
             // moved through a merge, and the resolution has to report it as one
             // update rather than as a removal and an addition of one identity.
             write(&repo, "config/generated-rules.txt", b"*.generated\n");
-            git_ok(&repo, ["add", "config/generated-rules.txt"]);
-            git_ok(&repo, ["commit", "--amend", "--no-edit"]);
-            let merge = git_text(&repo, ["rev-parse", "HEAD"]);
-            let parent_line = git_text(&repo, ["rev-list", "--parents", "-n", "1", "HEAD"]);
+            let mut merge_batch = FixtureGitBatch::new();
+            merge_batch
+                .git(["add", "config/generated-rules.txt"])
+                .git(["commit", "--amend", "--no-edit"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git_stdout(["rev-list", "--parents", "-n", "1", "HEAD"])
+                .git(["tag", "-a", "release-octo", "-m", "annotated"])
+                .git(["symbolic-ref", "refs/aliases/stable", "refs/heads/main"])
+                .git_stdout(["rev-parse", "HEAD:compose.yaml"])
+                .git_stdout(["rev-parse", "HEAD:scripts/tool.sh"])
+                .git_stdout(["rev-parse", "HEAD:config-link"])
+                .git_stdout(["rev-parse", "HEAD:assets/raw.bin"]);
+            let [merge, parent_line, compose_blob, tool_blob, symlink_blob, binary_blob] =
+                batch_lines(merge_batch.run_in(&repo));
             assert_eq!(
                 parent_line.split_whitespace().skip(1).collect::<Vec<_>>(),
                 [&empty, &one, &two, &three]
             );
-            git_ok(&repo, ["tag", "-a", "release-octo", "-m", "annotated"]);
-            git_ok(
-                &repo,
-                ["symbolic-ref", "refs/aliases/stable", "refs/heads/main"],
-            );
-
-            let compose_blob = git_text(&repo, ["rev-parse", "HEAD:compose.yaml"]);
-            let tool_blob = git_text(&repo, ["rev-parse", "HEAD:scripts/tool.sh"]);
-            let symlink_blob = git_text(&repo, ["rev-parse", "HEAD:config-link"]);
-            let binary_blob = git_text(&repo, ["rev-parse", "HEAD:assets/raw.bin"]);
             let cas_root = root.path().join("cas");
             let blob_store = BlobStore::new(cas_root.clone()).unwrap();
             Self {
@@ -2252,7 +2359,7 @@ mod tests {
     fn spooled_history_preserves_enrichment_and_refuses_missing_or_reordered_records() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("spooled-history").unwrap(),
             &fixture.blob_store,
         )
@@ -2344,12 +2451,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_checked_out_commit_imports_as_one_root_change_with_its_policy() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("source");
+        fs::create_dir(&repo).unwrap();
+        git_ok(&repo, ["init", "--initial-branch=main"]);
+        configure_git(&repo);
+        write(&repo, ".gitignore", b"*.log\n");
+        write(&repo, "a.py", b"def a():\n    return 1\n");
+        commit_all(&repo, "first");
+        write(&repo, "b.py", b"def b():\n    return 2\n");
+        commit_all(&repo, "second");
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = crate::lossless::capture_lossless_git_repository_scoped(
+            &worktree(&repo),
+            RepositoryId::new("scoped").unwrap(),
+            &blob_store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .unwrap();
+
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        assert!(!plan.is_complete_history());
+        assert_eq!(plan.changes.len(), 1);
+        let change = plan.changes.read_at(0).unwrap().unwrap();
+        assert!(
+            change.parents.is_empty(),
+            "a boundary commit imports as a root"
+        );
+        assert_eq!(change.tree_deltas.len(), 3);
+        assert_eq!(plan.workspace_seed.base_tree.len(), 3);
+        plan.validate(&blob_store).unwrap();
+
+        let admitted = admit_semantic_git_import(&plan, &blob_store).unwrap();
+        assert!(!admitted.is_complete_history());
+        let admitted_change = admitted.changes.read_at(0).unwrap().unwrap();
+        assert_eq!(
+            admitted_change.admission_policy_delta,
+            Some(kin_model::AdmissionPolicyDelta::initialize(
+                admitted.workspace_policy.clone()
+            ))
+        );
+        assert_eq!(admitted.workspace_policy.sources.len(), 1);
+        admitted.validate(&blob_store).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn plans_exact_polyglot_octopus_history_without_repository_access() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("semantic-octopus").unwrap(),
             &fixture.blob_store,
         )
@@ -2583,7 +2736,7 @@ mod tests {
     fn admission_walk_preserves_full_plan_validation() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("admission-single-walk").unwrap(),
             &fixture.blob_store,
         )
@@ -2737,7 +2890,7 @@ mod tests {
     fn admits_branch_versioned_policy_from_exact_commit_trees_and_cas() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("semantic-admission-history").unwrap(),
             &fixture.blob_store,
         )
@@ -2932,7 +3085,7 @@ mod tests {
         configure_git(&repo);
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repo,
+            &worktree(&repo),
             RepositoryId::new("semantic-unborn-admission").unwrap(),
             &blob_store,
         )
@@ -2971,13 +3124,12 @@ mod tests {
         git_ok(&repo, ["init", "--initial-branch=main"]);
         configure_git(&repo);
         write(&repo, "lib.rs", b"pub fn f() -> u32 { 1 }\n");
-        git_ok(&repo, ["add", "--all"]);
-        git_ok(&repo, ["commit", "-m", "initial"]);
+        commit_all(&repo, "initial");
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
 
         let before = crate::lossless::closure_reconstruction_count();
         let snapshot = capture_lossless_git_repository(
-            &repo,
+            &worktree(&repo),
             RepositoryId::new("closure-count").unwrap(),
             &blob_store,
         )
@@ -2999,6 +3151,47 @@ mod tests {
         );
     }
 
+    /// An imported commit records its author the way Git means one, the name
+    /// and address a native change records from Git's configuration, and the
+    /// commit's time in the change's own timestamp. Never the whole author
+    /// line with its seconds and offset.
+    #[test]
+    fn an_imported_commit_records_its_author_as_git_names_them() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("source");
+        fs::create_dir(&repo).unwrap();
+        git_ok(&repo, ["init", "--initial-branch=main"]);
+        configure_git(&repo);
+        write(&repo, "lib.rs", b"pub fn f() -> u32 { 1 }\n");
+        FixtureGitBatch::new()
+            .git(["add", "--all"])
+            .git(["commit", "-m", "initial"])
+            .author_date("1700000000 +0200")
+            .committer_date("1700000100 +0200")
+            .run_in(&repo);
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &worktree(&repo),
+            RepositoryId::new("import-author").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let change = plan.changes.iter().next().unwrap().unwrap();
+        assert_eq!(
+            change.author,
+            AuthorId::new("Kin Test <kin@example.invalid>")
+        );
+        assert_eq!(change.author.name(), "Kin Test");
+        assert_eq!(change.timestamp, normalized_timestamp(Some(1_700_000_100)));
+        let admitted = admit_semantic_git_import(&plan, &blob_store).unwrap();
+        admitted.validate(&blob_store).unwrap();
+        assert!(admitted
+            .changes
+            .iter()
+            .all(|change| change.unwrap().author.0 == "Kin Test <kin@example.invalid>"));
+    }
+
     #[test]
     fn missing_tampered_cas_and_mutated_plan_fail_closed() {
         let root = tempdir().unwrap();
@@ -3012,12 +3205,11 @@ mod tests {
             b"services:\n  api:\n    image: kin\n",
         );
         write(&repo, ".gitignore", b"*.scratch\n");
-        git_ok(&repo, ["add", "--all"]);
-        git_ok(&repo, ["commit", "-m", "initial"]);
+        commit_all(&repo, "initial");
         let cas_root = root.path().join("cas");
         let blob_store = BlobStore::new(cas_root.clone()).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repo,
+            &worktree(&repo),
             RepositoryId::new("semantic-cas").unwrap(),
             &blob_store,
         )
@@ -3127,7 +3319,7 @@ mod tests {
     fn delta_resolution_matches_the_whole_tree_oracle() {
         let fixture = SemanticFixture::octopus_polyglot();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("semantic-oracle").unwrap(),
             &fixture.blob_store,
         )
@@ -3139,30 +3331,30 @@ mod tests {
         let root = tempdir().unwrap();
         let repo = root.path().join("shapes");
         fs::create_dir(&repo).unwrap();
-        git_ok(&repo, ["init", "--initial-branch=main"]);
-        configure_git(&repo);
         write(&repo, "thing", b"a file\n");
         write(&repo, "dir/keep.txt", b"kept\n");
         write(&repo, "dir/nested/deep.txt", b"deep\n");
-        git_ok(&repo, ["add", "--all"]);
-        git_ok(&repo, ["commit", "-m", "file and directory"]);
+        let mut seed = FixtureGitBatch::new();
+        seed.git(["init", "--initial-branch=main"]);
+        configure_git_steps(&mut seed);
+        seed.git(["add", "--all"])
+            .git(["commit", "-m", "file and directory"])
+            .run_in(&repo);
         // The file becomes a directory, the nested directory becomes a file,
         // and an untouched sibling stays where it is.
         fs::remove_file(repo.join("thing")).unwrap();
         write(&repo, "thing/inside.txt", b"now a directory\n");
         fs::remove_dir_all(repo.join("dir/nested")).unwrap();
         write(&repo, "dir/nested", b"now a file\n");
-        git_ok(&repo, ["add", "--all"]);
-        git_ok(&repo, ["commit", "-m", "shapes change"]);
+        commit_all(&repo, "shapes change");
         // And back again, with a body change on the untouched sibling.
         fs::remove_dir_all(repo.join("thing")).unwrap();
         write(&repo, "thing", b"a file again\n");
         write(&repo, "dir/keep.txt", b"kept, edited\n");
-        git_ok(&repo, ["add", "--all"]);
-        git_ok(&repo, ["commit", "-m", "shapes change back"]);
+        commit_all(&repo, "shapes change back");
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repo,
+            &worktree(&repo),
             RepositoryId::new("semantic-oracle-shapes").unwrap(),
             &blob_store,
         )
@@ -3172,8 +3364,106 @@ mod tests {
         assert!(shapes.added > 0 && shapes.removed > 0 && shapes.updated > 0);
     }
 
-    /// The whole-tree resolution this module replaced, kept verbatim as the
-    /// oracle for [`delta_resolution_matches_the_whole_tree_oracle`].
+    /// An unparsed entity moved by a commit keeps its identity: the one path a
+    /// commit removes and the one it adds with exactly the same content and
+    /// mode are one entity, carried by one update from the old path to the
+    /// new. Source Kin parses, a pair that is not unique, and content edited
+    /// as it moved each take a new identity, and both resolutions agree.
+    #[cfg(unix)]
+    #[test]
+    fn an_unparsed_entity_keeps_its_identity_across_an_exact_move() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("moves");
+        fs::create_dir(&repo).unwrap();
+        write(&repo, "docs/logo.png", b"\x89PNG\r\n\x1a\nlogo bytes");
+        write(&repo, "NOTES.md", b"# Notes\n\nFirst.\n");
+        write(&repo, "src/app.py", b"def run():\n    return 1\n");
+        write(&repo, "a.txt", b"same\n");
+        write(&repo, "b.txt", b"same\n");
+        let mut seed = FixtureGitBatch::new();
+        seed.git(["init", "--initial-branch=main"]);
+        configure_git_steps(&mut seed);
+        seed.git(["add", "--all"])
+            .git(["commit", "-m", "seed"])
+            .git_stdout(["rev-parse", "HEAD"]);
+        let [first] = batch_lines(seed.run_in(&repo));
+
+        fs::create_dir_all(repo.join("static")).unwrap();
+        fs::rename(repo.join("docs/logo.png"), repo.join("static/logo.png")).unwrap();
+        fs::rename(repo.join("src/app.py"), repo.join("src/main.py")).unwrap();
+        fs::rename(repo.join("a.txt"), repo.join("c.txt")).unwrap();
+        fs::rename(repo.join("b.txt"), repo.join("d.txt")).unwrap();
+        fs::remove_file(repo.join("NOTES.md")).unwrap();
+        write(&repo, "docs/NOTES.md", b"# Notes\n\nFirst, edited.\n");
+        let mut moves = FixtureGitBatch::new();
+        moves
+            .git(["add", "--all"])
+            .git(["commit", "-m", "move things"])
+            .git_stdout(["rev-parse", "HEAD"]);
+        let [second] = batch_lines(moves.run_in(&repo));
+
+        let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &worktree(&repo),
+            RepositoryId::new("semantic-moves").unwrap(),
+            &blob_store,
+        )
+        .unwrap();
+        let trees = derive_commit_trees(&snapshot, &blob_store).unwrap();
+        let before = &trees[&model_oid(&first)];
+        let after = &trees[&model_oid(&second)];
+        let id = |tree: &ResolvedTree, path: &str| {
+            tree.artifact_id_at_path(&RepoPath::from_utf8(path.to_string()).unwrap())
+                .unwrap_or_else(|| panic!("{path} is held"))
+        };
+        assert_eq!(id(after, "static/logo.png"), id(before, "docs/logo.png"));
+        assert_ne!(id(after, "src/main.py"), id(before, "src/app.py"));
+        for moved in ["c.txt", "d.txt"] {
+            for earlier in ["a.txt", "b.txt"] {
+                assert_ne!(
+                    id(after, moved),
+                    id(before, earlier),
+                    "{moved} from {earlier}"
+                );
+            }
+        }
+        assert_ne!(id(after, "docs/NOTES.md"), id(before, "NOTES.md"));
+
+        // The move is one update, from the old path to the new.
+        let plan = plan_semantic_git_import(&snapshot, &blob_store).unwrap();
+        let logo = id(before, "docs/logo.png");
+        let change = plan
+            .changes
+            .iter()
+            .map(Result::unwrap)
+            .find(|change| {
+                change.tree_deltas.iter().any(|delta| {
+                    delta.artifact_id() == logo && !matches!(delta, TreeDelta::Added { .. })
+                })
+            })
+            .expect("a change moves the logo");
+        let moved: Vec<&TreeDelta> = change
+            .tree_deltas
+            .iter()
+            .filter(|delta| delta.artifact_id() == logo)
+            .collect();
+        assert!(
+            matches!(
+                moved.as_slice(),
+                [TreeDelta::Updated { old, new, .. }]
+                    if old.path.as_utf8() == Some("docs/logo.png")
+                        && new.path.as_utf8() == Some("static/logo.png")
+            ),
+            "{moved:?}"
+        );
+
+        let shapes = oracle::compare_every_commit(&snapshot, &blob_store);
+        assert_eq!(shapes.commits, 2);
+    }
+
+    /// The whole-tree resolution this module replaced, kept as the oracle for
+    /// [`delta_resolution_matches_the_whole_tree_oracle`], with the move rule
+    /// of an unparsed entity read off whole trees beside it.
     #[cfg(unix)]
     mod oracle {
         use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -3368,6 +3658,30 @@ mod tests {
                 }
             }
 
+            // The move of an unparsed entity, read off whole trees: a path
+            // the first parent held and this tree does not, and a path this
+            // tree holds and the first parent did not, alone with that entry.
+            let unparsed = |path: &RepoPath| {
+                path.as_utf8()
+                    .is_some_and(|place| !kin_model::is_entity_source_path(place))
+            };
+            let mut moved_from = HashMap::<TreeEntry, Vec<ArtifactId>>::new();
+            let mut moved_to = HashMap::<TreeEntry, usize>::new();
+            if secondary_parents.is_empty() {
+                for artifact in first_parent.artifacts() {
+                    if !raw_tree.contains_key(&artifact.path) && unparsed(&artifact.path) {
+                        moved_from
+                            .entry(artifact.entry)
+                            .or_default()
+                            .push(artifact.artifact_id);
+                    }
+                }
+                for (path, entry) in &raw_tree {
+                    if first_parent.artifact_at_path(path).is_none() && unparsed(path) {
+                        *moved_to.entry(*entry).or_default() += 1;
+                    }
+                }
+            }
             let mut assigned = BTreeSet::new();
             let mut artifacts = Vec::with_capacity(raw_tree.len());
             for (path, entry) in raw_tree {
@@ -3385,6 +3699,15 @@ mod tests {
                             candidate_target_counts.get(candidate) == Some(&1)
                                 && !reserved_first_parent_ids.contains(candidate)
                                 && !assigned.contains(candidate)
+                        })
+                        .or_else(|| {
+                            (unparsed(&path) && moved_to.get(&entry) == Some(&1))
+                                .then(|| moved_from.get(&entry))
+                                .flatten()
+                                .and_then(|ids| match ids.as_slice() {
+                                    [one] => Some(*one),
+                                    _ => None,
+                                })
                         });
                     match candidate {
                         Some(candidate) => candidate,
@@ -3540,12 +3863,37 @@ mod tests {
     }
 
     fn configure_git(repo: &Path) {
-        git_ok(repo, ["config", "user.name", "Kin Test"]);
-        git_ok(repo, ["config", "user.email", "kin@example.invalid"]);
-        git_ok(repo, ["config", "commit.gpgsign", "false"]);
-        git_ok(repo, ["config", "tag.gpgsign", "false"]);
-        git_ok(repo, ["config", "core.autocrlf", "false"]);
-        git_ok(repo, ["config", "core.filemode", "true"]);
+        let mut batch = FixtureGitBatch::new();
+        configure_git_steps(&mut batch);
+        batch.run_in(repo);
+    }
+
+    /// `git add --all` then `git commit -m message`, as one fixture launch.
+    fn commit_all(repo: &Path, message: &str) {
+        FixtureGitBatch::new()
+            .git(["add", "--all"])
+            .git(["commit", "-m", message])
+            .run_in(repo);
+    }
+
+    fn configure_git_steps(batch: &mut FixtureGitBatch) {
+        batch
+            .git(["config", "user.name", "Kin Test"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "commit.gpgsign", "false"])
+            .git(["config", "tag.gpgsign", "false"])
+            .git(["config", "core.autocrlf", "false"])
+            .git(["config", "core.filemode", "true"]);
+    }
+
+    /// A batch's kept standard output, one trimmed line per kept step.
+    #[cfg(unix)]
+    fn batch_lines<const N: usize>(stdout: Vec<u8>) -> [String; N] {
+        let text = String::from_utf8(stdout).unwrap();
+        let lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+        lines
+            .try_into()
+            .unwrap_or_else(|lines: Vec<String>| panic!("expected {N} lines, got {lines:?}"))
     }
 
     fn write(repo: &Path, path: &str, body: &[u8]) {
@@ -3569,22 +3917,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    #[cfg(unix)]
-    fn git_text<I, S>(repo: &Path, args: I) -> String
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let output = git_output(repo, args);
-        assert!(
-            output.status.success(),
-            "git failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     #[cfg(unix)]

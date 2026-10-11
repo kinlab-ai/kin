@@ -168,6 +168,100 @@ fn ledger_the_callers(store: &Store) {
     );
 }
 
+#[tokio::test]
+async fn reference_query_certainty_keeps_call_evidence_inside_the_requested_scope() {
+    let store = store();
+    ledger_the_callers(&store);
+    ledger_the_focal(&store);
+    // The row's target and relation class are persisted facts; this test does
+    // not need source bytes to place a site inside the referencing entity.
+    let mut caller = store.caller.clone();
+    caller.span = None;
+    store.graph.upsert_entity(&caller).unwrap();
+    let mut reference = imports(&store.caller, &store.target);
+    reference.id = RelationId::from_content(
+        &store.caller.id.to_string(),
+        &store.target.id.to_string(),
+        "References",
+    );
+    reference.kind = RelationKind::References;
+    reference.origin = RelationOrigin::Lsp;
+    store.graph.upsert_relation(&reference).unwrap();
+    let mut calls = reference.clone();
+    calls.id = RelationId::from_content(
+        &store.caller.id.to_string(),
+        &store.target.id.to_string(),
+        "Calls",
+    );
+    calls.kind = RelationKind::Calls;
+    store.graph.upsert_relation(&calls).unwrap();
+
+    for kinds in [
+        Some(json!(["references"])),
+        Some(json!(["calls"])),
+        Some(json!(["calls", "references"])),
+        None,
+        Some(json!([])),
+    ] {
+        let mut args = args_for(&store.target);
+        if let Some(kinds) = kinds {
+            args.insert("relation_kinds".to_string(), kinds);
+        }
+        let value = finalized(
+            handle_find_references(&args, &store.graph, None)
+                .await
+                .unwrap(),
+            "find_references",
+        );
+        let kinds = value["relation_kinds"].as_array().unwrap();
+        let wants_calls = kinds.iter().any(|kind| kind == "calls");
+        assert_eq!(
+            value
+                .get(crate::caller_arrival::CALLER_ARRIVAL_KEY)
+                .is_some(),
+            wants_calls,
+            "{value}"
+        );
+        // A call census answers a question that asks for calls. One that asks
+        // for references alone carries the census's reading of non-call reads
+        // instead, which holds no call tally and settles nothing about calls.
+        let block = value.get(crate::call_sites::CALL_SITES_KEY);
+        if wants_calls {
+            assert!(
+                block.is_some_and(|block| block.get("settled").is_some()),
+                "{value}"
+            );
+        } else {
+            let block = block.expect("a non-call question carries the mention reading");
+            assert_eq!(
+                block["scope"],
+                json!(crate::call_sites::MENTION_SCOPE),
+                "{value}"
+            );
+            assert!(block.get("settled").is_none(), "{value}");
+            assert!(block.get("by_state").is_none(), "{value}");
+        }
+        let rows = value["references"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{value}");
+        let recorded_kinds: Vec<_> = kinds
+            .iter()
+            .filter(|kind| *kind == "calls" || *kind == "references")
+            .cloned()
+            .collect();
+        assert_eq!(rows[0]["relation_kinds"], json!(recorded_kinds), "{value}");
+        if !wants_calls || kinds.len() > 1 {
+            assert_eq!(value["_kin"]["verdict"]["state"], "inconclusive", "{value}");
+            assert!(
+                value["_kin"]["verdict"]["limiting_factor"]
+                    .as_str()
+                    .is_some_and(|factor| factor.contains("reference_completion_unmeasured")),
+                "{value}"
+            );
+        }
+        assert!(value["_kin"].get("self_check").is_none(), "{value}");
+    }
+}
+
 /// The focal's own ledger: `fetch` proven into the repository, `get` settled
 /// outside it, and `render` answered with nothing a resolver could place.
 fn ledger_the_focal(store: &Store) {
@@ -664,10 +758,19 @@ async fn find_references_keeps_owed_callers_without_selected_escape_evidence() {
     assert_eq!(arrival["owed_callers_cannot_name_focal"], 2, "{arrival}");
     let block = &value[crate::call_sites::CALL_SITES_KEY];
     assert_eq!(block["settled"], false, "{block}");
-    assert_eq!(block["callers"], 3, "{block}");
-    assert_eq!(block["callers_owed_enrichment"], 3, "{block}");
+    // The caller whose body could spell the name stays in the named scope as
+    // owed. The two whose previews never spell it could reach the focal only
+    // through a value, so their unknown sites are value-call residue, still
+    // unsettled and still disclosed.
+    assert_eq!(block["callers"], 1, "{block}");
+    assert_eq!(block["callers_owed_enrichment"], 1, "{block}");
+    assert_eq!(block["value_calls"]["callers_unread"], 2, "{block}");
     assert_eq!(block["focal_escape"]["escape"], "unknown", "{block}");
-    assert_eq!(clause_codes(block), ["call_sites_owed"], "{block}");
+    assert_eq!(
+        clause_codes(block),
+        ["call_sites_owed", "value_calls_unmeasured"],
+        "{block}"
+    );
     assert_eq!(
         value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
         "{value}"
@@ -693,9 +796,17 @@ async fn an_owed_module_that_imports_the_focal_under_another_name_still_counts()
         "find_references",
     );
     let block = &value[crate::call_sites::CALL_SITES_KEY];
-    assert_eq!(block["callers_owed_enrichment"], 3, "{block}");
+    // The module spells the focal's name in its import, so it stays owed in
+    // the named scope beside the focal's own file; the test that never spells
+    // it is value-call residue.
+    assert_eq!(block["callers_owed_enrichment"], 2, "{block}");
+    assert_eq!(block["value_calls"]["callers_unread"], 1, "{block}");
     assert_eq!(block["focal_escape"]["escape"], "unknown", "{block}");
-    assert_eq!(clause_codes(block), ["call_sites_owed"], "{block}");
+    assert_eq!(
+        clause_codes(block),
+        ["call_sites_owed", "value_calls_unmeasured"],
+        "{block}"
+    );
     assert_eq!(
         value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
         "{value}"
@@ -774,5 +885,277 @@ fn graph_status_carries_the_store_s_site_shares_and_its_owed_callers() {
     assert_eq!(
         value["_kin"]["verdict"]["inputs"]["call_sites"], "inconclusive",
         "{value}"
+    );
+}
+
+/// A Rust declaration nowhere near the Python change, whose one call a
+/// resolver answered without proving a target.
+const ELSEWHERE_FILE: &str = "docs/build.rs";
+const ELSEWHERE_BODY: &str = "fn build_docs() {\n    render_site();\n}\n";
+
+fn add_unresolved_elsewhere(store: &Store) -> Entity {
+    let elsewhere = spanned_entity(
+        "build_docs",
+        ELSEWHERE_FILE,
+        LanguageId::Rust,
+        0,
+        ELSEWHERE_BODY,
+    );
+    let context = proof_context(LanguageId::Rust, "1.0");
+    let context_id = id_of(&context);
+    admit(
+        &store.graph,
+        &[&elsewhere],
+        vec![
+            context,
+            ledger(
+                &elsewhere,
+                ELSEWHERE_BODY,
+                context_id,
+                vec![(
+                    "render_site",
+                    CallSiteState::Unresolved {
+                        reason: UnresolvedReason::NoAnswer,
+                    },
+                )],
+            ),
+        ],
+    );
+    elsewhere
+}
+
+/// An edge of `kind` from `src` to `dst`, as a linker records it.
+fn edge(kind: RelationKind, src: &Entity, dst: &Entity) -> Relation {
+    let mut relation = imports(src, dst);
+    relation.id = RelationId::from_content(
+        &src.id.to_string(),
+        &dst.id.to_string(),
+        &format!("{kind:?}"),
+    );
+    relation.kind = kind;
+    relation.origin = RelationOrigin::Lsp;
+    relation
+}
+
+fn impact_args(entity: &Entity) -> HashMap<String, Value> {
+    HashMap::from([
+        ("entity_ids".to_string(), json!([entity.id.to_string()])),
+        ("include_traffic".to_string(), json!(false)),
+    ])
+}
+
+async fn impact_of(store: &Store, entity: &Entity) -> Value {
+    let sessions = SessionRegistry::empty_for_test();
+    finalized(
+        super::review::handle_impact_analysis(&impact_args(entity), &store.graph, &sessions)
+            .await
+            .unwrap(),
+        "impact_analysis",
+    )
+}
+
+/// The status a store reports about its call sites.
+fn status_call_sites(store: &Store) -> Value {
+    use super::entities::{
+        handle_daemon_graph_status_observation, with_call_site_status, GraphStatusObservation,
+        GraphStatusReport, GraphStatusScope,
+    };
+    let status = handle_daemon_graph_status_observation(
+        GraphStatusScope::Head,
+        GraphStatusObservation {
+            details: None,
+            authority_epoch: 1,
+            entity_count: 6,
+            relation_count: 2,
+            embeddings_indexed: 0,
+            embeddings_pending: 0,
+            embeddings_total: 0,
+            embedding_index_keys: None,
+            durable_entity_count: None,
+            durable_relation_count: None,
+        },
+    )
+    .unwrap();
+    let result = with_call_site_status(status, &store.graph);
+    let report: GraphStatusReport =
+        serde_json::from_value(payload(&result)).expect("the report still reads as a report");
+    report
+        .call_sites
+        .expect("the store's sites ride the status")
+}
+
+fn codes(factor: &Value) -> Vec<String> {
+    factor
+        .as_str()
+        .unwrap_or_default()
+        .split("; ")
+        .filter(|code| !code.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A store that owes nothing reads that way on status and on impact: the
+/// only caller's one unsettled call was answered without a target, so impact
+/// names it `call_sites_unresolved`, never owed enrichment, and a ledgerless
+/// caller whose language no resolver serves on this host reads unproven for
+/// that reason, the way status reads it.
+#[tokio::test]
+async fn impact_names_answered_calls_by_their_code_while_status_owes_nothing() {
+    let _host = crate::edge_coverage::test_support::scoped_language_servers(&[LanguageId::Python]);
+    let store = store();
+    ledger_the_callers(&store);
+    ledger_the_focal(&store);
+    store
+        .graph
+        .upsert_relation(&edge(RelationKind::Calls, &store.focal, &store.target))
+        .unwrap();
+    // A Rust declaration with no ledger, on a host with no Rust server.
+    let unserved = spanned_entity(
+        "unserved",
+        "tools/gen.rs",
+        LanguageId::Rust,
+        0,
+        "fn unserved() {\n    emit();\n}\n",
+    );
+    store.graph.upsert_entity(&unserved).unwrap();
+
+    let status = status_call_sites(&store);
+    assert_eq!(status["callers_owed"], 0, "{status}");
+    assert_eq!(status["owed_file_count"], 0, "{status}");
+
+    let impact = impact_of(&store, &store.target).await;
+    let callers: Vec<&str> = impact["affected_callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect();
+    assert_eq!(callers, ["note_body"], "{impact}");
+    assert_eq!(impact["enrichment"]["status"], "bounded", "{impact}");
+    assert_eq!(impact["enrichment"]["owed_entities"], 0, "{impact}");
+    let dependents = &impact["sections"]["dependents"]["verdict"];
+    assert_eq!(dependents["state"], "inconclusive", "{dependents}");
+    assert_eq!(dependents["inputs"]["enrichment"], "inconclusive");
+    let found = codes(&dependents["limiting_factor"]);
+    assert!(
+        found.iter().any(|code| code == "call_sites_unresolved"),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|code| code == "call_sites_unproven_no_resolver"),
+        "{found:?}"
+    );
+    for owed in ["enrichment_incomplete", "call_sites_owed"] {
+        assert!(!found.iter().any(|code| code == owed), "{found:?}");
+        assert!(
+            !codes(&impact["_kin"]["verdict"]["limiting_factor"])
+                .iter()
+                .any(|code| code == owed),
+            "{impact}"
+        );
+    }
+    assert_eq!(
+        impact["_kin"]["verdict"]["sections"]["dependents"]["limiting_factor"],
+        dependents["limiting_factor"]
+    );
+}
+
+/// The direct section answers who calls the changed entity, and it reads
+/// that the way `find_references` with `relation_kinds: ["calls"]` reads it,
+/// so the two agree, certified where references certifies, while an
+/// unresolved call in unrelated code bounds only the dependents section.
+#[tokio::test]
+async fn impact_direct_section_grades_its_callers_as_references_to_calls_do() {
+    let _host = crate::edge_coverage::test_support::scoped_language_servers(&[LanguageId::Python]);
+    let store = store();
+    ledger_the_callers(&store);
+    let context = proof_context(LanguageId::Python, "1.1.400");
+    let context_id = id_of(&context);
+    admit(
+        &store.graph,
+        &[],
+        vec![
+            context,
+            ledger(
+                &store.focal,
+                FOCAL_BODY,
+                context_id,
+                vec![
+                    ("fetch", CallSiteState::ProvenOutside),
+                    ("get", CallSiteState::ProvenOutside),
+                    ("render", CallSiteState::ProvenOutside),
+                ],
+            ),
+        ],
+    );
+    // The test calls the target, linked by the call and reference edges a
+    // sweep records. As in the reference-scope test above, the row's target
+    // and relation class are persisted facts, so no source bytes are needed.
+    let mut caller = store.caller.clone();
+    caller.span = None;
+    store.graph.upsert_entity(&caller).unwrap();
+    for kind in [RelationKind::Calls, RelationKind::References] {
+        store
+            .graph
+            .upsert_relation(&edge(kind, &store.caller, &store.target))
+            .unwrap();
+    }
+    add_unresolved_elsewhere(&store);
+
+    let mut args = args_for(&store.target);
+    args.insert("relation_kinds".to_string(), json!(["calls"]));
+    let references = finalized(
+        handle_find_references(&args, &store.graph, None)
+            .await
+            .unwrap(),
+        "find_references",
+    );
+    let impact = impact_of(&store, &store.target).await;
+
+    let direct = &impact["_kin"]["verdict"];
+    assert_eq!(direct["scope"], "direct", "{direct}");
+    assert_eq!(
+        impact["sections"]["direct"]["verdict"]["state"], direct["state"],
+        "{impact}"
+    );
+    assert_eq!(
+        direct["state"], references["_kin"]["verdict"]["state"],
+        "the impact verdict {direct} against the references verdict {}",
+        references["_kin"]["verdict"]
+    );
+    assert_eq!(direct["state"], "certified", "{impact}");
+    assert_eq!(direct["inputs"]["call_sites"], "certified", "{direct}");
+    assert_eq!(
+        references["_kin"]["verdict"]["inputs"]["call_sites"],
+        "certified"
+    );
+    assert_eq!(
+        impact["sections"]["direct"]["rows"],
+        json!(["affected_callers", "affected_overrides"])
+    );
+
+    // The unrelated call bounds the wider reach, under its own code.
+    let dependents = &impact["sections"]["dependents"]["verdict"];
+    assert_eq!(dependents["state"], "inconclusive", "{dependents}");
+    assert_eq!(
+        codes(&dependents["limiting_factor"]),
+        ["call_sites_unresolved"],
+        "{dependents}"
+    );
+    assert_eq!(
+        direct["sections"],
+        json!({
+            "direct": {"state": "certified", "limiting_factor": null},
+            "dependents": {
+                "state": "inconclusive",
+                "limiting_factor": dependents["limiting_factor"],
+            },
+        })
+    );
+    assert!(
+        crate::verdict::disagreements(&impact).is_empty(),
+        "{impact}"
     );
 }

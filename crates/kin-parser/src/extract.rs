@@ -32,6 +32,29 @@ pub const FILE_PARSED_IMPORT_STATEMENTS_KEY: &str = "file_parsed_import_statemen
 /// reader treats it as unmeasured rather than as zero.
 pub const FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY: &str = "file_parsed_external_module_imports";
 
+/// How many definitions the adapter found nested in this entity's file and
+/// left without an entity of their own.
+///
+/// Written on every entity of a file whose adapter took a nested-definition
+/// census, zero included. Absent when the adapter took none, which a reader
+/// must treat as unmeasured and never as zero: an adapter that does not look
+/// for nested definitions has not found that there are none.
+pub const FILE_NESTED_DEFINITIONS_NOT_ADMITTED_KEY: &str = "file_nested_definitions_not_admitted";
+
+/// The definitions nested directly in this entity that the adapter did not
+/// admit, as a JSON array of `{"name", "kind", "start_line", "bases"?}`.
+///
+/// Written on the innermost admitted entity enclosing each one, because that
+/// entity is where their calls and references are still attributed, and it is
+/// capped at [`NESTED_DEFINITIONS_RECORD_CAP`] entries per entity. The file
+/// count under [`FILE_NESTED_DEFINITIONS_NOT_ADMITTED_KEY`] carries the total.
+pub const NESTED_DEFINITIONS_NOT_ADMITTED_KEY: &str = "nested_definitions_not_admitted";
+
+/// Most unadmitted definitions listed on one entity. A factory holding
+/// hundreds of closures would otherwise carry a list longer than the entity it
+/// describes; the file count still reports every one.
+pub const NESTED_DEFINITIONS_RECORD_CAP: usize = 32;
+
 /// The 0-based line of an entity's own declaration, recorded when its span
 /// starts above it on a doc comment or an attribute. The entity id keys on
 /// this line, so widening a span over an item's documentation never re-mints
@@ -128,6 +151,68 @@ impl ExtractedEntity {
             superseded_by: None,
         }
     }
+}
+
+/// Give every declaration in one unit an identity of its own, and return how
+/// many it had to separate.
+///
+/// [`ExtractedEntity::into_entity_with_source`] keys an identity on the unit,
+/// the name, the kind and the declaration line, so two declarations of one
+/// name and kind that begin on one line derive one identity. The graph holds
+/// entities by identity, so it kept one of the two while the parse that
+/// produced them held both, and every later reading of the unit found its
+/// declarations disagreeing with its own bytes. A unit's own module and a
+/// namespace named like it on the unit's first line are such a pair in any
+/// language whose adapter names the module after the unit.
+///
+/// Positional order decides who keeps the derived identity: the declaration
+/// that starts first, and among equal starts the widest, which is the one that
+/// encloses the others. That keeps a unit's own module on the identity it has
+/// always had. Each later one takes the identity derived with its occurrence
+/// among them, which is as stable as the derived identity itself. Nothing
+/// changes for a unit whose identities are already distinct.
+pub fn separate_shared_identities(entities: &mut [Entity], file_id: &FilePathId) -> usize {
+    let mut order: Vec<usize> = (0..entities.len()).collect();
+    order.sort_by_key(|&index| {
+        let span = entities[index].span.as_ref();
+        (
+            span.map_or(usize::MAX, |span| span.start_byte),
+            std::cmp::Reverse(span.map_or(0, |span| span.end_byte)),
+            index,
+        )
+    });
+    let mut taken = std::collections::HashSet::with_capacity(entities.len());
+    let mut separated = 0;
+    for index in order {
+        let entity = &mut entities[index];
+        if taken.insert(entity.id) {
+            continue;
+        }
+        let line = entity
+            .metadata
+            .extra
+            .get(DECLARATION_LINE_KEY)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| u32::try_from(line).ok())
+            .or_else(|| entity.span.as_ref().map(|span| span.start_line))
+            .unwrap_or(0);
+        let kind = format!("{:?}", entity.kind);
+        let mut occurrence = 1u32;
+        entity.id = loop {
+            let candidate = EntityId::from_content(
+                &file_id.0,
+                &entity.name,
+                &format!("{kind}#{occurrence}"),
+                line,
+            );
+            if taken.insert(candidate) {
+                break candidate;
+            }
+            occurrence += 1;
+        };
+        separated += 1;
+    }
+    separated
 }
 
 fn embedding_body_preview(source: &[u8], span: &SourceSpan) -> Option<String> {
@@ -241,6 +326,17 @@ pub enum RelationSyntacticRole {
     /// uniquely bound CommonJS import. The lexical receiver remains recorded;
     /// this licenses only an inferred external boundary, never a local target.
     JsImportedGetterReceiver,
+    /// A source unit's own module directly owns the declaration at this
+    /// site's span (see [`crate::module_contains`]). The module may share the
+    /// child's name or span, as a Python module's blocks, which introduce no
+    /// scope, and a TypeScript unit named after its declaration do; the linker
+    /// must select the module by its kind and the child by its exact span.
+    #[serde(alias = "python_module_contains")]
+    ModuleContains,
+    /// A class or function directly owns the declaration at this site's
+    /// span. Resolve both identities from the admitted lexical spans.
+    #[serde(alias = "python_lexical_contains")]
+    LexicalContains,
 }
 
 /// Specifier subset supported by the imported-getter receiver derivation.
@@ -595,6 +691,118 @@ pub fn attach_file_reference_parse_counts(
     }
 }
 
+/// Record, on the file's entities, the nested definitions the adapter found
+/// and did not admit.
+///
+/// The count goes on every entity, so any one entity a reader holds can say
+/// whether its file carries definitions the graph cannot see. Each definition
+/// is listed on the innermost admitted entity enclosing it, because that is
+/// where its calls and references are still attributed, and an answer about
+/// that entity is the one the omission can mislead. `None` removes both keys:
+/// an adapter that took no census has measured nothing, and a zero written
+/// there would claim a file free of nested definitions nobody looked for.
+pub fn attach_file_nested_definition_record(
+    entities: &mut [Entity],
+    census: Option<&crate::nested::NestedDefinitionCensus>,
+) {
+    let Some(census) = census else {
+        for entity in entities.iter_mut() {
+            entity
+                .metadata
+                .extra
+                .remove(FILE_NESTED_DEFINITIONS_NOT_ADMITTED_KEY);
+            entity
+                .metadata
+                .extra
+                .remove(NESTED_DEFINITIONS_NOT_ADMITTED_KEY);
+        }
+        return;
+    };
+
+    // Resolve each record to one entity by name. Names within a file are
+    // meant to be unique, but a language can still declare one name twice, so
+    // the entity whose span holds the definition wins, the tightest first,
+    // and the first entity of that name answers when none holds it.
+    let mut listed: std::collections::HashMap<usize, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for definition in &census.not_admitted {
+        let Some(enclosing) = definition.enclosing.as_deref() else {
+            continue;
+        };
+        let holds_line = |entity: &Entity| {
+            entity.span.as_ref().is_some_and(|span| {
+                span.start_line <= definition.start_line && definition.start_line <= span.end_line
+            })
+        };
+        let span_width = |entity: &Entity| {
+            entity.span.as_ref().map_or(usize::MAX, |span| {
+                span.end_byte.saturating_sub(span.start_byte)
+            })
+        };
+        let owner = entities
+            .iter()
+            .enumerate()
+            .filter(|(_, entity)| entity.name == enclosing && holds_line(entity))
+            .min_by_key(|(_, entity)| span_width(entity))
+            .or_else(|| {
+                entities
+                    .iter()
+                    .enumerate()
+                    .find(|(_, entity)| entity.name == enclosing)
+            })
+            .map(|(index, _)| index);
+        let Some(owner) = owner else {
+            continue;
+        };
+        let rows = listed.entry(owner).or_default();
+        if rows.len() >= NESTED_DEFINITIONS_RECORD_CAP {
+            continue;
+        }
+        let mut row = serde_json::Map::new();
+        row.insert(
+            "name".into(),
+            serde_json::Value::from(definition.name.clone()),
+        );
+        row.insert(
+            "kind".into(),
+            serde_json::to_value(definition.kind).unwrap_or(serde_json::Value::Null),
+        );
+        row.insert(
+            "start_line".into(),
+            serde_json::Value::from(definition.start_line),
+        );
+        if !definition.bases.is_empty() {
+            row.insert(
+                "bases".into(),
+                serde_json::Value::from(definition.bases.clone()),
+            );
+        }
+        rows.push(serde_json::Value::Object(row));
+    }
+
+    let total = census.not_admitted.len() as u64;
+    for (index, entity) in entities.iter_mut().enumerate() {
+        entity.metadata.extra.insert(
+            FILE_NESTED_DEFINITIONS_NOT_ADMITTED_KEY.into(),
+            serde_json::Value::from(total),
+        );
+        match listed.remove(&index) {
+            Some(rows) => {
+                entity.metadata.extra.insert(
+                    NESTED_DEFINITIONS_NOT_ADMITTED_KEY.into(),
+                    serde_json::Value::Array(rows),
+                );
+            }
+            None => {
+                entity
+                    .metadata
+                    .extra
+                    .remove(NESTED_DEFINITIONS_NOT_ADMITTED_KEY);
+            }
+        }
+    }
+}
+
 /// Whether a module specifier's own syntax says the module is outside the
 /// repository, with no resolver run.
 ///
@@ -833,6 +1041,13 @@ pub struct ParseOutput {
     /// relations it emitted are the count then, which is the same number
     /// whenever every call site became one.
     pub parsed_call_sites: Option<u64>,
+    /// The definitions this adapter found nested inside function bodies and
+    /// did not admit as entities.
+    ///
+    /// `None` from an adapter that took no such census, which says nothing
+    /// about whether the file holds nested definitions. See
+    /// [`crate::nested`] for the naming rule the admitted ones follow.
+    pub nested_definitions: Option<crate::nested::NestedDefinitionCensus>,
 }
 
 #[cfg(test)]
@@ -1041,5 +1256,53 @@ mod tests {
             !extra.contains_key(FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY),
             "an absent count is unmeasured, and must not be read as zero"
         );
+    }
+
+    /// Two declarations of one name and kind that begin on one line derive one
+    /// identity, and the graph holds entities by identity. The one that starts
+    /// first and encloses the other keeps the derived identity; the other
+    /// takes the identity of its occurrence. A unit with distinct identities is
+    /// left exactly as it was.
+    #[test]
+    fn declarations_sharing_a_derived_identity_are_separated() {
+        let file = FilePathId::new("src/utils.ts");
+        let span = |start: usize, end: usize| SourceSpan {
+            file: file.clone(),
+            start_byte: start,
+            end_byte: end,
+            start_line: 1,
+            start_col: start as u32,
+            end_line: 1,
+            end_col: end as u32,
+        };
+        let declared = |start: usize, end: usize| {
+            let mut entity = test_entity("src/utils.ts");
+            entity.kind = EntityKind::Module;
+            entity.name = "utils".into();
+            entity.span = Some(span(start, end));
+            entity.id = EntityId::from_content(&file.0, "utils", "Module", 1);
+            entity
+        };
+        // The namespace comes first in the list and the unit's module last,
+        // which is the order an adapter pushes them in.
+        let mut entities = vec![declared(7, 30), declared(0, 31)];
+        let derived = entities[1].id;
+        assert_eq!(separate_shared_identities(&mut entities, &file), 1);
+        assert_eq!(
+            entities[1].id, derived,
+            "the enclosing unit module keeps the identity it has always had"
+        );
+        assert_ne!(entities[0].id, entities[1].id);
+        assert_eq!(
+            entities[0].id,
+            EntityId::from_content(&file.0, "utils", "Module#1", 1),
+            "the separated identity is derived, so it is the same on every parse"
+        );
+
+        let mut distinct = vec![declared(0, 31)];
+        distinct[0].id = EntityId::from_content(&file.0, "other", "Module", 1);
+        let before = distinct[0].id;
+        assert_eq!(separate_shared_identities(&mut distinct, &file), 0);
+        assert_eq!(distinct[0].id, before);
     }
 }

@@ -48,6 +48,7 @@ fn run_agent_setup(home: &Path, cwd: &Path) -> Output {
         .args([
             "setup",
             "--no-interactive",
+            "--verbose",
             "--intent",
             "agent",
             "--skip-mcp-check",

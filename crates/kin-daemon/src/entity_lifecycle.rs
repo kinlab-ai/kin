@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Source-bound function lifecycle planning, before native publication.
+//! Source-bound declaration lifecycle planning, before native publication.
 //! All locations come from exact graph/CAS authority; payloads name entities.
+//!
+//! A top-level leaf function is created beside another and removed in every
+//! language whose adapter implements
+//! [`kin_parser::declaration_lifecycle::DeclarationLifecycle`]. In every
+//! language whose adapter implements
+//! [`kin_parser::member_placement::MemberPlacement`], a method is also
+//! created beside a sibling method or as the last member of a class named as
+//! its container, a method is removed, and a class or a function is created
+//! after a top-level class or function. None of those reads or resends the
+//! class: the anchor's source base binds the write, and the new declaration
+//! takes its indentation from where it goes (see
+//! [`kin_mcp::member_placement`]). This planner names no language.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -13,6 +25,12 @@ use kin_model::{
     Entity, EntityKind, EntityStore, FileLayout, FilePathId, Hash256, LanguageId, LocatedEntry,
     ParseState, RepoPath, TransactionDelta, TreeDelta, TreeEntry,
 };
+
+use kin_parser::declaration_lifecycle::{
+    declaration_lifecycle_for, first_nested_declaration, lifecycle_languages,
+    prove_top_level_function, DeclarationLifecycle,
+};
+use kin_parser::member_placement::{member_placement_for, member_placement_languages};
 
 use crate::local_repository_authority::LocalRepositoryAuthorityContext;
 use crate::repository_commit::{load_native_source_blob, NativeCommitBase};
@@ -29,32 +47,47 @@ pub(crate) struct LifecyclePlan {
 pub(crate) fn is_lifecycle(operation: &McpMutationOperation) -> bool {
     match operation.payload.as_ref() {
         Some(McpMutationPayload::EntityCreate(create)) => create.anchor().is_some(),
-        Some(McpMutationPayload::EntityRemove(_)) => true,
+        // An entity Kin holds without parsing it is removed by its own
+        // planner ([`crate::artifact_commit`]).
+        Some(McpMutationPayload::EntityRemove(remove)) => {
+            !kin_mcp::artifact_entity::is_unparsed_base(&remove.source_base)
+        }
         _ => false,
     }
 }
 
-fn supported(language: LanguageId) -> Result<&'static str, String> {
-    match language {
-        LanguageId::Rust => Ok("rs"),
-        LanguageId::Python => Ok("py"),
-        LanguageId::Go => Ok("go"),
-        _ => Err(
-            "entity lifecycle currently supports top-level leaf functions in Rust, Python and Go"
-                .into(),
-        ),
-    }
+/// The lifecycle hook of `language`'s adapter, or the refusal that names the
+/// languages that have one.
+fn lifecycle_for(language: LanguageId) -> Result<&'static dyn DeclarationLifecycle, String> {
+    declaration_lifecycle_for(language).ok_or_else(|| {
+        format!(
+            "entity lifecycle currently supports top-level leaf functions in {}",
+            lifecycle_languages("and")
+        )
+    })
+}
+
+/// A top-level leaf function proven in a unit's exact bytes.
+struct Proven {
+    /// Its entity span.
+    span: Range<usize>,
+    /// What goes with it: its whole statement and the doc comment its
+    /// language reads as its own.
+    extent: Range<usize>,
+    /// What a new unit beside this one must open with.
+    prelude: Option<String>,
 }
 
 /// Prove the exact declaration is top-level syntax, not merely an entity whose
-/// name happens to match. Parser-widened docs/attributes must be inside its span.
+/// name happens to match. Parser-widened docs/attributes must be inside its
+/// span, and any other declaration prefix inside its statement.
 fn function_span(
     source: &[u8],
     file: &FilePathId,
     language: LanguageId,
     name: &str,
-) -> Result<(Range<usize>, Option<String>), String> {
-    supported(language)?;
+) -> Result<Proven, String> {
+    let lifecycle = lifecycle_for(language)?;
     let registry = kin_parser::AdapterRegistry::new();
     let adapter = registry
         .get_by_language(language)
@@ -81,69 +114,16 @@ fn function_span(
     }
     let entity = matches[0];
     let span = entity.span.start_byte..entity.span.end_byte;
-    let mut cursor = tree.root_node().walk();
-    let top = tree
-        .root_node()
-        .named_children(&mut cursor)
-        .find_map(|node| {
-            let declaration = match (language, node.kind()) {
-                (LanguageId::Rust, "function_item")
-                | (LanguageId::Python, "function_definition")
-                | (LanguageId::Go, "function_declaration") => Some(node),
-                (LanguageId::Python, "decorated_definition") => node
-                    .child_by_field_name("definition")
-                    .filter(|child| child.kind() == "function_definition"),
-                _ => None,
-            };
-            declaration.filter(|declaration| {
-                node.start_byte() >= span.start
-                    && declaration.end_byte() == span.end
-                    && declaration.start_byte() >= span.start
-                    && declaration
-                        .child_by_field_name("name")
-                        .is_some_and(|name_node| name_node.utf8_text(source).ok() == Some(name))
-            })
-        });
-    if top.is_none() || span.start >= span.end || span.end > source.len() {
-        return Err("entity lifecycle requires a proven top-level function including its declaration prefix".into());
-    }
+    let proven = (span.start < span.end && span.end <= source.len())
+        .then(|| prove_top_level_function(lifecycle, &tree, source, &span, name))
+        .flatten()
+        .ok_or("entity lifecycle requires a proven top-level function including its declaration prefix")?;
     // Some adapters intentionally do not extract declarations nested inside
     // function bodies. Prove the leaf property from the actual syntax too.
-    let declaration = top.expect("proved top-level declaration");
-    let mut pending = Vec::new();
-    let mut cursor = declaration.walk();
-    pending.extend(declaration.named_children(&mut cursor));
-    while let Some(node) = pending.pop() {
-        let nested = match language {
-            LanguageId::Rust => matches!(
-                node.kind(),
-                "function_item"
-                    | "struct_item"
-                    | "enum_item"
-                    | "trait_item"
-                    | "impl_item"
-                    | "mod_item"
-                    | "type_item"
-                    | "const_item"
-                    | "static_item"
-                    | "macro_definition"
-                    | "use_declaration"
-                    | "extern_crate_declaration"
-            ),
-            LanguageId::Python => matches!(node.kind(), "function_definition" | "class_definition"),
-            LanguageId::Go => matches!(
-                node.kind(),
-                "function_declaration" | "method_declaration" | "type_declaration"
-            ),
-            _ => unreachable!(),
-        };
-        if nested {
-            return Err(
-                "entity lifecycle does not yet support functions owning nested declarations".into(),
-            );
-        }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
+    if first_nested_declaration(lifecycle, proven.declaration).is_some() {
+        return Err(
+            "entity lifecycle does not yet support functions owning nested declarations".into(),
+        );
     }
     if parsed.entities.iter().any(|other| {
         !(std::ptr::eq(other, entity)
@@ -158,51 +138,40 @@ fn function_span(
             "entity lifecycle does not yet support functions owning nested declarations".into(),
         );
     }
-    let package = if language == LanguageId::Go {
-        let mut cursor = tree.root_node().walk();
-        let packages = tree
-            .root_node()
-            .named_children(&mut cursor)
-            .filter(|node| node.kind() == "package_clause")
-            .map(|node| std::str::from_utf8(&source[node.byte_range()]).map(str::to_owned))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        if packages.len() != 1 {
-            return Err("Go lifecycle requires one exact package owner".into());
-        }
-        packages.into_iter().next()
-    } else {
-        None
-    };
-    Ok((span, package))
+    let prelude = lifecycle.unit_prelude(&tree, source)?;
+    Ok(Proven {
+        span,
+        extent: proven.extent,
+        prelude,
+    })
 }
 
 fn declaration_body(
     create: &EntityCreate,
     anchor: &Entity,
-    package: Option<&str>,
+    prelude: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     create.validate()?;
-    let prefix = package
-        .map(|package| format!("{package}\n\n"))
+    let prefix = prelude
+        .map(|prelude| format!("{prelude}\n\n"))
         .unwrap_or_default();
     let candidate = format!("{prefix}{}", create.body);
     let file = anchor
         .file_origin
         .as_ref()
         .ok_or("anchor has no source owner")?;
-    let (span, _) = function_span(candidate.as_bytes(), file, anchor.language, &create.name)?;
-    if span.start < prefix.len()
-        || !candidate.as_bytes()[prefix.len()..span.start]
+    let proven = function_span(candidate.as_bytes(), file, anchor.language, &create.name)?;
+    if proven.extent.start < prefix.len()
+        || !candidate.as_bytes()[prefix.len()..proven.extent.start]
             .iter()
             .all(u8::is_ascii_whitespace)
-        || !candidate.as_bytes()[span.end..]
+        || !candidate.as_bytes()[proven.extent.end..]
             .iter()
             .all(u8::is_ascii_whitespace)
     {
         return Err("EntityCreate body must contain exactly the named function, not package/import statements or sibling declarations".into());
     }
-    Ok(candidate.as_bytes()[span].to_vec())
+    Ok(candidate.as_bytes()[proven.span].to_vec())
 }
 
 fn new_unit_path(anchor: &Entity, name: &str) -> Result<RepoPath, String> {
@@ -213,49 +182,284 @@ fn new_unit_path(anchor: &Entity, name: &str) -> Result<RepoPath, String> {
     kin_mcp::entity_lifecycle::generated_source_path(origin, anchor.language, name)
 }
 
-/// This increment does not synthesize compiler build ownership. Refuse Go
-/// owners whose filename or leading directives may restrict membership rather
-/// than accidentally promote a test/platform function into an ordinary unit.
-fn require_new_unit_owner(anchor: &Entity, source: &[u8]) -> Result<(), String> {
-    if anchor.language == LanguageId::Rust {
-        return Err("Rust new source units require a module-owner declaration; use sibling_after until module-owner creation is supported".into());
-    }
-    if anchor.language != LanguageId::Go {
-        return Ok(());
-    }
+/// Refuse a new unit beside the anchor's when its language cannot place one
+/// there (see [`DeclarationLifecycle::check_new_unit_owner`]).
+fn require_new_unit_owner(
+    lifecycle: &dyn DeclarationLifecycle,
+    anchor: &Entity,
+    source: &[u8],
+) -> Result<(), String> {
     let origin = anchor.file_origin.as_ref().ok_or("anchor has no owner")?;
-    let filename = std::path::Path::new(&origin.0)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("anchor owner is not UTF8")?;
-    if filename.contains('_') || filename.starts_with('.') {
-        return Err("Go new source units currently require a plain owner filename without underscores or a leading dot; test/platform build-owner placement is not yet supported; use sibling_after".into());
-    }
-    let registry = kin_parser::AdapterRegistry::new();
-    let adapter = registry
-        .get_by_language(LanguageId::Go)
-        .ok_or("missing Go parser")?;
-    let tree = adapter.parse(source).map_err(|e| e.to_string())?;
-    let mut cursor = tree.root_node().walk();
-    let package = tree
-        .root_node()
-        .named_children(&mut cursor)
-        .find(|n| n.kind() == "package_clause")
-        .ok_or("missing Go package owner")?;
-    let header = std::str::from_utf8(&source[..package.start_byte()]).map_err(|e| e.to_string())?;
-    if header.lines().any(|line| {
-        let line = line.trim_start();
-        line.starts_with("//go:build") || line.starts_with("// +build")
-    }) {
-        return Err("Go new source units with build directives require build-owner placement, which is not yet supported; use sibling_after".into());
-    }
-    Ok(())
+    lifecycle.check_new_unit_owner(&origin.0, source)
 }
 
+/// What one lifecycle operation must leave in its source unit, checked
+/// against the reconciled graph before anything is published.
 struct Expected {
     file: FilePathId,
-    created: Option<(String, Vec<u8>)>,
+    /// The declaration created: its name as the graph names it, its kind,
+    /// and its exact bytes.
+    created: Option<(String, EntityKind, Vec<u8>)>,
     removed: Option<kin_model::EntityId>,
+    /// The removed declaration's old bytes. A declaration nested in them
+    /// goes with it.
+    removed_span: Option<Range<usize>>,
+    /// Declarations that hold the place written, a class around a new
+    /// method: they keep their identity, and their bytes change.
+    enclosing: BTreeSet<kin_model::EntityId>,
+    /// Whether the created declaration may own declarations nested in it.
+    nested: bool,
+}
+
+/// One planned write to a source unit.
+struct Planned {
+    projected: Vec<u8>,
+    created: Option<(String, EntityKind, Vec<u8>)>,
+    removed: Option<kin_model::EntityId>,
+    removed_span: Option<Range<usize>>,
+    enclosing: BTreeSet<kin_model::EntityId>,
+}
+
+/// The entities of `file` whose bytes hold `inner` and are not it: the
+/// class around a method, and whatever that class is declared in.
+fn enclosing_declarations(
+    before: &kin_db::GraphSnapshot,
+    file: &FilePathId,
+    inner: &Range<usize>,
+    inner_id: Option<kin_model::EntityId>,
+) -> BTreeSet<kin_model::EntityId> {
+    before
+        .entities
+        .values()
+        .filter(|entity| {
+            entity.file_origin.as_ref() == Some(file)
+                && !kin_model::is_file_module_surface(entity)
+                && Some(entity.id) != inner_id
+                && entity.span.as_ref().is_some_and(|span| {
+                    span.start_byte <= inner.start
+                        && inner.end <= span.end_byte
+                        && (span.start_byte..span.end_byte) != *inner
+                })
+        })
+        .map(|entity| entity.id)
+        .collect()
+}
+
+/// Whether an operation takes the member and type path: its anchor is a
+/// method or a type, or it creates one, in a language whose adapter places
+/// members.
+fn is_member_declaration(anchor: &Entity, create: Option<&EntityCreate>) -> bool {
+    use kin_mcp::source_unit::DeclarationKind;
+    member_placement_for(anchor.language).is_some()
+        && (matches!(anchor.kind, EntityKind::Method | EntityKind::Class)
+            || create.is_some_and(|create| {
+                matches!(
+                    create.kind,
+                    DeclarationKind::Method | DeclarationKind::Class
+                )
+            }))
+}
+
+/// Plan a method or type operation against the unit's exact bytes. The
+/// anchor is proven to be one whole declaration at its recorded span; the
+/// new declaration is written at the indentation of the place it goes.
+fn plan_member_declaration(
+    before: &kin_db::GraphSnapshot,
+    anchor: &Entity,
+    file: &FilePathId,
+    original: &[u8],
+    create: Option<(&EntityCreate, EntityPlacement)>,
+) -> Result<Planned, String> {
+    use kin_mcp::member_placement::{self as placement, Shape};
+    use kin_mcp::source_unit::DeclarationKind;
+    let language = anchor.language;
+    let display = language.profile().display_name;
+    let hook = member_placement_for(language).ok_or("the anchor's language places no member")?;
+    let held = anchor
+        .span
+        .as_ref()
+        .ok_or("lifecycle anchor has no source span")?;
+    let anchor_span = held.start_byte..held.end_byte;
+    let site = hook
+        .locate(original, anchor_span.clone())
+        .map_err(|error| format!("lifecycle anchor: {error}"))?;
+    let anchored_as_recorded = match anchor.kind {
+        EntityKind::Method => site.shape == Shape::Function && site.member,
+        EntityKind::Class => site.shape == Shape::Class && (site.top_level || site.member),
+        EntityKind::Function => site.shape == Shape::Function && site.top_level,
+        _ => false,
+    };
+    if !anchored_as_recorded {
+        return Err(format!(
+            "entity lifecycle in {display} anchors on a method, a class, or a top-level function"
+        ));
+    }
+    let occupied = |name: &str| {
+        before.entities.values().any(|entity| {
+            entity.file_origin.as_ref() == Some(file)
+                && entity.name == name
+                && !kin_model::is_file_module_surface(entity)
+        })
+    };
+    let Some((create, how)) = create else {
+        // Removal: a method, with whatever is declared inside it.
+        if anchor.kind != EntityKind::Method {
+            return Err(
+                "entity lifecycle removes a method or a top-level leaf function; remove a class \
+                 by patching the declarations around it"
+                    .into(),
+            );
+        }
+        // A class header with nothing under it may still parse, so the
+        // tree is asked whether the method is all its class must hold.
+        if site.only_statement {
+            return Err(
+                "removing this method would leave its class without a body; patch the class \
+                 instead, so it keeps a statement"
+                    .into(),
+            );
+        }
+        let cut = placement::member_removal(original, &site);
+        let projected = kin_projection::apply_splices(
+            original,
+            vec![kin_projection::Splice {
+                byte_range: cut,
+                new_content: Vec::new(),
+            }],
+        )
+        .map_err(|error| error.to_string())?;
+        if !hook.parses(&projected) {
+            return Err(
+                "removing this method would leave its source unit unable to parse; patch the \
+                 class instead"
+                    .into(),
+            );
+        }
+        return Ok(Planned {
+            projected,
+            created: None,
+            removed: Some(anchor.id),
+            removed_span: Some(site.extent.clone()),
+            enclosing: enclosing_declarations(before, file, &anchor_span, Some(anchor.id)),
+        });
+    };
+    create.validate()?;
+    // The owner and its member are joined the way the graph names them.
+    let separator = kin_parser::name_syntax::name_syntax_for(language)
+        .unwrap_or(kin_parser::name_syntax::NameSyntax::UNSTATED)
+        .member_separator;
+    let (kind, insertion, enclosing, name) = match (create.kind, how, anchor.kind) {
+        // A method beside a method of the same type.
+        (DeclarationKind::Method, EntityPlacement::SiblingAfter, EntityKind::Method) => {
+            let owner = anchor
+                .name
+                .rsplit_once(separator)
+                .map(|(owner, _)| owner)
+                .ok_or("the anchor method names no class")?;
+            (
+                EntityKind::Method,
+                placement::sibling_after(
+                    language,
+                    hook,
+                    &site,
+                    &create.body,
+                    &create.name,
+                    Shape::Function,
+                )?,
+                enclosing_declarations(before, file, &anchor_span, Some(anchor.id)),
+                format!("{owner}{separator}{}", create.name),
+            )
+        }
+        // A method as the last member of the type named as its container.
+        (DeclarationKind::Method, EntityPlacement::Member, EntityKind::Class) => {
+            let mut enclosing = enclosing_declarations(before, file, &anchor_span, Some(anchor.id));
+            enclosing.insert(anchor.id);
+            (
+                EntityKind::Method,
+                placement::last_member(
+                    language,
+                    hook,
+                    &site,
+                    &create.body,
+                    &create.name,
+                    Shape::Function,
+                )?,
+                enclosing,
+                format!("{}{separator}{}", anchor.name, create.name),
+            )
+        }
+        // A type or a function after a top-level type or function.
+        (
+            DeclarationKind::Class | DeclarationKind::Function,
+            EntityPlacement::SiblingAfter,
+            EntityKind::Class | EntityKind::Function,
+        ) if site.top_level => {
+            let (shape, kind) = match create.kind {
+                DeclarationKind::Class => (Shape::Class, EntityKind::Class),
+                _ => (Shape::Function, EntityKind::Function),
+            };
+            (
+                kind,
+                placement::sibling_after(language, hook, &site, &create.body, &create.name, shape)?,
+                BTreeSet::new(),
+                create.name.clone(),
+            )
+        }
+        (DeclarationKind::Method, EntityPlacement::Member, _) => {
+            return Err(
+                "placement member needs a class as its anchor: send the class's source_base, \
+                 or a sibling method's with placement sibling_after"
+                    .into(),
+            );
+        }
+        (DeclarationKind::Method, EntityPlacement::SiblingAfter, _) => {
+            return Err(
+                "a method is created beside a method of its class, with that method's \
+                 source_base and placement sibling_after, or with the class's source_base and \
+                 placement member"
+                    .into(),
+            );
+        }
+        (_, EntityPlacement::NewSourceUnit, _) => {
+            return Err(
+                "placement new_source_unit creates one top-level function; create a class or \
+                 a method with sibling_after or member"
+                    .into(),
+            );
+        }
+        _ => {
+            return Err(format!(
+                "{display} creates a method beside a method (sibling_after) or in a class \
+                 (member), and a class or a function after a top-level class or function \
+                 (sibling_after)"
+            ));
+        }
+    };
+    if occupied(&name) {
+        return Err(format!(
+            "{name} already exists in the anchor's source unit; patch it instead of creating it"
+        ));
+    }
+    let projected = kin_projection::apply_splices(
+        original,
+        vec![kin_projection::Splice {
+            byte_range: insertion.at..insertion.at,
+            new_content: insertion.text.clone().into_bytes(),
+        }],
+    )
+    .map_err(|error| error.to_string())?;
+    if !hook.parses(&projected) {
+        return Err(format!(
+            "the created declaration does not leave valid {display} where it goes"
+        ));
+    }
+    Ok(Planned {
+        projected,
+        created: Some((name, kind, insertion.declaration.into_bytes())),
+        removed: None,
+        removed_span: None,
+        enclosing,
+    })
 }
 
 /// Keep cached admitted bodies. Missing bodies are recovered only from exact
@@ -361,9 +565,14 @@ pub(crate) fn prepare(
             .get_entity(&source_base.entity_id)
             .map_err(|error| error.to_string())?
             .ok_or("lifecycle anchor no longer exists")?;
-        kin_model::require_independent_source(&anchor)?;
-        if anchor.kind != EntityKind::Function {
-            return Err("entity lifecycle requires a top-level leaf function".into());
+        kin_model::require_targeted_source(&anchor)?;
+        let member_declaration = is_member_declaration(&anchor, create.map(|(create, _)| create));
+        if anchor.kind != EntityKind::Function && !member_declaration {
+            return Err(format!(
+                "entity lifecycle requires a top-level leaf function, or in {} a method or a \
+                 class",
+                member_placement_languages("or")
+            ));
         }
         let file = anchor
             .file_origin
@@ -378,30 +587,65 @@ pub(crate) fn prepare(
             return Err("lifecycle source is not a regular blob".into());
         };
         let original = load_native_source_blob(context, hash).map_err(|error| error.to_string())?;
-        let (span, package) = function_span(&original, file, anchor.language, &anchor.name)?;
-        let held = anchor
-            .span
-            .as_ref()
-            .ok_or("lifecycle anchor has no source span")?;
-        if span != (held.start_byte..held.end_byte) {
-            return Err("lifecycle anchor span differs from its exact parsed declaration".into());
-        }
-        let (target, projected, created, removed) = if let Some((create, placement)) = create {
-            let declaration = declaration_body(create, &anchor, package.as_deref())?;
-            if anchor.language == LanguageId::Go
+        let mut removed_span = None;
+        let mut enclosing = BTreeSet::new();
+        let mut nested = false;
+        let (target, projected, created, removed) = if member_declaration {
+            let planned = plan_member_declaration(&before, &anchor, file, &original, create)?;
+            removed_span = planned.removed_span;
+            enclosing = planned.enclosing;
+            nested = true;
+            (
+                path.clone(),
+                planned.projected,
+                planned.created,
+                planned.removed,
+            )
+        } else if let Some((create, placement)) = create {
+            // The declaration as it is written: at the margin, whichever way
+            // the caller indented it, and without the blank lines around it.
+            let placed = EntityCreate {
+                body: kin_parser::code_placement::at_margin(&create.body),
+                ..create.clone()
+            };
+            let create = &placed;
+            let lifecycle = lifecycle_for(anchor.language)?;
+            let proven = function_span(&original, file, anchor.language, &anchor.name)?;
+            let span = proven.span.clone();
+            let held = anchor
+                .span
+                .as_ref()
+                .ok_or("lifecycle anchor has no source span")?;
+            if span != (held.start_byte..held.end_byte) {
+                return Err(
+                    "lifecycle anchor span differs from its exact parsed declaration".into(),
+                );
+            }
+            // Said by its line in what was sent, before its shape is asked
+            // about.
+            kin_mcp::syntax_gate::refuse_unparseable_code(
+                anchor.language,
+                &create.body,
+                &format!("the code sent for {}", create.name),
+            )?;
+            let declaration = declaration_body(create, &anchor, proven.prelude.as_deref())?;
+            if lifecycle.package_scoped_names()
                 && !created_package_names.insert((
                     std::path::Path::new(&file.0).parent().map(|p| p.to_owned()),
                     create.name.clone(),
                 ))
             {
-                return Err("two creations name the same Go package member".into());
+                return Err(format!(
+                    "two creations name the same {} package member",
+                    anchor.language.profile().display_name
+                ));
             }
 
             if before.entities.values().any(|entity| {
                 entity.name == create.name
                     && (entity.file_origin.as_ref() == Some(file)
-                        || (anchor.language == LanguageId::Go
-                            && entity.language == LanguageId::Go
+                        || (lifecycle.package_scoped_names()
+                            && entity.language == anchor.language
                             && entity.file_origin.as_ref().is_some_and(|origin| {
                                 std::path::Path::new(&origin.0).parent()
                                     == std::path::Path::new(&file.0).parent()
@@ -413,13 +657,20 @@ pub(crate) fn prepare(
             }
             match placement {
                 EntityPlacement::SiblingAfter => {
-                    let mut insertion = b"\n\n".to_vec();
+                    // As far from its neighbours as they stand from one
+                    // another; with none to read, as far as the language
+                    // sets top-level declarations apart.
+                    let (at, before) = kin_parser::code_placement::after_sibling(
+                        &original,
+                        proven.extent.clone(),
+                        lifecycle.sibling_separation(),
+                    );
+                    let mut insertion = before.into_bytes();
                     insertion.extend_from_slice(create.body.as_bytes());
-                    insertion.push(b'\n');
                     let projected = kin_projection::apply_splices(
                         &original,
                         vec![kin_projection::Splice {
-                            byte_range: span.end..span.end,
+                            byte_range: at..at,
                             new_content: insertion,
                         }],
                     )
@@ -427,12 +678,19 @@ pub(crate) fn prepare(
                     (
                         path.clone(),
                         projected,
-                        Some((create.name.clone(), declaration)),
+                        Some((create.name.clone(), EntityKind::Function, declaration)),
                         None,
                     )
                 }
+                EntityPlacement::Member => {
+                    return Err(
+                        "placement member puts a method in a class; create a function with \
+                         sibling_after or new_source_unit"
+                            .into(),
+                    );
+                }
                 EntityPlacement::NewSourceUnit => {
-                    require_new_unit_owner(&anchor, &original)?;
+                    require_new_unit_owner(lifecycle, &anchor, &original)?;
                     let target = new_unit_path(&anchor, &create.name)?;
                     if prospective
                         .resolved_tree()
@@ -441,28 +699,69 @@ pub(crate) fn prepare(
                     {
                         return Err("the generated source unit is already occupied; no existing artifact was overwritten".into());
                     }
-                    let prefix = package
-                        .map(|package| format!("{package}\n\n"))
+                    let prefix = proven
+                        .prelude
+                        .as_ref()
+                        .map(|prelude| format!("{prelude}\n\n"))
                         .unwrap_or_default();
                     (
                         target,
                         format!("{prefix}{}\n", create.body).into_bytes(),
-                        Some((create.name.clone(), declaration)),
+                        Some((create.name.clone(), EntityKind::Function, declaration)),
                         None,
                     )
                 }
             }
         } else {
+            let proven = function_span(&original, file, anchor.language, &anchor.name)?;
+            let span = proven.span.clone();
+            let held = anchor
+                .span
+                .as_ref()
+                .ok_or("lifecycle anchor has no source span")?;
+            if span != (held.start_byte..held.end_byte) {
+                return Err(
+                    "lifecycle anchor span differs from its exact parsed declaration".into(),
+                );
+            }
+            // The declaration goes with its own lines, its whole statement and
+            // its doc comment, and the space that set it apart, so what stood
+            // around it is as far apart as before.
             let projected = kin_projection::apply_splices(
                 &original,
                 vec![kin_projection::Splice {
-                    byte_range: span,
+                    byte_range: kin_parser::code_placement::removal_of(
+                        &original,
+                        proven.extent.clone(),
+                    ),
                     new_content: Vec::new(),
                 }],
             )
             .map_err(|error| error.to_string())?;
             (path.clone(), projected, None, Some(anchor.id))
         };
+        // Never publish source that does not parse: read the result as its
+        // language before anything of it is stored.
+        if target == path {
+            let sent = match create {
+                Some((create, _)) => kin_mcp::syntax_gate::Sent::placed(
+                    format!("the code sent for {}", create.name),
+                    &original,
+                    &projected,
+                ),
+                None => kin_mcp::syntax_gate::Sent::removed(
+                    format!("removing {}", anchor.name),
+                    &original,
+                    &projected,
+                ),
+            };
+            kin_mcp::syntax_gate::refuse_unparseable(
+                anchor.language,
+                Some(&original),
+                &projected,
+                &[sent],
+            )?;
+        }
         if !authored_files.insert(target.clone()) {
             return Err("multiple lifecycle operations on one source unit are not yet supported; split them into guarded transactions".into());
         }
@@ -496,6 +795,9 @@ pub(crate) fn prepare(
             file: target_file,
             created,
             removed,
+            removed_span,
+            enclosing,
+            nested,
         });
     }
     let predecessor = kin_model::graph::ResolvedGraphState {
@@ -515,7 +817,20 @@ pub(crate) fn prepare(
         &state.blobs,
         &[predecessor],
     )
-    .map_err(|error| format!("reconcile source-bound lifecycle: {error}"))?;
+    .map_err(|error| {
+        let error = error.to_string();
+        // Reached only where a unit already held a syntax problem beside the
+        // change: one the change brings is refused above, by its line.
+        if error.contains("has syntax errors") {
+            tracing::warn!(%error, "a lifecycle operation writes a unit that does not parse");
+            "the source this change writes already has a syntax problem, and Kin creates or \
+             removes a declaration only where every declaration beside it can be read, so fix \
+             that problem first with a patch to the declaration that holds it"
+                .to_string()
+        } else {
+            format!("reconcile source-bound lifecycle: {error}")
+        }
+    })?;
     validate_footprint(
         &before,
         prepared.snapshot(),
@@ -555,22 +870,37 @@ fn validate_footprint(
                 }
                 continue;
             }
-            let new = after
-                .entities
-                .get(&old.id)
-                .ok_or("lifecycle unexpectedly removed a sibling declaration")?;
             let old_span = old
                 .span
                 .as_ref()
                 .ok_or("lifecycle owner has an unbounded sibling declaration")?;
+            // A declaration written inside the removed one goes with it.
+            if item.removed_span.as_ref().is_some_and(|removed| {
+                removed.start <= old_span.start_byte && old_span.end_byte <= removed.end
+            }) {
+                if after.entities.contains_key(&old.id) {
+                    return Err(
+                        "a declaration nested in the removed one remains in the prepared graph"
+                            .into(),
+                    );
+                }
+                continue;
+            }
+            let new = after
+                .entities
+                .get(&old.id)
+                .ok_or("lifecycle unexpectedly removed a sibling declaration")?;
             let new_span = new
                 .span
                 .as_ref()
                 .ok_or("lifecycle lost a sibling's independent source")?;
-            if new.name != old.name
-                || new.kind != old.kind
-                || new.file_origin != old.file_origin
-                || old_body.and_then(|body| body.get(old_span.start_byte..old_span.end_byte))
+            if new.name != old.name || new.kind != old.kind || new.file_origin != old.file_origin {
+                return Err("lifecycle changed an unrelated sibling declaration".into());
+            }
+            // A declaration that holds the place written keeps its identity
+            // and takes the new bytes; every other keeps its bytes exactly.
+            if !item.enclosing.contains(&old.id)
+                && old_body.and_then(|body| body.get(old_span.start_byte..old_span.end_byte))
                     != body.get(new_span.start_byte..new_span.end_byte)
             {
                 return Err("lifecycle changed an unrelated sibling declaration".into());
@@ -585,16 +915,34 @@ fn validate_footprint(
                     && !before.entities.contains_key(&entity.id)
             })
             .collect::<Vec<_>>();
-        if let Some((name, desired)) = &item.created {
-            if added.len() != 1 || added[0].kind != EntityKind::Function || added[0].name != *name {
-                return Err("creation did not derive exactly the requested new function".into());
-            }
-            let span = added[0]
+        if let Some((name, kind, desired)) = &item.created {
+            let created = added
+                .iter()
+                .filter(|entity| entity.kind == *kind && entity.name == *name)
+                .collect::<Vec<_>>();
+            let [created] = created.as_slice() else {
+                return Err("creation did not derive exactly the requested new declaration".into());
+            };
+            let span = created
                 .span
                 .as_ref()
-                .ok_or("created function has no source span")?;
+                .ok_or("created declaration has no source span")?;
             if body.get(span.start_byte..span.end_byte) != Some(desired.as_slice()) {
-                return Err("created function body differs from the requested declaration".into());
+                return Err(
+                    "created declaration body differs from the requested declaration".into(),
+                );
+            }
+            // Anything else that appeared is declared inside the new
+            // declaration, where the operation allows that.
+            let stray = added.iter().any(|entity| {
+                entity.id != created.id
+                    && !(item.nested
+                        && entity.span.as_ref().is_some_and(|inner| {
+                            span.start_byte <= inner.start_byte && inner.end_byte <= span.end_byte
+                        }))
+            });
+            if stray {
+                return Err("creation did not derive exactly the requested new declaration".into());
             }
         } else if !added.is_empty() {
             return Err("removal unexpectedly created a declaration".into());
@@ -609,32 +957,61 @@ mod tests {
 
     #[test]
     fn entity_lifecycle_proves_top_level_leaf_spans() {
-        for (language, source, expected) in [
+        for (language, source, expected, extent) in [
             (
                 LanguageId::Rust,
                 "// header\npub fn value() -> u8 { 1 }\n",
+                "pub fn value() -> u8 { 1 }",
                 "pub fn value() -> u8 { 1 }",
             ),
             (
                 LanguageId::Python,
                 "# header\ndef value():\n    return 1\n",
                 "def value():\n    return 1",
+                "def value():\n    return 1",
             ),
             (
                 LanguageId::Go,
-                "package sample\n\nfunc value() int { return 1 }\n",
-                "func value() int { return 1 }",
+                "package sample\n\n// value is one.\nfunc value() int { return 1 }\n",
+                // A Go entity's span holds the comments directly above it.
+                "// value is one.\nfunc value() int { return 1 }",
+                "// value is one.\nfunc value() int { return 1 }",
+            ),
+            (
+                LanguageId::TypeScript,
+                "// header\n\nexport function value(): number {\n  return 1;\n}\n",
+                "export function value(): number {\n  return 1;\n}",
+                "export function value(): number {\n  return 1;\n}",
+            ),
+            (
+                LanguageId::JavaScript,
+                "/** One. */\nexport const value = () => 1;\n",
+                "export const value = () => 1;",
+                "/** One. */\nexport const value = () => 1;",
             ),
         ] {
-            let (span, _) = function_span(
+            let proven = function_span(
                 source.as_bytes(),
                 &FilePathId::new("fixture"),
                 language,
                 "value",
             )
             .unwrap();
-            assert_eq!(&source[span], expected);
+            assert_eq!(&source[proven.span], expected);
+            assert_eq!(&source[proven.extent], extent);
         }
+        assert_eq!(
+            function_span(
+                b"package sample\n\nfunc value() int { return 1 }\n",
+                &FilePathId::new("fixture"),
+                LanguageId::Go,
+                "value",
+            )
+            .unwrap()
+            .prelude
+            .as_deref(),
+            Some("package sample")
+        );
     }
 
     #[test]
@@ -659,6 +1036,16 @@ mod tests {
             ),
             (LanguageId::Rust, "fn value() {}\nfn value() {}", "value"),
             (LanguageId::Rust, "fn value() {", "value"),
+            (
+                LanguageId::TypeScript,
+                "function value() {\n  function nested() {}\n  return nested();\n}\n",
+                "value",
+            ),
+            (
+                LanguageId::JavaScript,
+                "class Owner {\n  value() {\n    return 1;\n  }\n}\n",
+                "value",
+            ),
         ] {
             assert!(
                 function_span(
@@ -671,5 +1058,22 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn a_language_without_a_lifecycle_is_refused_by_name() {
+        let refusal = function_span(
+            b"class Owner { void value() {} }",
+            &FilePathId::new("fixture"),
+            LanguageId::Java,
+            "value",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            refusal,
+            "entity lifecycle currently supports top-level leaf functions in TypeScript, \
+             JavaScript, Python, Go and Rust"
+        );
     }
 }

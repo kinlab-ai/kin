@@ -16,7 +16,7 @@ without writing first, so neither could see the composition. This suite runs the
 binaries end to end: `kin init`, `kin agent run` against a scripted chat endpoint, and a
 direct `kin mcp start` session to read the result back.
 
-The agent's file tools have since been retired. It changes code only through `kin_mutate`,
+The agent's file tools have since been retired. It changes code only through `mutate`,
 naming the entity it changes, so every check drives an entity operation. The suite reads
 each target's entity id and `source_base` over its own `kin mcp start` session and scripts
 the model to send them back, as a model that had just read the entity would.
@@ -26,7 +26,7 @@ Six checks, one repository, run in order:
   edit_lands            an anchored `EntitySourcePatch` on a tracked function commits: the
                         run exits 0, the file holds the new text, `get_entity_source`
                         answers with the new body, the durability block reads `recorded`,
-                        and the change went out as a `kin_mutate` patch with no file tool
+                        and the change went out as a `mutate` patch with no file tool
   refused_edit_is_clean a patch authority refuses (an unterminated comment that hides a
                         declaration, which the planner rejects) leaves the file and the
                         entity exactly as they were, the model is told it did not land, and
@@ -42,21 +42,21 @@ Six checks, one repository, run in order:
                         holds is refused: the tracked file keeps its text, the function
                         never reaches the graph, the model is told why, and the declaration
                         it sent stays in the conversation it goes on with
-  pure_kin_mutate_lands one `kin_mutate` naming the ENTITY by its UUID, with the
+  pure_kin_mutate_lands one `mutate` naming the ENTITY by its UUID, with the
                         `source_base` a read returned for it, commits: the file and
                         `get_entity_source` carry it, durability reads `recorded`, the run
                         records that entity in `entities_changed` and no file, the call went
-                        out under a session the harness supplied (the model never sees
-                        `kin_session_start`), and `kin log` carries the agent's own summary
+                        out under a daemon-owned session verified in the mutation receipt
+                        (the model never starts one), and `kin log` carries the agent's own summary
                         rather than the bare transaction line
   edit_survives_a_daemon_restart
-                        the repository's daemon is stopped after the agent's session opens
+                        the repository's daemon is stopped after the agent's connection opens
                         and before its first change, as an unattended update did in the
-                        demo's real-model run. Sessions live in the daemon, so the session
-                        the harness opened is gone, and the change must commit through Kin
+                        demo's real-model run. The write must recover its daemon-owned session
+                        and commit through Kin
                         anyway. A whole-body `update` guarded by the entity's `source_base`
                         is sent; the run exits 0, the file and `get_entity_source` carry it,
-                        durability reads `recorded`, the last `kin_mutate` came back clean,
+                        durability reads `recorded`, the last `mutate` came back clean,
                         and no file tool was used
 
 What it is blind to: it drives one agent, one repository and one scripted conversation. It
@@ -84,6 +84,12 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
+
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -124,12 +130,24 @@ REFUSED_REPLACE = "/* pub fn kept() -> u8 {"
 # A new function in a new source unit, which Kin places beside its Python anchor.
 CREATED_NAME = "added"
 CREATED_PATH = "py/added.py"
+# The module Kin places the created unit's entities in, which is how the suite
+# finds them: by name, kind and the module that contains them, never by a path.
+CREATED_MODULE = "py.added"
 CREATED_DECLARATION = "def added():\n    return 3"
 CREATED_BODY = CREATED_DECLARATION + "\n"
 # A new source unit whose generated path a tracked file already holds, so creating it
 # would overwrite that file. Kin refuses it and overwrites nothing.
 TAKEN_NAME = "taken"
 TAKEN_PATH = "py/taken.py"
+TAKEN_MODULE = "py.taken"
+# The fixture's Cargo package. Kin names a Rust crate root by its Cargo crate name,
+# so the module src/lib.rs declares is this name.
+CRATE_NAME = "agentwrite"
+# The modules of the planted units each check edits, as Kin names them.
+LIB_MODULE = CRATE_NAME
+OTHER_MODULE = "other"
+MUTABLE_MODULE = "mutable"
+GREET_MODULE = "py.greet"
 TAKEN_DECLARATION = "def taken():\n    return 8"
 
 # The edit made after the daemon is restarted, on a function no earlier check changes. It
@@ -140,7 +158,7 @@ RESTART_MARKER = "0x2b"
 
 # How a run ends when Kin refuses its change. The refusal is an error result the model
 # reads, and the run then ends on the model's own answer, so the process exits 0; the
-# record is what says nothing landed: an errored kin_mutate and no entity changed.
+# record is what says nothing landed: an errored mutate and no entity changed.
 REFUSED_CHANGE_EXIT = 0
 
 # What Kin tells the model when it refuses to overwrite a tracked source unit: "the
@@ -268,16 +286,16 @@ def received(value, limit=240):
 
 
 def mutate_rows(trace):
-    """Every `kin_mutate` call the run made, as the trace recorded it."""
-    return [row for row in (trace or []) if row.get("tool") == "kin_mutate"]
+    """Every `mutate` call the run made, as the trace recorded it."""
+    return [row for row in (trace or []) if row.get("tool") == "mutate"]
 
 
 def entity_change_problems(trace, verb, lands=True):
     """What is wrong with how a run sent its change.
 
-    A change goes out as a `kin_mutate` operation with this verb and nothing else: a row
+    A change goes out as a `mutate` operation with this verb and nothing else: a row
     for a file tool, or for the local surface file tools used to take, is a change made
-    outside the graph. A change that lands ends on a clean `kin_mutate`; a refused one
+    outside the graph. A change that lands ends on a clean `mutate`; a refused one
     comes back an error on every call that carried it.
     """
     problems = []
@@ -289,18 +307,18 @@ def entity_change_problems(trace, verb, lands=True):
                if any(op.get("verb") == verb
                       for op in ((row.get("args") or {}).get("operations") or []))]
     if not carried:
-        problems.append("no kin_mutate call carried a %r operation" % verb)
+        problems.append("no mutate call carried a %r operation" % verb)
     elif lands and carried[-1].get("is_error"):
         problems.append("the %s came back an error: %s" % (verb, received(carried[-1])))
     elif not lands and not all(row.get("is_error") for row in carried):
-        problems.append("a kin_mutate carrying the refused %s came back clean" % verb)
+        problems.append("a mutate carrying the refused %s came back clean" % verb)
     return problems
 
 
 def says_it_did_not_land(tool_result, tool_error):
     """Whether the model was told its change did not land.
 
-    Kin answers a refused `kin_mutate` with an error result that carries its reason, and
+    Kin answers a refused `mutate` with an error result that carries its reason, and
     one that landed with a receipt naming what it applied. The model is told the change
     failed when it reads the error flag and a reason; a result that reads as a receipt
     told it the opposite.
@@ -364,17 +382,17 @@ def grade_edit_lands(rc, disk, source_payload, status_payload, trace):
 
 
 def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace, result,
-                                messages, entity):
+                                messages, entity, mutation_receipt):
     """A belt with no file tools commits by naming the entity, and says what it did.
 
     Five things have to be true together, and each one has been separately true
     while the composition was broken. The change reaches disk and the graph, the
     way any commit must. The run records the ENTITY it changed and no file,
-    because on this belt there is no file tool to record. The mutate call
-    carries a session_id the model never saw, since kin_session_start is
-    harness-owned and a call without one is refused by a daemon that owns
-    sessions. And history carries the agent's own sentence rather than the bare
-    transaction line.
+    because on this belt there is no file tool to record. The mutation receipt
+    carries the daemon-owned session that committed the change. The compact
+    default surface starts a connection session at the server when no session
+    is named; a client that supplies one must get the same owner back. History
+    carries the agent's own sentence rather than the bare transaction line.
 
     The session assertion is the one this check exists for. Two hermetic suites
     covered the halves: kin-agent's tests run against a scripted MCP server that
@@ -386,6 +404,8 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
         return UNREADABLE, "the run or its read-back produced nothing to grade"
     if trace is None or result is None or messages is None:
         return UNREADABLE, "the run's trace, result record or change log was unreadable"
+    if not isinstance(mutation_receipt, dict):
+        return UNREADABLE, "the mutation receipt could not be read to verify session ownership"
     problems = []
     if rc != 0:
         problems.append("kin agent run exited %s, not 0" % rc)
@@ -400,17 +420,35 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
 
     calls = mutate_rows(trace)
     if not calls:
-        problems.append("the run made no kin_mutate call at all")
+        problems.append("the run made no mutate call at all")
     else:
         errored = [row for row in calls if row.get("is_error")]
         if errored:
-            problems.append("kin_mutate came back an error: %s"
+            problems.append("mutate came back an error: %s"
                             % json.dumps(errored[0])[:300])
-        unsessioned = [row for row in calls
-                       if not ((row.get("args") or {}).get("session_id") or "").strip()]
-        if unsessioned:
-            problems.append("a kin_mutate went out with no session_id, which a daemon that "
-                            "owns sessions refuses; the harness must supply its own")
+        coordination = mutation_receipt.get("coordination")
+        if not isinstance(coordination, dict):
+            coordination = {}
+        owner = coordination.get("session_id")
+        try:
+            owner_uuid = uuid.UUID(owner) if isinstance(owner, str) else None
+        except ValueError:
+            owner_uuid = None
+        if (owner_uuid is None or coordination.get("evaluated") is not True
+                or coordination.get("allowed") is not True
+                or mutation_receipt.get("state") != "committed"):
+            problems.append("the committed receipt does not verify an allowed daemon-owned session")
+        for row in calls:
+            named = (row.get("args") or {}).get("session_id")
+            if named and named != owner:
+                problems.append("the daemon receipt session differs from the session the call named")
+            if not named:
+                implicit = any(event.get("event") == "session_unavailable"
+                               and event.get("policy") == "allowed"
+                               and event.get("server") == row.get("server") for event in trace)
+                if not implicit or (row.get("envelope") or {}).get("runtime") != "repo-daemon":
+                    problems.append("the unnamed mutation has no connection-session policy or daemon result")
+    problems.extend(entity_change_problems(trace, "update"))
 
     # The run records the entity as the agent named it, which is its UUID.
     agent = (result.get("kin_agent") or {})
@@ -431,8 +469,8 @@ def grade_pure_kin_mutate_lands(rc, disk, source_payload, status_payload, trace,
 
     if problems:
         return FAIL, "; ".join(problems)
-    return PASS, ("a Kin-only belt committed by naming the entity, under a session the harness "
-                  "supplied, and history carries the agent's own sentence")
+    return PASS, ("a Kin-only belt committed by naming the entity, under a daemon-owned session "
+                  "verified in its receipt, and history carries the agent's own sentence")
 
 
 def grade_refused_edit_is_clean(rc, disk_before, disk_after, source_before, source_after,
@@ -472,7 +510,7 @@ def grade_create_lands(rc, disk, listed_payload, source_payload, status_payload,
     if disk != CREATED_BODY:
         problems.append("the created source unit is missing or holds other bytes: %s"
                         % received(disk))
-    if not functions_named(listed_payload, CREATED_NAME, CREATED_PATH):
+    if not functions_named(listed_payload, CREATED_NAME, CREATED_MODULE):
         problems.append("the graph does not list the created function: %s"
                         % received(listed_payload))
     if not mentions(source_payload, CREATED_DECLARATION):
@@ -535,14 +573,18 @@ def grade_edit_survives_a_daemon_restart(stop, rc, disk, source_payload, status_
     state = durability_state(status_payload)
     if state != "recorded":
         problems.append("durability reads %r, not 'recorded'" % state)
-    # A `kin_mutate` is one transaction, begun and committed by the server, so a clean one
+    # A `mutate` is one transaction, begun and committed by the server, so a clean one
     # is the edit committed through a transaction and an errored one is not.
     problems.extend(entity_change_problems(trace, "update"))
     if problems:
         return FAIL, "; ".join(problems)
     sessions = sum(1 for row in trace if row.get("tool") == "kin_session_start")
-    how = ("the harness opened a new session after the restart" if sessions >= 2
-           else "the session outlived the restart")
+    if sessions >= 2:
+        how = "the harness opened a new session after the restart"
+    elif any(row.get("event") == "session_unavailable" for row in trace):
+        how = "the write used a connection-owned session after the restart"
+    else:
+        how = "the session outlived the restart"
     return PASS, "the entity update committed through Kin after a daemon restart; %s" % how
 
 
@@ -694,7 +736,12 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = os.path.join(workdir, "home")
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         # KIN_HOME does not move the supervisor. It lives beside an explicit
         # KIN_REGISTRY_PATH, or else in the real home's `.kin`, where a daemon started
         # here would take the machine-wide supervisor with the build under test.
@@ -740,8 +787,9 @@ class Suite(object):
                                    ("src/mutable.rs", MUTABLE_RS),
                                    ("py/greet.py", PY_GREET), (TAKEN_PATH, PY_TAKEN),
                                    ("README.md", README),
-                                   ("Cargo.toml", '[package]\nname = "agentwrite"\n'
-                                                  'version = "0.1.0"\nedition = "2021"\n')):
+                                   ("Cargo.toml", '[package]\nname = "%s"\n'
+                                                  'version = "0.1.0"\nedition = "2021"\n'
+                                                  % CRATE_NAME)):
                 with open(os.path.join(path, relative), "w") as handle:
                     handle.write(body)
             self.git(path, ["init", "-q", "-b", "main"])
@@ -889,6 +937,19 @@ NOT_FOUND_EXACT = "Entity not found: %s"
 MODULE_NODE_REFUSAL = re.compile(
     r"^entity '(?P<name>[^']*)' \((?P<id>[0-9a-fA-F-]{36})\) exists in the graph but has no "
     r"retrievable source: .* is an import/module relationship node for a whole file")
+# A name several entities carry is refused with each one's address: its
+# `module :: name` label, the short id when candidates share a label, and its kind
+# when the kinds sharing a label differ. Any address reads back as that entity.
+AMBIGUOUS_REFUSAL = re.compile(
+    r"^entity_id `(?P<name>[^`]+)` names (?P<count>\d+) entities, and this argument takes "
+    r"one\. Pass one of: (?P<listed>.+)\.$", re.DOTALL)
+CANDIDATE_ADDRESS = re.compile(
+    r"`(?P<address>(?P<module>[^`]+?) :: (?P<name>[^`#]+?)(?: #[0-9a-f]+)?)`"
+    r"(?: \((?P<kind>[a-z_]+)\b)?")
+# The wording a current build refuses a whole file's module surface with.
+WHOLE_MODULE_REFUSAL = re.compile(
+    r"^(?P<name>\S+) \((?P<id>[0-9a-fA-F-]{36})\) is a whole (?:module|package|file)\b.*"
+    r"Kin does not return (?:or edit )?whole files")
 
 
 def refusal_answer(message, name):
@@ -902,18 +963,26 @@ def refusal_answer(message, name):
     if message.startswith(NOT_FOUND_MATCHING % name) \
             or message.strip() == NOT_FOUND_EXACT % name:
         return {"not_found": True}
-    match = MODULE_NODE_REFUSAL.match(message)
+    match = MODULE_NODE_REFUSAL.match(message) or WHOLE_MODULE_REFUSAL.match(message)
     if match and match.group("name") == name:
         return {"module_node": {"id": match.group("id"), "name": name}}
+    match = AMBIGUOUS_REFUSAL.match(message.strip())
+    if match and match.group("name") == name:
+        candidates = [{"entity_id": found.group("address"), "name": found.group("name"),
+                       "kind": found.group("kind"), "module": found.group("module")}
+                      for found in CANDIDATE_ADDRESS.finditer(match.group("listed"))]
+        return {"ambiguous_focal": True, "query": name, "candidates": candidates,
+                "candidate_count": int(match.group("count"))}
     return None
 
 
 def entity_rows(reply):
-    """The entities a strict name lookup reached, one row each: id, name, kind and file.
+    """The entities a strict name lookup reached, one row each: id, name, kind and module.
 
     An exact answer is one row; an `ambiguous_focal` answer is every candidate it lists.
-    A caller picks among them by name, kind and file, never by rank, so a name two
-    entities share cannot stand for the wrong one. [] is a name nothing carries. None is
+    A caller picks among them by name, kind and the module that contains them, never by
+    rank, so a name two entities share cannot stand for the wrong one. A candidate's kind
+    is None when its address alone told it apart. [] is a name nothing carries. None is
     a reply that could not be read, including a candidate list cut short.
     """
     if not isinstance(reply, dict):
@@ -923,45 +992,58 @@ def entity_rows(reply):
     if reply.get("module_node"):
         node = reply["module_node"]
         return [{"id": node.get("id"), "name": node.get("name"), "kind": "module",
-                 "file_path": None}]
+                 "module": None}]
     if reply.get("ambiguous_focal"):
         candidates = reply.get("candidates") or []
         if reply.get("candidate_count") != len(candidates):
             return None
         return [{"id": row.get("entity_id"), "name": row.get("name"), "kind": row.get("kind"),
-                 "file_path": row.get("file_path")} for row in candidates]
+                 "module": row.get("module")} for row in candidates]
     if reply.get("id"):
         return [{"id": reply.get("id"), "name": reply.get("name"), "kind": reply.get("kind"),
-                 "file_path": reply.get("file_path")}]
+                 "module": reply.get("module")}]
     return None
 
 
-def functions_named(rows, name, path=None):
-    """The rows that are a function named exactly `name`, in `path` when one is named."""
+def functions_named(rows, name, module=None, kind_unknown=False):
+    """The rows that are a function named exactly `name`, in `module` when one is named.
+
+    `kind_unknown` also keeps a row whose kind its address left unsaid, for a caller
+    that reads the entity back and checks its kind there.
+    """
+    def is_function(row):
+        kind = row.get("kind")
+        return str(kind or "").lower() == "function" or (kind_unknown and kind is None)
     return [row for row in rows or []
-            if row.get("name") == name and str(row.get("kind", "")).lower() == "function"
-            and (path is None or row.get("file_path") == path)]
+            if row.get("name") == name and is_function(row)
+            and (module is None or row.get("module") == module)]
 
 
 # The name the agent's belt gives Kin's one write tool.
-MUTATE = "mcp__kin__kin_mutate"
+MUTATE = "mcp__kin__mutate"
 
 
-def read_back(suite, path, name, status=True):
-    """Find the function `name` in `path`, read it, and read the graph status, over one
+def read_back(suite, module, name, status=True):
+    """Find the function `name` in `module`, read it, and read the graph status, over one
     session.
 
     Returns the rows the exact-name lookup reached, the function's entity id, its
     `get_entity_source` answer by that id (which carries the `source_base` a guarded
     change names) and the status, each None when Kin did not answer it. The id is set
-    only when exactly one function of that name lives in `path`.
+    only when exactly one function of that name lives in `module`, and the read confirms
+    it is a function.
     """
     session = suite.mcp()
     try:
         rows = entity_rows(session.lookup(name))
-        matches = functions_named(rows, name, path)
-        focal = matches[0]["id"] if len(matches) == 1 else None
-        source = session.call("get_entity_source", {"entity_id": focal}) if focal else None
+        matches = functions_named(rows, name, module, kind_unknown=True)
+        address = matches[0]["id"] if len(matches) == 1 else None
+        source = session.call("get_entity_source", {"entity_id": address}) if address else None
+        is_function = (isinstance(source, dict)
+                       and str(source.get("kind", "")).lower() == "function"
+                       and source.get("module") == module)
+        focal = source.get("id") if is_function else None
+        source = source if focal else None
         state = session.call("kin_graph_status", {}) if status else None
     finally:
         session.close()
@@ -969,7 +1051,7 @@ def read_back(suite, path, name, status=True):
 
 
 def mutate_call(text, operation, summary):
-    """A scripted turn that sends one entity operation through `kin_mutate`."""
+    """A scripted turn that sends one entity operation through `mutate`."""
     return completion(text, MUTATE, {"operations": [operation], "summary": summary})
 
 
@@ -979,7 +1061,7 @@ def unreadable_base(ident, name):
 
 
 def check_edit_lands(suite):
-    _, focal, before, _ = read_back(suite, "src/lib.rs", "value", status=False)
+    _, focal, before, _ = read_back(suite, LIB_MODULE, "value", status=False)
     base = (before or {}).get("source_base")
     if not focal or not base:
         return unreadable_base("edit_lands", "value")
@@ -991,14 +1073,14 @@ def check_edit_lands(suite):
                                      "Document value and raise it to 0x2a"),
                          completion("value is documented.")])
     trace = suite.last_trace
-    _, _, source, status = read_back(suite, "src/lib.rs", "value")
+    _, _, source, status = read_back(suite, LIB_MODULE, "value")
     verdict, detail = grade_edit_lands(rc, suite.read("src/lib.rs"), source, status, trace)
     return Result("edit_lands", verdict, "%s %s" % (TICKET, detail))
 
 
 def check_refused_edit_is_clean(suite):
     before = suite.read("src/other.rs")
-    _, focal, source_before, _ = read_back(suite, "src/other.rs", "kept", status=False)
+    _, focal, source_before, _ = read_back(suite, OTHER_MODULE, "kept", status=False)
     base = (source_before or {}).get("source_base")
     if not focal or not base:
         return unreadable_base("refused_edit_is_clean", "kept")
@@ -1012,7 +1094,7 @@ def check_refused_edit_is_clean(suite):
                                                "Comment out kept"),
                                    completion("kept is commented out.")])
     tool_error, trace, result = suite.last_tool_error, suite.last_trace, suite.last_result
-    _, _, source_after, _ = read_back(suite, "src/other.rs", "kept", status=False)
+    _, _, source_after, _ = read_back(suite, OTHER_MODULE, "kept", status=False)
     verdict, detail = grade_refused_edit_is_clean(rc, before, suite.read("src/other.rs"),
                                                   source_before, source_after, tool_result,
                                                   tool_error, trace, result)
@@ -1020,7 +1102,7 @@ def check_refused_edit_is_clean(suite):
 
 
 def check_create_lands(suite):
-    _, anchor, anchor_source, _ = read_back(suite, "py/greet.py", "greet", status=False)
+    _, anchor, anchor_source, _ = read_back(suite, GREET_MODULE, "greet", status=False)
     base = (anchor_source or {}).get("source_base")
     if not anchor or not base:
         return unreadable_base("create_lands", "greet")
@@ -1034,7 +1116,7 @@ def check_create_lands(suite):
                                      "Add added in its own source unit"),
                          completion("py/added.py holds added.")])
     trace = suite.last_trace
-    listed, _, created, status = read_back(suite, CREATED_PATH, CREATED_NAME)
+    listed, _, created, status = read_back(suite, CREATED_MODULE, CREATED_NAME)
     verdict, detail = grade_create_lands(rc, suite.read(CREATED_PATH), listed, created, status,
                                          trace)
     return Result("create_lands", verdict, "%s %s" % (TICKET, detail))
@@ -1042,7 +1124,7 @@ def check_create_lands(suite):
 
 def check_refused_create_is_clean(suite):
     before = suite.read(TAKEN_PATH)
-    _, anchor, anchor_source, _ = read_back(suite, "py/greet.py", "greet", status=False)
+    _, anchor, anchor_source, _ = read_back(suite, GREET_MODULE, "greet", status=False)
     base = (anchor_source or {}).get("source_base")
     if not anchor or not base:
         return unreadable_base("refused_create_is_clean", "greet")
@@ -1060,7 +1142,7 @@ def check_refused_create_is_clean(suite):
     # The request after the refusal is the conversation the model went on with.
     requests = suite.last_requests or []
     next_request = requests[1] if len(requests) > 1 else None
-    listed, _, _, _ = read_back(suite, TAKEN_PATH, TAKEN_NAME, status=False)
+    listed, _, _, _ = read_back(suite, TAKEN_MODULE, TAKEN_NAME, status=False)
     verdict, detail = grade_refused_create_is_clean(rc, before, suite.read(TAKEN_PATH), listed,
                                                     tool_result, tool_error, next_request,
                                                     trace, result)
@@ -1072,16 +1154,16 @@ def check_pure_kin_mutate_lands(suite):
 
     `KIN_AGENT_PURE_KIN` is read per process, so this is the same binary run a
     second time rather than a flag on the call. The scripted model calls
-    `mcp__kin__kin_mutate` by the name the belt exposes, names the entity by its
+    `mcp__kin__mutate` by the name the belt exposes, names the entity by its
     UUID with the `source_base` a read returned for it rather than a path, and
     passes the change message as `summary`.
     """
-    _, focal, before, _ = read_back(suite, "src/mutable.rs", "mutable", status=False)
+    _, focal, before, _ = read_back(suite, MUTABLE_MODULE, "mutable", status=False)
     base = (before or {}).get("source_base")
     if not focal or not base:
         return unreadable_base("pure_kin_mutate_lands", "mutable")
-    rc, _ = suite.agent(
-        [completion("Raising mutable through Kin.", "mcp__kin__kin_mutate",
+    rc, tool_result = suite.agent(
+        [completion("Raising mutable through Kin.", MUTATE,
                     {"operations": [{"verb": "update", "target": focal,
                                      "payload": {"EntitySourceBase": base},
                                      "body": MUTATE_BODY,
@@ -1090,15 +1172,20 @@ def check_pure_kin_mutate_lands(suite):
          completion("mutable now returns 0x2c.")],
         env_extra={"KIN_AGENT_PURE_KIN": "1"})
     trace, result = suite.last_trace, suite.last_result
+    try:
+        mutation_receipt = json.loads(tool_result)
+    except (TypeError, ValueError):
+        mutation_receipt = None
     messages = suite.change_messages()
-    _, _, source, status = read_back(suite, "src/mutable.rs", "mutable")
+    _, _, source, status = read_back(suite, MUTABLE_MODULE, "mutable")
     verdict, detail = grade_pure_kin_mutate_lands(rc, suite.read("src/mutable.rs"), source,
-                                                  status, trace, result, messages, focal)
+                                                  status, trace, result, messages, focal,
+                                                  mutation_receipt)
     return Result("pure_kin_mutate_lands", verdict, "%s %s" % (TICKET, detail))
 
 
 def check_edit_survives_a_daemon_restart(suite):
-    _, focal, before, _ = read_back(suite, "src/other.rs", "other", status=False)
+    _, focal, before, _ = read_back(suite, OTHER_MODULE, "other", status=False)
     base = (before or {}).get("source_base")
     if not focal or not base:
         return unreadable_base("edit_survives_a_daemon_restart", "other")
@@ -1112,7 +1199,7 @@ def check_edit_survives_a_daemon_restart(suite):
                          completion("other is documented.")],
                         before_first=lambda: stop.append(suite.stop_daemon()))
     trace = suite.last_trace
-    _, _, source, status = read_back(suite, "src/other.rs", "other")
+    _, _, source, status = read_back(suite, OTHER_MODULE, "other")
     verdict, detail = grade_edit_survives_a_daemon_restart(
         stop[0] if stop else None, rc, suite.read("src/other.rs"), source, status, trace)
     return Result("edit_survives_a_daemon_restart", verdict, "%s %s" % (TICKET, detail))
@@ -1157,7 +1244,7 @@ def self_test():
     edited = EDIT_REPLACE + "\n"
 
     def mutation(verb, is_error=False):
-        return {"tool": "kin_mutate", "surface": "kin", "is_error": is_error,
+        return {"tool": "mutate", "surface": "kin", "is_error": is_error,
                 "args": {"session_id": "s1", "operations": [{"verb": verb, "target": "e1"}]}}
 
     session = {"tool": "kin_session_start"}
@@ -1165,8 +1252,20 @@ def self_test():
     patch_refused = [session, mutation("patch", is_error=True)]
     by_edit_file = patched + [{"surface": "local", "tool": "edit_file"}]
 
+    scripted_operation = {"verb": "patch", "target": "e1", "payload": {}}
+    scripted = mutate_call("Changing e1.", scripted_operation, "Change e1")
+    scripted_function = scripted["choices"][0]["message"]["tool_calls"][0]["function"]
+    expect("scripted write uses the current compact tool",
+           scripted_function["name"], "mcp__kin__mutate")
+    expect("compact mutate keeps the operations and summary schema",
+           json.loads(scripted_function["arguments"]),
+           {"operations": [scripted_operation], "summary": "Change e1"})
+
     expect("edit lands",
            grade_edit_lands(0, edited, new_source, recorded, patched)[0], PASS)
+    stale_name = [session, dict(mutation("patch"), tool="kin_mutate")]
+    expect("a retired tool trace does not prove a compact mutation happened",
+           grade_edit_lands(0, edited, new_source, recorded, stale_name)[0], FAIL)
     expect("edit refused by the commit",
            grade_edit_lands(6, edited, old_source, uncommitted, patch_refused)[0], FAIL)
     expect("edit lands on disk only",
@@ -1212,9 +1311,9 @@ def self_test():
     expect("refused edit with no read-back", refused_edit(source_after=None), UNREADABLE)
 
     created_listed = [{"id": "m2", "name": CREATED_NAME, "kind": "Module",
-                       "file_path": CREATED_PATH},
+                       "module": CREATED_MODULE},
                       {"id": "e2", "name": CREATED_NAME, "kind": "Function",
-                       "file_path": CREATED_PATH}]
+                       "module": CREATED_MODULE}]
     created_source = {"body": CREATED_DECLARATION, "_kin": {}}
     created = [session, mutation("create")]
     create_refused = [session, mutation("create", is_error=True)]
@@ -1233,7 +1332,7 @@ def self_test():
     expect("create reached only as its source unit's module",
            create(listed_payload=created_listed[:1]), FAIL)
     expect("create listed in another unit",
-           create(listed_payload=[dict(created_listed[1], file_path="py/greet.py")]), FAIL)
+           create(listed_payload=[dict(created_listed[1], module=GREET_MODULE)]), FAIL)
     expect("create not served by get_entity_source",
            create(source_payload={"body": "", "_kin": {}}), FAIL)
     expect("create not durable", create(status_payload=uncommitted), FAIL)
@@ -1247,9 +1346,9 @@ def self_test():
     # The tracked unit's module is named for its file, so the lookup reaches it. It is
     # not the function the refused create named, and a lookup that reaches only it is
     # clean.
-    kept_listed = [{"id": "m1", "name": TAKEN_NAME, "kind": "Module", "file_path": TAKEN_PATH}]
+    kept_listed = [{"id": "m1", "name": TAKEN_NAME, "kind": "Module", "module": TAKEN_MODULE}]
     reached_listed = kept_listed + [{"id": "e4", "name": TAKEN_NAME, "kind": "Function",
-                                     "file_path": TAKEN_PATH}]
+                                     "module": TAKEN_MODULE}]
     sent = json.dumps({"operations": [{"verb": "create", "payload": {"EntityCreate": {
         "name": TAKEN_NAME, "body": TAKEN_DECLARATION}}}]})
     went_on = {"messages": [{"role": "assistant", "content": "Adding taken.",
@@ -1288,10 +1387,13 @@ def self_test():
     mutated_source = {"source": MUTATE_BODY, "_kin": {}}
     stale_source = {"source": MUTABLE_RS, "_kin": {}}
     mutable_id = "00000000-0000-4000-8000-000000000042"
-    sessioned = [{"tool": "kin_mutate", "is_error": False,
-                  "args": {"session_id": "s1", "summary": MUTATE_SUMMARY,
+    owner_session = "00000000-0000-4000-8000-000000000077"
+    session_receipt = {"state": "committed", "coordination": {
+        "session_id": owner_session, "evaluated": True, "allowed": True}}
+    sessioned = [{"tool": "mutate", "is_error": False,
+                  "args": {"session_id": owner_session, "summary": MUTATE_SUMMARY,
                            "operations": [{"verb": "update", "target": mutable_id}]}}]
-    unsessioned = [{"tool": "kin_mutate", "is_error": False,
+    unsessioned = [{"tool": "mutate", "is_error": False,
                     "args": {"summary": MUTATE_SUMMARY,
                              "operations": [{"verb": "update", "target": mutable_id}]}}]
     kin_only = {"kin_agent": {"entities_changed": [mutable_id], "files_changed": []}}
@@ -1306,38 +1408,77 @@ def self_test():
 
     expect("pure-kin mutate lands",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, said_it, mutable_id)[0], PASS)
-    # The one this check exists for: the halves were green while the
-    # composition was not, so a mutate that goes out unsessioned must be a
-    # failure here and not merely a note.
+                                       kin_only, said_it, mutable_id, session_receipt)[0], PASS)
+    # No named session needs the current policy and the actual daemon receipt;
+    # removing the old argument check alone would accept an unowned mutation.
     expect("pure-kin mutate went out with no session",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, unsessioned,
-                                       kin_only, said_it, mutable_id)[0], FAIL)
+                                       kin_only, said_it, mutable_id, session_receipt)[0], FAIL)
     expect("pure-kin mutate said it under a fold",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, said_it_under_a_fold, mutable_id)[0], PASS)
+                                       kin_only, said_it_under_a_fold, mutable_id, session_receipt)[0], PASS)
     expect("pure-kin mutate recorded only the transaction line",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, said_nothing, mutable_id)[0], FAIL)
+                                       kin_only, said_nothing, mutable_id, session_receipt)[0], FAIL)
     expect("pure-kin mutate changed nothing in the graph",
            grade_pure_kin_mutate_lands(0, mutated, stale_source, recorded, sessioned,
-                                       kin_only, said_it, mutable_id)[0], FAIL)
+                                       kin_only, said_it, mutable_id, session_receipt)[0], FAIL)
     expect("pure-kin run recorded a file it has no tool to change",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
                                        {"kin_agent": {"entities_changed": [mutable_id],
                                                       "files_changed": ["src/mutable.rs"]}},
-                                       said_it, mutable_id)[0], FAIL)
+                                       said_it, mutable_id, session_receipt)[0], FAIL)
     expect("pure-kin mutate made no mutate call",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, [],
-                                       kin_only, said_it, mutable_id)[0], FAIL)
+                                       kin_only, said_it, mutable_id, session_receipt)[0], FAIL)
     expect("pure-kin run recorded an entity other than the one it named",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
                                        {"kin_agent": {"entities_changed": ["mutable"],
                                                       "files_changed": []}},
-                                       said_it, mutable_id)[0], FAIL)
+                                       said_it, mutable_id, session_receipt)[0], FAIL)
     expect("pure-kin mutate with no log to read",
            grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
-                                       kin_only, None, mutable_id)[0], UNREADABLE)
+                                       kin_only, None, mutable_id, session_receipt)[0], UNREADABLE)
+
+    connection_owned = [
+        {"event": "session_unavailable", "policy": "allowed", "server": "kin"},
+        dict(unsessioned[0], server="kin", envelope={"runtime": "repo-daemon"})]
+    expect("compact default commits in its connection-owned session",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, connection_owned,
+                                      kin_only, said_it, mutable_id, session_receipt)[0], PASS)
+    expect("connection session missing its daemon receipt is unreadable",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, connection_owned,
+                                      kin_only, said_it, mutable_id, None)[0], UNREADABLE)
+    expect("a receipt with no session owner fails",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, connection_owned,
+                                      kin_only, said_it, mutable_id, {"state": "committed"})[0], FAIL)
+    expect("a malformed receipt session owner fails",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, connection_owned,
+                                      kin_only, said_it, mutable_id,
+                                      {"state": "committed", "coordination": {
+                                          "session_id": "not-a-session", "evaluated": True,
+                                          "allowed": True}})[0], FAIL)
+    expect("a receipt that denied ownership fails",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, connection_owned,
+                                      kin_only, said_it, mutable_id,
+                                      {"state": "committed", "coordination": {
+                                          "session_id": owner_session, "evaluated": True,
+                                          "allowed": False}})[0], FAIL)
+    expect("a client-named owner different from the receipt fails",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded, sessioned,
+                                      kin_only, said_it, mutable_id,
+                                      {"state": "committed", "coordination": {
+                                          "session_id": mutable_id, "evaluated": True,
+                                          "allowed": True}})[0], FAIL)
+    expect("a local write trace cannot hide behind an empty files_changed record",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded,
+                                      connection_owned + [{"tool": "edit_file", "surface": "local"}],
+                                      kin_only, said_it, mutable_id, session_receipt)[0], FAIL)
+    expect("a different server's policy does not own this write",
+           grade_pure_kin_mutate_lands(0, mutated, mutated_source, recorded,
+                                      [dict(connection_owned[0], server="somewhere-else"),
+                                       connection_owned[1]],
+                                      kin_only, said_it, mutable_id, session_receipt)[0], FAIL)
 
     stopped = (0, "the daemon on port 1 stopped")
     other_edited = OTHER_RS.replace(RESTART_FIND, RESTART_REPLACE)
@@ -1371,17 +1512,44 @@ def self_test():
                                                 reopened)[0], UNREADABLE)
 
     # The exact-name lookup. A name a module and a function share, or two functions in
-    # two files share, answers with candidates; the harness takes the one function in the
-    # named file and nothing else.
+    # two modules share, answers with candidates; the harness takes the one function in
+    # the named module and nothing else.
     twins = {"ambiguous_focal": True, "query": "other", "candidate_count": 3, "candidates": [
-        {"entity_id": "m9", "name": "other", "kind": "Module", "file_path": "src/other.rs"},
-        {"entity_id": "f9", "name": "other", "kind": "Function", "file_path": "src/other.rs"},
-        {"entity_id": "g9", "name": "other", "kind": "Function", "file_path": "src/lib.rs"}]}
+        {"entity_id": "m9", "name": "other", "kind": "Module", "module": OTHER_MODULE},
+        {"entity_id": "f9", "name": "other", "kind": "Function", "module": OTHER_MODULE},
+        {"entity_id": "g9", "name": "other", "kind": "Function", "module": LIB_MODULE}]}
     rows = entity_rows(twins)
-    expect("lookup picks the function in its file",
-           [row["id"] for row in functions_named(rows, "other", "src/other.rs")], ["f9"])
-    expect("lookup never picks by rank across files",
+    expect("lookup picks the function in its module",
+           [row["id"] for row in functions_named(rows, "other", OTHER_MODULE)], ["f9"])
+    expect("lookup never picks by rank across modules",
            len(functions_named(rows, "other")), 2)
+    # The refusal a current build answers a shared name with: each candidate's address,
+    # and its kind where the kinds sharing an address differ.
+    shared = ("entity_id `other` names 2 entities, and this argument takes one. Pass one of: "
+              "`other :: other #695a25cf` (module `mod other`), "
+              "`other :: other #95e3abdf` (function `pub fn other() -> u8`).")
+    addressed = entity_rows(refusal_answer(shared, "other"))
+    expect("a shared-name refusal lists both candidates by address", addressed, [
+        {"id": "other :: other #695a25cf", "name": "other", "kind": "module",
+         "module": OTHER_MODULE},
+        {"id": "other :: other #95e3abdf", "name": "other", "kind": "function",
+         "module": OTHER_MODULE}])
+    expect("a shared-name refusal yields the one function in its module",
+           [row["id"] for row in functions_named(addressed, "other", OTHER_MODULE)],
+           ["other :: other #95e3abdf"])
+    apart = ("entity_id `value` names 2 entities, and this argument takes one. Pass one of: "
+             "`%s :: value`, `other :: value`." % CRATE_NAME)
+    expect("candidates told apart by module alone carry no kind",
+           [row["kind"] for row in entity_rows(refusal_answer(apart, "value"))], [None, None])
+    expect("a kind left unsaid is kept only for a caller that reads it back",
+           ([row["id"] for row in functions_named(entity_rows(refusal_answer(apart, "value")),
+                                                  "value", LIB_MODULE, kind_unknown=True)],
+            functions_named(entity_rows(refusal_answer(apart, "value")), "value", LIB_MODULE)),
+           (["%s :: value" % CRATE_NAME], []))
+    expect("a shared-name refusal cut short is unreadable",
+           entity_rows(refusal_answer(shared.replace("names 2", "names 5"), "other")), None)
+    expect("a shared-name refusal about another name is not this one",
+           refusal_answer(shared, "kept"), None)
     expect("lookup of a cut-short candidate list",
            entity_rows(dict(twins, candidate_count=30)), None)
     expect("lookup of a name nothing carries", entity_rows({"not_found": True}), [])
@@ -1397,7 +1565,17 @@ def self_test():
     expect("refused lookup of a name only a file's module carries",
            entity_rows(refusal_answer(module, "taken")),
            [{"id": "821e4f27-4ea4-491f-81af-b5488fc27eeb", "name": "taken", "kind": "module",
-             "file_path": None}])
+             "module": None}])
+    whole = ("taken (821e4f27-4ea4-491f-81af-b5488fc27eeb) is a whole module, src/taken.py, and "
+             "Kin does not return or edit whole files. To read code in it, find a function or class "
+             "with locate (by name, or exact text with mode literal) and call source with that "
+             "id; to see what calls something, call refs on it.")
+    expect("refused lookup of a name only a file's module carries, current wording",
+           entity_rows(refusal_answer(whole, "taken")),
+           [{"id": "821e4f27-4ea4-491f-81af-b5488fc27eeb", "name": "taken", "kind": "module",
+             "module": None}])
+    expect("a whole-module refusal about another name is not this one",
+           refusal_answer(whole, "other"), None)
     expect("a module node is no function of that name",
            functions_named(entity_rows(refusal_answer(module, "taken")), "taken"), [])
     expect("a refusal about another name says nothing about this one",
@@ -1417,10 +1595,10 @@ def self_test():
            refusal_answer("Entity not found", "taken"), None)
     expect("a daemon absence about a longer name says nothing about this one",
            refusal_answer("no entity found matching 'taken_too'.", "taken"), None)
-    exact = {"id": "f8", "name": "value", "kind": "Function", "file_path": "src/lib.rs",
+    exact = {"id": "f8", "name": "value", "kind": "Function", "module": LIB_MODULE,
              "source_base": {}}
     expect("lookup of an exact answer",
-           [row["id"] for row in functions_named(entity_rows(exact), "value", "src/lib.rs")],
+           [row["id"] for row in functions_named(entity_rows(exact), "value", LIB_MODULE)],
            ["f8"])
     expect("lookup that reached a member under another name",
            functions_named(entity_rows(dict(exact, name="Owner::value")), "value"), [])

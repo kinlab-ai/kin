@@ -8,10 +8,17 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
+use std::collections::HashMap;
+
 use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
     ParseOutput,
 };
+use crate::nested::{
+    local_scope_name, LocalScopeNames, NestedDefinitionCensus, UnadmittedNestedDefinition,
+};
+use crate::value_origins::php as php_origins;
+use crate::value_origins::{ScopeFacts, ValueOrigin};
 
 pub struct PhpAdapter;
 
@@ -34,6 +41,14 @@ impl LanguageAdapter for PhpAdapter {
             })
     }
 
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::php_declarations::census(tree, source))
+    }
+
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         let error_ranges = collect_error_ranges(tree);
         let parse_state = if error_ranges.is_empty() {
@@ -46,7 +61,16 @@ impl LanguageAdapter for PhpAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let root = tree.root_node();
-        extract_php_children(&root, source, file_id, None, &mut entities, &mut relations);
+        let mut cx = PhpCx::read(tree, source);
+        extract_php_children(
+            &root,
+            source,
+            file_id,
+            None,
+            &mut entities,
+            &mut relations,
+            &mut cx,
+        );
         extract_php_imports(&root, source, file_id, &mut imports, &mut relations);
 
         // The file module owns entity-level import edges, and it has to sit
@@ -71,6 +95,30 @@ impl LanguageAdapter for PhpAdapter {
                     ),
                 );
             }
+        }
+
+        // Calls no callable's walk reached (a script's top-level statements, a
+        // closure passed there such as a Pest `it('...', function () {...})`
+        // body) go to the innermost entity holding each one, the file's
+        // namespace surface for top-level code.
+        {
+            let accounted = crate::call_owner::accounted_call_sites(&relations);
+            let mut swept = Vec::new();
+            let scope = CallScope {
+                owner: None,
+                base: None,
+                facts: None,
+                file: &cx.file,
+            };
+            collect_calls(
+                &root,
+                source,
+                "",
+                &scope,
+                &NestedCalls::default(),
+                &mut swept,
+            );
+            crate::call_owner::adopt_unowned_calls(&entities, &accounted, swept, &mut relations);
         }
 
         // Build import lookup: local_name -> module_path
@@ -110,6 +158,10 @@ impl LanguageAdapter for PhpAdapter {
             }
         }
 
+        // The unit's module owns what is declared at its top.
+        let held = crate::module_contains::module_contains(&entities, &relations, file_id);
+        relations.extend(held);
+
         Ok(ParseOutput {
             derived_members: Vec::new(),
             entities,
@@ -118,6 +170,7 @@ impl LanguageAdapter for PhpAdapter {
             tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: Some(cx.nested.census),
         })
     }
 }
@@ -129,10 +182,11 @@ fn extract_php_children(
     class_ctx: Option<&str>,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    cx: &mut PhpCx,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_php_node(&child, source, file_id, class_ctx, entities, relations);
+        extract_php_node(&child, source, file_id, class_ctx, entities, relations, cx);
     }
 }
 
@@ -143,6 +197,7 @@ fn extract_php_node(
     class_ctx: Option<&str>,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    cx: &mut PhpCx,
 ) {
     match node.kind() {
         "function_definition" => {
@@ -159,7 +214,9 @@ fn extract_php_node(
                         span: span_from_node(node, file_id),
                         declaration_line: None,
                     });
-                    extract_calls_from_body(node, source, &name, relations);
+                    extract_callable_body(
+                        node, source, file_id, &name, None, entities, relations, cx,
+                    );
                 }
             }
         }
@@ -194,7 +251,24 @@ fn extract_php_node(
                             import_source: None,
                         });
                     }
-                    extract_calls_from_body(node, source, &qualified, relations);
+                    // A constructor parameter with a visibility declares a
+                    // property of its class too (constructor promotion).
+                    if let (Some(cls), Some(parameters)) =
+                        (class_ctx, node.child_by_field_name("parameters"))
+                    {
+                        let mut cursor = parameters.walk();
+                        for parameter in parameters.children(&mut cursor) {
+                            if parameter.kind() == "property_promotion_parameter" {
+                                push_php_field(
+                                    &parameter, &parameter, &parameter, cls, source, file_id,
+                                    entities, relations,
+                                );
+                            }
+                        }
+                    }
+                    extract_callable_body(
+                        node, source, file_id, &qualified, class_ctx, entities, relations, cx,
+                    );
                 }
             }
         }
@@ -214,7 +288,10 @@ fn extract_php_node(
                     });
 
                     // Extract base class (extends)
-                    if let Some(base) = node.child_by_field_name("base_clause") {
+                    // `base_clause` is a child kind, not a field: looking it
+                    // up as a field found nothing, and no PHP class had an
+                    // `Extends` edge.
+                    if let Some(base) = child_of_kind(node, "base_clause") {
                         let base_text = base.utf8_text(source).unwrap_or("").to_string();
                         let base_name = base_text
                             .trim()
@@ -241,6 +318,13 @@ fn extract_php_node(
                     // Extract interfaces (implements)
                     extract_php_implements(node, source, &name, relations);
 
+                    // A trait a class uses hands it the trait's methods, which
+                    // the class's own methods override: an inherited
+                    // implementation, so an `Extends` edge.
+                    if let Some(body) = node.child_by_field_name("body") {
+                        extract_php_trait_uses(&body, source, &name, relations);
+                    }
+
                     // Recurse into class body
                     if let Some(body) = node.child_by_field_name("body") {
                         extract_php_children(
@@ -250,6 +334,7 @@ fn extract_php_node(
                             Some(&name),
                             entities,
                             relations,
+                            cx,
                         );
                     }
                 }
@@ -279,6 +364,7 @@ fn extract_php_node(
                             Some(&name),
                             entities,
                             relations,
+                            cx,
                         );
                     }
                 }
@@ -308,6 +394,7 @@ fn extract_php_node(
                             Some(&name),
                             entities,
                             relations,
+                            cx,
                         );
                     }
                 }
@@ -319,7 +406,7 @@ fn extract_php_node(
                 if !name.is_empty() {
                     entities.push(ExtractedEntity {
                         kind: EntityKind::EnumDef,
-                        name,
+                        name: name.clone(),
                         signature: node_signature(node, source),
                         visibility: Visibility::Public,
                         doc_summary: extract_preceding_comment(node, source),
@@ -327,6 +414,18 @@ fn extract_php_node(
                         span: span_from_node(node, file_id),
                         declaration_line: None,
                     });
+                    // An enum declares methods and constants like a class.
+                    if let Some(body) = node.child_by_field_name("body") {
+                        extract_php_children(
+                            &body,
+                            source,
+                            file_id,
+                            Some(&name),
+                            entities,
+                            relations,
+                            cx,
+                        );
+                    }
                 }
             }
         }
@@ -334,7 +433,10 @@ fn extract_php_node(
             let mut child_cursor = node.walk();
             for child in node.children(&mut child_cursor) {
                 if child.kind() == "const_element" {
-                    if let Some(name_node) = child.child_by_field_name("name") {
+                    // The constant's name is a `name` child, not a field:
+                    // looking it up as a field found nothing, and no PHP
+                    // constant was admitted.
+                    if let Some(name_node) = child_of_kind(&child, "name") {
                         let name = name_node.utf8_text(source).unwrap_or("").to_string();
                         if !name.is_empty() {
                             let qualified = if let Some(cls) = class_ctx {
@@ -358,18 +460,48 @@ fn extract_php_node(
             }
         }
         "property_declaration" => {
-            // Extract class properties that are const-like (static final pattern not in PHP,
-            // but we capture const properties via const_declaration above)
+            // Every property a class declares is a field entity `Class.name`.
+            if let Some(cls) = class_ctx {
+                let mut cursor = node.walk();
+                let elements: Vec<tree_sitter::Node> = node
+                    .children(&mut cursor)
+                    .filter(|child| child.kind() == "property_element")
+                    .collect();
+                for element in &elements {
+                    let spanned = if elements.len() == 1 { node } else { element };
+                    push_php_field(
+                        element, spanned, node, cls, source, file_id, entities, relations,
+                    );
+                }
+            }
+        }
+        "enum_case" => {
+            // An enum case is a constant of its enum: `Mode::Fast`.
+            if let (Some(cls), Some(name_node)) = (class_ctx, node.child_by_field_name("name")) {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Constant,
+                        name: format!("{cls}.{name}"),
+                        signature: node_signature(node, source),
+                        visibility: Visibility::Public,
+                        doc_summary: None,
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                        declaration_line: None,
+                    });
+                }
+            }
         }
         "namespace_definition" => {
             // Recurse into namespace body
             if let Some(body) = node.child_by_field_name("body") {
-                extract_php_children(&body, source, file_id, class_ctx, entities, relations);
+                extract_php_children(&body, source, file_id, class_ctx, entities, relations, cx);
             }
         }
         // The top-level program node wraps everything
         "program" => {
-            extract_php_children(node, source, file_id, class_ctx, entities, relations);
+            extract_php_children(node, source, file_id, class_ctx, entities, relations, cx);
         }
         _ => {}
     }
@@ -453,55 +585,390 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     }
 }
 
-/// Recursively walk a function/method body to find call expressions.
-fn extract_calls_from_body(
+fn child_of_kind<'tree>(
+    node: &tree_sitter::Node<'tree>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == kind);
+    found
+}
+
+/// What the walk of one PHP file reads once and shares with every callable:
+/// the file's names, every callable's value-origin facts, each class's base,
+/// and the nested-definition census.
+struct PhpCx {
+    file: php_origins::FileContext,
+    facts: HashMap<(usize, usize), ScopeFacts>,
+    bases: HashMap<String, String>,
+    nested: PhpNestedState,
+}
+
+impl PhpCx {
+    fn read(tree: &Tree, source: &[u8]) -> Self {
+        let root = tree.root_node();
+        let file = php_origins::FileContext::read(root, source);
+        let mut bases = HashMap::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "class_declaration" {
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok());
+                let base = child_of_kind(&node, "base_clause")
+                    .and_then(|clause| clause.named_child(0))
+                    .and_then(|base| base.utf8_text(source).ok());
+                if let (Some(name), Some(base)) = (name, base) {
+                    bases.insert(name.to_string(), file.call_owner_leaf(base));
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        Self {
+            facts: php_origins::facts_by_range(tree, source),
+            file,
+            bases,
+            nested: PhpNestedState::default(),
+        }
+    }
+}
+
+/// What the walk accumulates about definitions nested in callable bodies.
+#[derive(Default)]
+struct PhpNestedState {
+    census: NestedDefinitionCensus,
+    names: LocalScopeNames,
+}
+
+impl PhpNestedState {
+    fn decline(&mut self, name: String, kind: EntityKind, line: u32, enclosing: &str) {
+        self.census.record(UnadmittedNestedDefinition {
+            name,
+            kind,
+            start_line: line,
+            enclosing: Some(enclosing.to_string()),
+            bases: Vec::new(),
+        });
+    }
+}
+
+/// Walk a function or method body: admit what it defines and emit its calls.
+///
+/// `$this->m()`, `self::m()` and `static::m()` are emitted owner-qualified
+/// (`Store.m`), the shape the linker's inheritance-aware tier reads, and so
+/// are `parent::m()` (on the declared base) and a static call on a named
+/// class (`Store::create()`, by the class's leaf through the file's `use`
+/// aliases). A call through a variable or a typed property with a
+/// value-origin fact the linker can follow carries its receiver (`$store`,
+/// `$this->store`) and the bare method, so the linker's value-origin tier
+/// binds it to the class the declarations name. Every other call keeps the
+/// bare method or function name.
+///
+/// A closure or arrow function bound once to a local becomes the function
+/// `F.<locals>.name`, owning the calls in its body, and `$name(...)` reaches
+/// it. A named function or class declared in a body is global in PHP once
+/// the enclosing function runs, so it is admitted under its plain name. An
+/// anonymous class is recorded as a nested definition not admitted.
+#[allow(clippy::too_many_arguments)]
+fn extract_callable_body(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    context_name: &str,
+    class_ctx: Option<&str>,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    cx: &mut PhpCx,
+) {
+    let census = php_origins::Census::of(*node, &cx.file, source);
+    let mut nested = NestedCalls::default();
+    let mut closures = Vec::new();
+    let mut declarations = Vec::new();
+    if let Some(body) = node.child_by_field_name("body") {
+        let mut stack = vec![body];
+        while let Some(current) = stack.pop() {
+            match current.kind() {
+                "anonymous_function" | "arrow_function" => {
+                    if let Some(name) = php_origins::bound_closure_name(current, source) {
+                        let entity = local_scope_name(context_name, &name);
+                        let line = current.start_position().row as u32;
+                        let variable = format!("${name}");
+                        if census.single(&variable) && cx.nested.names.claim(&entity) {
+                            nested.skip.push((current.start_byte(), current.end_byte()));
+                            nested.renames.push((variable, entity.clone()));
+                            closures.push((entity, current));
+                        } else {
+                            cx.nested
+                                .decline(entity, EntityKind::Function, line, context_name);
+                        }
+                    }
+                    // Its own closures stay with it.
+                    continue;
+                }
+                "function_definition"
+                | "class_declaration"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "enum_declaration" => {
+                    nested.skip.push((current.start_byte(), current.end_byte()));
+                    declarations.push(current);
+                    continue;
+                }
+                "anonymous_class" => {
+                    cx.nested.decline(
+                        local_scope_name(
+                            context_name,
+                            &format!("anonymous@{}", current.start_position().row + 1),
+                        ),
+                        EntityKind::Class,
+                        current.start_position().row as u32,
+                        context_name,
+                    );
+                }
+                _ => {}
+            }
+            let mut cursor = current.walk();
+            stack.extend(current.named_children(&mut cursor));
+        }
+    }
+    let scope = CallScope {
+        owner: class_ctx,
+        base: class_ctx.and_then(|class| cx.bases.get(class)).cloned(),
+        facts: cx.facts.get(&(node.start_byte(), node.end_byte())),
+        file: &cx.file,
+    };
+    collect_calls(node, source, context_name, &scope, &nested, relations);
+
+    for (entity, closure) in closures {
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Function,
+            name: entity.clone(),
+            signature: node_signature(&closure, source),
+            visibility: Visibility::Private,
+            doc_summary: None,
+            fingerprint: compute_fingerprint(&closure, source),
+            span: span_from_node(&closure, file_id),
+            declaration_line: None,
+        });
+        // An arrow function reads `$this` of the method around it; a
+        // closure's `$this` can be rebound, so it keeps no owner.
+        let owner = (closure.kind() == "arrow_function")
+            .then_some(class_ctx)
+            .flatten();
+        let own = CallScope {
+            owner,
+            base: owner.and_then(|class| cx.bases.get(class)).cloned(),
+            facts: cx.facts.get(&(closure.start_byte(), closure.end_byte())),
+            file: &cx.file,
+        };
+        let inner = NestedCalls {
+            skip: Vec::new(),
+            renames: nested.renames.clone(),
+        };
+        collect_calls(&closure, source, &entity, &own, &inner, relations);
+    }
+    for declaration in declarations {
+        extract_php_node(&declaration, source, file_id, None, entities, relations, cx);
+    }
+}
+
+/// The admitted definitions inside one callable body.
+#[derive(Default)]
+struct NestedCalls {
+    /// Bodies whose calls another entity owns.
+    skip: Vec<(usize, usize)>,
+    /// (`$variable`, entity) for each admitted closure.
+    renames: Vec<(String, String)>,
+}
+
+impl NestedCalls {
+    fn skips(&self, node: &tree_sitter::Node) -> bool {
+        self.skip
+            .iter()
+            .any(|&(start, end)| node.start_byte() == start && node.end_byte() == end)
+    }
+}
+
+/// What one callable's calls are read against.
+struct CallScope<'a> {
+    /// The class `$this`, `self` and `static` name.
+    owner: Option<&'a str>,
+    /// The base `parent` names.
+    base: Option<String>,
+    facts: Option<&'a ScopeFacts>,
+    file: &'a php_origins::FileContext,
+}
+
+impl CallScope<'_> {
+    /// Whether the linker's value-origin tier can follow the binding a
+    /// receiver key names: a declared type, an instance of a class, a
+    /// function this file declares (the linker finds a free function only in
+    /// the calling file), or a method called on one of those.
+    fn followable(&self, key: &str) -> bool {
+        let Some(facts) = self.facts else {
+            return false;
+        };
+        fn follows(
+            facts: &ScopeFacts,
+            file: &php_origins::FileContext,
+            origin: &ValueOrigin,
+            depth: usize,
+        ) -> bool {
+            if depth > 8 {
+                return false;
+            }
+            match origin {
+                ValueOrigin::Declared { .. } => true,
+                ValueOrigin::Local { name } => facts
+                    .bindings
+                    .get(name)
+                    .is_some_and(|bound| follows(facts, file, bound, depth + 1)),
+                ValueOrigin::Call { callee } => {
+                    file.declares_function(callee)
+                        || callee
+                            .chars()
+                            .next()
+                            .is_some_and(|first| first.is_ascii_uppercase())
+                }
+                ValueOrigin::MethodCall { receiver, .. } => {
+                    follows(facts, file, receiver, depth + 1)
+                }
+                ValueOrigin::Entered { .. }
+                | ValueOrigin::Provided { .. }
+                | ValueOrigin::External { .. }
+                | ValueOrigin::Supplied { .. }
+                | ValueOrigin::ImportedProvider { .. }
+                | ValueOrigin::ImportedCall { .. }
+                | ValueOrigin::Global { .. }
+                | ValueOrigin::Enclosing { .. }
+                | ValueOrigin::Module { .. }
+                | ValueOrigin::ModuleMember { .. } => false,
+            }
+        }
+        facts
+            .bindings
+            .get(key)
+            .is_some_and(|origin| follows(facts, self.file, origin, 0))
+    }
+}
+
+fn collect_calls(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    scope: &CallScope<'_>,
+    nested: &NestedCalls,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "function_call_expression" || child.kind() == "member_call_expression" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                let callee = name_node.utf8_text(source).unwrap_or("").to_string();
-                if !callee.is_empty() {
-                    relations.push(ExtractedRelation {
-                        // The call expression itself, so a reference row can
-                        // report the line the call is written on. Without it the
-                        // linker has no span to store and every consuming
-                        // surface reports the edge as having no evidence span.
-                        site: Some(crate::adapter::site_from_node(&child)),
-                        receiver: None,
-                        call_shape: None,
-                        kind: kin_model::RelationKind::Calls,
-                        src_name: context_name.to_string(),
-                        dst_name: callee,
-                        import_source: None,
-                    });
-                }
-            } else {
-                // For function_call_expression, the function name might be a direct child
-                let func = child.child_by_field_name("function");
-                if let Some(func_node) = func {
-                    let callee = func_node.utf8_text(source).unwrap_or("").to_string();
-                    if !callee.is_empty() && !callee.starts_with('"') && !callee.starts_with('\'') {
-                        relations.push(ExtractedRelation {
-                            // The call expression itself, for the same reason
-                            // the named-callee arm above records one.
-                            site: Some(crate::adapter::site_from_node(&child)),
-                            receiver: None,
-                            call_shape: None,
-                            kind: kin_model::RelationKind::Calls,
-                            src_name: context_name.to_string(),
-                            dst_name: callee,
-                            import_source: None,
-                        });
-                    }
-                }
+        if nested.skips(&child) {
+            continue;
+        }
+        if let Some((dst_name, receiver)) = call_shape(&child, source, scope, nested) {
+            if !dst_name.is_empty() {
+                relations.push(ExtractedRelation {
+                    // The call expression itself, so a reference row can
+                    // report the line the call is written on. Without it the
+                    // linker has no span to store and every consuming
+                    // surface reports the edge as having no evidence span.
+                    site: Some(crate::adapter::site_from_node(&child)),
+                    receiver,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Calls,
+                    src_name: context_name.to_string(),
+                    dst_name,
+                    import_source: None,
+                });
             }
         }
-        extract_calls_from_body(&child, source, context_name, relations);
+        collect_calls(&child, source, context_name, scope, nested, relations);
+    }
+}
+
+/// The callee name and receiver a call node is emitted with, or `None` when
+/// the node is no call.
+fn call_shape(
+    call: &tree_sitter::Node,
+    source: &[u8],
+    scope: &CallScope<'_>,
+    nested: &NestedCalls,
+) -> Option<(String, Option<String>)> {
+    let text = |node: tree_sitter::Node| node.utf8_text(source).unwrap_or("").to_string();
+    match call.kind() {
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            let name = call.child_by_field_name("name")?;
+            let method = text(name);
+            if name.kind() != "name" {
+                // `$obj->$method()`: the bare text, as before.
+                return Some((method, None));
+            }
+            let object = call.child_by_field_name("object");
+            let spelled = object.map(text).unwrap_or_default();
+            if spelled == "$this" {
+                if let Some(owner) = scope.owner {
+                    return Some((format!("{owner}.{method}"), None));
+                }
+            }
+            let key = object.and_then(|object| match object.kind() {
+                "variable_name" if spelled != "$this" => Some(spelled.clone()),
+                "member_access_expression" => {
+                    php_origins::this_property(object, source).map(|prop| format!("$this->{prop}"))
+                }
+                _ => None,
+            });
+            match key {
+                Some(key) if scope.followable(&key) => Some((method, Some(key))),
+                _ => Some((method, None)),
+            }
+        }
+        "scoped_call_expression" => {
+            let name = call.child_by_field_name("name")?;
+            let method = text(name);
+            if name.kind() != "name" {
+                return Some((method, None));
+            }
+            let scope_node = call.child_by_field_name("scope")?;
+            let owner = match scope_node.kind() {
+                "relative_scope" => match text(scope_node).to_lowercase().as_str() {
+                    "self" | "static" => scope.owner.map(str::to_string),
+                    "parent" => scope.base.clone(),
+                    _ => None,
+                },
+                "name" | "qualified_name" | "relative_name" => {
+                    Some(scope.file.call_owner_leaf(&text(scope_node)))
+                }
+                _ => None,
+            };
+            Some(match owner {
+                Some(owner) if !owner.is_empty() => (format!("{owner}.{method}"), None),
+                _ => (method, None),
+            })
+        }
+        "function_call_expression" => {
+            if let Some(name_node) = call.child_by_field_name("name") {
+                return Some((text(name_node), None));
+            }
+            let function = call.child_by_field_name("function")?;
+            let callee = text(function);
+            if callee.starts_with('"') || callee.starts_with('\'') {
+                return None;
+            }
+            if function.kind() == "variable_name" {
+                if let Some((_, entity)) = nested
+                    .renames
+                    .iter()
+                    .find(|(variable, _)| *variable == callee)
+                {
+                    return Some((entity.clone(), None));
+                }
+            }
+            Some((callee, None))
+        }
+        _ => None,
     }
 }
 
@@ -527,6 +994,43 @@ fn extract_php_imports(
         }
         // Recurse to find use declarations inside namespace bodies
         extract_php_imports(&child, source, file_id, imports, relations);
+    }
+}
+
+/// Every trait a class body's `use` declarations name, as an `Extends` edge
+/// from the class to the trait's name as the file spells it, without a
+/// leading namespace.
+fn extract_php_trait_uses(
+    body: &tree_sitter::Node,
+    source: &[u8],
+    class: &str,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if member.kind() != "use_declaration" {
+            continue;
+        }
+        let mut names = member.walk();
+        for name in member.named_children(&mut names) {
+            if !matches!(name.kind(), "name" | "qualified_name") {
+                continue;
+            }
+            let spelled = name.utf8_text(source).unwrap_or("").trim();
+            let leaf = spelled.rsplit('\\').next().unwrap_or(spelled).trim();
+            if leaf.is_empty() {
+                continue;
+            }
+            relations.push(ExtractedRelation {
+                site: None,
+                receiver: None,
+                call_shape: None,
+                kind: kin_model::RelationKind::Extends,
+                src_name: class.to_string(),
+                dst_name: leaf.to_string(),
+                import_source: None,
+            });
+        }
     }
 }
 
@@ -589,6 +1093,59 @@ fn parse_php_use_declaration(node: &tree_sitter::Node, source: &[u8]) -> Option<
         }
     }
     None
+}
+
+/// The field entity `class.name` for the property `holder` names (a
+/// `property_element` or a promoted constructor parameter), spanning
+/// `spanned`, with the visibility `declaration` writes, contained by its
+/// class.
+#[allow(clippy::too_many_arguments)]
+fn push_php_field(
+    holder: &tree_sitter::Node,
+    spanned: &tree_sitter::Node,
+    declaration: &tree_sitter::Node,
+    class: &str,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let mut cursor = holder.walk();
+    let Some(variable) = holder
+        .children(&mut cursor)
+        .find(|child| child.kind() == "variable_name")
+    else {
+        return;
+    };
+    let mut inner = variable.walk();
+    let Some(name) = variable
+        .children(&mut inner)
+        .find(|child| child.kind() == "name")
+        .and_then(|name| name.utf8_text(source).ok())
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let qualified = format!("{class}.{name}");
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Field,
+        name: qualified.clone(),
+        signature: node_signature(spanned, source),
+        visibility: detect_php_visibility(declaration, source),
+        doc_summary: extract_preceding_comment(declaration, source),
+        fingerprint: compute_fingerprint(spanned, source),
+        span: span_from_node(spanned, file_id),
+        declaration_line: None,
+    });
+    relations.push(ExtractedRelation {
+        site: None,
+        receiver: None,
+        call_shape: None,
+        kind: kin_model::RelationKind::Contains,
+        src_name: class.to_string(),
+        dst_name: qualified,
+        import_source: None,
+    });
 }
 
 #[cfg(test)]

@@ -193,6 +193,37 @@ def run(cmd, cwd=None, env=None, timeout=600):
     return proc.returncode, proc.stdout
 
 
+def run_apart(cmd, cwd=None, env=None, timeout=600):
+    """`run`, with stderr kept apart, for a command whose stdout is a report a
+    log line printed beside it must not corrupt."""
+    proc = subprocess.run(
+        cmd, cwd=cwd, env=env, timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def read_native_author(kin, repo, env):
+    """The newest native change's recorded author and the name `kin log` shows
+    for it, as (recorded, shown, problem). `problem` says why either could not
+    be read, and is None when both were."""
+    rc, out, err = run_apart([kin, "log", "--json"], cwd=repo, env=env)
+    if rc != 0:
+        return None, None, "kin log --json failed (rc=%d): %s" % (rc, error_lines(err or out))
+    recorded = native_change_author(out)
+    if recorded is None:
+        return None, None, ("kin log --json carried no native change with an author: %s"
+                            % tail(out))
+    rc, out = run([kin, "log"], cwd=repo, env=env)
+    if rc != 0:
+        return recorded, None, "kin log failed (rc=%d): %s" % (rc, error_lines(out))
+    shown = native_change_shown(out)
+    if shown is None:
+        return recorded, None, ("kin log printed no native change with an Author line: %s"
+                                % tail(out))
+    return recorded, shown, None
+
+
 class Result(object):
     def __init__(self, check_id, title):
         self.id = check_id
@@ -261,12 +292,42 @@ def init_refused_over(out, name):
     return "admission blocker" in out and "Git hook" in out and name in out
 
 
-def native_change_author(out):
-    """The `Author:` of the newest native change in `kin log`, or None.
+def native_change_author(log_json):
+    """The author the newest native change records, read from `kin log --json`, or None.
 
-    Scoped to `Origin: native` on purpose. Imported changes carry the author Git
-    recorded, so a grader that took the first `Author:` line it saw would read an
+    The JSON report carries the identity as Kin recorded it, `Name <email>`. The
+    text log shows a person by name alone, so it cannot tell the configured
+    identity from a value that merely shares the name, and the stamp is graded
+    here.
+
+    Scoped to native changes on purpose. Imported changes carry the author Git
+    recorded, so a grader that took the first author it saw would read an
     imported one and pass while a native commit was stamped by anybody.
+    """
+    try:
+        report = json.loads(log_json)
+    except (TypeError, ValueError):
+        return None
+    entries = report.get("entries") if isinstance(report, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        origin = entry.get("origin")
+        if isinstance(origin, dict) and origin.get("type") == "native":
+            author = entry.get("author")
+            if isinstance(author, str) and author.strip():
+                return author.strip()
+            return None
+    return None
+
+
+def native_change_shown(out):
+    """The `Author:` line `kin log` prints for the newest native change, or None.
+
+    The surface a person reads, and the one the report that started this was
+    read from. Scoped to `Origin: native` for the same reason as above.
     """
     for block in re.split(r"^change ", out, flags=re.M)[1:]:
         if not re.search(r"^Origin: native", block, re.M):
@@ -275,6 +336,12 @@ def native_change_author(out):
         if match:
             return match.group(1).strip()
     return None
+
+
+def shows_the_configured_person(shown, name, identity):
+    """Whether the text log names the configured person: by name, which is what
+    `kin log` prints, or by the whole identity, which an earlier build printed."""
+    return shown is not None and shown in (name, identity)
 
 
 def identity_refusal_is_worded(out):
@@ -295,6 +362,8 @@ GRADERS = {
     "refusal_is_worded": refusal_is_worded,
     "init_refused_over": init_refused_over,
     "native_change_author": native_change_author,
+    "native_change_shown": native_change_shown,
+    "shows_the_configured_person": shows_the_configured_person,
     "identity_refusal_is_worded": identity_refusal_is_worded,
 }
 
@@ -372,12 +441,17 @@ class Suite(object):
         self.kin_home = os.path.join(workdir, "kin-home-%d" % os.getpid())
         os.makedirs(self.kin_home, exist_ok=True)
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         # A scratch KIN_HOME keeps this run off the fleet's stores and the
         # auto-embed opt-out keeps it off the GPU.
         self.env["KIN_HOME"] = self.kin_home
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:
@@ -638,6 +712,11 @@ def check_author(suite):
     Git rather than a constant written here, because a constant this file and the
     fixture both spell would agree with itself while the product stamped anybody.
 
+    The stamp is read from `kin log --json`, which carries the identity as Kin
+    recorded it, `Name <email>`. The text log now shows a person by name alone,
+    so it is graded only for naming the configured person; the address it no
+    longer prints is proved by the record.
+
     This arm pins REPOSITORY scope. The container's identity was global, and
     `check_author_global` covers that, because closing the class at one scope
     says nothing about the other.
@@ -661,17 +740,21 @@ def check_author(suite):
         configured.append(out.strip())
     want = "%s <%s>" % (configured[0], configured[1])
 
-    rc, out = suite.kin_run(["log"], repo)
-    if rc != 0:
-        result.unknown("kin log failed (rc=%d): %s" % (rc, error_lines(out)))
-        return result
-    stamped = native_change_author(out)
+    stamped, shown, problem = read_native_author(suite.kin, repo, suite.env)
+    suite.log("kin log: native change recorded %r, shown as %r" % (stamped, shown))
     if stamped is None:
-        result.unknown("kin log printed no native change with an Author line: %s" % tail(out))
+        result.unknown(problem)
         return result
     if stamped != want:
         result.bad("the native change is stamped %r, but this repository's Git identity is %r; "
                    "kin substituted an identity nobody configured" % (stamped, want))
+        return result
+    if shown is None:
+        result.unknown(problem)
+        return result
+    if not shows_the_configured_person(shown, configured[0], want):
+        result.bad("the native change records %r, but kin log shows its author as %r" %
+                   (stamped, shown))
         return result
 
     # Nothing resolvable anywhere: the repository's own scope is unset and both
@@ -697,8 +780,8 @@ def check_author(suite):
         result.bad("kin refused the unattributable commit but did not name both remedies: %s"
                    % error_lines(out))
     else:
-        result.ok("stamped %r, matching this repository's Git identity, and refused when "
-                  "nothing was resolvable" % stamped)
+        result.ok("stamped %r, matching this repository's Git identity, shown by kin log as "
+                  "%r, and refused when nothing was resolvable" % (stamped, shown))
     return result
 
 
@@ -781,19 +864,22 @@ def check_author_global(suite):
                        % (rc, error_lines(out)))
         return result
 
-    rc, out = run([suite.kin, "log"], cwd=repo, env=env)
-    if rc != 0:
-        result.unknown("kin log failed (rc=%d): %s" % (rc, error_lines(out)))
-        return result
-    stamped = native_change_author(out)
+    stamped, shown, problem = read_native_author(suite.kin, repo, env)
+    suite.log("kin log: native change recorded %r, shown as %r" % (stamped, shown))
     if stamped is None:
-        result.unknown("kin log printed no native change with an Author line: %s" % tail(out))
+        result.unknown(problem)
         return result
     if stamped != want:
         result.bad("the native change is stamped %r, but the only identity resolvable here is the "
                    "global %r; kin did not read global scope" % (stamped, want))
+    elif shown is None:
+        result.unknown(problem)
+    elif not shows_the_configured_person(shown, merged[0], want):
+        result.bad("the native change records %r, but kin log shows its author as %r" %
+                   (stamped, shown))
     else:
-        result.ok("stamped %r from global scope alone, with no local identity present" % stamped)
+        result.ok("stamped %r from global scope alone, with no local identity present, and "
+                  "kin log shows %r" % (stamped, shown))
     return result
 
 
@@ -866,14 +952,43 @@ def self_test():
            "Author: Nate Prewitt <nate.prewitt@gmail.com> 1787618757 -0600\n"
            "Date:   2026-08-25T00:45:57Z\n"
            "Origin: git commit 5460f467\n")
-    expect("the native change's author is the one read",
-           native_change_author(log), "Kin Isolation Probe <iso-probe@firelock.io>")
-    expect("an imported change alone yields no native author",
-           native_change_author("change bbb\n"
-                                "Author: Nate Prewitt <nate.prewitt@gmail.com> 1 -0600\n"
-                                "Origin: git commit 5460f467\n"), None)
-    expect("a log with no Author line yields none",
-           native_change_author("change aaa\nOrigin: native\n"), None)
+    expect("the native change's shown author is the one read",
+           native_change_shown(log), "Kin Isolation Probe <iso-probe@firelock.io>")
+    expect("an imported change alone shows no native author",
+           native_change_shown("change bbb\n"
+                               "Author: Nate Prewitt <nate.prewitt@gmail.com> 1 -0600\n"
+                               "Origin: git commit 5460f467\n"), None)
+    expect("a log with no Author line shows none",
+           native_change_shown("change aaa\nOrigin: native\n"), None)
+
+    # `kin log --json` in the shape a current build prints it. The imported entry
+    # sits above the native one here, so a grader that took the first author it
+    # saw would read the imported one.
+    imported = {"origin": {"type": "git_commit", "oid": {"algorithm": "sha1", "bytes": [1]}},
+                "author": "Nate Prewitt <nate.prewitt@gmail.com>"}
+    native = {"origin": {"type": "native"},
+              "author": "Kin Isolation Probe <iso-probe@firelock.io>"}
+    expect("the native change's recorded author is the one read",
+           native_change_author(json.dumps({"entries": [imported, native]})),
+           "Kin Isolation Probe <iso-probe@firelock.io>")
+    expect("an imported change alone records no native author",
+           native_change_author(json.dumps({"entries": [imported]})), None)
+    expect("a native change with no author records none",
+           native_change_author(json.dumps({"entries": [{"origin": {"type": "native"}}]})),
+           None)
+    expect("text that is not the JSON report yields none", native_change_author(log), None)
+    expect("a report with no entries yields none", native_change_author("{}"), None)
+
+    expect("the text log naming the configured person by name passes",
+           shows_the_configured_person("Kin CI", "Kin CI", "Kin CI <ci@kinlab.ai>"), True)
+    expect("the text log naming the whole configured identity passes",
+           shows_the_configured_person("Kin CI <ci@kinlab.ai>", "Kin CI",
+                                       "Kin CI <ci@kinlab.ai>"), True)
+    expect("the text log naming somebody else fails",
+           shows_the_configured_person("Kin Isolation Probe", "Kin CI",
+                                       "Kin CI <ci@kinlab.ai>"), False)
+    expect("a text log with no author fails",
+           shows_the_configured_person(None, "Kin CI", "Kin CI <ci@kinlab.ai>"), False)
 
     remedy = ("Error: kin has no author identity to record for this change.\n\n"
               "Authorship is provenance. A change attributed to nobody cannot support review "

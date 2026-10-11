@@ -3852,30 +3852,33 @@ pub(crate) async fn probe_language_server_readiness(
     use kin_core::reference_coverage::{
         LanguageServerReadiness, LanguageServerReadinessMap, ENRICHABLE_LANGUAGES,
     };
-    use kin_lsp::registry::{ProviderGapReason, ProviderRegistry};
+    use kin_lsp::lifecycle::AdapterProbe;
 
+    // Each language is probed with the server its adapter names and the
+    // launch the adapter configures, which is what the daemon starts. A probe
+    // that started the server with no configuration failed where the daemon
+    // succeeded: typescript-language-server given no TypeScript refuses to
+    // initialize, and the daemon's launch gives it one.
     let probes: Vec<_> = ENRICHABLE_LANGUAGES
         .iter()
         .copied()
-        .map(|language| {
+        .filter_map(|language| Some((language, kin_lsp::adapters::for_language(language)?)))
+        .map(|(language, adapter)| {
             let workspace_root = workspace_root.to_path_buf();
             tokio::spawn(async move {
-                let registry = ProviderRegistry::with_defaults();
-                let readiness = match kin_lsp::lifecycle::probe_readiness(
-                    &registry,
-                    language,
+                let readiness = match kin_lsp::lifecycle::probe_adapter(
+                    adapter,
                     &workspace_root,
-                    None,
+                    kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT,
+                    &kin_lsp::SystemBinaryFinder,
                 )
                 .await
                 {
-                    Ok(_) => LanguageServerReadiness::Usable,
-                    Err(gap) => match gap.reason {
-                        ProviderGapReason::ServerUnusable { message } => {
-                            LanguageServerReadiness::Unusable { reason: message }
-                        }
-                        _ => LanguageServerReadiness::Absent,
-                    },
+                    AdapterProbe::Usable => LanguageServerReadiness::Usable,
+                    AdapterProbe::NotInstalled { .. } => LanguageServerReadiness::Absent,
+                    AdapterProbe::Unusable { reason } => {
+                        LanguageServerReadiness::Unusable { reason }
+                    }
                 };
                 (language, readiness)
             })

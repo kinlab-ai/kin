@@ -7,8 +7,13 @@
 //! train on [`crate::features::TrainingExample`]s and rerank candidates by
 //! predicted relevance score.
 
+use kin_io::HostDir;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// The largest model the ranker reads. A trained ensemble is a few megabytes of
+/// JSON; anything far larger is not one of ours.
+const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
 
 use crate::features::{LocateFeatureVector, TrainingExample};
 
@@ -35,17 +40,30 @@ pub struct GradientBoostedRanker {
 }
 
 impl GradientBoostedRanker {
-    /// Load a trained model from JSON.
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let data = std::fs::read_to_string(path)?;
-        let model: Self = serde_json::from_str(&data)?;
+    /// Load a trained model from the JSON entry `name` in the model directory
+    /// `dir`.
+    pub fn load(dir: &HostDir, name: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let name = name.as_ref();
+        let data = dir.read(name, MAX_MODEL_BYTES)?.ok_or_else(|| {
+            format!(
+                "no ranking model {} in {}",
+                name.display(),
+                dir.root().display()
+            )
+        })?;
+        let model: Self = serde_json::from_slice(&data)?;
         Ok(model)
     }
 
-    /// Save model to JSON.
-    pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    /// Save the model as the JSON entry `name` in the model directory `dir`,
+    /// replacing any earlier one atomically.
+    pub fn save(
+        &self,
+        dir: &HostDir,
+        name: impl AsRef<Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        dir.write(name, json.as_bytes())?;
         Ok(())
     }
 
@@ -460,19 +478,16 @@ mod tests {
             base_score: 0.5,
         };
 
-        let dir = std::env::temp_dir().join("kin_ltr_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("model.json");
+        let root = tempfile::tempdir().unwrap();
+        let dir = HostDir::open(root.path(), &kin_io::Grant::ambient()).unwrap();
 
-        ranker.save(&path).unwrap();
-        let loaded = GradientBoostedRanker::load(&path).unwrap();
+        ranker.save(&dir, "model.json").unwrap();
+        let loaded = GradientBoostedRanker::load(&dir, "model.json").unwrap();
+        assert!(GradientBoostedRanker::load(&dir, "absent.json").is_err());
 
         assert_eq!(loaded.trees.len(), 1);
         assert!((loaded.base_score - 0.5).abs() < 1e-7);
         assert!((loaded.learning_rate - 0.1).abs() < 1e-7);
-
-        // Cleanup.
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

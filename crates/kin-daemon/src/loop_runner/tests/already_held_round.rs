@@ -42,16 +42,33 @@ async fn settled_epoch(state: &DaemonState) -> u64 {
     .expect("the loop settles")
 }
 
-/// Wait until the reconcile pass records progress past `before`.
+/// Write `contents` to `rel_path` and wait until the reconcile pass records
+/// progress past `before`.
+///
+/// A saturated host can drop the write's notification and say nothing, so the
+/// same bytes are written again, by rename, only while the loop has received no
+/// notification for the path. A round that received it and did nothing still
+/// fails here.
 #[cfg(unix)]
-async fn progress_past(state: &DaemonState, before: u64) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while reconcile_progress(state) <= before {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the loop takes the watcher's event");
+async fn write_and_await_progress(state: &DaemonState, rel_path: &str, contents: &str, before: u64) {
+    let working_dir = state.layout.working_dir().to_path_buf();
+    let host = working_dir.join(rel_path);
+    let notified = HostNotificationMark::take(&working_dir, &[host.as_path()]);
+    std::fs::write(&host, contents).unwrap();
+    notified
+        .await_with_rewrites(
+            state,
+            || replace_by_rename_for_test(&working_dir, &host, contents.as_bytes()),
+            false,
+            async {
+                while reconcile_progress(state) <= before {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("the loop takes the watcher's event");
 }
 
 /// A write that leaves a source file holding the bytes the daemon already
@@ -70,6 +87,9 @@ async fn a_round_that_finds_the_bytes_already_held_leaves_the_epoch_and_a_captur
     let state = open_test_state(&repo);
     let held = "def held():\n    return 1\n";
     admit_and_derive(&state, "pkg/held.py", held);
+    // This grades the round a notification causes. A lost canary's complete
+    // admission would move the epoch by another route.
+    use_delivery_canary_for_test(state.layout.working_dir(), None);
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
@@ -95,8 +115,7 @@ async fn a_round_that_finds_the_bytes_already_held_leaves_the_epoch_and_a_captur
         .unwrap_or_else(|refused| panic!("a settled graph can be captured: {refused:?}"));
     let progress = reconcile_progress(&state);
 
-    std::fs::write(repo.path().join("pkg/held.py"), held).unwrap();
-    progress_past(&state, progress).await;
+    write_and_await_progress(&state, "pkg/held.py", held, progress).await;
     assert_eq!(
         settled_epoch(&state).await,
         epoch,
@@ -109,12 +128,7 @@ async fn a_round_that_finds_the_bytes_already_held_leaves_the_epoch_and_a_captur
 
     // The control: the same watch, different bytes.
     let progress = reconcile_progress(&state);
-    std::fs::write(
-        repo.path().join("pkg/held.py"),
-        "def held():\n    return 2\n",
-    )
-    .unwrap();
-    progress_past(&state, progress).await;
+    write_and_await_progress(&state, "pkg/held.py", "def held():\n    return 2\n", progress).await;
     assert_ne!(
         settled_epoch(&state).await,
         epoch,

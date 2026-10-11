@@ -33,7 +33,7 @@ $KinBin = Join-Path $KinDir "bin"
 $KinLib = Join-Path $KinDir "lib"
 $env:KIN_HOME = $KinDir
 $env:KIN_DIR = $KinDir
-$GitHubOrg = "firelock-ai"
+$GitHubOrg = "kinlab-ai"
 $GitHubRepo = "kin"
 # Override KIN_BASE_URL to install from a mirror or a local path (offline /
 # airgapped installs and CI smoke tests). Mirrors the install.sh override.
@@ -250,7 +250,7 @@ Write-Info "Platform: windows ($Arch)"
 # reader learns what runs natively and what still needs WSL2 before anything is
 # downloaded.
 Write-Host "  ! $NativeWindowsSupportNotice" -ForegroundColor Yellow
-Write-Host "    Details: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor DarkGray
+Write-Host "    Details: https://github.com/kinlab-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor DarkGray
 Write-Host ""
 
 # ── Detect an existing install (reinstall / upgrade) ──────────────────
@@ -456,5 +456,5 @@ if (Test-KinTruthy $env:KIN_NO_SETUP) {
 
 Write-Host ""
 Write-Ok "Done! Open a new terminal, then run 'kin init' in a Git repository."
-Write-Host "  Use WSL2 for review and projection workflows: https://github.com/firelock-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor Yellow
+Write-Host "  Use WSL2 for review and projection workflows: https://github.com/kinlab-ai/kin/blob/main/docs/windows-wsl2.md" -ForegroundColor Yellow
 Write-Host ""

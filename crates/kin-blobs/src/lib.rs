@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod authority;
+pub mod durable;
 mod error;
 
 pub use error::BlobError;
@@ -353,6 +355,135 @@ impl BlobStore {
 
         debug!(hash = %hash, bytes = data.len(), "wrote blob");
         Ok(hash)
+    }
+
+    /// Write several blobs, returning each one's content hash in order.
+    ///
+    /// The store ends up as if each body had gone through [`write`](Self::write)
+    /// in turn, with the same durability for every blob: its bytes are durable
+    /// before the rename that publishes its name, and the directory barriers
+    /// are deferred as `write` defers them. What changes is how the content
+    /// barriers are paid for. `write` gives each blob its own full device
+    /// flush, and on macOS that flush (`F_FULLFSYNC`) empties the whole drive
+    /// cache, about 9 ms a blob on an Apple SSD. Here each blob's bytes are
+    /// handed to the device with an ordinary `fsync`, and one full flush then
+    /// makes all of them durable before any of them is renamed into place, so
+    /// a thousand small blobs cost about a third of a second rather than nine.
+    /// Elsewhere each blob's own `fsync` is already a full barrier and is
+    /// issued as `write` issues it.
+    ///
+    /// Bodies already stored, and repeats within `bodies`, are not written
+    /// again. A failure leaves no temporary file behind, and the blobs renamed
+    /// before it stay, as they would after a failed `write` in a loop.
+    pub fn write_many(&self, bodies: &[&[u8]]) -> Result<Vec<Hash256>> {
+        let _span = tracing::info_span!("kin_blobs.write_many", blobs = bodies.len()).entered();
+        struct Staged {
+            temp: PathBuf,
+            blob: PathBuf,
+            shard: String,
+            created_shard_dir: bool,
+        }
+        let mut hashes = Vec::with_capacity(bodies.len());
+        let mut staged: Vec<Staged> = Vec::new();
+        let mut staging = std::collections::HashSet::new();
+        let mut last: Option<File> = None;
+        let discard = |staged: &[Staged]| {
+            for entry in staged {
+                let _ = fs::remove_file(&entry.temp);
+            }
+        };
+        for data in bodies {
+            let hash = digest(data);
+            hashes.push(hash);
+            let hex = hash.to_string();
+            let shard_dir = self.root.join(&hex[..2]);
+            let blob = shard_dir.join(&hex[2..]);
+            if blob.exists() || !staging.insert(hash) {
+                continue;
+            }
+            let created_shard_dir = match self.ensure_shard_dir(&shard_dir) {
+                Ok(created) => created,
+                Err(error) => {
+                    discard(&staged);
+                    return Err(error);
+                }
+            };
+            let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp = shard_dir.join(format!(".tmp-{}-{}-{}", hash, std::process::id(), seq));
+            let written = File::create(&temp).and_then(|mut file| {
+                file.write_all(data)?;
+                if self.durability == Durability::Barriered {
+                    self.hand_to_device(&file)?;
+                }
+                Ok(file)
+            });
+            match written {
+                Ok(file) => last = Some(file),
+                Err(error) => {
+                    let _ = fs::remove_file(&temp);
+                    discard(&staged);
+                    return Err(BlobError::io(&temp, error));
+                }
+            }
+            staged.push(Staged {
+                temp,
+                blob,
+                shard: hex[..2].to_string(),
+                created_shard_dir,
+            });
+        }
+        if let Some(file) = last.filter(|_| self.durability == Durability::Barriered) {
+            if let Err(error) = self.flush_device(&file) {
+                discard(&staged);
+                return Err(BlobError::io(&staged[staged.len() - 1].temp, error));
+            }
+        }
+        for (at, entry) in staged.iter().enumerate() {
+            if let Err(error) = fs::rename(&entry.temp, &entry.blob) {
+                discard(&staged[at..]);
+                return Err(BlobError::io(&entry.blob, error));
+            }
+            self.record_rename(&entry.shard, entry.created_shard_dir);
+        }
+        debug!(blobs = bodies.len(), written = staged.len(), "wrote blobs");
+        Ok(hashes)
+    }
+
+    /// Hand a staged blob's bytes to the device ahead of the batch's one full
+    /// flush. On Apple platforms that is an ordinary `fsync`, which moves the
+    /// bytes out of the kernel without emptying the drive's cache; elsewhere an
+    /// `fsync` is the full barrier itself, counted as `write` counts it.
+    #[cfg(target_vendor = "apple")]
+    fn hand_to_device(&self, file: &File) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fsync reads a descriptor `file` owns for the whole call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn hand_to_device(&self, file: &File) -> std::io::Result<()> {
+        crate::durable::sync_all(&file)?;
+        self.barriers.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The batch's one full flush: on Apple platforms `F_FULLFSYNC`, which
+    /// empties the drive's cache and so makes every byte handed to it durable.
+    /// Elsewhere every blob already had its own.
+    #[cfg(target_vendor = "apple")]
+    fn flush_device(&self, file: &File) -> std::io::Result<()> {
+        crate::durable::sync_all(file)?;
+        self.barriers.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn flush_device(&self, _file: &File) -> std::io::Result<()> {
+        Ok(())
     }
 
     /// Record one rename as owing a directory barrier, draining if enough have
@@ -825,7 +956,7 @@ impl BlobStore {
         if self.durability == Durability::Ephemeral {
             return Ok(());
         }
-        file.sync_all()?;
+        crate::durable::sync_all(&file)?;
         self.barriers.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -947,7 +1078,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     // namespace barrier: accepting it would let every missing child barrier be
     // mistaken for a pruned shard. Reject the wrong object before flushing.
     ensure_directory_metadata(dir, &directory.metadata()?)?;
-    directory.sync_all()
+    crate::durable::sync_all(&directory)
 }
 
 #[cfg(test)]
@@ -1396,6 +1527,58 @@ mod tests {
 
     /// A write must leave no temporary file behind: the temp is fsynced then
     /// renamed atomically into place, so the shard dir holds only the final blob.
+    #[test]
+    fn write_many_stores_what_write_stores() {
+        let (_dir, store) = make_store();
+        let (_other_dir, other) = make_store();
+        let bodies: Vec<Vec<u8>> = (0..40).map(|n| format!("body {n}").into_bytes()).collect();
+        let mut refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+        // A repeat within the batch, and one already stored.
+        refs.push(bodies[3].as_slice());
+        store.write(&bodies[5]).unwrap();
+        let hashes = store.write_many(&refs).unwrap();
+        assert_eq!(hashes.len(), refs.len());
+        for (body, hash) in refs.iter().zip(&hashes) {
+            assert_eq!(*hash, other.write(body).unwrap());
+            assert_eq!(store.read(hash).unwrap(), *body);
+        }
+        let mut stored = store.list_hashes().unwrap();
+        stored.sort();
+        let mut expected: Vec<Hash256> = bodies.iter().map(|body| digest(body)).collect();
+        expected.sort();
+        assert_eq!(stored, expected);
+        for shard in fs::read_dir(store.root()).unwrap() {
+            for entry in fs::read_dir(shard.unwrap().path()).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_string_lossy().starts_with(".tmp-"), "{name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn write_many_pays_for_its_content_barriers_once_where_one_flush_covers_them() {
+        let (_dir, store) = make_store();
+        let bodies: Vec<Vec<u8>> = (0..25).map(|n| vec![n as u8; 64]).collect();
+        let refs: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+        store.write_many(&refs).unwrap();
+        let expected = if cfg!(target_vendor = "apple") { 1 } else { 25 };
+        assert_eq!(store.barriers_issued(), expected);
+        // Nothing new to write issues no barrier.
+        store.write_many(&refs).unwrap();
+        assert_eq!(store.barriers_issued(), expected);
+    }
+
+    #[test]
+    fn write_many_on_an_ephemeral_store_barriers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new_ephemeral(dir.path().join("objects")).unwrap();
+        let bodies: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let hashes = store.write_many(&bodies).unwrap();
+        assert_eq!(store.read(&hashes[1]).unwrap(), b"b");
+        store.sync().unwrap();
+        assert_eq!(store.barriers_issued(), 0);
+    }
+
     #[test]
     fn write_leaves_no_temp_file() {
         let (_dir, store) = make_store();

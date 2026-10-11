@@ -77,6 +77,8 @@ fn run_configured_probe_session(
         .args(extra_args)
         .current_dir(dir)
         .env_clear()
+        // Set this after clearing the environment: assertions read machine codes.
+        .env("KIN_MCP_MACHINE_REPLIES", "1")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("USERPROFILE", home)
@@ -313,7 +315,13 @@ fn a_no_spawn_probe_over_a_dead_daemon_record_spawns_nothing() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
         listener.local_addr().expect("read reserved port").port()
     };
-    let kin_dir = repo.join(".kin");
+    let mut store_command = common::Command::new(env!("CARGO_BIN_EXE_kin"));
+    store_command
+        .env("HOME", &home)
+        .env("KIN_REGISTRY_PATH", home.join("registry.toml"));
+    let kin_dir = common::repository_layout(store_command, &repo)
+        .root()
+        .to_path_buf();
     std::fs::write(
         kin_dir.join(kin_daemon_spawn::PID_FILE_NAME),
         dead_pid.to_string(),

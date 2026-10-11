@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::process::Command;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -92,7 +91,7 @@ pub fn create_run(opts: RunOptions) -> ValidationRun {
 ///
 /// The command is executed via the system shell (`sh -c` on Unix).
 /// Returns the updated run with evidence and final status.
-pub fn execute_run(mut run: ValidationRun) -> Result<ValidationRun> {
+pub fn execute_run(spawner: &kin_io::Spawner, mut run: ValidationRun) -> Result<ValidationRun> {
     run.status = RunStatus::Running;
     run.started_at = Some(Utc::now());
 
@@ -105,7 +104,8 @@ pub fn execute_run(mut run: ValidationRun) -> Result<ValidationRun> {
 
     let start = Instant::now();
 
-    let output = Command::new("sh")
+    let output = spawner
+        .command("sh")
         .arg("-c")
         .arg(&run.command)
         .current_dir(&run.working_dir)
@@ -191,7 +191,7 @@ mod tests {
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });
-        let result = execute_run(run).unwrap();
+        let result = execute_run(&kin_io::Spawner::new(&kin_io::Grant::ambient()), run).unwrap();
         assert_eq!(result.status, RunStatus::Passed);
         assert_eq!(result.exit_code, Some(0));
         assert!(result.duration_ms.is_some());
@@ -207,7 +207,7 @@ mod tests {
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });
-        let result = execute_run(run).unwrap();
+        let result = execute_run(&kin_io::Spawner::new(&kin_io::Grant::ambient()), run).unwrap();
         assert_eq!(result.status, RunStatus::Failed);
         assert_eq!(result.exit_code, Some(1));
     }
@@ -220,7 +220,7 @@ mod tests {
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });
-        let result = execute_run(run).unwrap();
+        let result = execute_run(&kin_io::Spawner::new(&kin_io::Grant::ambient()), run).unwrap();
         let ev = result.evidence.unwrap();
         assert!(ev.stderr.unwrap().contains("error_output"));
     }
@@ -238,7 +238,7 @@ mod tests {
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });
-        let result = execute_run(run).unwrap();
+        let result = execute_run(&kin_io::Spawner::new(&kin_io::Grant::ambient()), run).unwrap();
         let ev = result.evidence.expect("evidence captured");
         assert_eq!(ev.test_results.len(), 2, "both test lines parsed");
         assert_eq!(ev.test_results[0].name, "mod::alpha");
@@ -257,7 +257,7 @@ mod tests {
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });
-        let result = execute_run(run).unwrap();
+        let result = execute_run(&kin_io::Spawner::new(&kin_io::Grant::ambient()), run).unwrap();
         let ev = result.evidence.expect("evidence captured");
         assert_eq!(ev.test_results.len(), 1);
         assert_eq!(ev.test_results[0].name, "it::works");
@@ -274,7 +274,7 @@ mod tests {
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });
-        let result = execute_run(run).unwrap();
+        let result = execute_run(&kin_io::Spawner::new(&kin_io::Grant::ambient()), run).unwrap();
         let ev = result.evidence.expect("evidence captured");
         assert!(
             ev.test_results.is_empty(),

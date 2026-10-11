@@ -73,6 +73,7 @@ fn publish_hosted_review(
             reviews: vec![kin_model::Keyed::new(review.review_id, review.clone())],
             ..kin_model::CollaborationDelta::default()
         }),
+        git_snapshot_proofs: Vec::new(),
     };
     drop(lease);
     manager.commit_repository_transaction(transaction).unwrap();

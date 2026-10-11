@@ -385,22 +385,28 @@ fn lost_the_daemon_mid_request(rendered: &str) -> bool {
 /// A disconnect with none of the three is left alone: a daemon that died for
 /// another reason on a large machine keeps its own error rather than being told
 /// it ran out of memory.
+#[cfg(test)]
 fn embed_resource_exhaustion(
     rendered: &str,
     evidence: &crate::capability::MemoryEvidence,
 ) -> Option<String> {
-    embed_resource_exhaustion_for(rendered, evidence, kin_daemon_spawn::enrichment_disabled())
+    embed_resource_exhaustion_for(
+        rendered,
+        evidence,
+        kin_core::enrichment_setting::state_given(kin_daemon_spawn::enrichment_disabled(), true),
+    )
 }
 
-/// [`embed_resource_exhaustion`] with the process switch supplied explicitly.
+/// [`embed_resource_exhaustion`] with the enrichment state supplied explicitly.
 ///
-/// The production wrapper reads the real process environment once. Tests use
-/// this pure seam so a developer's `KIN_DAEMON_DISABLE_LSP` cannot silently
-/// choose which sentence they grade.
+/// Production passes the state of the store being embedded: this process's
+/// switch, then the repository's own setting. Tests use this pure seam so a
+/// developer's `KIN_DAEMON_DISABLE_LSP` cannot silently choose which sentence
+/// they grade.
 fn embed_resource_exhaustion_for(
     rendered: &str,
     evidence: &crate::capability::MemoryEvidence,
-    enrichment_disabled: bool,
+    enrichment: kin_daemon_spawn::EnrichmentState,
 ) -> Option<String> {
     if !lost_the_daemon_mid_request(rendered) {
         return None;
@@ -446,30 +452,40 @@ fn embed_resource_exhaustion_for(
             human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
         )
     } else {
-        // The last sentence reads this process's own switch rather than
-        // assuming it is unset. Advice to set a variable the caller has already
-        // set is the shape a stranger hit on the memory-kill warning: they took
-        // it, re-ran, and were told to take it again.
-        format!(
+        // The last sentence reads this process's own switch and the store's
+        // own setting rather than assuming both are unset. Advice to set a
+        // variable the caller has already set is the shape a stranger hit on
+        // the memory-kill warning: they took it, re-ran, and were told to take
+        // it again.
+        let floor_cleared = format!(
             "This machine already clears the {} the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} \
-             model needs, so more memory is not the first thing to reach for. The other heavy \
-             resident in this daemon is the language-server enrichment sweep, measured taking a \
-             daemon from 15 MB to 11.5 GB on a store of about one gigabyte. {}",
+             model needs, so more memory is not the first thing to reach for.",
             human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
-            if enrichment_disabled {
-                format!(
-                    "This process already carries \
-                     `{}=1`, so stop the daemon (`kin daemon stop`) before re-running: a daemon \
-                     that was already up kept the setting it started with.",
-                    kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
-                )
-            } else {
-                format!(
-                    "Set `{}=1` and re-run to take it out of the picture.",
-                    kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
-                )
-            },
-        )
+        );
+        let sweep = "The other heavy resident in this daemon is the language-server enrichment \
+                     sweep, measured taking a daemon from 15 MB to 11.5 GB on a store of about one \
+                     gigabyte.";
+        match enrichment {
+            kin_daemon_spawn::EnrichmentState::Available => format!(
+                "{floor_cleared} {sweep} Set `{}=1` and re-run to take it out of the picture.",
+                kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
+            ),
+            kin_daemon_spawn::EnrichmentState::AlreadyDisabled => format!(
+                "{floor_cleared} {sweep} This process already carries `{}=1`, so stop the daemon \
+                 (`kin daemon stop`) before re-running: a daemon that was already up kept the \
+                 setting it started with.",
+                kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
+            ),
+            kin_daemon_spawn::EnrichmentState::OffForRepository => format!(
+                "{floor_cleared} No language-server sweep shares this daemon either: {}. Read \
+                 the daemon's log for how it ended.",
+                kin_core::enrichment_setting::OFF_FOR_REPOSITORY
+            ),
+            kin_daemon_spawn::EnrichmentState::Unavailable => format!(
+                "{floor_cleared} No language-server sweep shares this daemon either: it found no \
+                 language server. Read the daemon's log for how it ended."
+            ),
+        }
     };
     Some(format!(
         "{cause}.\n\
@@ -510,6 +526,24 @@ pub fn embed_pass_should_continue(result: &EmbedResult, made_progress: bool) -> 
     pending > 0 && made_progress
 }
 
+/// What `kin embed` says when this build and configuration cannot embed.
+///
+/// It names what is missing and what still works, and points at the one place
+/// that says how to supply it. It is a refusal of the request, not a failure of
+/// the daemon, so nothing about it reads as a server error.
+pub fn embed_unavailable_message(reason: &str) -> String {
+    let remedy = if cfg!(feature = "embeddings") {
+        "docs/model-slots.md describes selecting an embedding provider"
+    } else {
+        "docs/model-slots.md describes selecting an external embedding provider, or a build \
+         with the `embeddings` feature embeds locally"
+    };
+    format!(
+        "kin embed cannot index anything here: {reason}. Search by meaning stays off, and \
+         locate, search, refs and context answer from the graph without it; {remedy}"
+    )
+}
+
 /// Ask the repo daemon to build embeddings for the current repo's graph.
 ///
 /// With an explicit `--max-seconds` this issues a single bounded pass and
@@ -541,11 +575,23 @@ pub async fn run(
     .entered();
     let layout = crate::commands::require_repository_layout()?;
 
-    // Running `kin embed` is how a machine that declined the model download
-    // changes its mind, and every surface that reports the decline says so.
+    // A build or configuration that cannot embed anything is answered here, in
+    // words, before the daemon is asked. Asked anyway, the daemon tried to
+    // build an embedder, failed, and the reader got an HTTP 500 quoting an
+    // index error, after `kin init` had just told them to run this command.
+    if let Some(reason) = crate::embed_model::embed_pass_unavailable_reason() {
+        anyhow::bail!(embed_unavailable_message(&reason));
+    }
+
+    // Running `kin embed` is how a machine asks for the model download, and
+    // every surface that reports it as not asked for, or declined, says so.
     // Recorded before the first pass, because the embedder asks for this
-    // decision at the moment it would download.
-    if let Ok(kin_home) = crate::commands::setup::kin_dir() {
+    // decision at the moment it would download. A build without embeddings
+    // has no model to download, so it records nothing.
+    if let Some(kin_home) = crate::commands::setup::kin_dir()
+        .ok()
+        .filter(|_| cfg!(feature = "embeddings"))
+    {
         if crate::embed_model::consent_to_model_fetch(&kin_home)? {
             let line = "Semantic search turned on: this machine now downloads the search model \
                         when it is needed (`kin setup --embedding-model never` turns it off).";
@@ -734,9 +780,10 @@ async fn run_daemon_embed(
         // needs to see what the connection actually did still can, and a
         // failure this cannot attribute to memory is passed through untouched
         // rather than being given a diagnosis nobody proved.
-        match embed_resource_exhaustion(
+        match embed_resource_exhaustion_for(
             &rendered,
             &crate::capability::memory_evidence_since(memory_baseline),
+            kin_core::enrichment_setting::state_for(layout),
         ) {
             Some(guidance) => anyhow::anyhow!("daemon embed failed: {rendered}\n\n{guidance}"),
             None => anyhow::anyhow!("daemon embed failed: {rendered}"),
@@ -1495,7 +1542,7 @@ mod tests {
         let roomy = embed_resource_exhaustion_for(
             OOM_KILLED_MID_PASS,
             &evidence(12 << 30, Some(27)),
-            false,
+            kin_daemon_spawn::EnrichmentState::Available,
         )
         .expect("a kill during the pass is a memory diagnosis");
         let cramped = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(512 << 20, Some(1)))
@@ -1544,10 +1591,28 @@ mod tests {
     #[test]
     fn enrichment_advice_does_not_repeat_a_switch_the_process_already_carries() {
         let evidence = evidence(12 << 30, Some(1));
-        let unset = embed_resource_exhaustion_for(OOM_KILLED_MID_PASS, &evidence, false)
-            .expect("the recorded kill produces guidance");
-        let set = embed_resource_exhaustion_for(OOM_KILLED_MID_PASS, &evidence, true)
-            .expect("the recorded kill produces guidance");
+        let unset = embed_resource_exhaustion_for(
+            OOM_KILLED_MID_PASS,
+            &evidence,
+            kin_daemon_spawn::EnrichmentState::Available,
+        )
+        .expect("the recorded kill produces guidance");
+        let set = embed_resource_exhaustion_for(
+            OOM_KILLED_MID_PASS,
+            &evidence,
+            kin_daemon_spawn::EnrichmentState::AlreadyDisabled,
+        )
+        .expect("the recorded kill produces guidance");
+        let off = embed_resource_exhaustion_for(
+            OOM_KILLED_MID_PASS,
+            &evidence,
+            kin_daemon_spawn::EnrichmentState::OffForRepository,
+        )
+        .expect("the recorded kill produces guidance");
+        assert!(
+            !off.contains("KIN_DAEMON_DISABLE_LSP") && off.contains("off for this repository"),
+            "a repository switched off by its own setting has no sweep to turn off: {off}"
+        );
 
         assert!(
             unset.contains("Set `KIN_DAEMON_DISABLE_LSP=1`"),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Falsify the exact boundary pins added for current storage/session helpers.
+"""Falsify exact storage, session, admission and model-asset boundary pins.
 
 These use the production scanner and policy loader against copied source, never
 mutate the checkout, and require a reported primitive rather than just a red
@@ -44,8 +44,31 @@ FILES = (
     "crates/kin-lsp/src/analysis_env/python/interpreter.rs",
     "crates/kin-lsp/src/analysis_env/python/store.rs",
     "crates/kin-daemon/src/daemon/readiness.rs",
+    "crates/kin-infer/src/decision.rs",
+    "crates/kin-infer/src/lora.rs",
+    "crates/kin-infer/src/torch_checkpoint.rs",
+    "crates/kin-infer/src/decision/engine.rs",
+    "crates/kin-infer/src/decision/pointer.rs",
+    "crates/kin-infer/src/decision/reranker.rs",
+    "crates/kin-core/src/history_attach.rs",
+    "crates/kin-blobs/src/lib.rs",
+    "crates/kin-mcp/src/connection_session.rs",
+    "crates/kin-cli/src/commands/branch.rs",
+    "crates/kin-cli/src/commands/history_derive.rs",
+    "crates/kin-cli/src/commands/ref_grammar.rs",
+    "crates/kin-cli/src/commands/store.rs",
+    "crates/kin-cli/src/commands/locate/scorer.rs",
+    "crates/kin-lsp/src/concurrency_tests.rs",
+    "crates/kin-daemon/src/history_schedule.rs",
+    "crates/kin-daemon/src/bin/kin-daemon.rs",
+    "crates/kin-daemon-spawn/src/runtime_authority.rs",
 )
-UNPINNED_FILES = ("crates/kin-agent/src/belt.rs",)
+UNPINNED_FILES = (
+    "crates/kin-agent/src/belt.rs",
+    "crates/kin-core/src/history_state.rs",
+    "crates/kin-core/src/models.rs",
+    "crates/kin-core/src/dependencies.rs",
+)
 FUNCTIONS = (
     (FILES[0], "acquire_existing_lock_with_policy"),
     (FILES[4], "read_record_or_failure"),
@@ -73,7 +96,11 @@ FUNCTIONS = (
     (FILES[30], "executable_permissions"),
     (FILES[30], "executable_head"),
     (FILES[30], "native_input"),
+    ("crates/kin-blobs/src/lib.rs", "write_many"),
+    ("crates/kin-blobs/src/lib.rs", "hand_to_device"),
+    ("crates/kin-blobs/src/lib.rs", "flush_device"),
 )
+NEW_EXPRESSION_FILES = FILES[31:]
 POISON = (
     '\nfn __boundary_pin_probe(p: &str) -> String { '
     'std::fs::read_to_string(p).unwrap() }\n'
@@ -107,7 +134,14 @@ class BoundaryPins(unittest.TestCase):
         self.guard.KIN_ROOT = str(self.root)
         self.guard.ALLOWLIST_PATH = str(policy)
 
-    def policies(self):
+    def policies(self, file=None):
+        # The clean-source test grades every entry together. Each mutation only
+        # changes one file, so revalidate that file's pins rather than parsing
+        # every unchanged boundary again for each poison site.
+        entries = self.entries if file is None else [
+            entry for entry in self.entries if entry["file"] == file
+        ]
+        (self.root / "policy.json").write_text(json.dumps({"allowlist": entries}))
         return self.guard.load_allowlist()
 
     def scan(self, file, policy):
@@ -135,7 +169,7 @@ class BoundaryPins(unittest.TestCase):
             with self.subTest(file=file):
                 path = self.root / file
                 path.write_text(self.originals[file] + POISON)
-                policies, errors = self.policies()
+                policies, errors = self.policies(file)
                 self.assertEqual(errors, [])
                 self.assert_read_reported(file, policies[file])
                 path.write_text(self.originals[file])
@@ -148,12 +182,31 @@ class BoundaryPins(unittest.TestCase):
                 with self.subTest(file=file, function=function, after=last + 1):
                     path = self.root / file
                     path.write_text("".join(lines[: last + 1]) + POISON + "".join(lines[last + 1 :]))
-                    policies, errors = self.policies()
+                    policies, errors = self.policies(file)
                     self.assertEqual(errors, [])
                     self.assert_read_reported(file, policies[file])
                     path.write_text(self.originals[file])
 
-    def test_retired_file_belt_has_no_exemption_and_rejects_reads(self):
+    def test_runtime_owner_pins_cannot_authorize_semantic_query_source_io(self):
+        file = "crates/kin-daemon-spawn/src/runtime_authority.rs"
+        (self.root / file).write_text(self.originals[file] +
+            '\nfn semantic_locate(path: &str) { let _ = std::fs::read_to_string(path); }\n')
+        policies, errors = self.policies(file)
+        self.assertEqual(errors, [])
+        self.assert_read_reported(file, policies[file])
+
+    def test_runtime_owner_drop_still_rejects_repository_source_reads(self):
+        file = "crates/kin-daemon-spawn/src/runtime_authority.rs"
+        old = "fn drop(&mut self) {"
+        self.assertEqual(self.originals[file].count(old), 1)
+        (self.root / file).write_text(self.originals[file].replace(
+            old, old + '\n        let _ = std::fs::read_to_string("src/unapproved.rs");', 1
+        ))
+        policies, errors = self.policies(file)
+        self.assertEqual(errors, [])
+        self.assert_read_reported(file, policies[file])
+
+    def test_migrated_modules_have_no_exemption_and_reject_reads(self):
         policies, errors = self.policies()
         self.assertEqual(errors, [])
         for file in UNPINNED_FILES:
@@ -184,14 +237,19 @@ class BoundaryPins(unittest.TestCase):
                 self.assertEqual(self.originals[file].count(old), 1)
                 path = self.root / file
                 path.write_text(self.originals[file].replace(old, new))
-                policies, errors = self.policies()
+                policies, errors = self.policies(file)
                 self.assertEqual(errors, [])
                 self.assert_read_reported(file, policies[file])
                 path.write_text(self.originals[file])
 
     def test_extra_repository_metadata_occurrence_invalidates_pin(self):
         poison = "\nfn __extra_metadata(p: &std::path::Path) { let _ = p.metadata(); }\n"
-        for file in (FILES[23], FILES[25], FILES[26]):
+        for file in (
+            FILES[23], FILES[25], FILES[26],
+            "crates/kin-cli/src/commands/branch.rs",
+            "crates/kin-cli/src/commands/ref_grammar.rs",
+            "crates/kin-core/src/history_attach.rs",
+        ):
             with self.subTest(file=file):
                 entry = next(entry for entry in self.entries if entry["file"] == file)
                 pins = [pin for pin in entry["allow_match"]
@@ -200,12 +258,33 @@ class BoundaryPins(unittest.TestCase):
                 expected = pins[0]["count"]
                 path = self.root / file
                 path.write_text(self.originals[file] + poison)
-                policies, errors = self.policies()
+                policies, errors = self.policies(file)
                 mismatch = f"occurs {expected + 1} times in scanned code (want {expected})"
                 self.assertTrue(any(file in error and mismatch in error for error in errors), errors)
                 violations = self.scan(file, policies[file])
                 self.assertTrue(any("p.metadata()" in content for _, content, _ in violations), violations)
                 path.write_text(self.originals[file])
+
+    def test_second_primitive_beside_each_new_expression_boundary_is_reported(self):
+        for file in NEW_EXPRESSION_FILES:
+            entry = next(entry for entry in self.entries if entry["file"] == file)
+            pins = entry.get("allow_match", [])
+            # The blob boundary already has independently tested function pins.
+            if file == "crates/kin-blobs/src/lib.rs":
+                continue
+            self.assertTrue(pins, file)
+            for pin in pins:
+                expr = pin if isinstance(pin, str) else pin["expr"]
+                with self.subTest(file=file, expression=expr):
+                    self.assertIn(expr, self.originals[file])
+                    path = self.root / file
+                    path.write_text(self.originals[file].replace(
+                        expr, 'std::fs::read_to_string("unapproved"); ' + expr, 1
+                    ))
+                    policies, errors = self.policies(file)
+                    self.assertEqual(errors, [])
+                    self.assert_read_reported(file, policies[file])
+                    path.write_text(self.originals[file])
 
     def test_second_primitive_on_an_allowed_metadata_line_is_reported(self):
         file = "crates/kin-db/src/storage/binding_history.rs"
@@ -213,15 +292,56 @@ class BoundaryPins(unittest.TestCase):
         new = 'let _ = std::fs::read_to_string("unapproved"); ' + old
         self.assertEqual(self.originals[file].count(old), 1)
         (self.root / file).write_text(self.originals[file].replace(old, new))
-        policies, errors = self.policies()
+        policies, errors = self.policies(file)
         self.assertEqual(errors, [])
         self.assert_read_reported(file, policies[file])
+
+    def test_storage_root_identity_pins_do_not_hide_neighboring_source_reads(self):
+        file = "crates/kin-db/src/storage/backend.rs"
+        boundaries = (
+            ("storage_root_entry_metadata",
+             "fn storage_root_entry_metadata(path: &Path) -> Option<std::io::Result<std::fs::Metadata>> {"),
+            ("storage_root_entry_metadata", "Some(std::fs::symlink_metadata("),
+            ("pinned_storage_root_still_visible",
+             "if visible.file_type().is_symlink() || !visible.is_dir() {"),
+        )
+        lines = self.originals[file].splitlines(keepends=True)
+        spans = self.guard.find_fn_body_ranges(lines)
+        for function, expression in boundaries:
+            with self.subTest(function=function, expression=expression):
+                self.assertEqual(len(spans[function]), 1)
+                first, last = spans[function][0]
+                matching_lines = [line for line in range(first, last + 1)
+                                  if expression in lines[line]]
+                self.assertEqual(len(matching_lines), 1)
+                changed = lines.copy()
+                line = matching_lines[0]
+                changed[line] = changed[line].replace(
+                    expression, 'std::fs::read_to_string("unapproved"); ' + expression, 1
+                )
+                path = self.root / file
+                path.write_text("".join(changed))
+                policies, errors = self.policies(file)
+                self.assertEqual(errors, [])
+                self.assert_read_reported(file, policies[file])
+                path.write_text(self.originals[file])
+
+    def test_an_extra_daemon_failure_exit_invalidates_its_exact_count(self):
+        file = "crates/kin-daemon/src/bin/kin-daemon.rs"
+        poison = "\nfn __extra_failure_exit() { process::exit(1); }\n"
+        (self.root / file).write_text(self.originals[file] + poison)
+        policies, errors = self.policies(file)
+        self.assertTrue(any(file in error and "occurs 12 times" in error
+                            and "want 11" in error for error in errors), errors)
+        violations = self.scan(file, policies[file])
+        self.assertTrue(any("process::exit(1);" in content
+                            for _, content, _ in violations), violations)
 
     def test_extra_metadata_occurrence_invalidates_pin_and_remains_visible(self):
         file = "crates/kin-daemon/src/binding_history.rs"
         poison = "\nfn __extra_metadata(p: &std::path::Path) { let _ = p.metadata(); }\n"
         (self.root / file).write_text(self.originals[file] + poison)
-        policies, errors = self.policies()
+        policies, errors = self.policies(file)
         self.assertTrue(any(file in error and "occurs 2" in error for error in errors), errors)
         violations = self.scan(file, policies[file])
         self.assertTrue(any("p.metadata()" in content for _, content, _ in violations), violations)

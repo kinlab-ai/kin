@@ -195,6 +195,48 @@ pub fn cross_encoder_builds() -> u64 {
     cross_encoders().builds()
 }
 
+#[cfg(feature = "decision")]
+use crate::commands::locate::scorer::DecisionScorerModel;
+
+/// How many decision scorers stay resident at once.
+///
+/// A decision scorer holds a whole decoder backbone, about 2.4 GB of host memory
+/// for a 0.6B model in f32 plus its device copy, and the model is fixed per
+/// serving process, so one entry is the steady state.
+#[cfg(feature = "decision")]
+const DECISION_SCORER_CAPACITY: usize = 1;
+
+#[cfg(feature = "decision")]
+fn decision_scorers() -> &'static ResidentModels<DecisionScorerModel> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<ResidentModels<DecisionScorerModel>> = OnceLock::new();
+    CACHE.get_or_init(|| ResidentModels::new(DECISION_SCORER_CAPACITY))
+}
+
+/// The resident decision scorer for `model_id` at `revision`, built by `build`
+/// on first use in this process. Returns whether this call built it.
+#[cfg(feature = "decision")]
+pub fn decision_scorer<E>(
+    model_id: &str,
+    revision: &str,
+    build: impl FnOnce() -> Result<DecisionScorerModel, E>,
+) -> Result<(Arc<DecisionScorerModel>, bool), E> {
+    let cache = decision_scorers();
+    let started = std::time::Instant::now();
+    let (model, built) = cache.get_or_build(model_id, revision, build)?;
+    if built {
+        tracing::info!(
+            model_id,
+            revision,
+            backend = %model.backend(),
+            builds = cache.builds(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "built resident decision scorer"
+        );
+    }
+    Ok((model, built))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

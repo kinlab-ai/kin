@@ -530,6 +530,9 @@ fn runtime_launch_keeps_the_exact_safe_git_environment_after_final_scrub() {
 #[test]
 #[serial]
 fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
+    if !kin_core::test_env::alone_in_process() {
+        return;
+    }
     let root = tempdir().expect("temp root");
     let sentinel_home = root.path().join("sentinel-home");
     let sentinel_kin = sentinel_home.join(".kin");
@@ -722,7 +725,7 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
     );
     let init = runtime
         .kin_command()
-        .args(["init", "."])
+        .args(["init", ".", "--json"])
         .current_dir(&repository)
         .output()
         .expect("run isolated Kin init");
@@ -731,6 +734,13 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         "kin init failed: stdout={} stderr={}",
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
+    );
+    let initialized: serde_json::Value =
+        serde_json::from_slice(&init.stdout).expect("isolated Kin init reports JSON");
+    let kin_root = Path::new(
+        initialized["kin_dir"]
+            .as_str()
+            .expect("init reports its control directory"),
     );
 
     let locate = runtime
@@ -751,7 +761,7 @@ fn isolated_runtime_scrubs_ambient_authority_and_reaps_every_process() {
         String::from_utf8_lossy(&locate.stderr)
     );
 
-    let worker_pid_path = repository.join(".kin/daemon.pid");
+    let worker_pid_path = kin_root.join("daemon.pid");
     let supervisor_pid_path = runtime
         .registry_path()
         .parent()

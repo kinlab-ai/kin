@@ -72,6 +72,24 @@ pub(crate) fn leaf_digests_computed_on_this_thread() -> usize {
     LEAF_DIGESTS_COMPUTED_ON_THIS_THREAD.with(|count| count.get())
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECORDS_DECODED_ON_THIS_THREAD: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// How many history records this thread read from disk, checked against the
+/// digest the open recorded, and decoded.
+///
+/// This is the instrument behind "a history verifies each record once per
+/// generation": a second read of a record it already verified must leave the
+/// count where it was. Counted at the one place a record is verified and
+/// decoded. Per thread, because the suite runs in parallel.
+#[cfg(test)]
+pub(crate) fn records_decoded_on_this_thread() -> usize {
+    RECORDS_DECODED_ON_THIS_THREAD.with(|count| count.get())
+}
+
 /// Where an undecoded change map's frame can be read again.
 pub(crate) enum HistorySource {
     /// The snapshot file the open read, held open so a superseded generation
@@ -356,6 +374,80 @@ pub(crate) struct EncodedChanges {
     carries_call_site_ledgers: bool,
     /// Whether any change moves a context validation.
     carries_context_validations: bool,
+    /// Records this history already read, checked against the digest its open
+    /// recorded, and decoded, so a later read of the same record serves them.
+    verified: Mutex<VerifiedRecords>,
+}
+
+/// Encoded bytes of verified records one history keeps decoded.
+///
+/// Every read of a record used to read its bytes again, hash them against the
+/// digest the open recorded and decode them, and a history read replays the
+/// whole first-parent line from the head. So each entity history, and each
+/// reference read that binds a site to the change that introduced it, paid the
+/// whole line's verification and decode again, on every call, for bytes the
+/// same generation had already proved. On a converted itsdangerous that was
+/// nearly all of a references read.
+///
+/// The bound is in encoded bytes, which the index already holds for every
+/// record, and admission is first come: a history over the bound keeps the
+/// records it read first and reads the rest as it always did. A replay walks
+/// back from the head, so what it keeps is the recent line most reads ask for.
+/// Nothing is evicted, so a scan longer than the bound cannot churn the cache
+/// into keeping nothing.
+const VERIFIED_RECORD_BYTES_MAX: usize = 64 * 1024 * 1024;
+
+/// A record whose encoding is larger than this is never kept. A bootstrap
+/// change can carry a whole tree, and one such record would take the bound
+/// from every ordinary change after it.
+const VERIFIED_RECORD_KEPT_MAX: usize = 8 * 1024 * 1024;
+
+/// The records one history generation has verified and decoded.
+///
+/// Sound for the same two facts the leaf-digest memo states on [`ChangeMap`]: a
+/// change's identity determines its content, and nothing mutates a change in
+/// place. A kept record was read from this generation's bytes, matched the
+/// SHA-256 the open recorded for it and decoded to the identity and parents the
+/// index names, before it was kept. It lives exactly as long as the encoded
+/// history it came from: a new publication is a new snapshot and a new
+/// `EncodedChanges` with nothing kept, so every record of a changed store is
+/// verified again before it is served. A record never read is verified on its
+/// first read, as before, and one whose bytes no longer match is refused there.
+///
+/// Within one generation a kept record is served from what was verified. It is
+/// never the bytes on disk after that verification, so bytes written under an
+/// open snapshot are never served from here; they are refused by the next
+/// plain read, the one every validation walk makes, exactly as before. This
+/// holds no file metadata and probes nothing: the snapshot file is read only
+/// through the record read the open's verification already goes through.
+///
+/// Only a serving reader keeps records ([`ChangeMap::read_change_for_serving`]).
+/// A walk of the whole history, such as an open's validation or a base
+/// resolution, reads through [`ChangeMap::read_change`] and keeps nothing, so
+/// it never retains the history it checks.
+#[derive(Default)]
+struct VerifiedRecords {
+    records: HashMap<SemanticChangeId, Arc<SemanticChange>>,
+    encoded_bytes: usize,
+}
+
+impl VerifiedRecords {
+    fn get(&self, id: &SemanticChangeId) -> Option<Arc<SemanticChange>> {
+        self.records.get(id).map(Arc::clone)
+    }
+
+    /// Keep one verified record when it fits the bound. Two readers that
+    /// verified the same record at once keep it once.
+    fn keep(&mut self, id: SemanticChangeId, change: &SemanticChange, encoded_len: usize) {
+        if encoded_len > VERIFIED_RECORD_KEPT_MAX
+            || self.encoded_bytes.saturating_add(encoded_len) > VERIFIED_RECORD_BYTES_MAX
+            || self.records.contains_key(&id)
+        {
+            return;
+        }
+        self.encoded_bytes += encoded_len;
+        self.records.insert(id, Arc::new(change.clone()));
+    }
 }
 
 impl fmt::Debug for EncodedChanges {
@@ -517,6 +609,7 @@ impl EncodedChanges {
             carries_resolution_records: false,
             carries_call_site_ledgers: false,
             carries_context_validations: false,
+            verified: Mutex::new(VerifiedRecords::default()),
         }
     }
 
@@ -590,6 +683,37 @@ impl EncodedChanges {
         }
     }
 
+    /// [`Self::read_change`] for a reader that serves the change, keeping the
+    /// verified record so the next read of it at this generation serves it
+    /// without reading, hashing or decoding it again.
+    ///
+    /// A record is kept only after it matched the digest the open recorded and
+    /// decoded to the identity and parents the index names. See
+    /// `VerifiedRecords` for why serving it again is sound.
+    fn read_change_kept(
+        &self,
+        id: &SemanticChangeId,
+    ) -> Result<Option<SemanticChange>, KinDbError> {
+        let Some(record_len) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.get(id))
+            .map(|record| record.range.len())
+        else {
+            return self.read_change(id);
+        };
+        // Cloned out of the lock, so a large record never holds other readers.
+        let kept = self.verified.lock().get(id);
+        if let Some(kept) = kept {
+            return Ok(Some(SemanticChange::clone(&kept)));
+        }
+        let change = self.read_change(id)?;
+        if let Some(change) = &change {
+            self.verified.lock().keep(*id, change, record_len);
+        }
+        Ok(change)
+    }
+
     fn read_reopened_change(
         &self,
         id: &SemanticChangeId,
@@ -628,6 +752,8 @@ impl EncodedChanges {
                 "history record {id} changed after open"
             )));
         }
+        #[cfg(test)]
+        RECORDS_DECODED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
         let change: SemanticChange = rmp_serde::from_slice(&bytes).map_err(|error| {
             KinDbError::StorageError(format!("history record {id} decode failed: {error}"))
         })?;
@@ -914,6 +1040,26 @@ impl ChangeMap {
         }
         match &self.body.encoded {
             Some(encoded) => encoded.read_change(id),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::read_change`] for a reader that serves the change, such as a
+    /// query graph answering history: a record this generation already
+    /// verified is served again without reading, hashing or decoding it. See
+    /// `VerifiedRecords`.
+    pub fn read_change_for_serving(
+        &self,
+        id: &SemanticChangeId,
+    ) -> Result<Option<SemanticChange>, KinDbError> {
+        if self.overlay.contains_key(id) {
+            return self.overlay.read_change(id);
+        }
+        if let Some(decoded) = self.body.decoded.get() {
+            return Ok(decoded.get(id).cloned());
+        }
+        match &self.body.encoded {
+            Some(encoded) => encoded.read_change_kept(id),
             None => Ok(None),
         }
     }

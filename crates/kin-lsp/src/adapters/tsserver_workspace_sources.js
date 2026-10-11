@@ -16,9 +16,11 @@
 //    package's own tsconfig, so its path aliases (`~/*` -> `src/*`) mean what
 //    they mean to its own build rather than to the project that reached it.
 // 2. An import of a workspace package that tsserver could not resolve (it is
-//    linked to build output not built yet, `workspace:./drizzle-orm/dist`) is
-//    resolved through the workspace map: an exact entry names the file, and a
-//    `name/*` entry names the directory a subpath resolves under.
+//    linked to build output not built yet, `workspace:./drizzle-orm/dist`, or
+//    it is a JavaScript package no node_modules links at all, as React's
+//    `react` and `shared` are) is resolved through the workspace map: an
+//    exact entry names the file, and a `name/*` entry names the directory a
+//    subpath resolves under, TypeScript source first and JavaScript after.
 // 3. Any other import tsserver could not resolve is resolved as if from the
 //    importing file's mirror in the layout, where Kin laid out exactly the
 //    dependencies the lock gives that importer; and the layout's `@types`
@@ -33,6 +35,11 @@ const fs = require('fs');
 const path = require('path');
 
 const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.d.ts'];
+
+// JavaScript sources, tried after TypeScript ones, in Node's order. A
+// JavaScript workspace package has no TypeScript source, and tsserver reads
+// its JavaScript with `allowJs` as it reads the importing file.
+const JAVASCRIPT_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs'];
 
 function readWorkspace(log) {
   const file = process.env.KIN_TSSERVER_WORKSPACE;
@@ -128,18 +135,26 @@ function createResolver(ts, workspace, projectDir) {
     };
   }
 
-  // A file or directory named without its extension, as a source file.
+  // A file or directory named without its extension, as a source file:
+  // TypeScript source first, then the file as named, then JavaScript source.
   function probe(base) {
-    const stem = base.replace(/\.(m|c)?js$/, '');
-    for (const candidate of [stem, path.join(stem, 'index')]) {
-      for (const extension of SOURCE_EXTENSIONS) {
-        const file = candidate + extension;
-        if (ts.sys.fileExists(file)) {
-          return file;
+    const stem = base.replace(/\.(m|c)?jsx?$/, '');
+    const find = (extensions) => {
+      for (const candidate of [stem, path.join(stem, 'index')]) {
+        for (const extension of extensions) {
+          const file = candidate + extension;
+          if (ts.sys.fileExists(file)) {
+            return file;
+          }
         }
       }
-    }
-    return ts.sys.fileExists(base) ? base : undefined;
+      return undefined;
+    };
+    return (
+      find(SOURCE_EXTENSIONS) ||
+      (ts.sys.fileExists(base) ? base : undefined) ||
+      find(JAVASCRIPT_EXTENSIONS)
+    );
   }
 
   // Rule 2: a workspace package, through the workspace map.
@@ -277,6 +292,32 @@ function createResolver(ts, workspace, projectDir) {
   return { improve, typeFromLayout, withLayoutTypeRoots };
 }
 
+// The resolver with every function made unable to throw into tsserver. Its
+// hooks run while tsserver rebuilds a program, between the two halves of its
+// resolution cache's bookkeeping. An exception there leaves the cache half
+// updated, and from then on TypeScript asserts in
+// `watchFailedLookupLocationOfResolution` on every project update, so every
+// question fails until tsserver restarts. A failure here keeps tsserver's own
+// answer instead, and is logged once per function.
+function guarded(resolver, log) {
+  const reported = new Set();
+  const safe = {};
+  for (const [name, fn] of Object.entries(resolver)) {
+    safe[name] = (...args) => {
+      try {
+        return fn(...args);
+      } catch (error) {
+        if (!reported.has(name)) {
+          reported.add(name);
+          log(`${name} failed and tsserver's own answer is kept: ${error && error.stack ? error.stack : error}`);
+        }
+        return name === 'withLayoutTypeRoots' ? args[0] : undefined;
+      }
+    };
+  }
+  return safe;
+}
+
 function init(modules) {
   const ts = modules.typescript;
 
@@ -291,7 +332,7 @@ function init(modules) {
       info.project.projectKind === ts.server.ProjectKind.Configured
         ? path.dirname(path.resolve(info.project.getProjectName()))
         : undefined;
-    const resolver = createResolver(ts, workspace, projectDir);
+    const resolver = guarded(createResolver(ts, workspace, projectDir), log);
     const host = info.languageServiceHost;
     const settings = () =>
       typeof host.getCompilationSettings === 'function' ? host.getCompilationSettings() : {};

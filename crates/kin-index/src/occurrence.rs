@@ -397,6 +397,80 @@ pub fn groups(relation: &Relation) -> Vec<OccurrenceGroup> {
     result
 }
 
+/// The linker tiers whose destination is proven at the call site itself,
+/// not only narrowed to a scope: a callee the calling file defines or a
+/// declared import names, a pinned dispatch class walked to its defining
+/// ancestor, a receiver whose type is declared or chained through adapter
+/// facts, and a module pinned by an import with the symbol selected inside it.
+/// The locality tier, the dispatch-candidate tier and every name-only tier are
+/// left out: each names a real symbol without proving it is the one called.
+const STATIC_PROOF_TIERS: &[f32] = &[
+    1.0,
+    0.95,
+    0.85,
+    crate::resolution::RECEIVER_ORIGIN_CONFIDENCE,
+    0.9,
+];
+
+/// The sites at which a parser/linker call edge proves its destination, for a
+/// call-site ledger to settle where the language server proved nothing.
+///
+/// Read per occurrence: an edge's scalar confidence is its strongest
+/// occurrence's, so a site is admitted only when its own certificate names a
+/// [`STATIC_PROOF_TIERS`] tier. An edge whose certificates do not validate,
+/// and an older edge that holds several sites with no certificate, admit no
+/// site. Language-server, manual, derived-member and self-dispatch edges admit
+/// none either: the first two are the resolver's own, the last two are
+/// candidates by construction.
+pub fn static_proof_sites(relation: &Relation) -> Vec<SourceSpan> {
+    if relation.kind != RelationKind::Calls
+        || matches!(
+            relation.origin,
+            RelationOrigin::Lsp | RelationOrigin::Manual
+        )
+        || crate::resolution::is_derived_member_candidate(relation)
+        || crate::linker::is_self_dispatch_candidate(relation)
+    {
+        return Vec::new();
+    }
+    let proves = |confidence: f32| {
+        STATIC_PROOF_TIERS
+            .iter()
+            .any(|tier| tier.to_bits() == confidence.to_bits())
+    };
+    let records: Vec<&RelationEvidence> = relation
+        .evidence
+        .iter()
+        .filter(|record| !reserved(record) && record.source_span.is_some())
+        .collect();
+    if !relation.evidence.iter().any(reserved) {
+        let unique: BTreeSet<_> = records
+            .iter()
+            .map(|record| serde_json::to_string(&record.source_span).expect("span serializes"))
+            .collect();
+        if unique.len() == 1 && proves(relation.confidence) {
+            return records
+                .iter()
+                .filter_map(|record| record.source_span.clone())
+                .take(1)
+                .collect();
+        }
+        return Vec::new();
+    }
+    let Ok(proofs) = validated_proofs(relation) else {
+        return Vec::new();
+    };
+    records
+        .into_iter()
+        .filter(|record| {
+            proofs
+                .get(&evidence_digest(record))
+                .is_some_and(|proof| proves(proof.confidence))
+        })
+        .filter_map(|record| record.source_span.clone())
+        .collect()
+}
+
 /// Trace/path union only proven sites. Keep the disclosure across regrouping.
 pub fn proven_sites(relation: &Relation) -> (Vec<SourceSpan>, bool) {
     let mut sites = Vec::new();

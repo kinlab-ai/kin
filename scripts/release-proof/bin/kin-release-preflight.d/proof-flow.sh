@@ -752,16 +752,16 @@ NODE
 
   stopDaemons("before MCP startup");
 
-  const searchArgs = { query: "hello", compact: true, limit: 5 };
+  const searchArgs = { query: "hello", mode: "name", compact: true, limit: 5 };
   // The call takes the shape the launched entry's profile serves: a
   // routed profile lists one `kin` tool, and search goes through it.
-  // Any other profile lists `semantic_search` and is called by name.
+  // Any other profile lists `locate` and is called by name.
   // tools/list must serve the tool the call names, so the listing
   // check below follows the same profile.
   const searchCall = (profile) => (
     typeof profile === "string" && profile.startsWith("agent-routed")
-      ? { name: "kin", arguments: { command: "search", args: searchArgs } }
-      : { name: "semantic_search", arguments: searchArgs }
+      ? { name: "kin", arguments: { command: "locate", args: searchArgs } }
+      : { name: "locate", arguments: searchArgs }
   );
   // What a failure calls the search it made.
   const searchLabel = (call) => (
@@ -809,13 +809,33 @@ NODE
     child.kill("SIGKILL");
     finish(new Error("installed MCP startup/revival proof did not exit within 120 seconds"));
   }, 120_000);
+  // A reply names an entity by its name and the module that holds it,
+  // never by a file, so the seeded function is found as `hello` in
+  // module `probe`.
+  const holdsEntity = (value, name, module) => {
+    if (Array.isArray(value)) return value.some((item) => holdsEntity(item, name, module));
+    if (value && typeof value === "object") {
+      if (value.name === name && value.module === module) return true;
+      return Object.values(value).some((item) => holdsEntity(item, name, module));
+    }
+    return false;
+  };
   const validateSearch = (message, label) => {
     if (!message?.result || message.error || message.result.isError === true) {
       throw new Error(`${label} failed: ${JSON.stringify(message ?? null)}`);
     }
-    const rendered = JSON.stringify(message.result);
-    if (!rendered.includes("hello") || !rendered.includes("probe.py")) {
-      throw new Error(`${label} did not return the seeded hello entity`);
+    const replies = (message.result.content ?? []).flatMap((block) => {
+      try {
+        return [JSON.parse(block?.text)];
+      } catch {
+        return [];
+      }
+    });
+    if (!holdsEntity(replies, "hello", "probe")) {
+      throw new Error(
+        `${label} did not return the seeded hello entity in module probe: ` +
+        JSON.stringify(message.result).slice(0, 500)
+      );
     }
   };
   child.stdout.on("data", (chunk) => {

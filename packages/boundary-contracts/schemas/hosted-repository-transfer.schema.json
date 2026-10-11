@@ -79,7 +79,9 @@
               "aliases",
               "bodies",
               "source_hydration_semantics",
-              "collaboration"
+              "source_hydration_derivation",
+              "collaboration",
+              "git_snapshot_proofs"
             ]
           },
           {

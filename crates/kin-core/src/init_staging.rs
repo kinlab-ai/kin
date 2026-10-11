@@ -126,7 +126,8 @@ impl Drop for GitCaptureStaging {
 /// Only a refusal the kernel names as permission or a read-only filesystem is
 /// turned into this message. Anything else is left to the staging code, whose
 /// own errors already name the path.
-pub(crate) fn require_writable_init_directories(parent: &Path, repository: &Path) -> Result<()> {
+pub(crate) fn require_writable_init_directories(parent: &Path, store: &Path) -> Result<()> {
+    let repository = store.parent().unwrap_or(store);
     if let Some(reason) = write_refusal(parent) {
         return Err(KinError::Other(format!(
             "kin init cannot start: it stages the conversion beside the repository, in {parent}, \
@@ -141,7 +142,7 @@ pub(crate) fn require_writable_init_directories(parent: &Path, repository: &Path
             "kin init cannot start: it publishes the store as {store}, and this user cannot \
              create entries in {repository} ({reason}). Nothing was changed. Make {repository} \
              writable, then run `kin init` again",
-            store = repository.join(".kin").display(),
+            store = store.display(),
             repository = repository.display(),
         )));
     }
@@ -260,6 +261,18 @@ pub(crate) fn reap_abandoned_git_captures(parent: &Path) -> Result<usize> {
         Err(error) => return Err(KinError::io(parent, error)),
     };
     let mut entries = entries
+        .filter_map(|entry| match entry {
+            Ok(entry)
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(GIT_CAPTURE_PREFIX)) =>
+            {
+                Some(Ok(entry))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| KinError::io(parent, error))?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -387,7 +400,14 @@ const SIGNAL_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_sec
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SignalCleanup {
     removed: Vec<PathBuf>,
-    left: Vec<PathBuf>,
+    left: Vec<SignalCleanupFailure>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct SignalCleanupFailure {
+    path: PathBuf,
+    reason: String,
 }
 
 /// Remove the registered capture directories until `deadline`.
@@ -406,17 +426,19 @@ fn remove_registered_staging_until(deadline: std::time::Instant) -> SignalCleanu
 fn remove_captures_until(paths: Vec<PathBuf>, deadline: std::time::Instant) -> SignalCleanup {
     let mut outcome = SignalCleanup::default();
     for path in paths {
-        if remove_capture_until(&path, deadline) {
-            outcome.removed.push(path);
-        } else {
-            outcome.left.push(path);
+        match remove_capture_until(&path, deadline) {
+            Ok(()) => outcome.removed.push(path),
+            Err(error) => outcome.left.push(SignalCleanupFailure {
+                path,
+                reason: error.to_string(),
+            }),
         }
     }
     outcome
 }
 
 /// Remove one capture directory entry by entry, stopping at `deadline`, and
-/// answer whether it is gone.
+/// retain the last refusal if it cannot finish.
 ///
 /// The lease goes last. It is what lets the next init reap whatever is left: a
 /// capture directory without a published lease is retained and disclosed
@@ -424,11 +446,11 @@ fn remove_captures_until(paths: Vec<PathBuf>, deadline: std::time::Instant) -> S
 /// would strand the rest for good. Retries until the deadline, as
 /// [`remove_staging_tree`] does, against a writer still filling the tree.
 #[cfg(unix)]
-fn remove_capture_until(path: &Path, deadline: std::time::Instant) -> bool {
+fn remove_capture_until(path: &Path, deadline: std::time::Instant) -> std::io::Result<()> {
     loop {
         match try_remove_capture_until(path, deadline) {
-            Ok(()) => return true,
-            Err(_) if std::time::Instant::now() >= deadline => return false,
+            Ok(()) => return Ok(()),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
             Err(_) => {}
         }
     }
@@ -496,6 +518,14 @@ fn remove_entry_until(path: &Path, deadline: std::time::Instant) -> std::io::Res
 /// error handle, whose lock the interrupted thread may be holding mid-line.
 #[cfg(unix)]
 fn report_signal_cleanup(signal: libc::c_int, outcome: &SignalCleanup) {
+    let message = signal_cleanup_message(signal, outcome);
+    unsafe {
+        libc::write(2, message.as_ptr().cast(), message.len());
+    }
+}
+
+#[cfg(unix)]
+fn signal_cleanup_message(signal: libc::c_int, outcome: &SignalCleanup) -> String {
     let name = match signal {
         libc::SIGINT => "SIGINT",
         libc::SIGTERM => "SIGTERM",
@@ -506,16 +536,15 @@ fn report_signal_cleanup(signal: libc::c_int, outcome: &SignalCleanup) {
     if !outcome.removed.is_empty() {
         message.push_str("; removed its Git capture directory");
     }
-    for path in &outcome.left {
+    for failure in &outcome.left {
         message.push_str(&format!(
-            "; left {} for the next kin init to remove",
-            path.display()
+            "; left {} for the next kin init to remove because {}",
+            failure.path.display(),
+            failure.reason,
         ));
     }
     message.push_str(".\n");
-    unsafe {
-        libc::write(2, message.as_ptr().cast(), message.len());
-    }
+    message
 }
 
 #[cfg(not(unix))]
@@ -687,13 +716,22 @@ mod tests {
         std::fs::create_dir(capture.join("objects")).expect("captured objects");
         std::fs::write(capture.join("objects/body"), b"body").expect("body");
 
-        assert!(!remove_capture_until(&capture, std::time::Instant::now()));
+        let error = remove_capture_until(&capture, std::time::Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             capture.join(CAPTURE_LEASE_NAME).is_file(),
             "the lease must outlive the budget"
         );
-        assert_eq!(reap_abandoned_git_captures(parent.path()).expect("reap"), 1);
+        let live = GitCaptureStaging::claim(parent.path()).expect("next init claims its capture");
         assert!(!capture.exists());
+        assert_eq!(capture_lease_is_abandoned(live.path()), Ok(false));
+        let next = GitCaptureStaging::claim(parent.path()).expect("concurrent init claims capture");
+        assert!(
+            live.path().is_dir(),
+            "recovery must preserve a live owner's capture"
+        );
+        drop(next);
+        drop(live);
     }
 
     /// Within its budget the cleanup removes the whole directory, lease last.
@@ -714,7 +752,7 @@ mod tests {
         // A deadline no loaded test host can miss: what is under test is that
         // the whole tree goes, lease included, not how fast.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        assert!(remove_capture_until(&capture, deadline));
+        remove_capture_until(&capture, deadline).expect("remove captured closure");
         assert!(!capture.exists());
     }
 
@@ -739,13 +777,53 @@ mod tests {
             outcome,
             SignalCleanup {
                 removed: vec![removed.clone()],
-                left: vec![left.clone()],
+                left: vec![SignalCleanupFailure {
+                    path: left.clone(),
+                    reason: "signal cleanup budget spent".into(),
+                }],
             },
             "a directory holding only its lease goes even with no time left, and one with \
              more stays"
         );
         assert!(left.join(CAPTURE_LEASE_NAME).is_file());
         assert!(!removed.exists());
+        let message = signal_cleanup_message(libc::SIGTERM, &outcome);
+        assert!(message.contains("stopped by SIGTERM"));
+        assert!(message.contains("removed its Git capture directory"));
+        assert!(message.contains(&format!(
+            "left {} for the next kin init to remove because signal cleanup budget spent",
+            left.display()
+        )));
+    }
+
+    /// An IO refusal remains distinguishable from an exhausted cleanup budget.
+    #[cfg(unix)]
+    #[test]
+    fn signal_cleanup_reports_the_actual_removal_refusal() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let capture = capture_dir(parent.path(), "refused");
+        // A directory at the lease name cannot be removed as a file, regardless
+        // of the caller's permissions or how busy the host is.
+        std::fs::create_dir(capture.join(CAPTURE_LEASE_NAME)).expect("invalid lease directory");
+        let deadline = std::time::Instant::now();
+        let error = try_remove_capture_until(&capture, deadline).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+        let outcome = remove_captures_until(vec![capture.clone()], deadline);
+        assert_eq!(
+            outcome.left,
+            vec![SignalCleanupFailure {
+                path: capture.clone(),
+                reason: error.to_string(),
+            }]
+        );
+        let message = signal_cleanup_message(libc::SIGTERM, &outcome);
+        assert!(message.contains(&capture.display().to_string()));
+        assert!(message.contains(&error.to_string()));
+        assert!(!message.contains("signal cleanup budget spent"));
+        assert!(
+            capture.is_dir(),
+            "a refused removal must not be reported as complete"
+        );
     }
 
     /// The interrupted-init case: a directory whose lease nobody holds.

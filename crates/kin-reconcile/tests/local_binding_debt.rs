@@ -746,11 +746,12 @@ fn a_dependent_rederivation_does_not_reinstall_an_exact_withdrawn_guess() {
         if reopen {
             repo.reopen();
         }
-        // The caller's bytes never change. Editing its dependency makes the
-        // cross-file linker derive that same weak guess again.
+        // The caller's bytes never change. Changing the exported method's
+        // declaration makes the linker derive that same weak guess again;
+        // a body-only edit intentionally leaves dependent bindings alone.
         repo.edit(
             "local.py",
-            "class Worker:\n    def work(self, value):\n        return value + 1\n",
+            "class Worker:\n    def work(self, value, extra=0):\n        return value + 1\n",
         );
         repo.edit("local.py", GUESSED_TARGET);
         assert!(
@@ -772,7 +773,7 @@ fn a_dependent_rederivation_does_not_reinstall_an_exact_withdrawn_guess() {
             .unwrap();
         repo.edit(
             "local.py",
-            "class Worker:\n    def work(self, value):\n        return value + 2\n",
+            "class Worker:\n    def work(self, value, extra=0):\n        return value + 2\n",
         );
         assert!(
             repo.graph.get_relation_by_id(&retired.id).is_some(),
@@ -843,7 +844,10 @@ fn independently_reproved_named_import_can_restore_a_withdrawn_exact_call() {
         // This is an independently resolved named import from the same admitted
         // caller, not a repeated receiver-name guess. Re-reading its target must
         // admit the exact positive observation and discharge its old obligation.
-        repo.edit("local.py", "def work(value):\n    return value + 1\n");
+        repo.edit(
+            "local.py",
+            "def work(value, extra=0):\n    return value + 1\n",
+        );
         let restored = repo.graph.get_relation_by_id(&retired.id).unwrap();
         assert_eq!(restored.src, retired.src);
         assert_eq!(restored.dst, retired.dst);

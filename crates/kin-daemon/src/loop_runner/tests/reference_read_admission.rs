@@ -199,6 +199,105 @@ impl HeldAdmission {
     }
 }
 
+/// Several times the old retry budget, which gave up after under a second. A
+/// read seen parked with at least this long left before its deadline cannot
+/// give up inside it while the hold lasts.
+#[cfg(unix)]
+const WINDOW_READ_HEADROOM: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// How long a read issued inside a hold has to park or answer before the test
+/// says it did neither. Shorter than the holds' own 30 s release bounds, so
+/// this is the failure a test reports.
+#[cfg(unix)]
+const WINDOW_READ_PARK_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the hold lasts past the moment the read is seen parked. The wait
+/// began before the park was reported, so the wait the read then reports is
+/// at least this long. Its disclosure counts whole milliseconds, and a test
+/// that checks the answer says it waited would read a sub-millisecond wait as
+/// none.
+#[cfg(unix)]
+const WINDOW_READ_MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// A read issued while something holds the graph-authority wait shut, seen
+/// either parked in that wait or already answered.
+#[cfg(unix)]
+enum WindowRead<T> {
+    /// The read answered before it parked waiting out the hold.
+    Answered(T),
+    /// The read is parked waiting out the hold, and answers once it lifts.
+    Parked(tokio::task::JoinHandle<T>),
+}
+
+#[cfg(unix)]
+impl<T: Send + 'static> WindowRead<T> {
+    /// Issue `read` and wait until it parks in the graph-authority wait waiting
+    /// out `blocker`, or answers, whichever comes first.
+    ///
+    /// Parked means its own task reached the wait with the blocker still held:
+    /// the probe is scoped to the read's task, so no other waiter on the clock
+    /// can stand in for it. The park must leave at least
+    /// [`WINDOW_READ_HEADROOM`] before the deadline it waits under, which is
+    /// what a fixed sleep of that length used to show. A parked read is
+    /// returned [`WINDOW_READ_MIN_HOLD`] after it was seen parked, for the
+    /// caller to let the hold go.
+    async fn issue(
+        read: impl std::future::Future<Output = T> + Send + 'static,
+        blocker: crate::state::ReadBlocker,
+    ) -> Self {
+        let probe = crate::state::parked_read_probe::ParkedReadProbe::new();
+        let mut read = tokio::spawn(probe.scope(read));
+        let seen = tokio::time::timeout(WINDOW_READ_PARK_BOUND, async {
+            // An answer ready beside a park wins, so a read that parked and then
+            // gave up is reported as having answered.
+            tokio::select! {
+                biased;
+                answer = &mut read => Err(answer.expect("the read task completes")),
+                park = probe.parked_on(blocker) => Ok(park),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the read neither parked waiting out {blocker:?} nor answered within \
+                 {WINDOW_READ_PARK_BOUND:?}; last park: {:?}",
+                probe.last()
+            )
+        });
+        match seen {
+            Err(answer) => Self::Answered(answer),
+            Ok(park) => {
+                let headroom = park
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                assert!(
+                    headroom >= WINDOW_READ_HEADROOM,
+                    "a read parked waiting out {blocker:?} must have at least \
+                     {WINDOW_READ_HEADROOM:?} before it gives up, and had {headroom:?}"
+                );
+                tokio::time::sleep(WINDOW_READ_MIN_HOLD).await;
+                Self::Parked(read)
+            }
+        }
+    }
+
+    /// Whether the read has answered.
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Answered(_) => true,
+            Self::Parked(read) => read.is_finished(),
+        }
+    }
+
+    /// The read's answer, once it has one.
+    async fn answer(self) -> T {
+        match self {
+            Self::Answered(answer) => answer,
+            Self::Parked(read) => read.await.expect("the read task completes"),
+        }
+    }
+}
+
 /// The `graph_authority` disclosure with `reason`, from an answer's own
 /// `degradations[]`.
 #[cfg(unix)]
@@ -221,9 +320,9 @@ fn admission_window_disclosure<'a>(
 ///
 /// Here a real edit admission is held open at its publication, where it holds
 /// authority, until the test lets it go. The read issued inside that window
-/// must still be waiting after a hold several times longer than the old
-/// budget, then answer from the graph the admission left, certified current
-/// and labelled as a read that waited.
+/// must park waiting out the writer with several times the old budget left
+/// before it gives up, then answer from the graph the admission left,
+/// certified current and labelled as a read that waited.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(commit_phase_capture)]
@@ -289,19 +388,18 @@ async fn a_reference_read_waits_out_an_admission_that_holds_graph_authority() {
         "the admission must be holding graph authority while it is held open"
     );
 
-    let read = tokio::spawn(admission_window_find_references(
-        Arc::clone(&state),
-        work.id,
-    ));
-    // Several times the old retry budget, which gave up after under a second.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_find_references(Arc::clone(&state), work.id),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
     let answered_inside_the_window = read.is_finished();
     release.send(()).unwrap();
     admission
         .await
         .unwrap()
         .expect("the held admission finishes once released");
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let kin_mcp::ContentBlock::Text { text } = &result.content[0];
 
     assert!(
@@ -402,16 +500,18 @@ async fn a_reference_read_by_name_waits_for_the_admission_adding_that_name() {
         "held before it applies its delta, the admission has not moved the graph, so the settled \
          replay of the certified read is available inside the window"
     );
-    let read = tokio::spawn(admission_window_tool_call(
-        Arc::clone(&state),
-        "find_references",
-        serde_json::json!({"query": "again"}),
-    ));
-    // Several times the old retry budget, which gave up after under a second.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "find_references",
+            serde_json::json!({"query": "again"}),
+        ),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
     let answered_inside_the_window = read.is_finished();
     held.release().await;
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let kin_mcp::ContentBlock::Text { text } = &result.content[0];
 
     assert!(
@@ -482,15 +582,18 @@ async fn bulk_check_references_waits_out_an_admission_and_says_it_waited() {
 
     let held =
         HeldAdmission::begin(&state, repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).await;
-    let read = tokio::spawn(admission_window_tool_call(
-        Arc::clone(&state),
-        "bulk_check_references",
-        arguments.clone(),
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "bulk_check_references",
+            arguments.clone(),
+        ),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
     let answered_inside_the_window = read.is_finished();
     held.release().await;
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let kin_mcp::ContentBlock::Text { text } = &result.content[0];
 
     assert!(
@@ -590,14 +693,17 @@ async fn command_xref_waits_out_an_admission_and_names_a_writer_still_holding_au
     // A limit longer than the hold: a read issued inside the same window waits
     // and answers from the graph the admission leaves.
     state.set_xref_writer_drain_ceiling_for_test(std::time::Duration::from_secs(120));
-    let read = tokio::spawn(admission_window_xref(Arc::clone(&state), "again"));
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_xref(Arc::clone(&state), "again"),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
     let answered_inside_the_window = read.is_finished();
     held.release().await;
     state
         .reconciliation_status
         .store(RECON_IDLE, std::sync::atomic::Ordering::Relaxed);
-    let (status, answer) = read.await.unwrap();
+    let (status, answer) = read.answer().await;
 
     assert!(
         !answered_inside_the_window,
@@ -614,8 +720,9 @@ async fn command_xref_waits_out_an_admission_and_names_a_writer_still_holding_au
 }
 
 /// Issue `read` while the edit admission holds graph authority, and report
-/// whether it had answered after a hold several times longer than the old
-/// retry budget, before the admission is let go, and what it answered.
+/// whether it had answered by the time it parked waiting out the writer, with
+/// several times the old retry budget left, before the admission is let go,
+/// and what it answered.
 #[cfg(unix)]
 async fn read_inside_a_held_admission<T: Send + 'static>(
     state: &Arc<DaemonState>,
@@ -624,11 +731,10 @@ async fn read_inside_a_held_admission<T: Send + 'static>(
 ) -> (bool, T) {
     let held =
         HeldAdmission::begin(state, repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).await;
-    let read = tokio::spawn(read);
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(read, crate::state::ReadBlocker::Writer).await;
     let answered_inside_the_window = read.is_finished();
     held.release().await;
-    (answered_inside_the_window, read.await.unwrap())
+    (answered_inside_the_window, read.answer().await)
 }
 
 /// `/commands/refs` asked for a name the held admission adds must wait for the
@@ -1191,8 +1297,7 @@ async fn command_trace_by_name_waits_for_the_admission_adding_that_name() {
     .await;
 
     assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
-    let response: kin_cli::commands::trace::TraceResponse =
-        serde_json::from_str(&answer).unwrap();
+    let response: kin_cli::commands::trace::TraceResponse = serde_json::from_str(&answer).unwrap();
     assert!(
         response.error.is_none(),
         "a name the admission is adding must never be answered as missing: {answer}"
@@ -1203,7 +1308,10 @@ async fn command_trace_by_name_waits_for_the_admission_adding_that_name() {
          {answer}"
     );
     assert!(
-        response.entities.iter().any(|entity| entity.name == "again"),
+        response
+            .entities
+            .iter()
+            .any(|entity| entity.name == "again"),
         "the answer must trace the entity the admission added: {answer}"
     );
 }
@@ -1264,8 +1372,7 @@ async fn command_impact_waits_for_the_admission_adding_a_first_dependent() {
     let (status, before) =
         admission_window_post(Arc::clone(&state), "/impact", request.clone()).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{before}");
-    let before: kin_cli::commands::impact::ImpactResponse =
-        serde_json::from_str(&before).unwrap();
+    let before: kin_cli::commands::impact::ImpactResponse = serde_json::from_str(&before).unwrap();
     assert!(
         before
             .lines
@@ -1286,8 +1393,7 @@ async fn command_impact_waits_for_the_admission_adding_a_first_dependent() {
     let response: kin_cli::commands::impact::ImpactResponse =
         serde_json::from_str(&answer).unwrap();
     assert!(
-        response.negative.is_none()
-            && response.lines.iter().any(|line| line.contains("later")),
+        response.negative.is_none() && response.lines.iter().any(|line| line.contains("later")),
         "an entity the admission gives a dependent must never be answered as having none: \
          {answer}"
     );
@@ -1341,11 +1447,10 @@ async fn read_inside_a_held_new_file_admission<T: Send + 'static>(
         ADMISSION_WINDOW_NEW_FILE,
     )
     .await;
-    let read = tokio::spawn(read);
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(read, crate::state::ReadBlocker::Writer).await;
     let answered_inside_the_window = read.is_finished();
     held.release().await;
-    (answered_inside_the_window, read.await.unwrap())
+    (answered_inside_the_window, read.answer().await)
 }
 
 /// A tool answer's text and, when it is JSON, its payload.
@@ -1515,8 +1620,7 @@ async fn command_blame_by_name_waits_for_the_admission_adding_that_name() {
         "a blame by name issued while an admission holds graph authority must wait for it: \
          {answer}"
     );
-    let response: kin_cli::commands::blame::BlameResponse =
-        serde_json::from_str(&answer).unwrap();
+    let response: kin_cli::commands::blame::BlameResponse = serde_json::from_str(&answer).unwrap();
     assert!(
         response
             .lines
@@ -1655,9 +1759,12 @@ async fn command_dead_code_waits_for_the_admission_adding_a_reference() {
             serde_json::from_str(answer).unwrap();
         response.lines.iter().any(|line| line.contains("helper"))
     };
-    let (status, before) =
-        admission_window_post(Arc::clone(&state), "/commands/dead-code", serde_json::json!({}))
-            .await;
+    let (status, before) = admission_window_post(
+        Arc::clone(&state),
+        "/commands/dead-code",
+        serde_json::json!({}),
+    )
+    .await;
     assert_eq!(status, axum::http::StatusCode::OK, "{before}");
     assert!(
         lists_helper(&before),
@@ -1667,7 +1774,11 @@ async fn command_dead_code_waits_for_the_admission_adding_a_reference() {
     let (answered_inside_the_window, (status, answer)) = read_inside_a_held_admission(
         &state,
         &repo,
-        admission_window_post(Arc::clone(&state), "/commands/dead-code", serde_json::json!({})),
+        admission_window_post(
+            Arc::clone(&state),
+            "/commands/dead-code",
+            serde_json::json!({}),
+        ),
     )
     .await;
 
@@ -1934,12 +2045,9 @@ async fn repo_entities_by_name_waits_for_the_admission_adding_that_name() {
     state.set_xref_writer_drain_ceiling_for_test(std::time::Duration::from_secs(120));
     let uri = format!("/repos/{}/entities?query=again", state.cached_repo_id);
 
-    let (answered_inside_the_window, (status, answer)) = read_inside_a_held_admission(
-        &state,
-        &repo,
-        admission_window_get(Arc::clone(&state), uri),
-    )
-    .await;
+    let (answered_inside_the_window, (status, answer)) =
+        read_inside_a_held_admission(&state, &repo, admission_window_get(Arc::clone(&state), uri))
+            .await;
 
     assert_eq!(status, axum::http::StatusCode::OK, "{answer}");
     let response: serde_json::Value = serde_json::from_str(&answer).unwrap();
@@ -1956,8 +2064,8 @@ async fn repo_entities_by_name_waits_for_the_admission_adding_that_name() {
     );
 }
 
-/// Point the machine-wide repository registry at an empty scratch registry for
-/// this test process.
+/// Point the machine-wide repository registry at the test process's one empty
+/// scratch registry.
 ///
 /// A local spine initializes from every workspace the registry names, and the
 /// registry defaults to the one on this machine, so a test that reads the spine
@@ -1965,18 +2073,7 @@ async fn repo_entities_by_name_waits_for_the_admission_adding_that_name() {
 /// here rather than only its fixture.
 #[cfg(unix)]
 fn isolate_repository_registry() {
-    static REGISTRY: std::sync::OnceLock<(tempfile::TempDir, std::path::PathBuf)> =
-        std::sync::OnceLock::new();
-    let _guard = crate::test_env_lock();
-    let (_root, path) = REGISTRY.get_or_init(|| {
-        let root = tempfile::tempdir().expect("a scratch directory for the test registry");
-        let path = root.path().join("registry.toml");
-        kin_core::registry::KinRegistry { repos: Vec::new() }
-            .save_to(&path)
-            .unwrap();
-        (root, path)
-    });
-    kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
+    kin_core::test_env::install_test_registry();
 }
 
 /// On a local daemon the spine captures this repository from the live graph,
@@ -2005,10 +2102,7 @@ async fn spine_resolve_by_name_waits_for_the_admission_adding_that_name() {
     let (answered_inside_the_window, (status, answer)) = read_inside_a_held_admission(
         &state,
         &repo,
-        admission_window_get(
-            Arc::clone(&state),
-            "/spine/resolve?name=again".to_string(),
-        ),
+        admission_window_get(Arc::clone(&state), "/spine/resolve?name=again".to_string()),
     )
     .await;
 
@@ -2195,9 +2289,15 @@ async fn mcp_explore_codebase_by_name_waits_for_the_admission_adding_that_name()
         "explore_codebase",
         serde_json::json!({"query": "again"}),
         |_, body| {
-            body["content"].as_str().is_some_and(|content| {
-                !content.starts_with("No entities found matching") && content.contains("again")
-            })
+            let admitted = admission_window_entity(&state, "caller.py", "again");
+            body["content"]["match_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+                && body["content"]["matches"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row["name"] == admitted.name && row["id"] == admitted.id.to_string()
+                    })
+                })
         },
     )
     .await;
@@ -2265,35 +2365,80 @@ async fn mcp_find_dead_code_seeded_waits_for_the_admission_adding_a_reference() 
     .await;
 }
 
-/// `graph_neighborhood` of an entity with no incoming relation yet waits for
-/// the held admission that adds its first caller.
+/// An outgoing neighborhood has no edge before the held admission adds its
+/// first dependency. Incoming module containment remains a separate control;
+/// a nonempty incoming answer does not claim an absence and need not wait.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(commit_phase_capture)]
 async fn mcp_graph_neighborhood_waits_for_the_admission_adding_a_first_relation() {
     let repo = tempfile::tempdir().unwrap();
-    let (state, _work) = admission_window_fixture(&repo).await;
+    let (state, work) = admission_window_fixture(&repo).await;
     state.set_xref_writer_drain_ceiling_for_test(std::time::Duration::from_secs(120));
     let helper = admission_window_entity(&state, "target.py", "helper");
-    let arguments = serde_json::json!({"entity_id": helper.id.to_string(), "direction": "in"});
+    let incoming = admission_window_tool_call(
+        Arc::clone(&state),
+        "graph_neighborhood",
+        serde_json::json!({"entity_id": helper.id.to_string(), "direction": "in", "depth": 1}),
+    )
+    .await;
+    let (incoming_text, incoming) = tool_answer(&incoming);
+    let containment = incoming["relations"]
+        .as_array()
+        .expect("a neighborhood reports its actual relations");
+    assert_eq!(
+        incoming["relation_count"],
+        containment.len(),
+        "{incoming_text}"
+    );
+    assert!(
+        !containment.is_empty()
+            && containment.iter().all(|relation| {
+                relation["kind"] == "Contains" && relation["dst"]["Entity"] == helper.id.to_string()
+            }),
+        "only module containment reaches `helper` before the edit: {incoming_text}"
+    );
+    let arguments = serde_json::json!({
+        "entity_id": helper.id.to_string(), "direction": "out", "depth": 1
+    });
     let before =
         admission_window_tool_call(Arc::clone(&state), "graph_neighborhood", arguments.clone())
             .await;
     let (before_text, before) = tool_answer(&before);
-    assert_eq!(
-        before["relation_count"].as_u64(),
-        Some(0),
-        "nothing reaches `helper` before the edit: {before_text}"
-    );
-    assert_tool_waited_for_the_admission(
+    assert_eq!(before["relation_count"], 0, "{before_text}");
+    assert_eq!(before["relations"], serde_json::json!([]), "{before_text}");
+
+    let held = HeldAdmission::begin(
         &state,
-        &repo,
-        false,
-        "graph_neighborhood",
-        arguments,
-        |text, body| body["relation_count"].as_u64().is_some_and(|n| n > 0) && text.contains("later"),
+        repo.path().join("target.py"),
+        "def work(value):\n    return value\n\n\ndef helper():\n    return work(0)\n",
     )
     .await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(Arc::clone(&state), "graph_neighborhood", arguments),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
+    let answered_inside_the_window = read.is_finished();
+    held.release().await;
+    let result = read.answer().await;
+    let (text, body) = tool_answer(&result);
+    assert!(
+        !answered_inside_the_window,
+        "a read of the initially empty outgoing scope must wait for its admitting writer: {text}"
+    );
+    let relations = body["relations"]
+        .as_array()
+        .expect("neighborhood relation rows");
+    assert_eq!(body["relation_count"], relations.len(), "{text}");
+    assert!(
+        relations.iter().any(|relation| {
+            relation["kind"] == "Calls"
+                && relation["src"]["Entity"] == helper.id.to_string()
+                && relation["dst"]["Entity"] == work.id.to_string()
+        }),
+        "the answer must hold the exact newly admitted helper-to-work call: {text}"
+    );
 }
 
 /// Semantic discovery of an entity in a newly admitted source unit waits for
@@ -2341,43 +2486,140 @@ async fn mcp_lexical_lookup_waits_for_the_admission_adding_the_literal() {
     .await;
 }
 
-/// `semantic_diff` over a file the held admission adds waits for it rather
-/// than answering that the file resolved to no entity.
+/// An unsupported selector is refused before graph authority is consulted,
+/// even while admission is adding the source it names.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(commit_phase_capture)]
-async fn mcp_semantic_diff_of_files_waits_for_the_admission_adding_the_file() {
+async fn mcp_semantic_diff_refuses_physical_selectors_without_waiting_for_admission() {
     let repo = tempfile::tempdir().unwrap();
-    let (state, _work) = admission_window_fixture(&repo).await;
+    let (state, work) = admission_window_fixture(&repo).await;
     state.set_xref_writer_drain_ceiling_for_test(std::time::Duration::from_secs(120));
-    assert_tool_waited_for_the_admission(
+    let (answered_inside_the_window, result) = read_inside_a_held_new_file_admission(
         &state,
         &repo,
-        true,
-        "semantic_diff",
-        serde_json::json!({"files": ["fresh.py"]}),
-        |text, _| !text.contains("no entity resolved from the given files"),
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "semantic_diff",
+            serde_json::json!({"files": ["fresh.py"]}),
+        ),
     )
     .await;
+    let (text, _) = tool_answer(&result);
+    assert!(
+        answered_inside_the_window,
+        "unsupported selectors must not wait: {text}"
+    );
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(
+        text.contains("Select semantic entities by name or returned UUID"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("fresh.py"),
+        "the refusal must not echo a physical selector: {text}"
+    );
+    // The accepted selector returns useful records. This read follows release:
+    // semantic_diff does not promise the analysis fence semantic_review owns.
+    let current = admission_window_tool_call(
+        Arc::clone(&state),
+        "semantic_diff",
+        serde_json::json!({"entity_ids":[work.id.to_string()]}),
+    )
+    .await;
+    let (text, body) = tool_answer(&current);
+    assert_ne!(current.is_error, Some(true), "{text}");
+    let changes = body["diff"]["entity_changes"]
+        .as_array()
+        .expect("structured semantic diff");
+    assert_eq!(changes.len(), 1, "{text}");
+    assert_eq!(changes[0]["entity_id"], work.id.to_string(), "{text}");
+    let current = changes[0]["kind"]
+        .get("Added")
+        .or_else(|| changes[0]["kind"].pointer("/Modified/new"))
+        .expect("the selected entity still exists");
+    assert_eq!(current["id"], work.id.to_string(), "{text}");
+    assert_eq!(current["name"], work.name, "{text}");
+    assert_eq!(current["signature"], work.signature, "{text}");
+    assert!(!text.contains("target.py"), "{text}");
 }
 
-/// `semantic_review` over a file the held admission adds waits the same way.
+/// A semantic review waits for its selected entity's newly admitted consumer;
+/// a refused physical selector never enters that wait.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(commit_phase_capture)]
-async fn mcp_semantic_review_of_files_waits_for_the_admission_adding_the_file() {
+async fn mcp_semantic_review_by_entity_waits_for_admission_and_refuses_physical_selectors() {
     let repo = tempfile::tempdir().unwrap();
     let (state, _work) = admission_window_fixture(&repo).await;
     state.set_xref_writer_drain_ceiling_for_test(std::time::Duration::from_secs(120));
-    assert_tool_waited_for_the_admission(
-        &state,
-        &repo,
-        true,
-        "semantic_review",
-        serde_json::json!({"files": ["fresh.py"]}),
-        |text, _| !text.contains("no entity resolved from the given files"),
+    let helper = admission_window_entity(&state, "target.py", "helper");
+    let arguments = serde_json::json!({"entity_ids": [helper.id.to_string()], "format":"json"});
+    let before =
+        admission_window_tool_call(Arc::clone(&state), "semantic_review", arguments.clone()).await;
+    assert_ne!(before.is_error, Some(true));
+    let (before_text, before) = tool_answer(&before);
+    assert!(
+        before["impact"]["entity_impacts"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["entity_id"] == helper.id.to_string()
+                    && row["consumer_count"].as_u64() == Some(0)
+            })),
+        "the selected entity has no consumer before admission: {before_text}"
+    );
+
+    let held =
+        HeldAdmission::begin(&state, repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).await;
+    let refused = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "semantic_review",
+            serde_json::json!({"files":["caller.py"]}),
+        ),
+        crate::state::ReadBlocker::Writer,
     )
     .await;
+    let refused_inside_the_window = refused.is_finished();
+    let read = WindowRead::issue(
+        admission_window_tool_call(Arc::clone(&state), "semantic_review", arguments),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
+    let answered_inside_the_window = read.is_finished();
+    held.release().await;
+
+    let refused = refused.answer().await;
+    let (refusal, _) = tool_answer(&refused);
+    assert!(
+        refused_inside_the_window,
+        "unsupported selectors must not wait: {refusal}"
+    );
+    assert_eq!(refused.is_error, Some(true), "{refusal}");
+    assert!(
+        refusal.contains("Select semantic entities by name or returned UUID"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("caller.py"), "{refusal}");
+
+    let result = read.answer().await;
+    let (text, body) = tool_answer(&result);
+    assert_ne!(result.is_error, Some(true), "{text}");
+    assert!(
+        !answered_inside_the_window,
+        "semantic analysis must wait for admission: {text}"
+    );
+    assert!(
+        body["impact"]["entity_impacts"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| {
+                row["entity_id"] == helper.id.to_string()
+                    && row["consumer_count"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+            })),
+        "the selected entity must report its newly admitted consumer: {text}"
+    );
 }
 
 /// `impact_analysis` of an entity with no consumer yet waits for the held
@@ -2434,9 +2676,12 @@ async fn mcp_security_scan_waits_for_the_admission_adding_a_caller() {
             })
         })
     };
-    let before =
-        admission_window_tool_call(Arc::clone(&state), "kin_security_scan", serde_json::json!({}))
-            .await;
+    let before = admission_window_tool_call(
+        Arc::clone(&state),
+        "kin_security_scan",
+        serde_json::json!({}),
+    )
+    .await;
     let (before_text, before) = tool_answer(&before);
     assert!(
         reports_helper(&before),
@@ -2481,12 +2726,9 @@ async fn admission_window_post_as(
 #[cfg(unix)]
 async fn admission_window_historical_session(state: &Arc<DaemonState>) -> kin_model::SessionId {
     let binding = state.local_repository_authority_binding().unwrap();
-    let head = kin_cli::commands::ref_lookup::resolve_ref(
-        state.graph.as_ref(),
-        &binding,
-        Some("HEAD"),
-    )
-    .unwrap();
+    let head =
+        kin_cli::commands::ref_lookup::resolve_ref(state.graph.as_ref(), &binding, Some("HEAD"))
+            .unwrap();
     let manager = crate::api::held_repository_authority(state).unwrap();
     let historical = Arc::new(kin_core::build_graph_at_ref(manager.as_ref(), &head).unwrap());
     let session = kin_model::SessionId::new();
@@ -2569,17 +2811,20 @@ async fn a_cleared_scope_reads_the_live_graph_and_waits_like_one() {
 
     let writer = state.begin_graph_authority_mutation();
     let pending = state.begin_pending_admission();
-    let read = tokio::spawn(admission_window_tool_call_as(
-        Arc::clone(&state),
-        "get_entity_source",
-        serde_json::json!({"entity_id": "again"}),
-        session,
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call_as(
+            Arc::clone(&state),
+            "get_entity_source",
+            serde_json::json!({"entity_id": "again"}),
+            session,
+        ),
+        crate::state::ReadBlocker::Writer,
+    )
+    .await;
     let answered_while_held = read.is_finished();
     drop(pending);
     drop(writer);
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let (text, _) = tool_answer(&result);
 
     assert!(
@@ -2593,9 +2838,14 @@ async fn a_cleared_scope_reads_the_live_graph_and_waits_like_one() {
 }
 
 /// A malformed argument is the caller's to fix, and no admission changes it.
-/// A context pack call with an entity id that is not a uuid, beside one name
-/// the graph holds and one it does not, answers with the invalid-id error at
-/// once while edits are pending, rather than waiting on the missing name.
+/// A context pack call whose entity id names the `entity:` id form and then
+/// malforms its uuid, beside one name the graph holds and one it does not,
+/// answers with the invalid-id error at once while edits are pending, rather
+/// than waiting on the missing name.
+///
+/// A bare `entity_id` that is not a uuid is no longer malformed: the pack
+/// reads it as the name it is, and a name the graph lacks waits like any
+/// other. The `entity:` spelling is an id, never a name, so it stays refused.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial(commit_phase_capture)]
@@ -2611,7 +2861,7 @@ async fn a_malformed_context_pack_argument_is_refused_at_once_while_edits_are_pe
             Arc::clone(&state),
             "get_context_pack",
             serde_json::json!({
-                "entity_id": "not-a-uuid",
+                "entity_id": "entity:not-a-uuid",
                 "entities": ["work", "new_missing_name"],
             }),
         ),
@@ -2623,8 +2873,10 @@ async fn a_malformed_context_pack_argument_is_refused_at_once_while_edits_are_pe
         answer.expect("a malformed argument must be refused at once, not held behind edits");
     let (text, _) = tool_answer(&answer);
     assert_eq!(answer.is_error, Some(true), "{text}");
+    // An id argument is read against the graph, so a malformed one is
+    // refused as naming nothing, in the words every read tool uses.
     assert!(
-        text.contains("invalid entity_id"),
+        text.contains("entity_id `entity:not-a-uuid` names no entity"),
         "the refusal is the caller's own invalid id: {text}"
     );
     assert!(
@@ -2673,6 +2925,10 @@ struct ArmedAdmissionLoop {
 #[cfg(unix)]
 impl ArmedAdmissionLoop {
     async fn start(state: &Arc<DaemonState>, config: LoopConfig) -> Self {
+        // Every test on this loop grades a particular round's mark. A lost
+        // canary's complete admission would be another round, by another
+        // route, so delivery is not sampled here.
+        use_delivery_canary_for_test(state.layout.working_dir(), None);
         let (cancel, receiver) = tokio::sync::watch::channel(false);
         let (armed, ready) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(run_loop_armed(
@@ -2718,6 +2974,52 @@ impl ArmedAdmissionLoop {
             }
         }
     }
+}
+
+/// Wait until the loop has been idle across a short pause, or ten seconds.
+#[cfg(unix)]
+async fn wait_until_idle(state: &DaemonState) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if state.reconciliation_status_str() == "idle" {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if state.reconciliation_status_str() == "idle" {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
+/// Write `contents` to `file` and wait up to 60 s for `reached`, the round
+/// hold the write should cause.
+///
+/// A saturated host can drop the write's notification and say nothing, so the
+/// same bytes are written again, by rename, only while the loop has received no
+/// notification for the file. Once it has, this only waits.
+#[cfg(unix)]
+async fn write_until_the_round_holds<T>(
+    state: &DaemonState,
+    file: &str,
+    contents: &str,
+    reached: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, ()> {
+    let working_dir = state.layout.working_dir().to_path_buf();
+    let host = working_dir.join(file);
+    let notified = HostNotificationMark::take(&working_dir, &[host.as_path()]);
+    std::fs::write(&host, contents).unwrap();
+    notified
+        .await_with_rewrites(
+            state,
+            || replace_by_rename_for_test(&working_dir, &host, contents.as_bytes()),
+            false,
+            reached,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .ok_or(())
 }
 
 /// Assert that a find_references by name for `name` waited for the edit that
@@ -2792,19 +3094,21 @@ async fn a_reference_read_by_name_waits_through_the_commit_grace_for_a_drained_e
     // hold through the real sleep as well as through the hold.
     state.record_authority_publication(std::time::Duration::from_secs(8));
     let (reached, release) = hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
-    std::fs::write(repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).unwrap();
-    let in_the_grace = tokio::time::timeout(std::time::Duration::from_secs(30), reached).await;
+    let in_the_grace =
+        write_until_the_round_holds(&state, "caller.py", ADMISSION_WINDOW_EDIT, reached).await;
 
-    let read = tokio::spawn(admission_window_tool_call(
-        Arc::clone(&state),
-        "find_references",
-        serde_json::json!({"query": "again"}),
-    ));
-    // Several times the old retry budget, which gave up after under a second.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "find_references",
+            serde_json::json!({"query": "again"}),
+        ),
+        crate::state::ReadBlocker::PendingAdmission,
+    )
+    .await;
     let answered_inside_the_grace = read.is_finished();
     let _ = release.send(());
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let stopped = running.stop().await;
 
     assert!(
@@ -2850,8 +3154,8 @@ async fn a_reference_read_by_id_with_rows_is_served_through_a_pending_admission(
     )
     .await;
     let (reached, release) = hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
-    std::fs::write(repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).unwrap();
-    let in_the_grace = tokio::time::timeout(std::time::Duration::from_secs(30), reached).await;
+    let in_the_grace =
+        write_until_the_round_holds(&state, "caller.py", ADMISSION_WINDOW_EDIT, reached).await;
     let mark_up_before = state.pending_admission_active();
 
     let with_rows = tokio::time::timeout(
@@ -2859,15 +3163,15 @@ async fn a_reference_read_by_id_with_rows_is_served_through_a_pending_admission(
         admission_window_find_references(Arc::clone(&state), work.id),
     )
     .await;
-    let without_rows = tokio::spawn(admission_window_find_references(
-        Arc::clone(&state),
-        helper.id,
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let without_rows = WindowRead::issue(
+        admission_window_find_references(Arc::clone(&state), helper.id),
+        crate::state::ReadBlocker::PendingAdmission,
+    )
+    .await;
     let answered_inside_the_grace = without_rows.is_finished();
     let mark_up_after = state.pending_admission_active();
     let _ = release.send(());
-    let without_rows = without_rows.await.unwrap();
+    let without_rows = without_rows.answer().await;
     let stopped = running.stop().await;
 
     assert!(
@@ -2878,9 +3182,8 @@ async fn a_reference_read_by_id_with_rows_is_served_through_a_pending_admission(
         mark_up_before && mark_up_after,
         "the mark must be up across both reads, or neither read went through it"
     );
-    let with_rows = with_rows.expect(
-        "a read by id that returns rows must answer while the mark is up, not wait for it",
-    );
+    let with_rows = with_rows
+        .expect("a read by id that returns rows must answer while the mark is up, not wait for it");
     let kin_mcp::ContentBlock::Text { text } = &with_rows.content[0];
     assert_ne!(with_rows.is_error, Some(true), "{text}");
     let body: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -2890,7 +3193,8 @@ async fn a_reference_read_by_id_with_rows_is_served_through_a_pending_admission(
         .as_array()
         .expect("an answer with rows lists them");
     assert!(
-        rows.iter().any(|row| row["entity_id"] == run.id.to_string()),
+        rows.iter()
+            .any(|row| row["entity_id"] == run.id.to_string()),
         "the answer is read from the graph as it stands: {body}"
     );
     assert!(
@@ -2961,17 +3265,19 @@ async fn a_reference_read_by_name_waits_through_a_commit_stand_down_for_a_draine
     )
     .await;
     let commit = state.pending_commits.announce();
-    let (reached, release) =
-        hold_next_round_at_for_test(&state, RoundHoldPoint::CommitStandDown);
-    std::fs::write(repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).unwrap();
-    let standing_down = tokio::time::timeout(std::time::Duration::from_secs(30), reached).await;
+    let (reached, release) = hold_next_round_at_for_test(&state, RoundHoldPoint::CommitStandDown);
+    let standing_down =
+        write_until_the_round_holds(&state, "caller.py", ADMISSION_WINDOW_EDIT, reached).await;
 
-    let read = tokio::spawn(admission_window_tool_call(
-        Arc::clone(&state),
-        "find_references",
-        serde_json::json!({"query": "again"}),
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "find_references",
+            serde_json::json!({"query": "again"}),
+        ),
+        crate::state::ReadBlocker::PendingAdmission,
+    )
+    .await;
     let answered_at_the_first_stand_down = read.is_finished();
     // Let the loop go on standing down for the commit, one round per poll
     // interval, with the read still waiting across the rounds.
@@ -2979,7 +3285,7 @@ async fn a_reference_read_by_name_waits_through_a_commit_stand_down_for_a_draine
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let answered_across_the_stand_downs = read.is_finished();
     drop(commit);
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let stopped = running.stop().await;
 
     assert!(
@@ -3026,60 +3332,125 @@ async fn a_reference_read_by_name_waits_for_the_queued_tail_of_a_burst() {
         },
     )
     .await;
-    let burst = [("first.py", "alpha"), ("second.py", "omega")];
-    // Every round opens with the intent sweep, under the coordination gate, and
-    // drains the watcher after it. With the gate held here the loop parks at
-    // the sweep, so both files are waiting when the next round drains.
-    let coordination = state.coordination_gate.lock().await;
-    for (file, name) in burst {
-        std::fs::write(
-            repo.path().join(file),
-            format!("from target import work\n\ndef {name}():\n    return work(3)\n"),
+    // A saturated host can drop or delay one of the burst's notifications and
+    // say nothing, and then no round drains the whole burst and there is no tail
+    // to grade. Only an attempt whose first round provably drained both
+    // notifications is graded. Any other is let go and the burst is made again
+    // under fresh names, so nothing an abandoned attempt admitted can stand in
+    // for the graded one.
+    const BURST_ATTEMPTS: usize = 4;
+    let working_dir = state.layout.working_dir().to_path_buf();
+    let mut attempt = 0;
+    let (burst, first_round, second_round, second_release, working_through_the_tail, still_queued) = loop {
+        attempt += 1;
+        let burst = [
+            (format!("first{attempt}.py"), format!("alpha{attempt}")),
+            (format!("second{attempt}.py"), format!("omega{attempt}")),
+        ];
+        let hosts: Vec<std::path::PathBuf> = burst
+            .iter()
+            .map(|(file, _)| working_dir.join(file))
+            .collect();
+        let host_paths: Vec<&std::path::Path> = hosts.iter().map(|host| host.as_path()).collect();
+        let notified = HostNotificationMark::take(&working_dir, &host_paths);
+        // Every round opens with the intent sweep, under the coordination gate,
+        // and drains the watcher after it. With the gate held here the loop
+        // parks at the sweep, so both files are waiting when the next round
+        // drains.
+        let coordination = state.coordination_gate.lock().await;
+        let write_burst = || {
+            for ((_, name), host) in burst.iter().zip(&hosts) {
+                std::fs::write(
+                    host,
+                    format!("from target import work\n\ndef {name}():\n    return work(3)\n"),
+                )
+                .unwrap();
+            }
+        };
+        write_burst();
+        // Time for the watcher to deliver both notifications. The loop is
+        // parked at the sweep, so every notification delivered in this window
+        // waits in the watcher's queue for the next round's one drain. The same
+        // bytes are written again through the window, which widens with each
+        // attempt, because a saturated host drops most of them.
+        let window = std::time::Instant::now() + std::time::Duration::from_secs(1 << (attempt - 1));
+        while std::time::Instant::now() < window {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            write_burst();
+        }
+        let (first_reached, first_release) =
+            hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
+        drop(coordination);
+        // A round that drained anything reaches the grace at once; one that
+        // never comes means the host delivered nothing.
+        let first_round = tokio::time::timeout(
+            std::time::Duration::from_secs(if attempt < BURST_ATTEMPTS { 5 } else { 30 }),
+            first_reached,
         )
-        .unwrap();
-    }
-    // Time for the watcher to deliver both notifications.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let (first_reached, first_release) =
-        hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
-    drop(coordination);
-    let first_round =
-        tokio::time::timeout(std::time::Duration::from_secs(30), first_reached).await;
-    // Asked for while the first round is held, so it can only be a later one.
-    let (second_reached, second_release) =
-        hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
-    let _ = first_release.send(());
-    let second_round =
-        tokio::time::timeout(std::time::Duration::from_secs(30), second_reached).await;
-    // A pass that leaves a backlog stays `processing` and one that drains the
-    // queue goes idle, so this says the second round is working through the
-    // first round's tail rather than through a notification that came late.
-    let working_through_the_tail = state.reconciliation_status_str() == "processing";
-    let still_queued = burst
-        .into_iter()
-        .filter(|(file, name)| {
-            !state
-                .graph
-                .query_entities(&EntityFilter {
-                    file_path: Some(FilePathId::new(*file)),
-                    ..Default::default()
-                })
-                .unwrap()
-                .iter()
-                .any(|entity| entity.name == *name)
-        })
-        .collect::<Vec<_>>();
-    let (queued_file, queued_name) = still_queued.first().copied().unwrap_or(burst[1]);
+        .await;
+        if !notified.heard() && attempt < BURST_ATTEMPTS {
+            eprintln!(
+                "attempt {attempt}: the host did not deliver both of the burst's notifications \
+                 to one round, so there is no tail to grade; making the burst again"
+            );
+            cancel_round_holds_for_test(&state);
+            let _ = first_release.send(());
+            wait_until_idle(&state).await;
+            continue;
+        }
+        // Asked for while the first round is held, so it can only be a later one.
+        let (second_reached, second_release) =
+            hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
+        let _ = first_release.send(());
+        let second_round =
+            tokio::time::timeout(std::time::Duration::from_secs(30), second_reached).await;
+        // A pass that leaves a backlog stays `processing` and one that drains
+        // the queue goes idle, so this says the second round is working through
+        // the first round's tail rather than through a notification that came
+        // late.
+        let working_through_the_tail = state.reconciliation_status_str() == "processing";
+        let still_queued = burst
+            .iter()
+            .filter(|(file, name)| {
+                !state
+                    .graph
+                    .query_entities(&EntityFilter {
+                        file_path: Some(FilePathId::new(file.as_str())),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .iter()
+                    .any(|entity| entity.name == *name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        break (
+            burst,
+            first_round,
+            second_round,
+            second_release,
+            working_through_the_tail,
+            still_queued,
+        );
+    };
+    let (queued_file, queued_name) = still_queued
+        .first()
+        .cloned()
+        .unwrap_or_else(|| burst[1].clone());
+    let (queued_file, queued_name) = (queued_file.as_str(), queued_name.as_str());
 
-    let read = tokio::spawn(admission_window_tool_call(
-        Arc::clone(&state),
-        "find_references",
-        serde_json::json!({"query": queued_name}),
-    ));
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "find_references",
+            serde_json::json!({"query": queued_name}),
+        ),
+        crate::state::ReadBlocker::PendingAdmission,
+    )
+    .await;
     let answered_between_the_rounds = read.is_finished();
     let _ = second_release.send(());
-    let result = read.await.unwrap();
+    let result = read.answer().await;
     let stopped = running.stop().await;
 
     assert!(
@@ -3139,8 +3510,8 @@ async fn a_reference_read_by_name_waits_for_a_file_the_ambient_pass_picked_up() 
     .await;
 
     let (reached, release) = hold_next_round_at_for_test(&state, RoundHoldPoint::CommitGrace);
-    std::fs::write(repo.path().join("caller.py"), ADMISSION_WINDOW_EDIT).unwrap();
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(30), reached).await;
+    let drained =
+        write_until_the_round_holds(&state, "caller.py", ADMISSION_WINDOW_EDIT, reached).await;
     // Held the way a commit in flight holds it. The pass that picks the edit
     // up marks itself processing and then waits here, before its writer guard.
     let coordination = state.coordination_gate.lock().await;
@@ -3152,16 +3523,18 @@ async fn a_reference_read_by_name_waits_for_a_file_the_ambient_pass_picked_up() 
     })
     .await;
 
-    let read = tokio::spawn(admission_window_tool_call(
-        Arc::clone(&state),
-        "find_references",
-        serde_json::json!({"query": "again"}),
-    ));
-    // Several times the old retry budget, which gave up after under a second.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let read = WindowRead::issue(
+        admission_window_tool_call(
+            Arc::clone(&state),
+            "find_references",
+            serde_json::json!({"query": "again"}),
+        ),
+        crate::state::ReadBlocker::PendingAdmission,
+    )
+    .await;
     let answered_inside_the_window = read.is_finished();
     drop(coordination);
-    let result = read.await.unwrap();
+    let result = read.answer().await;
 
     // Always stop the owned loop before any assertion.
     let stopped = running.stop().await;
