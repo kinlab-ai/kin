@@ -1,0 +1,81 @@
+{
+ "_kin": {
+  "degraded": {
+   "embed_persistence_unavailable": false,
+   "embed_worker_failed": false,
+   "mass_deletion_blocked": false,
+   "memory_pressure": true
+  },
+  "durability": {
+   "durable_entities": 1898,
+   "durable_relations": 12779,
+   "live_entities": 1898,
+   "live_only_entities": 0,
+   "live_only_relations": 0,
+   "live_relations": 12779,
+   "state": "recorded"
+  },
+  "envelope_version": 2,
+  "freshness": {
+   "state": "no_admission_recorded"
+  },
+  "graph_as_of": {
+   "generation": 4
+  },
+  "graph_state": {
+   "entity_count": 1898,
+   "initialized": true,
+   "loaded": true,
+   "reconciliation_outcome": "settled",
+   "reconciliation_status": "idle"
+  },
+  "hydration_semantics": {
+   "created_under": 32,
+   "derives": 32,
+   "standing": "current"
+  },
+  "repository": {
+   "root": "/work/flask"
+  },
+  "runtime": "repo-daemon"
+ },
+ "approvals": [],
+ "change_count": 1,
+ "changes": [
+  {
+   "author": "snapshot <snapshot@localhost> 1788801247 +0100",
+   "entity_delta_count": 1898,
+   "id": "13ccfb15830cb8c58c0dd9f9e019fc263d0ad8f280ae231ef039dbc90457d03b",
+   "message": "pallets/flask tree at d73fa1cdcbd8b1465c151db8924ba58b1dd14e35\n",
+   "origin": {
+    "oid": "cd5aab00a2e20fdb77c534044c644aeea009c795",
+    "type": "git_commit"
+   },
+   "parents": [],
+   "relation_delta_count": 3165,
+   "timestamp": "2026-09-07T17:14:07Z",
+   "tree_delta_count": 236
+  }
+ ],
+ "compact": true,
+ "entity_id": "4bf5cda3-6b30-4361-96cb-b9f72736d582",
+ "latest_change": {
+  "author": "snapshot <snapshot@localhost> 1788801247 +0100",
+  "entity_delta_count": 1898,
+  "id": "13ccfb15830cb8c58c0dd9f9e019fc263d0ad8f280ae231ef039dbc90457d03b",
+  "message": "pallets/flask tree at d73fa1cdcbd8b1465c151db8924ba58b1dd14e35\n",
+  "origin": {
+   "oid": "cd5aab00a2e20fdb77c534044c644aeea009c795",
+   "type": "git_commit"
+  },
+  "parents": [],
+  "relation_delta_count": 3165,
+  "timestamp": "2026-09-07T17:14:07Z",
+  "tree_delta_count": 236
+ },
+ "next_offset": null,
+ "offset": 0,
+ "recent_audit_events": [],
+ "returned": 1,
+ "truncated": false
+}

@@ -69,8 +69,18 @@ const PIDS: &str = "fake-server.pids";
 
 /// How long the processes get to be gone. A stop returns once the group is
 /// empty, a drop sends SIGKILL before it returns, and the watcher takes the
-/// termination grace, about two seconds. The rest is room for a loaded machine.
+/// termination grace. The rest is room for a loaded machine.
 const SETTLE: Duration = Duration::from_secs(20);
+
+/// The termination grace every stop in these tests gives a server's group,
+/// in place of the production two seconds.
+///
+/// The fake server's child ignores SIGTERM, so every stop here still has to
+/// escalate to SIGKILL, and does, after this grace rather than after two
+/// seconds of waiting per test. Long enough for the server itself to exit on
+/// SIGTERM first. The watcher counts whole seconds, so under this grace it
+/// sends SIGKILL right after SIGTERM.
+const TEST_GRACE: Duration = Duration::from_millis(250);
 
 /// Selects worker mode for [`abrupt_owner_worker`] and names its scratch root.
 const ABRUPT_OWNER_ROOT: &str = "KIN_TEST_LANGUAGE_SERVER_ABRUPT_OWNER_ROOT";
@@ -89,8 +99,10 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a test runtime")
 }
 
-/// Start the fake server the way the sweep and the incremental path start one.
+/// Start the fake server the way the sweep and the incremental path start one,
+/// with every later stop in this process given [`TEST_GRACE`].
 async fn start_fake_server(root: &Path) -> (kin_lsp::lifecycle::LspServer, [u32; 2]) {
+    kin_lsp::lifecycle::set_termination_grace_for_tests(TEST_GRACE);
     let record = root.join(PIDS);
     let server = start_resolved_language_server(
         LanguageId::Python,

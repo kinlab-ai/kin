@@ -3,14 +3,21 @@
 
 //! Clean-slate repository authority initialization.
 //!
-//! `kin init` has exactly two admission paths:
+//! `kin init` has three admission paths:
 //!
-//! - a fresh Git worktree is captured by [`kin_core::init_from_git`] as exact
-//!   reachable history, refs, raw objects, workspace state, and admission policy;
+//! - a fresh Git worktree, by default, is admitted by
+//!   [`kin_core::init_current_commit_from_git`]: the checked-out commit's exact
+//!   tree becomes one snapshot change and the store answers at once, while its
+//!   history is derived afterwards (`--history background`) or not at all
+//!   (`--history none`), and the store records which;
+//! - `--history full` captures the worktree by [`kin_core::init_from_git`] as
+//!   exact reachable history, refs, raw objects, workspace state, and admission
+//!   policy before the store is published;
 //! - an empty non-Git directory is initialized as an unborn Kin-native repository.
 //!
-//! This command deliberately does not parse a checkout, synthesize a snapshot
-//! change, or rebuild an existing repository from raw filesystem contents.
+//! This command deliberately does not parse a checkout or rebuild an existing
+//! repository from raw filesystem contents. The snapshot of the first path is
+//! derived from the commit's Git objects, never from the files on disk.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -29,6 +36,8 @@ pub(crate) const GRAPH_BUILD_PIPELINE_EPOCH: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitBoundary {
     ExactGit,
+    /// The checked-out commit alone, with the history derived later or never.
+    ExactGitCheckedOut,
     NativeUnborn,
 }
 
@@ -36,6 +45,7 @@ impl InitBoundary {
     fn source_boundary(self) -> &'static str {
         match self {
             Self::ExactGit => "git-exact-reachable-history",
+            Self::ExactGitCheckedOut => "git-exact-checked-out-commit",
             Self::NativeUnborn => "native-unborn",
         }
     }
@@ -43,8 +53,108 @@ impl InitBoundary {
     fn history(self) -> &'static str {
         match self {
             Self::ExactGit => "exact-reachable",
+            Self::ExactGitCheckedOut => "checked-out-commit",
             Self::NativeUnborn => "unborn",
         }
+    }
+}
+
+/// The history mode `kin init` uses when `--history` is not given.
+///
+/// Background, because the first answer is what a new store is for: on a
+/// mature repository the complete admission is minutes to hours of history
+/// derivation before a single question can be asked, and the checked-out tree
+/// alone answers `locate`, `refs`, `context`, `impact` and `trace`. The history
+/// still arrives, behind the store, without anyone asking for it.
+pub(crate) const DEFAULT_HISTORY_MODE: kin_core::history_state::HistoryMode =
+    kin_core::history_state::HistoryMode::Background;
+
+/// The environment variable naming the default history mode, for a machine
+/// that wants one mode everywhere without passing `--history` each time.
+pub(crate) const HISTORY_MODE_ENV: &str = "KIN_INIT_HISTORY";
+
+/// The history mode `KIN_INIT_HISTORY` names, or [`DEFAULT_HISTORY_MODE`].
+/// A value that names no mode is refused rather than ignored: silently
+/// admitting a different amount of history than the operator asked for is the
+/// kind of surprise a store never recovers from cheaply.
+fn history_mode_from_environment() -> Result<kin_core::history_state::HistoryMode> {
+    match std::env::var(HISTORY_MODE_ENV) {
+        Ok(value) if !value.trim().is_empty() => {
+            kin_core::history_state::HistoryMode::parse(value.trim()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{HISTORY_MODE_ENV} is set to {value:?}, which is not a history mode; use \
+                     background, none or full"
+                )
+            })
+        }
+        _ => Ok(DEFAULT_HISTORY_MODE),
+    }
+}
+
+/// The `history_state` object of `kin init --json`: what the store admitted of
+/// its Git history, and how far a derivation has got.
+#[derive(Debug, Serialize)]
+pub(crate) struct HistoryStatePayload {
+    /// `complete`, `partial` or `unreadable`.
+    pub(crate) state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_change: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) boundary_parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) admitted_commits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reachable_commits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) derivation: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) derivation_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) underivable: Option<String>,
+    /// The sentence every history-dependent answer carries, when partial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sentence: Option<String>,
+}
+
+impl HistoryStatePayload {
+    pub(crate) fn from_standing(standing: &kin_core::history_state::HistoryStanding) -> Self {
+        use kin_core::history_state::HistoryStanding;
+        let mut payload = Self {
+            state: standing.code(),
+            mode: None,
+            source_commit: None,
+            snapshot_change: None,
+            boundary_parents: Vec::new(),
+            admitted_commits: None,
+            reachable_commits: None,
+            derivation: None,
+            derivation_step: None,
+            underivable: None,
+            sentence: standing.sentence(),
+        };
+        if let HistoryStanding::Partial { record, progress } = standing {
+            payload.mode = Some(record.mode.as_str());
+            payload.source_commit = Some(record.source_commit.clone());
+            payload.snapshot_change = Some(record.snapshot_change.clone());
+            payload
+                .boundary_parents
+                .clone_from(&record.boundary_parents);
+            payload.admitted_commits = Some(record.admitted_commits);
+            payload.reachable_commits = record.reachable_commits;
+            payload.underivable.clone_from(&record.underivable);
+            if let Some(progress) = progress {
+                payload.derivation = Some(progress.state.as_str());
+                payload.derivation_step = match (progress.step, progress.steps) {
+                    (Some(step), Some(steps)) => Some(format!("{step}/{steps}")),
+                    _ => None,
+                };
+            }
+        }
+        payload
     }
 }
 
@@ -91,6 +201,9 @@ struct InitResultPayload<'a> {
     roots: &'a kin_model::RootBundle,
     initial_change_id: Option<&'a kin_model::SemanticChangeId>,
     exact_reachable_git_history: bool,
+    /// How much of its Git history the store admitted. Additive to this schema
+    /// version; `partial` means only the checked-out commit is admitted.
+    history_state: HistoryStatePayload,
     /// What the store this command just wrote costs on disk, and what the Git
     /// object store it was admitted from costs. Measured after publication, so
     /// it describes the store the caller now has rather than a projection of it.
@@ -178,11 +291,14 @@ struct DaemonKilledPayload {
 /// What one machine-readable result says about its cross-file enrichment.
 #[derive(Debug, Serialize)]
 struct CrossFileEnrichmentPayload<'a> {
-    /// `produced` when a language-server sweep finished and enriched files;
-    /// `owed` when this run handed over a graph without some or all of those
-    /// edges; `unknown` when this run could not read what its sweep did.
+    /// `produced` when a language-server sweep finished and enriched what it
+    /// was asked about; `owed` when this run handed over a graph without some
+    /// or all of those edges and a later sweep supplies them; `off` when the
+    /// repository's own setting switched enrichment off, so no sweep runs
+    /// until `kin daemon sweep --enable`; `unknown` when this run could not
+    /// read what its sweep did.
     state: &'static str,
-    /// Why the edges are owed or unknown, as a stable code. Absent when
+    /// Why the edges are owed, off or unknown, as a stable code. Absent when
     /// produced.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
@@ -237,7 +353,11 @@ macro_rules! note {
     ($($arg:tt)*) => {{
         if !NOTES_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
             use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), $($arg)*);
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                crate::plain_words::text(&format!($($arg)*))
+            );
         }
     }};
 }
@@ -275,12 +395,51 @@ pub const EXIT_ENRICHMENT_UNATTESTED: i32 = 7;
 /// explicit graph command retries only the missing representation step.
 pub const EXIT_GRAPH_SECTION_UNMATERIALIZED: i32 = 8;
 
+/// What `kin init` does about language-server enrichment, as its flags ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitEnrichment {
+    /// Run the language-server sweep inside this command. The default.
+    Now,
+    /// `--defer-enrich`: skip the sweep here, and leave enrichment on, so the
+    /// next daemon that starts on the repository runs it.
+    Deferred,
+    /// `--no-enrich`: switch enrichment off for the repository, so no daemon
+    /// that serves it runs a sweep until `kin daemon sweep --enable`.
+    Off,
+}
+
+impl InitEnrichment {
+    /// The mode `--no-enrich` and `--defer-enrich` ask for. The parser refuses
+    /// both together, so either one alone decides.
+    pub fn from_flags(no_enrich: bool, defer_enrich: bool) -> Self {
+        if no_enrich {
+            Self::Off
+        } else if defer_enrich {
+            Self::Deferred
+        } else {
+            Self::Now
+        }
+    }
+
+    /// Whether this command runs the sweep itself.
+    fn sweeps_now(self) -> bool {
+        self == Self::Now
+    }
+
+    /// The setting the repository should hold: off only for `--no-enrich`.
+    fn repository_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
 pub async fn run(
     path: Option<String>,
     json: bool,
-    no_enrich: bool,
+    enrichment: InitEnrichment,
     adopt_repository_id: Option<String>,
+    store: Option<PathBuf>,
     verbose: bool,
+    history: Option<kin_core::history_state::HistoryMode>,
 ) -> Result<i32> {
     let _span = tracing::info_span!("kin.init").entered();
     // Read before any work, so the closing summary can say what this run did
@@ -305,12 +464,28 @@ pub async fn run(
     let short = !json && crate::screen::short_form(verbose);
 
     ensure_directory(&dir)?;
+    // Held until this command returns: a location reserved for a store that
+    // was never created there is released again.
+    // A selected moved store is already initialized: refuse command shapes
+    // that cannot reopen it before attachment rewrites its bindings. History
+    // mode changes intentionally precede the ordinary second-init refusal.
+    let can_reopen = history.is_some() || (!json && adopted.is_none());
+    let _reservation = reserve_external_store(&dir, store, can_reopen)?;
+    // Over a store that is already here, `--history` says how much history it
+    // should hold, and `--no-enrich` switches enrichment off, which are the
+    // two things a second `kin init` can still change.
+    if let Some(mode) = history {
+        if let Some(layout) = kin_core::layout::locate_store(&dir) {
+            switch_existing_repository_off(&layout, enrichment).await;
+            return change_history_mode(&dir, mode, json).await;
+        }
+    }
     // Reopening a repository reads its authority, starts its daemon and asks
     // it for the search index, which on a large store is tens of seconds. A
     // live line says which of those it is on, from a moment in, so a warm
     // reopen that answers fast never shows it.
     let style = crate::screen::Style::for_stdout();
-    let reopening = (!json && path_exists(&dir.join(".kin"))?)
+    let reopening = (!json && kin_core::layout::store_exists_for(&dir))
         .then(|| crate::screen::LiveLine::start_after(style, "Reopening", LIVE_LINE_DELAY))
         .flatten();
     let step = |label: &str, note: &str| {
@@ -321,6 +496,10 @@ pub async fn run(
     };
     step("Reopening", "reading the repository");
     if let Some(existing) = answer_existing_repository(&dir, json, adopted.is_some())? {
+        // Recorded before the daemon below starts, so it reads the setting
+        // this command asked for, as the daemon after a first
+        // `kin init --no-enrich` does.
+        switch_existing_repository_off(&existing.layout, enrichment).await;
         // A store that is already here may still owe background work, such as
         // a search index a stopped daemon left half built. Starting its daemon
         // resumes that work, and the answer says so rather than "nothing to do".
@@ -335,6 +514,9 @@ pub async fn run(
         if let Some(live) = reopening {
             live.finish();
         }
+        // A store made before `kin init` excluded it, or whose rule was lost
+        // since, still shows in `git status`; a second `kin init` repairs that.
+        keep_store_out_of_git_status(&existing.layout, true);
         let mut out = String::new();
         for line in existing_repository_lines(
             style,
@@ -352,12 +534,29 @@ pub async fn run(
     }
     drop(reopening);
 
+    let mode = match history {
+        Some(mode) => mode,
+        None => history_mode_from_environment()?,
+    };
     let boundary = if path_exists(&dir.join(".git"))? {
-        InitBoundary::ExactGit
+        if mode.starts_partial() {
+            InitBoundary::ExactGitCheckedOut
+        } else {
+            InitBoundary::ExactGit
+        }
     } else {
         require_empty_native_boundary(&dir)?;
         InitBoundary::NativeUnborn
     };
+
+    // A store this machine already prepared from exactly this checkout's Git
+    // state is reused rather than derived again. Adopting a named repository
+    // identity is a different admission, so it never reuses.
+    if boundary == InitBoundary::ExactGit && adopted.is_none() {
+        if let Some(code) = reuse_prepared_store(&dir, json, enrichment).await? {
+            return Ok(code);
+        }
+    }
 
     // The logo opens a conversion a person is watching, once the refusals
     // above have had their chance, so a refused `kin init` is still only its
@@ -372,6 +571,9 @@ pub async fn run(
         let header = match (boundary, git_commit_count(&dir)) {
             (InitBoundary::NativeUnborn, _) => {
                 format!("  Starting {name} as a new Kin repository")
+            }
+            (InitBoundary::ExactGitCheckedOut, _) => {
+                format!("  Reading {name}'s checked-out commit")
             }
             (InitBoundary::ExactGit, Some(commits)) => format!(
                 "  Reading {name}: {} {} of Git history",
@@ -396,6 +598,10 @@ pub async fn run(
             .with_context(|| {
                 format!("admit exact reachable Git repository authority adopting {adopted}")
             }),
+        (InitBoundary::ExactGitCheckedOut, adopted) => {
+            kin_core::init_current_commit_from_git(&dir, adopted.as_ref(), mode)
+                .context("admit the checked-out Git commit")
+        }
         (InitBoundary::NativeUnborn, None) => {
             kin_core::init(&dir).context("initialize unborn Kin-native repository authority")
         }
@@ -405,7 +611,29 @@ pub async fn run(
             }),
     })?;
 
-    let after = after_admission(&result, no_enrich, view.clone()).await;
+    // An unborn branch has no history to defer, so the checked-out-commit
+    // path admits it completely; say what the store actually holds.
+    let boundary = match boundary {
+        InitBoundary::ExactGitCheckedOut
+            if kin_core::history_state::standing(&result.layout).is_complete() =>
+        {
+            InitBoundary::ExactGit
+        }
+        other => other,
+    };
+
+    // Recorded before anything else can start a daemon on the store, and
+    // before the history worker below, so every daemon that ever serves it
+    // reads the setting this command was asked for.
+    let setting = record_enrichment_setting(&result.layout, enrichment);
+
+    // The history starts deriving the moment the store is published, behind
+    // everything that follows: the worker runs at background priority, so the
+    // sweep and every query below outrank it.
+    if boundary == InitBoundary::ExactGitCheckedOut {
+        start_background_history(&result.layout);
+    }
+    let after = after_admission(&result, setting, view.clone()).await;
 
     if json {
         print_json_result(
@@ -432,6 +660,340 @@ pub async fn run(
     Ok(after.exit_code())
 }
 
+/// Reuse a prepared store for the Git checkout at `dir` and finish it the way
+/// an admitted store is finished, or return `None` when none was reused and
+/// the checkout must be admitted from scratch.
+///
+/// Shared by `kin init` and `kin clone` over Git transport. The reuse itself
+/// is [`super::prepared_reuse::try_reuse`]; what follows it is the part of
+/// [`after_admission`] a reused store still owes: `.kin/` kept out of `git
+/// status`, a registry row for this location, the language servers this
+/// repository needs, and the enrichment phase, where the daemon resumes from
+/// the enrichment and vectors the store carried and pays only what differs.
+pub(crate) async fn reuse_prepared_store(
+    dir: &Path,
+    json: bool,
+    enrichment: InitEnrichment,
+) -> Result<Option<i32>> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let progress = |line: &str| {
+        if !json {
+            note!("{line}");
+        }
+    };
+    // The copy records the setting this command was asked for before it is
+    // published, so a store prepared with enrichment off is not reused with it
+    // off by a command that asked for it on, nor the other way round.
+    let report =
+        match super::prepared_reuse::try_reuse(&dir, enrichment.repository_enabled(), &progress) {
+            super::prepared_reuse::ReuseAttempt::Reused(report) => report,
+            super::prepared_reuse::ReuseAttempt::Declined {
+                reasons,
+                candidates,
+            } => {
+                for reason in &reasons {
+                    tracing::info!(%reason, "no prepared store was reused");
+                }
+                if candidates > 0 {
+                    note!(
+                    "note: a prepared store for this Git state was not reused, so this checkout \
+                     is admitted from scratch: {}",
+                    reasons.join("; ")
+                );
+                }
+                return Ok(None);
+            }
+        };
+    let layout = kin_core::KinLayout::for_working_dir(&dir);
+    if !json {
+        for line in report.lines() {
+            println!("{line}");
+        }
+    }
+    keep_store_out_of_git_status(&layout, false);
+    if let Err(error) =
+        kin_migrate::update_registry(layout.working_dir(), report.carried.entities, None)
+    {
+        eprintln!(
+            "warning: {} was not added to the local repository registry: {error:#}",
+            layout.root().display()
+        );
+    }
+    provision_language_servers(layout.working_dir(), !enrichment.sweeps_now(), None).await;
+    let vectors_before = super::prepared_reuse::persisted_vector_binding(&layout);
+    let enrichment_started = std::time::Instant::now();
+    let cross_file = match enrichment {
+        InitEnrichment::Now => {
+            let kin_root = layout.root().to_path_buf();
+            match tokio::spawn(async move { enrich_after_init(&kin_root, None).await }).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+                    CrossFileEnrichment::unreadable().with_cause(error.to_string())
+                }
+            }
+        }
+        InitEnrichment::Deferred => CrossFileEnrichment::withheld(
+            CrossFileShortfall::NotRequested,
+            "`--defer-enrich` skipped the language-server phase; the next daemon started on this \
+             repository resumes it from the enrichment the reused store carried",
+        ),
+        InitEnrichment::Off => CrossFileEnrichment::withheld(
+            CrossFileShortfall::SwitchedOff,
+            "`--no-enrich` switched language-server enrichment off for this repository, so the \
+             graph keeps the reference and override edges across units that the reused store \
+             carried, and no daemon adds more until `kin daemon sweep --enable` turns it on",
+        ),
+    };
+    let enrichment_elapsed = enrichment_started.elapsed();
+    connect_waiting_clients(layout.working_dir(), None);
+    let vectors_after = super::prepared_reuse::persisted_vector_count(&layout);
+    let vectors_unchanged = vectors_before.is_some()
+        && vectors_before == super::prepared_reuse::persisted_vector_binding(&layout);
+    // This store is a prepared store for its own source now, and a later
+    // checkout of the same state may reuse it in turn.
+    let recorded = kin_core::prepared_store::record_store(&layout, Some(report.donor.clone()));
+    if let Err(reason) = &recorded {
+        tracing::info!(%reason, "the reused store was not recorded in the prepared-store catalog");
+    }
+    let daemon_death = crate::daemon_death::recorded_for_store(layout.root());
+    let exit_code = exit_code_for(daemon_death.as_ref(), false);
+    let enrichment_ms = u64::try_from(enrichment_elapsed.as_millis()).unwrap_or(u64::MAX);
+    if json {
+        let payload = serde_json::json!({
+            "reuse": &*report,
+            "cross_file_enrichment": cross_file.payload(enrichment_elapsed),
+            "vectors_after_enrichment": vectors_after,
+            "vector_index_unchanged": vectors_unchanged,
+            "catalog_recorded": recorded.is_ok(),
+            "exit_code": exit_code,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        let vectors = match (vectors_unchanged, vectors_after) {
+            (true, Some(count)) => {
+                format!("the vector index is the one the store carried ({count} vectors, none computed)")
+            }
+            (false, Some(count)) => format!("the vector index now holds {count} vectors"),
+            (_, None) => "no vector index is persisted yet".to_string(),
+        };
+        let enrichment = match cross_file.pending() {
+            None => "finished".to_string(),
+            Some(pending) => format!("partial: {pending}"),
+        };
+        println!("  Enrichment phase: {enrichment}, in {enrichment_ms} ms; {vectors}.");
+        if let Some(line) = enrichment_kill_warning(
+            daemon_death.as_ref(),
+            kin_core::enrichment_setting::state_for(&layout),
+        ) {
+            println!("{line}");
+        }
+    }
+    Ok(Some(exit_code))
+}
+
+/// Start deriving a partial store's history behind it, when its mode asks for
+/// that. Never fails the command: the store answers either way, and a daemon
+/// starts the derivation later if this could not.
+pub(crate) fn start_background_history(layout: &kin_core::KinLayout) {
+    match super::history_derive::spawn_background_worker(layout) {
+        Ok(Some(pid)) => tracing::info!(pid, "started the background history derivation"),
+        Ok(None) => {}
+        Err(error) => note!(
+            "note: the background history derivation did not start ({error:#}); the next \
+             daemon starts it"
+        ),
+    }
+}
+
+/// `kin init --history <mode>` over a store that is already here.
+///
+/// A complete store has nothing to change. A partial store records the new
+/// mode, and `full` derives and attaches its history now.
+async fn change_history_mode(
+    dir: &Path,
+    mode: kin_core::history_state::HistoryMode,
+    json: bool,
+) -> Result<i32> {
+    use kin_core::history_state::{HistoryMode, HistoryStanding};
+    let layout = kin_core::layout::locate_store(dir)
+        .ok_or_else(|| anyhow::anyhow!(existing_repository_refusal(dir)))?;
+    let standing = kin_core::history_state::standing(&layout);
+    let (action, detail) = match (&standing, mode) {
+        (HistoryStanding::Complete, _) => (
+            "none",
+            "This store's history is already complete; nothing to change".to_string(),
+        ),
+        (_, HistoryMode::Full) => {
+            let derived = super::history_derive::derive_now(&layout, json).await?;
+            (
+                if derived.history == "complete" {
+                    "derived"
+                } else {
+                    "none"
+                },
+                derived.detail,
+            )
+        }
+        (HistoryStanding::Unreadable { reason }, _) => bail!(
+            "this store's history record cannot be read ({reason}); `kin init --history full`              derives its history and replaces the record"
+        ),
+        (HistoryStanding::Partial { record, .. }, mode) if record.mode == mode => (
+            "none",
+            format!("This store already records history mode {mode}"),
+        ),
+        (HistoryStanding::Partial { .. }, mode) => {
+            kin_core::history_state::set_mode(&layout, mode)
+                .with_context(|| format!("record history mode {mode}"))?;
+            if mode == HistoryMode::Background {
+                start_background_history(&layout);
+                (
+                    "mode_changed",
+                    "History mode is now background; the full history derives behind the store"
+                        .to_string(),
+                )
+            } else {
+                (
+                    "mode_changed",
+                    "History mode is now none; no history derives until `kin init --history \
+                     full`"
+                        .to_string(),
+                )
+            }
+        }
+    };
+    let standing = kin_core::history_state::standing(&layout);
+    if json {
+        #[derive(Serialize)]
+        struct HistoryChange<'a> {
+            schema: &'static str,
+            action: &'a str,
+            detail: &'a str,
+            history_state: HistoryStatePayload,
+        }
+        emit(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(&HistoryChange {
+                schema: "kin.init-history.v1",
+                action,
+                detail: &detail,
+                history_state: HistoryStatePayload::from_standing(&standing),
+            })?
+        ))?;
+    } else {
+        let mut out = format!("{detail}.\n");
+        if let Some(sentence) = standing.sentence() {
+            out.push_str(&sentence);
+            out.push('\n');
+        }
+        emit(&out)?;
+    }
+    Ok(0)
+}
+
+/// What the enrichment phase after admission does, once the store records the
+/// setting the command was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnrichmentPlan {
+    /// Run the sweep inside this command.
+    Sweep,
+    /// `--defer-enrich`: no sweep here, and enrichment stays on, so the next
+    /// daemon started on the repository runs it.
+    Deferred,
+    /// `--no-enrich`, recorded: enrichment is off for the repository.
+    SwitchedOff,
+    /// `--no-enrich` could not be recorded, for this reason, so enrichment is
+    /// still on and the next daemon runs the sweep. Said rather than hidden:
+    /// a store the caller believes is switched off and is not is the defect
+    /// this setting exists to end.
+    OffNotRecorded(String),
+}
+
+impl EnrichmentPlan {
+    /// The outcome of a phase this plan does not run here, or `None` when it
+    /// runs the sweep.
+    fn withheld(&self) -> Option<CrossFileEnrichment> {
+        Some(match self {
+            Self::Sweep => return None,
+            Self::Deferred => CrossFileEnrichment::withheld(
+                CrossFileShortfall::NotRequested,
+                "`--defer-enrich` skipped the language-server sweep, so reference and override \
+                 edges across units are not in this graph yet; the next daemon started on this \
+                 repository runs it, and `kin daemon sweep` runs it now",
+            ),
+            Self::SwitchedOff => CrossFileEnrichment::withheld(
+                CrossFileShortfall::SwitchedOff,
+                "`--no-enrich` switched language-server enrichment off for this repository, so no \
+                 daemon adds reference and override edges across units to this graph; import and \
+                 call edges still come from source, and `kin daemon sweep --enable` turns \
+                 enrichment on",
+            ),
+            Self::OffNotRecorded(cause) => CrossFileEnrichment::withheld(
+                CrossFileShortfall::NotRequested,
+                "`--no-enrich` skipped the language-server sweep, but enrichment could not be \
+                 switched off for this repository, so the next daemon started on it runs the \
+                 sweep",
+            )
+            .with_cause(cause.clone()),
+        })
+    }
+}
+
+/// Record the enrichment setting `enrichment` asks for in a store admission
+/// just published, and say what the phase after admission does.
+///
+/// Never fails the command: the store is durable either way. A store this
+/// command just admitted already enriches, so only `--no-enrich` writes.
+fn record_enrichment_setting(
+    layout: &kin_core::KinLayout,
+    enrichment: InitEnrichment,
+) -> EnrichmentPlan {
+    let recorded = kin_core::enrichment_setting::record(layout, enrichment.repository_enabled());
+    match (enrichment, recorded) {
+        (InitEnrichment::Now, _) => EnrichmentPlan::Sweep,
+        (InitEnrichment::Deferred, _) => EnrichmentPlan::Deferred,
+        (InitEnrichment::Off, Ok(_)) => EnrichmentPlan::SwitchedOff,
+        (InitEnrichment::Off, Err(error)) => {
+            note!(
+                "warning: language-server enrichment could not be switched off for this \
+                 repository, so the next daemon started on it runs the sweep: {error}"
+            );
+            EnrichmentPlan::OffNotRecorded(error.to_string())
+        }
+    }
+}
+
+/// `--no-enrich` over a repository that already exists: record enrichment off
+/// for it, as a first `kin init --no-enrich` does, and leave every other mode
+/// alone.
+///
+/// A daemon reads the setting once, when it starts, so one already serving the
+/// repository started with enrichment on and would keep sweeping. When the
+/// record changed the setting, that daemon is stopped through the path
+/// `kin daemon stop` takes, and the next one starts switched off. Never fails
+/// the command: what could not be done is said, as a first init says it.
+async fn switch_existing_repository_off(layout: &kin_core::KinLayout, enrichment: InitEnrichment) {
+    if enrichment != InitEnrichment::Off {
+        return;
+    }
+    match kin_core::enrichment_setting::record(layout, false) {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(error) = super::daemon::stop_current_repo_quiet(layout.root()).await {
+                note!(
+                    "warning: language-server enrichment is now off for this repository, but the \
+                     daemon serving it started with it on and could not be stopped, so it keeps \
+                     linking until it exits: {error:#}"
+                );
+            }
+        }
+        Err(error) => note!(
+            "warning: language-server enrichment could not be switched off for this repository, \
+             so the daemon serving it still runs the sweep: {error}"
+        ),
+    }
+}
+
 /// What the post-admission pipeline did, for whichever command admitted.
 ///
 /// `kin init` and `kin clone` over Git both end in an admitted store, and both
@@ -449,6 +1011,10 @@ pub(crate) struct AfterAdmission {
     /// A daemon serving this store that died during the phase, read once so
     /// the words and the exit status come from one reading.
     daemon_death: Option<kin_daemon_spawn::DaemonKillRecord>,
+    /// How enrichment stands for this store, read with the death record so a
+    /// kill sentence does not offer the environment switch after the
+    /// repository's own setting has already turned enrichment off.
+    enrichment: kin_daemon_spawn::EnrichmentState,
 }
 
 impl AfterAdmission {
@@ -471,7 +1037,7 @@ impl AfterAdmission {
 /// `view` is the short form's screen, when a person is watching.
 pub(crate) async fn after_admission(
     result: &kin_core::InitResult,
-    no_enrich: bool,
+    plan: EnrichmentPlan,
     view: Option<std::sync::Arc<crate::first_run::Screen>>,
 ) -> AfterAdmission {
     if view.is_some() {
@@ -483,8 +1049,15 @@ pub(crate) async fn after_admission(
     // its complete workspace base before enrichment starts a daemon. This
     // keeps the section's capture allocation out of the calibrated publish
     // peak and lets the first real daemon reopen consume the section.
+    let mut held_dependencies = None;
     let graph_section_materialization = match materialize_graph_section_after_init(&result.layout) {
-        Ok(outcome) => InitGraphSectionMaterialization::Complete(outcome),
+        Ok((outcome, held)) => {
+            match held {
+                Ok(content) => held_dependencies = Some(content),
+                Err(error) => note!("warning: dependency records remain unrecorded; run `kin deps` to refresh held manifests: {error:#}"),
+            }
+            InitGraphSectionMaterialization::Complete(outcome)
+        }
         Err(error) => {
             note!(
                 "warning: repository initialization completed, but graph-section materialization did not; run `kin graph materialize` to retry: {error:#}"
@@ -493,17 +1066,12 @@ pub(crate) async fn after_admission(
         }
     };
 
-    if let Err(error) = exclude_store_from_git(result.layout.working_dir()) {
-        eprintln!(
-            "warning: the Kin store at {} was not added to this repository's local Git excludes, \
-             so `git status` will list it as untracked: {error:#}",
-            result.layout.root().display()
-        );
-    }
+    keep_store_out_of_git_status(&result.layout, false);
 
     if let Err(error) = kin_migrate::update_registry(
         result.layout.working_dir(),
         result.authority.semantic_enrichment.entity_count,
+        held_dependencies.as_ref(),
     ) {
         eprintln!(
             "warning: {} was not added to the local repository registry, so cross-repo \
@@ -516,7 +1084,12 @@ pub(crate) async fn after_admission(
     // Before linking, because linking is what a server is for. Only with the
     // consent `kin setup` recorded, and only the servers this repository's
     // own languages need.
-    provision_language_servers(result.layout.working_dir(), no_enrich, view.as_ref()).await;
+    provision_language_servers(
+        result.layout.working_dir(),
+        plan != EnrichmentPlan::Sweep,
+        view.as_ref(),
+    )
+    .await;
 
     // Conversion is not finished when the graph exists. Cross-file reference,
     // override and type-use edges are not derivable from a single-file parse:
@@ -528,7 +1101,9 @@ pub(crate) async fn after_admission(
     // Runs before the result is printed so what a reader is told about their
     // repository is true of the repository they now have.
     let enrichment_started = std::time::Instant::now();
-    let cross_file = if !no_enrich {
+    let cross_file = if let Some(withheld) = plan.withheld() {
+        withheld
+    } else {
         // Isolated on its own task so a panic inside it cannot decide init's
         // exit status. `kin init 2>&1 | head -1` closes both streams after one
         // line and every advisory write after that panics; init's contract is
@@ -546,12 +1121,6 @@ pub(crate) async fn after_admission(
                 CrossFileEnrichment::unreadable().with_cause(error.to_string())
             }
         }
-    } else {
-        CrossFileEnrichment::withheld(
-            CrossFileShortfall::NotRequested,
-            "`--no-enrich` skipped the language-server sweep, so cross-file reference and \
-             override edges are not in this graph; `kin daemon sweep` runs it",
-        )
     };
     let enrichment_elapsed = enrichment_started.elapsed();
     if let Some(screen) = &view {
@@ -568,6 +1137,14 @@ pub(crate) async fn after_admission(
     // on stderr off the short form, so `--json` keeps stdout to one document.
     connect_waiting_clients(result.layout.working_dir(), view.as_ref());
 
+    // A store admitted from Git is a prepared store for exactly that Git
+    // state, and a later checkout of the same state reuses it rather than
+    // deriving it again. The entry is discovery only: a reuse checks the
+    // store again before it copies anything.
+    if let Err(reason) = kin_core::prepared_store::record_store(&result.layout, None) {
+        tracing::info!(%reason, "this store was not recorded in the prepared-store catalog");
+    }
+
     // After the phase, never before it: a sweep publishes as it goes, so what
     // admission published is not what the store holds once the phase ends.
     let reported = ReportedAuthority::after_enrichment(result, &cross_file);
@@ -578,6 +1155,7 @@ pub(crate) async fn after_admission(
     // once for the prose and once for the exit status, would let the sentence a
     // person reads and the number a script reads disagree about the same run.
     let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
+    let enrichment = kin_core::enrichment_setting::state_for(&result.layout);
 
     let author_warning =
         author_warning_lines(&result.layout, crate::screen::right_edge(), view.is_some());
@@ -595,6 +1173,7 @@ pub(crate) async fn after_admission(
         enrichment_elapsed,
         reported,
         daemon_death,
+        enrichment,
     }
 }
 
@@ -650,7 +1229,7 @@ fn connect_waiting_clients(
 /// `--json` keeps stdout to its one document.
 async fn provision_language_servers(
     working_dir: &Path,
-    no_enrich: bool,
+    skips_sweep: bool,
     view: Option<&std::sync::Arc<crate::first_run::Screen>>,
 ) {
     use crate::commands::language_servers::{self as servers, LanguageScope};
@@ -661,7 +1240,7 @@ async fn provision_language_servers(
         .and_then(|kin_home| servers::recorded_install_consent(&kin_home));
     // Off the short form nothing is shown, so without consent there is
     // nothing to do and the repository's languages are not counted at all.
-    if view.is_none() && (consent != Some(true) || no_enrich) {
+    if view.is_none() && (consent != Some(true) || skips_sweep) {
         return;
     }
     let languages = match servers::language_scope(working_dir, None) {
@@ -673,7 +1252,7 @@ async fn provision_language_servers(
         .filter(|language| languages.contains(language))
         .collect();
 
-    match crate::first_run::server_install(consent, no_enrich, &missing) {
+    match crate::first_run::server_install(consent, skips_sweep, &missing) {
         ServerInstall::Nothing => {}
         // Nothing is installed without a recorded yes. The Linked row names
         // the language it could not link and the command that adds its
@@ -944,7 +1523,10 @@ pub(crate) fn enrichment_report_lines(after: &AfterAdmission) -> Vec<String> {
         "  Semantic enrichment: {}",
         render_semantic_enrichment(enrichment, after.daemon_death.as_ref(), &after.cross_file)
     )];
-    lines.extend(enrichment_kill_warning(after.daemon_death.as_ref()));
+    lines.extend(enrichment_kill_warning(
+        after.daemon_death.as_ref(),
+        after.enrichment,
+    ));
     lines.extend(cross_file_pending_notice(enrichment, &after.cross_file));
     lines.extend(semantic_absence_notice(enrichment));
     lines
@@ -994,7 +1576,22 @@ pub(crate) fn admit_showing_progress(
     match admitted {
         Ok(result) => {
             let summary = &result.authority.semantic_enrichment;
-            if result.authority.initial_change_id.is_some() {
+            let history = kin_core::history_state::standing(&result.layout);
+            if let kin_core::history_state::HistoryStanding::Partial { record, .. } = &history {
+                // The checked-out commit alone: say so, and what comes next.
+                let later = match record.mode {
+                    kin_core::history_state::HistoryMode::None => "history not derived",
+                    _ => "history derives in the background",
+                };
+                screen.finish_row(
+                    crate::screen::Status::Ok,
+                    "Read commit",
+                    &format!(
+                        "{} entities · {later}",
+                        crate::screen::count(summary.entity_count as u64)
+                    ),
+                );
+            } else if result.authority.initial_change_id.is_some() {
                 screen.finish_row(
                     crate::screen::Status::Ok,
                     "Read history",
@@ -1105,10 +1702,34 @@ pub(crate) enum SearchIndexStanding {
         cause: String,
         resumes: Option<&'static str>,
     },
-    /// This machine declined the search model.
+    /// Nobody asked this machine to download the search model, or it declined.
     Off,
+    /// This build and configuration cannot embed anything, for this reason, so
+    /// nothing fills the index and `kin embed` would be refused.
+    Unavailable(String),
     /// The daemon could not be read.
     Unread,
+}
+
+/// A standing as this build and configuration can act on it.
+///
+/// Every standing that ends in "run `kin embed`" becomes [`Unavailable`] when
+/// `kin embed` cannot run here, because recommending a command that is then
+/// refused is the defect this exists for. A complete index stays complete and
+/// an unread one stays unread: neither recommends anything.
+///
+/// [`Unavailable`]: SearchIndexStanding::Unavailable
+fn standing_for_this_build(
+    standing: SearchIndexStanding,
+    unavailable: Option<String>,
+) -> SearchIndexStanding {
+    match (standing, unavailable) {
+        (standing @ (SearchIndexStanding::Complete { .. } | SearchIndexStanding::Unread), _) => {
+            standing
+        }
+        (_, Some(reason)) => SearchIndexStanding::Unavailable(reason),
+        (standing, None) => standing,
+    }
 }
 
 /// Answer a `kin init` over a directory that already holds a `.kin`, or say
@@ -1123,25 +1744,24 @@ fn answer_existing_repository(
     json: bool,
     adopting: bool,
 ) -> Result<Option<ExistingRepository>> {
-    if !path_exists(&dir.join(".kin"))? {
+    let in_tree = dir.join(".kin");
+    let installation = path_exists(&in_tree)? && kin_core::layout::is_managed_kin_home(&in_tree);
+    // The store serving this directory, in it or kept outside it, never an
+    // enclosing one that discovery would walk up to.
+    let own = kin_core::layout::locate_store(dir);
+    if own.is_none() && !installation {
         return Ok(None);
     }
-    let installation = kin_core::layout::is_managed_kin_home(&dir.join(".kin"));
     // The same authority open `kin status` pays when no daemon answers it,
     // and nothing more: the question is whether this build opens the store.
     let opened = if json || adopting || installation {
         None
     } else {
-        // The store in this directory, never an enclosing one that
-        // discovery would walk up to.
-        let own = dir.join(".kin").canonicalize().ok();
-        kin_core::KinLayout::discover(dir)
-            .filter(|layout| own.is_some() && layout.root().canonicalize().ok() == own)
-            .and_then(|layout| {
-                ReportedAuthority::read(&layout)
-                    .ok()
-                    .map(|reported| (layout, reported.semantic_enrichment.entity_count))
-            })
+        own.and_then(|layout| {
+            ReportedAuthority::read(&layout)
+                .ok()
+                .map(|reported| (layout, reported.semantic_enrichment.entity_count))
+        })
     };
     let entities = opened.as_ref().map(|(_, entities)| *entities);
     match second_init(json, adopting, installation, entities) {
@@ -1160,7 +1780,10 @@ fn answer_existing_repository(
 /// Never an error, because the answer to `kin init` is already settled.
 async fn search_index_standing(layout: &kin_core::KinLayout) -> SearchIndexStanding {
     match embed_runtime(layout).await {
-        Some(embed) => search_index_from(&embed, embed_refusal_for(layout.root()).as_ref()),
+        Some(embed) => standing_for_this_build(
+            search_index_from(&embed, embed_refusal_for(layout.root()).as_ref()),
+            crate::embed_model::embed_pass_unavailable_reason(),
+        ),
         None => SearchIndexStanding::Unread,
     }
 }
@@ -1189,7 +1812,10 @@ pub(crate) async fn semantic_search_note(
     text_fallback: bool,
 ) -> Option<Vec<String>> {
     let embed = embed_runtime(layout).await?;
-    let standing = search_index_from(&embed, embed_refusal_for(layout.root()).as_ref());
+    let standing = standing_for_this_build(
+        search_index_from(&embed, embed_refusal_for(layout.root()).as_ref()),
+        crate::embed_model::embed_pass_unavailable_reason(),
+    );
     semantic_search_note_from(&standing, &embed.model_fetch, text_fallback)
 }
 
@@ -1219,12 +1845,14 @@ fn semantic_search_note_from(
             resumes.map(|when| format!(" · {when}")).unwrap_or_default()
         ),
         SearchIndexStanding::Off => {
-            "Search index off · this machine declined the search model; kin embed turns it on."
+            "Search index off · the search model isn't downloaded; kin embed turns it on."
                 .to_string()
         }
+        SearchIndexStanding::Unavailable(reason) => format!("Search index off · {reason}."),
     };
     let mut note = vec![index];
-    if !model.present && !model.declined && model.no_fetch_reason.is_none() {
+    let can_embed = !matches!(standing, SearchIndexStanding::Unavailable(_));
+    if can_embed && !model.present && !model.declined && model.no_fetch_reason.is_none() {
         note.push(if model.fetching {
             format!(
                 "Downloading the search model ({}).",
@@ -1346,6 +1974,9 @@ fn existing_repository_lines(
                 .unwrap_or_default()
         )),
         SearchIndexStanding::Off => Some(format!("off {} kin embed turns it on", style.dot())),
+        SearchIndexStanding::Unavailable(_) => {
+            Some(format!("off {} {}", style.dot(), UNAVAILABLE_ROW))
+        }
         SearchIndexStanding::Unread => None,
     };
     if let Some(search) = search {
@@ -1354,6 +1985,32 @@ fn existing_repository_lines(
         let width = right_edge.saturating_sub(INDENT.len() + 12 + 2).max(24);
         for (index, part) in crate::screen::wrap(&search, width).into_iter().enumerate() {
             let name = if index == 0 { "Search index" } else { "" };
+            lines.push(format!("{INDENT}{}  {part}", label(name)));
+        }
+    }
+    // A store that holds only its checked-out commit says so here too, and how
+    // far its history got, under the same wrapping as the search index.
+    if let Some(sentence) = kin_core::history_state::standing(&existing.layout).sentence() {
+        let width = right_edge.saturating_sub(INDENT.len() + 12 + 2).max(24);
+        for (index, part) in crate::screen::wrap(&sentence, width)
+            .into_iter()
+            .enumerate()
+        {
+            let name = if index == 0 { "History" } else { "" };
+            lines.push(format!("{INDENT}{}  {part}", label(name)));
+        }
+    }
+    // A repository switched off by its own setting says so, with the way back
+    // on, so a reopened repository is not read as one still waiting on a sweep.
+    if !kin_core::enrichment_setting::repository_enabled(&existing.layout) {
+        let width = right_edge.saturating_sub(INDENT.len() + 12 + 2).max(24);
+        let value = format!(
+            "off for this repository {} {} turns it on",
+            style.dot(),
+            kin_core::enrichment_setting::TURN_ON_COMMAND
+        );
+        for (index, part) in crate::screen::wrap(&value, width).into_iter().enumerate() {
+            let name = if index == 0 { "Linking" } else { "" };
             lines.push(format!("{INDENT}{}  {part}", label(name)));
         }
     }
@@ -1394,7 +2051,7 @@ fn render_author_warning(
             )
         } else {
             format!(
-                "Author not configured: changes cannot be admitted or committed.\n{}",
+                "Author not configured: changes cannot be committed.\n{}",
                 kin_core::IDENTITY_REMEDIATION
             )
         }
@@ -1410,8 +2067,11 @@ fn render_author_warning(
 
 fn materialize_graph_section_after_init(
     layout: &kin_core::KinLayout,
-) -> Result<super::repository_authority::GraphSectionMaterialization> {
-    super::repository_authority::materialize_workspace_base_offline(layout)
+) -> Result<(
+    super::repository_authority::GraphSectionMaterialization,
+    Result<kin_core::dependencies::HeldContent>,
+)> {
+    super::repository_authority::materialize_workspace_base_with_dependencies_offline(layout)
         .context("prepare the initialized repository's first graph reopen")
 }
 
@@ -1505,7 +2165,8 @@ impl ConversionDaemonExit {
     fn after(outcome: &CrossFileEnrichment) -> Self {
         match outcome {
             CrossFileEnrichment::Withheld {
-                reason: CrossFileShortfall::SweepBudgetSpent,
+                reason:
+                    CrossFileShortfall::SweepBudgetSpent | CrossFileShortfall::DaemonStillLoading,
                 ..
             } => Self::RetireWhenWorkEnds,
             _ => Self::StopNow,
@@ -1680,13 +2341,13 @@ fn first_embed_pass_standing(
     if embed.embeddings_pending == 0 {
         return FirstEmbedPassStanding::Settled;
     }
-    // Declined in `kin setup`: nothing will download the model, so nothing
-    // drains this queue, and waiting out the budget would only delay the
-    // answer that says so.
+    // Nobody asked for the model, or `kin setup` declined it: nothing will
+    // download it, so nothing drains this queue, and waiting out the budget
+    // would only delay the answer that says so.
     if embed.model_fetch.declined {
         return FirstEmbedPassStanding::Stalled(
-            "this machine declined the embedding model download in `kin setup` (`kin embed` \
-             downloads it)",
+            "the embedding model downloads only when someone asks, and nobody has on this \
+             machine (`kin embed` downloads it)",
         );
     }
     if embed.background_embed_paused && !embed.embedding_work_busy {
@@ -1732,6 +2393,9 @@ enum FirstEmbedPassOutcome {
         pending: usize,
         reason: &'static str,
     },
+    /// This build and configuration cannot embed anything, so there was no
+    /// pass to wait for and nothing to recommend running.
+    Unavailable { reason: String },
     /// The budget ran out with the queue still filling. The budget is carried
     /// rather than read back off the constant, so the line a reader sees names
     /// the wait that actually happened.
@@ -1760,6 +2424,10 @@ impl FirstEmbedPassOutcome {
             Self::Stalled { pending, reason } => Some(format!(
                 "First embedding pass: {pending} still queued and {reason}, so this command did \
                  not wait for them."
+            )),
+            Self::Unavailable { reason } => Some(format!(
+                "Search by meaning is off: {reason}. Locate, search, refs and context answer from \
+                 the graph without it; docs/model-slots.md describes turning it on."
             )),
             Self::BudgetSpent {
                 indexed,
@@ -1888,6 +2556,12 @@ async fn settle_first_embed_pass(
     let Some(url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await else {
         return FirstEmbedPassOutcome::Unread;
     };
+    // A build that cannot embed has no pass to wait for. Asked anyway, the
+    // daemon reported its queue as paused automatic indexing, and this command
+    // recommended `kin embed`, which that build then refused.
+    if let Some(reason) = crate::embed_model::embed_pass_unavailable_reason() {
+        return FirstEmbedPassOutcome::Unavailable { reason };
+    }
     let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout)
     else {
         return FirstEmbedPassOutcome::Unread;
@@ -1918,6 +2592,11 @@ async fn settle_first_embed_pass(
     .await
 }
 
+/// What the Search index row says after `off` on a build or configuration
+/// that cannot embed. Short, because it is a row; the note under the
+/// conversion carries the reason in full.
+const UNAVAILABLE_ROW: &str = "no embedding model or provider here";
+
 /// The Search index row for one wait, or `None` when there is nothing to say.
 ///
 /// `fetch` is the model's standing after the wait, which is what separates a
@@ -1927,11 +2606,17 @@ fn search_index_row(
     fetch: &crate::embed_model::EmbedModelFetch,
 ) -> Option<(crate::screen::Status, String)> {
     use crate::screen::Status;
+    if let FirstEmbedPassOutcome::Unavailable { .. } = outcome {
+        return Some((Status::Off, format!("off · {UNAVAILABLE_ROW}")));
+    }
     if fetch.declined {
         return Some((Status::Off, "off · kin embed turns it on".to_string()));
     }
     match outcome {
         FirstEmbedPassOutcome::Unread | FirstEmbedPassOutcome::Drained { indexed: 0 } => None,
+        FirstEmbedPassOutcome::Unavailable { .. } => {
+            Some((Status::Off, format!("off · {UNAVAILABLE_ROW}")))
+        }
         FirstEmbedPassOutcome::Drained { indexed } => Some((
             Status::Ok,
             format!("{} entries", crate::screen::count(*indexed as u64)),
@@ -2026,8 +2711,12 @@ pub(crate) enum CrossFileEnrichment {
 /// they are a contract: a variant may be added, and a code is never reworded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CrossFileShortfall {
-    /// `--no-enrich` asked for no sweep.
+    /// The caller asked for no sweep in this command and left enrichment on,
+    /// so the next daemon started on the repository runs it.
     NotRequested,
+    /// `--no-enrich` switched enrichment off for the repository, so no daemon
+    /// that serves it runs a sweep.
+    SwitchedOff,
     /// `KIN_NO_DAEMON` forbids this process to start the daemon a sweep runs in.
     DaemonSpawnDisabled,
     /// The operating system refuses this process every loopback connection, so
@@ -2035,6 +2724,9 @@ pub(crate) enum CrossFileShortfall {
     LoopbackBlocked,
     /// No daemon could be started or reached for another reason.
     DaemonUnavailable,
+    /// The daemon this command started was still loading the repository when
+    /// the readiness wait ran out. It keeps running and sweeps once loaded.
+    DaemonStillLoading,
     /// The store this command just wrote could not be opened as a Kin layout.
     StoreUnreadable,
     /// A daemon answered and would not queue the sweep.
@@ -2059,9 +2751,11 @@ impl CrossFileShortfall {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::NotRequested => "not_requested",
+            Self::SwitchedOff => "switched_off",
             Self::DaemonSpawnDisabled => "daemon_spawn_disabled",
             Self::LoopbackBlocked => "loopback_blocked",
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::DaemonStillLoading => "daemon_still_loading",
             Self::StoreUnreadable => "store_unreadable",
             Self::SweepNotStarted => "sweep_not_started",
             Self::LanguageServerUnavailable => "language_server_unavailable",
@@ -2073,11 +2767,16 @@ impl CrossFileShortfall {
         }
     }
 
-    /// `owed` when this run knows the graph it handed over lacks cross-file
-    /// edges, and `unknown` when it cannot say whether its sweep produced any.
+    /// `owed` when this run knows the graph it handed over lacks
+    /// language-server edges a later sweep supplies, `off` when the
+    /// repository's own setting means no sweep supplies them until it is
+    /// turned on, and `unknown` when it cannot say whether its sweep produced
+    /// any. A switched-off repository is not `owed`: nothing it starts will
+    /// ever pay it, and a reader told "owed" waits on a sweep that never runs.
     fn state(self) -> &'static str {
         match self {
             Self::SweepOutcomeUnreadable => "unknown",
+            Self::SwitchedOff => "off",
             _ => "owed",
         }
     }
@@ -2136,6 +2835,23 @@ impl CrossFileEnrichment {
              cause, and the next daemon started on this repository runs the sweep",
         )
         .with_cause(error.to_string())
+    }
+
+    /// The daemon this command started was still loading the repository when
+    /// the readiness wait ran out, so no sweep ran in this command.
+    ///
+    /// Kept apart from [`Self::daemon_unavailable`], whose sentence says no
+    /// daemon could be started. One was, it is running, and it sweeps once it
+    /// has loaded, which is a different thing to tell a reader and a different
+    /// thing to do with the daemon: it is left to finish rather than stopped.
+    fn daemon_still_loading(detail: &str) -> Self {
+        Self::withheld(
+            CrossFileShortfall::DaemonStillLoading,
+            "the daemon this command started was still loading the repository when this \
+             command stopped waiting, so cross-file reference and override edges are not in this \
+             graph yet; that daemon keeps running and links them once it has loaded",
+        )
+        .with_cause(detail)
     }
 
     /// What is still owed, when something is.
@@ -2208,6 +2924,7 @@ impl AuthorityAsOf {
         match outcome {
             CrossFileEnrichment::Withheld { reason, .. } => match reason {
                 CrossFileShortfall::NotRequested
+                | CrossFileShortfall::SwitchedOff
                 | CrossFileShortfall::DaemonSpawnDisabled
                 | CrossFileShortfall::LoopbackBlocked
                 | CrossFileShortfall::StoreUnreadable => Some(Self::Admission),
@@ -2215,6 +2932,7 @@ impl AuthorityAsOf {
                 // A daemon was started, or may have been, and a daemon can
                 // publish whether or not its sweep ran.
                 CrossFileShortfall::DaemonUnavailable
+                | CrossFileShortfall::DaemonStillLoading
                 | CrossFileShortfall::SweepNotStarted
                 | CrossFileShortfall::LanguageServerUnavailable
                 | CrossFileShortfall::SweepEnrichedNothing
@@ -2309,7 +3027,14 @@ impl ReportedAuthority {
     /// and the same enrichment summary `kin status` reports.
     fn read(layout: &kin_core::KinLayout) -> Result<Self> {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+        let publication = crate::commands::status_reading::current_publication(layout, &binding)
+            .ok()
+            .flatten();
         let authority = super::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
+        // This open is the conversion's last read of the store, and the first
+        // `kin status` after it would otherwise pay for the same open again,
+        // with no daemon running, to print the counts read here.
+        super::status::record_reading_of(layout, &binding, publication, &authority, "kin init");
         let lease = authority.manager().read_authority();
         let roots = lease.roots().clone();
         let workspace = lease
@@ -2432,6 +3157,8 @@ pub(crate) struct SweepOwed {
     pub(crate) files: u64,
     /// One owed file and why, when the status names any.
     pub(crate) first: Option<(String, String)>,
+    /// At least one owed row explicitly requires changed inputs or manual refresh.
+    pub(crate) manual_refresh_required: bool,
 }
 
 /// Read what the sweep still owes from a `/lsp/sweep/status` payload.
@@ -2454,7 +3181,21 @@ pub(crate) fn owed_from_status(status: &serde_json::Value) -> SweepOwed {
                     .then(|| (file.to_string(), reason.to_string()))
             })
         });
-    SweepOwed { files, first }
+    let manual_refresh_required = status
+        .get("owed_files")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.get("automatic_retry")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            })
+        });
+    SweepOwed {
+        files,
+        first,
+        manual_refresh_required,
+    }
 }
 
 /// The line naming what is owed, or nothing when nothing is.
@@ -2473,10 +3214,14 @@ fn owed_detail_line(owed: &SweepOwed) -> Option<String> {
         Some((file, reason)) => format!("; the first, {file}: {reason}"),
         None => String::new(),
     };
-    Some(format!(
-        "{head}, so the next sweep after a backoff asks again, and `kin daemon sweep` asks at \
-         once{first}"
-    ))
+    if owed.manual_refresh_required {
+        Some(format!("{head}; retained Reference uncertainty needs changed source or resolver inputs, or `kin daemon sweep` to request another attempt{first}"))
+    } else {
+        Some(format!(
+            "{head}, so the next sweep after a backoff asks again, and `kin daemon sweep` asks at \
+             once{first}"
+        ))
+    }
 }
 
 /// `1 file` and `2 files`, so a count never reads `1 files`.
@@ -2720,7 +3465,11 @@ async fn enrich_after_init_with(
     loopback: impl FnOnce() -> Option<crate::daemon_client::LoopbackBlocked>,
     view: Option<std::sync::Arc<crate::first_run::Screen>>,
 ) -> CrossFileEnrichment {
-    let Some(layout) = kin_core::KinLayout::discover(kin_root) else {
+    let Some(layout) = kin_root
+        .join("manifest.json")
+        .is_file()
+        .then(|| kin_core::KinLayout::new(kin_root.to_path_buf()))
+    else {
         note!("note: cross-file reference enrichment was skipped: no Kin layout at this path");
         return CrossFileEnrichment::withheld(
             CrossFileShortfall::StoreUnreadable,
@@ -2827,10 +3576,12 @@ fn linking_for(outcome: &CrossFileEnrichment) -> crate::first_run::Linking {
     let not_run = |cause: &str| Linking::NotRun(cause.to_string());
     match reason {
         CrossFileShortfall::NotRequested => Linking::Skipped,
+        CrossFileShortfall::SwitchedOff => Linking::SwitchedOff,
         CrossFileShortfall::LanguageServerUnavailable => Linking::NoServer,
         CrossFileShortfall::DaemonSpawnDisabled => not_run("KIN_NO_DAEMON is set"),
         CrossFileShortfall::LoopbackBlocked => not_run("this process can't reach loopback"),
         CrossFileShortfall::DaemonUnavailable => not_run("no daemon could start"),
+        CrossFileShortfall::DaemonStillLoading => Linking::WaitsForDaemon,
         CrossFileShortfall::StoreUnreadable => not_run("the store couldn't be opened"),
         CrossFileShortfall::SweepNotStarted => not_run("the daemon wouldn't start it"),
         CrossFileShortfall::SweepOutcomeUnreadable => not_run("its progress couldn't be read"),
@@ -2877,7 +3628,10 @@ fn show_search_index(screen: &crate::first_run::Screen, settled: Option<&FirstEm
     let fetch = crate::embed_model::EmbedModelFetch::probe(false);
     let row = match settled {
         Some(settled) => search_index_row(settled, &fetch),
-        None => Some(unobserved_search_index_row(&fetch)),
+        None => Some(unobserved_search_index_row(
+            &fetch,
+            crate::embed_model::embed_pass_unavailable_reason().is_some(),
+        )),
     };
     match row {
         Some((status, value)) => screen.finish_row(status, "Search index", &value),
@@ -2892,10 +3646,13 @@ fn show_search_index(screen: &crate::first_run::Screen, settled: Option<&FirstEm
 /// running daemon can have paused automatic indexing independently of this CLI.
 fn unobserved_search_index_row(
     fetch: &crate::embed_model::EmbedModelFetch,
+    unavailable: bool,
 ) -> (crate::screen::Status, String) {
     (
         crate::screen::Status::Off,
-        if fetch.declined {
+        if unavailable {
+            format!("off · {UNAVAILABLE_ROW}")
+        } else if fetch.declined {
             "off · kin embed turns it on".to_string()
         } else {
             "kin embed builds it".to_string()
@@ -2967,6 +3724,18 @@ fn enrichment_unavailable_note(reason: &str, detail: Option<&str>) -> String {
     }
 }
 
+/// The note `kin init` prints when the daemon it started is still loading at
+/// the end of the readiness wait.
+///
+/// `detail` is the wait's own account, which names the process, what it is
+/// doing and how to check on it. It carries no log: a daemon that is merely
+/// slow has nothing in its log a reader needs here.
+fn still_loading_note(detail: &str) -> String {
+    format!(
+        "note: reference linking runs once the daemon has loaded, not in this command; {detail}."
+    )
+}
+
 async fn enrich_phase(
     kin_root: &Path,
     layout: &kin_core::KinLayout,
@@ -2978,6 +3747,13 @@ async fn enrich_phase(
     }
     let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
         Ok(url) => url,
+        // Started and still loading is not "no daemon could be started": it is
+        // running, it is left running, and the reader is told how to check on
+        // it rather than handed its log.
+        Err(crate::daemon_client::AutoStartError::StartupTimeout(detail)) => {
+            note!("{}", still_loading_note(&detail));
+            return CrossFileEnrichment::daemon_still_loading(&detail);
+        }
         Err(error) => {
             note!(
                 "note: cross-file reference enrichment was skipped because no daemon could be \
@@ -3081,7 +3857,7 @@ async fn enrich_phase(
         // interrupted, which is how the work a user asked for gets thrown away.
         if done > last_reported {
             last_reported = done;
-            note!("  enriched {done}/{total} files");
+            note!("  checked {done} of {total} files");
         }
         if let Some(screen) = view {
             if total > 0 {
@@ -3173,106 +3949,6 @@ fn ensure_directory(dir: &Path) -> Result<()> {
     }
 }
 
-/// What `kin_init` on the MCP surface does for one folder: the checks an
-/// agent-driven setup needs before anything runs, then `kin init` itself.
-///
-/// The checks are the ones a person at a terminal makes without thinking. The
-/// home directory, the filesystem root and the Kin installation are not
-/// projects. A folder that already is a repository is answered as one. A folder
-/// inside another Kin repository is answered from that one already, and with no
-/// Git repository of its own `kin init` would refuse it anyway, so the refusal
-/// says what would make it a repository of its own.
-///
-/// `kin init` runs as a child of this process with `--json --no-enrich`: its
-/// report on stdout and its progress on stderr, neither of which may reach the
-/// MCP server's stdout, and enrichment left to the daemon that serves the
-/// repository next, which resumes it. The child is not killed when the server
-/// exits, so a setup a client stopped waiting for still finishes.
-pub(crate) async fn initialize_for_mcp(dir: PathBuf) -> kin_mcp::InitOutcome {
-    use kin_mcp::InitOutcome;
-    if !dir.is_dir() {
-        return InitOutcome::Refused(format!(
-            "{} is not a folder on this machine, so there is nothing to set up there. Name the \
-             project folder you want Kin to serve.",
-            dir.display()
-        ));
-    }
-    let home = super::setup::home_dir().ok();
-    if dir.parent().is_none() || home.as_deref() == Some(dir.as_path()) {
-        return InitOutcome::Refused(format!(
-            "{} is not a project folder: setting it up would read everything under it into one \
-             graph. Name the project folder you want Kin to serve.",
-            dir.display()
-        ));
-    }
-    if dir.join(".kin").is_dir() {
-        if kin_core::layout::is_managed_kin_home(&dir.join(".kin")) {
-            return InitOutcome::Refused(existing_repository_refusal(&dir));
-        }
-        return InitOutcome::AlreadyRepository;
-    }
-    if let Some(enclosing) = kin_core::KinLayout::discover(&dir) {
-        if !dir.join(".git").exists() {
-            return InitOutcome::Refused(format!(
-                "{} is inside the Kin repository at {}, which already answers for it. To have \
-                 Kin serve {} on its own, make it a Git repository first (git init, then commit \
-                 its files), and set it up again.",
-                dir.display(),
-                enclosing.working_dir().display(),
-                dir.display()
-            ));
-        }
-    }
-    let program = match std::env::current_exe() {
-        Ok(program) => program,
-        Err(error) => {
-            return InitOutcome::Failed(format!(
-                "this server cannot find its own kin binary: {error}"
-            ))
-        }
-    };
-    let output = tokio::process::Command::new(program)
-        .arg("init")
-        .arg(&dir)
-        .arg("--json")
-        .arg("--no-enrich")
-        .current_dir(&dir)
-        // A daemon this server is bound to serves another repository, and a
-        // setup of this folder must not reach it.
-        .env_remove("KIN_DAEMON_URL")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => return InitOutcome::Failed(format!("kin init could not start: {error}")),
-    };
-    let report = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
-    if output.status.success() {
-        return InitOutcome::Initialized { report };
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let said = last_lines(&stderr, 6);
-    InitOutcome::Failed(if said.is_empty() {
-        format!("kin init exited with {}.", output.status)
-    } else {
-        said
-    })
-}
-
-/// The last `count` non-blank lines of `text`, joined with spaces, for an
-/// answer to quote.
-fn last_lines(text: &str, count: usize) -> String {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    lines[lines.len().saturating_sub(count)..].join(" ")
-}
-
 /// The refusal `kin init` raises over a directory that already holds a `.kin`.
 ///
 /// Two different directories answer to that name, and naming one remedy for
@@ -3357,6 +4033,200 @@ const STORE_EXCLUDE_RULE: &str = "/.kin/";
 /// author added the rule by hand, is already correct. Re-stating it would leave
 /// a duplicate line behind on every re-init.
 const STORE_EXCLUDE_EQUIVALENTS: &[&str] = &[".kin", ".kin/", "/.kin", "/.kin/"];
+
+/// Keep an in-tree store out of `git status`, warning rather than failing.
+///
+/// Run on every path that finishes with a store in hand: a fresh admission, a
+/// reused prepared store, a second `kin init`, and `kin upgrade`. The last two
+/// are how a store made before this rule existed is repaired, so `announce`
+/// says so on stderr when a rule was added there; a fresh store gets its rule
+/// silently as part of being made.
+pub(crate) fn keep_store_out_of_git_status(layout: &kin_core::KinLayout, announce: bool) {
+    match exclude_in_tree_store_from_git(layout) {
+        Ok(Some(_)) if announce => eprintln!(
+            "note: added the Kin store to this checkout's local Git excludes, so `git status` \
+             no longer lists it as untracked"
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "warning: the Kin store at {} was not added to this repository's local Git excludes, \
+             so `git status` will list it as untracked: {error:#}",
+            layout.root().display()
+        ),
+    }
+}
+
+/// Keep an in-tree store out of `git status`; a store kept outside its
+/// working tree is not in the tree, so there is nothing to exclude and the
+/// repository's Git files are left untouched.
+fn exclude_in_tree_store_from_git(layout: &kin_core::KinLayout) -> Result<Option<PathBuf>> {
+    if layout.is_external() {
+        return Ok(None);
+    }
+    exclude_store_from_git(layout.working_dir())
+}
+
+/// A store location reserved in the store index before admission publishes
+/// there: the central location by default, or one `--store` or `KIN_STORE`
+/// named.
+///
+/// Released when dropped if no store was created at the location, so a
+/// refused or failed `kin init` leaves no index entry pointing at nothing.
+struct StoreReservation {
+    working_dir: PathBuf,
+    store: PathBuf,
+}
+
+impl Drop for StoreReservation {
+    fn drop(&mut self) {
+        if std::fs::symlink_metadata(&self.store).is_err() {
+            let _ = kin_core::layout::forget_external_store(&self.working_dir);
+        }
+    }
+}
+
+/// Reserve the location of the store `kin init` is about to create.
+///
+/// The flag wins over `KIN_STORE`, and either wins over the default, which is
+/// the working tree's slot in the central stores directory (or its own `.kin`
+/// under `KIN_STORE_LAYOUT=in-tree`, which needs no reservation). A working
+/// tree that already has a store keeps it: naming that same store reopens it,
+/// and naming a different one is refused rather than creating a second store
+/// for one tree. A named location must be absent or an empty directory, which
+/// is removed so the admission can publish there with one no-replace rename.
+fn reserve_external_store(
+    dir: &Path,
+    flag: Option<PathBuf>,
+    can_reopen: bool,
+) -> Result<Option<StoreReservation>> {
+    let requested = flag.or_else(|| {
+        std::env::var_os(kin_core::layout::KIN_STORE_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let Some(requested) = requested else {
+        return reserve_default_store(dir, can_reopen);
+    };
+    if let Some(existing) = kin_core::layout::locate_store(dir) {
+        let same = match (existing.root().canonicalize(), requested.canonicalize()) {
+            (Ok(existing), Ok(requested)) => existing == requested,
+            _ => false,
+        };
+        if same {
+            return Ok(None);
+        }
+        bail!(
+            "{} already has a Kin store at {}, so it cannot get another at {}. Use that store, \
+             or remove it first",
+            dir.display(),
+            existing.root().display(),
+            requested.display()
+        );
+    }
+    match std::fs::read_dir(&requested) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                bail!(
+                    "the store location {} is not empty. Name an absent or empty directory",
+                    requested.display()
+                );
+            }
+            std::fs::remove_dir(&requested)
+                .with_context(|| format!("prepare the store location {}", requested.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect the store location {}", requested.display()))
+        }
+    }
+    if let Some(parent) = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create the store's parent {}", parent.display()))?;
+    }
+    let store = kin_core::layout::register_external_store(dir, &requested)
+        .with_context(|| format!("reserve the store location {}", requested.display()))?;
+    Ok(Some(StoreReservation {
+        working_dir: dir.canonicalize()?,
+        store,
+    }))
+}
+
+/// Reserve the default location for a tree that has no store yet, after
+/// taking back a store a moved checkout of this repository left behind.
+fn reserve_default_store(dir: &Path, can_reopen: bool) -> Result<Option<StoreReservation>> {
+    if kin_core::layout::locate_store(dir).is_some() {
+        return Ok(None);
+    }
+    if reattach_moved_store(dir, can_reopen)?.is_some() {
+        return Ok(None);
+    }
+    let canonical = dir.canonicalize()?;
+    let store = kin_core::layout::reserve_store_root(&canonical)
+        .with_context(|| format!("reserve a store location for {}", canonical.display()))?;
+    if kin_core::layout::is_in_tree_store_root(&canonical, &store) {
+        return Ok(None);
+    }
+    Ok(Some(StoreReservation {
+        working_dir: canonical,
+        store,
+    }))
+}
+
+/// Give this checkout back the store a moved or renamed copy of it left
+/// behind, instead of building a second store for the same repository.
+///
+/// A candidate is a store whose working tree is gone and whose recorded Git
+/// commit this checkout holds; see [`kin_core::layout::reattach_candidates`].
+/// One candidate is attached. Of several, the one whose tree had this
+/// checkout's directory name is attached when exactly one did, which is what
+/// moving a checkout to a new parent looks like. Otherwise `kin init` refuses
+/// and names them, because choosing would mean guessing which store holds the
+/// history this checkout should continue. An init shape that cannot reopen
+/// an existing store refuses before attachment changes that store's bindings.
+fn reattach_moved_store(dir: &Path, can_reopen: bool) -> Result<Option<kin_core::KinLayout>> {
+    // Only a store this directory itself checks out, never one a parent
+    // checkout left behind.
+    let root = dir.canonicalize()?;
+    let chosen = match kin_core::layout::explain_store_miss(dir)
+        .filter(|(checkout, _)| *checkout == root)
+        .map(|(_, miss)| miss)
+    {
+        Some(kin_core::layout::StoreMiss::Moved(chosen)) => chosen,
+        Some(kin_core::layout::StoreMiss::Ambiguous(candidates)) => {
+            bail!(
+                "{} stores were built from this repository's history and the working trees they \
+                 served are gone:\n{}\nRun `kin store attach <store>` here to continue one of \
+                 them, `kin store prune --yes` to delete them, or `kin init --store <dir>` to \
+                 start a new store beside them",
+                candidates.len(),
+                crate::commands::left_behind_listing(&candidates)
+            );
+        }
+        // A copy gets its own store; the one it was copied beside stays.
+        Some(kin_core::layout::StoreMiss::CopyOf(_)) | None => return Ok(None),
+    };
+    let canonical = dir.canonicalize()?;
+    if !can_reopen {
+        bail!(existing_repository_refusal(dir));
+    }
+    let layout = super::store::attach_store(&chosen.store, &canonical).with_context(|| {
+        format!(
+            "take back the store at {}, which served {} before it moved",
+            chosen.store.display(),
+            chosen.working_dir.display()
+        )
+    })?;
+    kin_core::init_attempt::disclose_line(&format!(
+        "Re-attached the Kin store at {}, which served {} before this checkout moved",
+        layout.root().display(),
+        chosen.working_dir.display()
+    ));
+    Ok(Some(layout))
+}
 
 /// Keep the store out of the converted repository's `git status`.
 ///
@@ -3478,7 +4348,10 @@ fn resolve_against(base: &Path, target: &str) -> PathBuf {
 /// repository. Nothing there resolves ignore rules either, so the two files a
 /// rule can be written into are the whole of what a reader could consult.
 fn store_already_excluded(working_dir: &Path, common_dir: &Path) -> Result<bool> {
-    match kin_git::kin_store_is_git_ignored(working_dir) {
+    match kin_git::kin_store_is_git_ignored(&kin_io::WorktreeRoot::new(
+        working_dir,
+        &kin_io::Grant::ambient(),
+    )) {
         Ok(excluded) => return Ok(excluded),
         Err(error) => tracing::debug!(
             %error,
@@ -3555,11 +4428,14 @@ fn print_json_result(
         roots: &reported.roots,
         initial_change_id: result.authority.initial_change_id.as_ref(),
         exact_reachable_git_history: boundary == InitBoundary::ExactGit,
+        history_state: HistoryStatePayload::from_standing(&kin_core::history_state::standing(
+            &result.layout,
+        )),
         store_footprint: StoreFootprint::measure(&result.layout),
         uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
         embedding_model: crate::embed_model::EmbedModelFetch::probe(false),
         daemon_killed: daemon_death.map(|record| DaemonKilledPayload {
-            summary: record.summary(),
+            summary: record.summary_in(kin_core::enrichment_setting::state_for(&result.layout)),
             exit_code: EXIT_ENRICHMENT_UNATTESTED,
         }),
         graph_section_materialization,
@@ -3598,7 +4474,7 @@ fn print_human_result(
     model_before: &crate::embed_model::EmbedModelFetch,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
-    emit(&render_human_result(
+    emit(&crate::plain_words::text(&render_human_result(
         result,
         boundary,
         reported,
@@ -3606,7 +4482,7 @@ fn print_human_result(
         graph_section_materialization,
         model_before,
         daemon_death,
-    )?)
+    )?))
 }
 
 /// Hand a finished result to stdout, tolerating a reader that already left.
@@ -3705,6 +4581,15 @@ fn render_human_result(
                 "  Imported: exact reachable Git history, refs, raw objects, workspace, and admission policy"
             )?;
         }
+        InitBoundary::ExactGitCheckedOut => {
+            writeln!(
+                out,
+                "  Imported: the checked-out commit's exact tree, workspace, and admission policy"
+            )?;
+            if let Some(sentence) = kin_core::history_state::standing(&result.layout).sentence() {
+                writeln!(out, "  {sentence}")?;
+            }
+        }
         InitBoundary::NativeUnborn => {
             writeln!(out, "  History: unborn (no synthetic commit)")?;
             writeln!(out, "  Workspace: empty exact tree")?;
@@ -3724,7 +4609,10 @@ fn render_human_result(
             "  Semantic enrichment: {}",
             render_semantic_enrichment(semantic_enrichment, daemon_death, cross_file)
         ),
-        enrichment_kill_warning(daemon_death),
+        enrichment_kill_warning(
+            daemon_death,
+            kin_core::enrichment_setting::state_for(&result.layout),
+        ),
         cross_file_pending_notice(semantic_enrichment, cross_file),
         semantic_absence_notice(semantic_enrichment),
         format!(
@@ -4131,8 +5019,11 @@ fn cross_file_pending_notice(
 /// whether anything more was coming. It quotes the record's own summary so this
 /// surface says what `kin graph status` and `kin doctor` say about the same
 /// store, word for word.
-fn enrichment_kill_warning(death: Option<&kin_daemon_spawn::DaemonKillRecord>) -> Option<String> {
-    Some(format!("  ⚠ {}", death?.summary()))
+fn enrichment_kill_warning(
+    death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    enrichment: kin_daemon_spawn::EnrichmentState,
+) -> Option<String> {
+    Some(format!("  ⚠ {}", death?.summary_in(enrichment)))
 }
 
 fn initialized_default_ref(result: &kin_core::InitResult) -> Option<&kin_model::RefName> {
@@ -4163,7 +5054,7 @@ mod tests {
         let refusal = kin_core::KinError::Config(kin_core::unresolved_identity_message());
         let compact = super::render_author_warning(&refusal, 58, true);
         assert_eq!(compact.len(), 3, "{compact:#?}");
-        assert!(compact[0].contains("admission and commits are blocked"));
+        assert!(compact[0].contains("commits are blocked"));
         assert_eq!(
             compact[1].trim(),
             "git config --global user.name \"Your Name\""
@@ -4223,6 +5114,9 @@ mod tests {
     /// be.
     #[test]
     fn the_workspace_head_line_names_the_ref_rather_than_serializing_it() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let head = kin_model::WorkspaceHead::Symbolic {
             target: kin_model::RefName::from_bytes(b"refs/heads/master".to_vec())
                 .expect("a valid ref name"),
@@ -4367,7 +5261,8 @@ mod tests {
         };
         match first_embed_pass_standing(&declined) {
             FirstEmbedPassStanding::Stalled(reason) => {
-                assert!(reason.contains("declined"), "{reason}");
+                assert!(reason.contains("only when someone asks"), "{reason}");
+                assert!(reason.contains("nobody has on this machine"), "{reason}");
                 assert!(reason.contains("`kin embed`"), "{reason}");
             }
             other => panic!("a declined model is not worth waiting for: {other:?}"),
@@ -5106,6 +6001,7 @@ mod tests {
             let owed = SweepOwed {
                 files: 1,
                 first: Some(("greet.go".to_string(), DEAD_SERVER.to_string())),
+                manual_refresh_required: false,
             };
             let (line, outcome) = cross_file_enrichment_outcome(0, 2, 1, &skipped, &owed);
             assert!(line.contains("exited with code 3"), "{line}");
@@ -5119,6 +6015,34 @@ mod tests {
                 }
                 CrossFileEnrichment::Produced => panic!("nothing was enriched"),
             }
+        }
+
+        #[test]
+        fn permanent_reference_uncertainty_names_manual_refresh_even_in_mixed_debt() {
+            let status = serde_json::json!({"files_owed":2,"owed_files":[
+                {"file":"legacy.py","reason":"timeout","retry_after_s":10},
+                {"file":"reference.py","reason":"retained Reference is uncertain","reference_uncertainty":true,"automatic_retry":false,"retry_after_s":null}
+            ]});
+            let owed = owed_from_status(&status);
+            assert!(owed.manual_refresh_required);
+            let line = super::super::owed_detail_line(&owed).unwrap();
+            assert!(line.contains("changed source or resolver inputs"));
+            assert!(line.contains("kin daemon sweep"));
+            assert!(!line.contains("next sweep after a backoff"));
+            let retryable = owed_from_status(&serde_json::json!({"files_owed":1,"owed_files":[
+                {"file":"reference.py","reason":"timeout","reference_uncertainty":true,"automatic_retry":true,"retry_after_s":10}
+            ]}));
+            assert!(!retryable.manual_refresh_required);
+            assert!(super::super::owed_detail_line(&retryable)
+                .unwrap()
+                .contains("next sweep after a backoff"));
+            let legacy = owed_from_status(
+                &serde_json::json!({"files_owed":1,"owed_files":[{"file":"old.py","reason":"timeout"}]}),
+            );
+            assert!(!legacy.manual_refresh_required);
+            assert!(super::super::owed_detail_line(&legacy)
+                .unwrap()
+                .contains("next sweep after a backoff"));
         }
 
         /// A daemon too old to serve the owed fields owes nothing by this
@@ -5481,7 +6405,7 @@ mod tests {
             "a store that lost no daemon must not report one: {quiet}"
         );
         assert!(
-            enrichment_kill_warning(None).is_none(),
+            enrichment_kill_warning(None, kin_daemon_spawn::EnrichmentState::Available).is_none(),
             "and it carries no warning line at all"
         );
 
@@ -5508,8 +6432,9 @@ mod tests {
             "the caveat alone was the defect, so both halves are required: {killed}"
         );
 
-        let warning = enrichment_kill_warning(Some(&record))
-            .expect("a store with a kill on record carries the line that explains it");
+        let warning =
+            enrichment_kill_warning(Some(&record), kin_daemon_spawn::EnrichmentState::Available)
+                .expect("a store with a kill on record carries the line that explains it");
         assert!(warning.contains("memory limit"), "{warning}");
         assert!(
             warning.contains("12.0 GiB"),
@@ -6367,14 +7292,21 @@ mod tests {
     /// starts from empty, so it cannot be fooled the same way.
     #[tokio::test]
     async fn init_registers_the_repository_under_a_scratch_registry() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let scratch = tempfile::tempdir().unwrap();
         let repo = scratch.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q"]);
         git(&repo, &["config", "user.email", "kin-test@example.invalid"]);
         git(&repo, &["config", "user.name", "Kin Test"]);
-        std::fs::write(repo.join("seed"), b"seed").unwrap();
-        git(&repo, &["add", "seed"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='sample'\nversion='0.1.0'\n[dependencies]\nkin-db={git='https://github.com/firelock-ai/kin-db.git'}\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "Cargo.toml"]);
         git(&repo, &["commit", "-qm", "seed"]);
 
         let kin_home = scratch.path().join("kin-home");
@@ -6389,9 +7321,11 @@ mod tests {
         run(
             Some(repo.to_str().unwrap().to_string()),
             false,
-            true,
+            InitEnrichment::Off,
+            None,
             None,
             false,
+            Some(kin_core::history_state::HistoryMode::Full),
         )
         .await
         .expect("kin init must succeed under a scratch registry");
@@ -6406,6 +7340,17 @@ mod tests {
              registry entries: {:?}",
             registry.repos
         );
+        let row = registry
+            .repos
+            .iter()
+            .find(|entry| entry.path == canonical)
+            .unwrap();
+        assert!(row.dependencies_recorded_by.is_some());
+        assert!(row.dependencies_manifest_recorded_at.is_some());
+        assert!(row
+            .dependencies
+            .iter()
+            .any(|dep| dep.name == "kin-db" && dep.source == "cargo"));
     }
 
     /// `kin init` decides whether its cross-file sweep can run before it starts
@@ -6418,7 +7363,7 @@ mod tests {
     mod cross_file_enrichment_decision {
         use super::super::{
             cross_file_enrichment_refusal, enrich_after_init_with, run, CrossFileEnrichment,
-            CrossFileShortfall,
+            CrossFileShortfall, InitEnrichment,
         };
         use super::git;
         use std::time::{Duration, Instant};
@@ -6510,6 +7455,9 @@ mod tests {
         /// supervisor and waited a minute for it to give up.
         #[tokio::test]
         async fn the_phase_entry_decides_at_once_and_starts_nothing() {
+            if !kin_core::test_env::alone_in_process() {
+                return;
+            }
             let scratch = tempfile::tempdir().unwrap();
             let repo = scratch.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
@@ -6534,14 +7482,19 @@ mod tests {
             run(
                 Some(repo.to_str().unwrap().to_string()),
                 false,
-                true,
+                InitEnrichment::Off,
+                None,
                 None,
                 false,
+                Some(kin_core::history_state::HistoryMode::Full),
             )
             .await
             .expect("kin init admits the fixture");
             let store = AdmittedStore {
-                kin_root: repo.join(".kin"),
+                kin_root: kin_core::layout::locate_store(&repo)
+                    .expect("the admitted store is discoverable")
+                    .root()
+                    .to_path_buf(),
                 scratch,
             };
 
@@ -6693,9 +7646,11 @@ mod tests {
             use CrossFileShortfall::*;
             let all = [
                 NotRequested,
+                SwitchedOff,
                 DaemonSpawnDisabled,
                 LoopbackBlocked,
                 DaemonUnavailable,
+                DaemonStillLoading,
                 StoreUnreadable,
                 SweepNotStarted,
                 LanguageServerUnavailable,
@@ -6708,9 +7663,11 @@ mod tests {
             for reason in all {
                 match reason {
                     NotRequested
+                    | SwitchedOff
                     | DaemonSpawnDisabled
                     | LoopbackBlocked
                     | DaemonUnavailable
+                    | DaemonStillLoading
                     | StoreUnreadable
                     | SweepNotStarted
                     | LanguageServerUnavailable
@@ -6725,7 +7682,15 @@ mod tests {
                     !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                     "{code}"
                 );
-                assert!(matches!(reason.state(), "owed" | "unknown"), "{reason:?}");
+                assert!(
+                    matches!(reason.state(), "owed" | "off" | "unknown"),
+                    "{reason:?}"
+                );
+                assert_eq!(
+                    reason.state() == "off",
+                    reason == CrossFileShortfall::SwitchedOff,
+                    "only a repository switched off by its own setting reads as off: {reason:?}"
+                );
             }
             let codes: std::collections::BTreeSet<&str> =
                 all.iter().map(|reason| reason.code()).collect();
@@ -6741,8 +7706,8 @@ mod tests {
     /// and what it says about the sweep.
     mod a_sweep_that_outlasts_the_conversion {
         use super::super::{
-            conversion_daemon_retirement_note, sweep_budget_spent, ConversionDaemonExit,
-            CrossFileEnrichment, CrossFileShortfall,
+            conversion_daemon_retirement_note, still_loading_note, sweep_budget_spent,
+            ConversionDaemonExit, CrossFileEnrichment, CrossFileShortfall,
         };
         use crate::commands::daemon::RetirementAnswer;
         use std::time::Duration;
@@ -6758,6 +7723,43 @@ mod tests {
             assert_eq!(
                 ConversionDaemonExit::after(&outcome),
                 ConversionDaemonExit::RetireWhenWorkEnds
+            );
+        }
+
+        /// A daemon still loading when the readiness wait ran out is left to
+        /// load and link, rather than stopped or reported as one that could not
+        /// start. On a 2,878-commit repository the first daemon took longer
+        /// than the 300-second wait, and the conversion printed twenty lines of
+        /// its colour-coded log, in its text and in its `--json` document, under
+        /// a sentence saying no daemon could be started.
+        #[test]
+        fn a_daemon_still_loading_is_left_running_and_explained_without_its_log() {
+            let detail = "the kin daemon (pid 4242) is still loading this repository after 300s \
+                          (the daemon process is up and loading the repository graph). It keeps \
+                          running and serves this repository once it has loaded: `kin status` \
+                          says whether it is ready, and `kin daemon stop` ends it";
+            let outcome = CrossFileEnrichment::daemon_still_loading(detail);
+            assert_eq!(
+                ConversionDaemonExit::after(&outcome),
+                ConversionDaemonExit::RetireWhenWorkEnds
+            );
+            let payload = outcome.payload(Duration::from_secs(300));
+            assert_eq!(payload.reason, Some("daemon_still_loading"));
+            assert_eq!(payload.state, "owed");
+            assert_eq!(payload.cause, Some(detail));
+            let pending = payload.detail.expect("an owed sweep says what is owed");
+            assert!(
+                pending.contains("still loading") && !pending.contains("could be started"),
+                "{pending}"
+            );
+            let note = still_loading_note(detail);
+            assert!(
+                note.contains("pid 4242") && note.contains("`kin status`"),
+                "{note}"
+            );
+            assert!(
+                !note.contains('\u{1b}') && !note.contains("recent log"),
+                "a slow daemon's note carries no log: {note}"
             );
         }
 
@@ -6864,6 +7866,10 @@ mod tests {
                     Some(AuthorityAsOf::Admission),
                 ),
                 (
+                    CrossFileShortfall::SwitchedOff,
+                    Some(AuthorityAsOf::Admission),
+                ),
+                (
                     CrossFileShortfall::DaemonSpawnDisabled,
                     Some(AuthorityAsOf::Admission),
                 ),
@@ -6880,6 +7886,7 @@ mod tests {
                     Some(AuthorityAsOf::EnrichmentRunning),
                 ),
                 (CrossFileShortfall::DaemonUnavailable, None),
+                (CrossFileShortfall::DaemonStillLoading, None),
                 (CrossFileShortfall::SweepNotStarted, None),
                 (CrossFileShortfall::LanguageServerUnavailable, None),
                 (CrossFileShortfall::SweepEnrichedNothing, None),
@@ -7001,6 +8008,209 @@ mod tests {
         }
     }
 
+    /// A moved checkout is offered its old store, but a refusing init must
+    /// leave that store and both index bindings untouched.
+    mod moved_store_init_refusals {
+        use super::super::{reserve_external_store, run, InitEnrichment};
+        use kin_core::test_env::EnvVarGuard;
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+
+        struct MovedStore {
+            _scratch: tempfile::TempDir,
+            _env: EnvVarGuard,
+            original: PathBuf,
+            moved: PathBuf,
+            store: PathBuf,
+            index: PathBuf,
+        }
+
+        fn git_object(tree: &Path, kind: &str, bytes: &[u8]) -> String {
+            let output = crate::commands::test_subprocess::fixture_git(tree)
+                .args(["hash-object", "-w", "-t", kind, "--stdin"])
+                .output_with_input(bytes)
+                .expect("write synthetic fixture object");
+            assert!(
+                output.status.success(),
+                "fixture object failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        fn moved_store() -> MovedStore {
+            let scratch = tempfile::tempdir().unwrap();
+            let home = scratch.path().join("machine");
+            let env = EnvVarGuard::set("HOME", &home)
+                .with("KIN_HOME", &home)
+                .with("KIN_REGISTRY_PATH", home.join("registry.toml"))
+                .without("KIN_STORE")
+                .without("KIN_STORE_LAYOUT")
+                .without("KIN_ALLOW_PARENT_STORE");
+            let original = scratch.path().join("original");
+            std::fs::create_dir_all(&original).unwrap();
+            let original = original.canonicalize().unwrap();
+            let initialized = kin_core::init(&original).expect("real empty native authority");
+            let store = initialized.layout.root().to_path_buf();
+
+            // The store's Git anchor only needs shared fixture history. Write
+            // synthetic objects with plumbing, without commit hooks or signing.
+            super::git(&original, &["init", "-q", "--initial-branch=main"]);
+            let tree = git_object(&original, "tree", b"");
+            let commit = git_object(
+                &original,
+                "commit",
+                format!(
+                    "tree {tree}\nauthor Kin Fixture <kin@example.invalid> 1 +0000\n\
+                     committer Kin Fixture <kin@example.invalid> 1 +0000\n\nfixture\n"
+                )
+                .as_bytes(),
+            );
+            super::git(&original, &["update-ref", "refs/heads/main", &commit]);
+            kin_core::layout::write_working_tree_record(&store, &original).unwrap();
+            // A refusal must not remove even stale, inactive runtime records.
+            std::fs::write(store.join("daemon.pid"), b"0\n").unwrap();
+            std::fs::write(store.join("daemon.lock"), b"inactive fixture lock\n").unwrap();
+            let moved = scratch.path().join("moved");
+            std::fs::rename(&original, &moved).unwrap();
+            assert!(kin_core::layout::locate_store(&moved).is_none());
+            let candidates = kin_core::layout::reattach_candidates(&moved);
+            assert_eq!(candidates.len(), 1, "{candidates:?}");
+            assert_eq!(candidates[0].store, store.canonicalize().unwrap());
+            assert_eq!(
+                candidates[0].standing,
+                kin_core::layout::StoreStanding::Gone
+            );
+            let index = kin_core::layout::store_index_dir();
+            MovedStore {
+                _scratch: scratch,
+                _env: env,
+                original,
+                moved,
+                store,
+                index,
+            }
+        }
+
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+                    if kind.is_dir() {
+                        out.insert(relative, None);
+                        visit(root, &path, out);
+                    } else {
+                        assert!(kind.is_file(), "fixture contains a non-regular file");
+                        out.insert(relative, Some(std::fs::read(path).unwrap()));
+                    }
+                }
+            }
+            let mut out = BTreeMap::new();
+            visit(root, root, &mut out);
+            out
+        }
+
+        async fn refused_without_mutation(json: bool, adopting: bool) {
+            let fixture = moved_store();
+            let store_before = snapshot(&fixture.store);
+            let index_before = snapshot(&fixture.index);
+            let error = run(
+                Some(fixture.moved.to_str().unwrap().to_owned()),
+                json,
+                InitEnrichment::Off,
+                adopting.then(|| "another-repository".to_owned()),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect_err("this init shape refuses an existing store");
+            assert!(error.to_string().contains("Kin repository already exists"));
+            assert_eq!(
+                snapshot(&fixture.store),
+                store_before,
+                "refusal changed store bytes"
+            );
+            assert_eq!(
+                snapshot(&fixture.index),
+                index_before,
+                "refusal changed index bindings"
+            );
+            assert!(kin_core::layout::locate_store(&fixture.moved).is_none());
+            assert_eq!(
+                kin_core::layout::read_working_tree_record(&fixture.store),
+                Some(fixture.original)
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn json_refuses_a_moved_store_before_mutation() {
+            if !kin_core::test_env::alone_in_process() {
+                return;
+            }
+            refused_without_mutation(true, false).await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn explicit_adoption_refuses_a_moved_store_before_mutation() {
+            if !kin_core::test_env::alone_in_process() {
+                return;
+            }
+            refused_without_mutation(false, true).await;
+        }
+
+        #[test]
+        fn ordinary_init_reattaches_a_moved_store() {
+            if !kin_core::test_env::alone_in_process() {
+                return;
+            }
+            let fixture = moved_store();
+            assert!(reserve_external_store(&fixture.moved, None, true)
+                .unwrap()
+                .is_none());
+            let layout = kin_core::layout::locate_store(&fixture.moved).unwrap();
+            assert_eq!(layout.root(), fixture.store);
+            assert_eq!(
+                kin_core::layout::read_working_tree_record(&fixture.store),
+                Some(fixture.moved.canonicalize().unwrap())
+            );
+            kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+                .expect("reattached authority binding")
+                .open_manager()
+                .expect("reattached real authority still opens");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn history_keeps_its_existing_json_and_adoption_exception() {
+            if !kin_core::test_env::alone_in_process() {
+                return;
+            }
+            for adopting in [false, true] {
+                let fixture = moved_store();
+                let code = run(
+                    Some(fixture.moved.to_str().unwrap().to_owned()),
+                    true,
+                    InitEnrichment::Off,
+                    adopting.then(|| "another-repository".to_owned()),
+                    None,
+                    false,
+                    Some(kin_core::history_state::HistoryMode::None),
+                )
+                .await
+                .expect("history may reopen an existing complete store");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    kin_core::layout::locate_store(&fixture.moved)
+                        .unwrap()
+                        .root(),
+                    fixture.store
+                );
+            }
+        }
+    }
+
     /// A second `kin init` over a store this build opens is done, not refused.
     mod second_init_decision {
         use super::super::{second_init, SecondInit};
@@ -7026,6 +8236,80 @@ mod tests {
             assert_eq!(second_init(true, false, false, Some(1)), SecondInit::Refuse);
             assert_eq!(second_init(false, true, false, Some(1)), SecondInit::Refuse);
             assert_eq!(second_init(false, false, true, Some(1)), SecondInit::Refuse);
+        }
+
+        /// A store whose build cannot embed reads as off for that reason, and
+        /// nothing it renders names `kin embed`. A complete index is still
+        /// complete, and an unread daemon still recommends nothing.
+        #[test]
+        fn a_build_that_cannot_embed_reads_as_off_and_recommends_nothing() {
+            use super::super::{
+                existing_repository_lines, semantic_search_note_from, standing_for_this_build,
+                ExistingRepository, SearchIndexStanding,
+            };
+            let reason = "this Kin build has no local embedding model, and no external embedding \
+                          provider is selected for this repository";
+            for standing in [
+                SearchIndexStanding::Off,
+                SearchIndexStanding::Filling {
+                    indexed: 0,
+                    total: 467,
+                },
+                SearchIndexStanding::Paused {
+                    indexed: 0,
+                    total: 467,
+                    cause: "automatic indexing is off".to_string(),
+                    resumes: Some("kin embed runs it"),
+                },
+            ] {
+                assert_eq!(
+                    standing_for_this_build(standing, Some(reason.to_string())),
+                    SearchIndexStanding::Unavailable(reason.to_string())
+                );
+            }
+            for kept in [
+                SearchIndexStanding::Complete { total: 467 },
+                SearchIndexStanding::Unread,
+            ] {
+                assert_eq!(
+                    standing_for_this_build(kept.clone(), Some(reason.to_string())),
+                    kept
+                );
+            }
+            assert_eq!(
+                standing_for_this_build(SearchIndexStanding::Off, None),
+                SearchIndexStanding::Off,
+                "a build that can embed keeps its way back"
+            );
+
+            let off = SearchIndexStanding::Unavailable(reason.to_string());
+            let note = semantic_search_note_from(&off, &Default::default(), true)
+                .expect("an off index is worth a note")
+                .join(" ");
+            assert!(
+                note.contains(reason) && !note.contains("kin embed"),
+                "{note}"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let existing = ExistingRepository {
+                name: "itsdangerous".to_string(),
+                entities: 216,
+                layout: kin_core::KinLayout::new(dir.path().join(".kin")),
+            };
+            let lines = existing_repository_lines(
+                crate::screen::Style::plain(),
+                &existing,
+                &off,
+                "kin status",
+                100,
+                false,
+            )
+            .join("\n");
+            assert!(
+                lines.contains("Search index") && !lines.contains("kin embed"),
+                "{lines}"
+            );
         }
 
         /// The search index reads as filling only while a daemon will fill it:
@@ -7205,7 +8489,9 @@ mod tests {
         async fn a_second_init_answers_and_leaves_the_store_alone() {
             let dir = tempfile::tempdir().unwrap();
             kin_core::init(dir.path()).unwrap();
-            let manifest = std::fs::read(dir.path().join(".kin/manifest.json")).unwrap();
+            let layout = kin_core::layout::locate_store(dir.path())
+                .expect("the initialized store is discoverable");
+            let manifest = std::fs::read(layout.manifest_path()).unwrap();
             let answered = super::super::answer_existing_repository(dir.path(), false, false)
                 .expect("a store this build opens is answered, not refused")
                 .expect("and answered as already a repository");
@@ -7247,19 +8533,79 @@ mod tests {
                 );
                 assert!(!line.contains("Nothing to do"), "{line}");
             }
-            assert_eq!(
-                std::fs::read(dir.path().join(".kin/manifest.json")).unwrap(),
-                manifest
-            );
+            assert_eq!(std::fs::read(layout.manifest_path()).unwrap(), manifest);
             let refused = super::super::answer_existing_repository(dir.path(), true, false)
                 .expect_err("--json keeps its refusal");
             assert!(refused.to_string().contains("already exists"), "{refused}");
+        }
+
+        /// `--no-enrich` over a repository that already exists records the
+        /// setting off, as a first `kin init --no-enrich` does, and the answer
+        /// then says so with the way back on. The other modes leave it alone.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_second_init_with_no_enrich_switches_the_repository_off() {
+            use super::super::InitEnrichment;
+            if !kin_core::test_env::alone_in_process() {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            // No supervisor of this machine's is asked about the stop below.
+            let kin_home = tempfile::tempdir().unwrap();
+            let _kin_home = kin_core::test_env::EnvVarGuard::set("KIN_HOME", kin_home.path());
+            kin_core::init(dir.path()).unwrap();
+            let layout = kin_core::layout::locate_store(dir.path())
+                .expect("the initialized store is discoverable");
+            for mode in [InitEnrichment::Now, InitEnrichment::Deferred] {
+                super::super::switch_existing_repository_off(&layout, mode).await;
+                assert!(
+                    kin_core::enrichment_setting::repository_enabled(&layout),
+                    "{mode:?} leaves the setting alone"
+                );
+            }
+            super::super::switch_existing_repository_off(&layout, InitEnrichment::Off).await;
+            assert!(
+                !kin_core::enrichment_setting::repository_enabled(&layout),
+                "--no-enrich switches an existing repository off"
+            );
+
+            let answered = super::super::answer_existing_repository(dir.path(), false, false)
+                .expect("answered")
+                .expect("as already a repository");
+            let lines = super::super::existing_repository_lines(
+                crate::screen::Style::plain(),
+                &answered,
+                &super::super::SearchIndexStanding::Unread,
+                "kin refs want_bytes",
+                58,
+                true,
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("Linking") && l.contains("off for this repository")),
+                "{lines:#?}"
+            );
+            let said = lines
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                said.contains("kin daemon sweep --enable turns it on"),
+                "{lines:#?}"
+            );
+            for line in &lines {
+                assert!(line.chars().count() < 60, "no hard wrap: {line:?}");
+            }
         }
     }
 
     /// The Search index row says what the first embedding pass came to.
     mod search_index_rows {
-        use super::super::{search_index_row, unobserved_search_index_row, FirstEmbedPassOutcome};
+        use super::super::{
+            search_index_row, unobserved_search_index_row, ConversionDaemonExit,
+            FirstEmbedPassOutcome,
+        };
         use crate::embed_model::EmbedModelFetch;
         use crate::screen::Status;
 
@@ -7274,16 +8620,59 @@ mod tests {
         fn an_unobserved_index_names_an_explicit_action_not_background_work() {
             for fetch in [cached(), EmbedModelFetch::default()] {
                 assert_eq!(
-                    unobserved_search_index_row(&fetch),
+                    unobserved_search_index_row(&fetch, false),
                     (Status::Off, "kin embed builds it".to_string())
                 );
             }
             assert_eq!(
-                unobserved_search_index_row(&EmbedModelFetch {
-                    declined: true,
-                    ..Default::default()
-                }),
+                unobserved_search_index_row(
+                    &EmbedModelFetch {
+                        declined: true,
+                        ..Default::default()
+                    },
+                    false
+                ),
                 (Status::Off, "off · kin embed turns it on".to_string())
+            );
+        }
+
+        /// A build or configuration that cannot embed never names `kin embed`,
+        /// in any row: that command would be refused. The first conversion on
+        /// a build without the embeddings feature ended by recommending it,
+        /// and `kin embed` then failed as an HTTP 500.
+        #[test]
+        fn a_build_that_cannot_embed_recommends_nothing_it_would_refuse() {
+            let declined = EmbedModelFetch {
+                declined: true,
+                ..EmbedModelFetch::default()
+            };
+            for fetch in [cached(), EmbedModelFetch::default(), declined.clone()] {
+                let (status, value) = unobserved_search_index_row(&fetch, true);
+                assert_eq!(status, Status::Off);
+                assert!(!value.contains("kin embed"), "{value}");
+            }
+            let unavailable = FirstEmbedPassOutcome::Unavailable {
+                reason: "this Kin build has no local embedding model, and no external embedding \
+                         provider is selected for this repository"
+                    .to_string(),
+            };
+            for fetch in [cached(), declined] {
+                let (status, value) =
+                    search_index_row(&unavailable, &fetch).expect("an unavailable index is said");
+                assert_eq!(status, Status::Off);
+                assert!(!value.contains("kin embed"), "{value}");
+            }
+            let note = unavailable
+                .note()
+                .expect("the conversion says why it is off");
+            assert!(
+                note.contains("no local embedding model") && !note.contains("kin embed"),
+                "{note}"
+            );
+            assert_eq!(
+                ConversionDaemonExit::StopNow.after_embedding(&unavailable),
+                ConversionDaemonExit::StopNow,
+                "nothing is filling, so nothing keeps the daemon up"
             );
         }
 
@@ -7357,8 +8746,16 @@ mod tests {
         let linking = |reason| linking_for(&CrossFileEnrichment::withheld(reason, "pending"));
         assert_eq!(linking(CrossFileShortfall::NotRequested), Linking::Skipped);
         assert_eq!(
+            linking(CrossFileShortfall::SwitchedOff),
+            Linking::SwitchedOff
+        );
+        assert_eq!(
             linking(CrossFileShortfall::LanguageServerUnavailable),
             Linking::NoServer
+        );
+        assert_eq!(
+            linking(CrossFileShortfall::DaemonStillLoading),
+            Linking::WaitsForDaemon
         );
         for reason in [
             CrossFileShortfall::DaemonSpawnDisabled,

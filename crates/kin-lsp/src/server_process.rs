@@ -42,6 +42,43 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 /// Whole seconds, because the watcher's shell counts it with `sleep 1`.
 pub const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 
+/// A shorter grace a test set for every stop in this process, in
+/// milliseconds, or zero for [`TERMINATION_GRACE`].
+#[cfg(any(test, feature = "test-support"))]
+static TEST_TERMINATION_GRACE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Give every server this process stops from now on `grace`, rather than
+/// [`TERMINATION_GRACE`], to exit after SIGTERM before SIGKILL.
+///
+/// For tests that prove the escalation, with a member that ignores SIGTERM,
+/// without waiting out the production grace each time. Only the length
+/// changes: a stop still sends SIGTERM, waits, and then sends SIGKILL to
+/// whatever is left. A watcher counts its grace in whole seconds, so one
+/// started under a grace below a second sends SIGKILL right after SIGTERM.
+///
+/// It is process-wide, which is what a test that runs in a process of its own
+/// wants; `Duration::ZERO` restores the production grace. Built only for this
+/// crate's tests and under the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_termination_grace_for_tests(grace: Duration) {
+    let millis = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+    TEST_TERMINATION_GRACE_MS.store(millis, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The grace a stop gives a group after SIGTERM: [`TERMINATION_GRACE`] unless
+/// a test shortened it.
+fn termination_grace() -> Duration {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let millis = TEST_TERMINATION_GRACE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if millis > 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    TERMINATION_GRACE
+}
+
 /// How often a stop checks whether the group has emptied.
 #[cfg(unix)]
 const GROUP_POLL: Duration = Duration::from_millis(20);
@@ -74,6 +111,8 @@ exit 0
 /// the process group it leads.
 pub(crate) struct ServerProcess {
     child: Child,
+    #[cfg(unix)]
+    runtime: Option<kin_daemon_spawn::test_runtime::TestRuntimeGroup>,
     /// The group's id, which is the leader's pid.
     #[cfg(unix)]
     group: libc::pid_t,
@@ -98,6 +137,20 @@ impl ServerProcess {
             // The whole mechanism on Windows. On Unix it also hands a leader
             // that outlived its drop to tokio, which reaps it.
             .kill_on_drop(true);
+        #[cfg(unix)]
+        if let Some(mut runtime) =
+            kin_daemon_spawn::test_runtime::TestRuntimeGroup::language_server_from_env()?
+        {
+            let group = runtime.group;
+            let child = runtime.spawn_tokio(command)?;
+            return Ok(Self {
+                child,
+                runtime: Some(runtime),
+                group,
+                watcher: None,
+                done: false,
+            });
+        }
         #[cfg(unix)]
         command.process_group(0);
         let child = command.spawn()?;
@@ -126,6 +179,7 @@ impl ServerProcess {
             };
             Ok(Self {
                 child,
+                runtime: None,
                 group,
                 watcher,
                 done: false,
@@ -137,9 +191,16 @@ impl ServerProcess {
         }
     }
 
-    /// The leader's pid, which is also the group's id.
+    /// The executable leader's pid (the guardian has a separate sentinel).
     #[cfg(unix)]
     pub(crate) fn leader_pid(&self) -> libc::pid_t {
+        if self.runtime.is_some() {
+            return self
+                .child
+                .id()
+                .and_then(|pid| libc::pid_t::try_from(pid).ok())
+                .unwrap_or(0);
+        }
         self.group
     }
 
@@ -166,7 +227,15 @@ impl ServerProcess {
     pub(crate) fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
         #[cfg(unix)]
         {
-            match exit_without_reaping(self.group) {
+            let pid = if self.runtime.is_some() {
+                match self.child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
+                    Some(pid) => pid,
+                    None => return self.child.try_wait().ok().flatten(),
+                }
+            } else {
+                self.group
+            };
+            match exit_without_reaping(pid) {
                 Ok(status) => status,
                 // Not this process's child to wait on any more: already
                 // reaped, in which case the handle kept the status and asking
@@ -191,8 +260,19 @@ impl ServerProcess {
     pub(crate) async fn terminate(mut self) {
         #[cfg(unix)]
         {
+            if let Some(mut runtime) = self.runtime.take() {
+                // This runtime owns a pinned guardian, not an unverified PID.
+                // Reap the child before the guardian finalizes its group proof.
+                runtime.request_cleanup();
+                let _ = tokio::time::timeout(KILL_SETTLE, self.child.wait()).await;
+                if let Err(error) = runtime.finish_cleanup() {
+                    tracing::warn!(%error, "runtime language server cleanup failed");
+                }
+                self.done = true;
+                return;
+            }
             signal_group(self.group, libc::SIGTERM);
-            if !self.wait_for_empty_group(TERMINATION_GRACE).await {
+            if !self.wait_for_empty_group(termination_grace()).await {
                 signal_group(self.group, libc::SIGKILL);
                 if !self.wait_for_empty_group(KILL_SETTLE).await {
                     tracing::warn!(
@@ -209,7 +289,7 @@ impl ServerProcess {
         #[cfg(not(unix))]
         {
             let _ = self.child.start_kill();
-            let _ = tokio::time::timeout(TERMINATION_GRACE, self.child.wait()).await;
+            let _ = tokio::time::timeout(termination_grace(), self.child.wait()).await;
         }
     }
 
@@ -240,6 +320,11 @@ impl Drop for ServerProcess {
         // so short of the group emptying in the instant before this runs, this
         // reaches only this server's processes.
         if !self.done {
+            if let Some(runtime) = self.runtime.as_mut() {
+                // Drop of the owned guardian records its own cleanup proof.
+                runtime.request_cleanup();
+                return;
+            }
             signal_group(self.group, libc::SIGKILL);
         }
     }
@@ -263,7 +348,7 @@ impl GroupWatcher {
             .arg(WATCHER_SCRIPT)
             .arg("kin-lsp-group-watcher")
             .arg(group.to_string())
-            .arg(TERMINATION_GRACE.as_secs().to_string())
+            .arg(termination_grace().as_secs().to_string())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .current_dir("/")
@@ -358,4 +443,116 @@ fn group_is_empty(group: libc::pid_t) -> bool {
     // SAFETY: as in `signal_group`; signal 0 only asks whether any member exists.
     let result = unsafe { libc::kill(-group, 0) };
     result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    /// Invoked in its own process by the private lifecycle qualification. This
+    /// avoids mutating the environment of parallel ordinary unit tests.
+    #[tokio::test]
+    #[ignore = "requires a live native runtime guardian and private fixture environment"]
+    async fn owned_runtime_fixture() {
+        let case = std::env::var("KIN_RUNTIME_LSP_FIXTURE").expect("explicit fixture case");
+        let marker = std::path::PathBuf::from(std::env::var_os("KIN_RUNTIME_LSP_MARKER").unwrap());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' TERM; echo ready; sleep 60 & wait"]);
+        if case == "readiness-failure" {
+            // The fixture launcher injects this only into the LSP test
+            // process, after its outer runtime guardian is ready.
+            assert_eq!(
+                std::env::var(kin_daemon_spawn::PROCESS_GROUP_GUARDIAN_EXIT_BEFORE_READY_ENV)
+                    .ok()
+                    .as_deref(),
+                Some("1"),
+                "readiness failure must be supplied by the fixture launcher"
+            );
+            assert!(ServerProcess::spawn(command).is_err());
+            std::fs::write(marker, "rejected before payload").unwrap();
+            return;
+        }
+        if case == "missing-command" {
+            assert!(ServerProcess::spawn(Command::new("/missing/owned-lsp-fixture")).is_err());
+            std::fs::write(marker, "rejected missing command").unwrap();
+            return;
+        }
+        let mut process = ServerProcess::spawn(command).expect("owned server");
+        let runtime = process.runtime.as_ref().expect("live runtime guardian");
+        let group = runtime.group;
+        let directory = runtime.directory.clone();
+        assert_ne!(
+            process.leader_pid(),
+            group,
+            "resolver identity must name the executable"
+        );
+        assert_eq!(Some(process.leader_pid() as u32), process.child.id());
+        assert!(process.exit_status().is_none());
+        let (_, stdout, _) = process.take_stdio();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stdout.unwrap())
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        std::fs::write(marker, group.to_string()).unwrap();
+        if case == "owner-interrupted" {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            panic!("fixture owner should be interrupted");
+        }
+        if case == "drop" {
+            drop(process);
+        } else {
+            assert_eq!(case, "terminate");
+            process.terminate().await;
+        }
+        let done: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("done.json")).unwrap()).unwrap();
+        assert_eq!(done["cleanup_verified"], true);
+        assert!(kin_daemon_spawn::test_runtime::recorded_group_is_quiescent(
+            group
+        ));
+    }
+
+    /// A stop sends SIGTERM, waits out the grace, and sends SIGKILL to a
+    /// member that ignores SIGTERM. A test grace changes only how long the
+    /// wait is, and production keeps its two seconds.
+    #[tokio::test]
+    async fn a_member_that_ignores_sigterm_is_killed_once_the_grace_runs_out() {
+        assert_eq!(TERMINATION_GRACE, Duration::from_secs(2));
+        let grace = Duration::from_millis(300);
+        set_termination_grace_for_tests(grace);
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' TERM; echo ignoring; exec sleep 600"]);
+        let mut process = ServerProcess::spawn(command).expect("spawn a member");
+        let group = process.leader_pid();
+        let (_stdin, stdout, _stderr) = process.take_stdio();
+        // SIGTERM is ignored only once the trap is set, and `sleep` keeps
+        // ignoring it across the exec.
+        let mut line = String::new();
+        tokio::io::BufReader::new(stdout.expect("captured stdout"))
+            .read_line(&mut line)
+            .await
+            .expect("the member says it ignores SIGTERM");
+        assert_eq!(line.trim(), "ignoring");
+
+        let started = tokio::time::Instant::now();
+        process.terminate().await;
+        let took = started.elapsed();
+        set_termination_grace_for_tests(Duration::ZERO);
+
+        assert!(
+            group_is_empty(group),
+            "a member that ignores SIGTERM is ended by the SIGKILL after the grace"
+        );
+        assert!(
+            took >= grace,
+            "SIGKILL waited out the grace after SIGTERM: took {took:?}"
+        );
+        assert!(
+            took < TERMINATION_GRACE,
+            "the test grace replaced the production one: took {took:?}"
+        );
+    }
 }

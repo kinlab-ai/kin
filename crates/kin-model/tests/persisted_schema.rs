@@ -64,6 +64,22 @@ const HUMAN_READABLE_ONLY: &[(&str, &str)] = &[
         "DirectoryPreset",
         "per-directory preset override, serialized to TOML/JSON config only",
     ),
+    (
+        "FileEscapeRecord",
+        "a value-escape record, stored only as a JSON object inside entity metadata, never as a positional field",
+    ),
+    (
+        "ValueOccurrence",
+        "part of a value-escape record, stored only as a JSON object inside entity metadata",
+    ),
+    (
+        "ReflectiveSite",
+        "part of a value-escape record, stored only as a JSON object inside entity metadata",
+    ),
+    (
+        "ClassBases",
+        "part of a value-escape record, stored only as a JSON object inside entity metadata",
+    ),
 ];
 
 /// Persisted types the scan must actually observe.
@@ -181,6 +197,13 @@ const HAND_WRITTEN_SERIALIZATIONS: &[(&str, &str, &str)] = &[
         "GitTreeEntryName",
         "",
         "serializes as a single-field hex wire struct",
+    ),
+    (
+        "MetadataMap",
+        "",
+        "delegates to the plain map it shares, so it writes exactly the bytes an unshared map \
+         wrote and has no element order of its own; metadata_map's tests pin that maps written \
+         before sharing read and re-write identically",
     ),
 ];
 

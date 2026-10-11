@@ -374,6 +374,8 @@ class ExportReferenceTests(unittest.TestCase):
         identity = file_path + ":" + name
         module_id = "module:" + caller
         self.starts[module_id] = 0
+        # What the store says about the focal, for replies that serve no file.
+        self.__dict__.setdefault("focals", {})[identity] = (name, kind, file_path)
         return {"focal_entity": {"id": identity, "name": name,
                                  "projection": {"path": file_path}, "kind": kind},
                 "entity_id": identity, "owner_qualified_name": name,
@@ -404,6 +406,11 @@ class ExportReferenceTests(unittest.TestCase):
         self.assertEqual((repo, timeout), ("fixture", 30))
         self.assertEqual((args[:2], args[3:]), (["graph", "inspect"], ["--json"]))
         entity_id = args[2]
+        if entity_id in getattr(self, "focals", {}):
+            name, kind, file_path = self.focals[entity_id]
+            lines = ["Entity: %s (%s)" % (name, kind.capitalize()), "  ID: " + entity_id,
+                     "  File: " + file_path, "  Span: lines 1-100"]
+            return 0, json.dumps({"error": None, "lines": lines}), ""
         start = self.starts.get(entity_id)
         if start is None:
             return 0, json.dumps({"error": "Entity not found", "lines": []}), ""
@@ -490,6 +497,33 @@ class ExportReferenceTests(unittest.TestCase):
         self.export["references"] = []
         self.sections(self.other, self.export)
         self.grade(m.FAIL)
+
+    def unprojected(self, *bodies):
+        """The same bodies as a projection-free reply serves them: no file on
+        the focal or any row, so each is placed through the store."""
+        for body in bodies:
+            body["focal_entity"].pop("projection", None)
+            for row in body["references"]:
+                row.pop("projection", None)
+
+    def test_a_projection_free_reply_is_placed_through_the_store(self):
+        self.unprojected(*self.payloads.values(), self.module, self.other)
+        self.grade(m.PASS)
+        self.sections(self.other, self.module, self.export)
+        self.grade(m.PASS)
+
+    def test_a_projection_free_consumer_the_store_places_elsewhere_fails(self):
+        self.unprojected(*self.payloads.values())
+        row = self.export["references"][0]
+        row["entity_id"] = "module:test/unrelated.js"
+        self.starts[row["entity_id"]] = 0
+        self.grade(m.FAIL)
+
+    def test_a_projection_free_focal_the_store_places_elsewhere_is_unreadable(self):
+        self.unprojected(*self.payloads.values())
+        identity = self.export["focal_entity"]["id"]
+        self.focals[identity] = (self.focals[identity][0], "constant", "lib/other.js")
+        self.grade(m.UNREADABLE)
 
     def test_wrong_consumer_kind_or_file_does_not_pass(self):
         for key, value in [("kind", "Method"), ("projection", {"path": "test/unrelated.js"}),
@@ -641,8 +675,33 @@ class PinnedCallSiteTests(unittest.TestCase):
         start = self.starts.get(args["entity_id"])
         if start is None:
             raise m.ProbeError("mcp get_entity_source isError: Entity not found")
-        return {"id": args["entity_id"], "start_line": start,
-                "body": self.bodies[args["entity_id"]]}
+        record = {"id": args["entity_id"], "body": self.bodies[args["entity_id"]]}
+        if getattr(self, "serve_start", True):
+            record["start_line"] = start
+        return record
+
+    def kin_run(self, args, repo, timeout):
+        self.assertEqual((repo, timeout), ("requests-fixture", 30))
+        self.assertEqual((args[:2], args[3:]), (["graph", "inspect"], ["--json"]))
+        entity_id = args[2]
+        row = next((row for row in self.payload["references"]
+                    if row["entity_id"] == entity_id), None)
+        start = self.starts.get(entity_id)
+        if row is None or start is None:
+            return 0, json.dumps({"error": "Entity not found", "lines": []}), ""
+        file_path = getattr(self, "store_files", {}).get(entity_id) or {
+            "session-send": m.REAL_CALLER_ONE_FILE,
+            "digest-401": m.REAL_CALLER_TWO_FILE}[entity_id]
+        lines = ["Entity: %s (Method)" % row["name"], "  ID: " + entity_id,
+                 "  File: " + file_path, "  Span: lines %d-%d" % (start, start + 200)]
+        return 0, json.dumps({"error": None, "lines": lines}), ""
+
+    def unprojected(self):
+        """A projection-free reply: rows carry no file, and the entity source
+        carries its body and no line, so both come from the store."""
+        for row in self.payload["references"]:
+            row.pop("projection", None)
+        self.serve_start = False
 
     def site(self, index):
         return self.payload["references"][index]["sites"][0]
@@ -713,6 +772,21 @@ class PinnedCallSiteTests(unittest.TestCase):
 
     def test_a_caller_projected_into_another_file_fails(self):
         self.payload["references"][0]["projection"] = {"path": "src/requests/adapters.py"}
+        self.grade(m.check_2, m.FAIL)
+
+    def test_a_projection_free_reply_places_both_calls_through_the_store(self):
+        self.unprojected()
+        self.grade(m.check_2, m.PASS)
+        self.grade(m.check_3, m.PASS)
+
+    def test_a_projection_free_caller_the_store_places_elsewhere_fails(self):
+        self.unprojected()
+        self.store_files = {"session-send": "src/requests/adapters.py"}
+        self.grade(m.check_2, m.FAIL)
+
+    def test_a_projection_free_caller_whose_store_start_moved_fails(self):
+        self.unprojected()
+        self.starts["session-send"] += 1
         self.grade(m.check_2, m.FAIL)
 
     def test_a_row_with_no_sites_fails(self):

@@ -261,6 +261,7 @@ def run_publish(
     *,
     preflight: bool = False,
     verify_fail: bool = False,
+    deterministic_poll_clock: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, bytes]]:
     owner, package_dir, env = harness()
@@ -273,6 +274,22 @@ def run_publish(
         env["FAKE_VERIFY_FAIL"] = "1"
     if extra_env:
         env.update(extra_env)
+    if deterministic_poll_clock:
+        # SECONDS has one-second wall-clock granularity. On a busy runner even
+        # the first fake npm process can exhaust the tiny timeout fixture.
+        # Unsetting it removes Bash's special clock behaviour; advance the
+        # fixture clock only when the unchanged publisher asks to sleep.
+        clock = tmp / "poll-clock.sh"
+        clock.write_text(
+            'unset SECONDS\nSECONDS=0\n'
+            'sleep() {\n'
+            '  SECONDS=$((SECONDS + 1))\n'
+            '  printf "%s\\n" "$SECONDS" >> "$FAKE_POLL_CLOCK_LOG"\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        env["BASH_ENV"] = str(clock)
+        env["FAKE_POLL_CLOCK_LOG"] = str(tmp / "poll-clock.log")
     command = ["bash", str(PUBLISHER)]
     if preflight:
         command.append("--preflight")
@@ -286,7 +303,7 @@ def run_publish(
         check=False,
     )
     snapshot: dict[str, bytes] = {}
-    for name in ("state.json", "verify.json", "github-output"):
+    for name in ("state.json", "verify.json", "github-output", "poll-clock.log"):
         source = tmp / name
         if source.exists():
             snapshot[name] = source.read_bytes()
@@ -529,6 +546,7 @@ def test_previously_staged_version_recovers_after_polling() -> None:
     )
     result, snapshot = run_publish(
         state,
+        deterministic_poll_clock=True,
         extra_env={
             "NPM_RELEASE_INFLIGHT_WAIT_SECONDS": "5",
             "NPM_RELEASE_INFLIGHT_POLL_SECONDS": "0.05",
@@ -542,6 +560,7 @@ def test_previously_staged_version_recovers_after_polling() -> None:
     ]
     assert len(poll_lines) >= 3, result.stdout
     assert "is publicly verifiable" in poll_lines[-1]
+    assert snapshot["poll-clock.log"] == b"1\n2\n"
     assert "already resolves to" in result.stdout
     state_after = json.loads(snapshot["state.json"])
     assert VERSION in state_after["public"][PACKAGE]
@@ -561,6 +580,7 @@ def test_previously_staged_version_times_out_without_recovery() -> None:
     )
     result, snapshot = run_publish(
         state,
+        deterministic_poll_clock=True,
         extra_env={
             "NPM_RELEASE_INFLIGHT_WAIT_SECONDS": "1",
             "NPM_RELEASE_INFLIGHT_POLL_SECONDS": "0.1",
@@ -574,6 +594,8 @@ def test_previously_staged_version_times_out_without_recovery() -> None:
     ]
     assert len(poll_lines) >= 2, result.stdout
     assert all("not yet publicly verifiable" in line for line in poll_lines)
+    assert snapshot["poll-clock.log"] == b"1\n"
+    assert "(1s elapsed)" in poll_lines[-1]
     assert "did not become publicly verifiable" in result.stderr
     assert "GitHub Latest remains blocked" in result.stderr
     assert "verify.json" not in snapshot

@@ -25,9 +25,9 @@ fn daemon_required_unavailable(operation: &str) -> ToolCallResult {
 pub const REGISTER_SESSION_DESC: &str = "\
 Register a lightweight assistant session with Kin so its activity can be tracked. This \
 is the legacy, minimal entry point: it records an assistant name and session ID and \
-nothing more. Prefer kin_session_start for new integrations, which captures \
-capabilities, transport, and working directory and unlocks intent registration and \
-collision detection. Use this only for simple or backward-compatible setups.";
+nothing more. A new integration needs no registration: a write, and an intent, run in \
+the connection's own session, which the server opens with its capabilities, transport and \
+working directory. Use this only for simple or backward-compatible setups.";
 
 pub fn handle_register_session(
     args: &HashMap<String, serde_json::Value>,
@@ -73,11 +73,32 @@ in the response are what this session may actually do on this store, not an echo
 you sent: declaring nothing gets you what the store permits, and declaring less than that \
 keeps your own restriction. capability_policy names what decided each bit, so you can tell \
 a store permission (`store`) from your own self-limit (`client_declared`) from a bit only a \
-declaration grants (`client_opt_in`: can_execute, which kin_session_exec requires) from a bit \
+declaration grants (`client_opt_in`: can_execute) from a bit \
 Kin checks nowhere today (`ungated`). Read can_write and can_commit before deciding a write is \
 forbidden; they now report false only when this store really refuses it. Supply the original \
 session_id UUID to re-register an absent daemon session before resuming a retained transaction \
 or unpublished keyed mutation after restart; an already registered UUID refuses and offline registration is unsupported.";
+
+/// Public session startup derives its private location from server authority.
+/// The operator helper below still accepts an internal location for delegation.
+pub(crate) async fn handle_session_start_bound(
+    args: &HashMap<String, serde_json::Value>,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+    root: Option<&std::path::Path>,
+) -> Result<ToolCallResult> {
+    if args.contains_key("cwd") {
+        return Ok(ToolCallResult::error("Session context is owned by the server; a client context selector is not supported. Nothing was started."));
+    }
+    let Some(root) = root.and_then(std::path::Path::to_str) else {
+        return Ok(ToolCallResult::error(
+            "Session context is unavailable for this repository binding. Nothing was started.",
+        ));
+    };
+    let mut private_args = args.clone();
+    private_args.insert("cwd".into(), serde_json::json!(root));
+    handle_session_start(&private_args, sessions, session_authority_mode).await
+}
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -288,9 +309,9 @@ intent (with a soft or hard lock), other agents can see you're working a region 
 avoid clobbering it, and you can see if someone is already there. Reach for it before \
 making changes in a multi-agent setting so concurrent work coordinates through graph \
 truth instead of racing. Optionally set an expiry; release it early with \
-kin_release_intent, and check who else is active with kin_check_traffic. Requires an \
-active session from kin_session_start. A scope naming a symbol outside the repository is \
-refused with external_symbol_not_served.";
+kin_release_intent, and check who else is active with kin_check_traffic. Runs in the \
+connection's own session unless the call names one. A scope naming a symbol outside the \
+repository is refused with external_symbol_not_served.";
 
 pub async fn handle_register_intent<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -597,19 +618,14 @@ pub fn resolve_target_entity<G: GraphStore>(
             // unrecoverable unless the refusal carries the candidates: the
             // caller cannot re-target what it cannot see, and it has no other
             // way to learn which entity it meant.
-            matches.sort_by(|left, right| {
-                candidate_location(left)
-                    .cmp(&candidate_location(right))
-                    .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
-            });
+            matches.sort_by_key(|entity| entity.id.to_string());
             let candidates = matches
                 .iter()
                 .map(|entity| {
                     format!(
-                        "{} ({:?} at {}): {}",
+                        "{} ({:?}): {}",
                         entity.id,
                         entity.kind,
-                        candidate_location(entity),
                         candidate_declaration(entity)
                     )
                 })
@@ -658,33 +674,16 @@ fn without_colocated_file_module_surfaces(
     matches
 }
 
-/// `file:line` for an ambiguity candidate, or a stable placeholder when the
-/// entity carries no source origin.
-fn candidate_location(entity: &kin_model::Entity) -> String {
-    match (entity.file_origin.as_ref(), entity.span.as_ref()) {
-        // `file:line` is read straight into an editor, so it carries the 1-based
-        // line rather than the graph's 0-based row.
-        (Some(file), Some(span)) => format!(
-            "{}:{}",
-            file.0,
-            crate::handlers::common::presentation_line(span.start_line)
-        ),
-        (Some(file), None) => file.0.clone(),
-        (None, _) => "<no source origin>".to_string(),
-    }
-}
-
-/// The one-line declaration that tells two same-named candidates apart.
-///
-/// A location says where a candidate lives; the declaration says what it is,
-/// which is what the caller is actually choosing between when the same name
-/// appears as several overloads or trait implementations. Bounded so one
-/// ambiguity refusal cannot carry an unbounded signature dump.
+/// The declaration helps distinguish same-named overloads or implementations.
+/// Bounded so one ambiguity refusal cannot carry an unbounded signature dump.
 fn candidate_declaration(entity: &kin_model::Entity) -> String {
     /// Long enough for a real signature, short enough that a dozen candidates
     /// stay readable.
     const MAX_DECLARATION: usize = 160;
 
+    if kin_model::is_file_module_surface(entity) {
+        return "semantic declaration name unavailable".to_string();
+    }
     let declaration = entity
         .signature
         .lines()
@@ -899,7 +898,8 @@ of what was carried. Neither key appears when nothing was carried. The daemon de
 the semantic state of carried source from its exact admitted content before publication. \
 The carried split describes prior pending workspace content, not authorship by this request. \
 New publication requires a live session in every coordination mode. After daemon restart, \
-re-register the original session_id with kin_session_start before resuming retained staged work. \
+re-register the original session_id, through the retired session verb's start action, before \
+resuming retained staged work. \
 Owner expiry preserves a recent staged payload; it does not clear it. Already-published receipts \
 remain recoverable without re-registration. A transaction whose owning session started without \
 can_write or can_commit is refused in every coordination mode. Before graph application, exact \
@@ -1019,6 +1019,10 @@ fn transaction_touched_scopes<G: GraphStore>(
             }))
             | Some(McpMutationPayload::EntityRemove(crate::entity_lifecycle::EntityRemove {
                 source_base: base,
+            }))
+            | Some(McpMutationPayload::EntityContent(crate::artifact_entity::EntityContent {
+                source_base: base,
+                ..
             })) => {
                 push_scope_once(&mut scopes, kin_model::IntentScope::Entity(base.entity_id));
                 if let Ok(Some(entity)) = store.get_entity(&base.entity_id) {
@@ -1083,7 +1087,12 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
         .enumerate()
         .filter(|(_, op)| {
             crate::session::carries_source_body(op)
-                || matches!(op.payload, Some(McpMutationPayload::EntityRemove(_)))
+                || matches!(
+                    op.payload,
+                    Some(
+                        McpMutationPayload::EntityRemove(_) | McpMutationPayload::EntityContent(_)
+                    )
+                )
                 || crate::session::is_retired_source_file(op)
                 || crate::session::is_renamed_source_file(op)
         })
@@ -1101,6 +1110,7 @@ fn offline_only_uncommittable_operations(operations: &[McpMutationOperation]) ->
                 Some(
                     McpMutationPayload::EntityCreate(_)
                         | McpMutationPayload::EntityRemove(_)
+                        | McpMutationPayload::EntityContent(_)
                         | McpMutationPayload::UnitImports(_)
                 )
             ) {
@@ -1277,11 +1287,11 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     let touched_scopes = transaction_touched_scopes(store, &tx.staged_operations);
     let coordination = sessions.evaluate_transaction_write(&tx.session_id, touched_scopes);
     if !coordination.allowed {
-        let evidence =
-            serde_json::to_string(&coordination).map_err(crate::error::McpError::Json)?;
-        return Ok(ToolCallResult::error(format!(
-            "coordination enforcement rejected transaction {transaction_id} before graph apply: {evidence}"
-        )));
+        return Ok(ToolCallResult::error(
+            coordination
+                .refusal(&format!("coordination enforcement rejected transaction {transaction_id} before graph apply"))
+                .map_err(crate::error::McpError::Json)?,
+        ));
     }
 
     let mut entity_deltas = Vec::new();
@@ -1400,6 +1410,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                 | McpMutationPayload::EntitySourcePatch(_)
                 | McpMutationPayload::EntityCreate(_)
                 | McpMutationPayload::EntityRemove(_)
+                | McpMutationPayload::EntityContent(_)
                 | McpMutationPayload::UnitImports(_) => {
                     return Ok(ToolCallResult::error(
                         "Guarded entity source edits require the exact daemon commit path",
@@ -1535,7 +1546,7 @@ manages transaction lifecycle (begin, validation, commit, and abort-on-refusal) 
 does not need multi-step transaction ceremonies. Provide an operations array with mutation \
 verbs ('patch', 'create', 'update', 'delete') and payloads, and an optional `summary` that becomes the \
 recorded change message instead of the bare transaction line. On success returns a compact \
-receipt with status, ops_applied, change_id, and modified_files. Every refusal comes back as a \
+receipt with status, ops_applied, and change_id. Every refusal comes back as a \
 tool error you can read and retry from, never as a protocol fault: a malformed operations array, \
 a body Kin cut short, a failed validation and a refused commit all return the structured reason. \
 Without request_id, a refused commit is aborted unless it reports source_base_conflict, which \
@@ -1605,6 +1616,29 @@ pub fn checked_mutate_operations(
     crate::session::validate_semantic_operations(&parsed).map_err(ToolCallResult::error)?;
     reject_truncated_bodies(&parsed).map_err(ToolCallResult::error)?;
     Ok(ops_val)
+}
+
+/// Forward tickets unchanged to the daemon that owns their source authority.
+/// No ticket is replaced with a dummy base merely to pass the private parser.
+fn checked_forward_mutate_operations(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<&serde_json::Value, ToolCallResult> {
+    let Some(operations) = arguments
+        .get("operations")
+        .filter(|operations| crate::source_ticket::contains(operations))
+    else {
+        return checked_mutate_operations(arguments);
+    };
+    for operation in operations.as_array().expect("contains requires an array") {
+        if crate::source_ticket::check_forward_operation(operation)
+            .map_err(ToolCallResult::error)?
+        {
+            continue;
+        }
+        let single = HashMap::from([("operations".into(), serde_json::json!([operation]))]);
+        checked_mutate_operations(&single)?;
+    }
+    Ok(operations)
 }
 
 /// A supplied ID always requests the durable daemon contract. Invalid IDs must
@@ -1722,7 +1756,7 @@ where
     // the graph that says what it names; its commit refuses it by that.
     let ops_val = match arguments.get("operations") {
         Some(ops_val) if names_external_relation_endpoint(ops_val) => ops_val,
-        _ => match checked_mutate_operations(arguments) {
+        _ => match checked_forward_mutate_operations(arguments) {
             Ok(ops_val) => ops_val,
             Err(refusal) => return Ok(refusal),
         },

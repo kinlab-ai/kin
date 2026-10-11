@@ -882,7 +882,7 @@ fn collect_changed_entities<G: GraphStore>(
                     file,
                     start_line,
                     end_line,
-                    signature_changed: old.signature != new.signature
+                    signature_changed: crate::contract::signature_changed(old, new)
                         && !crate::inline::signature_runtime_neutral(
                             &old.signature,
                             &new.signature,
@@ -1237,7 +1237,7 @@ fn derive_policy(
                             new.span
                                 .as_ref()
                                 .map(|span| (span.file.to_string(), span.start_line)),
-                            (old.signature != new.signature
+                            (crate::contract::signature_changed(old, new)
                                 && !crate::inline::signature_runtime_neutral(
                                     &old.signature,
                                     &new.signature,
@@ -1492,7 +1492,7 @@ fn repair_guidance(kind: &str) -> &'static str {
         }
         "entity_renamed" => "Confirm references were updated for the rename.",
         "consumer_fanout" => {
-            "Behavior changed on an entity consumed from multiple files; verify each listed \
+            "Behavior changed on an entity with multiple consumers; verify each listed \
              consumer still gets the behavior it expects, then run the covering tests."
         }
         "downstream_risk" => {
@@ -4263,9 +4263,9 @@ mod tests {
                 start_line: 10,
                 end_line: 20,
                 kind: InlineCommentKind::ConsumerFanout,
-                message: "Behavior of `hot_path` changed with 3 distinct non-test consumer(s) \
-                          across 3 file(s)"
-                    .to_string(),
+                message:
+                    "Behavior of `hot_path` changed with 3 distinct non-test consumer entities"
+                        .to_string(),
             }],
         };
 

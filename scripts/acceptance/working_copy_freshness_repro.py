@@ -28,9 +28,9 @@ The fixture writes a new directory while the daemon is down. Startup can first
 report that source as unadmitted, then automatically admit it through checked
 catch-up. Both observations are legitimate. The durability check requires the
 original behind disclosure while the gap remains; it accepts the admitted state
-only with an exact function body served from graph-owned source, its source base
-bound to the complete fixture artifact digest, and an explicit live-uncommitted
-count. A file's mere existence never proves graph admission.
+only with an exact function body served from graph-owned source, placed in its
+module and bound to the repository the read answered for, and an explicit
+live-uncommitted count. Source on disk never proves graph admission.
 
 Four checks, one seeded repository, run in order because the experiment is
 destructive: the last one commits what the first three are about.
@@ -61,7 +61,6 @@ from __future__ import print_function
 
 import argparse
 import functools
-import hashlib
 import json
 import os
 import re
@@ -70,6 +69,11 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -116,6 +120,10 @@ def resolve_key(conn, key):
 ''' % (SYMBOL, SYMBOL)
 
 ADMITTED_FUNCTION_NAME = "dangling_links"
+# The module the graph places that source under, read from its own module
+# records. Every grader names where an entity lives by its module, never by
+# where the module's source is stored.
+ADMITTED_MODULE = "linkgraph.predicates"
 ADMITTED_FUNCTION_BODY = ('def dangling_links(conn):\n'
                           '    return conn.execute("SELECT 1 FROM notes WHERE " + %s)' % SYMBOL)
 
@@ -269,12 +277,83 @@ def grade_durability_withholds_the_all_clear(payload):
     )
 
 
-def grade_durability_after_admission(payload, source, expected_path):
-    """An admitted source is proved by graph bytes, never by missing `behind`."""
+def module_owner(record, module):
+    """The id of the one module entity the graph records as containing `record`.
+
+    Read from the record's `semantic_owners`, the proven `Contains` edges Kin
+    serves beside an entity, and only when that module is `module`. None when
+    the record names no such owner, or more than one module owner.
+    """
+    owners = record.get("semantic_owners") if isinstance(record, dict) else None
+    if not isinstance(owners, list):
+        return None
+    modules = [owner for owner in owners if isinstance(owner, dict)
+               and owner.get("relationship") == "Contains"
+               and str(owner.get("kind") or "").lower() == "module"]
+    if len(modules) != 1:
+        return None
+    owner = modules[0]
+    if owner.get("qualified_name") != module or not owner.get("entity_id"):
+        return None
+    return owner["entity_id"]
+
+
+def ticket_names(ticket, entity_id):
+    """Whether a `source_base` ticket names `entity_id` and carries its digest.
+
+    A read serves the precondition a guarded edit carries back as a ticket,
+    `<version>.<entity>.<generation>.<digest>`. The digest binds what the read
+    served, and the server alone can open it, so a grader reads the shape: this
+    entity, a generation, and a 128-bit hex digest.
+    """
+    parts = ticket.split(".") if isinstance(ticket, str) else []
+    return (len(parts) == 4 and parts[0].startswith("sb") and parts[1] == entity_id
+            and parts[2].isdigit() and len(parts[3]) == 32
+            and all(char in "0123456789abcdef" for char in parts[3]))
+
+
+def graph_source_failure(source, entity_id, name, kind, module, body, repository_id):
+    """What a `get_entity_source` reply fails to prove about one exact entity, or None.
+
+    The entity is named the way Kin addresses it: its id, its name and kind,
+    and the module that contains it, read both as the reply's `module` and as
+    the one module owner the graph records for it. Its body must be the exact
+    text the fixture wrote, served from a span Kin verified against its digest,
+    under the identity of the repository the reply answered for and the ticket
+    a guarded edit would carry back. No line or byte of a file is read.
+    """
+    if not isinstance(source, dict):
+        return "no targeted graph source"
+    identity = source.get("source_identity") or {}
+    if (not entity_id or source.get("id") != entity_id or source.get("name") != name
+            or source.get("kind") != kind):
+        return "the source reply names another entity than %s %s" % (kind, name)
+    if source.get("module") != module or module_owner(source, module) is None:
+        return "the source reply does not place %s in %s" % (name, module)
+    if source.get("body") != body or source.get("span_coherence") != "digest_verified":
+        return "the source reply does not serve the exact body of %s from a verified span" % name
+    if (identity.get("entity_id") != entity_id or not repository_id
+            or identity.get("repository_id") != repository_id
+            or not identity.get("workspace_id")):
+        return "the source identity does not bind %s to the fixture repository" % name
+    if not ticket_names((source.get("source_base") or {}).get("ticket"), entity_id):
+        return "the source base ticket does not name %s" % name
+    source_envelope = source.get("_kin") or {}
+    freshness = source_envelope.get("freshness") or {}
+    if (source_envelope.get("runtime") != "repo-daemon"
+            or (source_envelope.get("self_check") or {}).get("status") == "contradicted"
+            or freshness.get("state") != "recorded" or not freshness.get("at")
+            or type(freshness.get("age_seconds")) is not int
+            or freshness["age_seconds"] < 0):
+        return "the source reply for %s has no recorded daemon observation" % name
+    return None
+
+
+def grade_durability_after_admission(payload, source, expected_module):
+    """An admitted source is proved by graph entities, never by missing `behind`."""
     if not isinstance(source, dict) or not isinstance(payload, dict):
         return UNREADABLE, "no graph source/status proof of automatic admission"
     envelope = payload.get("_kin") or {}
-    source_envelope = source.get("_kin") or {}
     block = durability_of(payload) or {}
     counts = [block.get(key) for key in
               ("live_entities", "durable_entities", "live_only_entities")]
@@ -284,41 +363,21 @@ def grade_durability_after_admission(payload, source, expected_path):
         return FAIL, "admitted uncommitted module has no truthful live delta: %r" % block
     if "note" in block or "behind" in envelope:
         return FAIL, "admitted control still carries a durability note or behind gap"
-    base = source.get("source_base") or {}
-    context = base.get("context") or {}
-    expected_body = ADMITTED_FUNCTION_BODY.encode("utf-8")
-    expected_start = LINKGRAPH_SRC.encode("utf-8").index(expected_body)
-    expected_end = expected_start + len(expected_body)
-    expected_digest = hashlib.sha256(LINKGRAPH_SRC.encode("utf-8")).hexdigest()
-    expected_body_digest = hashlib.sha256(expected_body).hexdigest()
-    digest = base.get("source_blob_hash")
-    if (source.get("file_path") != expected_path or source.get("kind") != "Function"
-            or source.get("name") != ADMITTED_FUNCTION_NAME
-            or source.get("body") != ADMITTED_FUNCTION_BODY
-            or source.get("span_coherence") != "digest_verified"
-            or not source.get("id") or base.get("entity_id") != source.get("id")
-            or base.get("schema") != "kin.entity.source_base.v1"
-            or not base.get("artifact_id")
-            or source.get("start_byte") != expected_start or source.get("end_byte") != expected_end
-            or base.get("start_byte") != expected_start or base.get("end_byte") != expected_end
-            or not isinstance(digest, str) or len(digest) != 64
-            or any(char not in "0123456789abcdef" for char in digest)
-            or digest != expected_digest
-            or base.get("body_hash") != expected_body_digest):
-        return FAIL, "graph function source does not prove its body and complete fixture artifact"
-    if (envelope.get("runtime") != "repo-daemon"
-            or source_envelope.get("runtime") != "repo-daemon"
-            or not context.get("repository_id")
-            or context.get("repository_id") != (envelope.get("answered_by") or {}).get("repo_id")
-            or not context.get("workspace_tree_hash")):
+    repository_id = (envelope.get("answered_by") or {}).get("repo_id")
+    if envelope.get("runtime") != "repo-daemon" or not repository_id:
         return FAIL, "graph source and status do not identify the same live repository"
-    for observed in (envelope, source_envelope):
-        freshness = observed.get("freshness") or {}
-        if (freshness.get("state") != "recorded" or not freshness.get("at")
-                or type(freshness.get("age_seconds")) is not int
-                or freshness["age_seconds"] < 0):
-            return FAIL, "automatic admission has no recorded observation"
-    return PASS, "exact graph function binds the admitted fixture artifact; live_uncommitted, %d live-only entities" % counts[2]
+    failure = graph_source_failure(source, source.get("id"), ADMITTED_FUNCTION_NAME, "Function",
+                                   expected_module, ADMITTED_FUNCTION_BODY, repository_id)
+    if failure:
+        return FAIL, "graph function source does not prove its exact body in %s: %s" % (
+            expected_module, failure)
+    freshness = envelope.get("freshness") or {}
+    if (freshness.get("state") != "recorded" or not freshness.get("at")
+            or type(freshness.get("age_seconds")) is not int
+            or freshness["age_seconds"] < 0):
+        return FAIL, "automatic admission has no recorded observation"
+    return PASS, ("exact graph function %s in %s is admitted; live_uncommitted, %d live-only "
+                  "entities" % (ADMITTED_FUNCTION_NAME, expected_module, counts[2]))
 
 
 def grade_durability_reads_clean_over_a_committed_tree(payload):
@@ -492,8 +551,15 @@ def reports_positive_references(payload):
                 or negative.get("interpretation") == "qualified_answer")
 
 
-def grade_admitted_reference(payload, focal_source, caller_source, expected_path, expected_repo):
-    """Accept the fixture's actual use, never a count or a declaration-only hit."""
+def grade_admitted_reference(payload, focal_source, caller_source, expected_module,
+                             expected_repo_id):
+    """Accept the fixture's actual use, never a count or a declaration-only hit.
+
+    The focal and its caller are identified the way Kin addresses them: by
+    entity id, name, kind and the module that contains them. The repository is
+    the one this run's own registry recorded for the fixture, `expected_repo_id`,
+    so a reply is never graded against another reply's account of it.
+    """
     if not isinstance(payload, dict):
         return UNREADABLE, "no reference payload"
     negative = negative_of(payload) or {}
@@ -511,9 +577,10 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_path
             or verdict.get("absence_claim") != "not_applicable"
             or verdict.get("safe_to_conclude_absent") is not False):
         return FAIL, "positive reference rows, counts and absence verdict do not agree"
-    # The rows are either certified as the whole set, or the answer says it
-    # cannot rule out further callers and names exactly which call sites it
-    # could not settle. Either is a truthful positive; nothing else is.
+    # A real positive may be certified, bounded by named Call residues, or
+    # retain separately unmeasured non-call completion after its Call census
+    # settles. The exact use and graph-owned source proofs below are mandatory
+    # in every case; none of these qualifications proves an absence.
     if negative.get("trust") == "authoritative" and verdict.get("state") == "certified":
         trust_detail = "certified"
     else:
@@ -534,21 +601,18 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_path
     use_text = body_lines[expected_offset]
     sites = caller.get("sites") if isinstance(caller, dict) else None
     site = sites[0] if isinstance(sites, list) and len(sites) == 1 else None
-    projection = caller.get("projection") if isinstance(caller, dict) else None
-    # The focal is addressed the way its caller is: by id, with its file only as
-    # the labelled projection. A focal still carrying `file_path` is the retired
-    # shape.
-    focal_projection = focal.get("projection")
+    # The focal is addressed the way its caller is: by id, and placed by the
+    # module that contains it. A focal or row still carrying `file_path`, or a
+    # row carrying a line of a file, is the retired shape.
     if (not isinstance(caller, dict) or focal.get("name") != SYMBOL
             or focal.get("kind") != "constant"
-            or not isinstance(focal_projection, dict)
-            or focal_projection.get("path") != expected_path
+            or focal.get("module") != expected_module
             or "file_path" in focal
             or not focal.get("id") or anchor.get("entity_id") != focal["id"]
-            or not anchor.get("repo_id")
             or caller.get("name") != ADMITTED_FUNCTION_NAME
             or caller.get("kind") != "Function"
-            or not isinstance(projection, dict) or projection.get("path") != expected_path
+            or caller.get("module") != expected_module
+            or module_owner(caller, expected_module) is None
             or any(key in caller for key in ("file_path", "start_line", "reference_lines"))
             or not caller.get("entity_id") or caller.get("resolution") != "type_resolved"
             or caller.get("relation_kinds") != ["references"]
@@ -565,49 +629,27 @@ def grade_admitted_reference(payload, focal_source, caller_source, expected_path
             or type(payload.get("unconfirmed_candidates")) is not int
             or payload["unconfirmed_candidates"] != 0):
         return FAIL, "the answer does not prove the fixture's exact focal, caller and use site"
-    if ((envelope.get("repository") or {}).get("root") != expected_repo
+    if (not expected_repo_id or anchor.get("repo_id") != expected_repo_id
             or envelope.get("runtime") != "repo-daemon" or "behind" in envelope):
         return FAIL, "reference reply does not identify the admitted fixture repository"
     sources = ((focal_source, focal["id"], SYMBOL, "Constant", LINKGRAPH_SRC.splitlines()[0]),
                (caller_source, caller["entity_id"], ADMITTED_FUNCTION_NAME, "Function",
                 ADMITTED_FUNCTION_BODY))
-    contexts = []
-    artifacts = []
+    owners = [module_owner(caller, expected_module)]
+    workspaces = []
     for source, entity_id, name, kind, body in sources:
         if not isinstance(source, dict):
             return UNREADABLE, "no targeted graph source proof for the positive reference"
-        base = source.get("source_base") or {}
-        context = base.get("context") or {}
-        start = LINKGRAPH_SRC.encode("utf-8").index(body.encode("utf-8"))
-        end = start + len(body.encode("utf-8"))
-        if (source.get("id") != entity_id or base.get("entity_id") != entity_id
-                or source.get("name") != name or source.get("kind") != kind
-                or source.get("file_path") != expected_path or source.get("body") != body
-                or source.get("span_coherence") != "digest_verified"
-                or base.get("schema") != "kin.entity.source_base.v1"
-                or not base.get("artifact_id")
-                or source.get("start_byte") != start or source.get("end_byte") != end
-                or base.get("start_byte") != start or base.get("end_byte") != end
-                or any(type(value) is not int for value in
-                       (source.get("start_byte"), source.get("end_byte"),
-                        base.get("start_byte"), base.get("end_byte")))
-                or base.get("source_blob_hash") != hashlib.sha256(LINKGRAPH_SRC.encode("utf-8")).hexdigest()
-                or base.get("body_hash") != hashlib.sha256(body.encode("utf-8")).hexdigest()
-                or context.get("repository_id") != anchor["repo_id"]
-                or not context.get("workspace_tree_hash")):
-            return FAIL, "targeted graph source does not bind the reference identities and fixture bytes"
-        source_envelope = source.get("_kin") or {}
-        freshness = source_envelope.get("freshness") or {}
-        if (source_envelope.get("runtime") != "repo-daemon"
-                or (source_envelope.get("self_check") or {}).get("status") == "contradicted"
-                or freshness.get("state") != "recorded" or not freshness.get("at")
-                or type(freshness.get("age_seconds")) is not int
-                or freshness["age_seconds"] < 0):
-            return FAIL, "targeted graph source has no recorded daemon observation"
-        contexts.append(context["workspace_tree_hash"])
-        artifacts.append(base["artifact_id"])
-    if contexts[0] != contexts[1] or artifacts[0] != artifacts[1]:
-        return FAIL, "the focal and caller proofs describe different admitted artifacts or trees"
+        failure = graph_source_failure(source, entity_id, name, kind, expected_module, body,
+                                       expected_repo_id)
+        if failure:
+            return FAIL, "targeted graph source does not bind the reference identities: %s" % failure
+        owners.append(module_owner(source, expected_module))
+        workspaces.append(source["source_identity"]["workspace_id"])
+    # One module entity contains the focal and its caller, and both sources were
+    # read in one workspace: the row, and both reads, describe the same place.
+    if len(set(owners)) != 1 or len(set(workspaces)) != 1:
+        return FAIL, "the focal and caller proofs describe different modules or workspaces"
     return PASS, ("exact graph-owned focal and caller prove the real use at +%d inside %s; "
                   "no absence claimed; rows %s" % (expected_offset, ADMITTED_FUNCTION_NAME,
                                                    trust_detail))
@@ -627,20 +669,67 @@ CALL_DOMAIN_CODES = frozenset((
 CALL_DOMAIN_INPUTS = ("call_sites", "absence_gate")
 
 
+def reference_completion_qualification(payload, negative, verdict):
+    """A settled Call census does not certify requested non-call completion.
+
+    Accept only this recorded gap, with a lower bound and no absence claim.
+    This qualifies the returned positives; it never certifies their whole set.
+    """
+    code = "reference_completion_unmeasured"
+    kinds = payload.get("relation_kinds")
+    inputs = verdict.get("inputs")
+    comp = (payload.get("_kin") or {}).get("completeness") or {}
+    block = payload.get("call_sites")
+    if (not isinstance(kinds, list)
+            or not any(isinstance(kind, str) and kind.lower() != "calls" for kind in kinds)):
+        return False, "no requested non-call relation backs the completion gap"
+    if (verdict.get("state") != "inconclusive" or negative.get("trust") != "inconclusive"
+            or not isinstance(inputs, dict)
+            or inputs.get("reference_completion") != "inconclusive"
+            or inputs.get("absence_gate") != "inconclusive"
+            or inputs.get("call_sites") != "certified"):
+        return False, "the verdict does not separately attribute the non-call completion gap"
+    if any(reading not in ("certified", "not_applicable") for name, reading in inputs.items()
+           if name not in ("reference_completion", "absence_gate")):
+        return False, "another verdict input limits the positive beyond non-call completion"
+    codes = [part.strip() for part in str(verdict.get("limiting_factor") or "").split(";")
+             if part.strip()]
+    reason = negative.get("trust_reason")
+    if (codes != [code]
+            or reason != code + ": non-call completion is unmeasured"
+            or code not in str(negative.get("advice") or "")):
+        return False, "non-call completion provenance does not match its exact limiting code"
+    if (verdict.get("absence_claim") != "not_applicable"
+            or verdict.get("safe_to_conclude_absent") is not False
+            or negative.get("safe_to_conclude_absent") is not False
+            or comp.get("status") == "complete" or comp.get("bound") != "at_least"
+            or (comp.get("counted") or {}).get("exact") is not False
+            or "verdict_inconclusive" not in (comp.get("limits") or [])):
+        return False, "non-call uncertainty claims an exact count or an absence"
+    if (not isinstance(block, dict) or block.get("settled") is not True
+            or block.get("clauses") != [] or block.get("candidates") != []
+            or type(block.get("candidate_count")) is not int or block["candidate_count"] != 0
+            or block.get("candidates_withheld", 0) != 0):
+        return False, "no settled, residue-free Call census backs the separate completion gap"
+    return True, "bounded by non-call completion, with the Call census settled"
+
+
 def call_domain_qualification(payload, negative, verdict):
-    """Whether an inconclusive positive is bounded only by the call domain.
+    """Whether an inconclusive positive has a precisely recorded scope limit.
 
     Returns (True, what it names) when the only thing between the rows and a
     certified answer is a call-site reading that names every limiting factor as
-    a clause and every call site it kept as a row, and (False, why) otherwise.
-    A vaguer inconclusive answer, or one limited by anything else, fails.
+    a clause and every call site it kept as a row, or a settled Call census with
+    separately unmeasured non-call completion. A vaguer refusal fails.
     """
     if verdict.get("state") != "inconclusive" or negative.get("trust") != "inconclusive":
         return False, "trust %r and verdict %r are neither certified nor call-domain inconclusive" % (
             negative.get("trust"), verdict.get("state"))
     inputs = verdict.get("inputs")
+    if isinstance(inputs, dict) and inputs.get("call_sites") == "certified":
+        return reference_completion_qualification(payload, negative, verdict)
     if not isinstance(inputs, dict) or inputs.get("call_sites") != "inconclusive":
-        return False, "the verdict does not attribute its inconclusive state to the call sites"
+        return False, "the verdict does not attribute its inconclusive state to a recorded domain"
     others = sorted(name for name, reading in inputs.items()
                     if name not in CALL_DOMAIN_INPUTS
                     and reading not in ("certified", "not_applicable"))
@@ -672,7 +761,6 @@ def call_domain_qualification(payload, negative, verdict):
         if (not isinstance(row, dict) or not row.get("caller") or not row.get("caller_name")
                 or type(row.get("line_in_entity")) is not int or row["line_in_entity"] < 0
                 or not row.get("state") or not row.get("reason")
-                or not isinstance(row.get("projection"), dict)
                 or any(key in row for key in ("file_path", "start_line"))):
             return False, "a candidate call site is not addressed by its caller and line in it"
     return True, "bounded by the call domain (%s), naming %d candidate site(s)" % (
@@ -767,6 +855,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["KIN_REGISTRY_PATH"] = os.path.join(self.home, "registry.toml")
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DAEMON_URL", None)
@@ -852,6 +942,26 @@ class Suite(object):
                 return
             time.sleep(0.5)
 
+    def repository_id(self):
+        """The id this run's own registry recorded for the fixture repository, or None.
+
+        Read from the isolated registry the suite set up, so a reply's repository
+        is graded against the harness's own record rather than against another
+        reply's account of it.
+        """
+        try:
+            with open(self.env["KIN_REGISTRY_PATH"]) as handle:
+                text = handle.read()
+        except (IOError, OSError, KeyError):
+            return None
+        repo = os.path.realpath(self.repo())
+        for block in text.split("[[repos]]")[1:]:
+            ident = re.search(r'^id\s*=\s*"([^"]+)"', block, re.M)
+            path = re.search(r'^path\s*=\s*"([^"]+)"', block, re.M)
+            if ident and path and os.path.realpath(path.group(1)) == repo:
+                return ident.group(1)
+        return None
+
     def ground_truth(self):
         """What a one-line grep says, which is the whole point of the finding."""
         target = os.path.join(self.repo(), self.unadmitted_path)
@@ -876,8 +986,15 @@ class Suite(object):
         with open(os.path.join(evidence, "stdin.jsonl"), "w") as handle:
             handle.write(payload_in)
         rc, out, err, launch_error = None, "", "", None
+        # A reference probe that reads the detailed blocks is served by `full`;
+        # the agent profiles always answer references answer-only.
+        env = self.env
+        if any(name in ("find_references", "refs") and arguments.get("answer_only") is False
+               for name, arguments in calls):
+            env = dict(self.env or os.environ)
+            env["KIN_MCP_TOOL_PROFILE"] = "full"
         try:
-            rc, out, err = run([self.kin, "mcp", "start"], cwd=self.repo(), env=self.env,
+            rc, out, err = run([self.kin, "mcp", "start"], cwd=self.repo(), env=env,
                                timeout=600, stdin=payload_in)
         except Exception as error:
             launch_error = repr(error)
@@ -993,9 +1110,9 @@ def check_durability(suite):
             return Result("durability", UNREADABLE, "no unique admitted function to verify")
         proof = suite.mcp([("get_entity_source", {"entity_id": functions[0]["id"]}),
                            ("kin_graph_status", {})])
-        status, detail = grade_durability_after_admission(payload, proof.get(2), suite.unadmitted_path)
+        status, detail = grade_durability_after_admission(payload, proof.get(2), ADMITTED_MODULE)
         if status == PASS:
-            status, detail = grade_durability_after_admission(proof.get(3), proof.get(2), suite.unadmitted_path)
+            status, detail = grade_durability_after_admission(proof.get(3), proof.get(2), ADMITTED_MODULE)
     return Result("durability", status,
                   "%s grep finds %s on %d lines; %s" % (TICKET, SYMBOL, lines, detail))
 
@@ -1022,7 +1139,7 @@ def check_absence(suite):
             proof = suite.mcp([("get_entity_source", {"entity_id": focal["id"]}),
                                ("get_entity_source", {"entity_id": caller["entity_id"]})])
         status, detail = grade_admitted_reference(payload, proof.get(2), proof.get(3),
-                                                  suite.unadmitted_path, suite.repo())
+                                                  ADMITTED_MODULE, suite.repository_id())
         if status == PASS:
             rc, out, err = suite.kin_run(["refs", SYMBOL, "--json"])
             cli_status, cli_detail = grade_cli_agrees(payload, rc, out or err)
@@ -1200,6 +1317,72 @@ WITHHELD_UNEXPLAINED = {"negative": {
     "trust_reason": "some other reason entirely", "advice": "some other reason entirely"}}
 
 
+# The admitted shapes, as the product serves them: every entity addressed by id
+# and placed by its module, with no line or byte of a file anywhere in them.
+ADMITTED_REPO_ID = "fixture-repository"
+ADMITTED_WORKSPACE_ID = "fixture-workspace"
+ADMITTED_MODULE_ID = "fixture-module"
+ADMITTED_FOCAL_ID = "fixture-focal"
+ADMITTED_CALLER_ID = "fixture-caller"
+
+
+def admitted_owners(module_id=ADMITTED_MODULE_ID, module=ADMITTED_MODULE):
+    return [{"entity_id": module_id, "kind": "module", "name": module.rsplit(".", 1)[-1],
+             "qualified_name": module, "relationship": "Contains",
+             "resolution": "type_resolved"}]
+
+
+def admitted_source(entity_id, name, kind, body):
+    """A `get_entity_source` reply for one admitted entity."""
+    return {"id": entity_id, "name": name, "kind": kind, "body": body,
+            "module": ADMITTED_MODULE, "semantic_owners": admitted_owners(),
+            "span_coherence": "digest_verified",
+            "source_base": {"ticket": "sb2.%s.3.%s" % (entity_id, "e0" * 16)},
+            "source_identity": {"entity_id": entity_id, "repository_id": ADMITTED_REPO_ID,
+                                "workspace_id": ADMITTED_WORKSPACE_ID},
+            "_kin": {"runtime": "repo-daemon",
+                     "freshness": {"state": "recorded", "at": "now", "age_seconds": 0}}}
+
+
+def admitted_reference():
+    """`(payload, focal source, caller source, module, repository id)` as served."""
+    payload = {
+        "focal_entity": {"id": ADMITTED_FOCAL_ID, "name": SYMBOL, "kind": "constant",
+                         "module": ADMITTED_MODULE},
+        "references": [{"entity_id": ADMITTED_CALLER_ID, "name": ADMITTED_FUNCTION_NAME,
+                        "kind": "Function", "role": "source", "module": ADMITTED_MODULE,
+                        "semantic_owners": admitted_owners(),
+                        "resolution": "type_resolved", "relation_kinds": ["references"],
+                        "site_count": 1, "sites": [{"line_in_entity": 1, "callee": SYMBOL}],
+                        "sites_absent_reason": None, "sites_partial_reason": None,
+                        "via_override_of": None}],
+        "total_upstream": 1, "candidates": [], "unconfirmed_candidates": 0,
+        "negative": {"kind": "qualified_answer", "interpretation": "qualified_answer",
+                     "result_count": 1, "safe_to_conclude_absent": False,
+                     "trust": "authoritative",
+                     "trust_reason": "structural_authoritative: no degraded signals"},
+        "cross_repo": {"authority_anchor": {"entity_id": ADMITTED_FOCAL_ID,
+                                            "repo_id": ADMITTED_REPO_ID}},
+        "_kin": {"runtime": "repo-daemon",
+                 "verdict": {"state": "certified", "absence_claim": "not_applicable",
+                             "safe_to_conclude_absent": False}},
+    }
+    return (payload,
+            admitted_source(ADMITTED_FOCAL_ID, SYMBOL, "Constant", LINKGRAPH_SRC.splitlines()[0]),
+            admitted_source(ADMITTED_CALLER_ID, ADMITTED_FUNCTION_NAME, "Function",
+                            ADMITTED_FUNCTION_BODY),
+            ADMITTED_MODULE, ADMITTED_REPO_ID)
+
+
+def admitted_status():
+    """A `kin_graph_status` reply over the admitted, uncommitted module."""
+    return {"_kin": {"runtime": "repo-daemon",
+                     "answered_by": {"repo_id": ADMITTED_REPO_ID},
+                     "freshness": {"state": "recorded", "at": "now", "age_seconds": 0},
+                     "durability": {"state": "live_uncommitted", "live_entities": 10,
+                                    "durable_entities": 6, "live_only_entities": 4}}}
+
+
 def report_payload(results):
     """The report shape `scripts/acceptance/gate.py` reads.
 
@@ -1326,6 +1509,116 @@ def self_test():
            grade_absence_stays_authoritative_over_a_committed_tree(WITHHELD), FAIL)
     expect("absence control cannot read a response with no negative block",
            grade_absence_stays_authoritative_over_a_committed_tree({}), UNREADABLE)
+
+    import copy
+
+    completion = {
+        "relation_kinds": ["calls", "imports", "references"],
+        "call_sites": {"settled": True, "clauses": [], "candidates": [], "candidate_count": 0},
+        "negative": {"trust": "inconclusive", "safe_to_conclude_absent": False,
+                     "trust_reason": "reference_completion_unmeasured: non-call completion is unmeasured",
+                     "advice": "reference_completion_unmeasured"},
+        "_kin": {"completeness": {"status": "unknown", "bound": "at_least",
+                                  "counted": {"exact": False}, "limits": ["verdict_inconclusive"]},
+                 "verdict": {"state": "inconclusive", "absence_claim": "not_applicable",
+                             "safe_to_conclude_absent": False,
+                             "limiting_factor": "reference_completion_unmeasured",
+                             "inputs": {"call_sites": "certified", "absence_gate": "inconclusive",
+                                        "reference_completion": "inconclusive"}}}}
+
+    def qualify(payload):
+        ok, detail = call_domain_qualification(payload, payload["negative"], payload["_kin"]["verdict"])
+        return (PASS if ok else FAIL), detail
+
+    expect("a settled Call census preserves separately unmeasured Reference completion",
+           qualify(completion), PASS)
+    unsettled = copy.deepcopy(completion)
+    unsettled["_kin"]["verdict"]["inputs"].update(
+        call_sites="inconclusive", reference_completion="not_applicable")
+    unsettled["_kin"]["verdict"]["limiting_factor"] = "call_sites_owed"
+    unsettled["negative"]["advice"] = "call_sites_owed"
+    unsettled["call_sites"].update(settled=False, clauses=["call_sites_owed: an observed site is owed"])
+    expect("the original precisely bounded Call domain still passes", qualify(unsettled), PASS)
+    no_clause = copy.deepcopy(unsettled)
+    no_clause["call_sites"]["clauses"] = []
+    expect("an unsettled Call domain still has to name its own clauses", qualify(no_clause), FAIL)
+    for label, mutate in (
+            ("missing completion provenance", lambda p: p["_kin"]["verdict"]["inputs"].pop("reference_completion")),
+            ("another limiting input", lambda p: p["_kin"]["verdict"]["inputs"].update(source_body="inconclusive")),
+            ("an exact count over uncertainty", lambda p: p["_kin"]["completeness"]["counted"].update(exact=True)),
+            ("an absence claim", lambda p: p["_kin"]["verdict"].update(safe_to_conclude_absent=True)),
+            ("an unsettled Call census", lambda p: p["call_sites"].update(settled=False)),
+            ("a Calls-only completion excuse", lambda p: p.update(relation_kinds=["calls"])),
+            ("an arbitrary completion reason", lambda p: p["negative"].update(trust_reason="some gap")),
+            ("a candidate hidden behind completion", lambda p: p["call_sites"].update(candidate_count=1)),
+            ("an extra clause", lambda p: p["_kin"]["verdict"].update(limiting_factor="reference_completion_unmeasured; proof_context_stale"))):
+        broken = copy.deepcopy(completion)
+        mutate(broken)
+        expect(label + " fails", qualify(broken), FAIL)
+
+    # The admitted reference and the admitted durability control, graded by
+    # entity and module. Each mutation below breaks exactly one rule.
+    expect("the admitted use is proved by entity, module and source identity",
+           grade_admitted_reference(*admitted_reference()), PASS)
+
+    def admitted(mutate, side=0):
+        args = list(copy.deepcopy(admitted_reference()))
+        mutate(args[side] if side < 3 else args)
+        return grade_admitted_reference(*args)
+
+    for label, side, mutate in (
+            ("a focal in another module", 0,
+             lambda p: p["focal_entity"].update(module="linkgraph.other")),
+            ("a focal placed only by a projected path", 0,
+             lambda p: p["focal_entity"].pop("module")),
+            ("a caller in another module", 0,
+             lambda p: p["references"][0].update(module="notekeeper.storage")),
+            ("a caller with no recorded module owner", 0,
+             lambda p: p["references"][0].update(semantic_owners=[])),
+            ("an anchor in another repository", 0,
+             lambda p: p["cross_repo"]["authority_anchor"].update(repo_id="foreign")),
+            ("a repository the registry did not record", 3,
+             lambda a: a.__setitem__(4, None)),
+            ("a focal source in another module", 1, lambda p: p.update(module="linkgraph.other")),
+            ("a caller source owned by another module entity", 2,
+             lambda p: p.update(semantic_owners=admitted_owners(module_id="other-module"))),
+            ("a caller source read in another workspace", 2,
+             lambda p: p["source_identity"].update(workspace_id="other-workspace")),
+            ("a source identity in another repository", 1,
+             lambda p: p["source_identity"].update(repository_id="foreign")),
+            ("a source ticket for another entity", 2,
+             lambda p: p["source_base"].update(ticket="sb2.other.3." + "e0" * 16)),
+            ("a source body that is not the fixture's", 2,
+             lambda p: p.update(body="def dangling_links(conn):\n    return None")),
+            ("a source span Kin did not verify", 1, lambda p: p.update(span_coherence="unproven"))):
+        expect(label + " fails", admitted(mutate, side), FAIL)
+
+    expect("the admitted durability control is proved by entity and module",
+           grade_durability_after_admission(admitted_status(), admitted_reference()[2],
+                                            ADMITTED_MODULE), PASS)
+    for label, mutate in (
+            ("an admitted function in another module",
+             lambda status, source: source.update(module="linkgraph.other")),
+            ("an admitted function read from another repository",
+             lambda status, source: source["source_identity"].update(repository_id="foreign")),
+            ("a status that names no repository",
+             lambda status, source: status["_kin"].pop("answered_by")),
+            ("an admitted function whose body is not the fixture's",
+             lambda status, source: source.update(body="def dangling_links(conn): pass"))):
+        status, source = admitted_status(), copy.deepcopy(admitted_reference()[2])
+        mutate(status, source)
+        expect(label + " fails", grade_durability_after_admission(status, source, ADMITTED_MODULE),
+               FAIL)
+
+    # A candidate call site is addressed by its caller and its line in it; the
+    # caller's place is never required of it.
+    placed = copy.deepcopy(unsettled)
+    placed["call_sites"].update(candidate_count=1, candidates=[
+        {"caller": "store-id", "caller_name": "store", "line_in_entity": 1,
+         "state": "unresolved", "reason": "focal escapes as a value"}])
+    expect("a candidate site addressed only inside its caller qualifies", qualify(placed), PASS)
+    placed["call_sites"]["candidates"][0]["start_line"] = 4
+    expect("a candidate site carrying a line of a file fails", qualify(placed), FAIL)
 
     # The report shape, driven through the gate's own reader rather than through
     # a copy of its rules. This suite printed four CHECK lines on kin#1205's

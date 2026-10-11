@@ -440,6 +440,8 @@ class Suite(object):
         # A scratch KIN_HOME and HOME so nothing here touches the machine's real
         # store registry, its credential store, or a daemon the fleet is using.
         self.env["KIN_HOME"] = self.home
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["HOME"] = self.home
         self.env["GIT_CONFIG_NOSYSTEM"] = "1"
         self.env["KIN_EMBED_BACKEND"] = "cpu"

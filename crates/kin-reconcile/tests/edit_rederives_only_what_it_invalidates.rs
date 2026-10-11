@@ -193,6 +193,25 @@ fn moving_every_declaration_down_a_line_is_still_a_body_edit() {
         "positions are not something another file binds against"
     );
     assert!(repo.call_edge(run, c_remove).is_none());
+    // The edited file's own records still move with its bytes: the escape
+    // census reads the line each class now sits on from this file's entity.
+    let module = repo
+        .graph
+        .get_entity(&repo.entity("src/b.ts", "b"))
+        .unwrap()
+        .expect("the edited file keeps its module entity");
+    let record = kin_model::FileEscapeRecord::from_entity(&module)
+        .expect("the edited file keeps its value-escape record");
+    let class_lines: Vec<(String, u32)> = record
+        .classes
+        .iter()
+        .map(|class| (class.name.clone(), class.line))
+        .collect();
+    assert_eq!(
+        class_lines,
+        vec![("B".to_string(), 2)],
+        "the edited file's record names the line its class moved to"
+    );
 }
 
 #[test]

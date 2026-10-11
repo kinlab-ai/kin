@@ -47,6 +47,7 @@ fn agent_setup_command(home: &Path, cwd: &Path) -> common::Command<'static> {
         .args([
             "setup",
             "--no-interactive",
+            "--verbose",
             "--intent",
             "agent",
             "--skip-mcp-check",

@@ -668,9 +668,16 @@ fn render_work_verification(graph: &kin_db::InMemoryGraph, work_id: String) -> R
     Ok(out)
 }
 
+/// Run one work request against `graph`.
+///
+/// `held` is the repository's pinned storage capability, which the TODO import
+/// reads held content through. A long-lived daemon passes the binding it
+/// pinned at startup; a one-shot caller passes `None` and the import pins one
+/// from `layout` itself.
 pub fn execute_work_request(
-    _layout: &kin_core::KinLayout,
+    layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
+    held: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     request: WorkRequest,
 ) -> Result<WorkExecution> {
     let mut mutated = false;
@@ -914,13 +921,20 @@ pub fn execute_work_request(
         WorkRequest::TodoImport { path } => {
             // `path` is caller supplied: this arm serves the daemon's POST
             // /work and POST /note routes, so the value arrives in a request
-            // body rather than from an operator's shell. The `kin_todo_import`
-            // MCP tool does NOT reach this arm; it has its own handler, which
-            // calls the same resolver. Containment lives in kin-parser beside
-            // the walk so both callers share one implementation.
-            let scan_root = kin_parser::resolve_scan_root(_layout.working_dir(), path.as_deref())
-                .context("resolve todo import scan root")?;
-            let todos = kin_parser::extract_todos(&scan_root)?;
+            // body. It only narrows which held entities are scanned; the scan
+            // reads what the graph holds and never a working tree, so no path
+            // can reach content Kin does not hold.
+            let prefix = todo_import_prefix(layout.working_dir(), path.as_deref())?;
+            let pinned;
+            let held = match held {
+                Some(binding) => binding,
+                None => {
+                    pinned = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
+                        .context("pin the repository's held content for the TODO import")?;
+                    &pinned
+                }
+            };
+            let todos = held_todos(graph, held, prefix.as_deref())?;
             let existing = graph.list_work_items(&WorkFilter::default())?;
             let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
                 .into_iter()
@@ -1000,6 +1014,108 @@ pub fn execute_work_request(
     })
 }
 
+/// The repository path a TODO import is narrowed to, from a request's `path`.
+///
+/// A request names a place in the repository: a path relative to its root, or
+/// an absolute path inside its working directory. An absolute path elsewhere,
+/// or one that steps out with `..`, is refused. The import reads only what Kin
+/// holds, so such a path names nothing it could scan, and refusing says so
+/// rather than importing nothing in silence. `None` is the whole repository.
+fn todo_import_prefix(
+    working_dir: &std::path::Path,
+    requested: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let requested_path = std::path::Path::new(requested);
+    let relative = if requested_path.is_absolute() {
+        requested_path.strip_prefix(working_dir).map_err(|_| {
+            anyhow::anyhow!("the TODO import path {requested} is outside this repository")
+        })?
+    } else {
+        requested_path
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
+                anyhow::anyhow!("the TODO import path {requested} is not valid UTF-8")
+            })?),
+            std::path::Component::CurDir => {}
+            _ => anyhow::bail!("the TODO import path {requested} leaves this repository"),
+        }
+    }
+    Ok((!parts.is_empty()).then(|| parts.join("/")))
+}
+
+/// Every inline marker in the content `graph` holds under `prefix`.
+///
+/// The workspace tree selects each held entity and repository CAS supplies
+/// its exact bytes, verified against the tree's content address, through the
+/// pinned binding. Code is scanned with its comment forms and unparsed text
+/// with the stricter colon form; content held as bytes has no markers. A
+/// prefix that selects nothing Kin holds is refused rather than reported as no
+/// markers.
+fn held_todos(
+    graph: &kin_db::InMemoryGraph,
+    held: &kin_core::LocalRepositoryAuthorityBinding,
+    prefix: Option<&str>,
+) -> Result<Vec<kin_parser::ExtractedTodo>> {
+    let tree = graph.resolved_tree();
+    let mut todos = Vec::new();
+    let mut selected = 0usize;
+    for artifact in tree.artifacts_by_path() {
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        if let Some(prefix) = prefix {
+            let under = path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+            if !under {
+                continue;
+            }
+        }
+        selected += 1;
+        // A link's held content is its target, and a submodule holds none.
+        let TreeEntry::Blob { hash, .. } = &artifact.entry else {
+            continue;
+        };
+        let bytes = held
+            .load_source_blob(hash.0)
+            .with_context(|| format!("read the held content of {path}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{path} is in the workspace tree but its content was never stored, so the \
+                     TODO import cannot read it"
+                )
+            })?;
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if text.contains('\0') {
+            continue;
+        }
+        let code = matches!(
+            kin_index::FileClassifier::classify(std::path::Path::new(path)),
+            kin_index::FileClassification::EntitySource
+                | kin_index::FileClassification::ShallowSyntax { .. }
+        );
+        if code {
+            todos.extend(kin_parser::todos_in_text(text, path));
+        } else {
+            todos.extend(kin_parser::todos_in_unparsed_text(text, path));
+        }
+    }
+    if let Some(prefix) = prefix {
+        if selected == 0 {
+            anyhow::bail!("{prefix} names nothing Kin holds in this repository");
+        }
+    }
+    Ok(todos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,7 +1148,7 @@ mod tests {
         store.graph.create_work_item(&item).unwrap();
         let work_id = item.work_id.to_string();
         let refused = |request: WorkRequest, command: &str| {
-            let error = match execute_work_request(&layout, &store.graph, request) {
+            let error = match execute_work_request(&layout, &store.graph, None, request) {
                 Ok(execution) => panic!("{command} answered: {}", execution.response.text),
                 Err(error) => format!("{error:#}"),
             };
@@ -1086,6 +1202,7 @@ mod tests {
         let error = match execute_work_request(
             &layout,
             &store.graph,
+            None,
             WorkRequest::Link {
                 work_id: work_id.clone(),
                 scope: unknown.into(),
@@ -1112,6 +1229,7 @@ mod tests {
         execute_work_request(
             &layout,
             &store.graph,
+            None,
             WorkRequest::Link {
                 work_id,
                 scope: format!("entity:{}", store.caller.id),
@@ -1446,45 +1564,6 @@ mod tests {
             .any(|event| event.action == "work.status"));
     }
 
-    #[tokio::test]
-    async fn todo_import_uses_snapshot_and_skips_duplicates() {
-        let dir = tempfile::tempdir().unwrap();
-        kin_core::init(dir.path()).unwrap();
-        std::fs::write(
-            dir.path().join("src.rs"),
-            "// TODO: keep this stable\n// FIXME: make it safer\n",
-        )
-        .unwrap();
-        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
-
-        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
-        let graph = snap.graph();
-        let import = || {
-            execute_work_request(
-                &layout,
-                graph.as_ref(),
-                WorkRequest::TodoImport { path: None },
-            )
-            .unwrap()
-            .response
-            .text
-        };
-
-        let first = import();
-        let second = import();
-        assert!(
-            first.contains("Imported 2 TODO(s)") && !first.contains("Skipped"),
-            "the first import takes both markers: {first:?}"
-        );
-        assert!(
-            second.contains("Imported 0 TODO(s)") && second.contains("Skipped 2 TODO(s)"),
-            "the second import skips both as duplicates: {second:?}"
-        );
-
-        let items = graph.list_work_items(&WorkFilter::default()).unwrap();
-        assert_eq!(items.len(), 2);
-    }
-
     #[test]
     fn work_verification_report_uses_runs_and_work_tests() {
         let store = kin_db::InMemoryGraph::new();
@@ -1577,84 +1656,235 @@ mod tests {
     // unguarded. It is gone rather than fixed: a second copy of the code under
     // test only ever fails in the shape of a passing run.
 
-    #[tokio::test]
-    async fn todo_import_refuses_a_scan_root_outside_the_repository() {
-        let repo = tempfile::tempdir().unwrap();
-        kin_core::init(repo.path()).unwrap();
-        std::fs::write(repo.path().join("inside.rs"), "// TODO: inside the repo\n").unwrap();
-        let layout = kin_core::KinLayout::discover(repo.path()).unwrap();
+    /// A repository whose workspace tree holds `members`, admitted from a Git
+    /// commit so their content is in repository CAS, and the live graph a
+    /// daemon serves over it: the workspace tree, with no entities needed.
+    struct HeldTodoFixture {
+        _temp: tempfile::TempDir,
+        repo: std::path::PathBuf,
+        layout: kin_core::KinLayout,
+        binding: kin_core::LocalRepositoryAuthorityBinding,
+        graph: kin_db::InMemoryGraph,
+    }
 
-        // A tree this request has no business reading. The marker text is what
-        // says whether the walk actually reached it.
+    fn held_todo_fixture(members: &[(&str, &str)]) -> HeldTodoFixture {
+        held_todo_fixture_with_links(members, &[])
+    }
+
+    /// As [`held_todo_fixture`], with `links` admitted as links: each names
+    /// its place in the repository and the target it points at.
+    fn held_todo_fixture_with_links(
+        members: &[(&str, &str)],
+        links: &[(&str, &std::path::Path)],
+    ) -> HeldTodoFixture {
+        // Publication proves the Git source more than once, and the proof reads
+        // the global excludes through `HOME`; holding the environment domain
+        // keeps `HOME` still for the width of the admission.
+        let _domain = kin_core::test_env::EnvVarGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::commands::test_subprocess::fixture_git(&repo)
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.email", "kin@example.invalid"]);
+        git(&["config", "user.name", "Kin"]);
+        for (path, text) in members {
+            let place = repo.join(path);
+            std::fs::create_dir_all(place.parent().unwrap()).unwrap();
+            std::fs::write(place, text).unwrap();
+        }
+        for (path, target) in links {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, repo.join(path)).unwrap();
+            #[cfg(not(unix))]
+            let _ = (path, target);
+        }
+        git(&["add", "--all"]);
+        git(&["commit", "--signoff", "-m", "seed held content"]);
+        let layout = kin_core::init_from_git(&repo).unwrap().layout;
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let authority =
+            crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
+                .unwrap();
+        let mut snapshot = kin_db::GraphSnapshot::empty();
+        snapshot.resolved_tree = authority.workspace().unwrap().tree;
+        let graph = kin_db::InMemoryGraph::from_snapshot(snapshot).unwrap();
+        HeldTodoFixture {
+            _temp: temp,
+            repo,
+            layout,
+            binding,
+            graph,
+        }
+    }
+
+    impl HeldTodoFixture {
+        fn import(
+            &self,
+            held: Option<&kin_core::LocalRepositoryAuthorityBinding>,
+            path: Option<&str>,
+        ) -> Result<String> {
+            execute_work_request(
+                &self.layout,
+                &self.graph,
+                held,
+                WorkRequest::TodoImport {
+                    path: path.map(str::to_string),
+                },
+            )
+            .map(|execution| execution.response.text)
+        }
+
+        fn titles(&self) -> Vec<String> {
+            let mut titles: Vec<String> = self
+                .graph
+                .list_work_items(&WorkFilter::default())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.title)
+                .collect();
+            titles.sort();
+            titles
+        }
+    }
+
+    /// The import reads what the graph holds, code and unparsed text, and
+    /// nothing else: a marker written to the working tree after admission, in
+    /// a held entity or in a new one, is not imported, because no working tree
+    /// is read. A second import skips what the first took.
+    #[test]
+    fn todo_import_reads_held_content_and_skips_duplicates() {
+        let fixture = held_todo_fixture(&[
+            (
+                "src/lib.rs",
+                "// TODO: keep this stable\nfn f() {}\n// FIXME: make it safer\n",
+            ),
+            (
+                "deploy.yml",
+                "# Note on the rollout\n# TODO: pin the image digest\n",
+            ),
+            ("README.md", "# Note on setup\n\nPlain prose.\n"),
+        ]);
+        std::fs::write(
+            fixture.repo.join("src/lib.rs"),
+            "// TODO: only on disk\nfn f() {}\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.repo.join("loose.rs"), "// TODO: never admitted\n").unwrap();
+
+        let first = fixture.import(Some(&fixture.binding), None).unwrap();
+        assert!(
+            first.contains("Imported 3 TODO(s)") && !first.contains("Skipped"),
+            "the first import takes the three held markers: {first:?}"
+        );
+        assert_eq!(
+            fixture.titles(),
+            vec![
+                "keep this stable".to_string(),
+                "make it safer".to_string(),
+                "pin the image digest".to_string(),
+            ],
+            "held markers only: no working-tree text, and no prose heading"
+        );
+
+        // A one-shot caller passes no binding and the import pins its own.
+        let second = fixture.import(None, None).unwrap();
+        assert!(
+            second.contains("Imported 0 TODO(s)") && second.contains("Skipped 3 TODO(s)"),
+            "the second import skips all three as duplicates: {second:?}"
+        );
+        assert_eq!(fixture.titles().len(), 3);
+    }
+
+    /// A request's path narrows the scan to held entities under it, relative
+    /// to the repository or absolute inside its working directory. A path
+    /// outside, a `..` step, or a path naming nothing held is refused, and a
+    /// refused import writes nothing.
+    #[test]
+    fn todo_import_narrows_to_a_held_place_and_refuses_anything_else() {
+        let fixture = held_todo_fixture(&[
+            ("src/lib.rs", "// TODO: inside a subdirectory\n"),
+            ("src_other.rs", "// TODO: beside the subdirectory\n"),
+            ("top.rs", "// TODO: at the root\n"),
+        ]);
+
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(
             outside.path().join("secret.rs"),
             "// TODO: outside the repo\n",
         )
         .unwrap();
-
-        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
-        let graph = snap.graph();
-        let refused = execute_work_request(
-            &layout,
-            graph.as_ref(),
-            WorkRequest::TodoImport {
-                path: Some(outside.path().to_string_lossy().into_owned()),
-            },
-        );
+        for refused in [
+            outside.path().to_string_lossy().into_owned(),
+            "../escape".to_string(),
+            "src/../../escape".to_string(),
+            "nowhere".to_string(),
+        ] {
+            assert!(
+                fixture.import(None, Some(&refused)).is_err(),
+                "{refused} must be refused"
+            );
+        }
         assert!(
-            refused.is_err(),
-            "a scan root outside the repository must be refused"
+            fixture.titles().is_empty(),
+            "a refused import writes nothing"
         );
 
-        let titles: Vec<String> = graph
-            .list_work_items(&WorkFilter::default())
-            .unwrap()
-            .into_iter()
-            .map(|item| item.title)
-            .collect();
-        assert!(
-            !titles
-                .iter()
-                .any(|title| title.contains("outside the repo")),
-            "nothing outside the repository may be imported: {titles:?}"
+        fixture.import(None, Some("src")).unwrap();
+        assert_eq!(
+            fixture.titles(),
+            vec!["inside a subdirectory".to_string()],
+            "`src` selects what is under src/, not src_other.rs"
+        );
+
+        let absolute = fixture.layout.working_dir().join("top.rs");
+        fixture
+            .import(None, Some(&absolute.to_string_lossy()))
+            .unwrap();
+        assert_eq!(
+            fixture.titles(),
+            vec![
+                "at the root".to_string(),
+                "inside a subdirectory".to_string()
+            ],
+            "an absolute path inside the working directory names a held place"
         );
     }
 
-    #[tokio::test]
-    async fn todo_import_accepts_a_scan_root_inside_the_repository() {
-        let repo = tempfile::tempdir().unwrap();
-        kin_core::init(repo.path()).unwrap();
-        std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(
-            repo.path().join("src").join("lib.rs"),
-            "// TODO: inside a subdirectory\n",
-        )
-        .unwrap();
-        let layout = kin_core::KinLayout::discover(repo.path()).unwrap();
-
-        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
-        let graph = snap.graph();
-        execute_work_request(
-            &layout,
-            graph.as_ref(),
-            WorkRequest::TodoImport {
-                path: Some("src".to_string()),
-            },
-        )
-        .expect("a subdirectory of the repository is a legitimate scan root");
-
-        let titles: Vec<String> = graph
-            .list_work_items(&WorkFilter::default())
-            .unwrap()
-            .into_iter()
-            .map(|item| item.title)
-            .collect();
-        assert!(
-            titles
-                .iter()
-                .any(|title| title.contains("inside a subdirectory")),
-            "a legitimate subdirectory scan must still import: {titles:?}"
+    /// A link is held as the name of its target, never as the content it
+    /// points at, so a link out of the repository can never lead the import
+    /// to read there.
+    #[cfg(unix)]
+    #[test]
+    fn todo_import_never_follows_a_held_link() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.rs");
+        std::fs::write(&secret, "// TODO: outside the repo\n").unwrap();
+        let fixture = held_todo_fixture_with_links(
+            &[("src/lib.rs", "// TODO: inside\n")],
+            &[("escape.rs", secret.as_path())],
         );
+        assert!(
+            fixture
+                .graph
+                .resolved_tree()
+                .artifacts_by_path()
+                .any(|artifact| artifact.path.as_utf8() == Some("escape.rs")),
+            "the link itself is held"
+        );
+        fixture.import(None, None).unwrap();
+        assert_eq!(fixture.titles(), vec!["inside".to_string()]);
     }
 }

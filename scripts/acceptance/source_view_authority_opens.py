@@ -200,7 +200,12 @@ def build_repo(root, file_count):
 def run_arm(kin, root, file_count, home):
     build_repo(root, file_count)
     env = dict(os.environ)
+    # This fixture inspects/copies an in-tree store; central layout is
+    # qualified separately by brownfield_repro --store-layout central.
+    env["KIN_STORE_LAYOUT"] = "in-tree"
     env["KIN_HOME"] = home
+    # Written against a store that holds its complete history.
+    env["KIN_INIT_HISTORY"] = "full"
     env["KIN_EMBED_BACKEND"] = "cpu"
     env["KIN_DAEMON_AUTO_EMBED"] = "0"
     env["RUST_LOG"] = "kin_core=info,kin_daemon=info"

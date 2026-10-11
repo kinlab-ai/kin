@@ -31,29 +31,26 @@ of the code. Kin is your only way to look at the repository.
 
 You have no shell, no grep, no find and no file-reading tool. This is deliberate. Every \
 question about where code lives, what calls what, or what a symbol does is answered from \
-the graph with the mcp__kin__ tools. Start with mcp__kin__semantic_locate or \
-mcp__kin__semantic_search to find things by meaning, use mcp__kin__get_context_pack or \
-mcp__kin__get_entity_source to read exact source, and use mcp__kin__find_references or \
-mcp__kin__trace_data_flow to follow relationships.
+the graph with the mcp__kin__ tools. Start with mcp__kin__locate to find things by name or \
+by meaning, use mcp__kin__context or mcp__kin__source to read exact source, and use \
+mcp__kin__refs or mcp__kin__trace to follow relationships.
 
-Reach for mcp__kin__lexical_lookup when the question names an exact identifier, string, or \
-symbol to find, or when mcp__kin__find_references or mcp__kin__trace_data_flow answered with \
-an inconclusive verdict for the entity you asked about. Resolve the entity first as usual, \
-then call mcp__kin__lexical_lookup with that bare token, not a sentence describing it: it \
-matches stored graph fields literally. A hit there is lexical evidence, never a \
-resolved reference, so mcp__kin__find_references stays the answer of record whenever it \
-certifies.
+Call mcp__kin__locate with mode \"literal\" when the question names an exact identifier, \
+string, or symbol to find, or when mcp__kin__refs or mcp__kin__trace answered with an \
+inconclusive verdict for the entity you asked about. Resolve the entity first as usual, then \
+pass that bare token as the query, not a sentence describing it: literal mode matches stored \
+graph fields literally. A hit there is lexical evidence, never a resolved reference, so \
+mcp__kin__refs stays the answer of record whenever it certifies.
 
 When a Kin result is empty, read what Kin says about that emptiness. If it reports the \
 absence cannot be trusted, the honest answer is that you do not know, and you should say \
 what the gap is. Never turn an untrusted absence into a claim that something does not exist.
 
 To change code, name the entity you are changing by its UUID, the id \
-mcp__kin__semantic_locate, mcp__kin__find_references and mcp__kin__get_entity_source hand \
-you, and read it with mcp__kin__get_entity_source first. mcp__kin__kin_mutate takes an \
-operations array and stages and commits it in one call. Prefer verb 'patch' with target \
-set to that UUID and an EntitySourcePatch payload: the exact source_base \
-mcp__kin__get_entity_source returned, unchanged, and edits, each an old_text that occurs \
+mcp__kin__locate, mcp__kin__refs and mcp__kin__source hand you, and read it with \
+mcp__kin__source first. mcp__kin__mutate takes an operations array and stages and commits \
+it in one call. Prefer verb 'patch' with target set to that UUID and an EntitySourcePatch \
+payload: the exact source_base mcp__kin__source returned, unchanged, and edits, each an old_text that occurs \
 exactly once in the entity's body with the new_text that takes its place. The source_base \
 names the version you read, so a change to an entity that has moved since is refused \
 rather than applied over the newer text. When the change rewrites most of the entity, use \
@@ -66,17 +63,17 @@ an existing function's UUID and an EntityCreate payload: that function's source_
 anchor, the new function's name, kind 'function', its one declaration as body, and \
 placement 'sibling_after' or 'new_source_unit'. To delete one, use verb 'remove' with its \
 UUID and an EntityRemove payload holding its source_base. Use only these operations, as the \
-mcp__kin__kin_mutate schema describes them. Give every operation a description saying what \
+mcp__kin__mutate schema describes them. Give every operation a description saying what \
 it does, and pass a summary too: one sentence in your own words saying what the whole \
 change does, which becomes the subject a human reads in history. Your session is already \
 open: this run opened it once and sends it with every change, so do not start another. If \
-mcp__kin__kin_mutate refuses, the reason comes back in the result: fix what it names and \
-call it again.
+mcp__kin__mutate refuses, the reason comes back in the result: fix what it names and call it \
+again.
 
 Your tools are the ones on your belt and no others: this repository is a graph, and a change \
-to it is a change to an entity. Every change goes through mcp__kin__kin_mutate, including a \
-new entity if its operations offer one; there is no file creation. If the change needs \
-something kin_mutate cannot make, stop and say so.
+to it is a change to an entity. Every change goes through mcp__kin__mutate, including a new \
+entity if its operations offer one; there is no file creation. If the change needs something \
+mutate cannot make, stop and say so.
 
 Work in small steps. Call one or two tools, read what came back, then decide. When you have \
 the answer, say it in plain text without calling a tool.";
@@ -99,11 +96,12 @@ Your tools are the mcp__kin__ ones named above. You have no others.
 /// The paragraph about changing code has to describe the write tool the model
 /// actually has, because a prompt that names a tool the belt does not carry is a
 /// false instruction: under `--tool-profile agent-query` the server serves no
-/// `kin_mutate`, and a model told to call it spends its turns being refused.
-/// `kin_mutate` on the belt keeps the entity paragraph, and a belt without it is
-/// told the run is read-only.
+/// `mutate`, and a model told to call it spends its turns being refused.
+/// `mutate` on the belt, or `kin_mutate` from a server that serves the name it
+/// replaced, keeps the entity paragraph, and a belt without either is told the
+/// run is read-only.
 pub fn system_prompt_for(belt: &Belt) -> String {
-    if belt.has_kin_tool("kin_mutate") {
+    if belt.has_kin_tool("mutate") || belt.has_kin_tool("kin_mutate") {
         return DEFAULT_SYSTEM_PROMPT.to_string();
     }
     let (Some(start), Some(end)) = (
@@ -151,6 +149,25 @@ impl Server {
     /// Whether this server declares a tool by that exact name.
     fn declares(&self, tool: &str) -> bool {
         self.declared.iter().any(|declared| declared.name == tool)
+    }
+
+    /// The call that runs one session action on this server: the `session`
+    /// verb with that `action` where the server serves verbs, and the tool the
+    /// action had to itself where it serves the names the verb replaced.
+    /// `None` when it serves neither.
+    fn session_call(&self, action: &str, mut arguments: Value) -> Option<(&'static str, Value)> {
+        if self.declares(belt::SESSION_VERB) {
+            if let Some(map) = arguments.as_object_mut() {
+                map.insert("action".into(), Value::String(action.to_string()));
+            }
+            return Some((belt::SESSION_VERB, arguments));
+        }
+        let tool = match action {
+            "start" => "kin_session_start",
+            "heartbeat" => "kin_session_heartbeat",
+            _ => "kin_session_end",
+        };
+        self.declares(tool).then_some((tool, arguments))
     }
 }
 
@@ -359,7 +376,7 @@ impl Counters {
     /// what Kin returned, not the whole object, so this record does not grow
     /// a new implicit schema every time Kin adds a field to the real one.
     fn record_reference_rows(&mut self, tool: &str, raw_text: &str) {
-        if tool != "find_references" {
+        if tool != "find_references" && tool != "refs" {
             return;
         }
         let Ok(payload) = serde_json::from_str::<Value>(raw_text) else {
@@ -516,8 +533,23 @@ impl Counters {
 /// A session the model DID name is left exactly as it wrote it. Overriding one
 /// would hide a caller's mistake behind a silent correction, and the refusal it
 /// earns says more than a commit against a session it did not ask for.
+///
+/// A server's `session` verb reaches the model as its `exec` action alone
+/// (`belt::session_exec_form`), so a call to it always goes out as `exec`,
+/// whatever action the model wrote: starting and ending the session is the
+/// harness's, and the session a toolchain run needs is the one it holds.
 pub(crate) fn with_harness_session(arguments: &Value, tool: &str, session: Option<&str>) -> Value {
-    let (Some(session), "kin_mutate") = (session, tool) else {
+    if tool == belt::SESSION_VERB {
+        let mut arguments = arguments.clone();
+        if let Some(map) = arguments.as_object_mut() {
+            map.insert("action".into(), Value::String("exec".into()));
+            if let Some(session) = session {
+                map.insert("session_id".into(), Value::String(session.to_string()));
+            }
+        }
+        return arguments;
+    }
+    let Some(session) = session.filter(|_| belt::is_mutate(tool)) else {
         return arguments.clone();
     };
     let mut arguments = arguments.clone();
@@ -572,7 +604,7 @@ pub(crate) fn retry_under_fresh_session(
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
     };
-    if tool != "kin_mutate" || !outcome.is_error || named("session_id") || named("request_id") {
+    if !belt::is_mutate(tool) || !outcome.is_error || named("session_id") || named("request_id") {
         return false;
     }
     let Some(harness_session) = harness_session else {
@@ -749,7 +781,10 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
     // Validate the provider dialect before transcript or MCP I/O. Construction sends no request.
     let provider = Provider::new(config.provider.clone())?;
     let session_id = uuid::Uuid::new_v4().to_string();
-    let mut writer = TranscriptWriter::create(&config.out_dir, &session_id)?;
+    // The run's output directory is a declared boundary: the run writes its
+    // transcript, trace and result there and nowhere else.
+    let out = kin_io::HostDir::create(&config.out_dir, &kin_io::Grant::ambient())?;
+    let mut writer = TranscriptWriter::create(out, &session_id)?;
     let mut counters = Counters::new();
 
     // Every wait in the run, the endpoint's included, is measured against this one instant.
@@ -796,29 +831,32 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                 err.to_string()
             }
         };
-        let mut client = match McpClient::start(&spec.mcp_command, &spec.repo, config.mcp_timeout) {
-            Ok(client) => client,
-            Err(err) => {
-                let message = attach(err);
-                writer.init(
-                    &config.provider.model,
-                    &config.repo,
-                    &[],
-                    "failed",
-                    std::slice::from_ref(&message),
-                    agent_meta,
-                )?;
-                return finish(
-                    writer,
-                    &config,
-                    Stop::new(ExitStatus::McpError, "the MCP server did not start", None),
-                    &message,
-                    counters,
-                    started,
-                    None,
-                );
-            }
-        };
+        // Starting the Kin MCP server is this run's one process boundary.
+        let spawner = kin_io::Spawner::new(&kin_io::Grant::ambient());
+        let mut client =
+            match McpClient::start(&spawner, &spec.mcp_command, &spec.repo, config.mcp_timeout) {
+                Ok(client) => client,
+                Err(err) => {
+                    let message = attach(err);
+                    writer.init(
+                        &config.provider.model,
+                        &config.repo,
+                        &[],
+                        "failed",
+                        std::slice::from_ref(&message),
+                        agent_meta,
+                    )?;
+                    return finish(
+                        writer,
+                        &config,
+                        Stop::new(ExitStatus::McpError, "the MCP server did not start", None),
+                        &message,
+                        counters,
+                        started,
+                        None,
+                    );
+                }
+            };
         let declared = match client.list_tools() {
             Ok(tools) => tools,
             Err(err) => {
@@ -875,13 +913,20 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
             if belt_profile == belt::BeltProfile::Default && belt::is_opt_in(&tool.name) {
                 continue;
             }
+            // The session verb carries the harness's own lifecycle beside the
+            // toolchain run, so the model is served the run alone.
+            let (description, schema) = if tool.name == belt::SESSION_VERB {
+                belt::session_exec_form(&tool.input_schema)
+            } else {
+                (tool.description.clone(), tool.input_schema.clone())
+            };
             kin_tools.push(belt::KinTool {
                 folded: false,
                 server: index,
                 bare: tool.name.clone(),
                 exposed: format!("{prefix}{}", tool.name),
-                description: tool.description.clone(),
-                schema: tool.input_schema.clone(),
+                description,
+                schema,
             });
         }
     }
@@ -1530,7 +1575,7 @@ pub fn run_with_options(config: AgentConfig, options: RunOptions) -> anyhow::Res
                                             // refusals as edits would overstate
                                             // itself in exactly the place a
                                             // reader checks.
-                                            if name == "kin_mutate" && !outcome.is_error {
+                                            if belt::is_mutate(&name) && !outcome.is_error {
                                                 if let Some(ops) = call
                                                     .arguments
                                                     .get("operations")
@@ -2103,15 +2148,16 @@ impl<'a> Keepalive<'a> {
                 continue;
             }
             let session = server.session.clone().unwrap_or_default();
-            let outcome = server
-                .client
-                .call_tool("kin_session_heartbeat", &json!({ "session_id": session }));
+            let (tool, arguments) = server
+                .session_call("heartbeat", json!({ "session_id": session }))
+                .unwrap_or(("kin_session_heartbeat", json!({ "session_id": session })));
+            let outcome = server.client.call_tool(tool, &arguments);
             self.refreshed[index] = Instant::now();
             self.beats += 1;
             self.rows.push(json!({
                 "surface": "kin",
                 "server": server.name(),
-                "tool": "kin_session_heartbeat",
+                "tool": tool,
                 "policy": "allowed",
                 "event": "session_heartbeat",
                 "kin_session_id": session,
@@ -2186,25 +2232,28 @@ fn start_kin_session(
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<Option<String>> {
     let server_name = server.name();
-    if !server.declares("kin_session_start") {
+    let start = server.session_call(
+        "start",
+        json!({
+            "vendor": "kin-agent",
+            "client_name": format!("kin-agent ({})", config.provider.model),
+            "transport": "mcp",
+            "pid": std::process::id(),
+            "cwd": server.repo.display().to_string(),
+            "capabilities": { "can_read": true, "can_write": true, "can_commit": true },
+        }),
+    );
+    let Some((tool, arguments)) = start else {
         writer.trace(json!({
             "surface": "policy",
             "server": server_name,
             "policy": "allowed",
             "event": "session_unavailable",
-            "detail": "the server does not expose kin_session_start, so a change this run makes carries no agent session",
+            "detail": "the server lists neither session nor kin_session_start, so this run holds no session of its own; a server that opens its connection's own session for each write attributes the run's changes to that one",
         }))?;
         return Ok(None);
-    }
-    let arguments = json!({
-        "vendor": "kin-agent",
-        "client_name": format!("kin-agent ({})", config.provider.model),
-        "transport": "mcp",
-        "pid": std::process::id(),
-        "cwd": server.repo.display().to_string(),
-        "capabilities": { "can_read": true, "can_write": true, "can_commit": true },
-    });
-    match server.client.call_tool("kin_session_start", &arguments) {
+    };
+    match server.client.call_tool(tool, &arguments) {
         Ok(outcome) => {
             let session = extract_id(&outcome, &["session_id", "id"]);
             server.session_ttl = if outcome.is_error {
@@ -2215,7 +2264,7 @@ fn start_kin_session(
             writer.trace(json!({
                 "surface": "kin",
                 "server": server_name,
-                "tool": "kin_session_start",
+                "tool": tool,
                 "policy": "allowed",
                 "event": "session_start",
                 "wall_ms": outcome.wall_ms as u64,
@@ -2230,7 +2279,7 @@ fn start_kin_session(
             writer.trace(json!({
                 "surface": "kin",
                 "server": server_name,
-                "tool": "kin_session_start",
+                "tool": tool,
                 "policy": "allowed",
                 "event": "session_start",
                 "is_error": true,
@@ -2245,17 +2294,16 @@ fn end_kin_session(server: &mut Server, writer: &mut TranscriptWriter) -> anyhow
     let Some(session) = server.session.clone() else {
         return Ok(());
     };
-    if !server.declares("kin_session_end") {
+    let Some((tool, arguments)) = server.session_call("end", json!({ "session_id": session }))
+    else {
         return Ok(());
-    }
+    };
     let server_name = server.name();
-    let outcome = server
-        .client
-        .call_tool("kin_session_end", &json!({ "session_id": session }));
+    let outcome = server.client.call_tool(tool, &arguments);
     writer.trace(json!({
         "surface": "kin",
         "server": server_name,
-        "tool": "kin_session_end",
+        "tool": tool,
         "policy": "allowed",
         "event": "session_end",
         "is_error": outcome.as_ref().map(|o| o.is_error).unwrap_or(true),
@@ -2403,9 +2451,9 @@ fn finish(
         counters.usage_json(),
         agent,
     )?;
-    std::fs::write(
-        config.out_dir.join("result.json"),
-        serde_json::to_string_pretty(&record)?,
+    writer.out_dir().write(
+        "result.json",
+        serde_json::to_string_pretty(&record)?.as_bytes(),
     )?;
     Ok(RunOutcome {
         status,
@@ -2422,7 +2470,8 @@ pub fn probe_mcp(
     repo: &Path,
     timeout: Duration,
 ) -> Result<Vec<String>, crate::mcp::McpError> {
-    let mut client = McpClient::start(argv, repo, timeout)?;
+    let spawner = kin_io::Spawner::new(&kin_io::Grant::ambient());
+    let mut client = McpClient::start(&spawner, argv, repo, timeout)?;
     Ok(client
         .list_tools()?
         .into_iter()
@@ -2761,10 +2810,10 @@ mod guidance_tests {
             "verb 'create' with target set to an existing function's UUID and an EntityCreate \
              payload",
             "verb 'remove' with its UUID and an EntityRemove payload holding its source_base",
-            "Use only these operations, as the mcp__kin__kin_mutate schema describes them.",
+            "Use only these operations, as the mcp__kin__mutate schema describes them.",
             "Your session is already open",
             "there is no file creation",
-            "If the change needs something kin_mutate cannot make, stop and say so.",
+            "If the change needs something mutate cannot make, stop and say so.",
         ] {
             assert!(prompt.contains(expected), "the prompt lost {expected:?}");
         }
@@ -2777,6 +2826,7 @@ mod guidance_tests {
         // The session tools are the harness's and never on the belt, so the prompt must
         // not send the model looking for one.
         assert!(!prompt.contains("kin_session_start"));
+        assert!(!prompt.contains("mcp__kin__session"));
     }
 
     /// A model that reaches for a retired file tool is given the same guidance.

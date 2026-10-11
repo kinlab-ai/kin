@@ -473,6 +473,7 @@ async fn prepared_session_plan_captures_late_fresh_lsp_call_into_durable_unknown
             name_line: span.start_line,
             name_col: 4,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         }
     };

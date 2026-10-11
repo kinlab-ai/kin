@@ -314,7 +314,30 @@ impl Thresholds {
         }
         measured
     }
+
+    /// The bars a reading must clear before work these bars refused starts
+    /// after all: each one [`RECOVERY_MARGIN`] lower, and never below zero.
+    ///
+    /// A host does not sit still at a bar. One whose swap stays mostly used
+    /// reads critical every moment its memory crosses three quarters and
+    /// nominal the moment it dips back, several times a minute, so work that
+    /// resumed at the same bar that refused it would start and be refused
+    /// again on the host's own noise. Lowering every bar by the same margin
+    /// keeps their order, so the elevated and critical rungs still mean what
+    /// they mean.
+    pub fn for_recovery(&self) -> Self {
+        let lower = |bar: f64| (bar - RECOVERY_MARGIN).max(0.0);
+        Self {
+            elevated: lower(self.elevated),
+            critical: lower(self.critical),
+            swap: lower(self.swap),
+        }
+    }
 }
+
+/// How far under each bar a reading must fall before work refused at that bar
+/// starts after all. See [`Thresholds::for_recovery`].
+pub const RECOVERY_MARGIN: f64 = 0.05;
 
 /// A fraction from the environment, or `default` when it is unset, unparsable,
 /// or outside `0.0..=1.0`.
@@ -932,6 +955,54 @@ pub fn host_leaves_room(level: PressureLevel) -> bool {
     match level {
         PressureLevel::Nominal | PressureLevel::Elevated => true,
         PressureLevel::Unknown | PressureLevel::Critical => false,
+    }
+}
+
+/// Whether work already refused for memory may start now.
+///
+/// The same verdict that refused it, graded against the recovery bars
+/// ([`Thresholds::for_recovery`]) rather than the bars that refused it, so a
+/// reading just under a bar is not yet room. And the machine itself has to
+/// leave room on those bars ([`host_leaves_room`]): a host that could not be
+/// read lets work start that was never refused, but it is no evidence that
+/// the shortage behind a refusal has passed.
+pub fn refused_work_may_resume(
+    work: HeavyWork,
+    pressure: &MemoryPressure,
+    standing: Option<&BudgetStanding>,
+    thresholds: &Thresholds,
+) -> bool {
+    let recovery = thresholds.for_recovery();
+    host_leaves_room(pressure.level_under(&recovery))
+        && !Verdict::decide(work, pressure, standing, &recovery).refused()
+}
+
+/// Consecutive readings with room, counted toward resuming refused work.
+///
+/// The recovery bars stop work resuming on a reading that has only just
+/// crossed back under a bar. This stops it resuming on one reading at all: a
+/// single quiet moment on a loaded host is not room, so the count starts over
+/// at every reading without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryDwell {
+    needed: u32,
+    seen: u32,
+}
+
+impl RecoveryDwell {
+    /// A dwell that resumes after `needed` readings in a row with room, and
+    /// never after fewer than one.
+    pub fn new(needed: u32) -> Self {
+        Self {
+            needed: needed.max(1),
+            seen: 0,
+        }
+    }
+
+    /// Count one reading, and say whether enough in a row have had room.
+    pub fn observe(&mut self, room: bool) -> bool {
+        self.seen = if room { self.seen.saturating_add(1) } else { 0 };
+        self.seen >= self.needed
     }
 }
 
@@ -2402,6 +2473,144 @@ mod tests {
             bars.level_for(&reading(12 * GIB, 11 * GIB + GIB / 2)),
             PressureLevel::Critical
         );
+    }
+
+    /// A host reading with `used` of its memory and `swap` of its swap in use.
+    fn host(used: f64, swap: f64) -> MemoryPressure {
+        let limit = 100 * GIB;
+        let swap_total = 10 * GIB;
+        MemoryPressure::Known(MemoryReading {
+            source: PressureSource::Host,
+            limit_bytes: limit,
+            used_bytes: (limit as f64 * used) as u64,
+            swap_used_bytes: Some((swap_total as f64 * swap) as u64),
+            swap_total_bytes: Some(swap_total),
+            oom_kills: None,
+            peak_bytes: None,
+        })
+    }
+
+    fn standing_at(fraction: f64) -> BudgetStanding {
+        let budget = 10 * GIB;
+        BudgetStanding {
+            footprint: TreeFootprint {
+                own_bytes: (budget as f64 * fraction) as u64,
+                children_bytes: 0,
+                child_count: 0,
+                kernel_capped: false,
+            },
+            budget: FootprintBudget {
+                bytes: budget,
+                source: BudgetSource::Operator,
+            },
+        }
+    }
+
+    #[test]
+    fn recovery_bars_sit_one_margin_under_the_bars_that_refused_and_never_below_zero() {
+        let bars = Thresholds::default().for_recovery();
+        assert!((bars.elevated - 0.70).abs() < 1e-9, "{bars:?}");
+        assert!((bars.critical - 0.85).abs() < 1e-9, "{bars:?}");
+        assert!((bars.swap - 0.45).abs() < 1e-9, "{bars:?}");
+        let floor = Thresholds {
+            elevated: 0.02,
+            critical: 0.03,
+            swap: 0.0,
+        }
+        .for_recovery();
+        assert_eq!(
+            floor,
+            Thresholds {
+                elevated: 0.0,
+                critical: 0.0,
+                swap: 0.0,
+            }
+        );
+    }
+
+    /// The measured host: swap held near 96% while memory swung around three
+    /// quarters of the machine. A reading that would admit a fresh sweep is not
+    /// yet room for one already refused.
+    #[test]
+    fn a_refused_sweep_resumes_only_once_the_host_is_clear_of_the_bar_that_refused_it() {
+        let bars = Thresholds::default();
+        let sweep = HeavyWork::LspSweep;
+
+        let refusing = host(0.81, 0.96);
+        assert!(Verdict::for_reading(sweep, &refusing, &bars).refused());
+        assert!(!refused_work_may_resume(sweep, &refusing, None, &bars));
+
+        let just_under = host(0.72, 0.96);
+        assert!(
+            !Verdict::for_reading(sweep, &just_under, &bars).refused(),
+            "a start on this reading sweeps"
+        );
+        assert!(
+            !refused_work_may_resume(sweep, &just_under, None, &bars),
+            "a sweep refused at the bar waits until the host is clear of it"
+        );
+
+        assert!(refused_work_may_resume(
+            sweep,
+            &host(0.65, 0.96),
+            None,
+            &bars
+        ));
+        assert!(
+            refused_work_may_resume(sweep, &host(0.80, 0.30), None, &bars),
+            "swap clear of its own bar leaves an elevated host room for the sweep"
+        );
+        assert!(!refused_work_may_resume(
+            sweep,
+            &host(0.87, 0.0),
+            None,
+            &bars
+        ));
+    }
+
+    #[test]
+    fn a_daemon_just_under_its_own_budget_bar_has_not_recovered() {
+        let bars = Thresholds::default();
+        let sweep = HeavyWork::LspSweep;
+        let room = host(0.30, 0.0);
+        let near = standing_at(0.87);
+        assert!(!Verdict::decide(sweep, &room, Some(&near), &bars).refused());
+        assert!(!refused_work_may_resume(sweep, &room, Some(&near), &bars));
+        assert!(refused_work_may_resume(
+            sweep,
+            &room,
+            Some(&standing_at(0.80)),
+            &bars
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_or_pinned_critical_host_never_resumes_refused_work() {
+        let bars = Thresholds::default();
+        let sweep = HeavyWork::LspSweep;
+        let unreadable = MemoryPressure::Unknown {
+            reason: "no accounting".into(),
+        };
+        assert!(!refused_work_may_resume(sweep, &unreadable, None, &bars));
+        let critical = MemoryPressure::Forced {
+            level: PressureLevel::Critical,
+        };
+        assert!(!refused_work_may_resume(sweep, &critical, None, &bars));
+        let nominal = MemoryPressure::Forced {
+            level: PressureLevel::Nominal,
+        };
+        assert!(refused_work_may_resume(sweep, &nominal, None, &bars));
+    }
+
+    #[test]
+    fn refused_work_resumes_only_after_the_readings_in_a_row_it_needs() {
+        let mut dwell = RecoveryDwell::new(3);
+        for room in [true, false, true, true, false, true, true] {
+            assert!(!dwell.observe(room), "{dwell:?}");
+        }
+        assert!(dwell.observe(true), "the third reading in a row with room");
+        assert!(RecoveryDwell::new(0).observe(true));
+        assert!(!RecoveryDwell::new(0).observe(false));
     }
 
     #[test]

@@ -28,6 +28,7 @@ const REPOSITORY_RUNTIME_AUTHORITY_RETRY_INTERVAL: Duration = Duration::from_mil
 pub struct RepositoryRuntimeAuthority {
     file: File,
     canonical_kin_root: PathBuf,
+    acquiring_pid: u32,
 }
 
 impl RepositoryRuntimeAuthority {
@@ -38,11 +39,17 @@ impl RepositoryRuntimeAuthority {
 }
 
 impl Drop for RepositoryRuntimeAuthority {
-    /// Clear the owner stamp while the singleton is still held, then let the
-    /// file handle close and release the advisory lock.
+    /// Clear the owner stamp and explicitly release the advisory lock in the
+    /// acquiring process. An inherited descriptor may outlive this handle.
     fn drop(&mut self) {
+        // A forked child shares the open description but does not own the
+        // parent's authority. It must neither clear the stamp nor unlock it.
+        if self.acquiring_pid != std::process::id() {
+            return;
+        }
         let _ = self.file.set_len(0);
         let _ = self.file.flush();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -118,6 +125,7 @@ fn try_acquire_repository_runtime_authority(
             Ok(Some(RepositoryRuntimeAuthority {
                 file,
                 canonical_kin_root,
+                acquiring_pid: std::process::id(),
             }))
         }
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
@@ -178,6 +186,7 @@ fn without_blocking_runtime_worker<T>(work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// Budget for an acquisition a test asserts MUST succeed.
     ///
@@ -207,10 +216,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(
-            std::fs::read_to_string(root.join("daemon.lock")).unwrap(),
-            "owner-a"
-        );
+        // Read through the acquiring handle. Windows excludes other handles
+        // from the locked range even when they belong to this process.
+        let mut owner_stamp = String::new();
+        let mut reader = &held.file;
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_to_string(&mut owner_stamp).unwrap();
+        assert_eq!(owner_stamp, "owner-a");
 
         drop(held);
         assert!(root.join("daemon.lock").exists());
@@ -223,6 +235,61 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn releasing_authority_releases_an_inherited_description() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let held = acquire_repository_runtime_authority(root, "owner-a")
+            .unwrap()
+            .expect("take the repository");
+        // dup and fork retain the same open description. Keep that description
+        // live to reproduce a child holding it after the owner stands down.
+        let inherited = held.file.try_clone().unwrap();
+        drop(held);
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.lock")).unwrap(),
+            ""
+        );
+        let next =
+            acquire_repository_runtime_authority_within(root, REACQUIRE_BUDGET, "owner-b").unwrap();
+        assert!(
+            next.is_some(),
+            "an inherited descriptor cannot retain released authority"
+        );
+        assert!(
+            inherited.metadata().is_ok(),
+            "the inherited descriptor is still open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_authority_cannot_release_its_acquiring_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut held = acquire_repository_runtime_authority(root, "owner-a")
+            .unwrap()
+            .expect("take the repository");
+        let inherited = held.file.try_clone().unwrap();
+        // Exercise a child's Drop without forking a multi-threaded test runner.
+        held.acquiring_pid = std::process::id().wrapping_add(1);
+        drop(held);
+        assert_eq!(
+            std::fs::read_to_string(root.join("daemon.lock")).unwrap(),
+            "owner-a"
+        );
+        assert!(
+            acquire_repository_runtime_authority_within(root, Duration::ZERO, "owner-b")
+                .unwrap()
+                .is_none(),
+            "the acquiring process retains its authority"
+        );
+        FileExt::unlock(&inherited).unwrap();
+        let next =
+            acquire_repository_runtime_authority_within(root, REACQUIRE_BUDGET, "owner-b").unwrap();
+        assert!(next.is_some(), "the owner's release permits the next claim");
     }
 
     #[test]

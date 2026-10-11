@@ -414,7 +414,8 @@ pub const SAME_FILE_FALLBACK_MAX: usize = 6;
 /// question a row answers: "what does this need to run" and "what breaks if I
 /// change this" are opposite queries served by opposite edges. Collapsing them
 /// reported a caller as a callee.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DependencyRelation {
     /// The focal reaches this entity over a real dependency edge. The focal
     /// depends on it.
@@ -424,6 +425,7 @@ pub enum DependencyRelation {
     DependentEdge,
     /// The focal carried no dependency edge in either direction, so this row is
     /// an entity that shares the focal's file. Not a dependency.
+    #[serde(rename = "contextual_neighbor")]
     SameFileNeighbor,
 }
 
@@ -486,6 +488,8 @@ pub mod group {
     pub const DEPENDENCIES: &str = "dependencies";
     /// Rows that depend on the focal.
     pub const DEPENDENTS: &str = "dependents";
+    /// Contextual neighbours with no established dependency relation.
+    pub const CONTEXTUAL_NEIGHBORS: &str = "contextual_neighbors";
     /// Rows reached at more than one hop.
     pub const TRANSITIVE_DEPS: &str = "transitive_deps";
     /// Tests covering the focal or its direct dependencies.
@@ -587,21 +591,36 @@ impl DependencySelection {
     }
 
     /// Rows one group lost to the token budget, discounting any the caller
-    /// recovered by another route.
+    /// accounted for by another route: recovered into the answer, or withheld
+    /// for a cause it reports itself.
     ///
     /// The MCP pack recovers a certified caller this fold refused, from the
     /// same reference authority `find_references` reads. A row that reached the
     /// answer is not a row the answer lost, and claiming it in both places
     /// would be a false report of loss, which is the same defect as silence
-    /// with its sign flipped.
+    /// with its sign flipped. A refused caller the pack's own cap then kept out
+    /// is the cap's to report: counting it here as well reported one row as two
+    /// losses, and a pack of 24 served dependents out of 40 said 32 more were
+    /// withheld.
+    ///
+    /// Each entity counts once, whatever the number of refusals filed for it.
     pub fn budget_elided_unrecovered(
         &self,
         group: &str,
-        recovered: impl Fn(&EntityId) -> bool,
+        accounted: impl Fn(&EntityId) -> bool,
     ) -> usize {
-        self.budget_elided
-            .get(group)
-            .map_or(0, |ids| ids.iter().filter(|id| !recovered(id)).count())
+        self.budget_elided.get(group).map_or(0, |ids| {
+            let mut seen: HashSet<EntityId> = HashSet::new();
+            ids.iter()
+                .filter(|id| !accounted(id) && seen.insert(**id))
+                .count()
+        })
+    }
+
+    /// The ids of the rows one group lost to the token budget, in the order
+    /// they were refused.
+    pub fn budget_elided_ids(&self, group: &str) -> &[EntityId] {
+        self.budget_elided.get(group).map_or(&[], Vec::as_slice)
     }
 
     /// Rows one group lost to the token budget.
@@ -948,6 +967,13 @@ pub fn build_context_pack_with_provider<G: GraphStore>(
         entry.content = match entry.projection_level {
             ProjectionLevel::FullBody => project_signature_only(&focal),
             ProjectionLevel::SignatureOnly => project_name_and_kind(&focal),
+            // A name and kind still carries the signature, which can be most
+            // of the pack. The name and kind alone is the last rung.
+            ProjectionLevel::NameAndKind
+                if entry.content.len() > project_bare_name_and_kind(&focal).len() =>
+            {
+                project_bare_name_and_kind(&focal)
+            }
             _ => {
                 return Err(ContextError::BudgetExceeded {
                     actual: measured,
@@ -2036,6 +2062,12 @@ pub(crate) fn project_name_and_kind(entity: &Entity) -> String {
         "{} ({:?}): {}\n",
         entity.name, entity.kind, entity.signature
     )
+}
+
+/// The name and kind with no signature: the smallest thing a pack can say
+/// about an entity and still name it.
+pub(crate) fn project_bare_name_and_kind(entity: &Entity) -> String {
+    format!("{} ({:?})\n", entity.name, entity.kind)
 }
 
 fn derived_member_projection(entity: &Entity) -> Option<String> {
@@ -4146,6 +4178,38 @@ mod tests {
             selection.budget_elided_unrecovered(group::DEPENDENCIES, |_| true),
             0,
             "a row the caller recovered elsewhere is not a row the answer lost"
+        );
+    }
+
+    #[test]
+    fn a_refused_row_the_caller_withheld_for_its_own_cause_is_counted_once_and_by_that_cause() {
+        let (store, focal) = calling_store(40);
+        let tight = ContextOptions {
+            budget: TokenBudget::Custom(1),
+            ..ContextOptions::default()
+        };
+        let (_, mut selection) =
+            build_context_pack_with_provenance(&store, &focal.id, &tight).unwrap();
+        let refused: Vec<EntityId> = selection.budget_elided_ids(group::DEPENDENCIES).to_vec();
+        assert_eq!(refused.len(), 39);
+        // A caller that recovers some refused rows and withholds the rest
+        // under a cap of its own accounts for every one: none is the budget's.
+        let (recovered, capped) = refused.split_at(10);
+        let accounted = |id: &EntityId| recovered.contains(id) || capped.contains(id);
+        assert_eq!(
+            selection.budget_elided_unrecovered(group::DEPENDENCIES, accounted),
+            0
+        );
+        // Only the cap's rows left out, the budget keeps the rest.
+        assert_eq!(
+            selection.budget_elided_unrecovered(group::DEPENDENCIES, |id| capped.contains(id)),
+            10
+        );
+        // A second refusal filed for one entity is still one lost row.
+        selection.refuse(group::DEPENDENCIES, refused[0]);
+        assert_eq!(
+            selection.budget_elided_unrecovered(group::DEPENDENCIES, |_| false),
+            39
         );
     }
 

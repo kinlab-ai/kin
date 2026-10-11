@@ -25,9 +25,13 @@
 //!
 //! A few names mean something a shell runs another way, and `kin call`
 //! refuses those by name, before anything is sent, with the spelling that
-//! works: `kin_init` is `kin init`, the tool dispatchers are `kin describe` and
-//! `kin call` themselves, a routed command's name is its CLI spelling or `kin
-//! call` with the tool it runs, and a name nothing takes is sent nowhere.
+//! works: the tool dispatchers are `kin describe` and `kin call` themselves,
+//! the name of a routed command that is not a tool, such as `describe` or a
+//! replaced `search`, is its CLI spelling or `kin call` with the tool it runs,
+//! and a name nothing takes is sent nowhere. The operator commands the agent
+//! surface does not carry are names nothing takes, `exec` among them, except
+//! `init` and `kin_init`: setting a repository up is `kin init`, so those name
+//! it. Every other verb is a registered tool by its own name, and runs.
 
 use std::io::Read;
 
@@ -112,21 +116,37 @@ fn routed_call(arguments: Value) -> ToolCallParams {
 /// `kin_init` and `graph source` is the `source` command.
 pub fn refusal_for(name: &str) -> Option<String> {
     let spelled = name.trim();
-    if let Some(command) = kin_mcp::routed::command_named_by(spelled) {
-        return Some(command_refusal(spelled, command));
+    // Setting a repository up is a command a person runs, and the agent
+    // surface carries no tool for it, so its old tool names point at the
+    // command rather than reading as names nothing takes.
+    if matches!(
+        spelled.to_ascii_lowercase().replace('-', "_").as_str(),
+        "kin_init" | "init"
+    ) {
+        return Some(format!(
+            "There is no Kin tool named '{spelled}': setting a repository up is a command a \
+             person runs. In a shell, run `kin init` in the project you want Kin to serve; `kin \
+             describe` lists every tool `kin call` runs."
+        ));
     }
+    if let Some(command) = kin_mcp::routed::command_named_by(spelled) {
+        // A verb spelled as itself is a registered tool as well as a command,
+        // and `kin call` runs it by that name.
+        let as_itself = spelled.eq_ignore_ascii_case(command);
+        if !(as_itself && kin_mcp::verbs::is_plain_word(command)) {
+            return Some(command_refusal(spelled, command));
+        }
+        return None;
+    }
+    // The registry drops the operator commands the agent surface does not
+    // carry, so `kin_session_exec` and `exec` are refused here as names
+    // nothing takes.
     let Some(tool) = kin_mcp::routed::tool_named_by(spelled) else {
         return Some(format!(
             "There is no Kin tool named '{spelled}'. `kin describe` lists every tool `kin call` \
              runs."
         ));
     };
-    if tool == kin_mcp::repository_init::TOOL_NAME {
-        return Some(format!(
-            "{tool} sets up the folder an MCP client works in. In a shell, run `kin init` in that \
-             folder, or `kin init <path>`."
-        ));
-    }
     if kin_mcp::routed::is_dispatcher(&tool) {
         return Some(format!(
             "{tool} finds and runs tools for an MCP client that lists only some of them. In a \
@@ -138,7 +158,7 @@ pub fn refusal_for(name: &str) -> Option<String> {
 
 /// The refusal for a routed command's name: `kin call` runs tools, so it
 /// names the command's CLI spelling and `kin call` with each tool it runs
-/// that a shell's `kin call` runs too, which leaves `init` to `kin init`.
+/// that a shell's `kin call` runs too.
 fn command_refusal(spelled: &str, command: &str) -> String {
     let row = kin_mcp::routed::command_table()
         .into_iter()
@@ -148,9 +168,12 @@ fn command_refusal(spelled: &str, command: &str) -> String {
         "{spelled} is the kin tool's {command} command rather than a tool, and `kin call` runs a \
          tool by its registered name."
     );
+    // A verb in a row is a command too, so it is read here rather than through
+    // `refusal_for`, which would come back to this row: every verb runs
+    // through `kin call` by its name.
     let calls: Vec<String> = tools
         .iter()
-        .filter(|tool| refusal_for(tool).is_none())
+        .filter(|tool| kin_mcp::verbs::is_plain_word(tool) || refusal_for(tool).is_none())
         .map(|tool| format!("`kin call {tool}`"))
         .collect();
     if calls.is_empty() {
@@ -226,9 +249,12 @@ pub(crate) fn shell_config() -> kin_mcp::McpServerConfig {
 
 /// Answer one request through the server path `kin mcp start` answers it on.
 pub(crate) async fn send(request: &Value, config: &kin_mcp::McpServerConfig) -> Result<Answer> {
-    let response = kin_mcp::process_daemon_message(&request.to_string(), config)
+    let message = request.to_string();
+    let response = kin_mcp::process_daemon_message(&message, config)
         .await
         .context("the routed kin tool gave no answer")?;
+    // Answered in the words that profile's client reads.
+    let response = kin_mcp::present_for_client(response, &message, config);
     if let Some(error) = response.error {
         anyhow::bail!("the routed kin tool refused the call: {}", error.message);
     }
@@ -252,19 +278,31 @@ pub async fn call(tool: &str, arguments: Option<&str>) -> Result<Answer> {
     let arguments = call_arguments(arguments, &mut std::io::stdin().lock())?;
     let request = call_request(tool, arguments);
     let config = shell_config();
-    if !kin_mcp::routed::answers_locally(&request, config.routed) {
-        let layout = crate::commands::require_repository_layout()?;
-        let url = crate::daemon_client::resolve_daemon_url(&layout)
-            .await?
-            .ok_or_else(|| crate::daemon_client::daemon_required_error("kin call", &layout))?;
-        // The server path forwards to the daemon this names, as it does for
-        // `kin mcp start`, and a daemon it revives joins supervisor routing.
-        std::env::set_var("KIN_DAEMON_URL", &url);
-        crate::daemon_client::install_spawn_registrar();
+    if kin_mcp::routed::answers_locally(&request, config.routed) {
+        kin_mcp::first_contact::set_spelling(crate::commands::mcp::command_spelling());
+        return send(&request, &config).await;
     }
+    send_to_this_repository(&request, &config, "kin call").await
+}
+
+/// Send `request` to the daemon serving this repository, starting it when
+/// none is, and answer as `config`'s client is answered. `command` names the
+/// shell command in the refusal when no daemon can serve it.
+pub(crate) async fn send_to_this_repository(
+    request: &Value,
+    config: &kin_mcp::McpServerConfig,
+    command: &str,
+) -> Result<Answer> {
+    let layout = crate::commands::require_repository_layout()?;
+    let url = crate::daemon_client::resolve_daemon_url(&layout)
+        .await?
+        .ok_or_else(|| crate::daemon_client::daemon_required_error(command, &layout))?;
+    // The server path forwards to the daemon this names, as it does for
+    // `kin mcp start`, and a daemon it revives joins supervisor routing.
+    std::env::set_var("KIN_DAEMON_URL", &url);
+    crate::daemon_client::install_spawn_registrar();
     kin_mcp::first_contact::set_spelling(crate::commands::mcp::command_spelling());
-    kin_mcp::session_exec::install_executor(crate::commands::agent_exec::executor());
-    send(&request, &config).await
+    send(request, config).await
 }
 
 #[cfg(test)]
@@ -364,51 +402,66 @@ mod tests {
             .as_array()
             .expect("other_tools")
             .iter()
-            .any(|row| row["tool"] == "kin_transaction_commit" && row["writes"] == true));
-        for command in ["session", "mutate", "init"] {
+            .any(|row| row["tool"] == "kin_transaction_validate" && row["writes"] == true));
+        let commands = catalogue["commands"].as_array().expect("commands");
+        let other_tools = catalogue["other_tools"].as_array().expect("other_tools");
+        for command in ["mutate", "transaction"] {
             assert!(
-                catalogue["commands"]
-                    .as_array()
-                    .expect("commands")
-                    .iter()
-                    .any(|row| row["command"] == command),
+                commands.iter().any(|row| row["command"] == command),
                 "{command}: {catalogue}"
             );
+        }
+        // Running a program and setting a folder up are not semantic agent
+        // work, so the agent surface carries neither, writes included: the
+        // listing names neither by any name, and `describe` refuses each.
+        for retired in [
+            "exec",
+            "init",
+            "kin_init",
+            "kin_session_exec",
+            "kin_todo_import",
+        ] {
+            assert!(
+                !commands.iter().any(|row| row["command"] == retired)
+                    && !other_tools.iter().any(|row| row["tool"] == retired),
+                "{retired}: {catalogue}"
+            );
+            assert!(describe(Some(retired)).is_error, "{retired} was described");
         }
     }
 
     /// Names a shell runs another way are refused by name, before anything is
-    /// sent, with the spelling that works in a shell. Every other name the
-    /// routed `call` takes is sent as it is.
+    /// sent, with the spelling that works in a shell. The operator commands
+    /// the agent surface no longer carries are no Kin tool to `kin call`,
+    /// which answers as the agent surface does: running a program is a name
+    /// nothing takes, and setting a repository up names `kin init`, the
+    /// command a person runs for it. Every other name the routed `call` takes
+    /// is sent as it is.
     #[test]
     fn kin_call_refuses_by_name_what_a_shell_runs_another_way() {
         for (name, says) in [
-            ("kin_init", vec!["`kin init`"]),
-            ("kin-init", vec!["`kin init`"]),
+            (
+                "kin_init",
+                vec!["no Kin tool", "`kin init`", "`kin describe`"],
+            ),
+            (
+                "kin-init",
+                vec!["no Kin tool", "`kin init`", "`kin describe`"],
+            ),
+            ("KIN_INIT", vec!["no Kin tool", "`kin init`"]),
+            ("init", vec!["no Kin tool", "`kin init`", "`kin describe`"]),
+            ("exec", vec!["no Kin tool", "`kin describe`"]),
+            ("kin_session_exec", vec!["no Kin tool", "`kin describe`"]),
+            ("kin_todo_import", vec!["no Kin tool", "`kin describe`"]),
             ("kin_tool_search", vec!["`kin describe`", "`kin call`"]),
             ("kin_tool_call", vec!["`kin describe`", "`kin call`"]),
-            (
-                "locate",
-                vec![
-                    "`kin locate`",
-                    "`kin call semantic_locate`",
-                    "`kin describe locate`",
-                ],
-            ),
             (
                 "search",
                 vec!["`kin call semantic_search`", "`kin call lexical_lookup`"],
             ),
-            (
-                "session",
-                vec!["`kin call kin_session_start`", "`kin describe session`"],
-            ),
-            (
-                "graph source",
-                vec!["`kin source`", "`kin call get_entity_source`"],
-            ),
+            ("path", vec!["`kin path`", "`kin call trace_path`"]),
+            ("graph source", vec!["`kin source`", "`kin call source`"]),
             ("describe", vec!["`kin describe`"]),
-            ("init", vec!["`kin init`"]),
             ("nope", vec!["no Kin tool", "`kin describe`"]),
         ] {
             let refusal = refusal_for(name).unwrap_or_else(|| panic!("{name} was sent"));
@@ -422,7 +475,21 @@ mod tests {
                 assert_eq!(refusal_for(tool), None, "{name} offers {tool}: {refusal}");
             }
         }
+        // Running a program has no command to name in its place here.
+        for name in ["exec", "kin_session_exec", "nope"] {
+            let refusal = refusal_for(name).unwrap_or_else(|| panic!("{name} was sent"));
+            assert!(!refusal.contains("`kin init`"), "{name}: {refusal}");
+        }
+        // Every verb is a registered tool as well as a command, so `kin call`
+        // sends it by its name, and so it does every name a verb replaced.
         for name in [
+            "locate",
+            "refs",
+            "trace",
+            "session",
+            "mutate",
+            "transaction",
+            "Locate",
             "graph_neighborhood",
             "graph-neighborhood",
             "get_entity_source",

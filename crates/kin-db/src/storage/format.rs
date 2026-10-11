@@ -1024,7 +1024,9 @@ impl GraphSnapshot {
     /// v27/v28 carry a context validation (without/with a section), including
     /// in history. They add no layout but require a reader that understands
     /// the language's current validation state before admitting its proofs.
-    pub const CURRENT_VERSION: u32 = Self::CONTEXT_VALIDATIONS_SECTION_VERSION;
+    /// v29/v30 append Git snapshot proofs inside repository authority, without
+    /// changing the top-level record layout.
+    pub const CURRENT_VERSION: u32 = Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION;
 
     pub const LEGACY_SECTION_TRIMMED_VERSION: u32 = 16;
     pub const BINDING_HISTORY_VERSION: u32 = 17;
@@ -1064,6 +1066,12 @@ impl GraphSnapshot {
     /// Context validations and a section.
     pub const CONTEXT_VALIDATIONS_SECTION_VERSION: u32 = 28;
 
+    /// Git snapshot proofs and no materialized section.
+    pub const GIT_SNAPSHOT_PROOFS_VERSION: u32 = 29;
+
+    /// Git snapshot proofs and a materialized section.
+    pub const GIT_SNAPSHOT_PROOFS_SECTION_VERSION: u32 = 30;
+
     /// A section, and receipts that still embed their operation records.
     pub const SECTION_VERSION: u32 = 14;
 
@@ -1090,8 +1098,20 @@ impl GraphSnapshot {
     /// resolution records outrank marks: every binary that reads v23 reads
     /// marks too. Call-site ledgers outrank the other records the same way:
     /// every binary that reads v25 reads v23 too. Context validations outrank
-    /// ledgers and include records held in a materialized section.
+    /// ledgers and include records held in a materialized section. Git snapshot
+    /// proofs outrank all earlier capabilities and preserve that section axis.
     pub fn wire_version(&self) -> u32 {
+        if self
+            .repository_authority
+            .as_ref()
+            .is_some_and(|authority| !authority.git_snapshot_proofs.is_empty())
+        {
+            return if self.materialized_graph.is_some() {
+                Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION
+            } else {
+                Self::GIT_SNAPSHOT_PROOFS_VERSION
+            };
+        }
         if self.carries_context_validations() {
             return if self.materialized_graph.is_some() {
                 Self::CONTEXT_VALIDATIONS_SECTION_VERSION
@@ -1273,11 +1293,12 @@ impl GraphSnapshot {
                 | Self::RESOLUTION_RECORDS_SECTION_VERSION
                 | Self::CALL_SITE_LEDGERS_SECTION_VERSION
                 | Self::CONTEXT_VALIDATIONS_SECTION_VERSION
+                | Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION
         )
     }
 
     /// Whether a body at this version carries the resolution-record slot: the
-    /// records rungs and the ledger and validation rungs above them.
+    /// records rungs and the ledger, validation and snapshot-proof rungs above them.
     pub(crate) const fn version_carries_resolution_records(version: u32) -> bool {
         matches!(
             version,
@@ -1287,6 +1308,8 @@ impl GraphSnapshot {
                 | Self::CALL_SITE_LEDGERS_SECTION_VERSION
                 | Self::CONTEXT_VALIDATIONS_VERSION
                 | Self::CONTEXT_VALIDATIONS_SECTION_VERSION
+                | Self::GIT_SNAPSHOT_PROOFS_VERSION
+                | Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION
         )
     }
 
@@ -1322,9 +1345,11 @@ impl GraphSnapshot {
     /// `serde(default)` read as no records. v25 and v26 are v23 and v24
     /// declared by a store that carries a call-site ledger, so they add no
     /// element and are read by the same decoder. v27 and v28 similarly carry
-    /// context validations in the existing record slot. One decoder reads
+    /// context validations in the existing record slot. v29 and v30 append
+    /// snapshot proofs inside authority and retain the v23/v24 top-level layout.
+    /// One decoder reads
     /// every rung and no second copy of the field list exists to drift.
-    pub const MAX_SUPPORTED_VERSION: u32 = Self::CONTEXT_VALIDATIONS_SECTION_VERSION;
+    pub const MAX_SUPPORTED_VERSION: u32 = Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -1579,7 +1604,8 @@ impl GraphSnapshot {
         if self.version != wire_version {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "refusing to serialize a snapshot whose body declares v{} while its contents \
-                 serialize as v{}; context validations require v{}/v{} without/with a section; \
+                 serialize as v{}; Git snapshot proofs require v{}/v{} without/with a section; \
+                 context validations require v{}/v{} without/with a section; \
                  call-site ledgers require v{}/v{} without/with a section; \
                  other resolution records require v{}/v{} without/with a section; \
                  enrichment marks require v{}/v{} without/with a section; \
@@ -1589,6 +1615,8 @@ impl GraphSnapshot {
                  it v{}",
                 self.version,
                 wire_version,
+                Self::GIT_SNAPSHOT_PROOFS_VERSION,
+                Self::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
                 Self::CONTEXT_VALIDATIONS_VERSION,
                 Self::CONTEXT_VALIDATIONS_SECTION_VERSION,
                 Self::CALL_SITE_LEDGERS_VERSION,
@@ -4422,6 +4450,59 @@ mod tests {
         );
     }
 
+    /// Decoding a store body shares one allocation between equal metadata
+    /// maps, wherever in the body they sit, and changes nothing a reader sees.
+    ///
+    /// A store body holds the same entity in several sections at once (the
+    /// entities, their revisions, the materialized graph and the change that
+    /// admitted them), and each section used to decode its own copy of the
+    /// entity's metadata. Two entities with equal metadata stand in for that
+    /// here, since the sharing is by content, and a third with different
+    /// metadata must keep its own.
+    #[test]
+    fn decoding_shares_equal_entity_metadata() {
+        let metadata = |line: u64| -> kin_model::MetadataMap {
+            [
+                (
+                    "embedding_body_preview".to_string(),
+                    serde_json::json!("def render(self, console, options): ..."),
+                ),
+                (
+                    "file_import_context".to_string(),
+                    serde_json::json!({"modules": ["rich.console", "rich.segment"]}),
+                ),
+                ("declaration_line".to_string(), serde_json::json!(line)),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let mut first = test_entity("first_copy");
+        first.metadata.extra = metadata(12);
+        let mut second = test_entity("second_copy");
+        second.metadata.extra = metadata(12);
+        let mut different = test_entity("different");
+        different.metadata.extra = metadata(13);
+        assert!(!first
+            .metadata
+            .extra
+            .shares_storage_with(&second.metadata.extra));
+
+        let mut snapshot = GraphSnapshot::empty();
+        for entity in [&first, &second, &different] {
+            snapshot.entities.insert(entity.id, entity.clone());
+        }
+        let loaded = GraphSnapshot::from_bytes(&snapshot.to_bytes().unwrap()).unwrap();
+
+        let loaded_first = &loaded.entities[&first.id].metadata.extra;
+        let loaded_second = &loaded.entities[&second.id].metadata.extra;
+        let loaded_different = &loaded.entities[&different.id].metadata.extra;
+        assert!(loaded_first.shares_storage_with(loaded_second));
+        assert!(!loaded_first.shares_storage_with(loaded_different));
+        for entity in [&first, &second, &different] {
+            assert_eq!(loaded.entities[&entity.id], *entity);
+        }
+    }
+
     #[test]
     fn roundtrip_empty_snapshot() {
         let snap = GraphSnapshot::empty();
@@ -5300,7 +5381,7 @@ mod tests {
             GRAPH_SNAPSHOT_FIELD_COUNT - 1,
             "v14 appends exactly one element to v13"
         );
-        // Sixteen contiguous rungs, including the required-capability pair,
+        // Eighteen contiguous rungs, including the required-capability pair,
         // the owed-derivation pair, the enrichment-marks pair, the
         // resolution-records, call-site-ledgers and context-validations pairs; the width is
         // a function of the version rather than a second opinion about it.
@@ -5325,8 +5406,10 @@ mod tests {
                 GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION,
                 GraphSnapshot::CONTEXT_VALIDATIONS_VERSION,
                 GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
+                GraphSnapshot::GIT_SNAPSHOT_PROOFS_VERSION,
+                GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
             ],
-            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
             "the ladder is contiguous, which is what lets one decoder read every \
              rung with defaulted trailing fields"
         );
@@ -5354,6 +5437,8 @@ mod tests {
             (GraphSnapshot::CALL_SITE_LEDGERS_SECTION_VERSION, true),
             (GraphSnapshot::CONTEXT_VALIDATIONS_VERSION, false),
             (GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION, true),
+            (GraphSnapshot::GIT_SNAPSHOT_PROOFS_VERSION, false),
+            (GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION, true),
         ] {
             assert_eq!(
                 GraphSnapshot::version_carries_a_section(version),
@@ -5397,6 +5482,14 @@ mod tests {
                 GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
                 GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
             ),
+            (
+                GraphSnapshot::GIT_SNAPSHOT_PROOFS_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_VERSION,
+            ),
+            (
+                GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
+                GraphSnapshot::RESOLUTION_RECORDS_SECTION_VERSION,
+            ),
         ] {
             assert!(GraphSnapshot::version_carries_resolution_records(ledgers));
             assert_eq!(
@@ -5412,8 +5505,8 @@ mod tests {
         }
         assert_eq!(
             GraphSnapshot::MAX_SUPPORTED_VERSION,
-            GraphSnapshot::CONTEXT_VALIDATIONS_SECTION_VERSION,
-            "a reader of the validation rungs reads every earlier rung"
+            GraphSnapshot::GIT_SNAPSHOT_PROOFS_SECTION_VERSION,
+            "a reader of the Git snapshot proof rungs reads every earlier rung"
         );
     }
 
@@ -5651,6 +5744,95 @@ mod tests {
             GraphSnapshot::RESOLUTION_RECORDS_VERSION,
             "the history the append was made over is unchanged"
         );
+    }
+
+    /// Codec-only evidence: storage's raw-body and tree admission tests build
+    /// real Git closures. Here the inert proof isolates positional fields and
+    /// version selection from admission so both section shapes are exercised.
+    #[test]
+    fn git_snapshot_proofs_round_trip_at_both_snapshot_rungs() {
+        for section in [false, true] {
+            let mut snapshot = if section {
+                a_v14_snapshot("snapshot proof section")
+            } else {
+                GraphSnapshot::empty()
+            };
+            let repository_id = RepositoryId::new("snapshot-proof-codec").unwrap();
+            snapshot.repository_authority = Some(
+                PersistedRepositoryAuthority::empty(repository_id.clone(), &snapshot).unwrap(),
+            );
+            snapshot.version = snapshot.wire_version();
+            let legacy_bytes = encode_snapshot_without_admission_validation(&snapshot);
+            let source_commit = kin_model::GitObjectId::sha1([1; 20]);
+            let proof = kin_model::GitSnapshotProof {
+                repository_id,
+                snapshot_change_id: kin_model::SemanticChangeId::from_hash(Hash256::from_bytes(
+                    [2; 32],
+                )),
+                source_commit,
+                objects: vec![kin_model::ExternalObjectId::new(
+                    kin_model::ExternalObjectKind::Commit,
+                    source_commit,
+                )],
+            };
+            snapshot
+                .repository_authority
+                .as_mut()
+                .unwrap()
+                .git_snapshot_proofs
+                .push(proof.clone());
+            snapshot.version = snapshot.wire_version();
+            let expected = if section { 30 } else { 29 };
+            let bytes = encode_snapshot_without_admission_validation(&snapshot);
+            assert_eq!(ledger_test_header(&bytes), expected);
+            assert_eq!(encoded_field_count(&bytes[16..bytes.len() - 32]), 37);
+            assert_eq!(GraphSnapshot::body_width(expected), 37);
+            let error = GraphSnapshot::check_readable_version(expected, 28).unwrap_err();
+            assert!(matches!(error,
+                crate::error::KinDbError::IncompatibleSnapshotVersion {
+                    found, max: 28, ..
+                } if found == expected
+            ));
+            let decoded = GraphSnapshot::decode_pre_validated(&bytes).unwrap();
+            assert_eq!(
+                decoded
+                    .repository_authority
+                    .as_ref()
+                    .unwrap()
+                    .git_snapshot_proofs,
+                vec![proof.clone()]
+            );
+            assert_eq!(decoded.materialized_graph.is_some(), section);
+            assert_eq!(
+                encode_snapshot_without_admission_validation(&decoded),
+                bytes
+            );
+            GraphSnapshot::prove_pre_validated_round_trip(&bytes).unwrap();
+            let envelope = AuthorityEnvelopeSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(envelope.version, expected);
+            assert_eq!(
+                envelope.repository_authority.unwrap().git_snapshot_proofs,
+                vec![proof]
+            );
+            LocateGraphSnapshot::from_bytes_with_persisted_root_hash(&bytes).unwrap();
+            snapshot.version = if section { 28 } else { 27 };
+            assert!(snapshot
+                .wire_version_checked()
+                .unwrap_err()
+                .to_string()
+                .contains("Git snapshot proofs require v29/v30"));
+            snapshot
+                .repository_authority
+                .as_mut()
+                .unwrap()
+                .git_snapshot_proofs
+                .clear();
+            snapshot.version = snapshot.wire_version();
+            assert_eq!(
+                encode_snapshot_without_admission_validation(&snapshot),
+                legacy_bytes
+            );
+        }
     }
 
     fn format_context_validations() -> [ResolutionRecord; 2] {
@@ -6622,6 +6804,102 @@ mod tests {
             events_for_assert.count(),
             0,
             "a corruption mismatch must not emit the stale-handle recovery event"
+        );
+    }
+
+    /// A serving read verifies and decodes each record once per generation,
+    /// a whole-history walk keeps nothing, and what is kept is never bytes the
+    /// open did not verify.
+    ///
+    /// Within one generation a second pass over the whole line, by the same
+    /// map and by a clone that shares its storage, reads, hashes and decodes
+    /// nothing, and answers exactly what the first pass did. A plain read, the
+    /// one an open's validation walks, keeps nothing. And once the file is
+    /// written under the open generation, a plain read of the changed record
+    /// is refused while a serving read still answers what was verified, never
+    /// the changed bytes.
+    #[test]
+    fn serving_reads_verify_each_record_once_and_never_serve_unverified_bytes() {
+        use std::io::{Seek, SeekFrom, Write};
+        let decoded_records = crate::storage::change_map::records_decoded_on_this_thread;
+        let original = a_snapshot_with_history(6);
+        let frame = encode_snapshot_without_admission_validation(&original);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&frame).unwrap();
+        let (opened, _) = decode_lazily(
+            &frame,
+            HistorySource::File {
+                file: Arc::new(file.try_clone().unwrap()),
+                display: "serving reads fixture".into(),
+                frame_len: frame.len() as u64,
+            },
+        );
+        let changes = opened.changes;
+        let ids = changes.change_ids().unwrap();
+        assert_eq!(ids.len(), 6);
+
+        let walked = decoded_records();
+        for _ in 0..2 {
+            for id in &ids {
+                changes.read_change(id).unwrap();
+            }
+        }
+        assert_eq!(
+            decoded_records() - walked,
+            2 * ids.len(),
+            "a plain read, the one a validation walk makes, keeps nothing"
+        );
+
+        let before = decoded_records();
+        for id in &ids {
+            assert_eq!(
+                changes.read_change_for_serving(id).unwrap().as_ref(),
+                original.changes.get(id)
+            );
+        }
+        assert_eq!(
+            decoded_records() - before,
+            ids.len(),
+            "the first serving read of each record verifies and decodes it"
+        );
+        let shared = changes.clone();
+        for reader in [&changes, &shared] {
+            for id in &ids {
+                assert_eq!(
+                    reader.read_change_for_serving(id).unwrap().as_ref(),
+                    original.changes.get(id),
+                    "a kept record answers exactly what its verified read did"
+                );
+            }
+        }
+        assert_eq!(
+            decoded_records() - before,
+            ids.len(),
+            "a record this generation already verified is served without reading, \
+             hashing or decoding it again, by the map and by every clone that shares it"
+        );
+
+        // Bytes written under the open generation.
+        let target = original
+            .changes
+            .iter()
+            .find(|(_, change)| change.message == "history change 1")
+            .map(|(id, _)| *id)
+            .expect("fixture carries the targeted change");
+        let position = frame
+            .windows(b"history change 1".len())
+            .position(|part| part == b"history change 1")
+            .expect("fixture contains the targeted change's message bytes");
+        file.seek(SeekFrom::Start(position as u64)).unwrap();
+        file.write_all(&[frame[position] ^ 1]).unwrap();
+        let error = changes
+            .read_change(&target)
+            .expect_err("a plain read of a record changed in place is refused");
+        assert!(error.to_string().contains("changed after open"), "{error}");
+        assert_eq!(
+            changes.read_change_for_serving(&target).unwrap().as_ref(),
+            original.changes.get(&target),
+            "a serving read answers what was verified, never the changed bytes"
         );
     }
 

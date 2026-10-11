@@ -74,5 +74,7 @@ git apply /path/to/patches/0001-*.patch /path/to/patches/0002-*.patch
 Then copy `common/`, `queries/`, `tree-sitter.json`, and each dialect's
 `grammar.js` and `src/` back under `grammar/`.
 
-Changing anything here changes what a parse means, so bump
-`kin_parser::PARSER_SEMANTICS_VERSION` in the same commit.
+Changing anything here changes what a parse means. The grammar's sources
+are classified in `derivation-inputs.toml`, so the change moves the key
+stores compare against, and every store re-derives on its next
+`kin upgrade` with nothing to bump by hand.

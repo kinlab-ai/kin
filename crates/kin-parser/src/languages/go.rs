@@ -3,13 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use kin_model::{Entity, EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use kin_model::{Entity, EntityKind, FilePathId, LanguageId, ParseState, SourceSpan, Visibility};
 use serde_json::{json, Value};
 use tree_sitter::Tree;
 
 use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
+use crate::declaration_extent::{declaration_line, leading_run, span_with_leading, Leading};
 use crate::error::Result;
 use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
@@ -69,8 +70,38 @@ impl LanguageAdapter for GoAdapter {
         LanguageId::Go
     }
 
+    fn declaration_lifecycle(
+        &self,
+    ) -> Option<&dyn crate::declaration_lifecycle::DeclarationLifecycle> {
+        Some(&super::go_edit::GoLifecycle)
+    }
+
+    fn member_placement(&self) -> Option<&dyn crate::member_placement::MemberPlacement> {
+        Some(&super::go_edit::GoPlacement)
+    }
+
+    fn unit_editor(&self) -> Option<&dyn crate::unit_editor::UnitEditor> {
+        Some(&super::go_unit::GoUnitEditor)
+    }
+
+    fn name_syntax(&self) -> Option<crate::name_syntax::NameSyntax> {
+        Some(crate::name_syntax::GO)
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["go"]
+    }
+
+    fn project_manifest(&self) -> Option<crate::project_manifest::ProjectManifest> {
+        Some(crate::project_manifest::GO_MOD)
+    }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::go_declarations::go_declaration_census(tree, source))
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
@@ -102,6 +133,7 @@ impl LanguageAdapter for GoAdapter {
         // after `dst_name` has been narrowed to the simple callee name.
         let mut call_prefixes: Vec<(usize, String)> = Vec::new();
         let root = tree.root_node();
+        let typing = GoFileTyping::read(tree, source);
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
@@ -114,11 +146,18 @@ impl LanguageAdapter for GoAdapter {
                 &mut interface_methods,
                 &mut type_methods,
                 &mut call_prefixes,
+                &typing,
             );
             if child.kind() == "import_declaration" {
                 extract_go_imports(&child, source, &mut imports);
             }
         }
+
+        // Types declared in function bodies become entities under the
+        // `enclosing.<locals>.T` rule; function literals bound to a name are
+        // recorded as not admitted.
+        let nested_definitions =
+            extract_go_nested_definitions(&root, source, file_id, &mut entities, &mut relations);
 
         // The file module owns entity-level import edges, and it has to sit
         // first so `module_entity_by_file` reads it rather than a declaration
@@ -141,6 +180,46 @@ impl LanguageAdapter for GoAdapter {
                         file_id,
                     ),
                 );
+            }
+        }
+
+        // Calls no declaration walk reached, such as a package-level
+        // `var client = newClient()` or a function literal bound there, go to
+        // the innermost entity holding each one: the variable, else the file's
+        // package surface. The walk runs with no function's value-origin
+        // facts, since package scope binds no local. A package qualifier the
+        // walk read travels with its call to the import annotation below.
+        {
+            let accounted = crate::call_owner::accounted_call_sites(&relations);
+            let mut swept = Vec::new();
+            let mut swept_prefixes: Vec<(usize, String)> = Vec::new();
+            let mut ref_seen = std::collections::HashSet::new();
+            let package_scope = CallTyping {
+                file: &typing,
+                origins: BTreeMap::new(),
+            };
+            extract_calls_from_body(
+                &root,
+                source,
+                "",
+                None,
+                &package_scope,
+                &mut swept,
+                &mut swept_prefixes,
+                &mut ref_seen,
+            );
+            let first = relations.len();
+            let prefixes: HashMap<usize, String> = swept_prefixes.into_iter().collect();
+            let adopted = crate::call_owner::adopt_unowned_calls(
+                &entities,
+                &accounted,
+                swept,
+                &mut relations,
+            );
+            for (offset, swept_index) in adopted.into_iter().enumerate() {
+                if let Some(prefix) = prefixes.get(&swept_index) {
+                    call_prefixes.push((first + offset, prefix.clone()));
+                }
             }
         }
 
@@ -232,6 +311,10 @@ impl LanguageAdapter for GoAdapter {
             }
         }
 
+        // The unit's module owns what is declared at its top.
+        let held = crate::module_contains::module_contains(&entities, &relations, file_id);
+        relations.extend(held);
+
         Ok(ParseOutput {
             derived_members: Vec::new(),
             entities,
@@ -240,6 +323,7 @@ impl LanguageAdapter for GoAdapter {
             tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: Some(nested_definitions),
         })
     }
 }
@@ -492,12 +576,14 @@ fn extract_go_node(
     interface_methods: &mut Vec<(String, InterfaceContract)>,
     type_methods: &mut HashMap<String, Vec<String>>,
     call_prefixes: &mut Vec<(usize, String)>,
+    typing: &GoFileTyping,
 ) {
     match node.kind() {
         "function_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 let vis = go_visibility_with_path(&name, file_id);
+                let (span, declaration_line) = go_entity_span(node, node, source, file_id);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Function,
                     name: name.clone(),
@@ -505,15 +591,17 @@ fn extract_go_node(
                     visibility: vis,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span,
+                    declaration_line,
                 });
                 let mut ref_seen = std::collections::HashSet::new();
+                let calls = typing.for_function(node, source);
                 extract_calls_from_body(
                     node,
                     source,
                     &name,
                     None,
+                    &calls,
                     relations,
                     call_prefixes,
                     &mut ref_seen,
@@ -543,6 +631,7 @@ fn extract_go_node(
                         .push(method_name.clone());
                 }
 
+                let (span, declaration_line) = go_entity_span(node, node, source, file_id);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Method,
                     name: qualified.clone(),
@@ -550,8 +639,8 @@ fn extract_go_node(
                     visibility: go_visibility_with_path(&method_name, file_id),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span,
+                    declaration_line,
                 });
 
                 // Emit Contains relation from receiver type to method
@@ -569,11 +658,13 @@ fn extract_go_node(
 
                 let mut ref_seen = std::collections::HashSet::new();
                 let receiver = GoMethodReceiver::from_method(node, source);
+                let calls = typing.for_function(node, source);
                 extract_calls_from_body(
                     node,
                     source,
                     &qualified,
                     receiver.as_ref(),
+                    &calls,
                     relations,
                     call_prefixes,
                     &mut ref_seen,
@@ -583,157 +674,17 @@ fn extract_go_node(
         "type_declaration" => {
             let mut cursor = node.walk();
             for spec in node.children(&mut cursor) {
-                // `type Name = Other` is a `type_alias` node rather than a
-                // `type_spec`. It declares a name exactly as a spec does, so it
-                // is a TypeAlias entity spanning its own node; skipping it left
-                // an alias invisible to every graph query.
-                if spec.kind() == "type_alias" {
-                    if let Some(name_node) = spec.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        entities.push(ExtractedEntity {
-                            kind: EntityKind::TypeAlias,
-                            name: name.clone(),
-                            signature: node_signature(&spec, source),
-                            visibility: go_visibility(&name),
-                            doc_summary: extract_preceding_comment(node, source),
-                            fingerprint: compute_fingerprint(&spec, source),
-                            span: span_from_node(&spec, file_id),
-                            declaration_line: None,
-                        });
-                    }
+                let Some(name) = spec
+                    .child_by_field_name("name")
+                    .filter(|_| matches!(spec.kind(), "type_spec" | "type_alias"))
+                    .map(|name_node| name_node.utf8_text(source).unwrap_or("").to_string())
+                else {
                     continue;
-                }
-                if spec.kind() == "type_spec" {
-                    if let Some(name_node) = spec.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        let type_node = spec.child_by_field_name("type");
-                        let kind = match type_node.map(|t| t.kind()) {
-                            Some("struct_type") => EntityKind::Class,
-                            Some("interface_type") => EntityKind::Interface,
-                            _ => EntityKind::TypeAlias,
-                        };
-
-                        // For interfaces, extract the contract surface as
-                        // first-class entities: every method spec becomes a
-                        // Method entity (qualified `Interface.Method`, like
-                        // concrete `Receiver.Method`), contained by the
-                        // interface — so the contract is retrievable, not just
-                        // an inference input. Embedded interfaces are recorded
-                        // for Extends edges and same-file method-set expansion.
-                        if kind == EntityKind::Interface {
-                            if let Some(ref iface_node) = type_node {
-                                let members =
-                                    extract_interface_members(iface_node, source, file_id);
-                                for member in &members.methods {
-                                    let qualified = format!("{}.{}", name, member.name);
-                                    entities.push(ExtractedEntity {
-                                        kind: EntityKind::Method,
-                                        name: qualified.clone(),
-                                        signature: member.signature.clone(),
-                                        visibility: go_visibility_with_path(&member.name, file_id),
-                                        doc_summary: member.doc_summary.clone(),
-                                        fingerprint: member.fingerprint.clone(),
-                                        span: member.span.clone(),
-                                        declaration_line: None,
-                                    });
-                                    relations.push(ExtractedRelation {
-                                        site: None,
-                                        receiver: None,
-                                        call_shape: None,
-                                        kind: kin_model::RelationKind::Contains,
-                                        src_name: name.clone(),
-                                        dst_name: qualified,
-                                        import_source: None,
-                                    });
-                                }
-                                for embedded in &members.embedded {
-                                    relations.push(ExtractedRelation {
-                                        site: None,
-                                        receiver: None,
-                                        call_shape: None,
-                                        kind: kin_model::RelationKind::Extends,
-                                        src_name: name.clone(),
-                                        dst_name: embedded.clone(),
-                                        import_source: None,
-                                    });
-                                }
-                                interface_methods.push((
-                                    name.clone(),
-                                    InterfaceContract {
-                                        method_names: members
-                                            .methods
-                                            .iter()
-                                            .map(|member| member.name.clone())
-                                            .collect(),
-                                        embedded: members.embedded,
-                                    },
-                                ));
-                            }
-                        }
-
-                        // For structs, detect embedded types and emit Extends
-                        // relations. Go embedded types provide method forwarding
-                        // similar to inheritance.
-                        if kind == EntityKind::Class {
-                            if let Some(ref struct_node) = type_node {
-                                for embedded in extract_embedded_types(struct_node, source) {
-                                    relations.push(ExtractedRelation {
-                                        site: None,
-                                        receiver: None,
-                                        call_shape: None,
-                                        kind: kin_model::RelationKind::Extends,
-                                        src_name: name.clone(),
-                                        dst_name: embedded,
-                                        import_source: None,
-                                    });
-                                }
-
-                                // Every NAMED field becomes a first-class entity,
-                                // owner-qualified (`Struct.Field`) the same way a
-                                // method is `Receiver.Method`, so it is
-                                // addressable and `find_references` has
-                                // something in the graph to answer against. An
-                                // embedded field (no name at all) stays out of
-                                // this: it already produced the Extends relation
-                                // above, and Go reaches its promoted members
-                                // through THAT type's own fields, not through an
-                                // entity named after the embedder.
-                                for field in extract_struct_fields(struct_node, source, file_id) {
-                                    let qualified = format!("{}.{}", name, field.name);
-                                    entities.push(ExtractedEntity {
-                                        kind: EntityKind::Field,
-                                        name: qualified.clone(),
-                                        signature: field.signature,
-                                        visibility: go_visibility_with_path(&field.name, file_id),
-                                        doc_summary: field.doc_summary,
-                                        fingerprint: field.fingerprint,
-                                        span: field.span,
-                                        declaration_line: None,
-                                    });
-                                    relations.push(ExtractedRelation {
-                                        site: None,
-                                        receiver: None,
-                                        call_shape: None,
-                                        kind: kin_model::RelationKind::Contains,
-                                        src_name: name.clone(),
-                                        dst_name: qualified,
-                                        import_source: None,
-                                    });
-                                }
-                            }
-                        }
-
-                        entities.push(ExtractedEntity {
-                            kind,
-                            name,
-                            signature: node_signature(&spec, source),
-                            visibility: go_visibility(name_node.utf8_text(source).unwrap_or("")),
-                            doc_summary: extract_preceding_comment(node, source),
-                            fingerprint: compute_fingerprint(&spec, source),
-                            span: span_from_node(&spec, file_id),
-                            declaration_line: None,
-                        });
-                    }
+                };
+                if let Some(contract) = extract_go_type_spec(
+                    &spec, node, name, false, source, file_id, entities, relations,
+                ) {
+                    interface_methods.push(contract);
                 }
             }
         }
@@ -761,6 +712,7 @@ fn extract_go_node(
                         } else {
                             EntityKind::StaticVar
                         };
+                        let (span, declaration_line) = go_entity_span(&spec, node, source, file_id);
                         entities.push(ExtractedEntity {
                             kind,
                             name: name.clone(),
@@ -768,8 +720,8 @@ fn extract_go_node(
                             visibility: go_visibility(name_node.utf8_text(source).unwrap_or("")),
                             doc_summary: extract_preceding_comment(node, source),
                             fingerprint: compute_fingerprint(&spec, source),
-                            span: span_from_node(&spec, file_id),
-                            declaration_line: None,
+                            span,
+                            declaration_line,
                         });
 
                         // A package-level const/var initializer references the
@@ -788,6 +740,231 @@ fn extract_go_node(
         "import_declaration" => {}
         _ => {}
     }
+}
+
+/// Extract one spec of a `type` declaration as the entity named `name`, with
+/// its members, returning the contract an interface declares.
+///
+/// A package-level type is named as written. A type declared in a function
+/// body is named `enclosing.<locals>.T` (see [`crate::nested`]) and passes
+/// `local`, which keeps its members private: nothing outside the function can
+/// name them. Everything else is extracted exactly as a package-level type is.
+#[allow(clippy::too_many_arguments)]
+fn extract_go_type_spec(
+    spec: &tree_sitter::Node,
+    declaration: &tree_sitter::Node,
+    name: String,
+    local: bool,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) -> Option<(String, InterfaceContract)> {
+    let leaf = spec
+        .child_by_field_name("name")
+        .map(|name_node| name_node.utf8_text(source).unwrap_or("").to_string())
+        .unwrap_or_default();
+    let member_visibility = |member: &str| {
+        if local {
+            Visibility::Private
+        } else {
+            go_visibility_with_path(member, file_id)
+        }
+    };
+    let own_visibility = if local {
+        Visibility::Private
+    } else {
+        go_visibility(&leaf)
+    };
+    // `type Name = Other` is a `type_alias` node rather than a `type_spec`. It
+    // declares a name exactly as a spec does, so it is a TypeAlias entity
+    // spanning its own node; skipping it left an alias invisible to every
+    // graph query.
+    if spec.kind() == "type_alias" {
+        let (span, declaration_line) = go_entity_span(spec, declaration, source, file_id);
+        entities.push(ExtractedEntity {
+            kind: EntityKind::TypeAlias,
+            name,
+            signature: node_signature(spec, source),
+            visibility: own_visibility,
+            doc_summary: extract_preceding_comment(declaration, source),
+            fingerprint: compute_fingerprint(spec, source),
+            span,
+            declaration_line,
+        });
+        return None;
+    }
+    let type_node = spec.child_by_field_name("type");
+    let kind = match type_node.map(|t| t.kind()) {
+        Some("struct_type") => EntityKind::Class,
+        Some("interface_type") => EntityKind::Interface,
+        _ => EntityKind::TypeAlias,
+    };
+    let mut contract = None;
+
+    // For interfaces, extract the contract surface as first-class entities:
+    // every method spec becomes a Method entity (qualified
+    // `Interface.Method`, like concrete `Receiver.Method`), contained by the
+    // interface — so the contract is retrievable, not just an inference
+    // input. Embedded interfaces are recorded for Extends edges and same-file
+    // method-set expansion.
+    if kind == EntityKind::Interface {
+        if let Some(ref iface_node) = type_node {
+            let members = extract_interface_members(iface_node, source, file_id);
+            for member in &members.methods {
+                let qualified = format!("{}.{}", name, member.name);
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Method,
+                    name: qualified.clone(),
+                    signature: member.signature.clone(),
+                    visibility: member_visibility(&member.name),
+                    doc_summary: member.doc_summary.clone(),
+                    fingerprint: member.fingerprint.clone(),
+                    span: member.span.clone(),
+                    declaration_line: None,
+                });
+                relations.push(ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: name.clone(),
+                    dst_name: qualified,
+                    import_source: None,
+                });
+            }
+            for embedded in &members.embedded {
+                relations.push(ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Extends,
+                    src_name: name.clone(),
+                    dst_name: embedded.clone(),
+                    import_source: None,
+                });
+            }
+            contract = Some((
+                name.clone(),
+                InterfaceContract {
+                    method_names: members
+                        .methods
+                        .iter()
+                        .map(|member| member.name.clone())
+                        .collect(),
+                    embedded: members.embedded,
+                },
+            ));
+        }
+    }
+
+    // For structs, detect embedded types and emit Extends relations. Go
+    // embedded types provide method forwarding similar to inheritance.
+    if kind == EntityKind::Class {
+        if let Some(ref struct_node) = type_node {
+            for embedded in extract_embedded_types(struct_node, source) {
+                relations.push(ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Extends,
+                    src_name: name.clone(),
+                    dst_name: embedded,
+                    import_source: None,
+                });
+            }
+
+            // Every NAMED field becomes a first-class entity, owner-qualified
+            // (`Struct.Field`) the same way a method is `Receiver.Method`, so
+            // it is addressable and `find_references` has something in the
+            // graph to answer against. An embedded field (no name at all)
+            // stays out of this: it already produced the Extends relation
+            // above, and Go reaches its promoted members through THAT type's
+            // own fields, not through an entity named after the embedder.
+            for field in extract_struct_fields(struct_node, source, file_id) {
+                let qualified = format!("{}.{}", name, field.name);
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Field,
+                    name: qualified.clone(),
+                    signature: field.signature,
+                    visibility: member_visibility(&field.name),
+                    doc_summary: field.doc_summary,
+                    fingerprint: field.fingerprint,
+                    span: field.span,
+                    declaration_line: None,
+                });
+                relations.push(ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: name.clone(),
+                    dst_name: qualified,
+                    import_source: None,
+                });
+            }
+        }
+    }
+
+    let (span, declaration_line) = go_entity_span(spec, declaration, source, file_id);
+    entities.push(ExtractedEntity {
+        kind,
+        name,
+        signature: node_signature(spec, source),
+        visibility: own_visibility,
+        doc_summary: extract_preceding_comment(declaration, source),
+        fingerprint: compute_fingerprint(spec, source),
+        span,
+        declaration_line,
+    });
+    contract
+}
+
+/// The comments directly above a Go declaration that belong to it: its doc
+/// comment, and any directive written with it (`//go:noinline`). Go attaches
+/// them only when each starts its own line and no blank line stands between
+/// them and the declaration.
+pub(crate) fn go_leading_comments<'t>(
+    node: &tree_sitter::Node<'t>,
+    source: &[u8],
+) -> Vec<tree_sitter::Node<'t>> {
+    leading_run(node, true, |sibling| {
+        let starts_line = source[..sibling.start_byte()]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte != b'\n')
+            .all(|byte| byte.is_ascii_whitespace());
+        if sibling.kind() == "comment" && starts_line {
+            Leading::Owned
+        } else {
+            Leading::Stop
+        }
+    })
+}
+
+/// The span of a Go entity and the line its id keys on. A function or method
+/// spans its declaration. A `type`, `var` or `const` declaration of one spec
+/// spans from its keyword, so the entity holds the whole declaration, while a
+/// spec inside a parenthesized group spans itself. Either way the comments
+/// directly above belong to it.
+fn go_entity_span(
+    spec: &tree_sitter::Node,
+    declaration: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+) -> (SourceSpan, Option<u32>) {
+    let grouped = spec.id() != declaration.id()
+        && (spec.parent().map(|parent| parent.id()) != Some(declaration.id()) || {
+            let mut cursor = declaration.walk();
+            let open = declaration
+                .children(&mut cursor)
+                .any(|child| child.kind() == "(");
+            open
+        });
+    let node = if grouped { *spec } else { *declaration };
+    let span = span_with_leading(&node, &go_leading_comments(&node, source), file_id);
+    let line = declaration_line(spec, &span);
+    (span, line)
 }
 
 /// Extract embedded type names from a Go struct_type node.
@@ -1368,11 +1545,13 @@ fn collect_receiver_shadows(
 /// side channel in `call_prefixes` — parallel to `relations` at the index of
 /// the just-pushed relation — so the import-map post-pass can still annotate
 /// package calls with their source module.
+#[allow(clippy::too_many_arguments)]
 fn extract_calls_from_body(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
     method_receiver: Option<&GoMethodReceiver>,
+    typing: &CallTyping<'_>,
     relations: &mut Vec<ExtractedRelation>,
     call_prefixes: &mut Vec<(usize, String)>,
     ref_seen: &mut ValueReadsSeen,
@@ -1449,9 +1628,43 @@ fn extract_calls_from_body(
                     });
                     let declared_receiver = local_receiver
                         .filter(|receiver| receiver.binds(&receiver.name, child.start_byte()));
-                    let callee = declared_receiver
-                        .map(|receiver| format!("{}.{}", receiver.owner, callee))
-                        .unwrap_or(callee);
+                    // A local the function's value-origin facts bind is a
+                    // value, never a package, so the call carries it as its
+                    // receiver and the linker types it from those facts.
+                    let typed_local = prefix
+                        .as_deref()
+                        .filter(|prefix| {
+                            local_receiver.is_none() && typing.carries_receiver(prefix)
+                        })
+                        .map(str::to_string);
+                    // `x.field.Method()` through fields the file's own struct
+                    // types declare, on a type that declares the method here.
+                    let field_owner = function
+                        .child_by_field_name("operand")
+                        .filter(|operand| {
+                            function.kind() == "selector_expression"
+                                && operand.kind() == "selector_expression"
+                        })
+                        .and_then(|operand| {
+                            typing
+                                .chain_type(&operand, source, method_receiver, child.start_byte())
+                                .filter(|owner| {
+                                    typing.file.class_like(owner)
+                                        && typing.declares_method(owner, &callee)
+                                })
+                                .map(|owner| (owner, normalize_go_contract_expr(&operand, source)))
+                        });
+                    let (callee, receiver) = match field_owner {
+                        Some((owner, operand)) => (format!("{owner}.{callee}"), Some(operand)),
+                        None => (
+                            declared_receiver
+                                .map(|receiver| format!("{}.{}", receiver.owner, callee))
+                                .unwrap_or(callee),
+                            local_receiver
+                                .map(|receiver| receiver.name.clone())
+                                .or_else(|| typed_local.clone()),
+                        ),
+                    };
                     let idx = relations.len();
                     relations.push(ExtractedRelation {
                         // The call expression itself, so a reference row can
@@ -1459,14 +1672,16 @@ fn extract_calls_from_body(
                         // linker has no span to store and every consuming
                         // surface reports the edge as having no evidence span.
                         site: Some(crate::adapter::site_from_node(&child)),
-                        receiver: local_receiver.map(|receiver| receiver.name.clone()),
+                        receiver,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
                         import_source: None,
                     });
-                    if let Some(p) = prefix.filter(|_| local_receiver.is_none()) {
+                    if let Some(p) =
+                        prefix.filter(|_| local_receiver.is_none() && typed_local.is_none())
+                    {
                         call_prefixes.push((idx, p));
                     }
                 }
@@ -1517,6 +1732,7 @@ fn extract_calls_from_body(
             source,
             context_name,
             method_receiver,
+            typing,
             relations,
             call_prefixes,
             ref_seen,
@@ -1794,6 +2010,529 @@ fn extract_go_import_spec(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
     })
 }
 
+// ── Receiver typing ───────────────────────────────────────────────────────
+
+/// What a file lets the adapter know, while it extracts calls, about the
+/// values those calls go through.
+///
+/// Two things. A call through a local the function's value-origin facts bind
+/// carries that local as its receiver, so the linker's receiver-origin tier
+/// types it from the same facts (see [`crate::value_origins`]). And a call
+/// through a chain of fields, `x.store.Load()`, is typed here when every link
+/// is written in this file: `x` is the method receiver or a local declared
+/// with a type, each field is one this file's struct type declares directly
+/// with a single named type, and the last type declares the method in this
+/// file. The call is then named `Store.Load`, the owner-qualified shape a
+/// receiver call already takes, and the linker resolves it inside this file.
+/// A chain any link of which is written elsewhere, or reached by promotion
+/// through an embedded field, is left as the adapter always left it.
+///
+/// A file whose tree holds a parse error types nothing: the recovered tree
+/// can drop the very declaration that makes a local single, and the linker
+/// finds no facts on such a file's entities to type a receiver with.
+#[derive(Default)]
+struct GoFileTyping {
+    file: super::go_escape::GoFile,
+    /// The named fields of each package-level struct type the file declares,
+    /// with the one unqualified named type each field is declared with.
+    fields: HashMap<String, HashMap<String, String>>,
+    /// Every (type, method) the file declares: a method on one of its types,
+    /// or a method one of its interfaces lists.
+    methods: std::collections::HashSet<(String, String)>,
+    /// Every package-level type the file declares, and whether it is a struct
+    /// or an interface: the types the linker locates a method on.
+    types: HashMap<String, bool>,
+    /// The package-level functions the file declares.
+    functions: std::collections::HashSet<String>,
+    /// Whether the file parsed cleanly, so typing applies.
+    clean: bool,
+}
+
+impl GoFileTyping {
+    fn read(tree: &Tree, source: &[u8]) -> Self {
+        let root = tree.root_node();
+        if root.has_error() {
+            return Self::default();
+        }
+        let mut typing = Self {
+            file: super::go_escape::GoFile::read(root, source),
+            clean: true,
+            ..Self::default()
+        };
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            match child.kind() {
+                "function_declaration" => {
+                    if let Some(name) = child
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source).ok())
+                    {
+                        typing.functions.insert(name.to_string());
+                    }
+                }
+                "method_declaration" => {
+                    let owner = method_receiver_type(&child, source);
+                    let name = child
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source).ok());
+                    if let (Some(owner), Some(name)) = (owner, name) {
+                        typing.methods.insert((owner, name.to_string()));
+                    }
+                }
+                "type_declaration" => {
+                    let mut specs = child.walk();
+                    for spec in child.named_children(&mut specs) {
+                        if spec.kind() == "type_spec" {
+                            typing.read_type(&spec, source);
+                        } else if let Some(name) = spec
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(source).ok())
+                        {
+                            typing.types.insert(name.to_string(), false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        typing
+    }
+
+    fn read_type(&mut self, spec: &tree_sitter::Node, source: &[u8]) {
+        let (Some(name), Some(body)) = (
+            spec.child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok()),
+            spec.child_by_field_name("type"),
+        ) else {
+            return;
+        };
+        self.types.insert(
+            name.to_string(),
+            matches!(body.kind(), "struct_type" | "interface_type"),
+        );
+        let mut parameters = std::collections::HashSet::new();
+        if let Some(list) = spec.child_by_field_name("type_parameters") {
+            let mut stack = vec![list];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "type_parameter_declaration" {
+                    let mut cursor = node.walk();
+                    for parameter in node.children_by_field_name("name", &mut cursor) {
+                        parameters.insert(parameter.utf8_text(source).unwrap_or("").to_string());
+                    }
+                    continue;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        match body.kind() {
+            "interface_type" => {
+                let mut cursor = body.walk();
+                for element in body.named_children(&mut cursor) {
+                    if element.kind() != "method_elem" {
+                        continue;
+                    }
+                    if let Some(method) = element
+                        .child_by_field_name("name")
+                        .and_then(|method| method.utf8_text(source).ok())
+                    {
+                        self.methods.insert((name.to_string(), method.to_string()));
+                    }
+                }
+            }
+            "struct_type" => {
+                let mut fields = HashMap::new();
+                let mut stack = vec![body];
+                while let Some(node) = stack.pop() {
+                    if node.kind() == "field_declaration" {
+                        let declared = node
+                            .child_by_field_name("type")
+                            .and_then(|type_node| field_type(&type_node, source, &parameters));
+                        let mut cursor = node.walk();
+                        for field in node.children_by_field_name("name", &mut cursor) {
+                            if let Some(type_name) = &declared {
+                                let field = field.utf8_text(source).unwrap_or("").to_string();
+                                fields.insert(field, type_name.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    if matches!(node.kind(), "struct_type" | "field_declaration_list") {
+                        let mut cursor = node.walk();
+                        stack.extend(node.named_children(&mut cursor));
+                    }
+                }
+                self.fields.insert(name.to_string(), fields);
+            }
+            _ => {}
+        }
+    }
+
+    /// The typing of one function's calls, from its value-origin facts.
+    fn for_function<'a>(&'a self, function: &tree_sitter::Node, source: &[u8]) -> CallTyping<'a> {
+        let mut typing = CallTyping {
+            file: self,
+            origins: BTreeMap::new(),
+        };
+        if self.clean {
+            typing.origins =
+                crate::value_origins::go::scope_facts(*function, source, &self.file).bindings;
+        }
+        typing
+    }
+
+    /// Whether the file declares `name` as a struct or interface type.
+    fn class_like(&self, name: &str) -> bool {
+        self.types.get(name) == Some(&true)
+    }
+}
+
+/// The one unqualified named type a struct field is declared with: `T`, `*T`
+/// or `T[...]`, never a type parameter of the struct or a predeclared type.
+fn field_type(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    parameters: &std::collections::HashSet<String>,
+) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node.utf8_text(source).ok()?;
+            (!super::go_escape::GO_UNIVERSE.contains(&name) && !parameters.contains(name))
+                .then(|| name.to_string())
+        }
+        "pointer_type" => {
+            let inner = node.named_child(0)?;
+            (inner.kind() != "pointer_type")
+                .then(|| field_type(&inner, source, parameters))
+                .flatten()
+        }
+        "generic_type" => field_type(&node.child_by_field_name("type")?, source, parameters),
+        _ => None,
+    }
+}
+
+/// The typing of one function's calls.
+struct CallTyping<'a> {
+    file: &'a GoFileTyping,
+    /// The function's value-origin bindings, by the name they bind.
+    origins: BTreeMap<String, crate::value_origins::ValueOrigin>,
+}
+
+impl CallTyping<'_> {
+    /// Whether a call through the bound local `name` should carry the local as
+    /// its receiver, so the linker types it from the facts.
+    ///
+    /// The linker finds a type, its methods and a function in any file of the
+    /// package, so a chain this file cannot finish may still be followed:
+    /// only a chain that dead-ends in this file (a local no fact binds) keeps
+    /// the shape it had before value origins existed, and the name tiers that
+    /// settled it then.
+    fn carries_receiver(&self, name: &str) -> bool {
+        self.origins
+            .get(name)
+            .is_some_and(|origin| self.follows(origin, 0))
+    }
+
+    /// Whether the linker may follow `origin` to a type: every link that is a
+    /// local of this function is bound.
+    fn follows(&self, origin: &crate::value_origins::ValueOrigin, depth: usize) -> bool {
+        use crate::value_origins::ValueOrigin;
+        if depth > 8 {
+            return false;
+        }
+        match origin {
+            ValueOrigin::Local { name } => self
+                .origins
+                .get(name)
+                .is_some_and(|bound| self.follows(bound, depth + 1)),
+            ValueOrigin::MethodCall { receiver, .. } => self.follows(receiver, depth + 1),
+            _ => true,
+        }
+    }
+
+    /// The type a chain of selectors holds, when every link is written in this
+    /// file: see [`GoFileTyping`].
+    fn chain_type(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        method_receiver: Option<&GoMethodReceiver>,
+        at: usize,
+    ) -> Option<String> {
+        match node.kind() {
+            "identifier" => {
+                let name = node.utf8_text(source).ok()?;
+                if let Some(receiver) = method_receiver.filter(|receiver| receiver.name == name) {
+                    return receiver.binds(name, at).then(|| receiver.owner.clone());
+                }
+                match self.origins.get(name) {
+                    Some(crate::value_origins::ValueOrigin::Declared { type_name })
+                        if !type_name.contains('.') =>
+                    {
+                        Some(type_name.clone())
+                    }
+                    _ => None,
+                }
+            }
+            "selector_expression" => {
+                let owner = self.chain_type(
+                    &node.child_by_field_name("operand")?,
+                    source,
+                    method_receiver,
+                    at,
+                )?;
+                let field = node.child_by_field_name("field")?.utf8_text(source).ok()?;
+                self.file.fields.get(&owner)?.get(field).cloned()
+            }
+            "parenthesized_expression" => {
+                self.chain_type(&node.named_child(0)?, source, method_receiver, at)
+            }
+            _ => None,
+        }
+    }
+
+    fn declares_method(&self, owner: &str, method: &str) -> bool {
+        self.file
+            .methods
+            .contains(&(owner.to_string(), method.to_string()))
+    }
+}
+
+// ── Nested definitions ────────────────────────────────────────────────────
+
+/// Admit the types declared in function bodies and record the function
+/// literals bound to a name there.
+///
+/// A type declared inside a function (`type result struct{...}` in a test,
+/// `type closer interface{ Close() error }` for an assertion) is a declaration
+/// like any other: code reads its fields and calls through its interface
+/// methods. It is extracted exactly as a package-level type is, named
+/// `enclosing.<locals>.T` by [`crate::nested`]'s rule with every named
+/// function literal between the enclosing entity and the type as a scope of
+/// its own (`Run.<locals>.helper.<locals>.T`), and contained by the enclosing
+/// entity. Its members are private. A second type that would mint the same
+/// name is recorded instead of admitted. Local types stay out of the file's
+/// interface satisfaction inference.
+///
+/// A function literal bound to a name (`helper := func() {...}`, `var walk
+/// func(); walk = func() {...}`) is recorded as not admitted, and the calls in
+/// its body stay with the enclosing entity, which is where every Go-aware tier
+/// of the linker expects a method's own calls to be. So is anything declared
+/// inside a package-level variable's function literal, whose holder is a
+/// variable rather than a function body.
+fn extract_go_nested_definitions(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) -> crate::nested::NestedDefinitionCensus {
+    let mut pass = NestedPass {
+        source,
+        file_id,
+        census: crate::nested::NestedDefinitionCensus::default(),
+        names: crate::nested::LocalScopeNames::default(),
+        bound: HashMap::new(),
+    };
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "function_declaration" | "method_declaration" => {
+                let Some(name) = child
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                else {
+                    continue;
+                };
+                let holder = if child.kind() == "method_declaration" {
+                    match method_receiver_type(&child, source).filter(|owner| !owner.is_empty()) {
+                        Some(owner) => format!("{owner}.{name}"),
+                        None => name.to_string(),
+                    }
+                } else {
+                    name.to_string()
+                };
+                if let Some(body) = child.child_by_field_name("body") {
+                    let scopes = super::go_escape::FunctionScopes::of(child, source);
+                    pass.bind_literals(body, &scopes);
+                    pass.visit(body, &holder, true, &mut Vec::new(), entities, relations);
+                }
+            }
+            "var_declaration" | "const_declaration" => {
+                for spec in super::go_escape::specs_of(child) {
+                    let (Some(holder), Some(value)) = (
+                        spec_entity_name(&spec, source),
+                        spec.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    let scopes = super::go_escape::FunctionScopes::of(value, source);
+                    pass.bind_literals(value, &scopes);
+                    pass.visit(value, &holder, false, &mut Vec::new(), entities, relations);
+                }
+            }
+            _ => {}
+        }
+    }
+    pass.census
+}
+
+struct NestedPass<'s> {
+    source: &'s [u8],
+    file_id: &'s FilePathId,
+    census: crate::nested::NestedDefinitionCensus,
+    names: crate::nested::LocalScopeNames,
+    /// The name each named function literal is bound to, by node id.
+    bound: HashMap<usize, (String, usize)>,
+}
+
+impl NestedPass<'_> {
+    /// Find every function literal the statements under `node` bind to a
+    /// name, and record each.
+    fn bind_literals(
+        &mut self,
+        node: tree_sitter::Node,
+        scopes: &super::go_escape::FunctionScopes,
+    ) {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if matches!(
+                current.kind(),
+                "short_var_declaration" | "var_spec" | "assignment_statement"
+            ) {
+                for (name, literal) in
+                    super::go_declarations::bound_literals(current, self.source, scopes)
+                {
+                    self.bound
+                        .insert(literal.id(), (name, current.start_position().row));
+                }
+            }
+            let mut cursor = current.walk();
+            stack.extend(current.named_children(&mut cursor));
+        }
+    }
+
+    fn visit(
+        &mut self,
+        node: tree_sitter::Node,
+        holder: &str,
+        admits: bool,
+        closures: &mut Vec<String>,
+        entities: &mut Vec<ExtractedEntity>,
+        relations: &mut Vec<ExtractedRelation>,
+    ) {
+        let mut cursor = node.walk();
+        let children: Vec<tree_sitter::Node> = node.named_children(&mut cursor).collect();
+        for child in children {
+            match child.kind() {
+                "type_declaration" => {
+                    self.declare_types(child, holder, admits, closures, entities, relations);
+                }
+                "func_literal" => {
+                    let named = self.bound.get(&child.id()).cloned();
+                    if let Some((name, line)) = &named {
+                        self.census
+                            .record(crate::nested::UnadmittedNestedDefinition {
+                                name: qualify(holder, closures, name),
+                                kind: EntityKind::Function,
+                                start_line: *line as u32,
+                                enclosing: Some(holder.to_string()),
+                                bases: Vec::new(),
+                            });
+                        closures.push(name.clone());
+                    }
+                    self.visit(child, holder, admits, closures, entities, relations);
+                    if named.is_some() {
+                        closures.pop();
+                    }
+                }
+                _ => self.visit(child, holder, admits, closures, entities, relations),
+            }
+        }
+    }
+
+    fn declare_types(
+        &mut self,
+        declaration: tree_sitter::Node,
+        holder: &str,
+        admits: bool,
+        closures: &[String],
+        entities: &mut Vec<ExtractedEntity>,
+        relations: &mut Vec<ExtractedRelation>,
+    ) {
+        let mut cursor = declaration.walk();
+        let specs: Vec<tree_sitter::Node> = declaration.named_children(&mut cursor).collect();
+        for spec in specs {
+            if !matches!(spec.kind(), "type_spec" | "type_alias") {
+                continue;
+            }
+            let Some(raw) = spec
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(self.source).ok())
+                .filter(|name| !name.is_empty() && *name != "_")
+            else {
+                continue;
+            };
+            let name = qualify(holder, closures, raw);
+            if admits && self.names.claim(&name) {
+                extract_go_type_spec(
+                    &spec,
+                    &declaration,
+                    name.clone(),
+                    true,
+                    self.source,
+                    self.file_id,
+                    entities,
+                    relations,
+                );
+                relations.push(ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: holder.to_string(),
+                    dst_name: name,
+                    import_source: None,
+                });
+                continue;
+            }
+            let body = spec.child_by_field_name("type");
+            let (kind, bases) = match (spec.kind(), body.map(|body| body.kind())) {
+                ("type_spec", Some("struct_type")) => (
+                    EntityKind::Class,
+                    body.map(|body| extract_embedded_types(&body, self.source))
+                        .unwrap_or_default(),
+                ),
+                ("type_spec", Some("interface_type")) => (
+                    EntityKind::Interface,
+                    body.map(|body| {
+                        extract_interface_members(&body, self.source, self.file_id).embedded
+                    })
+                    .unwrap_or_default(),
+                ),
+                _ => (EntityKind::TypeAlias, Vec::new()),
+            };
+            self.census
+                .record(crate::nested::UnadmittedNestedDefinition {
+                    name,
+                    kind,
+                    start_line: spec.start_position().row as u32,
+                    enclosing: Some(holder.to_string()),
+                    bases,
+                });
+        }
+    }
+}
+
+/// `holder.<locals>.closure.<locals>.name`: see [`crate::nested`].
+fn qualify(holder: &str, closures: &[String], name: &str) -> String {
+    let mut qualified = holder.to_string();
+    for closure in closures {
+        qualified = crate::nested::local_scope_name(&qualified, closure);
+    }
+    crate::nested::local_scope_name(&qualified, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1921,7 +2660,7 @@ mod tests {
         let alias = output.entities.iter().find(|e| e.name == "Key").unwrap();
         assert_eq!(
             &source[alias.span.start_byte..alias.span.end_byte],
-            b"Key = string"
+            b"type Key = string"
         );
     }
 
@@ -2890,5 +3629,52 @@ func rename(t *Task, next string) {
                 .map(|e| (e.kind, e.name.as_str()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A Go entity spans its whole declaration: the comments directly above
+    /// it, and for a declaration of one spec the keyword that opens it. A
+    /// grouped spec spans itself with the comment above it inside the group,
+    /// and a comment trailing the line above is no one's documentation.
+    #[test]
+    fn spans_hold_the_whole_declaration_with_its_comments() {
+        let source = b"package p\n\n// Total sums.\n//go:noinline\nfunc Total() int { return 1 }\n\n// Account is a balance.\ntype Account struct {\n\tbalance int\n}\n\ntype (\n\t// A is first.\n\tA int\n\tB string\n)\n\n// ErrNone is nothing.\nvar ErrNone = 1\n\nvar x = 1 // trailing\nfunc After() {}\n";
+        let tree = GoAdapter.parse(source).unwrap();
+        let output = GoAdapter
+            .extract(&tree, source, &FilePathId::new("p.go"))
+            .unwrap();
+        let text = |name: &str| {
+            let entity = output
+                .entities
+                .iter()
+                .find(|entity| entity.name == name && entity.kind != EntityKind::Module)
+                .unwrap_or_else(|| panic!("no entity {name}"));
+            std::str::from_utf8(&source[entity.span.start_byte..entity.span.end_byte])
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            text("Total"),
+            "// Total sums.\n//go:noinline\nfunc Total() int { return 1 }"
+        );
+        assert_eq!(
+            text("Account"),
+            "// Account is a balance.\ntype Account struct {\n\tbalance int\n}"
+        );
+        assert_eq!(text("A"), "// A is first.\n\tA int");
+        assert_eq!(text("B"), "B string");
+        assert_eq!(text("ErrNone"), "// ErrNone is nothing.\nvar ErrNone = 1");
+        assert_eq!(text("After"), "func After() {}");
+        let line = |name: &str| {
+            output
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap()
+                .declaration_line
+        };
+        // Ids key on the declaration's own line, not the widened span start.
+        assert_eq!(line("Total"), Some(4));
+        assert_eq!(line("Account"), Some(7));
+        assert_eq!(line("After"), None);
     }
 }

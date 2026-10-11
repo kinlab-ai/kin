@@ -328,40 +328,8 @@ fn is_dead_code_candidate(entity: &Entity) -> bool {
 }
 
 fn is_nonproduction_path(file_origin: Option<&FilePathId>) -> bool {
-    let Some(file_origin) = file_origin else {
-        return false;
-    };
-
-    let normalized = file_origin.0.to_ascii_lowercase().replace('\\', "/");
-    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
-
-    file_name == "conftest.py"
-        || file_name.starts_with("test_")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("_test.rs")
-        || file_name.ends_with("_test.go")
-        || file_name.ends_with(".spec.ts")
-        || file_name.ends_with(".spec.tsx")
-        || file_name.ends_with(".spec.js")
-        || file_name.ends_with(".spec.jsx")
-        || normalized.contains("/test/")
-        || normalized.contains("/tests/")
-        || normalized.contains("/testing/")
-        || normalized.starts_with("test/")
-        || normalized.starts_with("tests/")
-        || normalized.starts_with("testing/")
-        || normalized.contains("/example/")
-        || normalized.contains("/examples/")
-        || normalized.starts_with("example/")
-        || normalized.starts_with("examples/")
-        || normalized.contains("/bench/")
-        || normalized.contains("/benches/")
-        || normalized.contains("/benchmark/")
-        || normalized.contains("/benchmarks/")
-        || normalized.starts_with("bench/")
-        || normalized.starts_with("benches/")
-        || normalized.starts_with("benchmark/")
-        || normalized.starts_with("benchmarks/")
+    file_origin
+        .is_some_and(|file_origin| kin_model::test_paths::is_nonproduction_path(&file_origin.0))
 }
 
 fn is_runtime_magic_method(entity: &Entity) -> bool {

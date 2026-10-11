@@ -42,7 +42,30 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # A receiver run that found the Kin registry unavailable succeeds without
+      # writing a result, and says so with its own artifact. Only that exact
+      # pairing (marker present, result absent) skips; anything else proceeds
+      # and fails loudly on the missing result as before.
+      - name: Detect a registry-unavailable receiver run
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          names="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name')"
+          suffix="${SOURCE_RUN_ID}-${SOURCE_RUN_ATTEMPT}"
+          if grep -qxF "kin-registry-unavailable-${suffix}" <<<"$names" \
+            && ! grep -qxF "kin-registry-result-${suffix}" <<<"$names"; then
+            echo "::warning title=Kin registry unavailable::receiver run ${SOURCE_RUN_ID} skipped its wave; nothing to attest"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download the exact completed-run admission
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           name: kin-registry-result-${{ env.SOURCE_RUN_ID }}-${{ env.SOURCE_RUN_ATTEMPT }}
@@ -52,6 +75,7 @@ jobs:
 
       - name: Validate terminal server authority and live admitted head
         id: validate
+        if: steps.gate.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

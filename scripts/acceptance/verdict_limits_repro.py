@@ -28,15 +28,16 @@ winning. These checks hold the envelope to it on a live store:
               while the verdict certifies; when one does, the verdict is
               inconclusive, its limiting factor names the class, the
               completeness status is not `complete`, the bound is a floor, and
-              `limits` names the class. When every class is present, the
-              verdict certifies. Either world passes; the shipped shape fails.
+              `limits` names the class. Present non-call classes do not prove
+              their own completion. Either the separately recorded gap, a
+              settled Call census and an explicit lower bound qualify the
+              positive, or a settled Call census whose mention reading matched
+              every non-call read against a requested row certifies it. The
+              shipped certification over absent classes fails.
   inverse     the control that keeps the invariant from being satisfied by
-              refusing everything. On a build whose linker produces import
-              edges, the default query has every requested class present and
-              must certify with `limiting_factor: null` and an exact count;
-              that is the genuine inverse. On a build whose linker does not,
-              the check falls back to the same focal over `calls` alone, a
-              class the fixture proves present, and says so in its detail.
+              refusing everything. The same focal over `calls` alone must
+              return a real call witness and a settled Call census, certify
+              with `limiting_factor: null`, and carry an exact count.
   unproduced  the import class is never `absent` on a source whose files
               import one another: it reads `unproduced` on a build whose
               linker emits no entity-level import edge, and `present` on one
@@ -79,6 +80,11 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 from trace_pages import mcp_references
 
@@ -227,9 +233,103 @@ class Result(object):
 
 # ------------------------------------------------------------------- graders
 
+def reference_completion_qualification(payload, negative, verdict):
+    """A settled Call census does not certify requested non-call completion.
+
+    Accept only this recorded gap, with a lower bound and no absence claim.
+    This qualifies the returned positives; it never certifies their whole set.
+    """
+    code = "reference_completion_unmeasured"
+    kinds = payload.get("relation_kinds")
+    inputs = verdict.get("inputs")
+    comp = (payload.get("_kin") or {}).get("completeness") or {}
+    block = payload.get("call_sites")
+    if (not isinstance(kinds, list)
+            or not any(isinstance(kind, str) and kind.lower() != "calls" for kind in kinds)):
+        return False, "no requested non-call relation backs the completion gap"
+    if (verdict.get("state") != "inconclusive" or negative.get("trust") != "inconclusive"
+            or not isinstance(inputs, dict)
+            or inputs.get("reference_completion") != "inconclusive"
+            or inputs.get("absence_gate") != "inconclusive"
+            or inputs.get("call_sites") != "certified"):
+        return False, "the verdict does not separately attribute the non-call completion gap"
+    if any(reading not in ("certified", "not_applicable") for name, reading in inputs.items()
+           if name not in ("reference_completion", "absence_gate")):
+        return False, "another verdict input limits the positive beyond non-call completion"
+    codes = [part.strip() for part in str(verdict.get("limiting_factor") or "").split(";")
+             if part.strip()]
+    reason = negative.get("trust_reason")
+    if (codes != [code]
+            or reason != code + ": non-call completion is unmeasured"
+            or code not in str(negative.get("advice") or "")):
+        return False, "non-call completion provenance does not match its exact limiting code"
+    if (verdict.get("absence_claim") != "not_applicable"
+            or verdict.get("safe_to_conclude_absent") is not False
+            or negative.get("safe_to_conclude_absent") is not False
+            or comp.get("status") == "complete" or comp.get("bound") != "at_least"
+            or (comp.get("counted") or {}).get("exact") is not False
+            or "verdict_inconclusive" not in (comp.get("limits") or [])):
+        return False, "non-call uncertainty claims an exact count or an absence"
+    if (not isinstance(block, dict) or block.get("settled") is not True
+            or block.get("clauses") != [] or block.get("candidates") != []
+            or type(block.get("candidate_count")) is not int or block["candidate_count"] != 0
+            or block.get("candidates_withheld", 0) != 0):
+        return False, "no settled, residue-free Call census backs the separate completion gap"
+    return True, "bounded by non-call completion, with the Call census settled"
+
+
+def measured_non_call_completion(payload, verdict):
+    """A certification of non-call completion that the census actually measured.
+
+    The server certifies imports and references only when the Call census is
+    settled and its mention reading matched every non-call read that could
+    reach the focal against a stored row of a requested kind. Accept exactly
+    that evidence: a measured reading with nothing unmatched, no lookup by a
+    computed name, no member-held references left unmeasured, and no read
+    carried only by a kind the query did not ask for.
+    """
+    requested = [kind.lower() for kind in payload.get("relation_kinds") or []
+                 if isinstance(kind, str)]
+    if (verdict.get("inputs") or {}).get("reference_completion") != "certified":
+        return False, "the verdict does not attribute the certification to reference completion"
+    block = payload.get("call_sites")
+    if (not isinstance(block, dict) or block.get("settled") is not True
+            or block.get("clauses") != []):
+        return False, "no settled, clause-free Call census backs the certification"
+    residue = ((block.get("focal_escape") or {}).get("residue")) or {}
+    mentions = residue.get("mentions")
+    if not isinstance(mentions, dict) or mentions.get("measured") is not True:
+        return False, "the Call census took no mention reading"
+    if "references" in requested and mentions.get("references_unmeasured") is not None:
+        return False, "the mention reading left member-held references unmeasured"
+    if ((residue.get("unkeyed_lookups") or {}).get("count") or 0) != 0:
+        return False, "lookups by a computed name could reach the focal"
+    if ((mentions.get("unmatched") or {}).get("count") or 0) != 0:
+        return False, "the mention reading lists non-call reads with no stored row"
+    matched = mentions.get("matched") or {}
+    if (not isinstance(matched, dict)
+            or any(type(count) is not int or count < 0 for count in matched.values())):
+        return False, "the mention reading's matched counts are not whole numbers"
+    elsewhere = sorted(kind for kind, count in matched.items()
+                       if count > 0 and kind.lower() not in requested)
+    if elsewhere:
+        return False, "reads are carried only by unrequested %s rows" % ", ".join(elsewhere)
+    # `count` is every read the reading took, matched or not. With nothing
+    # listed unmatched it must equal the matched total, or a read went unaccounted.
+    total = mentions.get("count")
+    if type(total) is not int or total != sum(matched.values()):
+        return False, ("the mention reading counts %r reads and matched %d"
+                       % (total, sum(matched.values())))
+    return True, "every non-call read was matched by the mention census"
+
+
 def verdict_honours_classes(payload):
-    """Every requested class the answer could not read makes the verdict
-    inconclusive and names itself; every class present certifies.
+    """Every unread requested class makes the verdict inconclusive and named.
+
+    Presence alone does not prove non-call completion. A fully present answer
+    either retains the separately attributed, explicitly bounded completion
+    gap, or certifies on a measured mention census that matched every non-call
+    read; an unexplained refusal or a certification without that census fails.
 
     Returns (verdict, problems). `verdict` is None when the payload does not
     carry the fields, which is UNREADABLE rather than a finding.
@@ -263,10 +363,16 @@ def verdict_honours_classes(payload):
             problems.append("limits %s name none of %s" % (limits, short))
         if (verdict.get("inputs") or {}).get("edge_coverage") == "certified":
             problems.append("inputs.edge_coverage reads certified over %s" % short)
-    else:
-        if state != "certified":
-            problems.append("every class is present yet the verdict is %r (%s)"
-                            % (state, (verdict.get("limiting_factor") or "")[:160]))
+    elif state == "inconclusive":
+        qualified, reason = reference_completion_qualification(
+            payload, payload.get("negative") or {}, verdict)
+        if not qualified:
+            problems.append("every class is present but the refusal is unproven: %s" % reason)
+    elif any(c != "calls" for c in requested):
+        measured, reason = measured_non_call_completion(payload, verdict)
+        if not measured:
+            problems.append("the verdict certifies non-call completion from edge-class "
+                            "presence: %s" % reason)
     return state, problems
 
 
@@ -285,6 +391,7 @@ def import_class_never_absent_on_importing_source(payload):
 # every gap it pushed and is not held to one label.
 INPUT_CLAUSE_LABELS = {
     "caller_arrival": ("caller_arrival_",),
+    "reference_completion": ("reference_completion_unmeasured",),
     "edge_coverage": ("cross_file_edges_", "edge_coverage_unknown"),
     "withheld_candidates": ("withheld_candidates",),
     "degradations": ("retrieval_degraded",),
@@ -439,8 +546,8 @@ GRADERS = {
 # `search.py` and the test import from `parsing.py` (imports), call
 # `blank_code` (calls), and use the `Note` class as an annotation and read its
 # attributes (references, which a language server resolves). A fixture with
-# calls alone reads `references: absent` honestly, and the genuine inverse
-# needs every class present.
+# calls alone reads `references: absent` honestly. The invariant reads every
+# class; the inverse certifies only the fixture's settled Calls-only domain.
 FILES = {
     "pkg/__init__.py": "",
     "pkg/parsing.py": (
@@ -500,6 +607,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:
@@ -621,7 +730,7 @@ class Suite(object):
 
 def check_invariant(suite):
     result = Result("invariant", "the verdict never certifies over a requested class it could "
-                                 "not read, and certifies when every class is present")
+                                 "not read, and retains the separate non-call completion gap")
     try:
         payload = suite.references()
     except Exception as error:  # noqa: BLE001
@@ -646,34 +755,21 @@ def check_invariant(suite):
 
 
 def check_inverse(suite):
-    result = Result("inverse", "an answer with every requested class present certifies cleanly, "
+    result = Result("inverse", "a settled Calls-only positive certifies cleanly, "
                                "with no limiting factor and an exact count")
-    # The genuine inverse first: the default query, on a build whose linker
-    # produces import edges, has every requested class present.
-    try:
-        payload = suite.references()
-    except Exception as error:  # noqa: BLE001
-        result.unknown("find_references(blank_code) unreadable: %s" % error)
-        return result
-    classes = ((payload.get("_kin") or {}).get("completeness") or {}).get("classes") or {}
-    if classes and all(classes.get(c) == "present" for c in CLASSES if c in classes):
-        return grade_inverse(result, payload, "every requested class present")
-    # The fallback control on a build whose linker produces no import edge: the
-    # same focal over `calls` alone, a class the fixture proves present. It is a
-    # control over a class that IS present, not over classes left unrequested
-    # by accident, and the detail says which arm ran.
+    # Edge-class presence is not a census of non-call uses. Exercise the
+    # certifiable domain directly, regardless of which other classes exist.
     try:
         payload = suite.references(kinds=("calls",))
     except Exception as error:  # noqa: BLE001
         result.unknown("find_references(blank_code, calls) unreadable: %s" % error)
         return result
-    calls_classes = ((payload.get("_kin") or {}).get("completeness") or {}).get("classes") or {}
-    if calls_classes.get("calls") != "present":
+    classes = ((payload.get("_kin") or {}).get("completeness") or {}).get("classes") or {}
+    if classes.get("calls") != "present":
         result.unknown("the calls class reads %r on the fixture, so no certified control is "
-                       "available" % calls_classes.get("calls"))
+                       "available" % classes.get("calls"))
         return result
-    return grade_inverse(result, payload, "control: calls alone, while imports reads %r on this "
-                                          "build" % classes.get("imports"))
+    return grade_inverse(result, payload, "control: settled calls alone")
 
 
 def grade_inverse(result, payload, arm):
@@ -681,7 +777,27 @@ def grade_inverse(result, payload, arm):
     state, problems = verdict_honours_classes(payload)
     kin = payload.get("_kin") or {}
     comp = kin.get("completeness") or {}
-    factor = (kin.get("verdict") or {}).get("limiting_factor")
+    verdict = kin.get("verdict") or {}
+    factor = verdict.get("limiting_factor")
+    block = payload.get("call_sites") or {}
+    witness = any(isinstance(row, dict) and row.get("entity_id")
+                  and "calls" in (row.get("relation_kinds") or [])
+                  and any(isinstance(site, dict)
+                          and type(site.get("line_in_entity")) is int
+                          and site["line_in_entity"] >= 0
+                          and "blank_code" in str(site.get("callee") or "")
+                          for site in row.get("sites") or []) for row in refs)
+    if payload.get("relation_kinds") != ["calls"] or not witness:
+        problems.append("the control has no Calls-only positive witness for blank_code")
+    if (block.get("settled") is not True or block.get("clauses") != []
+            or (verdict.get("inputs") or {}).get("call_sites") != "certified"
+            # The producer omits this input when it is silent on Calls-only answers.
+            or (verdict.get("inputs") or {}).get("reference_completion", "not_applicable")
+            != "not_applicable"):
+        problems.append("the control does not record a settled Call census without a non-call gap")
+    if ((comp.get("counted") or {}).get("exact") is not True
+            or (comp.get("counted") or {}).get("reported") != len(refs)):
+        problems.append("the control's exact count does not match its positive rows")
     if state == "certified" and not problems and comp.get("bound") == "exact" and factor is None:
         result.ok("%s: %d rows, certified, limiting_factor null, bound exact" % (arm, len(refs)))
     else:
@@ -717,8 +833,9 @@ def check_two_reasons(suite):
     result = Result("two_reasons", "a verdict with more than one reason to refuse names every "
                                    "one of them in its limiting factor, each once")
     # At the floor, withheld rows or partial pages qualify the transport
-    # independently of what the graph holds. A paged answer must name that
-    # limit on every page and recover the original graph verdict afterward. Beside an import class this build cannot produce that is two
+    # independently of what the graph holds. A paged answer must say on every
+    # page that the page is partial, carry the answer's own verdict on it, and
+    # recover the original graph verdict afterward. Beside an import class this build cannot produce that is two
     # reasons; on a build whose linker produces the class it is one, and the
     # check says which world it graded. Either way every refusing input must
     # keep its clause: the shape this guards against kept the budget's clause
@@ -737,14 +854,19 @@ def check_two_reasons(suite):
     if partial:
         if len(partial) != len(pages) or len(pages) < 2:
             page_problems.append("partial reference evidence did not traverse a complete continuation sequence")
+        original_verdict = (payload.get("_kin") or {}).get("verdict") or {}
         for index, page in enumerate(pages):
             verdict = page["verdict"]
+            limits = (page.get("completeness") or {}).get("limits") or []
             if (page["page"].get("kind") != "references"
-                    or verdict.get("state") != "inconclusive"
+                    or "reference_page_partial" not in limits
                     or verdict.get("safe_to_conclude_absent") is not False
-                    or page["negative"].get("safe_to_conclude_absent") is not False
-                    or factor_labels(verdict.get("limiting_factor")) != ["reference_page_partial"]):
+                    or page["negative"].get("safe_to_conclude_absent") is not False):
                 page_problems.append("reference page %d lost its explicit partial-answer qualification" % index)
+            if (verdict.get("state") != original_verdict.get("state")
+                    or factor_labels(verdict.get("limiting_factor"))
+                    != factor_labels(original_verdict.get("limiting_factor"))):
+                page_problems.append("reference page %d does not carry the answer's own verdict" % index)
         if "reference_page_partial" in factor_labels(
                 ((payload.get("_kin") or {}).get("verdict") or {}).get("limiting_factor")):
             page_problems.append("the assembled original verdict still carries a transport-only partial clause")
@@ -824,7 +946,8 @@ def self_test():
             "references": [{}] * 5,
             "relation_kinds": ["calls", "imports", "references"],
         }
-    expect("every class present and certified passes", verdict_honours_classes(honest())[1], [])
+    expect("Calls-only presence and certification passes",
+           verdict_honours_classes(dict(honest(), relation_kinds=["calls"]))[1], [])
     fixed = honest(imports="unproduced", state="inconclusive",
                    factor="cross_file_edges_unproduced: this build produced no entity-level "
                           "imports edge for Python", status="partial", bound="at_least",
@@ -843,6 +966,106 @@ def self_test():
     expect("calls-only query reads only calls",
            verdict_honours_classes(dict(honest(imports="absent"),
                                         relation_kinds=["calls"]))[1], [])
+
+    import copy
+
+    completion = honest(state="inconclusive", factor="reference_completion_unmeasured",
+                        status="unknown", bound="at_least", limits=["verdict_inconclusive"])
+    completion["_kin"]["verdict"].update({
+        "absence_claim": "not_applicable", "safe_to_conclude_absent": False,
+        "inputs": {"edge_coverage": "certified", "call_sites": "certified",
+                   "reference_completion": "inconclusive", "absence_gate": "inconclusive"}})
+    completion["call_sites"] = {"settled": True, "clauses": [], "candidates": [],
+                                "candidate_count": 0}
+    completion["negative"] = {
+        "trust": "inconclusive", "safe_to_conclude_absent": False,
+        "trust_reason": "reference_completion_unmeasured: non-call completion is unmeasured",
+        "advice": "reference_completion_unmeasured"}
+    expect("present non-call classes retain their exact completion gap",
+           verdict_honours_classes(completion)[1], [])
+    expect("present non-call classes never certify from presence alone",
+           bool(verdict_honours_classes(honest())[1]), True)
+    certified_noncall = copy.deepcopy(completion)
+    certified_noncall["_kin"]["verdict"].update(state="certified")
+    expect("certification over a recorded non-call gap fails",
+           bool(verdict_honours_classes(certified_noncall)[1]), True)
+    for label, mutate in (
+            ("missing completion provenance", lambda p: p["_kin"]["verdict"]["inputs"].pop("reference_completion")),
+            ("another limiting input", lambda p: p["_kin"]["verdict"]["inputs"].update(degradations="inconclusive")),
+            ("an exact count over uncertainty", lambda p: p["_kin"]["completeness"]["counted"].update(exact=True)),
+            ("an absence claim", lambda p: p["_kin"]["verdict"].update(safe_to_conclude_absent=True)),
+            ("an unsettled Call census", lambda p: p["call_sites"].update(settled=False)),
+            ("a Calls-only completion excuse", lambda p: p.update(relation_kinds=["calls"])),
+            ("an arbitrary completion reason", lambda p: p["negative"].update(trust_reason="some gap"))):
+        broken = copy.deepcopy(completion)
+        mutate(broken)
+        expect(label + " fails", bool(verdict_honours_classes(broken)[1]), True)
+
+    # The shape a measured census certifies on: both imports of the focal
+    # matched, nothing unmatched, no computed-name lookup.
+    measured = honest()
+    measured["_kin"]["verdict"]["inputs"].update(
+        call_sites="certified", reference_completion="certified")
+    measured["call_sites"] = {
+        "settled": True, "clauses": [],
+        "focal_escape": {"escape": "contained", "residue": {
+            "mentions": {"measured": True, "count": 2, "matched": {"imports": 2}}}}}
+    expect("a measured census that matched every read certifies",
+           verdict_honours_classes(measured)[1], [])
+    for label, mutate in (
+            ("an unmeasured mention reading",
+             lambda p: p["call_sites"]["focal_escape"]["residue"]["mentions"].update(measured=False)),
+            ("no mention reading",
+             lambda p: p["call_sites"]["focal_escape"]["residue"].pop("mentions")),
+            ("an unmatched non-call read",
+             lambda p: p["call_sites"]["focal_escape"]["residue"]["mentions"].update(
+                 unmatched={"count": 1, "sites": [{"file": "pkg/a.py", "line": 3}]})),
+            ("a computed-name lookup",
+             lambda p: p["call_sites"]["focal_escape"]["residue"].update(
+                 unkeyed_lookups={"count": 1})),
+            ("member-held references left unmeasured",
+             lambda p: p["call_sites"]["focal_escape"]["residue"]["mentions"].update(
+                 references_unmeasured="the focal holds members")),
+            ("a read carried only by an unrequested kind",
+             lambda p: p["call_sites"]["focal_escape"]["residue"]["mentions"].update(
+                 matched={"imports": 1, "decorates": 1})),
+            ("a read neither matched nor listed unmatched",
+             lambda p: p["call_sites"]["focal_escape"]["residue"]["mentions"].update(
+                 count=2, matched={"imports": 1})),
+            ("no total of the reads taken",
+             lambda p: p["call_sites"]["focal_escape"]["residue"]["mentions"].pop("count")),
+            ("an unsettled Call census", lambda p: p["call_sites"].update(settled=False)),
+            ("certification not attributed to reference completion",
+             lambda p: p["_kin"]["verdict"]["inputs"].update(reference_completion="not_applicable"))):
+        broken = copy.deepcopy(measured)
+        mutate(broken)
+        expect("a certification with " + label + " fails",
+               bool(verdict_honours_classes(broken)[1]), True)
+
+    calls = honest()
+    calls["relation_kinds"] = ["calls"]
+    calls["references"] = [{"entity_id": "caller", "relation_kinds": ["calls"],
+                            "sites": [{"line_in_entity": 1, "callee": "blank_code"}]}]
+    calls["_kin"]["completeness"]["counted"]["reported"] = 1
+    calls["_kin"]["verdict"]["inputs"].update(
+        call_sites="certified", reference_completion="not_applicable")
+    calls["call_sites"] = {"settled": True, "clauses": []}
+    expect("a settled Calls-only positive certifies",
+           grade_inverse(Result("t", "t"), calls, "control").status, PASS)
+    silent_calls = copy.deepcopy(calls)
+    silent_calls["_kin"]["verdict"]["inputs"].pop("reference_completion")
+    expect("a silent non-call input is omitted on the settled Calls-only control",
+           grade_inverse(Result("t", "t"), silent_calls, "control").status, PASS)
+    for label, mutate in (
+            ("active non-call gap on the inverse", lambda p: p["_kin"]["verdict"]["inputs"].update(reference_completion="inconclusive")),
+            ("empty inverse", lambda p: p.update(references=[])),
+            ("no call witness", lambda p: p["references"][0].update(sites=[])),
+            ("unsettled inverse", lambda p: p["call_sites"].update(settled=False)),
+            ("non-call inverse", lambda p: p.update(relation_kinds=list(CLASSES))),
+            ("inexact inverse", lambda p: p["_kin"]["completeness"]["counted"].update(exact=False))):
+        broken = copy.deepcopy(calls)
+        mutate(broken)
+        expect(label + " fails", grade_inverse(Result("t", "t"), broken, "control").status, FAIL)
 
     expect("unproduced is honest",
            import_class_never_absent_on_importing_source(honest(imports="unproduced")),

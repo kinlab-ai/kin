@@ -10,8 +10,16 @@ description = "LSP client for graph enrichment: type-resolved relations via lang
 repository = "https://github.com/firelock-ai/kin-lsp"
 authors = ["Troy Fortin <troy@firelock.ai>"]
 
+[features]
+# Test seams for crates that drive this one from their own tests: a shorter
+# termination grace and a scripted peer whose context binds its program bytes.
+# Nothing in a normal build enables it.
+test-support = ["dep:tempfile"]
+
 [dependencies]
 kin-model = { workspace = true }
+kin-blobs = { workspace = true }
+kin-daemon-spawn = { workspace = true }
 tree-sitter = { workspace = true }
 # The grammar interface only. Callers hand in the TypeScript and TSX grammars
 # the binding-initializer proof parses with (`TypeScriptGrammars`); Kin passes
@@ -19,12 +27,15 @@ tree-sitter = { workspace = true }
 tree-sitter-language = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Ordered, bounded concurrency for the questions one pass asks a server.
+futures-util = "0.3"
 sha2 = { workspace = true }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
 toml = { workspace = true }
 tracing = "0.1"
 thiserror = "2"
 which = "7"
+tempfile = { workspace = true, optional = true }
 # Analysis environments: hash-verified downloads of locked dependencies, and
 # unpacking of wheels, source archives and standalone CPython builds.
 reqwest = { workspace = true, features = ["blocking"] }
@@ -40,10 +51,15 @@ ed25519-dalek = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `build.rs` embeds the content identity of the enrichment producer code.
+[build-dependencies]
+sha2 = { workspace = true }
+
 [dev-dependencies]
 kin-parser = { workspace = true }
 kin-grammar-typescript = { workspace = true }
-tokio = { version = "1", features = ["full"] }
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 # Not a real dependency of this crate. tinyvec 1.13.0, published 2026-09-03, does
 # not compile: src/tinyvec.rs:3 does `use alloc::vec::{self, Vec}`, which binds

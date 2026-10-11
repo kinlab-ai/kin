@@ -13,6 +13,7 @@
 //! Everything Kin-specific lives there rather than in the stream, so a strict reader of
 //! the stream never chokes and the existing analyzers keep working untouched.
 
+use kin_io::HostDir;
 use serde_json::{json, Map, Value};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -26,19 +27,27 @@ pub fn now_iso() -> String {
 }
 
 pub struct TranscriptWriter {
+    out: HostDir,
     stream: BufWriter<File>,
     trace: BufWriter<File>,
     session_id: String,
 }
 
 impl TranscriptWriter {
-    pub fn create(out_dir: &Path, session_id: &str) -> std::io::Result<Self> {
-        std::fs::create_dir_all(out_dir)?;
+    /// Start a run's transcript in the output directory `out`.
+    pub fn create(out: HostDir, session_id: &str) -> std::io::Result<Self> {
         Ok(TranscriptWriter {
-            stream: BufWriter::new(File::create(out_dir.join("transcript.jsonl"))?),
-            trace: BufWriter::new(File::create(out_dir.join("kin-trace.jsonl"))?),
+            stream: BufWriter::new(out.create_file("transcript.jsonl")?),
+            trace: BufWriter::new(out.create_file("kin-trace.jsonl")?),
+            out,
             session_id: session_id.to_string(),
         })
+    }
+
+    /// The run's output directory, for the records written beside the
+    /// transcript.
+    pub fn out_dir(&self) -> &HostDir {
+        &self.out
     }
 
     fn write_stream(&mut self, mut record: Value) -> std::io::Result<()> {

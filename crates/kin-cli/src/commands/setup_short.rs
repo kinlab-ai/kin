@@ -64,7 +64,7 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
     let style = Style::for_stdout();
 
     let kin_home = kin_dir().ok();
-    let assistants = detect_ai_assistants();
+    let assistants = choose_assistants(detect_ai_assistants(), opts.clients.as_deref())?;
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
     let cwd = env::current_dir().unwrap_or_default();
     let language_scope = language_servers::language_scope(&cwd, None);
@@ -85,11 +85,15 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
     if !crate::banner::print_once_leaving(interactive, first_rows + 2) {
         println!();
     }
-    println!(
-        "{INDENT}Welcome to Kin {}. {}",
+    // Wrapped at a word, so a narrow terminal never strands the full stop.
+    let welcome = format!(
+        "Welcome to Kin {}. {}",
         env!("CARGO_PKG_VERSION"),
-        welcome_tail(if interactive { to_ask.len() } else { 0 }, machine)
+        welcome_tail(to_ask.len(), machine, interactive)
     );
+    for line in screen::wrap(&welcome, screen::right_edge().saturating_sub(INDENT.len())) {
+        println!("{INDENT}{line}");
+    }
 
     // Nothing is written before every answer is in.
     let chosen: Vec<usize> = if interactive {
@@ -155,7 +159,12 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
     let add_path = answer(Asked::Path).unwrap_or(true);
     let servers = answer(Asked::Servers);
     if let Some(home) = kin_home.as_deref() {
-        if let Some(yes) = answer(Asked::Model) {
+        // Recorded only when someone answered it, like the installs below: a
+        // yes is what lets a model download, and a scripted run that passed no
+        // `--embedding-model` has not asked for one.
+        if let Some(yes) =
+            answer(Asked::Model).filter(|_| interactive || opts.embedding_model.is_some())
+        {
             let decision = if yes {
                 crate::embed_model::MODEL_FETCH_DEFERRED
             } else {
@@ -213,6 +222,7 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
     let applied = apply_plan(&plan, &assistants, shell_name, opts.tool_profile.as_deref()).await?;
     if let Some(home) = kin_home.as_deref() {
         let _ = record_client_consent(home, connect);
+        let _ = record_client_choice(home, opts.clients.as_deref());
     }
 
     // Inside a repository whose languages are known, the servers it needs go
@@ -277,12 +287,18 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
         notifier_issue: notifier_issue.as_deref(),
         report: &report,
         in_repo,
+        defaults_taken: if interactive { 0 } else { skipped.len() },
     });
     println!();
     for line in completion_lines(style, &summary, screen::terminal_width()) {
         println!("{line}");
     }
 
+    // The same ending as the full record: a registry Kin refuses fails the
+    // run with its exact repair, before the client failures it causes.
+    if let Some(error) = registry_authority_error(&report) {
+        return Err(error);
+    }
     match failed_clients_error(&applied.failed_clients) {
         Some(error) => Err(error),
         None => Ok(()),
@@ -306,8 +322,14 @@ fn steps(
         let claude = detected
             .iter()
             .any(|a| a.name == assistants[IDX_CLAUDE_CODE].name);
+        let one = detected.len() == 1;
         let mut consent = format!(
-            "Kin adds its MCP server to each one's own config and leaves the rest of it alone{}.",
+            "Kin adds its MCP server to {} own config and leaves the rest of it alone{}.",
+            if one {
+                format!("{}'s", names[0])
+            } else {
+                "each one's".to_string()
+            },
             if claude {
                 ", and adds a short Kin note to ~/.claude/CLAUDE.md so Claude Code reaches for it"
             } else {
@@ -340,21 +362,32 @@ fn steps(
             2 => "both".to_string(),
             n => format!("all {n}"),
         };
+        let mut question = Question::yes_no(
+            "AI clients",
+            if one {
+                format!("Connect Kin to {}?", names[0])
+            } else {
+                format!("Connect Kin to the {} AI clients here?", detected.len())
+            },
+            (
+                if one {
+                    "Yes, connect it"
+                } else {
+                    "Yes, connect them"
+                },
+                &format!("on for {count}"),
+            ),
+            ("No, not now", "off"),
+            true,
+        )
+        .consent(consent);
+        // The title already names a single client; several are named here.
+        if !one {
+            question = question.note(join_names(&names));
+        }
         steps.push(Step {
             asked: Asked::Clients,
-            question: Question::yes_no(
-                "AI clients",
-                if detected.len() == 1 {
-                    format!("Connect Kin to {}?", names[0])
-                } else {
-                    format!("Connect Kin to the {} AI clients here?", detected.len())
-                },
-                ("Yes, connect them", &format!("on for {count}")),
-                ("No, not now", "off"),
-                true,
-            )
-            .consent(consent)
-            .note(join_names(&names)),
+            question,
             preset: opts
                 .intent
                 .as_deref()
@@ -404,6 +437,18 @@ fn steps(
                     "servers would"
                 }
             ));
+            // A yes cannot install these without npm, and the first repository
+            // would be the first place a person learned that.
+            if check_binary_in_path("npm").is_none() {
+                where_.push(format!(
+                    "npm is not installed here, so {} until it is.",
+                    if npm.len() == 1 {
+                        "that one waits"
+                    } else {
+                        "those wait"
+                    }
+                ));
+            }
         }
         if !other.is_empty() {
             where_.push(format!(
@@ -425,7 +470,7 @@ fn steps(
         )
         .consent(
             "When you clone or init a repository, Kin installs the servers its languages need, \
-             so calls link across files. Only those languages.",
+             so it can link each call to what it calls. Only those languages.",
         );
         // Where each install lands is part of what a person consents to, so
         // it is consent text at full contrast, not a faint note.
@@ -470,7 +515,13 @@ fn steps(
 }
 
 /// What the welcome line says after the version.
-fn welcome_tail(asked: usize, machine: &str) -> String {
+///
+/// A run with no terminal asks nothing whatever there is to ask, and says so
+/// rather than promising questions that never come.
+fn welcome_tail(asked: usize, machine: &str, interactive: bool) -> String {
+    if !interactive {
+        return "This run asks nothing and takes the defaults.".to_string();
+    }
     let count = match asked {
         0 => return format!("Setting up {machine}."),
         1 => "One question",
@@ -563,6 +614,29 @@ fn grouped_health(checks: &[&crate::commands::health::HealthCheck]) -> Vec<Atten
                         fix: Some(crate::commands::compact_author_commands()),
                     }
                 }
+                // A host limit, not a broken install: the person can carry on,
+                // and the one thing worth doing now is the doctor's own advice.
+                [one]
+                    if one.id == "memory_floor"
+                        && matches!(
+                            one.status,
+                            crate::commands::health::HealthStatus::Degraded
+                        ) =>
+                {
+                    Attention {
+                        status: Status::Warn,
+                        what: format!(
+                            "{} has less memory than Kin has been measured on, so Kin keeps \
+                             tighter limits here.",
+                            capitalized(screen::this_machine())
+                        ),
+                        fix: Some(
+                            "Convert one repository at a time. kin doctor --verbose has the \
+                             numbers."
+                                .to_string(),
+                        ),
+                    }
+                }
                 [one] => Attention {
                     status: Status::Fail,
                     what: if short_enough(&one.detail) {
@@ -607,6 +681,25 @@ fn grouped_health(checks: &[&crate::commands::health::HealthCheck]) -> Vec<Atten
         .collect()
 }
 
+/// Whether a line of a fix is a command a person runs as it is, rather than a
+/// sentence about one, which ends on a full stop.
+fn is_command(line: &str) -> bool {
+    let line = line.trim();
+    ["git ", "kin ", "export ", "curl "]
+        .iter()
+        .any(|program| line.starts_with(program))
+        && !line.ends_with('.')
+}
+
+/// `this Mac` as the start of a sentence.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// The line to add by hand when a new terminal does not find this kin: the
 /// install's `bin` directory in front of `PATH`.
 const PATH_LINE: &str = "export PATH=\"$HOME/.kin/bin:$PATH\"";
@@ -630,12 +723,12 @@ fn terminal_attention(
                 "A new terminal runs {}, not the kin setup just installed.",
                 screen::home_relative(path)
             ),
-            fix: Some(format!("Put this line last in {path_rc}: {PATH_LINE}")),
+            fix: Some(format!("Put this line last in {path_rc}:\n{PATH_LINE}")),
         }),
         TerminalKin::Missing => Some(Attention {
             status: Status::Warn,
             what: "A new terminal does not find kin.".to_string(),
-            fix: Some(format!("Add this line to {path_rc}: {PATH_LINE}")),
+            fix: Some(format!("Add this line to {path_rc}:\n{PATH_LINE}")),
         }),
         TerminalKin::Unknown => Some(Attention {
             status: Status::Warn,
@@ -693,6 +786,9 @@ struct Observed<'a> {
     notifier_issue: Option<&'a str>,
     report: &'a crate::commands::health::HealthReport,
     in_repo: bool,
+    /// Decisions a run without a terminal took without asking, which the
+    /// completion counts and `--verbose` lists.
+    defaults_taken: usize,
 }
 
 /// Something that needs the person, and what fixes it.
@@ -876,16 +972,33 @@ fn summarize(observed: Observed<'_>) -> Summary {
     if !observed.installed_servers.is_empty() {
         facts.push(("Installed", observed.installed_servers.join(", ")));
     }
+    if observed.defaults_taken > 0 {
+        facts.push((
+            "Defaults",
+            format!(
+                "{} taken without asking; kin setup --verbose lists each one",
+                observed.defaults_taken
+            ),
+        ));
+    }
 
+    // Outside a repository the first thing to do is bring one in, and the
+    // one a person already works in is the one whose answers they can check.
+    // When setup or the installer before it just put kin on PATH, the
+    // terminal that ran them predates the line, so the step says to open a
+    // new one; in a terminal that already had kin it costs nothing.
     let (next, next_note) = if observed.in_repo {
         ("kin refs <function>".to_string(), None)
-    } else if path_verified && observed.path_asked {
+    } else if path_verified {
         (
-            "kin clone <git-url>".to_string(),
-            Some("in a new terminal".to_string()),
+            "kin init".to_string(),
+            Some("in a new terminal, inside a repository you know".to_string()),
         )
     } else {
-        ("kin clone <git-url>".to_string(), None)
+        (
+            "kin init".to_string(),
+            Some("inside a repository you know, or kin clone <git-url>".to_string()),
+        )
     };
     Summary {
         machine: observed.machine,
@@ -938,9 +1051,17 @@ fn completion_lines(style: Style, summary: &Summary, width: usize) -> Vec<String
             }
             if let Some(fix) = &item.fix {
                 // Keep separate repair commands separate; wrapping the whole
-                // paragraph would join them into an invalid shell command.
-                for line in fix.lines().flat_map(|line| screen::wrap(line, text)) {
-                    lines.push(format!("{INDENT}  {line}"));
+                // paragraph would join them into an invalid shell command. A
+                // line that is itself a command stays whole even past the
+                // edge: split, it would copy as two commands that both fail.
+                for line in fix.lines() {
+                    if is_command(line) {
+                        lines.push(format!("{INDENT}  {line}"));
+                        continue;
+                    }
+                    for part in screen::wrap(line, text) {
+                        lines.push(format!("{INDENT}  {part}"));
+                    }
                 }
             }
         }
@@ -965,16 +1086,28 @@ fn completion_lines(style: Style, summary: &Summary, width: usize) -> Vec<String
     }
 
     lines.push(String::new());
-    let note = summary
-        .next_note
-        .as_deref()
-        .map(|note| format!("  {}", style.faint(note)))
-        .unwrap_or_default();
-    lines.push(format!(
-        "{INDENT}{}  {}{note}",
+    let head = format!(
+        "{INDENT}{}  {}",
         style.lilac("Next"),
         style.bold(&summary.next)
-    ));
+    );
+    // The note rides beside the command when it fits, and wraps under the
+    // command, never under the label, when it does not.
+    match summary.next_note.as_deref() {
+        Some(note) => {
+            let beside = format!("{head}  {}", style.faint(note));
+            if console::measure_text_width(&beside) <= edge {
+                lines.push(beside);
+            } else {
+                lines.push(head);
+                let under = INDENT.len() + "Next  ".len();
+                for line in screen::wrap(note, edge.saturating_sub(under)) {
+                    lines.push(format!("{}{}", " ".repeat(under), style.faint(&line)));
+                }
+            }
+        }
+        None => lines.push(head),
+    }
     lines.push(format!(
         "{INDENT}{}  kin setup status {} kin setup --verbose",
         style.faint("More"),
@@ -990,14 +1123,21 @@ mod tests {
     #[test]
     fn the_welcome_counts_the_questions_it_will_ask() {
         assert_eq!(
-            welcome_tail(4, "this Mac"),
+            welcome_tail(4, "this Mac", true),
             "Four questions, then you're ready."
         );
         assert_eq!(
-            welcome_tail(1, "this Mac"),
+            welcome_tail(1, "this Mac", true),
             "One question, then you're ready."
         );
-        assert_eq!(welcome_tail(0, "this machine"), "Setting up this machine.");
+        assert_eq!(
+            welcome_tail(0, "this machine", true),
+            "Setting up this machine."
+        );
+        assert_eq!(
+            welcome_tail(3, "this Mac", false),
+            "This run asks nothing and takes the defaults."
+        );
     }
 
     #[test]
@@ -1028,12 +1168,12 @@ mod tests {
     #[test]
     fn a_non_agent_intent_or_a_remote_provider_keeps_the_full_record() {
         let mut opts = WizardOptions {
-            mode: None,
             shell: None,
             auto_daemon: false,
             no_interactive: false,
             intent: None,
             skip_mcp_check: false,
+            prompt_hook: false,
             install_language_servers: false,
             resource_profile: None,
             embedding_model: None,
@@ -1041,6 +1181,7 @@ mod tests {
             skip_path: false,
             tool_profile: None,
             verbose: false,
+            clients: None,
         };
         assert!(fits(&opts));
         opts.intent = Some("local".to_string());
@@ -1093,6 +1234,62 @@ mod tests {
         let next: Vec<&String> = lines.iter().filter(|l| l.contains("Next")).collect();
         assert_eq!(next.len(), 1, "{lines:#?}");
         assert!(next[0].contains("kin clone <git-url>"));
+    }
+
+    /// A repair command stays on one line on a narrow terminal, so it copies
+    /// as the one command it is; a sentence around a command still wraps.
+    #[test]
+    fn a_repair_command_is_never_split_across_lines() {
+        let lines = completion_lines(
+            Style::plain(),
+            &summary(vec![Attention {
+                status: Status::Fail,
+                what: crate::commands::COMPACT_AUTHOR_CONSEQUENCE.to_string(),
+                fix: Some(crate::commands::compact_author_commands()),
+            }]),
+            50,
+        );
+        let email = lines
+            .iter()
+            .find(|line| line.contains("user.email"))
+            .unwrap_or_else(|| panic!("{lines:#?}"));
+        assert!(email.ends_with("\"you@example.com\""), "{lines:#?}");
+        assert!(is_command("git config --global user.name \"Your Name\""));
+        assert!(is_command(PATH_LINE), "the PATH line copies whole");
+        let path = terminal_attention(&TerminalKin::Missing, true, "~/.zprofile")
+            .and_then(|item| item.fix)
+            .unwrap();
+        assert_eq!(path.lines().last(), Some(PATH_LINE), "{path:?}");
+        assert!(!is_command("Convert one repository at a time."));
+        assert!(!is_command(
+            "kin setup --verbose prints the lines to add by hand."
+        ));
+    }
+
+    /// The next step's note sits beside the command when it fits and wraps
+    /// under the command when it does not, so a narrow terminal never cuts
+    /// it and never pushes it past the edge.
+    #[test]
+    fn the_next_steps_note_wraps_under_the_command() {
+        let mut summary = summary(Vec::new());
+        summary.next = "kin init".to_string();
+        summary.next_note = Some("in a new terminal, inside a repository you know".to_string());
+        let wide = completion_lines(Style::plain(), &summary, 100);
+        let next = wide.iter().position(|l| l.contains("Next")).unwrap();
+        assert!(
+            wide[next].ends_with("kin init  in a new terminal, inside a repository you know"),
+            "{wide:#?}"
+        );
+        let narrow = completion_lines(Style::plain(), &summary, 60);
+        let next = narrow.iter().position(|l| l.contains("Next")).unwrap();
+        assert_eq!(narrow[next], "  Next  kin init");
+        assert!(
+            narrow[next + 1].starts_with("        in a new terminal"),
+            "{narrow:#?}"
+        );
+        for line in &narrow {
+            assert!(console::measure_text_width(line) < 60, "{line:?}");
+        }
     }
 
     /// At 60 columns nothing reaches the edge and a fix a person copies is
@@ -1154,7 +1351,7 @@ mod tests {
                     } else {
                         HealthStatus::Healthy
                     },
-                    detail: "not configured; changes cannot be admitted or committed".to_string(),
+                    detail: "not configured; changes cannot be committed".to_string(),
                     platform_note: None,
                     fixable: false,
                     manual_fix: missing.then(|| kin_core::IDENTITY_REMEDIATION.to_string()),
@@ -1174,6 +1371,7 @@ mod tests {
                 notifier_issue: None,
                 report: &report,
                 in_repo: false,
+                defaults_taken: 0,
             });
             assert_eq!(summary.attention.len(), usize::from(missing));
             let lines = completion_lines(Style::plain(), &summary, 60);
@@ -1282,6 +1480,40 @@ mod tests {
         );
     }
 
+    /// A machine below Kin's measured memory is a host limit the person can
+    /// work within, so the completion says what it means and what to do, as a
+    /// warning, rather than a red row naming an internal check.
+    #[test]
+    fn low_memory_reads_as_a_limit_with_a_step_not_a_failure() {
+        use crate::commands::health::{HealthCheck, HealthStatus};
+        let memory = HealthCheck {
+            id: "memory_floor".to_string(),
+            label: "Memory floor".to_string(),
+            status: HealthStatus::Degraded,
+            detail: "8.0 GiB of memory here (this host's RAM); one repository daemon is \
+                     allowed 4.0 GiB of that"
+                .to_string(),
+            platform_note: None,
+            fixable: false,
+            manual_fix: Some("Before converting a repository here: ...".to_string()),
+        };
+        let grouped = grouped_health(&[&memory]);
+        assert_eq!(grouped.len(), 1, "{grouped:#?}");
+        assert_eq!(grouped[0].status, Status::Warn);
+        assert!(
+            grouped[0].what.ends_with(
+                "has less memory than Kin has been measured on, so Kin keeps tighter limits here."
+            ),
+            "{grouped:#?}"
+        );
+        assert!(!grouped[0].what.contains("Memory floor"), "{grouped:#?}");
+        assert_eq!(
+            grouped[0].fix.as_deref(),
+            Some("Convert one repository at a time. kin doctor --verbose has the numbers.")
+        );
+        assert_eq!(capitalized("this Mac"), "This Mac");
+    }
+
     /// One finding keeps its own detail only when that detail is short and has
     /// no path in it; otherwise it points at `kin doctor`.
     #[test]
@@ -1361,6 +1593,7 @@ mod tests {
                 notifier_issue: None,
                 report: &report,
                 in_repo: false,
+                defaults_taken: 0,
             });
             let text = completion_lines(Style::plain(), &summary, 80).join("\n");
             assert_eq!(
@@ -1405,6 +1638,7 @@ mod tests {
             notifier_issue: None,
             report: &report,
             in_repo: false,
+            defaults_taken: 0,
         });
         let text = completion_lines(Style::plain(), &summary, 80).join("\n");
         assert!(

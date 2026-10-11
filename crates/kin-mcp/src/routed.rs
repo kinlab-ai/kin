@@ -24,9 +24,9 @@
 //! types a word these instructions teach gets the same answer there.
 //!
 //! Two surfaces, one per [`RoutedSurface`]. `agent-routed` carries Kin's
-//! writes: `session` opens the session `mutate` needs, and `mutate` is
-//! `kin_mutate`, entity-addressed and atomic. `agent-routed-query` is the same
-//! surface without a write path.
+//! writes: `mutate` is `kin_mutate`, entity-addressed and atomic, run in the
+//! connection's own session, and `exec` runs the project's toolchain.
+//! `agent-routed-query` is the same surface without a write path.
 //!
 //! A routed call is rewritten, before anything reads its name, into the named
 //! tool it stands for: the dispatcher, the profile's belt defaults, the
@@ -61,14 +61,16 @@ pub const TOOL_NAME: &str = "kin";
 ///
 /// The founder-approved budget for the routed design, about 800 tokens at four
 /// bytes a token, against the 14,610 bytes `agent-query` served at 97c719c8d.
-/// Adding `session`, `mutate`, `path` and `call` did not need a larger one.
+/// Adding `session`, `mutate`, `path` and `call` did not need a larger one,
+/// and neither did serving `exec` in `session`'s place.
 pub const ROUTED_LIST_CEILING_BYTES: usize = 3_200;
 
 /// Which routed surface a connection serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutedSurface {
-    /// Whether this surface carries Kin's writes: `session`, `mutate`, and a
-    /// `call` to a tool the registry does not annotate read-only.
+    /// Whether this surface carries Kin's writes: `mutate`, `exec`,
+    /// `transaction`, and a `call` to a tool the registry does not annotate
+    /// read-only.
     pub writes: bool,
     /// Whether `source` serves an entity's body with each line marked by its
     /// offset in the entity, as [`crate::entity_lines`] presents it. Never on
@@ -141,6 +143,9 @@ struct Command {
     variants: &'static [Variant],
     /// Served only on a surface with writes.
     writes: bool,
+    /// Accepted and never served: a command a verb replaced, kept for one
+    /// version so a caller that learned it still reaches the same tool.
+    hidden: bool,
     /// The `kin` CLI subcommand for the same capability, empty when the CLI
     /// has none. It is also accepted as the command, and a hint names the
     /// command by it, since it runs in a shell as well.
@@ -149,27 +154,195 @@ struct Command {
 
 /// Every command, in the order the served description lists them.
 ///
-/// The founder-approved set is locate, search, context, refs, trace, impact,
-/// source, status and describe. `read` joined it because the cohort's Kin arms
-/// read artifacts more than they used any other Kin tool. `path` split from
-/// `trace` so each describes only its own tool's fields. `session` and `mutate`
-/// are the entity-addressed write path, `exec` runs the project's toolchain
-/// over what they wrote, and `call` reaches every other tool.
+/// The commands are the plain verbs the named profiles serve, one per verb,
+/// so a routed caller, a named caller and a shell share one vocabulary:
+/// `locate` is the `locate` tool, and its `mode` picks a name search, a ranking
+/// by description or a literal lookup; `trace` walks from one entity or, given
+/// `to`, finds the route to another; `transaction` takes an `action`.
+/// `describe` and `call` reach every other tool.
+///
+/// `search` and `path` are the commands `locate` and `trace` replaced, and
+/// `session` is retired now that a write opens its own. Each is still
+/// accepted, runs exactly as it did, and is never served in the description or
+/// the command list.
 const COMMANDS: &[Command] = &[
     Command {
-        name: "locate",
-        line: "locate {query}: find code by what it does",
+        name: "ask",
+        line: "ask {question}: a question in plain words, answered in one reply",
         variants: &[Variant {
-            tool: "semantic_locate",
+            tool: crate::ask::TOOL_NAME,
+            when: "",
+            example: r#"{"question":"what calls parse_config?"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin ask",
+    },
+    Command {
+        name: "locate",
+        line: "locate {query, mode}: find code by name, by what it does, or by exact text",
+        variants: &[Variant {
+            tool: crate::verbs::LOCATE,
             when: "",
             example: r#"{"query":"where failed requests are retried"}"#,
         }],
         writes: false,
+        hidden: false,
         cli: "kin locate",
     },
     Command {
+        name: "context",
+        line: "context {entity_id|entities|question}: code and routes around entities",
+        variants: &[Variant {
+            tool: crate::verbs::CONTEXT,
+            when: "",
+            example: r#"{"question":"how are failed requests retried"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin context",
+    },
+    Command {
+        name: "refs",
+        line: "refs {entity_id|query}: callers, importers and references",
+        variants: &[Variant {
+            tool: crate::verbs::REFS,
+            when: "",
+            example: r#"{"query":"parse_config"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin refs",
+    },
+    Command {
+        name: "trace",
+        line: "trace {focal, to, direction, scope}: a call chain, or the route to another entity",
+        variants: &[Variant {
+            tool: crate::verbs::TRACE,
+            when: "",
+            example: r#"{"focal":"parse_config"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin trace-data-flow",
+    },
+    Command {
+        name: "neighbors",
+        line: "neighbors {entity_id}: an entity's dependencies and dependents",
+        variants: &[Variant {
+            tool: crate::verbs::NEIGHBORS,
+            when: "",
+            example: r#"{"entity_id":"<entity id from kin locate>"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "",
+    },
+    Command {
+        name: "impact",
+        line: "impact {entity_ids}: what a change could affect; ids come from locate",
+        variants: &[Variant {
+            tool: crate::verbs::IMPACT,
+            when: "",
+            example: r#"{"entity_ids":["<entity id from kin locate>"]}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin impact",
+    },
+    Command {
+        name: "source",
+        line: "",
+        variants: &[Variant {
+            tool: crate::verbs::SOURCE,
+            when: "",
+            example: r#"{"entity_id":"<entity id from kin locate>"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin source",
+    },
+    Command {
+        name: "status",
+        line: "status {}: graph counts and freshness",
+        variants: &[Variant {
+            tool: crate::verbs::STATUS,
+            when: "",
+            example: "{}",
+        }],
+        writes: false,
+        hidden: false,
+        cli: "kin graph status",
+    },
+    Command {
+        name: "history",
+        line: "history {entity_id}: who changed an entity, and when",
+        variants: &[Variant {
+            tool: crate::verbs::HISTORY,
+            when: "",
+            example: r#"{"entity_id":"<entity id from kin locate>"}"#,
+        }],
+        writes: false,
+        hidden: false,
+        cli: "",
+    },
+    // A write opens the connection's own session. Explicit lifecycle remains
+    // available as a hidden compatibility command.
+    Command {
+        name: "session",
+        line: "",
+        variants: &[Variant {
+            tool: crate::verbs::SESSION,
+            when: "",
+            example: r#"{"action":"end","session_id":"<session_id>"}"#,
+        }],
+        writes: true,
+        hidden: true,
+        cli: "",
+    },
+    Command {
+        name: "mutate",
+        line: "mutate {operations}: patch anchors or update entity bodies atomically",
+        variants: &[Variant {
+            tool: crate::verbs::MUTATE,
+            when: "",
+            example: r#"{"operations":[{"verb":"patch","target":"<entity id>","payload":{"EntitySourcePatch":{"source_base":{"ticket":"<copy unchanged from this entity's source_base>"},"edits":[{"old_text":"<unique exact text>","new_text":"<replacement>"}]}},"description":"what this changes"}],"summary":"one sentence for the history"}"#,
+        }],
+        writes: true,
+        hidden: false,
+        cli: "",
+    },
+    Command {
+        name: "transaction",
+        line: "transaction {action}: begin, stage, commit or abort a multi-call change",
+        variants: &[Variant {
+            tool: crate::verbs::TRANSACTION,
+            when: "",
+            example: r#"{"scope":"repository"}"#,
+        }],
+        writes: true,
+        hidden: false,
+        cli: "",
+    },
+    Command {
+        name: DESCRIBE,
+        line: "describe {command}: args and an example for any command or tool; {} lists them all",
+        variants: &[],
+        writes: false,
+        hidden: false,
+        cli: "kin describe",
+    },
+    Command {
+        name: CALL,
+        line: "",
+        variants: &[],
+        writes: false,
+        hidden: false,
+        cli: "kin call",
+    },
+    Command {
         name: "search",
-        line: "search {query}: declarations by name, kind or language; {literal}: exact text",
+        line: "",
         variants: &[
             Variant {
                 tool: "semantic_search",
@@ -183,148 +356,20 @@ const COMMANDS: &[Command] = &[
             },
         ],
         writes: false,
+        hidden: true,
         cli: "kin search",
     },
     Command {
-        name: "context",
-        line: "context {entity_id|entities|question}: code and routes around entities",
-        variants: &[Variant {
-            tool: "get_context_pack",
-            when: "",
-            example: r#"{"question":"how are failed requests retried"}"#,
-        }],
-        writes: false,
-        cli: "kin context",
-    },
-    Command {
-        name: "refs",
-        line: "refs {entity_id|query}: callers, importers and references",
-        variants: &[Variant {
-            tool: "find_references",
-            when: "",
-            example: r#"{"query":"parse_config"}"#,
-        }],
-        writes: false,
-        cli: "kin refs",
-    },
-    Command {
-        name: "trace",
-        line: "trace {focal}: the call chain out from one entity",
-        variants: &[Variant {
-            tool: "trace_data_flow",
-            when: "",
-            example: r#"{"focal":"parse_config"}"#,
-        }],
-        writes: false,
-        cli: "kin trace-data-flow",
-    },
-    Command {
         name: "path",
-        line: "path {from, to}: how one entity reaches another",
+        line: "",
         variants: &[Variant {
             tool: crate::handlers::path::TOOL_NAME,
             when: "",
             example: r#"{"from":"main","to":"parse_config"}"#,
         }],
         writes: false,
+        hidden: true,
         cli: "kin path",
-    },
-    Command {
-        name: "impact",
-        line: "impact {entity_ids}: what a change could affect",
-        variants: &[Variant {
-            tool: "impact_analysis",
-            when: "",
-            example: r#"{"entity_ids":["<entity id from kin locate>"]}"#,
-        }],
-        writes: false,
-        cli: "kin impact",
-    },
-    Command {
-        name: "source",
-        line: "",
-        variants: &[Variant {
-            tool: "get_entity_source",
-            when: "",
-            example: r#"{"entity_id":"<entity id from kin locate>"}"#,
-        }],
-        writes: false,
-        cli: "kin source",
-    },
-    Command {
-        name: "status",
-        line: "status {}: graph counts and freshness",
-        variants: &[Variant {
-            tool: "kin_graph_status",
-            when: "",
-            example: "{}",
-        }],
-        writes: false,
-        cli: "kin graph status",
-    },
-    Command {
-        name: "init",
-        line: "init {path}: set this folder up as a Kin repository, when Kin says it is not one",
-        variants: &[Variant {
-            tool: crate::repository_init::TOOL_NAME,
-            when: "",
-            example: "{}",
-        }],
-        // It creates a store and the repository's canonical state, so the
-        // read-only surface never carries it.
-        writes: true,
-        cli: "kin init",
-    },
-    Command {
-        name: "session",
-        line: "session {vendor, client_name, cwd}: open the write session mutate needs",
-        variants: &[Variant {
-            tool: "kin_session_start",
-            when: "",
-            example: r#"{"vendor":"codex","client_name":"Codex CLI","cwd":"/path/to/repo"}"#,
-        }],
-        writes: true,
-        cli: "",
-    },
-    Command {
-        name: "mutate",
-        line: "mutate {session_id, operations}: patch anchors or update entity bodies atomically",
-        variants: &[Variant {
-            tool: "kin_mutate",
-            when: "",
-            example: r#"{"session_id":"<session_id from kin call kin_session_start>","operations":[{"verb":"patch","target":"<entity id>","payload":{"EntitySourcePatch":{"source_base":{"schema":"kin.entity.source_base.v1","context":{"repository_id":"<copy from source_base>","workspace_id":"<copy from source_base>","workspace_generation":0,"workspace_head_hash":"<copy from source_base>","workspace_tree_hash":"<copy from source_base>"},"entity_id":"<entity id>","artifact_id":"<copy from source_base>","source_blob_hash":"<copy from source_base>","start_byte":0,"end_byte":1,"body_hash":"<copy from source_base>"},"edits":[{"old_text":"<unique exact text>","new_text":"<replacement>"}]}},"description":"what this changes"}],"summary":"one sentence for the history"}"#,
-        }],
-        writes: true,
-        cli: "",
-    },
-    Command {
-        name: "exec",
-        line: "exec {session_id, argv}: build, test or run the project in a session workspace",
-        variants: &[Variant {
-            tool: crate::session_exec::TOOL_NAME,
-            when: "",
-            example: r#"{"session_id":"<session_id from kin call kin_session_start>","argv":["go","test","./..."]}"#,
-        }],
-        // It runs the project's own code and hands the manifests it writes
-        // back as a change, so the read-only surface never carries it. It has
-        // no CLI spelling: `kin exec` in a shell is a person's session, which
-        // runs any command and keeps everything it writes but build outputs.
-        writes: true,
-        cli: "",
-    },
-    Command {
-        name: DESCRIBE,
-        line: "describe {command}: args and an example for any command or tool; {} lists them all",
-        variants: &[],
-        writes: false,
-        cli: "kin describe",
-    },
-    Command {
-        name: CALL,
-        line: "",
-        variants: &[],
-        writes: false,
-        cli: "kin call",
     },
 ];
 
@@ -364,7 +409,7 @@ fn command_line(command: &Command, surface: RoutedSurface) -> String {
 fn served_commands(surface: RoutedSurface) -> impl Iterator<Item = &'static Command> {
     COMMANDS
         .iter()
-        .filter(move |command| surface.writes || !command.writes)
+        .filter(move |command| !command.hidden && (surface.writes || !command.writes))
 }
 
 /// The routed tool's definition, exactly as `tools/list` serves it.
@@ -453,6 +498,8 @@ pub struct CommandRow {
     pub tools: Vec<&'static str>,
     pub cli: &'static str,
     pub writes: bool,
+    /// A command a verb replaced: accepted for one version, never served.
+    pub hidden: bool,
 }
 
 /// The name table `docs/mcp-tools.md` prints, one row per command.
@@ -468,6 +515,7 @@ pub fn command_table() -> Vec<CommandRow> {
                 .collect(),
             cli: command.cli,
             writes: command.writes,
+            hidden: command.hidden,
         })
         .collect()
 }
@@ -575,14 +623,46 @@ fn command_named(name: &str) -> Option<&'static Command> {
 }
 
 /// The command a registered tool is one variant of, with that variant's index.
+///
+/// A name a verb replaced is the variant of the command that serves its verb,
+/// so a hint naming `get_entity_source` is presented as `source`. A served
+/// command is preferred over the hidden one that also runs the same tool.
 fn command_for_tool(tool: &str) -> Option<(&'static Command, usize)> {
-    COMMANDS.iter().find_map(|command| {
-        command
-            .variants
+    let find = |tool: &str, hidden: bool| {
+        COMMANDS
             .iter()
-            .position(|variant| variant.tool == tool)
-            .map(|index| (command, index))
-    })
+            .filter(|command| command.hidden == hidden)
+            .find_map(|command| {
+                command
+                    .variants
+                    .iter()
+                    .position(|variant| variant.tool == tool)
+                    .map(|index| (command, index))
+            })
+    };
+    find(tool, false)
+        .or_else(|| crate::verbs::verb_for(tool).and_then(|verb| find(verb, false)))
+        .or_else(|| find(tool, true))
+        .or_else(|| crate::verbs::verb_for(tool).and_then(|verb| find(verb, true)))
+}
+
+/// The command whose CLI spelling a hint naming `tool` is presented as.
+///
+/// A tool a hidden command runs exactly keeps that command's spelling, because
+/// the verb's would run a different route in a shell: `kin path` finds a route
+/// and `kin trace-data-flow` walks a chain, and `kin search` matches names
+/// where `kin locate` ranks descriptions.
+fn hint_command_for_tool(tool: &str) -> Option<(&'static Command, usize)> {
+    let exact = |tool: &str| {
+        COMMANDS.iter().find_map(|command| {
+            command
+                .variants
+                .iter()
+                .position(|variant| variant.tool == tool)
+                .map(|index| (command, index))
+        })
+    };
+    exact(tool).or_else(|| crate::verbs::verb_for(tool).and_then(exact))
 }
 
 /// The registry this binary serves, built once.
@@ -881,6 +961,11 @@ fn call(args: Map<String, Value>, surface: RoutedSurface) -> Resolved {
     };
     match resolve_name(requested) {
         Some(Target::Tool(tool)) => run_tool(tool, arguments, surface),
+        // A verb is a command here and a registered tool by the same name, so
+        // `call` runs it as the tool it names.
+        Some(Target::Command { command, .. }) if crate::verbs::is_plain_word(command.name) => {
+            run_tool(command.name.to_string(), arguments, surface)
+        }
         Some(Target::Command { command, .. }) => refusal(
             format!(
                 "call runs a tool by its registered name, and '{}' is a command: run it as \
@@ -903,8 +988,34 @@ fn call(args: Map<String, Value>, surface: RoutedSurface) -> Resolved {
 }
 
 /// Everything wrong with `args` against `tool`'s registered schema, empty when
-/// the call is good.
+/// the call is good. A verb is also resolved, on a copy, so a call whose
+/// option names no valid form, a `session` action missing its field or a
+/// `locate` mode that does not exist, is refused here with the verb's own
+/// sentence rather than dispatched.
 fn validate(tool: &str, args: &Map<String, Value>) -> Vec<String> {
+    let problems = validate_schema(tool, args);
+    if !problems.is_empty() || !(crate::verbs::is_verb(tool) || crate::requests::is_typed(tool)) {
+        return problems;
+    }
+    let mut name = tool.to_string();
+    let mut arguments: HashMap<String, Value> = args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    match crate::verbs::resolve(&mut name, &mut arguments) {
+        Ok(()) => Vec::new(),
+        Err(refusal) => {
+            let prefix = format!("{tool}: ");
+            vec![refusal
+                .strip_prefix(&prefix)
+                .unwrap_or(&refusal)
+                .trim_end_matches('.')
+                .to_string()]
+        }
+    }
+}
+
+fn validate_schema(tool: &str, args: &Map<String, Value>) -> Vec<String> {
     let Some(definition) = registered(tool) else {
         return vec![format!(
             "routes to {tool}, which this server does not register"
@@ -919,6 +1030,18 @@ fn validate(tool: &str, args: &Map<String, Value>) -> Vec<String> {
     names.sort();
     for name in names {
         let value = &args[name.as_str()];
+        // Compatibility spellings validate as their typed value without
+        // advertising aliases in the served schema. Dispatch keeps the
+        // original arguments for the normal verb resolver.
+        let canonical_mode = if tool == crate::verbs::LOCATE && name == "mode" {
+            value
+                .as_str()
+                .and_then(|raw| crate::requests::LocateMode::SPEC.canonical(raw))
+                .map(|mode| json!(mode))
+        } else {
+            None
+        };
+        let value = canonical_mode.as_ref().unwrap_or(value);
         match properties.and_then(|properties| properties.get(name.as_str())) {
             Some(property) => problems.extend(check_value(name, property, value)),
             None => {
@@ -1064,34 +1187,16 @@ fn enum_label(values: &[Value], separator: &str) -> String {
 /// tool the belt serves, with the same defaults a routed call gets, and the
 /// registered form for any other tool.
 ///
-/// One field is added back. The belt's `kin_mutate` leaves `session_id` out,
-/// because `kin agent run` holds the session and fills it in for the model; a
-/// routed caller opens its own session with `session`, so it is told the field
-/// that carries it.
+/// No session field is added: a write opens the connection's own session, as
+/// it does on the named profiles.
 fn served_schema(tool: &str) -> Value {
-    let mut schema = belt_listing()
+    belt_listing()
         .tools
         .iter()
         .find(|served| served.name == tool)
         .or_else(|| registered(tool))
         .map(|served| served.input_schema.clone())
-        .unwrap_or(Value::Null);
-    if tool == "kin_mutate" {
-        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.entry("session_id").or_insert_with(|| {
-                json!({
-                    "type": "string",
-                    "description": "The session_id kin call kin_session_start returned."
-                })
-            });
-        }
-        if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
-            if !required.contains(&json!("session_id")) {
-                required.push(json!("session_id"));
-            }
-        }
-    }
-    schema
+        .unwrap_or(Value::Null)
 }
 
 /// The fields a tool takes, in the words a refusal uses.
@@ -1441,7 +1546,7 @@ pub fn routed_form(tool: &str) -> String {
     if tool == crate::tool_invocation::TOOL_NAME {
         return cli_of(CALL).to_string();
     }
-    match command_for_tool(tool) {
+    match hint_command_for_tool(tool) {
         Some((command, _)) if !command.cli.is_empty() => command.cli.to_string(),
         _ => format!("{} {tool}", cli_of(CALL)),
     }
@@ -1525,10 +1630,15 @@ const HINT_KEYS: [&str; 6] = [
 /// breaks the size contract the caller asked for.
 pub fn rewrite_hints(result: &mut ToolCallResult, max_bytes: usize) {
     let is_error = result.is_error == Some(true);
+    // A verb is a plain word: "the source", "its context" and "the status"
+    // name no tool in a hint, and a hint that names a verb already names the
+    // command that runs it here. Only the registered snake-case names are
+    // presented as their routed form.
     let names: HashSet<&str> = registry()
         .tools
         .iter()
         .map(|tool| tool.name.as_str())
+        .filter(|name| !crate::verbs::is_plain_word(name))
         .collect();
     for block in &mut result.content {
         let ContentBlock::Text { text } = block;
@@ -1688,16 +1798,59 @@ mod tests {
         params
     }
 
-    fn dispatched(arguments: Value) -> ToolCallParams {
-        dispatched_on(WRITES, arguments)
-    }
-
     fn works(example: &Value, surface: RoutedSurface) -> bool {
         let (routing, _, _) = outcome_on(surface, example.clone());
         match routing {
             Routing::Dispatch => true,
             Routing::Answer(result) => result.is_error != Some(true),
             Routing::NotRouted => false,
+        }
+    }
+
+    #[test]
+    fn hidden_literal_mode_routes_as_text_without_entering_the_schema() {
+        let definition = registered(crate::verbs::LOCATE).unwrap();
+        assert_eq!(
+            definition.input_schema["properties"]["mode"]["enum"],
+            json!(["auto", "name", "description", "text"])
+        );
+        for surface in [WRITES, READ_ONLY] {
+            for mode in ["text", "literal", " LITERAL "] {
+                let arguments = json!({"query":"src/guard.py", "mode":mode,
+                    "pattern":true, "ignore_case":true});
+                for call in [
+                    json!({"command":"locate", "args":arguments}),
+                    json!({"command":"call", "args":{"tool":"locate", "arguments":arguments}}),
+                ] {
+                    let mut dispatched = dispatched_on(surface, call);
+                    // Routing preserves the named verb and caller arguments;
+                    // local dispatch and daemon forwarding resolve it next.
+                    assert_eq!(dispatched.name, crate::verbs::LOCATE);
+                    assert_eq!(
+                        serde_json::to_value(&dispatched.arguments).unwrap(),
+                        arguments
+                    );
+                    crate::verbs::resolve(&mut dispatched.name, &mut dispatched.arguments).unwrap();
+                    assert_eq!(dispatched.name, "lexical_lookup");
+                    assert_eq!(
+                        serde_json::to_value(&dispatched.arguments).unwrap(),
+                        json!({"literal":"src/guard.py", "held_text":true,
+                            "pattern":true, "ignore_case":true})
+                    );
+                }
+            }
+            let invalid = refusal_on(
+                surface,
+                json!({"command":"locate",
+                "args":{"query":"needle", "mode":"unknown"}}),
+            );
+            assert!(invalid.to_string().contains("mode must be one of"));
+            let unexpected = refusal_on(
+                surface,
+                json!({"command":"locate",
+                "args":{"query":"needle", "mode":"literal", "undeclared":true}}),
+            );
+            assert!(unexpected.to_string().contains("does not take undeclared"));
         }
     }
 
@@ -1799,52 +1952,38 @@ mod tests {
         }
     }
 
-    /// Setting a folder up creates a store and the repository's canonical
-    /// state, so it is a write: the read-only surface neither lists it nor runs
-    /// it by any name, and says which profile does.
     #[test]
-    fn the_read_only_surface_never_lists_or_runs_init() {
-        assert!(!command_names(READ_ONLY).contains(&"init"));
-        let listed = tool_definition(READ_ONLY);
-        assert!(
-            !listed.description.contains("init {path}"),
-            "{}",
-            listed.description
-        );
-        assert!(
-            !listed.input_schema["properties"]["command"]["enum"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("init")),
-            "{}",
-            listed.input_schema
-        );
-        for arguments in [
-            json!({"command": "init"}),
-            json!({"command": "init", "args": {"path": "/work/app"}}),
-            json!({"command": crate::repository_init::TOOL_NAME}),
-            json!({"command": "kin init"}),
-            json!({"command": "call", "args": {"tool": crate::repository_init::TOOL_NAME, "arguments": {}}}),
-            json!({"command": "describe", "args": {"command": "init"}}),
-        ] {
-            let refused = refusal_on(READ_ONLY, arguments.clone());
-            let message = refused["message"].as_str().unwrap_or_default();
-            assert!(
-                message.contains("read-only agent-routed-query profile")
-                    && message.contains("The agent-routed profile carries Kin's writes."),
-                "{arguments}: {refused}"
+    fn operator_commands_have_no_direct_generic_or_description_route() {
+        for surface in [WRITES, READ_ONLY] {
+            for command in [
+                "init",
+                "kin_init",
+                "exec",
+                "kin_session_exec",
+                "kin_todo_import",
+            ] {
+                assert!(!command_names(surface).contains(&command));
+                let listing = catalogue(surface);
+                assert!(!listing["other_tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["tool"] == command));
+                refusal_on(surface, json!({"command":command}));
+                refusal_on(
+                    surface,
+                    json!({"command":"describe", "args":{"command":command}}),
+                );
+                refusal_on(
+                    surface,
+                    json!({"command":"call", "args":{"tool":command,"arguments":{}}}),
+                );
+            }
+            refusal_on(
+                surface,
+                json!({"command":"session","args":{"action":"exec","argv":["go","test"]}}),
             );
         }
-        let catalogue = catalogue(READ_ONLY).to_string();
-        assert!(
-            !catalogue.contains(crate::repository_init::TOOL_NAME),
-            "{catalogue}"
-        );
-
-        // The write surface lists it and runs it as the named tool.
-        assert!(command_names(WRITES).contains(&"init"));
-        let params = dispatched(json!({"command": "init", "args": {}}));
-        assert_eq!(params.name, crate::repository_init::TOOL_NAME);
     }
 
     /// The routed tool's annotations are a claim about everything reachable
@@ -1898,7 +2037,7 @@ mod tests {
                     .any(|line| line.starts_with(&format!("{} {{", command.name)));
                 assert_eq!(
                     listed,
-                    surface.writes || !command.writes,
+                    !command.hidden && (surface.writes || !command.writes),
                     "{} on {}: {description}",
                     command.name,
                     surface.profile()
@@ -1924,8 +2063,10 @@ mod tests {
         }
     }
 
-    /// Every read command runs a read-only tool the query belt serves, and the
-    /// two write commands run exactly the write path `kin_mutate` needs.
+    /// Every served command is one of the verbs the named profiles serve: a
+    /// read command runs a read-only verb the query belt serves, and a write
+    /// command a verb only the default belt carries. A hidden command runs a
+    /// tool a served verb replaced, so it reaches nothing a verb does not.
     #[test]
     fn commands_run_the_tools_the_design_names() {
         let query: HashSet<&str> = crate::tools::agent_query_tool_names()
@@ -1945,11 +2086,26 @@ mod tests {
                     .iter()
                     .find(|tool| tool.name == variant.tool)
                     .unwrap_or_else(|| panic!("{} is not registered", variant.tool));
+                if command.hidden {
+                    if variant.tool == crate::verbs::SESSION {
+                        assert!(!tool.annotations.read_only_hint);
+                        reached.push(variant.tool);
+                        continue;
+                    }
+                    let verb = crate::verbs::verb_for(variant.tool)
+                        .unwrap_or_else(|| panic!("{} was replaced by no verb", variant.tool));
+                    assert!(default.contains(verb), "{}", variant.tool);
+                    continue;
+                }
+                assert_eq!(command.name, variant.tool, "a served command is its verb");
                 if command.writes {
                     assert!(
-                        !tool.annotations.read_only_hint || variant.tool == "kin_session_start"
+                        !tool.annotations.read_only_hint,
+                        "{} is a write command over a read-only tool",
+                        variant.tool
                     );
                     assert!(default.contains(variant.tool), "{}", variant.tool);
+                    assert!(!query.contains(variant.tool), "{}", variant.tool);
                 } else {
                     assert!(tool.annotations.read_only_hint, "{} writes", variant.tool);
                     assert!(query.contains(variant.tool), "{}", variant.tool);
@@ -1958,25 +2114,11 @@ mod tests {
             }
         }
         reached.sort_unstable();
-        assert_eq!(
-            reached,
-            vec![
-                "find_references",
-                "get_context_pack",
-                "get_entity_source",
-                "impact_analysis",
-                "kin_graph_status",
-                "kin_init",
-                "kin_mutate",
-                "kin_session_exec",
-                "kin_session_start",
-                "lexical_lookup",
-                "semantic_locate",
-                "semantic_search",
-                "trace_data_flow",
-                "trace_path",
-            ]
-        );
+        // Every verb, and the front door that runs them, is one routed command.
+        let mut verbs = crate::verbs::VERBS.to_vec();
+        verbs.push(crate::ask::TOOL_NAME);
+        verbs.sort_unstable();
+        assert_eq!(reached, verbs, "every verb is one routed command");
     }
 
     /// `describe` hands back each command's schema, and every example it gives
@@ -2019,6 +2161,26 @@ mod tests {
                         works(example, surface),
                         "the {name} example fails: {example}"
                     );
+                    if name == crate::verbs::MUTATE {
+                        let base = &example["args"]["operations"][0]["payload"]
+                            ["EntitySourcePatch"]["source_base"];
+                        assert!(crate::source_ticket::is_ticket(base), "{example}");
+                        let arguments: HashMap<String, Value> =
+                            serde_json::from_value(example["args"].clone()).unwrap();
+                        assert!(crate::input_contract::semantic_selector_refusal(
+                            "kin_mutate",
+                            &arguments
+                        )
+                        .is_none());
+                        for private in [
+                            "artifact_id",
+                            "start_byte",
+                            "end_byte",
+                            "workspace_tree_hash",
+                        ] {
+                            assert!(!example.to_string().contains(private), "{example}");
+                        }
+                    }
                 }
             }
         }
@@ -2030,9 +2192,11 @@ mod tests {
     #[test]
     fn describe_with_no_command_lists_everything_reachable() {
         let registry = crate::tools::tool_definitions();
+        // A name a verb replaced is covered by the command that serves its verb.
         let covered: HashSet<&str> = COMMANDS
             .iter()
             .flat_map(|command| command.variants.iter().map(|variant| variant.tool))
+            .chain(crate::verbs::ALIASES.iter().map(|(alias, _)| *alias))
             .collect();
         for surface in [WRITES, READ_ONLY] {
             let (_, _, payload) = outcome_on(surface, json!({"command": "describe"}));
@@ -2123,7 +2287,7 @@ mod tests {
             (
                 WRITES,
                 json!({"command": "trace", "args": {"from": "a"}}),
-                vec!["does not take from", "missing focal"],
+                vec!["does not take from", "focal (string)"],
             ),
             (
                 WRITES,
@@ -2143,7 +2307,22 @@ mod tests {
             (
                 WRITES,
                 json!({"command": "session", "args": {"vendor": "codex"}}),
-                vec!["missing client_name", "missing cwd"],
+                vec!["action start needs client_name", "Valid form"],
+            ),
+            (
+                WRITES,
+                json!({"command": "session", "args": {"action": "end"}}),
+                vec!["action end needs session_id"],
+            ),
+            (
+                WRITES,
+                json!({"command": "locate", "args": {"query": "x", "mode": "fuzzy"}}),
+                vec!["mode must be one of auto, name, description, text"],
+            ),
+            (
+                WRITES,
+                json!({"command": "transaction", "args": {"transaction_id": "t1"}}),
+                vec!["stage, commit or abort"],
             ),
             (
                 WRITES,
@@ -2223,6 +2402,11 @@ mod tests {
             (
                 WRITES,
                 json!({"command": "call", "args": {"tool": "locate"}}),
+                vec!["needs query or cursor"],
+            ),
+            (
+                WRITES,
+                json!({"command": "call", "args": {"tool": "describe"}}),
                 vec!["is a command"],
             ),
             (
@@ -2319,7 +2503,7 @@ mod tests {
         for field in [
             "query (string)",
             "limit (integer)",
-            "granularity (entity)",
+            "include_tests (boolean)",
             "cursor (string)",
         ] {
             assert!(message.contains(field), "{field} missing from: {message}");
@@ -2362,12 +2546,62 @@ mod tests {
             "body": "x",
             "description": "d",
         });
+        // Each row names the registered tool the call reaches once the verb it
+        // was routed to is resolved, which is what the dispatcher does next.
         for (surface, arguments, tool, expected) in [
             (
                 WRITES,
-                json!({"command": "locate", "args": {"query": "retries"}}),
+                json!({"command": "locate", "args": {"query": "where retries happen"}}),
                 "semantic_locate",
+                json!({"query": "where retries happen"}),
+            ),
+            (
+                WRITES,
+                json!({"command": "locate", "args": {"query": "retries"}}),
+                "semantic_search",
                 json!({"query": "retries"}),
+            ),
+            (
+                WRITES,
+                json!({"command": "locate", "args": {"query": "retry_after(", "mode": "literal"}}),
+                "lexical_lookup",
+                json!({"literal": "retry_after(", "held_text": true}),
+            ),
+            (
+                WRITES,
+                json!({"command": "trace", "args": {"focal": "a", "to": "b", "direction": "calls"}}),
+                "trace_path",
+                json!({"from": "a", "to": "b", "direction": "forward"}),
+            ),
+            (
+                WRITES,
+                json!({"command": "neighbors", "args": {"entity_id": "e1"}}),
+                "graph_neighborhood",
+                json!({"entity_id": "e1"}),
+            ),
+            (
+                READ_ONLY,
+                json!({"command": "history", "args": {"entity_id": "e1"}}),
+                "kin_provenance_query",
+                json!({"entity_id": "e1"}),
+            ),
+            (
+                WRITES,
+                json!({"command": "session", "args": {"action": "end", "session_id": "s1"}}),
+                "kin_session_end",
+                json!({"session_id": "s1"}),
+            ),
+            (
+                WRITES,
+                json!({"command": "transaction", "args": {"action": "commit", "transaction_id": "t1"}}),
+                "kin_transaction_commit",
+                json!({"transaction_id": "t1"}),
+            ),
+            (
+                WRITES,
+                json!({"command": "call", "args": {"tool": "refs", "arguments": {"query": "p"}}}),
+                "find_references",
+                json!({"query": "p"}),
             ),
             (
                 WRITES,
@@ -2431,9 +2665,9 @@ mod tests {
             ),
             (
                 WRITES,
-                json!({"command": "session", "args": {"vendor": "codex", "client_name": "Codex", "cwd": "/r"}}),
+                json!({"command": "session", "args": {"vendor": "codex", "client_name": "Codex"}}),
                 "kin_session_start",
-                json!({"vendor": "codex", "client_name": "Codex", "cwd": "/r"}),
+                json!({"vendor": "codex", "client_name": "Codex"}),
             ),
             (
                 WRITES,
@@ -2525,13 +2759,13 @@ mod tests {
             (
                 WRITES,
                 json!({"command": " Locate ", "args": "{\"query\":\"x\"}"}),
-                "semantic_locate",
+                "semantic_search",
                 json!({"query": "x"}),
             ),
             (
                 WRITES,
                 json!({"command": "locate", "query": "x", "limit": 3}),
-                "semantic_locate",
+                "semantic_search",
                 json!({"query": "x", "limit": 3}),
             ),
             (
@@ -2552,11 +2786,14 @@ mod tests {
             (
                 WRITES,
                 json!({"command": "locate", "args": {"query": "x", "cursor": null}}),
-                "semantic_locate",
+                "semantic_search",
                 json!({"query": "x", "cursor": null}),
             ),
         ] {
-            let params = dispatched_on(surface, arguments.clone());
+            let mut params = dispatched_on(surface, arguments.clone());
+            crate::verbs::resolve(&mut params.name, &mut params.arguments).unwrap_or_else(
+                |refusal| panic!("{arguments} was dispatched and refused: {refusal}"),
+            );
             assert_eq!(params.name, tool, "{arguments}");
             let got: Value = serde_json::to_value(&params.arguments).unwrap();
             assert_eq!(got, expected, "{arguments} reached {tool} with other args");
@@ -2744,7 +2981,7 @@ mod tests {
         let args = json!({"entity_id": "00000000-0000-0000-0000-000000000001"});
         for surface in [WRITES, READ_ONLY] {
             let source = dispatched_on(surface, json!({"command": "source", "args": args}));
-            assert_eq!(source.name, "get_entity_source");
+            assert_eq!(source.name, crate::verbs::SOURCE);
             for spelling in ["graph source", "kin graph source"] {
                 assert!(accepts(surface, spelling), "{spelling}");
                 let routed = dispatched_on(surface, json!({"command": spelling, "args": args}));
@@ -2802,9 +3039,24 @@ mod tests {
                 let (spelled, spelled_params, spelled_payload) = outcome_on(WRITES, by_cli.clone());
                 match (&named, &spelled) {
                     (Routing::Dispatch, Routing::Dispatch) => {
+                        // Compared as the registered tool each reaches once a
+                        // verb is resolved: `kin trace-data-flow` names the walk
+                        // itself, and `trace` reaches it.
+                        let resolve = |params: &ToolCallParams| {
+                            let mut params = params.clone();
+                            crate::verbs::resolve(&mut params.name, &mut params.arguments)
+                                .expect("a dispatched example resolves");
+                            params
+                        };
+                        let (named_params, spelled_params) =
+                            (resolve(&named_params), resolve(&spelled_params));
                         assert!(
                             row.tools.is_empty()
-                                || row.tools.contains(&spelled_params.name.as_str()),
+                                || row.tools.iter().any(|tool| {
+                                    *tool == spelled_params.name
+                                        || crate::verbs::handlers_of(tool)
+                                            .contains(&spelled_params.name.as_str())
+                                }),
                             "{} reached {}",
                             row.cli,
                             spelled_params.name
@@ -2868,17 +3120,34 @@ mod tests {
                 if !reachable(surface, name) {
                     continue;
                 }
+                // A command reaches a tool its variant runs, or, for a name a
+                // verb replaced, the verb that serves it.
+                let runs = |command: &Command| {
+                    command.variants.iter().any(|variant| {
+                        variant.tool == name || crate::verbs::verb_for(name) == Some(variant.tool)
+                    })
+                };
                 let reached = match spelled.strip_prefix("call ") {
                     Some(called) => match resolve_name(called) {
                         Some(Target::Tool(called)) => reachable(surface, &called) && called == name,
-                        _ => false,
+                        // `call` runs a verb by its name as the tool it is.
+                        Some(Target::Command { command, .. }) => {
+                            crate::verbs::is_plain_word(command.name)
+                                && command.name == name
+                                && reachable(surface, name)
+                        }
+                        None => false,
                     },
                     None => match resolve_name(&form) {
                         Some(Target::Command { command, .. }) => {
-                            (surface.writes || !command.writes)
-                                && command.variants.iter().any(|variant| variant.tool == name)
+                            (surface.writes || !command.writes) && runs(command)
                         }
-                        Some(Target::Tool(named)) => named == name,
+                        // A verb's CLI spelling may be its default tool's own
+                        // name, as `kin trace-data-flow` is `trace`'s.
+                        Some(Target::Tool(named)) => {
+                            named == name
+                                || crate::verbs::handlers_of(name).contains(&named.as_str())
+                        }
                         None => false,
                     },
                 };
@@ -2940,7 +3209,12 @@ mod tests {
         assert!(neighborhood["message"]
             .as_str()
             .unwrap()
-            .contains("command call, tool graph_neighborhood"));
+            .contains("command neighbors"));
+        let withheld = refusal_of("kin_transaction_validate", WRITES);
+        assert!(withheld["message"]
+            .as_str()
+            .unwrap()
+            .contains("command call, tool kin_transaction_validate"));
         let mutate = refusal_of("kin_mutate", READ_ONLY);
         assert!(mutate["message"]
             .as_str()

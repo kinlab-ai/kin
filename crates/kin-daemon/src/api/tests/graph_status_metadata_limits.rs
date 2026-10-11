@@ -2,6 +2,100 @@
 // Copyright 2026 Firelock, LLC
 
 #[tokio::test]
+async fn public_graph_status_preserves_the_producer_verdict_without_private_inventory() {
+    let state = test_state_with_committed_sources(&[("src/lib.py", "def caller():\n    return 1\n")]);
+    let result = mcp_call(
+        router(Arc::clone(&state)),
+        "kin_graph_status",
+        json!({"max_chars": 60000}),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let text = mcp_result_text(&result);
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["_kin"]["semantic_surface"], 1);
+    assert_eq!(body["scope"], "head");
+    assert_eq!(body["entity_count"], state.graph.entity_count());
+    assert_eq!(body["_kin"]["graph_state"]["entity_count"], body["entity_count"]);
+    assert_eq!(body["_kin"]["semantic_coverage"]["total"], body["embeddings_total"]);
+    assert_eq!(body["_kin"]["verdict"]["safe_to_conclude_absent"], false);
+    assert!(body["_kin"]["repository"]["authority_context"].is_string());
+    assert!(body.get("source_derivation").is_none());
+    assert!(body["enrichment"].get("files").is_none());
+    assert!(body["_kin"]["repository"].get("root").is_none());
+    assert!(!text.contains("src/lib.py"));
+    assert!(!text.contains(&state.layout.working_dir().display().to_string()));
+
+    // A later transport observation may describe an entirely different HEAD.
+    // The forwarded semantic report must retain its selected count and verdict.
+    let unrelated = kin_mcp::Envelope::daemon().with_health(&json!({
+        "graph_entity_count":99999, "graph_loaded":true,
+        "graph_generation":99999, "embed_worker_failed":true,
+    }));
+    let accepted = kin_mcp::server::finalize_daemon_graph_status(
+        result.clone(), unrelated, &[], u64::MAX,
+    );
+    assert_eq!(serde_json::to_value(accepted).unwrap(), serde_json::to_value(result).unwrap());
+}
+
+#[tokio::test]
+async fn graph_status_cli_pages_include_local_decorations_without_losing_dependency_rows() {
+    let state = test_state_with_committed_sources(&[("src/lib.py", "def caller():\n    return 1\n")]);
+    let app = router(Arc::clone(&state));
+    let dependencies = std::iter::once("src/lib.py".to_owned())
+        .chain((0..48).map(|index| format!("missing/{index:03}.py")))
+        .collect::<Vec<_>>();
+    let mut cursor = None::<String>;
+    let mut rows = Vec::new();
+    let mut snapshot = None;
+    let mut pages = 0;
+    loop {
+        let response = app.clone().oneshot(
+            Request::post("/commands/graph")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({
+                    "command":"status_detailed", "dependencies":dependencies,
+                    "cursor":cursor, "max_chars":60000, "response_overhead_bytes":40000,
+                }).to_string())).unwrap(),
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 60_000).await.unwrap();
+        assert!(bytes.len() + 40_000 <= 60_000, "{} bytes before local decoration", bytes.len());
+        let cli: kin_cli::commands::graph::GraphCommandResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(cli.reference_edge_coverage.is_some());
+        assert!(cli.relation_census.is_some());
+        assert!(cli.graph_section.is_some());
+        assert!(cli.call_sites.is_some());
+        assert!(cli.lines.iter().any(|line|line.contains("neither attests every relationship or safe absence")));
+        let detail = cli.enrichment.unwrap();
+        assert_eq!(detail["all_relationships_attested"], false);
+        assert_eq!(detail["page"]["max_chars"], 60000);
+        assert_eq!(detail["page"]["start"], rows.len());
+        assert_eq!(detail["page"]["total"], 49);
+        let id = detail["snapshot_id"].clone();
+        assert_eq!(snapshot.get_or_insert(id.clone()), &id);
+        let files = detail["files"].as_array().unwrap();
+        assert!(!files.is_empty());
+        rows.extend(files.iter().cloned());
+        pages += 1;
+        cursor = detail["page"]["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() { break; }
+    }
+    assert!(pages > 1);
+    assert_eq!(rows.len(), 49);
+    let observed = rows.iter().map(|row|row["projection_path"].clone()).collect::<Vec<_>>();
+    for dependency in dependencies {
+        let path = json!(kin_model::RepoPath::from_utf8(dependency).unwrap());
+        assert_eq!(observed.iter().filter(|observed|**observed == path).count(), 1);
+    }
+    assert_eq!(rows.iter().filter(|row| row["admitted"] == false).count(), 48);
+    for missing in rows.iter().filter(|row| row["admitted"] == false) {
+        assert_eq!(missing["proof"], "unverified");
+        assert_eq!(missing["source_reason"], "not_admitted");
+    }
+}
+
+#[tokio::test]
 async fn enrichment_status_detail_limit_preserves_fenced_counters_and_targeted_rows() {
     let mut state = test_state();
     let mut snapshot = state.graph.to_snapshot();
@@ -68,14 +162,9 @@ async fn enrichment_status_detail_limit_preserves_fenced_counters_and_targeted_r
     let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&raw)).unwrap();
     assert_eq!(body["entity_count"], 2);
     assert_eq!(body["enrichment"]["status"], "bounded");
-    // The daemon owns this selected report; stdio adds the safety envelope
-    // through the shared finalizer. Qualify the actual routed payload there.
-    let finalized = kin_mcp::envelope::finalize(
-        raw,
-        kin_mcp::envelope::Envelope::daemon(),
-        "kin_graph_status",
-    );
-    let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&finalized)).unwrap();
+    assert_eq!(body["_kin"]["semantic_surface"], 1);
+    assert_eq!(body["scope"], "head");
+    assert_eq!(body["enrichment"]["scope"]["kind"], "workspace_head");
     assert_eq!(body["_kin"]["verdict"]["state"], "inconclusive");
     assert_eq!(
         body["_kin"]["verdict"]["inputs"]["enrichment"],
@@ -83,30 +172,50 @@ async fn enrichment_status_detail_limit_preserves_fenced_counters_and_targeted_r
     );
     assert_eq!(body["_kin"]["verdict"]["safe_to_conclude_absent"], false);
     assert!(body["enrichment"].get("page").is_none());
-    assert!(
-        body.get("source_derivation").is_some(),
-        "the independent source reading survives"
-    );
+    assert!(body["enrichment"].get("files").is_none());
+    assert!(body.get("source_derivation").is_none());
+    assert!(body["_kin"].get("source_derivation").is_none());
+    assert_eq!(body["binding_coverage"], body["_kin"]["binding_coverage"]);
+    assert!(matches!(
+        body["binding_coverage"]["scope"].as_str(),
+        Some("live_head" | "selected_scope_unavailable")
+    ));
+
+    let request = kin_mcp::status_pages::StatusRequest {
+        dependencies: vec!["src/target.py".into(), "missing.py".into()],
+        ..Default::default()
+    };
+    let selected_private = mcp_graph_status_snapshot(
+        &state,
+        None,
+        &graph,
+        RequestGraphAuthority::Head,
+        kin_mcp::handlers::entities::GraphStatusScope::Head,
+        &request,
+    )
+    .await
+    .unwrap();
+    let selected_private = parse_graph_status(&selected_private);
+    assert_eq!(selected_private.entity_count, 2);
+    let private_detail = selected_private.enrichment.unwrap();
+    assert!(private_detail.get("unavailable").is_none());
+    let private_rows = private_detail["files"].as_array().unwrap();
+    assert_eq!(private_rows.len(), 2);
+    let missing = json!(kin_model::RepoPath::from_utf8("missing.py").unwrap());
+    assert!(private_rows
+        .iter()
+        .any(|row| row["projection_path"] == missing && row["admitted"] == false));
 
     let selected = mcp_call(
         app,
         "kin_graph_status",
         json!({
-            "dependencies":["src/target.py","missing.py"], "max_chars":60000,
+            "dependencies":request.dependencies, "max_chars":60000,
         }),
     )
     .await;
-    let selected = parse_graph_status(&selected);
-    assert_eq!(selected.entity_count, 2);
-    let detail = selected.enrichment.unwrap();
-    assert!(detail.get("unavailable").is_none());
-    assert_eq!(detail["files"].as_array().unwrap().len(), 2);
-    assert_eq!(detail["page"]["total"], 2);
-    assert!(detail["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|row| row["admitted"] == false));
+    assert_eq!(selected.is_error, Some(true));
+    assert!(mcp_result_text(&selected).contains("This selector is not supported; nothing ran."));
 }
 
 #[tokio::test]

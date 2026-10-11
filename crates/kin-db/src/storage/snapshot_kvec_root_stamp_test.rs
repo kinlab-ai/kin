@@ -54,6 +54,10 @@ fn kvec_stamp_uses_continuously_maintained_root() {
     graph.upsert_entity(&entity).unwrap();
 
     let vectors = VectorIndex::new(4).unwrap();
+    vectors.set_descriptor(crate::vector::IndexDescriptor {
+        model_id: Some("root-stamp-fixture-v1".into()),
+        graph_root: None,
+    });
     vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
     vectors.save(&vector_path).unwrap();
     graph.load_vector_index(&vector_path).unwrap();
@@ -95,6 +99,10 @@ fn kvec_stamp_is_prep_invariant() {
         graph.upsert_entity(&entity).unwrap();
 
         let vectors = VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(crate::vector::IndexDescriptor {
+            model_id: Some("root-stamp-fixture-v1".into()),
+            graph_root: None,
+        });
         vectors.upsert(entity.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         vectors.save(&vector_path).unwrap();
         graph.load_vector_index(&vector_path).unwrap();

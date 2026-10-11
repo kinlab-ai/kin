@@ -253,18 +253,24 @@ async fn session_binding_capture_unknown_interval_is_durable_and_equal_unknown_i
             json!({"entity_ids":[caller.to_string()],"include_traffic":false}),
         )
         .await;
+        let private =
+            serde_json::to_value(observe_live_head_sources(&cold, &cold.graph, None)).unwrap();
+        assert_eq!(private["report"]["prior_local_binding"], "unproven");
+        assert!(private["report"]["outstanding_local_binding_obligations"].is_null());
+        assert_eq!(private["report"]["body_binding"], "current");
+        assert!(report.get("source_derivation").is_none());
         assert_eq!(
-            report["source_derivation"]["report"]["prior_local_binding"],
+            report["binding_coverage"]["binding_scope"]["prior_local_binding"],
             "unproven"
         );
-        assert!(
-            report["source_derivation"]["report"]["outstanding_local_binding_obligations"]
-                .is_null()
-        );
-        assert_eq!(
-            report["source_derivation"]["report"]["body_binding"],
-            "current"
-        );
+        assert!(report["binding_coverage"]["binding_scope"]
+            ["outstanding_local_binding_obligations"]
+            .is_null());
+        assert_eq!(report["_kin"]["verdict"]["state"], "inconclusive");
+        assert!(report["_kin"]["verdict"]["limiting_factor"]
+            .as_str()
+            .unwrap()
+            .contains("local_binding_unproven"));
         let after_cold = session_capture_materialize(&cold, "unknown-cold-noop").await;
         assert_eq!(after_cold.authority_roots, first.authority_roots);
     }
@@ -378,6 +384,7 @@ async fn session_binding_capture_transferred_equal_authority_materializes_withou
                 merge_transaction_delta: None,
                 sealed_observation: None,
                 collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
             },
             None,
         )

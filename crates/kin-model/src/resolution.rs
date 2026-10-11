@@ -379,6 +379,15 @@ pub enum CallSiteState {
     ServerFailed { reason: ServerFailure },
     /// The resolver answered and the answer proves nothing.
     Unresolved { reason: UnresolvedReason },
+    /// The resolver proved nothing here, and the linker proved from the
+    /// source alone that the call names this repository declaration: the
+    /// callee is a binding the calling file declares or imports, or the
+    /// receiver's type is fixed by facts an adapter read (a declared type, a
+    /// provider a framework injects, a value a context carries). A
+    /// non-language-server `Calls` edge from the caller to `target` carries
+    /// the site and names the tier that proved it. It is never a
+    /// language-server proof, so no language-server edge is minted for it.
+    ProvenStatic { target: EntityId },
 }
 
 impl CallSiteState {
@@ -400,7 +409,17 @@ impl CallSiteState {
             | Self::Binding { .. }
             | Self::NotInBuild { .. }
             | Self::ServerFailed { .. }
-            | Self::Unresolved { .. } => None,
+            | Self::Unresolved { .. }
+            | Self::ProvenStatic { .. } => None,
+        }
+    }
+
+    /// The declaration a static proof says the call reaches. `None` for
+    /// every state a static tier did not prove, a resolver's proofs included.
+    pub fn static_target(&self) -> Option<EntityId> {
+        match self {
+            Self::ProvenStatic { target } => Some(*target),
+            _ => None,
         }
     }
 
@@ -415,6 +434,7 @@ impl CallSiteState {
             Self::NotInBuild { .. } => "not_in_build",
             Self::ServerFailed { .. } => "server_failed",
             Self::Unresolved { .. } => "unresolved",
+            Self::ProvenStatic { .. } => "proven_static",
         }
     }
 
@@ -426,6 +446,7 @@ impl CallSiteState {
             Self::ProvenDeclaration { declaration, .. } => {
                 out.push(GraphNodeId::Entity(*declaration))
             }
+            Self::ProvenStatic { target } => out.push(GraphNodeId::Entity(*target)),
             Self::ProvenOutside
             | Self::Binding { .. }
             | Self::NotInBuild { .. }
@@ -471,6 +492,7 @@ impl UnresolvedReason {
     pub fn wire(self) -> &'static str {
         match self {
             Self::NoAnswer => "no_answer",
+            Self::ServerRefused => "server_refused",
             Self::AnswersDisagree => "answers_disagree",
             Self::CalleeNotPlaceable => "callee_not_placeable",
             Self::OutsideTheGraph => "outside_the_graph",
@@ -483,7 +505,13 @@ impl UnresolvedReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UnresolvedReason {
+    /// The resolver answered with no location.
     NoAnswer,
+    /// The resolver answered this position with an error of its own, or with
+    /// an answer that cannot be proven or decoded, and answers the same bytes
+    /// the same way every time. The resolver is at fault, not the site, so
+    /// this is never read as the resolver finding no location.
+    ServerRefused,
     AnswersDisagree,
     CalleeNotPlaceable,
     OutsideTheGraph,

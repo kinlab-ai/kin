@@ -652,7 +652,16 @@ step_graph_query_mcp() {
   kin locate hello --json --explain --max-files 5 > "$captures/kin-locate.json"
   cat "$captures/kin-locate.json"
 
-  daemon_port="$(tr -d '[:space:]' < .kin/daemon.port)"
+  # The daemon publishes its endpoint in its store's directory, which a new
+  # store keeps outside the working tree, so ask Kin where the store is. A
+  # release older than `kin store` keeps every store in the tree.
+  if kin store path --help > /dev/null 2>&1; then
+    kin store path > "$captures/kin-store-path.txt"
+    store_dir="$(tr -d '\r' < "$captures/kin-store-path.txt" | tail -n 1)"
+  else
+    store_dir=.kin
+  fi
+  daemon_port="$(tr -d '[:space:]' < "$store_dir/daemon.port")"
   case "$daemon_port" in
     ''|*[!0-9]*)
       echo "installed daemon published an invalid port: $daemon_port" >&2
@@ -752,16 +761,16 @@ NODE
 
   stopDaemons("before MCP startup");
 
-  const searchArgs = { query: "hello", compact: true, limit: 5 };
+  const searchArgs = { query: "hello", mode: "name", compact: true, limit: 5 };
   // The call takes the shape the launched entry's profile serves: a
   // routed profile lists one `kin` tool, and search goes through it.
-  // Any other profile lists `semantic_search` and is called by name.
+  // Any other profile lists `locate` and is called by name.
   // tools/list must serve the tool the call names, so the listing
   // check below follows the same profile.
   const searchCall = (profile) => (
     typeof profile === "string" && profile.startsWith("agent-routed")
-      ? { name: "kin", arguments: { command: "search", args: searchArgs } }
-      : { name: "semantic_search", arguments: searchArgs }
+      ? { name: "kin", arguments: { command: "locate", args: searchArgs } }
+      : { name: "locate", arguments: searchArgs }
   );
   // What a failure calls the search it made.
   const searchLabel = (call) => (
@@ -809,13 +818,33 @@ NODE
     child.kill("SIGKILL");
     finish(new Error("installed MCP startup/revival proof did not exit within 120 seconds"));
   }, 120_000);
+  // A reply names an entity by its name and the module that holds it,
+  // never by a file, so the seeded function is found as `hello` in
+  // module `probe`.
+  const holdsEntity = (value, name, module) => {
+    if (Array.isArray(value)) return value.some((item) => holdsEntity(item, name, module));
+    if (value && typeof value === "object") {
+      if (value.name === name && value.module === module) return true;
+      return Object.values(value).some((item) => holdsEntity(item, name, module));
+    }
+    return false;
+  };
   const validateSearch = (message, label) => {
     if (!message?.result || message.error || message.result.isError === true) {
       throw new Error(`${label} failed: ${JSON.stringify(message ?? null)}`);
     }
-    const rendered = JSON.stringify(message.result);
-    if (!rendered.includes("hello") || !rendered.includes("probe.py")) {
-      throw new Error(`${label} did not return the seeded hello entity`);
+    const replies = (message.result.content ?? []).flatMap((block) => {
+      try {
+        return [JSON.parse(block?.text)];
+      } catch {
+        return [];
+      }
+    });
+    if (!holdsEntity(replies, "hello", "probe")) {
+      throw new Error(
+        `${label} did not return the seeded hello entity in module probe: ` +
+        JSON.stringify(message.result).slice(0, 500)
+      );
     }
   };
   child.stdout.on("data", (chunk) => {
@@ -1083,7 +1112,24 @@ step_embedding_retrieval() {
   esac
   captures="$RUNNER_TEMP/kin-proof-captures"
   mkdir -p "$captures"
-  kin embed --max-seconds "$PF_EMBED_SECONDS" --json | tee "$captures/kin-embed.json"
+  # The release archives carry no local embedding model and a fresh install
+  # selects no external provider, so `kin embed` must refuse before any work
+  # and name what is missing, as the workflow's step proves.
+  embed_rc=0
+  kin embed --max-seconds "$PF_EMBED_SECONDS" --json \
+    > "$captures/kin-embed.json" 2> "$captures/kin-embed-refusal.txt" || embed_rc=$?
+  cat "$captures/kin-embed.json" "$captures/kin-embed-refusal.txt"
+  if [ "$embed_rc" -eq 0 ]; then
+    echo "kin embed ran on an archive with no local embedding model and no provider selected" >&2
+    exit 1
+  fi
+  case "$(cat "$captures/kin-embed-refusal.txt")" in
+    *"kin embed cannot index anything here"*"no local embedding model"*) ;;
+    *)
+      echo "kin embed exited $embed_rc without the refusal that names the missing model and provider" >&2
+      exit 1
+      ;;
+  esac
 
   PROOF_CAPTURES="$captures" PF_SETTLE_SECONDS="$PF_SETTLE_SECONDS" node <<'NODE'
   const fs = require("fs");
@@ -1155,13 +1201,7 @@ step_embedding_retrieval() {
     }
     const current = fingerprint(status);
     last = current;
-    const coverage = status.embedding_coverage ?? {};
-    const drained =
-      coverage.state === "observed" &&
-      coverage.total > 0 &&
-      coverage.pending === 0 &&
-      coverage.indexed === coverage.total;
-    if (drained && current === previous) {
+    if (current === previous) {
       record(`settled after ${reads} reads: ${current}`);
       settled = true;
       break;
@@ -1174,8 +1214,7 @@ step_embedding_retrieval() {
     flush();
     console.log(
       `::error::the store never settled: ${last}. ` +
-      "Embedding coverage must reach observed with pending 0 and indexed equal to total, " +
-      "and two consecutive reads must agree that nothing new was admitted between them.",
+      "Two consecutive reads must agree that nothing new was admitted between them.",
     );
     process.exit(1);
   }
@@ -1183,7 +1222,7 @@ step_embedding_retrieval() {
 NODE
 
   settle_probe="$(kin status --help 2>&1 || true)"
-  # Both arms sample the store the settle loop just watched drain, and the
+  # Both arms sample the store the settle loop just watched go quiet, and the
   # thing they are sampling is embedding coverage. Exit 9 is `kin status`
   # reporting that nothing admitted the working copy, which is a statement
   # about uncommitted work and says nothing about the coverage this sample

@@ -1,0 +1,297 @@
+{
+ "_kin": {
+  "completeness": {
+   "bound": "at_least",
+   "classes": {
+    "graph": "present"
+   },
+   "decided_by": [
+    "graph"
+   ],
+   "limits": [
+    "degraded:memory_pressure",
+    "verdict_inconclusive",
+    "response_bounded"
+   ],
+   "status": "unknown",
+   "substrate": "graph"
+  },
+  "envelope_version": 2,
+  "provenance": "answered by repo-daemon; from graph generation 4; no_admission_recorded; reconciliation settled; source binding current; store semantics current; degraded: memory_pressure",
+  "response": {
+   "bounded": true,
+   "chars_after_budget": 11800,
+   "chars_before_budget": 44295,
+   "compact": true,
+   "max_chars": 12000,
+   "primary_collection": "entities",
+   "primary_rows": 25
+  },
+  "verdict": {
+   "absence_claim": "not_applicable",
+   "inputs": {
+    "absence_gate": "inconclusive",
+    "call_sites": "certified",
+    "completeness": "certified",
+    "degradations": "inconclusive",
+    "edge_coverage": "inconclusive",
+    "response_budget": "inconclusive"
+   },
+   "limiting_factor": "response_bounded; degraded; answer_coverage_unmeasured; answer_truncated; retrieval_degraded",
+   "safe_to_conclude_absent": false,
+   "state": "inconclusive"
+  }
+ },
+ "call_sites": {
+  "by_state": {
+   "proven_external": 7,
+   "proven_target": 4
+  },
+  "callers": 1,
+  "callers_owed_derivation": 0,
+  "callers_owed_enrichment": 0,
+  "callers_stale": 0,
+  "callers_unproven_no_resolver": 0,
+  "callers_unverified": 0,
+  "clauses": [],
+  "no_resolver": {},
+  "reading": "current",
+  "rows": [
+   {
+    "callee": "RuntimeError",
+    "line_in_entity": 20,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:fddd4adb-77ed-5e02-85ad-af4586c5ea45"
+   },
+   {
+    "callee": "get",
+    "line_in_entity": 22,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:9260a2fe-4162-5cb7-b0fd-3973c07dd0ec"
+   },
+   {
+    "callee": "RuntimeError",
+    "line_in_entity": 25,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:fddd4adb-77ed-5e02-85ad-af4586c5ea45"
+   },
+   {
+    "callee": "RuntimeError",
+    "line_in_entity": 30,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:fddd4adb-77ed-5e02-85ad-af4586c5ea45"
+   },
+   {
+    "callee": "_CollectErrors",
+    "line_in_entity": 40,
+    "reason": null,
+    "state": "proven_target",
+    "target": "entity:9c579cef-25a9-4ba3-a54d-60aea192d570"
+   },
+   {
+    "callee": "do_teardown_request",
+    "line_in_entity": 44,
+    "reason": null,
+    "state": "proven_target",
+    "target": "entity:e3f7a60f-22fa-4185-9954-7e9ca6c3e675"
+   },
+   {
+    "callee": "close",
+    "line_in_entity": 47,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:14b8bfb3-be8f-597c-b873-ce77d50cd111"
+   },
+   {
+    "callee": "do_teardown_appcontext",
+    "line_in_entity": 50,
+    "reason": null,
+    "state": "proven_target",
+    "target": "entity:1914f185-6712-41cf-9197-e4fb07636460"
+   },
+   {
+    "callee": "reset",
+    "line_in_entity": 52,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:474b7eff-9349-5b48-98bb-31f8fd679320"
+   },
+   {
+    "callee": "send",
+    "line_in_entity": 56,
+    "reason": null,
+    "state": "proven_external",
+    "target": "external_reference:f46b4cf2-fb82-51e0-b7e3-0a26ff91ecd3"
+   },
+   {
+    "callee": "raise_any",
+    "line_in_entity": 58,
+    "reason": null,
+    "state": "proven_target",
+    "target": "entity:7e80452e-8e52-4530-b61c-18e2daa7cbda"
+   }
+  ],
+  "scope": "the focal's own body",
+  "settled": true,
+  "sites": 11,
+  "unverified_contexts": {}
+ },
+ "degradations": [
+  {
+   "chars_before_budget": 44295,
+   "chars_before_withholding": 31192,
+   "component": "response_budget",
+   "detail": "the response exceeded its 12000-character budget, so inline source dropped from 24 hits, each of which still carries its identity, location, and span; 81 of 90 entries withheld from `relations`, from the end of the list",
+   "max_chars": 12000,
+   "reason": "response_bounded",
+   "remediation": "read one body with get_entity_source; narrow the request with `depth`; or raise max_chars, up to the 60000 this server will build, if the caller's own result limit accepts a larger payload"
+  },
+  {
+   "chars_before_budget": 17504,
+   "chars_before_withholding": 12964,
+   "component": "response_budget",
+   "detail": "the response exceeded its 12000-character budget, so 8 of 9 entries withheld from `relations`, from the end of the list; 5 of 30 entries withheld from `entities`, from the end of the list",
+   "max_chars": 12000,
+   "reason": "response_bounded",
+   "remediation": "narrow the request with `depth`; or raise max_chars, up to the 60000 this server will build, if the caller's own result limit accepts a larger payload"
+  }
+ ],
+ "depth": 2,
+ "direction": "both",
+ "edge_coverage": {
+  "budget_exhausted": false,
+  "classes": {},
+  "cross_unit_classes": [],
+  "entities_examined": 0,
+  "language": "Python",
+  "reference_enrichment": "available",
+  "requested_classes": [],
+  "scan": "skipped_no_edge_dependency",
+  "scope": "walked_entities"
+ },
+ "elisions": {
+  "body": {
+   "elided": 24,
+   "kept": 0,
+   "reason": "response_budget",
+   "total": 24
+  },
+  "entities": {
+   "elided": 5,
+   "kept": 25,
+   "reason": "response_budget",
+   "total": 30
+  },
+  "relations": {
+   "elided": 89,
+   "kept": 1,
+   "reason": "response_budget",
+   "total": 90
+  }
+ },
+ "entities": [
+  {
+   "body_elided": [
+    "signature"
+   ],
+   "file_path": "src/flask/ctx.py",
+   "id": "4bf5cda3-6b30-4361-96cb-b9f72736d582",
+   "kind": "Method",
+   "name": "AppContext.pop"
+  },
+  {
+   "body_elided": [
+    "signature"
+   ],
+   "file_path": "src/flask/app.py",
+   "id": "1914f185-6712-41cf-9197-e4fb07636460",
+   "kind": "Method",
+   "name": "Flask.do_teardown_appcontext"
+  },
+  {
+   "body_elided": [
+    "signature"
+   ],
+   "file_path": "src/flask/wrappers.py",
+   "id": "f635dce2-850f-41dc-b5cd-dfcad6b4f9f1",
+   "kind": "Class",
+   "name": "Request"
+  },
+  {
+   "body_elided": [
+    "signature"
+   ],
+   "file_path": "src/flask/app.py",
+   "id": "e3f7a60f-22fa-4185-9954-7e9ca6c3e675",
+   "kind": "Method",
+   "name": "Flask.do_teardown_request"
+  },
+  {
+   "body_elided": [
+    "signature"
+   ],
+   "file_path": "src/flask/globals.py",
+   "id": "3943bfdf-b70f-477c-a1ed-c2cbd8c9d445",
+   "kind": "Constant",
+   "name": "_cv_app"
+  },
+  {
+   "body_elided": [
+    "signature"
+   ],
+   "file_path": "src/flask/app.py",
+   "id": "23644d17-578f-425e-a039-345ea9f5ce84",
+   "kind": "Class",
+   "name": "Flask"
+  }
+ ],
+ "entities_withheld": 5,
+ "entity_count": 454,
+ "focal_id": "4bf5cda3-6b30-4361-96cb-b9f72736d582",
+ "negative": {
+  "advice": "this answer returned rows, so it asserts no absence; the verdict below says how far those rows can be trusted as the whole set, against graph as-of {\"generation\":4} with graph coverage for Python (this answer reads no edge class; a language server available for it) and degraded signals [memory_pressure, response_budget:response_bounded, absence_coverage:classes_unmeasured]. Treat these rows as a lower bound rather than the whole set, and do not conclude anything from what is missing from them. Limiting factor: response_bounded: the response budget withheld part of this answer, so its counts are a lower bound and its absence claims are not authoritative; degraded: the daemon reported a degraded signal, so the index may not reflect current truth; answer_coverage_unmeasured: no coverage class was measured for Python, so the rows here are a floor and a declaration the extractor never admitted could not be among them; answer_truncated: this answer stopped early and returned part of what it found, so its counts are a floor and an absence in it is a fact about where the walk stopped; retrieval_degraded: this query reported degradations [response_budget:response_bounded], so it did not run at full capability",
+  "bounding_signals": [
+   "memory_pressure",
+   "response_budget:response_bounded",
+   "absence_coverage:classes_unmeasured"
+  ],
+  "coverage_basis": "graph_structure",
+  "degraded_signals": [
+   "memory_pressure",
+   "response_budget:response_bounded",
+   "absence_coverage:classes_unmeasured"
+  ],
+  "graph_as_of": {
+   "generation": 4
+  },
+  "interpretation": "qualified_answer",
+  "kind": "qualified_answer",
+  "result_count": 1,
+  "safe_to_conclude_absent": false,
+  "semantic_coverage": null,
+  "subject": "this answer returned rows, so it asserts no absence; the verdict below says how far those rows can be trusted as the whole set",
+  "trust": "inconclusive",
+  "trust_reason": "response_bounded: the response budget withheld part of this answer, so its counts are a lower bound and its absence claims are not authoritative; degraded: the daemon reported a degraded signal, so the index may not reflect current truth; answer_coverage_unmeasured: no coverage class was measured for Python, so the rows here are a floor and a declaration the extractor never admitted could not be among them; answer_truncated: this answer stopped early and returned part of what it found, so its counts are a floor and an absence in it is a fact about where the walk stopped; retrieval_degraded: this query reported degradations [response_budget:response_bounded], so it did not run at full capability"
+ },
+ "relation_count": 1186,
+ "relations": [
+  {
+   "direction": "outgoing",
+   "dst": {
+    "Entity": "1914f185-6712-41cf-9197-e4fb07636460"
+   },
+   "from": "4bf5cda3-6b30-4361-96cb-b9f72736d582",
+   "kind": "References",
+   "resolution": "type_resolved",
+   "src": {
+    "Entity": "4bf5cda3-6b30-4361-96cb-b9f72736d582"
+   }
+  }
+ ],
+ "relations_withheld": 89,
+ "truncated": true
+}

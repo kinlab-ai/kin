@@ -42,7 +42,7 @@ not fill in missing observations.
 
 ## Save and reopen
 
-1. Read complete current-head `get_entity_source` and retain `body` plus the
+1. Read complete current-head `source` and retain `body` plus the
    exact versioned `source_base`. Historical and bounded reads do not provide a
    current editing expectation.
 2. Call `kin_draft_create` with client-generated stable `draft_id` UUID,

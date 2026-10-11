@@ -143,12 +143,18 @@ pub async fn run(
         // (FIR-3071).
         if response.resolution != "resolved" && !response.resolution.is_empty() {
             for line in response.lines {
-                eprintln!("{}", crate::output_style::paint_impact_line(&line));
+                eprintln!(
+                    "{}",
+                    crate::output_style::paint_impact_line(&crate::plain_words::line(&line))
+                );
             }
             anyhow::bail!("impact resolution failed: {}", response.resolution);
         }
         for line in response.lines {
-            println!("{}", crate::output_style::paint_impact_line(&line));
+            println!(
+                "{}",
+                crate::output_style::paint_impact_line(&crate::plain_words::line(&line))
+            );
         }
     }
     Ok(())
@@ -386,11 +392,16 @@ pub async fn build_impact_response_with_source(
         source_scope,
     );
     let escape_evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
-    let enrichment = kin_review::enrichment::observe_selected_impact_with_source(
+    // Read a caller with no ledger the way the store-wide status reads it.
+    let no_resolver = kin_mcp::call_sites::host_no_resolver();
+    let enrichment = kin_review::enrichment::observe_selected_impact_with_sources(
         graph,
         &enrichment_targets,
         false,
-        Some(&escape_evidence),
+        kin_review::enrichment::ObservationSources {
+            escape_evidence: Some(&escape_evidence),
+            no_resolver: Some(&no_resolver),
+        },
     )?;
     let mut negative = None;
     if local_impacted.is_empty() {
@@ -1013,14 +1024,14 @@ mod tests {
             "the CLI must inherit the refusal the MCP surface reached: {rendered}"
         );
         assert!(
-            rendered.contains("memory_pressure"),
+            rendered.contains("the machine was low on memory"),
             "the line names the signal the verdict disclosed rather than inventing a cause: \
              {rendered}"
         );
         // And it must not fabricate a missing edge class. Nothing here observed
         // one, and naming one anyway is the fabrication this family exists to end.
         assert!(
-            !rendered.contains("holds no cross-file"),
+            !rendered.contains("holds no cross-file") && !rendered.contains("links between files"),
             "no absent class was observed, so none may be claimed: {rendered}"
         );
 
@@ -1474,14 +1485,16 @@ mod tests {
         let rendered = response.lines.join("\n");
 
         let build_gap = rendered
-            .find("mints no entity-level import edge for C")
+            .find("does not record import links for C")
             .unwrap_or_else(|| panic!("the class no build mints must be named: {rendered}"));
         let class_gap = rendered
-            .find("holds no cross-file reference edges")
+            .find("holds no reference links between files")
             .unwrap_or_else(|| panic!("the short classes decide and must be named: {rendered}"));
-        let worker = rendered.find("mass_deletion_blocked").unwrap_or_else(|| {
-            panic!("the blocked mass deletion must stay named beside the class gap: {rendered}")
-        });
+        let worker = rendered
+            .find("a mass deletion was blocked")
+            .unwrap_or_else(|| {
+                panic!("the blocked mass deletion must stay named beside the class gap: {rendered}")
+            });
         assert!(
             build_gap < class_gap && class_gap < worker,
             "the structural gaps lead and the run degradation follows: {rendered}"
@@ -1492,7 +1505,7 @@ mod tests {
         // sentence over this class would be a claim about code the observation
         // never made.
         assert!(
-            !rendered.contains("although the source carries"),
+            !rendered.contains("although the source contains"),
             "a class no build mints has no resolved import site to blame: {rendered}"
         );
     }
@@ -2127,10 +2140,11 @@ mod tests {
                 // ledger, so every entity in reach is owed enrichment, and the
                 // listing says so after the hops it leaves byte for byte.
                 "  Limit: enrichment_incomplete: 3 entities in this impact's reach or among its \
-                 possible inbound callers across the selected graph have unsettled call-site \
-                 evidence. Impact counts are a lower bound and review risk may change. This \
-                 conservatively bounds the answer. It does not prove that every listed entity \
-                 reaches the changed code."
+                 possible inbound callers across the selected graph have call-site evidence the \
+                 graph has not settled yet because derivation or enrichment is still owed, and a \
+                 sweep will still reach it. Impact counts are a lower bound and review risk may \
+                 change. This conservatively bounds the answer. It does not prove that every \
+                 listed entity reaches the changed code."
                     .to_string(),
                 "    Pending: direct_caller [69bde98b-ea48-5a6a-97d2-7ba614bb0969] (projection: \
                  src/direct.rs; owed_enrichment)"

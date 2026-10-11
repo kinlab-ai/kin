@@ -238,7 +238,12 @@ pub enum ProviderGapReason {
     /// No provider is registered for the language at all.
     NoProviderRegistered,
     /// Providers are registered but none of their binaries were found on PATH.
-    NoBinaryOnPath,
+    /// Carries the binaries looked for and the directories searched, as
+    /// [`crate::discovery::describe_search_path`] names them.
+    NoBinaryOnPath {
+        binaries: Vec<String>,
+        searched: String,
+    },
     /// A repo config named a provider id the registry does not know.
     UnknownConfiguredProvider(ProviderId),
     /// A server binary was found and the server refused to start or to
@@ -257,8 +262,20 @@ impl fmt::Display for ProviderGapReason {
             ProviderGapReason::NoProviderRegistered => {
                 f.write_str("no provider registered for this language")
             }
-            ProviderGapReason::NoBinaryOnPath => {
-                f.write_str("no registered server binary found on PATH")
+            ProviderGapReason::NoBinaryOnPath { binaries, searched } => {
+                let named = binaries
+                    .iter()
+                    .map(|binary| format!("`{binary}`"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                if named.is_empty() {
+                    write!(
+                        f,
+                        "no registered server binary found on PATH (looked in {searched})"
+                    )
+                } else {
+                    write!(f, "no {named} found on PATH (looked in {searched})")
+                }
             }
             ProviderGapReason::UnknownConfiguredProvider(id) => {
                 write!(f, "configured provider '{id}' is not known to the registry")
@@ -280,6 +297,11 @@ pub trait BinaryFinder: Send + Sync {
     fn find_on_path(&self, binary: &str) -> Option<PathBuf>;
     /// Version string reported by the binary, if probing succeeds.
     fn probe_version(&self, path: &Path) -> Option<String>;
+    /// The directories [`Self::find_on_path`] searches, as a reason names
+    /// them. This process's `PATH` unless the finder searches elsewhere.
+    fn searched(&self) -> String {
+        crate::discovery::searched_on_this_path()
+    }
 }
 
 /// Production binary finder: `which` for PATH lookup + `--version` probe.
@@ -691,9 +713,18 @@ impl ProviderRegistry {
             }
         }
 
+        let mut binaries: Vec<String> = Vec::new();
+        for binary in candidates.iter().flat_map(|spec| spec.binaries.iter()) {
+            if !binaries.contains(binary) {
+                binaries.push(binary.clone());
+            }
+        }
         Err(ProviderGap {
             language,
-            reason: ProviderGapReason::NoBinaryOnPath,
+            reason: ProviderGapReason::NoBinaryOnPath {
+                binaries,
+                searched: finder.searched(),
+            },
             tried,
         })
     }
@@ -813,6 +844,9 @@ mod tests {
                 .find(|(p, _)| p == path)
                 .and_then(|(_, v)| v.clone())
         }
+        fn searched(&self) -> String {
+            "/fake/bin, /usr/bin".to_string()
+        }
     }
 
     #[test]
@@ -866,7 +900,18 @@ mod tests {
         let gap = registry
             .resolve_with(LanguageId::Rust, &finder)
             .unwrap_err();
-        assert_eq!(gap.reason, ProviderGapReason::NoBinaryOnPath);
+        assert_eq!(
+            gap.reason,
+            ProviderGapReason::NoBinaryOnPath {
+                binaries: vec!["rust-analyzer".to_string()],
+                searched: "/fake/bin, /usr/bin".to_string(),
+            }
+        );
+        assert_eq!(
+            gap.reason.to_string(),
+            "no `rust-analyzer` found on PATH (looked in /fake/bin, /usr/bin)",
+            "a missing server names what was looked for and where"
+        );
         assert_eq!(gap.tried, vec![ProviderId::new("rust-analyzer")]);
     }
 

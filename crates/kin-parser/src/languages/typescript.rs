@@ -4,9 +4,7 @@
 use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
 use tree_sitter::Tree;
 
-use crate::adapter::{
-    collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
-};
+use crate::adapter::{collect_error_ranges, compute_fingerprint, span_from_node, LanguageAdapter};
 use crate::error::Result;
 use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
@@ -22,6 +20,7 @@ use super::javascript::{
     js_heritage_name, js_module_identity, js_require_target, JsOwners, JsPropertyDefiner,
     TS_SUFFIXES,
 };
+use super::javascript::{parse_with, unparsed_byte_total};
 
 pub struct TypeScriptAdapter;
 
@@ -30,23 +29,102 @@ impl LanguageAdapter for TypeScriptAdapter {
         LanguageId::TypeScript
     }
 
+    /// An ambient declaration, `declare const`, `declare let`, `declare var`
+    /// or `declare class`, says a binding exists without giving it a body,
+    /// and extraction keeps the `declare` at the head of its signature. The
+    /// value lives in another unit or outside the repository, the same shape
+    /// as a C prototype.
+    fn declares_only(&self, kind: EntityKind, signature: &str) -> bool {
+        matches!(
+            kind,
+            EntityKind::Function | EntityKind::Constant | EntityKind::StaticVar | EntityKind::Class
+        ) && signature.trim_start().starts_with("declare ")
+    }
+
+    fn declaration_lifecycle(
+        &self,
+    ) -> Option<&dyn crate::declaration_lifecycle::DeclarationLifecycle> {
+        Some(&super::ecmascript_edit::TYPESCRIPT_LIFECYCLE)
+    }
+
+    fn member_placement(&self) -> Option<&dyn crate::member_placement::MemberPlacement> {
+        Some(&super::ecmascript_edit::TYPESCRIPT_PLACEMENT)
+    }
+
+    fn unit_editor(&self) -> Option<&dyn crate::unit_editor::UnitEditor> {
+        Some(&super::ecmascript_edit::TYPESCRIPT_UNITS)
+    }
+
+    fn site_syntax(&self) -> Option<crate::site_syntax::SiteSyntax> {
+        Some(crate::site_syntax::ECMASCRIPT)
+    }
+
+    fn body_syntax(&self) -> Option<crate::body_syntax::BodySyntax> {
+        Some(crate::body_syntax::ECMASCRIPT)
+    }
+
+    fn name_syntax(&self) -> Option<crate::name_syntax::NameSyntax> {
+        Some(crate::name_syntax::ECMASCRIPT)
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["ts", "tsx"]
     }
 
+    fn project_manifest(&self) -> Option<crate::project_manifest::ProjectManifest> {
+        Some(crate::project_manifest::PACKAGE_JSON)
+    }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::ecmascript_declarations::ecmascript_declaration_census(tree, source))
+    }
+
+    fn import_specifier_root(
+        &self,
+        module_path: &str,
+    ) -> crate::import_origin::ImportSpecifierRoot {
+        crate::import_origin::ecmascript_specifier_root(module_path)
+    }
+
     fn parse(&self, source: &[u8]) -> Result<Tree> {
-        let mut parser = make_parser(&kin_grammar_typescript::LANGUAGE_TYPESCRIPT)?;
-        parser
-            .parse(source, None)
-            .ok_or_else(|| crate::error::ParseError::ParseFailed {
-                file: String::new(),
-                reason: "tree-sitter returned None".into(),
-            })
+        parse_typescript_family(source)
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         extract_typescript_tree(tree, source, file_id, TS_SUFFIXES)
     }
+}
+
+/// Parse a `.ts` or `.tsx` file with the TypeScript grammar that reads it.
+///
+/// One adapter serves both extensions, and the two grammars disagree about one
+/// construct: `<T>value` is a type assertion in `.ts` and the start of a JSX
+/// element in `.tsx`. The non-JSX grammar alone left every JSX element of a
+/// React component in error recovery, so the file parsed as incomplete, its
+/// calls inside JSX were mis-owned or lost, and anything that reads only a
+/// clean tree (value-origin facts above all) skipped it.
+///
+/// The choice is made from the bytes, not the path, because this adapter is
+/// also reached by language id wherever a caller re-parses an entity's file
+/// (source-span validation, binding debt, entity lifecycle), and every one of
+/// those must get the tree ingestion got. A file the TypeScript grammar reads
+/// cleanly keeps that tree, so a `.ts` type assertion is never reread as JSX.
+/// Otherwise TSX wins when it reads the file cleanly, or leaves strictly fewer
+/// bytes unparsed; a tie keeps the TypeScript tree. That is the same rule
+/// [`super::javascript::parse_javascript_family`] applies between its grammars.
+pub(super) fn parse_typescript_family(source: &[u8]) -> Result<Tree> {
+    let typescript = parse_with(&kin_grammar_typescript::LANGUAGE_TYPESCRIPT, source)?;
+    if !typescript.root_node().has_error() {
+        return Ok(typescript);
+    }
+    let tsx = parse_with(&kin_grammar_typescript::LANGUAGE_TSX, source)?;
+    let tsx_wins = !tsx.root_node().has_error()
+        || unparsed_byte_total(&tsx) < unparsed_byte_total(&typescript);
+    Ok(if tsx_wins { tsx } else { typescript })
 }
 
 /// The TypeScript walk over `tree`, with `suffixes` naming the file extensions
@@ -101,6 +179,21 @@ pub(super) fn extract_typescript_tree(
         extract_js_tests(&child, source, &mut tests);
     }
 
+    // Definitions nested in function bodies, after the declaration walk so
+    // every entity that can hold one already exists. The JavaScript adapter
+    // runs the same pass, and a Flow file reaches this walk, so the two have
+    // to share it.
+    let (module_name, is_package) = js_module_identity(&file_id.0, suffixes);
+    let nested_definitions = super::javascript_nested::extract_js_nested_definitions(
+        &root,
+        source,
+        file_id,
+        super::javascript_nested::JsDialect::TypeScript,
+        &module_name,
+        &mut entities,
+        &mut relations,
+    );
+
     // Emitted after the walk and BEFORE `owners.finish`, and both halves of
     // that are load-bearing.
     //
@@ -146,7 +239,6 @@ pub(super) fn extract_typescript_tree(
     // parsed, so a comment-only or unreadable file read `typescript 4/4` on
     // the doctor's parse-coverage row and the parse-hole census could not name
     // it.
-    let (module_name, is_package) = js_module_identity(&file_id.0, suffixes);
     let produced_surface = !entities.is_empty() || !imports.is_empty();
     if produced_surface && !module_name.is_empty() {
         entities.push(ExtractedEntity {
@@ -164,6 +256,10 @@ pub(super) fn extract_typescript_tree(
             declaration_line: None,
         });
     }
+
+    // Calls no declaration walk reached, charged to the innermost entity
+    // holding each one: the JavaScript walk's rule, over the same call walk.
+    super::javascript::adopt_js_unowned_calls(&root, source, &entities, &mut relations);
 
     owners.finish(&mut entities);
 
@@ -189,6 +285,15 @@ pub(super) fn extract_typescript_tree(
         }
     }
 
+    // Every reader above saw the spans it was written against. Module
+    // containment, below, names each child by its span, so it reads the
+    // widened ones.
+    super::ecmascript_extent::widen_to_statements(&root, file_id, &mut entities);
+
+    // The unit's module owns what is declared at its top.
+    let held = crate::module_contains::module_contains(&entities, &relations, file_id);
+    relations.extend(held);
+
     Ok(ParseOutput {
         derived_members: Vec::new(),
         entities,
@@ -197,6 +302,7 @@ pub(super) fn extract_typescript_tree(
         tests,
         parse_state,
         parsed_call_sites: None,
+        nested_definitions: Some(nested_definitions),
     })
 }
 
@@ -211,7 +317,9 @@ fn extract_ts_node(
     definers: &std::collections::HashMap<String, JsPropertyDefiner>,
 ) {
     match node.kind() {
-        "function_declaration" | "function" => {
+        // A generator (`function* f()`) is a function like any other; its
+        // grammar kind differs only by the star.
+        "function_declaration" | "generator_function_declaration" | "function" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 let sig = node_signature(node, source);
@@ -332,6 +440,17 @@ fn extract_ts_node(
             }
         }
         "expression_statement" => {
+            // An unexported `namespace` is wrapped as an expression statement
+            // by this grammar; its scope is identical to an exported one.
+            if let Some(namespace) = node
+                .named_child(0)
+                .filter(|child| child.kind() == "internal_module")
+            {
+                extract_ts_namespace(
+                    &namespace, source, file_id, entities, relations, owners, definers,
+                );
+                return;
+            }
             // `Object.defineProperty(obj, 'name', {...})` and the local helpers
             // that forward to it, which a Node-shaped TypeScript file carries
             // for the same reasons a JavaScript one does.
@@ -485,51 +604,10 @@ fn extract_ts_node(
                 }
             }
         }
-        // `namespace X { ... }` is `internal_module` and `module X { ... }` is
-        // `module`; both carry a `name` and an optional `statement_block` body.
-        // Neither had an arm, so every declaration written inside a namespace
-        // was dropped along with the namespace itself. VS Code's
-        // `coreCommands.ts` declares 117 names and the graph held ten: the ten
-        // that sit at column zero outside all four of its namespaces.
-        //
-        // The body's children go back through `extract_ts_node` with their own
-        // plain names, which is what the Rust adapter's `mod_item` arm does in
-        // this same crate and what the call extractor can resolve: a call
-        // written `CoreNavigationCommands.MoveTo.runEditorCommand(x)` is a
-        // `member_expression`, and `extract_calls_from_context` collapses those
-        // to the bare property name. An entity named `CoreNavigationCommands.MoveTo`
-        // would be a name no call site in the repository ever writes.
+        // Namespace declarations share a lexical owner, so two namespaces
+        // may each declare Inner without colliding in the graph's name index.
         "internal_module" | "module" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                // `declare module "marked"` names the module with a string
-                // literal; the quotes are syntax, not part of the name.
-                let name = name_node
-                    .utf8_text(source)
-                    .unwrap_or("")
-                    .trim_matches(|c| c == '"' || c == '\'')
-                    .to_string();
-                if !name.is_empty() {
-                    entities.push(ExtractedEntity {
-                        kind: EntityKind::Module,
-                        name,
-                        signature: node_signature(node, source),
-                        visibility: detect_ts_visibility(node, source),
-                        doc_summary: extract_preceding_comment(node, source),
-                        fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
-                    });
-                }
-            }
-            // `declare module foo;` has no body to descend into.
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for child in body.children(&mut cursor) {
-                    extract_ts_node(
-                        &child, source, file_id, entities, relations, owners, definers,
-                    );
-                }
-            }
+            extract_ts_namespace(node, source, file_id, entities, relations, owners, definers);
         }
         // `declare` wraps a plain declaration in the grammar, so a `.d.ts`
         // file's `declare class`, `declare const`, `declare function` and
@@ -550,9 +628,23 @@ fn extract_ts_node(
             // body here. The linker treats a declared binding as a declaration
             // and hands a call to it on to the definitions that share its name.
             // Members keep their own signatures: an ambient class's methods are
-            // reached through the class, not by a bare name.
+            // reached through the class, not by a bare name. A member is named
+            // under the declaration that holds it, which is how it is told
+            // apart: a dot alone is not, because a module specifier carries
+            // dots of its own (`declare module "react-dom/server.browser"`,
+            // `declare module '*.css?inline'`).
+            let heads: Vec<String> = entities[declared_from..]
+                .iter()
+                .map(|entity| entity.name.clone())
+                .collect();
             for entity in &mut entities[declared_from..] {
-                if !entity.name.contains('.') && !entity.signature.starts_with("declare ") {
+                let member = heads.iter().any(|head| {
+                    entity
+                        .name
+                        .strip_prefix(head.as_str())
+                        .is_some_and(|tail| tail.starts_with('.'))
+                });
+                if !member && !entity.signature.starts_with("declare ") {
                     entity.signature = format!("declare {}", entity.signature);
                 }
             }
@@ -562,10 +654,255 @@ fn extract_ts_node(
     }
 }
 
+/// The name a `namespace` or `module` declaration is held under.
+///
+/// A namespace is named by its identifier (`namespace Tokens`, `module A.B`).
+/// A module named by a string literal (`declare module 'postcss-import'`)
+/// declares the module that specifier resolves to, which is a different thing
+/// from any identifier, and it keeps its quotes, written as double quotes the
+/// way TypeScript's checker names the symbol. Unquoted, the specifier is a
+/// valid unit-module name: a shim `postcss-import.d.ts` declaring
+/// `module 'postcss-import'` on its first line held two `Module`
+/// `postcss-import` entities on one line, the unit's own and the declared one,
+/// which derive one identity. The graph kept one of them and the parse held
+/// two, so every reopen found the unit's layout disagreeing with its bytes.
+fn ts_module_name(name_node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let text = name_node.utf8_text(source).ok()?.trim();
+    if name_node.kind() == "string" {
+        let specifier = text
+            .strip_prefix(['"', '\''])
+            .and_then(|inner| inner.strip_suffix(['"', '\'']))
+            .unwrap_or(text);
+        return (!specifier.is_empty()).then(|| format!("\"{specifier}\""));
+    }
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Extract a namespace in its own name scope, then rebase its declarations
+/// and their edges together. Property assignments to an object declared
+/// outside the namespace keep that object's name; only locally declared
+/// bindings introduce a namespace prefix.
+#[allow(clippy::too_many_arguments)]
+fn extract_ts_namespace(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    owners: &mut JsOwners,
+    definers: &std::collections::HashMap<String, JsPropertyDefiner>,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let Some(name) = ts_module_name(&name_node, source) else {
+        return;
+    };
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Module,
+        name: name.clone(),
+        signature: node_signature(node, source),
+        visibility: detect_ts_visibility(node, source),
+        doc_summary: extract_preceding_comment(node, source),
+        fingerprint: compute_fingerprint(node, source),
+        span: span_from_node(node, file_id),
+        declaration_line: None,
+    });
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut local_entities = Vec::new();
+    let mut local_relations = Vec::new();
+    let mut local_owners = JsOwners::default();
+    let mut declared = std::collections::HashSet::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        let first = local_entities.len();
+        extract_ts_node(
+            &child,
+            source,
+            file_id,
+            &mut local_entities,
+            &mut local_relations,
+            &mut local_owners,
+            definers,
+        );
+        // An expression can mutate an outer binding; it does not declare a
+        // new namespace member merely by appearing in this body.
+        if child.kind() != "expression_statement"
+            || child
+                .named_child(0)
+                .is_some_and(|inner| inner.kind() == "internal_module")
+        {
+            declared.extend(
+                local_entities[first..]
+                    .iter()
+                    .map(|entity| entity.name.clone()),
+            );
+        }
+    }
+    let is_local = |candidate: &str| {
+        declared.iter().any(|binding: &String| {
+            candidate == binding
+                || candidate
+                    .strip_prefix(binding.as_str())
+                    .is_some_and(|tail| tail.starts_with('.'))
+        })
+    };
+    let rename = |candidate: &str| {
+        if is_local(candidate) {
+            format!("{name}.{candidate}")
+        } else {
+            candidate.to_string()
+        }
+    };
+    let already_owned: std::collections::HashSet<_> = local_relations
+        .iter()
+        .filter(|relation| relation.kind == kin_model::RelationKind::Contains)
+        .map(|relation| relation.dst_name.clone())
+        .collect();
+    for entity in &local_entities {
+        if !is_local(&entity.name) || already_owned.contains(&entity.name) {
+            continue;
+        }
+        let nested = local_entities.iter().any(|outer| {
+            outer.span.start_byte <= entity.span.start_byte
+                && entity.span.end_byte <= outer.span.end_byte
+                && (outer.span.start_byte, outer.span.end_byte)
+                    != (entity.span.start_byte, entity.span.end_byte)
+        });
+        if !nested {
+            relations.push(ExtractedRelation {
+                kind: kin_model::RelationKind::Contains,
+                src_name: name.clone(),
+                dst_name: rename(&entity.name),
+                site: None,
+                receiver: None,
+                call_shape: None,
+                import_source: None,
+            });
+        }
+    }
+    for relation in &mut local_relations {
+        relation.src_name = rename(&relation.src_name);
+        // A recorded receiver remains a value-origin question. A bare local
+        // call or an already owner-qualified this call can follow the name
+        // change, except when a callable binds that root itself.
+        if relation.receiver.is_none() && !namespace_call_root_is_shadowed(&body, source, relation)
+        {
+            relation.dst_name = rename(&relation.dst_name);
+        }
+    }
+    for entity in &mut local_entities {
+        entity.name = rename(&entity.name);
+    }
+    owners.extend_renamed(local_owners, rename);
+    entities.extend(local_entities);
+    relations.extend(local_relations);
+}
+
+/// A parameter or local declaration can shadow a namespace binding. This
+/// conservative syntactic check stands down even when the binding occurs in
+/// another branch of the callable; it never guesses through a shadow.
+fn namespace_call_root_is_shadowed(
+    body: &tree_sitter::Node,
+    source: &[u8],
+    relation: &ExtractedRelation,
+) -> bool {
+    if relation.kind != kin_model::RelationKind::Calls {
+        return false;
+    }
+    let Some(site) = &relation.site else {
+        return true;
+    };
+    let root = relation.dst_name.split('.').next().unwrap_or("");
+    let contains_name = |binding: tree_sitter::Node<'_>| {
+        let mut pending = vec![binding];
+        while let Some(part) = pending.pop() {
+            if matches!(
+                part.kind(),
+                "identifier" | "shorthand_property_identifier_pattern"
+            ) && part.utf8_text(source).ok() == Some(root)
+            {
+                return true;
+            }
+            let mut cursor = part.walk();
+            pending.extend(part.named_children(&mut cursor));
+        }
+        false
+    };
+    let mut at = body.descendant_for_byte_range(site.start_byte, site.end_byte);
+    // An inner namespace already settled this bare name. Its written token
+    // cannot shadow the namespace prefix introduced by that inner pass.
+    if relation.dst_name.contains('.')
+        && at
+            .and_then(|call| call.child_by_field_name("function"))
+            .is_some_and(|callee| callee.kind() == "identifier")
+    {
+        return false;
+    }
+    if at
+        .and_then(|call| call.child_by_field_name("function"))
+        .and_then(|callee| callee.child_by_field_name("object"))
+        .is_some_and(|object| object.kind() == "this")
+    {
+        return false;
+    }
+    while let Some(node) = at {
+        if node.id() == body.id() {
+            break;
+        }
+        if node.kind() == "catch_clause"
+            && node
+                .child_by_field_name("parameter")
+                .is_some_and(contains_name)
+        {
+            return true;
+        }
+        if let Some(parameters) = node.child_by_field_name("parameters") {
+            if contains_name(parameters) {
+                return true;
+            }
+        }
+        if matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "generator_function"
+                | "generator_function_declaration"
+        ) {
+            if node
+                .child_by_field_name("parameter")
+                .is_some_and(contains_name)
+            {
+                return true;
+            }
+            if let Some(callable_body) = node.child_by_field_name("body") {
+                let mut pending = vec![callable_body];
+                while let Some(part) = pending.pop() {
+                    if matches!(
+                        part.kind(),
+                        "variable_declarator" | "function_declaration" | "class_declaration"
+                    ) && part.child_by_field_name("name").is_some_and(contains_name)
+                    {
+                        return true;
+                    }
+                    let mut cursor = part.walk();
+                    pending.extend(part.named_children(&mut cursor));
+                }
+            }
+        }
+        at = node.parent();
+    }
+    false
+}
+
 /// Extract a class entity, its heritage edges, and its members. Shared by
 /// `class Foo {}` and `const Foo = class {}`, which differ only in where the
 /// name comes from.
-fn extract_ts_class_like(
+pub(super) fn extract_ts_class_like(
     node: &tree_sitter::Node,
     name: &str,
     source: &[u8],
@@ -778,7 +1115,7 @@ fn extract_ts_class_member(
 /// module. A re-export written `export const Foo = Bar as Baz` still filters:
 /// unwrapping reaches `Bar`, a bare identifier, which is the case the filter
 /// was written for.
-fn ts_effective_value<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
+pub(super) fn ts_effective_value<'a>(node: &tree_sitter::Node<'a>) -> tree_sitter::Node<'a> {
     let mut current = *node;
     loop {
         let inner = match current.kind() {
@@ -1140,6 +1477,11 @@ fn extract_ts_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
             "export_clause" | "named_exports" => {
                 extract_ts_export_specifiers(&child, source, &mut specifiers);
             }
+            "namespace_export" => {
+                if let Some(namespace) = super::javascript::namespace_export_name(&child, source) {
+                    specifiers.push(namespace);
+                }
+            }
             _ => {}
         }
     }
@@ -1487,6 +1829,25 @@ export class Dog extends Animal implements Pet {
     }
 
     #[test]
+    fn parse_typescript_namespace_reexport_binds_one_name_not_a_star() {
+        let adapter = TypeScriptAdapter;
+        let source = b"export * as dom from './dom';\nexport * from './shared';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.ts");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 2);
+        let namespace = &output.imports[0];
+        assert_eq!(namespace.module_path, "./dom");
+        assert_eq!(namespace.specifiers.len(), 1);
+        assert_eq!(namespace.specifiers[0].local_name, "dom");
+        assert_eq!(namespace.specifiers[0].original_name.as_deref(), Some("*"));
+        let star = &output.imports[1];
+        assert_eq!(star.specifiers.len(), 1);
+        assert_eq!(star.specifiers[0].local_name, "*");
+    }
+
+    #[test]
     fn filter_trivial_reexport_const() {
         let adapter = TypeScriptAdapter;
         // `export const Foo = Bar` is a re-export barrel — should be filtered out
@@ -1657,7 +2018,9 @@ const isAbsolute = require('node:path').isAbsolute;
             .filter(|r| r.kind == kin_model::RelationKind::Contains)
             .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
             .collect();
-        assert_eq!(contains, vec![("View", "View.lookup")]);
+        // The method assigned outside the class stays the class's; the
+        // unit's module holds the class.
+        assert_eq!(contains, vec![("View", "View.lookup"), ("test", "View")]);
     }
 
     #[test]
@@ -2051,13 +2414,10 @@ function registerCommand<T extends Command>(command: T): T { return command; }
     }
 
     /// The `CoreNavigationCommands` shape: a namespace whose body holds the
-    /// classes an editor question routes to. Their names stay unqualified,
-    /// because `extract_calls_from_context` collapses a
-    /// `CoreNavigationCommands.MoveTo.runEditorCommand(x)` member expression to
-    /// the bare property, so a qualified entity would be a name no call site
-    /// writes.
+    /// classes an editor question routes to. Members retain the namespace
+    /// owner so equal leaves in different namespaces remain distinct.
     #[test]
-    fn a_namespace_body_is_walked_like_the_files_own_top_level() {
+    fn a_namespace_body_keeps_its_lexical_owner() {
         let adapter = TypeScriptAdapter;
         let source = br#"
 export namespace CoreNavigationCommands {
@@ -2090,23 +2450,32 @@ declare module ambientWithNoBody;
             .collect();
 
         assert!(
-            named.contains(&(EntityKind::Class, "BaseMoveToCommand")),
+            named.contains(&(
+                EntityKind::Class,
+                "CoreNavigationCommands.BaseMoveToCommand"
+            )),
             "a class inside a namespace is missing: {named:?}"
         );
         assert!(
-            named.contains(&(EntityKind::Method, "BaseMoveToCommand.runCoreEditorCommand")),
+            named.contains(&(
+                EntityKind::Method,
+                "CoreNavigationCommands.BaseMoveToCommand.runCoreEditorCommand"
+            )),
             "a method on a class inside a namespace is missing: {named:?}"
         );
         assert!(
-            named.contains(&(EntityKind::Interface, "BaseCommandOptions")),
+            named.contains(&(
+                EntityKind::Interface,
+                "CoreNavigationCommands.BaseCommandOptions"
+            )),
             "an interface inside a namespace is missing: {named:?}"
         );
         assert!(
-            named.contains(&(EntityKind::Function, "parse")),
+            named.contains(&(EntityKind::Function, "CoreNavigationCommands.parse")),
             "a function inside a namespace is missing: {named:?}"
         );
         assert!(
-            named.contains(&(EntityKind::Class, "Renamed")),
+            named.contains(&(EntityKind::Class, "LegacyNames.Renamed")),
             "a class inside a `module` block is missing: {named:?}"
         );
         assert!(
@@ -2219,7 +2588,7 @@ export interface Tokens { space: boolean; }
         );
         let named = entities_besides_the_files_own_module(&output.entities);
         assert!(
-            named.contains(&(EntityKind::Function, "once")),
+            named.contains(&(EntityKind::Function, "Event.once")),
             "the merged namespace's own members are missing: {named:?}"
         );
     }
@@ -2257,7 +2626,7 @@ export declare const MAX_LENGTH = 256;
             "the ambient class's method is missing: {named:?}"
         );
         assert!(
-            named.contains(&(EntityKind::Interface, "Space")),
+            named.contains(&(EntityKind::Interface, "Tokens.Space")),
             "a declaration inside an ambient namespace is missing: {named:?}"
         );
         // `declare function marked(...): string;` is `function_signature`, not
@@ -2325,6 +2694,100 @@ const defined = (n: number): number => n * 2;
             "a const that gives its value here defines it: {}",
             signature("defined")
         );
+    }
+
+    /// The ambient module shapes `.d.ts` shims are written in, from
+    /// resend/react-email: a shorthand `declare module 'x';` in a unit named
+    /// after `x`, wildcard specifiers that share their members' names, and
+    /// specifiers with dots of their own.
+    ///
+    /// The shorthand is the one that stopped a daemon from starting. The
+    /// unit's own module is named after the unit, `postcss-import`, and the
+    /// declared module was named after its specifier with the quotes trimmed,
+    /// also `postcss-import`, both on line one, so both derived one identity.
+    #[test]
+    fn an_ambient_module_is_named_by_its_quoted_specifier() {
+        let adapter = TypeScriptAdapter;
+        let shapes: [(&str, &str); 3] = [
+            (
+                "packages/editor/postcss-import.d.ts",
+                "declare module 'postcss-import';\n",
+            ),
+            (
+                "packages/ui/inline-css.d.ts",
+                "declare module '*.css?inline' {\n  const content: string;\n  export default content;\n}\ndeclare module '*.css?raw' {\n  const content: string;\n  export default content;\n}\n",
+            ),
+            (
+                "packages/render/src/react-internals.d.ts",
+                "declare module \"react-dom/server.browser\" {\n  export * from \"react-dom/server\";\n}\ndeclare module \"react-dom/server.edge\" {\n  export * from \"react-dom/server\";\n}\n",
+            ),
+        ];
+        let mut outputs = Vec::new();
+        for (path, source) in shapes {
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let file_id = FilePathId::new(path);
+            let output = adapter.extract(&tree, source.as_bytes(), &file_id).unwrap();
+            assert!(matches!(output.parse_state, ParseState::Valid), "{path}");
+            let ids: std::collections::HashSet<_> = output
+                .entities
+                .iter()
+                .cloned()
+                .map(|entity| entity.into_entity(LanguageId::TypeScript, &file_id).id)
+                .collect();
+            assert_eq!(
+                ids.len(),
+                output.entities.len(),
+                "{path}: two declarations derive one identity: {:?}",
+                output
+                    .entities
+                    .iter()
+                    .map(|entity| (&entity.name, entity.kind, entity.span.start_line))
+                    .collect::<Vec<_>>()
+            );
+            outputs.push((path, output));
+        }
+        let entity = |path: &str, name: &str| -> ExtractedEntity {
+            outputs
+                .iter()
+                .find(|(held, _)| *held == path)
+                .and_then(|(_, output)| output.entities.iter().find(|e| e.name == name))
+                .cloned()
+                .unwrap_or_else(|| panic!("{path}: no entity `{name}`"))
+        };
+
+        let unit = entity("packages/editor/postcss-import.d.ts", "postcss-import");
+        assert_eq!(unit.signature, "module packages/editor/postcss-import.d.ts");
+        let declared = entity("packages/editor/postcss-import.d.ts", "\"postcss-import\"");
+        assert_eq!(declared.kind, EntityKind::Module);
+        assert!(
+            declared.signature.starts_with("declare module"),
+            "{}",
+            declared.signature
+        );
+
+        let wildcard = entity("packages/ui/inline-css.d.ts", "\"*.css?inline\"");
+        assert!(
+            wildcard.signature.starts_with("declare "),
+            "a specifier's own dot does not make the module a member: {}",
+            wildcard.signature
+        );
+        for member in ["\"*.css?inline\".content", "\"*.css?raw\".content"] {
+            let member = entity("packages/ui/inline-css.d.ts", member);
+            assert!(
+                !member.signature.starts_with("declare "),
+                "a member keeps its own signature: {}",
+                member.signature
+            );
+        }
+
+        for name in ["\"react-dom/server.browser\"", "\"react-dom/server.edge\""] {
+            let module = entity("packages/render/src/react-internals.d.ts", name);
+            assert!(
+                module.signature.starts_with("declare "),
+                "{name}: {}",
+                module.signature
+            );
+        }
     }
 
     /// A member signature of an interface is a declaration a caller asks about
@@ -2585,5 +3048,260 @@ export const Reexported = Bar as Baz
             .entities
             .iter()
             .any(|e| e.kind == EntityKind::Module && e.name == "greeter"));
+    }
+    #[test]
+    fn namespace_names_and_edges_stay_together_across_nested_and_merged_scopes() {
+        let source = br#"
+        namespace Alpha {
+            export class Inner {
+                ping() {}
+                run(Inner: unknown) { this.ping(); }
+            }
+            export function helper() {}
+            export function run() { helper(); }
+            export function shadow(helper: () => void) { helper(); }
+            export namespace Deep { export class Leaf { ping() {} } export function helper() {} export function run(Deep: unknown) { helper(); } }
+        }
+        namespace Beta { export class Inner { ping() {} run() { this.ping(); } } }
+        interface Merged { value: string }
+        namespace Merged { export class Inner { ping() {} } }
+        "#;
+        let tree = TypeScriptAdapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = TypeScriptAdapter
+            .extract(&tree, source, &FilePathId::new("scopes.ts"))
+            .unwrap();
+        let names: Vec<_> = output
+            .entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        for name in [
+            "Alpha.Inner",
+            "Alpha.Inner.ping",
+            "Alpha.Deep",
+            "Alpha.Deep.Leaf",
+            "Alpha.Deep.Leaf.ping",
+            "Beta.Inner",
+            "Beta.Inner.ping",
+            "Merged.Inner",
+        ] {
+            assert!(
+                names.contains(&name),
+                "{name}: {names:?}; {}",
+                tree.root_node().to_sexp()
+            );
+        }
+        assert!(!names.contains(&"Inner"));
+        assert_eq!(names.iter().filter(|name| **name == "Merged").count(), 1);
+        for (kind, from, to) in [
+            (kin_model::RelationKind::Contains, "Alpha", "Alpha.Inner"),
+            (kin_model::RelationKind::Contains, "Alpha", "Alpha.Deep"),
+            (
+                kin_model::RelationKind::Contains,
+                "Alpha.Deep",
+                "Alpha.Deep.Leaf",
+            ),
+            (
+                kin_model::RelationKind::Contains,
+                "Alpha.Inner",
+                "Alpha.Inner.ping",
+            ),
+            (kin_model::RelationKind::Contains, "Merged", "Merged.Inner"),
+            (kin_model::RelationKind::Calls, "Alpha.run", "Alpha.helper"),
+            (
+                kin_model::RelationKind::Calls,
+                "Alpha.Deep.run",
+                "Alpha.Deep.helper",
+            ),
+            (
+                kin_model::RelationKind::Calls,
+                "Alpha.Inner.run",
+                "Alpha.Inner.ping",
+            ),
+            (
+                kin_model::RelationKind::Calls,
+                "Beta.Inner.run",
+                "Beta.Inner.ping",
+            ),
+            (kin_model::RelationKind::Calls, "Alpha.shadow", "helper"),
+        ] {
+            assert!(
+                output
+                    .relations
+                    .iter()
+                    .any(|r| r.kind == kind && r.src_name == from && r.dst_name == to),
+                "{from} -> {to}: {:?}",
+                output.relations
+            );
+        }
+        let seen = TypeScriptAdapter.declaration_census(&tree, source).unwrap();
+        let census = crate::declaration_census::take_census(seen, &output.entities);
+        assert!(census.unadmitted.is_empty(), "{census:?}");
+    }
+
+    #[test]
+    fn namespace_prototype_owners_follow_local_bindings_and_preserve_outer_mutations() {
+        let source = br#"
+        namespace Local {
+            export function Counter() {}
+            Counter.prototype.ping = function() {};
+            Counter.prototype.run = function() { this.ping(); };
+            Global.prototype.extra = function() {};
+        }
+        function Global() {}
+        "#;
+        let tree = TypeScriptAdapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = TypeScriptAdapter
+            .extract(&tree, source, &FilePathId::new("owners.ts"))
+            .unwrap();
+        let names: Vec<_> = output
+            .entities
+            .iter()
+            .map(|entity| (entity.kind, entity.name.as_str()))
+            .collect();
+        assert!(
+            names.contains(&(EntityKind::Class, "Local.Counter")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&(EntityKind::Method, "Local.Counter.ping")),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&(EntityKind::Method, "Global.extra")),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|(_, name)| *name == "Counter" || name.starts_with("Local.Global")),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|(_, name)| *name == "Global").count(),
+            1
+        );
+        assert!(
+            output
+                .relations
+                .iter()
+                .any(|r| r.kind == kin_model::RelationKind::Calls
+                    && r.src_name == "Local.Counter.run"
+                    && r.dst_name == "Local.Counter.ping"),
+            "{:?}",
+            output.relations
+        );
+    }
+    #[test]
+    fn namespace_calls_do_not_capture_destructured_or_catch_bindings() {
+        let source = br#"
+        namespace Alpha {
+            export function helper() {}
+            export function unpack({ helper }: { helper: () => void }) { helper(); }
+            export function recover() { try {} catch (helper) { helper(); } }
+        }
+        "#;
+        let tree = TypeScriptAdapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = TypeScriptAdapter
+            .extract(&tree, source, &FilePathId::new("shadows.ts"))
+            .unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls.iter().all(|r| r.dst_name == "helper"),
+            "{calls:?}; {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    /// A call that passes type arguments still calls the function it names:
+    /// `parseBody<Record<string, string>>(request)` calls `parseBody`, and
+    /// `c.req.parseBody<T>()` calls `parseBody` on `c.req`, as hono's
+    /// method-override middleware does. The grammar wraps such a callee in an
+    /// `instantiation_expression`; read through it, the call is recorded like
+    /// one written without type arguments, and is no protocol invocation.
+    #[test]
+    fn a_call_with_type_arguments_calls_the_function_it_names() {
+        let source = br#"
+        import { parseBody } from '../../utils/body'
+        export const methodOverride = async (c: any, request: Request) => {
+          const params = await parseBody<Record<string, string>>(request)
+          const body = await c.req.parseBody<{ name: string }>()
+          const plain = parseBody<string>(request)
+          return [params, body, plain]
+        }
+        "#;
+        let tree = TypeScriptAdapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = TypeScriptAdapter
+            .extract(&tree, source, &FilePathId::new("method-override.ts"))
+            .unwrap();
+        let calls: Vec<(&str, &str, Option<&str>)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| {
+                (
+                    r.src_name.as_str(),
+                    r.dst_name.as_str(),
+                    r.receiver.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == ("methodOverride", "parseBody", None))
+                .count(),
+            2,
+            "{calls:?}; {}",
+            tree.root_node().to_sexp()
+        );
+        assert!(
+            calls.contains(&("methodOverride", "parseBody", None)),
+            "{calls:?}; {}",
+            tree.root_node().to_sexp()
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(src, dst, receiver)| *src == "methodOverride"
+                    && *dst == "parseBody"
+                    && receiver.is_some()),
+            "{calls:?}"
+        );
+        let imported = output
+            .relations
+            .iter()
+            .find(|r| {
+                r.kind == kin_model::RelationKind::Calls
+                    && r.receiver.is_none()
+                    && r.dst_name == "parseBody"
+            })
+            .and_then(|r| r.import_source.as_deref());
+        assert_eq!(imported, Some("../../utils/body"));
     }
 }

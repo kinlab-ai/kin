@@ -146,7 +146,7 @@ import path from "node:path";
 // tool-call step is a producer step, and proof-flow.sh beside this file carries
 // its change: the call and the tools/list check both follow the launched
 // entry's profile, so a routed entry is listed and called as the one `kin`
-// tool and any other profile as `semantic_search`.
+// tool and any other profile as `locate`.
 //
 // Moved again for the first-run proof's status capture, with nothing to port.
 // The one hunk between 0f0180fe and 747950dd is at old lines 926 to 936, where
@@ -156,15 +156,46 @@ import path from "node:path";
 // hash to bf1dd52477a0b133d2578a73a8ae3c9cb2e289ccd8e85339ea2817b11858691e at
 // both, so no assertion moved.
 //
+// Moved again for the agent tool verbs, with the change ported and nothing in
+// the mirrored step. The MCP tool-call step names the search it makes by the
+// served verb: `locate` with `mode: "name"` by name, and the routed `locate`
+// command, in place of `semantic_search` and the routed `search` command. The
+// hunks between 747950dd and 35edcff4 are at lines 1139, 1209, 1212 and 1217
+// to 1218, and no line was added or removed; proof-flow.sh beside this file
+// carries the same call. Extracting the mirrored step from its `- name:` line
+// to the next sibling `- name:` gives lines 1754 to 2166, 413 lines, sha256
+// 68d39ea447259eef156869a961891a7fc503b7d0a986f4c533f2cf9735f65a02 at both.
+// Resynced for the engine-free default archives. The installed feature check
+// now attests local inference absent, HTTP support present, no selected model
+// and no Metal backend; all source, bytes, graph and health assertions remain.
+//
 // Moved for the firelock-ai -> kinlab-ai repository transfer, with nothing to
-// port. The hunks between 747950dd and 51f4f0b9 only repoint release download,
+// port. The hunks between a8eead0d and 036300c5 only repoint release download,
 // latest-release, ls-remote and raw Cargo.lock URLs to kinlab-ai/kin, all above
 // the mirrored step; the attestation --repo/--signer-workflow lines are left
-// alone. The mirrored step sits at lines 1754 to 2166 and hashes to
-// 68d39ea447259eef156869a961891a7fc503b7d0a986f4c533f2cf9735f65a02, unchanged, so no assertion moved.
+// alone. The mirrored step sits at lines 1777 to 2192 and hashes to
+// db5ff73c122e04e037e6936dea9a01847e8b279cf56644b8b6e338314467a6eb, unchanged, so no assertion moved.
+//
+// Moved again for the same transfer, with nothing to port. The hunks between
+// 036300c5 and 91b09212 repoint the two attestation checks, --repo and
+// --signer-workflow, to kinlab-ai/kin, since a release built there is signed
+// by kinlab-ai/kin's release.yml. Both sit above the mirrored step, which
+// still spans lines 1777 to 2192 and hashes to
+// db5ff73c122e04e037e6936dea9a01847e8b279cf56644b8b6e338314467a6eb, unchanged, so no assertion moved.
+//
+// Resynced for 0.8.2's central stores and engine-free archives, with every
+// changed assertion ported. The first-run capture's semantic readiness must be
+// unsupported, and `semantic_query_readiness` and `embedding_model` leave its
+// tolerated rows, because nothing embeds on an archive with no local model and
+// no provider selected. The Unix block now proves `kin embed` refuses with the
+// named reason (kin-embed-refusal.txt), that no embeddings are indexed, that
+// readiness stays unsupported after the refusal, and that search and locate
+// answer from the graph with embeddings unused. proof-flow.sh beside this file
+// reads the daemon endpoint from the store `kin store path` names and drives
+// the same refusal.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "51f4f0b948664325a1f60608b2e8c7d80aff595f431cd864bb443d3c357067e2",
+  sha256: "d783bd4b359f011822b61823b79f51821f1cdb48a52f57a1e30350d776cf7133",
 };
 
 class Unreadable extends Error {}
@@ -378,8 +409,11 @@ const validateEmbeddingCoverage = (coverage, label) => {
 
 check("bench metadata proves vector and embedding support", () => {
   const cliMeta = readJson("kin-build-meta.json");
-  if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-    throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+  if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true ||
+      cliMeta.embeddings?.local_inference_enabled !== false ||
+      cliMeta.embeddings?.external_embeddings_enabled !== true ||
+      cliMeta.embeddings?.metal_enabled !== false || cliMeta.embeddings?.provider !== "none") {
+    throw new Error(`${runnerOs} bench metadata does not prove the engine-free default archive profile`);
   }
 });
 if (!isWindows) {
@@ -496,10 +530,11 @@ for (const reportPath of ["kin-health.json", "kin-doctor.json"]) {
   check(`${reportPath} aggregate health`, () => {
     const report = readJson(reportPath);
     const checks = validateHealthReport(report, reportPath);
-    // Every row a correct fresh Unix install reports beyond healthy and
+    // Every row a correct fresh install reports beyond healthy and
     // not-applicable, named with the statuses it may hold. This capture
-    // runs before `kin embed`, so the daemon graph still has embeddings
-    // pending and the model has never been fetched.
+    // runs before `kin embed`. The archive is engine-free with no provider
+    // selected, so nothing will ever embed here and semantic readiness is
+    // unsupported rather than pending.
     //
     // This used to read `report.healthy !== true` with one tolerance for
     // a stale readiness. On the v0.6.1 release run's own
@@ -509,9 +544,7 @@ for (const reportPath of ["kin-health.json", "kin-doctor.json"]) {
     // them. Listing them is what makes a sixth fail (FIR-2919).
     const firstRunAttention = new Map([
       ["projection_mode", ["stale"]],
-      ["semantic_query_readiness", ["pending", "stale"]],
       ["reference_edge_coverage", ["pending"]],
-      ["embedding_model", ["pending"]],
       ["memory_floor", ["degraded"]],
       // The first relation census is its own background pass, so a
       // capture that beats it reads `pending`, the same first-run
@@ -551,7 +584,9 @@ for (const reportPath of ["kin-health.json", "kin-doctor.json"]) {
     const report = readJson(reportPath);
     const checks = validateHealthReport(report, reportPath);
     const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-    const allowedSemanticReadiness = ["healthy", "pending", "stale"];
+    // Nothing will embed on an engine-free archive with no provider
+    // selected, so the only honest readiness is unsupported.
+    const allowedSemanticReadiness = ["unsupported"];
     if (!allowedSemanticReadiness.includes(semanticReadiness)) {
       throw new Error(
         `${reportPath}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected ${allowedSemanticReadiness.join(" or ")}`
@@ -625,10 +660,17 @@ check("Antigravity legacy repair preserved user policy", () => {
 });
 
 if (!isWindows) {
-  check("bounded clean-install embedding reached full coverage", () => {
-    const embed = readJson("kin-embed.json");
-    if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
-      throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
+  // The engine-free archive refuses `kin embed`, names what is missing, and
+  // keeps answering from the graph.
+  check("kin embed refuses with the reason an engine-free archive has", () => {
+    const embedRefusal = readText("kin-embed-refusal.txt");
+    if (
+      !embedRefusal.includes("kin embed cannot index anything here") ||
+      !embedRefusal.includes("no local embedding model")
+    ) {
+      throw new Error(
+        `kin embed did not refuse with the reason an engine-free archive has: ${embedRefusal.trim() || "no output"}`
+      );
     }
   });
   check("kin-embedded-status.json schema", () => {
@@ -641,60 +683,36 @@ if (!isWindows) {
     const embeddedStatus = readJson("kin-embedded-status.json");
     validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
   });
-  check("Unix status observed embedding coverage after settle", () => {
-    const embeddedStatus = readJson("kin-embedded-status.json");
-    const embeddedCoverage = embeddedStatus.embedding_coverage;
-    const settleMode = fs.existsSync(path.join(captures, "kin-status-settle-mode.txt"))
-      ? fs.readFileSync(path.join(captures, "kin-status-settle-mode.txt"), "utf8").trim()
-      : "unrecorded";
-    if (embeddedCoverage?.state !== "observed") {
+  check("an archive that cannot embed holds no indexed embeddings", () => {
+    const embeddedCoverage = readJson("kin-embedded-status.json").embedding_coverage ?? {};
+    if (embeddedCoverage.state === "observed" && embeddedCoverage.indexed !== 0) {
       throw new Error(
-        `Unix status could not observe embedding coverage after a ${settleMode} read: ` +
-        `${JSON.stringify(embeddedCoverage)}`
+        `an archive that cannot embed reports indexed embeddings: ${JSON.stringify(embeddedCoverage)}`
       );
     }
-    return settleMode;
-  });
-  check("Unix status proves complete observed embedding coverage", () => {
-    const embeddedStatus = readJson("kin-embedded-status.json");
-    const embeddedCoverage = embeddedStatus.embedding_coverage ?? {};
-    if (
-      embeddedCoverage.source !== "live_query_graph" ||
-      embeddedCoverage.total === 0 ||
-      embeddedCoverage.indexed !== embeddedCoverage.total ||
-      embeddedCoverage.pending !== 0
-    ) {
-      throw new Error(`Unix status did not prove complete observed embedding coverage: ${JSON.stringify(embeddedCoverage)}`);
-    }
-    return `indexed ${embeddedCoverage.indexed}/${embeddedCoverage.total}`;
+    return JSON.stringify(embeddedCoverage);
   });
   for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
-    check(`${reportPath} healthy with semantic readiness`, () => {
+    check(`${reportPath} semantic readiness unsupported after the refused embed`, () => {
       const report = readJson(reportPath);
       const checks = validateHealthReport(report, reportPath);
       const readiness = checks.get("semantic_query_readiness")?.status;
-      if (readiness !== "healthy") {
+      if (readiness !== "unsupported") {
         throw new Error(
           `${reportPath}: semantic_query_readiness=${readiness ?? "missing"} after a ` +
-          `completed embed; verdict=${report.verdict}; every row needing attention: ` +
-          `${attentionRows(report)}`
+          `refused embed on an archive that cannot embed; verdict=${report.verdict}; ` +
+          `every row needing attention: ${attentionRows(report)}`
         );
       }
-      // What a completed embed leaves behind on this runner, named. The
-      // model is cached and the fill is done, so `embedding_model` and
-      // `semantic_query_readiness` are gone from the list the pre-embed
-      // capture carries; the three below are the runner, not the embed.
-      // This used to read `report.healthy !== true`, which passed on the
-      // v0.6.1 run's own `kin-embedded-health.json` while those three
-      // rows sat inside it unnamed (FIR-2919). Naming them is what makes
-      // a fourth fail.
+      // What the refused embed leaves behind on this runner, named, so an
+      // unnamed fourth row fails.
       const postEmbedAttention = new Map([
         ["projection_mode", ["stale"]],
         ["reference_edge_coverage", ["pending"]],
         ["memory_floor", ["degraded"]],
         // The census pass is not tied to `kin embed`, so a capture can
-        // still beat it after a completed embed; same measurement as
-        // the pre-embed entry (kin#1238).
+        // still beat it; same measurement as the pre-embed entry
+        // (kin#1238).
         ["relation_census", ["pending"]],
       ]);
       const stillWaiting = report.checks.filter(
@@ -704,7 +722,7 @@ if (!isWindows) {
       );
       if (stillWaiting.length > 0) {
         throw new Error(
-          `${reportPath}: rows needing attention after a completed embed that this ` +
+          `${reportPath}: rows needing attention after the refused embed that this ` +
           `runner does not expect: ` +
           `${stillWaiting.map((check) => `${check.id}=${check.status}`).join(", ")}; ` +
           `verdict=${report.verdict}`
@@ -712,17 +730,17 @@ if (!isWindows) {
       }
     });
   }
-  check("semantic kin search returns the seeded hello entity", () => {
+  check("kin search --semantic answers the seeded hello entity from the graph", () => {
     const semanticSearch = readJson("kin-semantic-search.json");
     if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
-      throw new Error("semantic kin search did not return the seeded hello entity");
+      throw new Error("kin search --semantic did not answer the seeded hello entity from the graph");
     }
   });
-  check("semantic kin locate proves complete coverage and returns probe.py", () => {
+  check("kin locate answers probe.py from the graph with embeddings unused", () => {
     const semanticLocate = readJson("kin-semantic-locate.json");
-    if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
+    if (semanticLocate.semantic_coverage?.embedding_state !== "not_used" || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
       throw new Error(
-        "semantic kin locate did not prove complete coverage and return probe.py; " +
+        "kin locate did not answer probe.py from the graph with embeddings reported unused; " +
         `semantic_coverage=${JSON.stringify(semanticLocate.semantic_coverage ?? null)} ` +
         `files=${JSON.stringify((semanticLocate.files ?? []).map((entry) => entry.path))}`
       );

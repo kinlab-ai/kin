@@ -214,6 +214,17 @@ pub const LSP_REFERENCES_RULE: &str = "lsp_references";
 /// build wrote before the proof existed are still in stores it enriched.
 pub const LSP_PROVEN_METHOD_REFERENCES_RULE: &str = "lsp_method_references_proven";
 
+/// The evidence rule a language-server `References` site is restamped under
+/// once its unit was asked about it on repeated passes over unchanged source
+/// and resolver inputs and no pass gave it a decisive answer.
+///
+/// The record stays on its edge, so the reference is still served, but it is
+/// undecided rather than proven: every answer that reads it names the site as
+/// undecided, and none reads as complete because of it. A pass over new source
+/// or a new resolver context asks about the site again, and a decisive answer
+/// there replaces the record or retires it.
+pub const LSP_REFERENCE_UNDECIDED_RULE: &str = "lsp_reference_undecided";
+
 /// Concrete evidence supporting a graph relation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RelationEvidence {

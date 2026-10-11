@@ -544,7 +544,7 @@ PULL_REQUEST_CHECK_STUB = textwrap.dedent(
     """\
     check-pr-fast-path:
       name: Check & Test
-      if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+      if: ${{ !cancelled() && github.event_name == 'pull_request' && !startsWith(github.head_ref, 'feature/public-export-') }}
       runs-on: ubuntu-latest
       strategy:
         matrix:
@@ -573,7 +573,7 @@ REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
       if: >-
         ${{ !cancelled()
         && needs.changes.outputs.docs_only != 'true'
-        && github.event_name != 'pull_request' }}
+        && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
       runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
       timeout-minutes: 60
       env:
@@ -600,7 +600,7 @@ UBUNTU_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
       if: >-
         ${{ !cancelled()
         && needs.changes.outputs.docs_only != 'true'
-        && github.event_name != 'pull_request' }}
+        && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
       runs-on: ubuntu-latest
       timeout-minutes: 5
       strategy:
@@ -624,9 +624,9 @@ UBUNTU_SHARD_RUNNER = "  runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }
 UBUNTU_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
 UBUNTU_SHARD_MATRIX = "      shard: [1, 2]"
 UBUNTU_SHARD_PARTITION = (
-    "      run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2"
+    "      run: cargo nextest run --locked --no-fail-fast --features kin-cli/embeddings,kin-daemon/embeddings --partition count:${{ matrix.shard }}/2"
 )
-UBUNTU_SHARD_DOCTESTS = "      run: cargo test --doc --locked"
+UBUNTU_SHARD_DOCTESTS = "      run: cargo test --doc --locked --features kin-cli/embeddings,kin-daemon/embeddings"
 UBUNTU_SHARD_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
 # The gates this job runs and the macOS shards deliberately do not. Each reads
 # source and cannot answer differently on a second runner, so each is pinned to
@@ -645,10 +645,10 @@ UBUNTU_SHARD_ONE_ONLY_GATES = (
     "Check formatting",
     "Check Zero File-Search Invariant",
     "Check Zero File-Search Invariant (answer modules)",
-    "Check Hydration Replay Semantics",
-    "Falsify Hydration Replay Semantics guard",
+    "Test the filesystem boundary lint",
     "Falsify the release policy and Windows leg gates",
     "Clippy",
+    "Check the filesystem boundary lint",
     "Check Runtime Boundaries",
     "Check Private Repo Coupling",
     "Test Private Repo Coupling Guard",
@@ -684,7 +684,7 @@ MACOS_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
       if: >-
         ${{ !cancelled()
         && needs.changes.outputs.docs_only != 'true'
-        && github.event_name != 'pull_request' }}
+        && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
       runs-on: ubuntu-latest
       timeout-minutes: 5
       strategy:
@@ -699,9 +699,9 @@ MACOS_SHARD_RUNNER = "  runs-on: macos-latest"
 MACOS_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
 MACOS_SHARD_MATRIX = "      shard: [1, 2]"
 MACOS_SHARD_PARTITION = (
-    "      run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2"
+    "      run: cargo nextest run --locked --no-fail-fast --features kin-cli/metal,kin-daemon/metal --partition count:${{ matrix.shard }}/2"
 )
-MACOS_SHARD_DOCTESTS = "      run: cargo test --doc --locked"
+MACOS_SHARD_DOCTESTS = "      run: cargo test --doc --locked --features kin-cli/metal,kin-daemon/metal"
 MACOS_SHARD_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
 CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
@@ -2128,8 +2128,9 @@ def windows_node_validator_fixture() -> tuple[
                 "embeddings": {
                     "vector_enabled": True,
                     "embeddings_enabled": True,
-                    # Metal is the macOS-only compiled backend, not the marker
-                    # cargo feature, so it stays false on a correct Windows build.
+                    "local_inference_enabled": False,
+                    "external_embeddings_enabled": True,
+                    "provider": "none",
                     "metal_enabled": False,
                 },
             },
@@ -2163,7 +2164,14 @@ UNIX_REQUIRED_VALIDATOR_CHECKS = {
 }
 UNIX_VALIDATOR_CHECKS = {
     **UNIX_REQUIRED_VALIDATOR_CHECKS,
-    "semantic_query_readiness": "stale",
+    # The archive is engine-free with no provider selected, so nothing will
+    # embed and the honest readiness is unsupported, before and after the
+    # refused `kin embed`.
+    "semantic_query_readiness": "unsupported",
+    # A tolerated first-run row, as the real runner reports with no language
+    # server on it. It holds the honest aggregate false, so an overclaimed
+    # `healthy` or `ready` stays something this fixture can be caught making.
+    "reference_edge_coverage": "pending",
     # Carried for the same reason the Windows fixture carries it: the real
     # report has it, the pre-embed tolerance reads every check rather than only
     # the named ones, and a fixture that omits it cannot fail the way the real
@@ -2171,6 +2179,18 @@ UNIX_VALIDATOR_CHECKS = {
     # model, which is a first-run state and reports unsupported.
     "retrieval_profile": "unsupported",
 }
+
+
+# What the engine-free archive's `kin embed` writes to stderr when no external
+# provider is selected.
+VALIDATOR_EMBED_REFUSAL = (
+    "Error: kin embed cannot index anything here: this Kin build has no local "
+    "embedding model, and no external embedding provider is selected for this "
+    "repository. Search by meaning stays off, and locate, search, refs and "
+    "context answer from the graph without it; docs/model-slots.md describes "
+    "selecting an external embedding provider, or a build with the `embeddings` "
+    "feature embeds locally\n"
+)
 
 
 def unix_node_validator_fixture() -> tuple[
@@ -2185,7 +2205,7 @@ def unix_node_validator_fixture() -> tuple[
     # both here is what makes those tested claims instead of assumed ones.
     embedded_report = validator_health_report(
         {
-            "semantic_query_readiness": "healthy",
+            "semantic_query_readiness": "unsupported",
             "retrieval_profile": "unsupported",
             "memory_floor": "degraded",
         }
@@ -2228,6 +2248,10 @@ def unix_node_validator_fixture() -> tuple[
                 "embeddings": {
                     "vector_enabled": True,
                     "embeddings_enabled": True,
+                    "local_inference_enabled": False,
+                    "external_embeddings_enabled": True,
+                    "provider": "none",
+                    "metal_enabled": False,
                 },
             },
             "kin-daemon-health.json": {
@@ -2249,19 +2273,12 @@ def unix_node_validator_fixture() -> tuple[
                 {"name": "hello", "file": "probe.py"}
             ],
             "kin-locate.json": {"files": [{"path": "probe.py"}]},
-            "kin-embed.json": {
-                "pending_entities": 0,
-                "pending_artifacts": 0,
-                "time_limited": False,
-            },
+            "kin-embed-refusal.txt": VALIDATOR_EMBED_REFUSAL,
             "kin-embedded-status.json": {
                 "schema": "kin.status.v3",
                 "embedding_coverage": {
-                    "state": "observed",
-                    "source": "live_query_graph",
-                    "indexed": 2,
-                    "pending": 0,
-                    "total": 2,
+                    "state": "unobserved",
+                    "reason": "no_vector_index_attached",
                 },
             },
             "kin-embedded-health.json": copy.deepcopy(embedded_report),
@@ -2270,7 +2287,11 @@ def unix_node_validator_fixture() -> tuple[
                 {"name": "hello", "file": "probe.py"}
             ],
             "kin-semantic-locate.json": {
-                "semantic_coverage": {"supported": True, "complete": True},
+                "semantic_coverage": {
+                    "supported": True,
+                    "complete": True,
+                    "embedding_state": "not_used",
+                },
                 "files": [{"path": "probe.py"}],
             },
         },
@@ -2474,6 +2495,24 @@ def assert_windows_node_validator_behavior(step: str) -> None:
             "kin-windows-bench-meta.json",
             ("embeddings", "embeddings_enabled"),
             False,
+        ),
+        (
+            "local engine unexpectedly enabled",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "local_inference_enabled"),
+            True,
+        ),
+        (
+            "external support absent",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "external_embeddings_enabled"),
+            False,
+        ),
+        (
+            "model work selected by default",
+            "kin-windows-bench-meta.json",
+            ("embeddings", "provider"),
+            "external",
         ),
         # Metal stays a negative control in the same direction: it is the
         # macOS-only compiled backend, so a Windows archive claiming it is
@@ -2795,6 +2834,24 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             False,
         ),
         (
+            "local engine unexpectedly enabled",
+            "kin-build-meta.json",
+            ("embeddings", "local_inference_enabled"),
+            True,
+        ),
+        (
+            "external support absent",
+            "kin-build-meta.json",
+            ("embeddings", "external_embeddings_enabled"),
+            False,
+        ),
+        (
+            "model work selected by default",
+            "kin-build-meta.json",
+            ("embeddings", "provider"),
+            "external",
+        ),
+        (
             "lexical search misses entity",
             "kin-search.json",
             (0, "name"),
@@ -2807,64 +2864,28 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             "other.py",
         ),
         (
-            "pending entities remain",
-            "kin-embed.json",
-            ("pending_entities",),
-            1,
-        ),
-        (
-            "pending artifacts remain",
-            "kin-embed.json",
-            ("pending_artifacts",),
-            1,
-        ),
-        (
-            "embedding is time limited",
-            "kin-embed.json",
-            ("time_limited",),
-            True,
-        ),
-        (
             "embedded status schema drift",
             "kin-embedded-status.json",
             ("schema",),
             "kin.status.v2",
         ),
         (
-            "embedded coverage unobserved",
-            "kin-embedded-status.json",
-            ("embedding_coverage",),
-            {"state": "unobserved", "reason": "missing"},
-        ),
-        (
-            "embedded coverage has wrong source",
-            "kin-embedded-status.json",
-            ("embedding_coverage", "source"),
-            "snapshot",
-        ),
-        (
-            "embedded coverage has zero total",
-            "kin-embedded-status.json",
-            ("embedding_coverage", "total"),
-            0,
-        ),
-        (
-            "embedded coverage incomplete",
+            "an archive that cannot embed reports indexed vectors",
             "kin-embedded-status.json",
             ("embedding_coverage",),
             {
                 "state": "observed",
                 "source": "live_query_graph",
-                "indexed": 1,
-                "pending": 1,
+                "indexed": 2,
+                "pending": 0,
                 "total": 2,
             },
         ),
         (
-            "embedded coverage still pending",
+            "embedded coverage unobserved without a reason",
             "kin-embedded-status.json",
-            ("embedding_coverage", "pending"),
-            1,
+            ("embedding_coverage",),
+            {"state": "unobserved"},
         ),
         (
             "semantic search misses entity",
@@ -2873,16 +2894,10 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             "other",
         ),
         (
-            "semantic locate unsupported",
+            "locate claims it used embeddings",
             "kin-semantic-locate.json",
-            ("semantic_coverage", "supported"),
-            False,
-        ),
-        (
-            "semantic locate incomplete",
-            "kin-semantic-locate.json",
-            ("semantic_coverage", "complete"),
-            False,
+            ("semantic_coverage", "embedding_state"),
+            "used",
         ),
         (
             "semantic locate misses artifact",
@@ -2892,6 +2907,19 @@ def assert_unix_node_validator_behavior(step: str) -> None:
         ),
     ):
         reject(case, fixture_with_json_value(proof, path, keys, value))
+
+    # The refusal has to be the one that names what is missing. A server error,
+    # or a refusal that names nothing, sends the reader nowhere.
+    for case, refusal in (
+        ("kin embed answered with a server error", "Error: daemon embed failed: HTTP 500\n"),
+        (
+            "kin embed refused without naming the missing model",
+            "Error: kin embed cannot index anything here\n",
+        ),
+    ):
+        invalid_refusal = copy.deepcopy(proof)
+        invalid_refusal["kin-embed-refusal.txt"] = refusal
+        reject(case, invalid_refusal)
 
     reject(
         "pre-embed coverage missing",
@@ -3025,30 +3053,19 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             ),
         )
 
-        healthy_readiness = fixture_with_derived_aggregate(
-            fixture_with_check_status(
-                proof, report_path, "semantic_query_readiness", "healthy"
-            ),
-            report_path,
-        )
-        assert_node_validator_accepts_fixture(
-            step,
-            f"{label} ({report_path} already semantically ready)",
-            healthy_readiness,
-            home,
-            environment,
-        )
-
-        unsupported_readiness = fixture_with_derived_aggregate(
-            fixture_with_check_status(
-                proof, report_path, "semantic_query_readiness", "unsupported"
-            ),
-            report_path,
-        )
-        reject(
-            f"{report_path} semantic readiness unsupported",
-            unsupported_readiness,
-        )
+        # Nothing embeds on the engine-free archive, so readiness that claims
+        # a filled index, or a first pass under way, is a promise the host
+        # never keeps.
+        for claimed in ("healthy", "pending"):
+            reject(
+                f"{report_path} semantic readiness {claimed} on an archive that cannot embed",
+                fixture_with_derived_aggregate(
+                    fixture_with_check_status(
+                        proof, report_path, "semantic_query_readiness", claimed
+                    ),
+                    report_path,
+                ),
+            )
 
     for report_path in ("kin-embedded-health.json", "kin-embedded-doctor.json"):
         # The post-embed capture carries `memory_floor: degraded`, so its honest
@@ -3073,16 +3090,16 @@ def assert_unix_node_validator_behavior(step: str) -> None:
         reject(
             f"{report_path} contradictory duplicate check",
             fixture_with_duplicate_check(
-                proof, report_path, "semantic_query_readiness", "unsupported"
+                proof, report_path, "semantic_query_readiness", "healthy"
             ),
         )
-        unsupported_readiness = fixture_with_check_status(
-            proof, report_path, "semantic_query_readiness", "unsupported"
-        )
-        reject(
-            f"{report_path} semantic readiness unsupported",
-            unsupported_readiness,
-        )
+        for claimed in ("healthy", "pending"):
+            reject(
+                f"{report_path} semantic readiness {claimed} after a refused embed",
+                fixture_with_check_status(
+                    proof, report_path, "semantic_query_readiness", claimed
+                ),
+            )
 
     for report_path in (
         "kin-claude-fallback-health.json",
@@ -3752,7 +3769,7 @@ def assert_install_proof_embedding_settles_before_measurement(embedding: str) ->
     """
 
     active = active_lines(embedding)
-    embed = 'kin embed --max-seconds 300 --json | tee "$captures/kin-embed.json"'
+    embed = 'kin embed --max-seconds 300 --json \\'
     settle = 'PROOF_CAPTURES="$captures" node <<\'NODE\''
     capture = (
         'kin status --json --wait-quiesce 60 | tee "$captures/kin-embedded-status.json"'
@@ -3764,11 +3781,10 @@ def assert_install_proof_embedding_settles_before_measurement(embedding: str) ->
             )
     settle_body = "\n".join(active)
     for policy in (
-        'coverage.state === "observed" &&',
-        "coverage.total > 0 &&",
-        "coverage.pending === 0 &&",
-        "coverage.indexed === coverage.total",
-        "drained && current === previous",
+        '> "$captures/kin-embed.json" 2> "$captures/kin-embed-refusal.txt"',
+        'if [ "$embed_rc" -eq 0 ]; then',
+        '*"kin embed cannot index anything here"*"no local embedding model"*) ;;',
+        "if (current === previous) {",
         "process.exit(1);",
     ):
         if policy not in settle_body:
@@ -3948,6 +3964,16 @@ def assert_release_critical_runner_policy(
         )
 
 
+# The release suites skip an ordinary pull request and run on the push to
+# main, and also on the export pull request that becomes the next public main
+# commit. Public main takes one squash commit per release, so a suite that
+# first ran after that merge left the release sha untaggable whenever it went
+# red; running it on the export pull request grades the same tree while the
+# merge can still be refused.
+RELEASE_SUITE_EVENT_FILTER = (
+    "github.event_name != 'pull_request' || "
+    "startsWith(github.head_ref, 'feature/public-export-')"
+)
 INSTALL_PROOF_PULL_REQUEST_ARTIFACT = "install-proof-pr-binaries"
 INSTALL_PROOF_PULL_REQUEST_JOBS = (
     "install-proof-pr-build",
@@ -3963,7 +3989,10 @@ INSTALL_PROOF_PULL_REQUEST_JOBS = (
 # heavy leg quietly leaving the merge queue. `install-proof-pr-gate` carries no
 # job-level filter at all: it always reports, and decides inside its own step.
 INSTALL_PROOF_ADMITTED_EVENT_FILTERS = frozenset(
-    {"&& github.event_name != 'pull_request'"}
+    {
+        "&& github.event_name != 'pull_request'",
+        f"&& ({RELEASE_SUITE_EVENT_FILTER})",
+    }
 )
 # The gate is exempt from even that. It always reports, under one stable name,
 # and decides inside its own step, so any job-level event filter here publishes
@@ -4025,6 +4054,8 @@ def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> N
                 f"proof with the built artifact; missing `{policy}`"
             )
     build_lines = active_lines(build)
+    if any("--features" in line or "--all-features" in line for line in build_lines):
+        raise AssertionError("the install proof core build must use Cargo defaults")
     for policy in (
         f"name: {INSTALL_PROOF_PULL_REQUEST_ARTIFACT}",
         "--target x86_64-unknown-linux-musl -p kin-cli -p kin-daemon",
@@ -4100,6 +4131,45 @@ def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> N
             "the semantic retrieval proof lost the locate capture the "
             "capability validator reads"
         )
+
+
+def assert_install_proof_gate_grades_export_pull_requests(ci: str) -> None:
+    """Exercise the actual wrapper with real failed/skipped dependency outcomes."""
+    gate = workflow_job_blocks(ci)[INSTALL_PROOF_PULL_REQUEST_GATE]
+    if "HEAD_REF: ${{ github.head_ref }}" not in active_lines(gate):
+        raise AssertionError("install proof gate must receive the real pull-request head")
+    shell = workflow_step_shell(gate, "Require the pull request install proof")
+    fixtures = (
+        ("ordinary PR", "pull_request", "fix/example", "false", "skipped", "skipped", 0),
+        ("export build failed", "pull_request", "feature/public-export-kin-fixture", "false", "failure", "skipped", 1),
+        ("export proof failed", "pull_request", "feature/public-export-kin-fixture", "false", "success", "failure", 1),
+        ("export proof cancelled", "pull_request", "feature/public-export-kin-fixture", "false", "success", "cancelled", 1),
+        ("export proof skipped", "pull_request", "feature/public-export-kin-fixture", "false", "success", "skipped", 1),
+        ("export passed", "pull_request", "feature/public-export-kin-fixture", "false", "success", "success", 0),
+        ("docs-only export", "pull_request", "feature/public-export-kin-fixture", "true", "skipped", "skipped", 0),
+        ("main proof failed", "push", "", "false", "success", "failure", 1),
+    )
+    for label, event, head, docs, build, proof, expected in fixtures:
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", shell],
+            env={
+                "PATH": os.defpath,
+                "EVENT_NAME": event,
+                "HEAD_REF": head,
+                "DOCS_ONLY": docs,
+                "BUILD_RESULT": build,
+                "PROOF_RESULT": proof,
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != expected:
+            raise AssertionError(
+                f"install proof gate {label}: expected exit {expected}, "
+                f"got {result.returncode}: {result.stdout}{result.stderr}"
+            )
 
 
 def assert_install_proof_every_leg_gates_the_release(install_proof: str) -> None:
@@ -4381,25 +4451,25 @@ def assert_mcp_smoke_follows_the_launched_profile(source: str, context: str) -> 
     """Hold the MCP smoke's tools/list check to the call the smoke makes.
 
     The smoke launches the entry setup wrote, and that entry's profile decides
-    what the server lists: one `kin` tool on a routed profile, `semantic_search`
-    by name otherwise. The call already followed the profile when the listing
-    check still looked for `semantic_search` by substring, which a routed
-    listing never contains, so every leg would have failed on the release's own
-    bytes. The workflow step and its preflight port both carry this smoke.
+    what the server lists: one `kin` tool on a routed profile, `locate` by name
+    otherwise. The call already followed the profile when the listing check
+    still looked for the named tool by substring, which a routed listing never
+    contains, so every leg would have failed on the release's own bytes. The
+    workflow step and its preflight port both carry this smoke.
     """
 
     active = "\n".join(active_lines(source))
-    if 'includes("semantic_search")' in active:
+    if 'includes("locate")' in active or 'includes("semantic_search")' in active:
         raise AssertionError(
             f"{context} must check tools/list for the tool the launched entry's "
-            "profile serves, not for semantic_search by name"
+            "profile serves, not for one tool by name"
         )
     for policy in (
         "const launchProfile = entry.env?.KIN_MCP_TOOL_PROFILE;",
         "const launchCall = searchCall(launchProfile);",
         'profile.startsWith("agent-routed")',
-        '{ name: "kin", arguments: { command: "search", args: searchArgs } }',
-        '{ name: "semantic_search", arguments: searchArgs }',
+        '{ name: "kin", arguments: { command: "locate", args: searchArgs } }',
+        '{ name: "locate", arguments: searchArgs }',
         "listedTools.some((tool) => tool?.name === launchCall.name)",
         "`MCP tools/list omitted ${launchCall.name}, the tool the launched ` +",
         "params: launchCall,",
@@ -4535,17 +4605,28 @@ def assert_install_proof_windows_admission_contract(
                 f"verbatim; {name} drifted from {WINDOWS_INIT_CONTRACT_POLICY}: "
                 f"expected {binding}"
             )
+    # A new store is central and the tree carries nothing, so publication is
+    # what `kin store path` discovers against each fixture's own Kin home, and
+    # the in-tree layout is admitted once more and must publish the tree's own
+    # `.kin`. Stages are counted where each layout makes them.
     for policy in (
         'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree',
         'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
         'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
         'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
         'fail "$1 failed" "$3"',
         'fail "$1 unexpectedly succeeded" "$3"',
+        'export KIN_HOME="$home"',
+        'if ! answer="$(fixture_kin "$1" "$2" kin store path 2>> "$3")"; then',
+        'fail "$1 returned success but no store serves $2" "$3"',
+        "if [ \"$(count_matching \"$home/stores\" '*/manifest.json')\" != \"1\" ]; then",
         'if [ ! -d "$2/.kin" ]; then',
-        'if [ -e "$2/.kin" ]; then',
+        'fail "$1 published authority at $2/.kin" "$3"',
+        'fail "$1 published a store in $home/stores" "$3"',
         'parent="$(dirname "$2")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
+        "staged=\"$(count_matching \"$stores\" '.kin.init-*')\"",
         'if [ "$staged" != "0" ]; then',
     ):
         require(active, policy, "shipped Windows admission contract proof")
@@ -4579,6 +4660,9 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         "meta.dependency_provenance !== expectedLock",
         "meta.embeddings?.vector_enabled !== true",
         "meta.embeddings?.embeddings_enabled !== true",
+        "meta.embeddings?.local_inference_enabled !== false",
+        "meta.embeddings?.external_embeddings_enabled !== true",
+        'meta.embeddings?.provider !== "none"',
         "meta.embeddings?.metal_enabled !== false",
         'authority.checks[0]?.state !== "unsupported"',
         '["repo_init", "unsupported"]',
@@ -4661,7 +4745,9 @@ def assert_install_proof_status_contract(
     for policy in (
         'kin search hello --json > "$captures/kin-search.json"',
         'kin locate hello --json --explain --max-files 5 > "$captures/kin-locate.json"',
-        "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\"",
+        'kin store path > "$captures/kin-store-path.txt"',
+        "store_dir=.kin",
+        "daemon_port=\"$(tr -d '[:space:]' < \"$store_dir/daemon.port\")\"",
         'DAEMON_PORT="$daemon_port" node',
         "http://127.0.0.1:${process.env.DAEMON_PORT}/health",
         "kin-daemon-health.json",
@@ -4676,7 +4762,7 @@ def assert_install_proof_status_contract(
         require(graph_active, policy, "installed daemon startup and health capture")
 
     daemon_start = 'kin search hello --json > "$captures/kin-search.json"'
-    endpoint_capture = "daemon_port=\"$(tr -d '[:space:]' < .kin/daemon.port)\""
+    endpoint_capture = "daemon_port=\"$(tr -d '[:space:]' < \"$store_dir/daemon.port\")\""
     setup_health = 'kin setup status --json | tee "$captures/kin-health.json"'
     doctor_health = 'kin doctor --json | tee "$captures/kin-doctor.json"'
     daemon_start_index = graph_active_lines.index(daemon_start)
@@ -4716,10 +4802,14 @@ def assert_install_proof_status_contract(
         "validateEmbeddingCoverage(status.embedding_coverage",
         "cliMeta.embeddings?.vector_enabled !== true",
         "cliMeta.embeddings?.embeddings_enabled !== true",
+        "cliMeta.embeddings?.local_inference_enabled !== false",
+        "cliMeta.embeddings?.external_embeddings_enabled !== true",
+        'cliMeta.embeddings?.provider !== "none"',
         'embeddedStatus.schema !== "kin.status.v3"',
         "validateEmbeddingCoverage(embeddedStatus.embedding_coverage",
-        "embeddedCoverage.indexed !== embeddedCoverage.total",
-        "embeddedCoverage.pending !== 0",
+        'embeddedCoverage.state === "observed" && embeddedCoverage.indexed !== 0',
+        'fs.readFileSync("kin-embed-refusal.txt", "utf8")',
+        'const allowedSemanticReadiness = ["unsupported"];',
         'fs.readFileSync("../installed-kin-command.txt", "utf8").trim()',
         "installedKin !== expectedInstalledKin",
         '["mcp_client_antigravity", "healthy"]',
@@ -5301,7 +5391,7 @@ WINDOWS_AUTHORITY_LEG_HELPERS = "source ./scripts/windows-authority-legs.sh"
 # than by substring, because `github.event_name != 'pull_request'` is a
 # substring of every condition that also excludes the merge queue or the push,
 # and that is the thing this rule exists to catch.
-WINDOWS_AUTHORITY_ADMITTED_IF = "${{ github.event_name != 'pull_request' }}"
+WINDOWS_AUTHORITY_ADMITTED_IF = "${{ " + RELEASE_SUITE_EVENT_FILTER + " }}"
 # Every native Windows leg, wherever it runs. The set is what the three jobs
 # owe between them, so splitting or rebalancing them stays a free choice while
 # dropping one does not: a leg that leaves this file has to leave it visibly.
@@ -5656,9 +5746,9 @@ def assert_windows_npm_first_run_proof(ci_job: str, proof_source: str) -> None:
         "launcher: canonicalMcpLauncher",
         "setEnv(env, 'KIN_MCP_AUTO_INIT', '1')",
         "launcher: compatibilityMcpLauncher",
-        "name: 'semantic_search'",
+        "name: 'locate'",
         "assert.match(rendered, /greet/i",
-        "assert.match(rendered, /main\\.rs/i",
+        "holdsEntity(replies, 'greet', 'crate')",
         "['daemon', 'stop', '--all', '--json']",
     ):
         require(active_proof, policy, "native Windows npm first-run harness")
@@ -11252,6 +11342,23 @@ def assert_release_tag_nudge_uses_app_identity(release_cut: str) -> None:
         )
 
 
+def assert_default_core_archive_profile(workflow: str) -> None:
+    jobs = workflow_job_blocks(workflow)
+    build = jobs["build"]
+    for line in active_lines(build):
+        if "build --locked --release --target" in line and "-p kin-cli -p kin-daemon" in line:
+            if "--features" in line or "--all-features" in line or "--no-default-features" in line:
+                raise AssertionError("core archive builds must use Cargo defaults")
+    for required in (
+        '["vector", "external-embeddings"]', '["embeddings", "metal"]',
+        'meta.embeddings?.local_inference_enabled !== false',
+        'meta.embeddings?.external_embeddings_enabled !== true',
+        'meta.embeddings?.provider !== "none"',
+    ):
+        if required not in build:
+            raise AssertionError("default archive feature evidence is missing " + required)
+
+
 def main() -> None:
     assert_release_probe_fixtures()
     retired = (
@@ -11267,6 +11374,10 @@ def main() -> None:
             )
 
     release = RELEASE.read_text(encoding="utf-8")
+    assert_default_core_archive_profile(release)
+    assert_default_core_archive_profile((WORKFLOWS / "rc-build.yml").read_text(encoding="utf-8"))
+    expect_assertion("local engine smuggled into a default archive", "must use Cargo defaults", lambda: assert_default_core_archive_profile(release.replace('-p kin-cli -p kin-daemon || rc=$?', '-p kin-cli -p kin-daemon --features kin-cli/embeddings || rc=$?', 1)))
+    expect_assertion("engine metadata assertion removed", "feature evidence is missing", lambda: assert_default_core_archive_profile(release.replace('meta.embeddings?.local_inference_enabled !== false', 'false', 1)))
     release_cut = RELEASE_CUT.read_text(encoding="utf-8")
     assert_native_startup_release_proof(release_cut)
     for label, before, after, error in [
@@ -11988,8 +12099,8 @@ def main() -> None:
         "ltrimstr($run_uri)",
         "verifiedTimestamps",
         "registry.npmjs.org/@kinlab%2F",
-        "ghcr.io/v2/firelock-ai/kin/manifests",
-        "oci://ghcr.io/firelock-ai/kin@${ghcr_latest}",
+        "ghcr.io/v2/kinlab-ai/kin/manifests",
+        "oci://ghcr.io/kinlab-ai/kin@${ghcr_latest}",
         "--bundle-from-oci",
         'latest_tag" != v0.3.6',
         "markerless logless fallback is retired",
@@ -13075,24 +13186,24 @@ def main() -> None:
     ):
         assert_mcp_smoke_follows_the_launched_profile(smoke_source, smoke_context)
         expect_assertion(
-            f"the {smoke_context} looks for semantic_search whatever the profile",
-            "not for semantic_search by name",
+            f"the {smoke_context} looks for locate whatever the profile",
+            "not for one tool by name",
             lambda mutated=replace_exactly_once(
                 smoke_source,
                 "listedTools.some((tool) => tool?.name === launchCall.name)",
-                'JSON.stringify(listedTools).includes("semantic_search")',
+                'JSON.stringify(listedTools).includes("locate")',
                 f"{smoke_context} listing check",
             ), context=smoke_context: assert_mcp_smoke_follows_the_launched_profile(
                 mutated, context
             ),
         )
         expect_assertion(
-            f"the {smoke_context} calls semantic_search whatever the profile",
+            f"the {smoke_context} calls locate whatever the profile",
             "is missing required policy: const launchCall = searchCall(launchProfile);",
             lambda mutated=replace_exactly_once(
                 smoke_source,
                 "const launchCall = searchCall(launchProfile);",
-                'const launchCall = { name: "semantic_search", arguments: searchArgs };',
+                'const launchCall = { name: "locate", arguments: searchArgs };',
                 f"{smoke_context} call shape",
             ), context=smoke_context: assert_mcp_smoke_follows_the_launched_profile(
                 mutated, context
@@ -13177,16 +13288,22 @@ def main() -> None:
     assert_install_proof_embedding_settles_before_measurement(embedding)
     for label, expected, original, mutation in (
         (
-            "the settle stops requiring a drained embedding pass",
+            "an embed pass that ran stops failing the engine-free leg",
             "poll the counters to quiescence",
-            "coverage.pending === 0 &&",
-            "coverage.pending >= 0 &&",
+            'if [ "$embed_rc" -eq 0 ]; then',
+            "if false; then",
+        ),
+        (
+            "the refusal stops having to name the missing model",
+            "poll the counters to quiescence",
+            '*"kin embed cannot index anything here"*"no local embedding model"*) ;;',
+            "*) ;;",
         ),
         (
             "the settle stops requiring two agreeing reads",
             "poll the counters to quiescence",
-            "drained && current === previous",
-            "drained",
+            "if (current === previous) {",
+            "if (true) {",
         ),
         (
             "an expired settle stops failing the leg",
@@ -13516,7 +13633,23 @@ def main() -> None:
     for label, active_line in (
         (
             "the non-empty Windows refusal may publish a repository anyway",
-            'if [ -e "$2/.kin" ]; then',
+            'fail "$1 published authority at $2/.kin" "$3"',
+        ),
+        (
+            "the non-empty Windows refusal may publish a central store anyway",
+            'fail "$1 published a store in $home/stores" "$3"',
+        ),
+        (
+            "a Windows admission may publish no store Kin can discover",
+            'fail "$1 returned success but no store serves $2" "$3"',
+        ),
+        (
+            "a central Windows admission may leave its unpublished stage behind",
+            "staged=\"$(count_matching \"$stores\" '.kin.init-*')\"",
+        ),
+        (
+            "the in-tree layout stops having to succeed",
+            'require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree',
         ),
         (
             "a Windows admission may leave its unpublished stage behind",
@@ -13830,6 +13963,7 @@ def main() -> None:
         )
 
     assert_install_proof_runs_on_pull_requests(ci_workflow, install_proof)
+    assert_install_proof_gate_grades_export_pull_requests(ci_workflow)
     pull_request_gate = workflow_job_blocks(ci_workflow)["install-proof-pr-gate"]
     for label, source, original, mutation, expected in (
         (
@@ -14487,16 +14621,22 @@ def main() -> None:
     #
     # Exact Git and native-empty admission are supported. The contract pins
     # both successes, zero transaction residue, and the retained non-empty
-    # boundary refusal.
+    # boundary refusal. A new store is central and the tree carries nothing, so
+    # publication is what `kin store path` discovers, and the in-tree layout is
+    # admitted once more and must publish the tree's own `.kin`.
     windows_admission = (ROOT / "scripts" / "assert-windows-init-contract.sh").read_text(
         encoding="utf-8"
     )
     for policy in (
         '"$kin_bin" init',
+        '"$kin_bin" store path',
         'NON_EMPTY_REFUSAL="requires an empty directory"',
         'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree',
         'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
         'require_non_empty_refused',
+        'fail "$label returned success but no store serves $dir" "$log"',
+        "count_matching \"$home/stores\" '*/manifest.json'",
         'if [ ! -d "$dir/.kin" ]; then',
         'fail "$label unexpectedly succeeded" "$log"',
         'if [ -e "$dir/.kin" ]; then',
@@ -14510,6 +14650,20 @@ def main() -> None:
     assert_windows_npm_first_run_proof(
         ci_jobs["windows-authority-tests"], windows_npm_proof
     )
+    for label, replacement in (
+        ("the Windows search proof accepts another entity", "holdsEntity(replies, 'other', 'crate')"),
+        ("the Windows search proof accepts another module", "holdsEntity(replies, 'greet', 'other')"),
+    ):
+        expect_assertion(
+            label,
+            "native Windows npm first-run harness",
+            lambda replacement=replacement: assert_windows_npm_first_run_proof(
+                ci_jobs["windows-authority-tests"],
+                windows_npm_proof.replace(
+                    "holdsEntity(replies, 'greet', 'crate')", replacement, 1
+                ),
+            ),
+        )
     assert_windows_daemon_sibling_build(ci_jobs["windows-authority-runtime-tests"])
     windows_job = ci_jobs["windows-authority-runtime-tests"]
     sibling_build_start = windows_job.index(WINDOWS_DAEMON_SIBLING_BUILD)
@@ -15087,7 +15241,7 @@ def main() -> None:
         "Publish installers ${KIN_TAG} from Kin run ${SOURCE_RUN_ID}",
         "actions/workflows/publish-install.yml/runs?event=repository_dispatch",
         "the workflow may still be disabled",
-        'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
+        'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA" --surface pages',
         # The image-promotion dispatch, third beside the two above and under the
         # same token, whose repositories list already carries kin-infra.
         #
@@ -15111,7 +15265,7 @@ def main() -> None:
         )
 
     for policy in (
-        "`firelock-ai/homebrew-kin` and `firelock-ai/kin-infra`",
+        "`kinlab-ai/homebrew-kin` and `kinlab-ai/kin-infra`",
         "`KIN_RELEASE_APP_ID`",
         "`KIN_RELEASE_APP_PRIVATE_KEY`",
         "`RELEASE_FOLLOWUP_READY`",
@@ -15171,7 +15325,7 @@ def main() -> None:
         "needs: config",
         "environment: release",
         "packages: write",
-        "ghcr.io/firelock-ai/kin",
+        "ghcr.io/kinlab-ai/kin",
         "verify-container-build-info.sh",
         "docker buildx build",
     ):
@@ -15209,12 +15363,12 @@ def main() -> None:
         '"${IMAGE}@${digest}" "$COMMIT"',
         "Attest immutable daemon image",
         "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
-        "subject-name: ghcr.io/firelock-ai/kin",
+        "subject-name: ghcr.io/kinlab-ai/kin",
         "subject-digest: ${{ steps.subject.outputs.digest }}",
         "push-to-registry: true",
         "create-storage-record: false",
         "Verify immutable daemon image attestation",
-        '"oci://ghcr.io/firelock-ai/kin@${DIGEST}"',
+        '"oci://ghcr.io/kinlab-ai/kin@${DIGEST}"',
         "--bundle-from-oci",
         "--predicate-type https://slsa.dev/provenance/v1",
         '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"',
@@ -15595,7 +15749,7 @@ def main() -> None:
         "--expect-sha",
         "--expect-archive-sha256",
         "gh attestation verify",
-        "firelock-ai/kin/.github/workflows/release.yml",
+        "kinlab-ai/kin/.github/workflows/release.yml",
         "sourceRepositoryDigest",
         "opens the install lock or performs local mutation",
         "selection and drift evidence only",
@@ -16295,13 +16449,13 @@ def main() -> None:
     for label, old, new in (
         (
             "a shard stops partitioning and both legs run the whole suite",
-            "        run: cargo nextest run --locked "
+            "        run: cargo nextest run --locked --no-fail-fast --features kin-cli/metal,kin-daemon/metal "
             "--partition count:${{ matrix.shard }}/2",
             "        run: cargo nextest run --locked",
         ),
         (
             "the doctest pass nextest cannot run disappears",
-            "        run: cargo test --doc --locked",
+            "        run: cargo test --doc --locked --features kin-cli/metal,kin-daemon/metal",
             "        run: echo doctests skipped",
         ),
         (
@@ -16378,13 +16532,13 @@ def main() -> None:
     for label, old, new in (
         (
             "a shard stops partitioning and both legs run the whole suite",
-            "        run: cargo nextest run --locked "
+            "        run: cargo nextest run --locked --no-fail-fast --features kin-cli/embeddings,kin-daemon/embeddings "
             "--partition count:${{ matrix.shard }}/2",
             "        run: cargo nextest run --locked",
         ),
         (
             "the doctest pass nextest cannot run disappears",
-            "        run: cargo test --doc --locked",
+            "        run: cargo test --doc --locked --features kin-cli/embeddings,kin-daemon/embeddings",
             "        run: echo doctests skipped",
         ),
         (
@@ -16424,9 +16578,9 @@ def main() -> None:
         # leg, and a shard that skipped its own build never ran a partition.
         (
             "a step the partition consumes is pinned to one shard",
-            "      - name: Build\n        run: cargo build --all-targets --locked\n",
+            "      - name: Build\n        run: cargo build --all-targets --locked --features kin-cli/embeddings,kin-daemon/embeddings\n",
             "      - name: Build\n        if: matrix.shard == 1\n"
-            "        run: cargo build --all-targets --locked\n",
+            "        run: cargo build --all-targets --locked --features kin-cli/embeddings,kin-daemon/embeddings\n",
         ),
         (
             "a step the partition consumes leaves the job",
@@ -16509,13 +16663,14 @@ def main() -> None:
     )
 
     stub_condition = (
-        "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"
+        "    if: ${{ !cancelled() && github.event_name == 'pull_request' "
+        "&& !startsWith(github.head_ref, 'feature/public-export-') }}"
     )
     real_check_condition = (
         "    if: >-\n"
         "      ${{ !cancelled()\n"
         "      && needs.changes.outputs.docs_only != 'true'\n"
-        "      && github.event_name != 'pull_request' }}"
+        f"      && ({RELEASE_SUITE_EVENT_FILTER}) }}}}"
     )
     swapped_stub_check = stub_check.replace(
         stub_condition,
@@ -16580,7 +16735,8 @@ def main() -> None:
             # no producer of either expanded `Check & Test` name at all, which
             # is a silent hang rather than a failure.
             "pull-request Check & Test narrowed back to documentation diffs",
-            "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}",
+            "    if: ${{ !cancelled() && github.event_name == 'pull_request' "
+            "&& !startsWith(github.head_ref, 'feature/public-export-') }}",
             "    if: ${{ !cancelled() && "
             "needs.changes.outputs.docs_only == 'true' }}",
         ),
@@ -17308,6 +17464,54 @@ def main() -> None:
         "two successful check-runs claim one required context",
         "ambiguous required check: cargo-deny (2 check-runs under one provenance)",
         add_duplicate_success,
+    )
+
+    def retry(first: str, second: str, second_start: str) -> Callable[
+        [list[dict[str, object]], list[dict[str, object]], dict[str, object]], None
+    ]:
+        def mutate(
+            check_runs: list[dict[str, object]],
+            _workflow_runs: list[dict[str, object]],
+            _current_run: dict[str, object],
+        ) -> None:
+            original = required_check_fixture(check_runs, "cargo-deny")
+            attempt = original.copy()
+            original.update(
+                {
+                    "conclusion": first,
+                    "started_at": "2026-09-28T10:00:00Z",
+                    "completed_at": "2026-09-28T10:20:00Z",
+                }
+            )
+            attempt.update(
+                {
+                    "id": 10_002,
+                    "conclusion": second,
+                    "started_at": second_start,
+                    "completed_at": "2026-09-28T10:45:00Z",
+                }
+            )
+            check_runs.append(attempt)
+
+        return mutate
+
+    assert_release_gate_admits(
+        release_gate,
+        "one failed attempt of a required job retried to success in its own run",
+        ("required check passed on its one admitted retry: cargo-deny",),
+        retry("failure", "success", "2026-09-28T10:25:00Z"),
+    )
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "a passing attempt followed by a failing one is no retry",
+        "ambiguous required check: cargo-deny (2 check-runs under one provenance)",
+        retry("success", "failure", "2026-09-28T10:25:00Z"),
+    )
+    assert_release_gate_fixture_rejected(
+        release_gate,
+        "a retry that started before the failure finished is no retry",
+        "ambiguous required check: cargo-deny (2 check-runs under one provenance)",
+        retry("failure", "success", "2026-09-28T10:10:00Z"),
     )
 
     def add_landing_push_producer(

@@ -884,7 +884,7 @@ pub fn record_relation_census(
         chrono::Utc::now(),
         source,
         kinds,
-        kin_core::relation_census::known_causes(std::env::vars()),
+        kin_core::relation_census::known_causes_for(layout, std::env::vars()),
     )
     .with_entities(entities);
     // Offered rather than written. `record` refuses to make a losing census the

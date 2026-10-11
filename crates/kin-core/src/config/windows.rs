@@ -161,7 +161,7 @@ pub(super) fn save_config_atomically_scoped_with_hook(
         hook(ConfigSaveHookPoint::AfterPartialTempWrite)?;
         file.write_all(&contents[split..])
             .map_err(|error| KinError::io(&temp.display_path, error))?;
-        file.sync_all()
+        kin_blobs::durable::sync_all(&file)
             .map_err(|error| KinError::io(&temp.display_path, error))?;
         hook(ConfigSaveHookPoint::AfterTempSync)?;
         // The Unix arm re-reads the temp by name here, to catch a name swapped

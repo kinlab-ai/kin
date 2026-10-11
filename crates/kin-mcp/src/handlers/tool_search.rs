@@ -18,7 +18,7 @@
 //!
 //! ## Three properties, and why each one is load-bearing
 //!
-//! **It reads the registry, never a copy.** [`crate::tools::tool_definitions`]
+//! **It reads the registry, never a copy.** [`crate::tools::surface_definitions`]
 //! is the same function `tools/list` is built from, so this cannot become a
 //! second home where a description drifts. A hand-kept index of tool summaries
 //! would be exactly that, and it would go stale the first time a description
@@ -231,9 +231,7 @@ fn limit_from(args: &HashMap<String, serde_json::Value>) -> Result<u64> {
         return Ok(DEFAULT_LIMIT);
     }
     let raw = value.as_u64().ok_or_else(|| {
-        McpError::InvalidParams(format!(
-            "{TOOL_NAME}: `limit` must be a positive integer, got {value}"
-        ))
+        McpError::InvalidParams(format!("{TOOL_NAME}: `limit` must be a positive integer"))
     })?;
     Ok(raw.clamp(1, MAX_LIMIT))
 }
@@ -264,15 +262,15 @@ fn build_tool_search(
         None => String::new(),
         Some(value) if value.is_null() => String::new(),
         Some(serde_json::Value::String(text)) => text.clone(),
-        Some(other) => {
+        Some(_) => {
             return Err(McpError::InvalidParams(format!(
-                "{TOOL_NAME}: `need` must be a string, got {other}"
+                "{TOOL_NAME}: `need` must be a string"
             )))
         }
     };
     let limit = limit_from(args)? as usize;
 
-    let registry = crate::tools::tool_definitions();
+    let registry = crate::tools::surface_definitions();
     let ranked = rank(&registry.tools, &need);
     let matched_names: Vec<&str> = ranked
         .iter()
@@ -296,7 +294,6 @@ fn build_tool_search(
         .collect();
 
     let payload = serde_json::json!({
-        "need": need,
         // The full definitions, exactly as `full` serves them. Serialized from
         // the same structs `tools/list` serializes, which is what makes the
         // fidelity assertion a property of the code rather than of a habit.
@@ -327,7 +324,11 @@ fn build_tool_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::tool_definitions;
+    /// The registry this tool searches: the surface `full` serves, verbs and
+    /// all, with the names they replaced left out.
+    fn tool_definitions() -> crate::types::ToolsListResult {
+        crate::tools::surface_definitions()
+    }
 
     fn call(args: serde_json::Value) -> serde_json::Value {
         let map: HashMap<String, serde_json::Value> = args
@@ -344,7 +345,7 @@ mod tests {
     #[test]
     fn dispatcher_routes_match_the_serving_boundary_and_read_only_registry() {
         let args = HashMap::from([
-            ("need".into(), serde_json::json!("kin_mutate")),
+            ("need".into(), serde_json::json!(crate::verbs::MUTATE)),
             ("limit".into(), serde_json::json!(25)),
         ]);
         let parse = |result: ToolCallResult| {
@@ -372,10 +373,10 @@ mod tests {
         let served = parse(handle_tool_search_with_profile(&args, None).unwrap());
         assert_eq!(served["invocation"]["dispatcher_enabled"], true);
         assert_eq!(
-            served["invocation"]["callable_via_dispatcher"]["kin_mutate"],
+            served["invocation"]["callable_via_dispatcher"][crate::verbs::MUTATE],
             false
         );
-        let args = HashMap::from([("need".into(), serde_json::json!("semantic_search"))]);
+        let args = HashMap::from([("need".into(), serde_json::json!(crate::verbs::LOCATE))]);
         let served = parse(
             handle_tool_search_with_profile(
                 &args,
@@ -386,7 +387,7 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            served["invocation"]["callable_via_dispatcher"]["semantic_search"],
+            served["invocation"]["callable_via_dispatcher"][crate::verbs::LOCATE],
             true
         );
     }
@@ -534,7 +535,7 @@ mod tests {
         let names: Vec<String> =
             serde_json::from_value(payload["matched_names"].clone()).expect("names");
         assert!(
-            names.iter().any(|name| name == "impact_analysis"),
+            names.iter().any(|name| name == crate::verbs::IMPACT),
             "the change-impact tool was not reachable from the question it answers: {names:?}"
         );
     }
@@ -545,7 +546,7 @@ mod tests {
     /// contract.
     #[test]
     fn the_search_returns_the_registered_form_not_the_belt_short_form() {
-        let payload = call(serde_json::json!({ "need": "semantic_locate" }));
+        let payload = call(serde_json::json!({ "need": crate::verbs::LOCATE }));
         let found = payload["matches"][0]["description"]
             .as_str()
             .expect("a description")
@@ -553,13 +554,13 @@ mod tests {
         let registered = tool_definitions()
             .tools
             .iter()
-            .find(|tool| tool.name == "semantic_locate")
-            .expect("semantic_locate is registered")
+            .find(|tool| tool.name == crate::verbs::LOCATE)
+            .expect("locate is registered")
             .description
             .clone();
         assert_eq!(found, registered);
         let mut belt = crate::tools::served_tools_list(
-            Some(&crate::tools::name_set(&["semantic_locate"])),
+            Some(&crate::tools::name_set(&[crate::verbs::LOCATE])),
             true,
         );
         let short = belt.tools.remove(0).description;
@@ -579,6 +580,33 @@ mod tests {
         );
         let one = call(serde_json::json!({ "need": "", "limit": 0 }));
         assert_eq!(one["matches"].as_array().expect("matches").len(), 1);
+    }
+
+    #[test]
+    fn discovery_returns_registry_records_without_echoing_request_data() {
+        let private = "/operator/private/repository.rs:42";
+        let payload = call(serde_json::json!({"need":private}));
+        assert!(payload.get("need").is_none());
+        assert!(!payload.to_string().contains(private));
+        for (key, value) in [
+            ("need", serde_json::json!({"path":private})),
+            ("limit", serde_json::json!(private)),
+        ] {
+            let error = handle_tool_search(&HashMap::from([(key.into(), value)])).unwrap_err();
+            assert!(!error.to_string().contains(private));
+            assert!(error.to_string().contains(key));
+        }
+        // Discovery preserves authored schemas, including source-edit data.
+        let source = call(serde_json::json!({"need":crate::verbs::SOURCE}));
+        let registry = tool_definitions();
+        for matched in source["matches"].as_array().unwrap() {
+            let definition = registry
+                .tools
+                .iter()
+                .find(|tool| matched["name"] == tool.name)
+                .unwrap();
+            assert_eq!(*matched, serde_json::to_value(definition).unwrap());
+        }
     }
 
     #[test]

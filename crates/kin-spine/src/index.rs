@@ -15,6 +15,7 @@ use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFing
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 
+use crate::graph_facts::{FactsSnapshot, RepoGraphFacts};
 use crate::publication::SpineSourceCursor;
 use crate::xref::UnresolvedImport;
 
@@ -467,6 +468,12 @@ struct SpineInner {
     /// they are the registered set at resolution time, and are filled in then.
     retained_imports: HashMap<RepoId, Arc<[UnresolvedImport]>>,
 
+    /// Each repo's language and derivation facts, as the registration that
+    /// installed its entries supplied them. A repo registered without facts,
+    /// which is how a durable publication installs one, has no row here and
+    /// reads as unknown: nothing about it narrows resolution or authority.
+    repo_facts: HashMap<RepoId, Arc<RepoGraphFacts>>,
+
     /// Monotonic generation for the registered repo/entity/root authority.
     /// A refresh may clear its dirty bit only when this value is unchanged
     /// from the start of that refresh.
@@ -531,6 +538,7 @@ impl SpineIndex {
             source_cursors: HashMap::new(),
             dirty_edge_repos: HashSet::new(),
             retained_imports: HashMap::new(),
+            repo_facts: HashMap::new(),
             authority_epoch: 0,
             active_edge_refreshes: 0,
             active_full_refresh_epoch: None,
@@ -601,11 +609,45 @@ impl SpineIndex {
     }
 
     /// Register entities from a repo into the index.
+    ///
+    /// The repo registers without graph facts, so its languages and inferred
+    /// members are unknown until a registration supplies them.
     pub fn register_repo(&self, repo_id: &str, entities: Vec<EntityEntry>, root_hash: &str) {
         let mut inner = self.inner.write();
 
         Self::register_repo_locked(&mut inner, repo_id, entities, root_hash);
         inner.source_cursors.remove(repo_id);
+    }
+
+    /// [`Self::register_repo`] with the language and derivation facts of the
+    /// graph the entries were captured from, installed under the same write
+    /// lock so no resolution reads the entries without them.
+    pub fn register_repo_with_facts(
+        &self,
+        repo_id: &str,
+        entities: Vec<EntityEntry>,
+        facts: RepoGraphFacts,
+        root_hash: &str,
+    ) {
+        let mut inner = self.inner.write();
+
+        Self::register_repo_locked(&mut inner, repo_id, entities, root_hash);
+        inner
+            .repo_facts
+            .insert(repo_id.to_string(), Arc::new(facts));
+        inner.source_cursors.remove(repo_id);
+    }
+
+    /// Every registered repo's graph facts, read under one lock.
+    pub(crate) fn facts_snapshot(&self) -> FactsSnapshot {
+        let inner = self.inner.read();
+        FactsSnapshot {
+            repos: inner
+                .repo_facts
+                .iter()
+                .map(|(repo, facts)| (repo.clone(), Arc::clone(facts)))
+                .collect(),
+        }
     }
 
     /// Install one committed durable publication under a single write lock.
@@ -632,6 +674,9 @@ impl SpineIndex {
         });
         inner.by_id.retain(|(owner, _), _| owner != repo_id);
         inner.retained_imports.remove(repo_id);
+        // A durable publication carries no graph facts, so the repo's
+        // languages and inferred members are unknown from here on.
+        inner.repo_facts.remove(repo_id);
         for entry in entities {
             let key = (entry.name.to_lowercase(), entry.kind);
             inner.by_name.entry(key).or_default().push(entry.clone());
@@ -691,8 +736,10 @@ impl SpineIndex {
             entries.retain(|e| e.repo_id != repo_id);
         });
         inner.by_id.retain(|(rid, _), _| rid != repo_id);
-        // The imports kept for this repo came from the graph this replaces.
+        // The imports kept for this repo came from the graph this replaces,
+        // and so did its facts.
         inner.retained_imports.remove(repo_id);
+        inner.repo_facts.remove(repo_id);
 
         // Insert new entries
         for entry in entities {
@@ -822,14 +869,64 @@ impl SpineIndex {
     }
 
     fn authority_complete(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
+        Self::authority_settled(inner, roots) && inner.dirty_edge_repos.is_empty()
+    }
+
+    /// Everything [`Self::authority_complete`] asks except which repos are
+    /// stale: no refresh in flight, every root canonical, and every edge
+    /// endpoint registered.
+    fn authority_settled(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
         inner.active_edge_refreshes == 0
             && inner.active_full_refresh_epoch.is_none()
-            && inner.dirty_edge_repos.is_empty()
             && !roots.is_empty()
             && roots
                 .values()
                 .all(|root| !root.is_empty() && root.trim() == root)
             && inner.edge_authority_is_closed
+    }
+
+    /// Cross-repo authority for one anchor.
+    ///
+    /// A stale repo leaves an answer about the anchor short only when it could
+    /// hold a reference into the anchor. The anchor's own repo always counts,
+    /// since its stale edges are the anchor's outgoing ones. Another repo counts
+    /// unless its graph facts show that none of its languages can reach the
+    /// anchor's language and it holds no edge on the anchor already. A repo with
+    /// no facts, or an anchor whose language is unknown, always counts.
+    fn anchor_authority_complete(
+        inner: &SpineInner,
+        roots: &BTreeMap<RepoId, String>,
+        repo_id: &str,
+        entity_id: &EntityId,
+        incident: &[CrossRepoEdge],
+    ) -> bool {
+        Self::authority_settled(inner, roots)
+            && roots.contains_key(repo_id)
+            && inner.by_id.contains_key(&(repo_id.to_string(), *entity_id))
+            && inner.dirty_edge_repos.iter().all(|stale| {
+                stale != repo_id
+                    && !incident.iter().any(|edge| edge.src_repo == *stale)
+                    && !Self::could_reference(inner, stale, repo_id, entity_id)
+            })
+    }
+
+    /// Whether `source_repo` could hold a reference to `target_entity` in
+    /// `target_repo`, read from the graph facts both registrations supplied.
+    /// Unknown on either side is "could".
+    fn could_reference(
+        inner: &SpineInner,
+        source_repo: &str,
+        target_repo: &str,
+        target_entity: &EntityId,
+    ) -> bool {
+        let target_language = inner
+            .repo_facts
+            .get(target_repo)
+            .and_then(|facts| facts.language(target_entity));
+        match (inner.repo_facts.get(source_repo), target_language) {
+            (Some(source), Some(target)) => source.could_reference(target),
+            _ => true,
+        }
     }
 
     /// Resolve an entity by name and kind across all repos.
@@ -1015,7 +1112,8 @@ impl SpineIndex {
             .into_iter()
             .filter_map(|key| inner.by_id.get(&key).cloned())
             .collect();
-        let anchor_covered = inner.by_id.contains_key(&(repo_id.to_string(), *entity_id));
+        let authority_complete =
+            Self::anchor_authority_complete(&inner, &roots, repo_id, entity_id, &edges);
 
         SpineXrefResponse {
             version: crate::SPINE_PAYLOAD_VERSION,
@@ -1025,9 +1123,7 @@ impl SpineIndex {
                 repo_id: repo_id.to_string(),
                 entity_id: *entity_id,
             }),
-            authority_complete: Self::authority_complete(&inner, &roots)
-                && roots.contains_key(repo_id)
-                && anchor_covered,
+            authority_complete,
             authority_revision: Some(inner.authority_revision.clone()),
             authority_roots: roots,
         }
@@ -1362,6 +1458,10 @@ impl SpineIndex {
                 entries_from_entities(repo_id, entities),
                 "",
             );
+            inner.repo_facts.insert(
+                repo_id.to_string(),
+                Arc::new(RepoGraphFacts::from_entities(entities)),
+            );
         }
         self.start_edge_refresh(&mut inner, repo_id)
     }
@@ -1456,6 +1556,7 @@ pub fn fingerprint_match_score(a: &SemanticFingerprint, b: &SemanticFingerprint)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DERIVED_MEMBER_EDGE_CONFIDENCE;
     use kin_model::{
         EntityMetadata, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, RelationEvidence,
         RelationId, RelationKind, RelationOrigin, Visibility,
@@ -2785,5 +2886,276 @@ mod tests {
             confidence: 0.9,
         });
         assert!(!orphan_entity.cross_repo_edges_snapshot().complete);
+    }
+
+    fn entity_in(id: EntityId, name: &str, language: LanguageId) -> Entity {
+        let mut entity = test_entity(id, name);
+        entity.language = language;
+        entity
+    }
+
+    /// An inferred member: its derivation record is present, and a record the
+    /// reader cannot vouch for counts as one too.
+    fn inferred(mut entity: Entity) -> Entity {
+        entity.metadata.extra.insert(
+            kin_model::derivation::ENTITY_DERIVATION_KEY.to_string(),
+            serde_json::json!({}),
+        );
+        assert!(kin_model::is_derived_member(&entity));
+        entity
+    }
+
+    fn register_graph(index: &SpineIndex, repo: &str, entities: &[Entity], root: &str) {
+        index.register_repo_with_facts(
+            repo,
+            entries_from_entities(repo, entities),
+            RepoGraphFacts::from_entities(entities),
+            root,
+        );
+    }
+
+    fn edge_confidence(index: &SpineIndex, src: EntityId, dst: EntityId) -> Option<f32> {
+        index
+            .cross_repo_edges_snapshot()
+            .edges
+            .iter()
+            .find(|edge| edge.src_entity == src && edge.dst_entity == dst)
+            .map(|edge| edge.confidence)
+    }
+
+    /// One inferred member used to keep its whole repository out of the spine.
+    /// It enters with the rest of the graph now, and every cross-repo edge that
+    /// touches it, into it or out of it, carries the candidate confidence the
+    /// local graph gives the same edge, while an edge into an ordinary
+    /// declaration beside it keeps its own tier. The member's own anchor is
+    /// answered with complete authority, so nothing about it is a gap.
+    #[test]
+    fn an_inferred_member_enters_the_spine_and_every_edge_on_it_is_a_candidate() {
+        let member_id = EntityId::from_content("src/app.js", "get", "function", 1);
+        let declared_id = EntityId::from_content("src/app.js", "listen", "function", 1);
+        let caller_id = EntityId::from_content("src/client.js", "main", "function", 1);
+        let helper_id = EntityId::from_content("src/client.js", "helper", "function", 1);
+        let app = vec![
+            inferred(entity_in(member_id, "get", LanguageId::JavaScript)),
+            entity_in(declared_id, "listen", LanguageId::JavaScript),
+        ];
+        let client = vec![
+            entity_in(caller_id, "main", LanguageId::JavaScript),
+            entity_in(helper_id, "helper", LanguageId::JavaScript),
+        ];
+        let repos = vec!["app".to_string(), "client".to_string()];
+        let client_calls = vec![
+            external_call(caller_id, "app", "get"),
+            external_call(caller_id, "app", "listen"),
+        ];
+        let member_calls = vec![external_call(member_id, "client", "helper")];
+
+        let index = SpineIndex::new();
+        register_graph(&index, "app", &app, "root-app");
+        register_graph(&index, "client", &client, "root-client");
+        index.refresh_cross_repo_edges("app", &app, &member_calls, &repos);
+        index.refresh_cross_repo_edges("client", &client, &client_calls, &repos);
+        assert!(index.authority_is_complete());
+        assert_eq!(
+            index.lookup_by_id("app", &member_id).map(|e| e.name),
+            Some("get".into())
+        );
+
+        assert_eq!(
+            edge_confidence(&index, caller_id, declared_id),
+            Some(0.95),
+            "the control: an import naming the repo binds an ordinary declaration at its tier"
+        );
+        assert_eq!(
+            edge_confidence(&index, caller_id, member_id),
+            Some(DERIVED_MEMBER_EDGE_CONFIDENCE),
+            "an edge into an inferred member is a candidate"
+        );
+        assert_eq!(
+            edge_confidence(&index, member_id, helper_id),
+            Some(DERIVED_MEMBER_EDGE_CONFIDENCE),
+            "an edge out of an inferred member is a candidate"
+        );
+        let member = index.cross_repo_xref_response("app", &member_id);
+        assert!(member.authority_complete_for("app", &member_id));
+        assert_eq!(member.edges.len(), 2);
+
+        // Resolving the kept imports again, as a caller without the graph
+        // does, keeps both caps.
+        register_graph(&index, "client", &client, "root-client-next");
+        assert!(index.refresh_cross_repo_edges_from_retained_imports("app", &repos));
+        index.refresh_cross_repo_edges("client", &client, &client_calls, &repos);
+        assert!(index.authority_is_complete());
+        assert_eq!(
+            edge_confidence(&index, member_id, helper_id),
+            Some(DERIVED_MEMBER_EDGE_CONFIDENCE)
+        );
+        assert_eq!(
+            edge_confidence(&index, caller_id, member_id),
+            Some(DERIVED_MEMBER_EDGE_CONFIDENCE)
+        );
+    }
+
+    /// A same-named declaration in a runtime the importer cannot load is not a
+    /// match at any tier. A Python call whose module names no registered repo
+    /// used to fall through to a bare-name match and bind a JavaScript function
+    /// of the same name.
+    #[test]
+    fn resolution_never_binds_a_declaration_the_importing_language_cannot_reach() {
+        let render_id = EntityId::from_content("src/render.js", "render", "function", 1);
+        let view_id = EntityId::from_content("app/views.py", "view", "function", 1);
+        let widget_id = EntityId::from_content("src/widget.ts", "widget", "function", 1);
+        let ui = vec![entity_in(render_id, "render", LanguageId::JavaScript)];
+        let server = vec![entity_in(view_id, "view", LanguageId::Python)];
+        let widgets = vec![entity_in(widget_id, "widget", LanguageId::TypeScript)];
+        let repos = vec![
+            "server".to_string(),
+            "ui".to_string(),
+            "widgets".to_string(),
+        ];
+
+        let index = SpineIndex::new();
+        register_graph(&index, "ui", &ui, "root-ui");
+        register_graph(&index, "server", &server, "root-server");
+        register_graph(&index, "widgets", &widgets, "root-widgets");
+        index.refresh_cross_repo_edges("ui", &ui, &[], &repos);
+        index.refresh_cross_repo_edges(
+            "server",
+            &server,
+            &[external_call(view_id, "jinja2", "render")],
+            &repos,
+        );
+        index.refresh_cross_repo_edges(
+            "widgets",
+            &widgets,
+            &[external_call(widget_id, "lodash", "render")],
+            &repos,
+        );
+        assert!(index.authority_is_complete());
+        assert_eq!(edge_confidence(&index, view_id, render_id), None);
+        assert!(
+            edge_confidence(&index, widget_id, render_id).is_some(),
+            "the control: the same fallback binds for a language that can reach the target"
+        );
+    }
+
+    /// A stale repository leaves an anchor's answer short only when it could
+    /// hold a reference into the anchor.
+    #[test]
+    fn a_stale_repository_in_an_unrelated_language_leaves_an_anchor_complete() {
+        let focal_id = EntityId::from_content("src/store.js", "containsElement", "method", 1);
+        let view_id = EntityId::from_content("app/views.py", "view", "function", 1);
+        let ui = vec![entity_in(
+            focal_id,
+            "containsElement",
+            LanguageId::JavaScript,
+        )];
+        let server = vec![entity_in(view_id, "view", LanguageId::Python)];
+        let repos = vec!["server".to_string(), "ui".to_string()];
+
+        let index = SpineIndex::new();
+        register_graph(&index, "ui", &ui, "root-ui");
+        register_graph(&index, "server", &server, "root-server");
+        index.refresh_cross_repo_edges("ui", &ui, &[], &repos);
+        index.refresh_cross_repo_edges("server", &server, &[], &repos);
+        assert!(index
+            .cross_repo_xref_response("ui", &focal_id)
+            .authority_complete_for("ui", &focal_id));
+
+        index.invalidate_cross_repo_edges("server");
+        assert!(index.cross_repo_edges_stale("server"));
+        assert!(
+            !index.authority_is_complete(),
+            "the whole-fleet reading still reports the stale repository"
+        );
+        assert!(
+            index
+                .cross_repo_xref_response("ui", &focal_id)
+                .authority_complete_for("ui", &focal_id),
+            "no Python code can reference a JavaScript method, so the stale Python \
+             repository hides nothing from this anchor"
+        );
+        // The same repository, read the other way, is the anchor's own.
+        assert!(!index
+            .cross_repo_xref_response("server", &view_id)
+            .authority_complete_for("server", &view_id));
+    }
+
+    /// A stale repository that could reference the anchor keeps its answer
+    /// short: one written in a language that reaches the anchor's, one whose
+    /// languages nothing recorded, and one that already holds an edge on it.
+    #[test]
+    fn a_stale_repository_that_could_reference_the_anchor_keeps_it_incomplete() {
+        let focal_id = EntityId::from_content("src/store.js", "containsElement", "method", 1);
+        let caller_id = EntityId::from_content("src/panel.ts", "panel", "function", 1);
+        let view_id = EntityId::from_content("app/views.py", "view", "function", 1);
+        let ui = vec![entity_in(
+            focal_id,
+            "containsElement",
+            LanguageId::JavaScript,
+        )];
+        let sibling = |language| vec![entity_in(caller_id, "panel", language)];
+        let repos = vec!["sibling".to_string(), "ui".to_string()];
+        let complete = |index: &SpineIndex| {
+            index
+                .cross_repo_xref_response("ui", &focal_id)
+                .authority_complete_for("ui", &focal_id)
+        };
+
+        // A TypeScript sibling can import a JavaScript method.
+        let index = SpineIndex::new();
+        register_graph(&index, "ui", &ui, "root-ui");
+        register_graph(
+            &index,
+            "sibling",
+            &sibling(LanguageId::TypeScript),
+            "root-s",
+        );
+        index.refresh_cross_repo_edges("ui", &ui, &[], &repos);
+        index.refresh_cross_repo_edges("sibling", &sibling(LanguageId::TypeScript), &[], &repos);
+        assert!(complete(&index), "the control: fresh evidence certifies");
+        index.invalidate_cross_repo_edges("sibling");
+        assert!(!complete(&index));
+
+        // A sibling registered without facts could be written in anything.
+        let index = SpineIndex::new();
+        register_graph(&index, "ui", &ui, "root-ui");
+        index.register_repo(
+            "sibling",
+            vec![test_entry_with_id("sibling", view_id, "view")],
+            "root-s",
+        );
+        index.refresh_cross_repo_edges("ui", &ui, &[], &repos);
+        index.refresh_cross_repo_edges("sibling", &[], &[], &repos);
+        assert!(complete(&index));
+        index.invalidate_cross_repo_edges("sibling");
+        assert!(!complete(&index));
+
+        // A stale sibling that already holds an edge on the anchor holds a
+        // reference into it, whatever its language says.
+        let server = vec![entity_in(view_id, "view", LanguageId::Python)];
+        let index = SpineIndex::new();
+        register_graph(&index, "ui", &ui, "root-ui");
+        register_graph(&index, "sibling", &server, "root-s");
+        index.refresh_cross_repo_edges("ui", &ui, &[], &repos);
+        index.refresh_cross_repo_edges("sibling", &server, &[], &repos);
+        assert!(index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "sibling".to_string(),
+            src_entity: view_id,
+            dst_repo: "ui".to_string(),
+            dst_entity: focal_id,
+            confidence: 0.9,
+        }));
+        index.invalidate_cross_repo_edges("sibling");
+        assert!(!complete(&index));
+
+        // And the anchor's own repository counts whatever its language.
+        let index = SpineIndex::new();
+        register_graph(&index, "ui", &ui, "root-ui");
+        register_graph(&index, "sibling", &server, "root-s");
+        index.refresh_cross_repo_edges("ui", &ui, &[], &repos);
+        index.refresh_cross_repo_edges("sibling", &server, &[], &repos);
+        index.invalidate_cross_repo_edges("ui");
+        assert!(!complete(&index));
     }
 }

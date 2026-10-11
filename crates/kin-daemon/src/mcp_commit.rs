@@ -40,6 +40,12 @@ struct ExactMcpPlan {
     native: crate::repository_commit::NativeCommitPlan,
     layouts: Vec<FileLayout>,
     carried_pending_files: Vec<RepoPath>,
+    /// The sources whose re-derivation this change records although no
+    /// operation in it wrote them: semantics the workspace held ahead of
+    /// history, such as a daemon's startup re-derivation of a store an earlier
+    /// build of Kin derived. See
+    /// [`crate::repository_commit::NativeCommitPlan::carried_semantic_files`].
+    rederived_files: Vec<RepoPath>,
     /// The paths this transaction's own operations write. Publication accepts
     /// one of them when the working copy already holds its exact target bytes,
     /// because a writer that edited the file and then staged its new text is
@@ -202,6 +208,7 @@ pub(crate) async fn await_mcp_commit_outcome(
 struct PlannedCommitFacts {
     layouts: Vec<FileLayout>,
     carried_pending_files: Vec<RepoPath>,
+    rederived_files: Vec<RepoPath>,
 }
 
 /// How far back a commit looks in the audit log for attribution it may already
@@ -277,9 +284,8 @@ fn authored_files_from_staged(
                 let tree = graph.resolved_tree();
                 let artifact = tree.get(&source_base.artifact_id)?;
                 let path = match placement {
-                    kin_mcp::entity_lifecycle::EntityPlacement::SiblingAfter => {
-                        artifact.path.clone()
-                    }
+                    kin_mcp::entity_lifecycle::EntityPlacement::SiblingAfter
+                    | kin_mcp::entity_lifecycle::EntityPlacement::Member => artifact.path.clone(),
                     kin_mcp::entity_lifecycle::EntityPlacement::NewSourceUnit => {
                         let anchor = graph.get_entity(&source_base.entity_id).ok().flatten()?;
                         kin_mcp::entity_lifecycle::generated_source_path(
@@ -475,10 +481,12 @@ fn require_new_commit_authority(
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
 ) -> Result<(), String> {
     if let Some(preflight) = coordination.filter(|preflight| !preflight.allowed) {
-        let evidence = serde_json::to_string(preflight).map_err(|error| error.to_string())?;
-        return Err(format!(
-            "coordination enforcement rejected transaction before repository publication: {evidence}"
-        ));
+        // Keep the semantic refusal and its typed evidence separate. A string
+        // containing the entire private preflight loses every ownership or
+        // capability reason when public presentation removes physical detail.
+        return Err(preflight
+            .refusal("coordination enforcement rejected transaction before repository publication")
+            .map_err(|error| error.to_string())?);
     }
     sessions.require_live_session(&transaction.session_id)?;
     // Whatever the coordination mode, a read-only owner does not publish. Only
@@ -813,6 +821,15 @@ fn commit_exact_transaction_inner(
         },
     };
 
+    // The startup re-derivation is in history now, carried by this change or
+    // by one before it, so nothing is left for the freshness check to excuse or
+    // for a later commit to carry.
+    if let Ok(mut held) = state.startup_rederivation.lock() {
+        if !held.is_empty() {
+            *held = Default::default();
+        }
+    }
+
     // The publication went through the daemon's held authority, which now holds
     // the successor it wrote and the graph section refreshed after it. While
     // the record on disk is still the one those writes installed, finalization
@@ -844,6 +861,7 @@ fn commit_exact_transaction_inner(
         Some(PlannedCommitFacts {
             layouts: plan.layouts,
             carried_pending_files: plan.carried_pending_files,
+            rederived_files: plan.rederived_files,
         }),
         coordination,
         CommitApplication::Applied,
@@ -867,6 +885,15 @@ fn unstage_failed_attempt(
     transaction_id: &str,
     detail: String,
 ) -> String {
+    // The agent surface withholds a reason that names storage and says the
+    // daemon's log holds it, so this is where it is logged.
+    if !kin_mcp::semantic_surface::is_semantic(&detail) {
+        tracing::warn!(
+            transaction = %transaction_id,
+            %detail,
+            "a commit plan was discarded for a reason the agent surface withholds"
+        );
+    }
     let cleared = match sessions.clear_staged_operations(transaction_id) {
         Ok(cleared) => cleared,
         Err(clear_error) => {
@@ -951,16 +978,6 @@ fn resolve_commit_actor(sessions: &kin_mcp::SessionRegistry, session_id: &str) -
         .map(kin_model::SessionId)
         .and_then(|id| sessions.get_agent_session(&id));
     commit_actor_for(agent.as_ref(), session_id)
-}
-
-/// The author a change made for one agent session is recorded under: the
-/// same attribution an MCP transaction commit carries, for a write the
-/// session made another way, such as the manifests its toolchain run wrote.
-pub(crate) fn session_commit_author(
-    agent: Option<&kin_model::session::AgentSession>,
-    session_id: &str,
-) -> kin_model::AuthorId {
-    commit_actor_for(agent, session_id).author
 }
 
 fn commit_actor_for(
@@ -1073,6 +1090,7 @@ fn record_commit_provenance(
     transaction: &kin_mcp::McpTransaction,
     committed: &NativeCommitResult,
     carried_pending_files: &[RepoPath],
+    rederived_files: &[RepoPath],
 ) -> Result<(), String> {
     graph
         .create_actor(&actor.actor)
@@ -1092,8 +1110,13 @@ fn record_commit_provenance(
     // `kin_provenance_query` with the authorship it already had, and the fold is
     // declared at the level it happened at, in the change message, which the
     // `change_id` recorded below leads to.
+    //
+    // A source this change records the startup re-derivation of is the same
+    // case one level down: its bytes did not move, its semantics did, and no
+    // operation in this transaction authored either.
     let carried_origins = carried_pending_files
         .iter()
+        .chain(rederived_files)
         .filter_map(|path| path.as_utf8().map(FilePathId::new))
         .collect::<HashSet<_>>();
     // Where each entity this change names lives, read from the change's own
@@ -1342,10 +1365,43 @@ fn require_bound_authority_revision(
         "committing an MCP transaction",
     )
     .map_err(|error| {
+        let error = error.to_string();
+        if !error.contains(crate::local_repository_authority::LOST_AUTHORITY) {
+            return format!(
+                "Cannot commit transaction {transaction_id}: {error}. No repository authority \
+                 moved and the staged operations are untouched, so re-send this commit unchanged \
+                 once the daemon is reading current repository authority."
+            );
+        }
+        // Nothing a running daemon does brings back what its graph lost, so
+        // the same commit meets the same refusal however often it is sent.
+        // What ends it is a daemon that reads the repository again.
+        let unpublished = state
+            .lsp_publication_failure
+            .lock()
+            .ok()
+            .and_then(|failure| failure.clone())
+            .map(|reason| {
+                // A reason that names storage is kept out of what an agent
+                // reads; that a publication is failing is said either way.
+                let reason = if kin_mcp::semantic_surface::is_semantic(&reason) {
+                    format!(" ({reason})")
+                } else {
+                    String::new()
+                };
+                format!(
+                    " {}{reason}, which a new daemon will meet again {}",
+                    kin_mcp::write_reply::PUBLICATION_FAILING,
+                    kin_mcp::write_reply::PUBLICATION_FAILING_END
+                )
+            })
+            .unwrap_or_default();
         format!(
             "Cannot commit transaction {transaction_id}: {error}. No repository authority moved \
-             and the staged operations are untouched, so re-send this commit unchanged once the \
-             daemon is reading current repository authority."
+             and the staged operations are untouched. {}: the running daemon does not get back \
+             what its graph lost.{unpublished} Stop the daemon with `kin daemon stop`; the next \
+             call starts one that reads the repository again, and the commit can be sent then.",
+            kin_mcp::write_reply::RESEND_WILL_NOT_HELP
         )
     })
 }
@@ -1378,7 +1434,7 @@ fn plan_exact_transaction(
     base: &NativeCommitBase,
     requested_message: Option<&str>,
 ) -> Result<ExactMcpPlan, String> {
-    let mut edits: BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)> = BTreeMap::new();
+    let mut edits = SourceEdits::new();
     let mut creations: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
     let mut replacements: BTreeMap<String, (FilePathId, Vec<u8>)> = BTreeMap::new();
     let mut retirements: BTreeMap<String, FilePathId> = BTreeMap::new();
@@ -1443,9 +1499,18 @@ fn plan_exact_transaction(
             .payload
             .as_ref()
             .ok_or_else(|| format!("operation '{}' has no payload", operation.verb))?;
+        if crate::module_code_commit::is_module_patch(base, operation) {
+            // A module's own code is planned after the entity edits, below.
+            continue;
+        }
+        if crate::artifact_commit::is_artifact_operation(operation) {
+            // So is a change to a tracked thing Kin does not parse.
+            continue;
+        }
         match payload {
             kin_mcp::McpMutationPayload::EntityCreate(_)
             | kin_mcp::McpMutationPayload::EntityRemove(_)
+            | kin_mcp::McpMutationPayload::EntityContent(_)
             | kin_mcp::McpMutationPayload::UnitImports(_) => {
                 // Anchored lifecycle is planned through admitted source
                 // reconciliation below; unit-addressed work after the edits.
@@ -1456,7 +1521,7 @@ fn plan_exact_transaction(
                     .get_entity(&patch.source_base.entity_id)
                     .map_err(|error| error.to_string())?
                     .ok_or("the guarded patch entity disappeared during planning")?;
-                kin_model::require_independent_source(&existing)?;
+                kin_model::require_targeted_source(&existing)?;
                 let origin = existing
                     .file_origin
                     .as_ref()
@@ -1484,13 +1549,17 @@ fn plan_exact_transaction(
                     .ok_or("patch entity span is outside its source artifact")?;
                 let body = std::str::from_utf8(body)
                     .map_err(|error| format!("patch entity body is not UTF-8: {error}"))?;
-                let patched = patch.apply_to_exact_body(body)?;
+                // The indentation the entity stands at, which an anchor
+                // written at another one is moved by.
+                let place = kin_parser::code_placement::indentation_at(&original, span.start_byte);
+                let patched = patch.apply_to_exact_body_at(body, place, &existing.name)?;
                 record_source_edit(
                     &mut edits,
                     &mut edited_entities,
                     base,
                     existing,
                     patched.as_bytes(),
+                    SentAs::Patched,
                 )?;
             }
             kin_mcp::McpMutationPayload::EntitySourceBase(expected) => {
@@ -1499,6 +1568,30 @@ fn plan_exact_transaction(
                     .get_entity(&expected.entity_id)
                     .map_err(|error| error.to_string())?
                     .ok_or("the guarded entity disappeared during planning")?;
+                // A class served as its own code carries a base that guards
+                // that code and none of its members' bytes, so it is never
+                // the base of a replacement of the whole class.
+                if kin_mcp::module_code::serves_class_code(&base.graph, &existing) {
+                    return Err(format!(
+                        "class {} is too large to replace whole, and Kin holds it as its own \
+                         code and its members: change the class-level code with a patch \
+                         against what source returns for {}, and each member by its own id",
+                        existing.name, existing.name
+                    ));
+                }
+                // No read serves a body this long whole, so whoever holds its
+                // base saw an excerpt of it, which carries a patch and never
+                // the replacement of the bytes the reader did not see.
+                if expected.end_byte.saturating_sub(expected.start_byte)
+                    > kin_mcp::source_pages::FULL_BODY_MAX_BYTES
+                {
+                    return Err(format!(
+                        "{} holds more code than one reply carries, so it is changed by patch \
+                         and never replaced whole. Send a patch whose old_text is copied from \
+                         an excerpt source returned",
+                        existing.name
+                    ));
+                }
                 record_source_edit(
                     &mut edits,
                     &mut edited_entities,
@@ -1509,6 +1602,7 @@ fn plan_exact_transaction(
                         .as_ref()
                         .ok_or("guarded source edit has no body")?
                         .as_bytes(),
+                    SentAs::WholeCode,
                 )?;
             }
             kin_mcp::McpMutationPayload::Entity(payload_entity) => {
@@ -1587,7 +1681,23 @@ fn plan_exact_transaction(
     };
     let prospective = kin_db::InMemoryGraph::from_snapshot(snapshot)
         .map_err(|error| format!("create prospective exact graph: {error}"))?;
-    let pipeline = kin_index::IndexPipeline::new();
+    // Before any staged operation is planned, because an edit is re-derived
+    // against its dependents and the strict reader refuses one still holding
+    // the derivation the startup repair replaced.
+    let carried_rederivation = carry_startup_rederivation(state, &prospective);
+    // What "this transaction changes nothing" is measured against once the
+    // carry is in the graph: authority plus the carry, never authority alone,
+    // or a transaction whose operations change nothing would publish the carry
+    // by itself. Taken only on the commit that carries one.
+    let carried_baseline = if carried_rederivation {
+        Some(
+            kin_db::InMemoryGraph::from_snapshot(prospective.to_snapshot()).map_err(|error| {
+                format!("hold the graph this commit's carried re-derivation leaves: {error}")
+            })?,
+        )
+    } else {
+        None
+    };
 
     refuse_overlapping_file_operations(
         &creations,
@@ -1604,9 +1714,21 @@ fn plan_exact_transaction(
     // is planned against the same tree, so the collision is caught rather than
     // published.
     plan_retired_source_files(&prospective, retirements)?;
-    plan_renamed_source_files(&prospective, relocations, &mut layouts)?;
-    plan_new_source_files(state, &prospective, &pipeline, creations, &mut layouts)?;
-    plan_replaced_source_files(state, &prospective, &pipeline, replacements, &mut layouts)?;
+    plan_renamed_source_files(
+        &prospective,
+        relocations,
+        &mut layouts,
+        state.blobs.as_ref(),
+        held_authority,
+    )?;
+    plan_new_source_files(state, &prospective, held_authority, creations, &mut layouts)?;
+    plan_replaced_source_files(
+        state,
+        &prospective,
+        held_authority,
+        replacements,
+        &mut layouts,
+    )?;
     for (_, (file_id, file_edits)) in edits {
         let path = RepoPath::from_utf8(file_id.0.clone())
             .map_err(|error| format!("invalid exact source path {file_id}: {error}"))?;
@@ -1644,32 +1766,81 @@ fn plan_exact_transaction(
         // Legacy container metadata can look declaration-shaped while its
         // coordinates still cover unrelated siblings. Validate against the
         // exact CAS bytes already loaded for splicing, before any publication.
-        for (entity, _) in &file_edits {
+        for (entity, _, _) in &file_edits {
             kin_parser::validate_module_source_span(entity, &original)
                 .map_err(|error| format!("semantic source span refused: {error}"))?;
         }
-        // `entity_body_splice`, not a raw span splice: an entity span opens at
-        // the entity's first token, so a nested entity's indentation sits in the
-        // file ahead of the span while the rest of its body carries indentation
-        // inside it. A caller that submits the entity as the file renders it
-        // would otherwise have line 1 indented twice.
-        let splices = file_edits
+        // An entity span opens at the entity's first token, so a nested
+        // entity's indentation sits in the source ahead of the span while the
+        // rest of its code carries indentation inside it. Whole code a caller
+        // sent is therefore placed: written at the margin, indented as a
+        // whole or exactly as it was read, it lands at the entity's own
+        // indentation. A patched body is the code as it was read with the
+        // patch's edits in it, and stands where it stood.
+        let mut splices = Vec::with_capacity(file_edits.len());
+        let mut sent = Vec::with_capacity(file_edits.len());
+        let mut sent_for = Vec::with_capacity(file_edits.len());
+        for (entity, body, sent_as) in &file_edits {
+            let span = entity
+                .span
+                .as_ref()
+                .expect("validated source edit always has a span");
+            let span = span.start_byte..span.end_byte;
+            let (splice, what) = match sent_as {
+                SentAs::WholeCode => {
+                    let code = std::str::from_utf8(body).map_err(|error| {
+                        format!("the code sent for {} is not UTF-8: {error}", entity.name)
+                    })?;
+                    let placed = kin_parser::code_placement::place_entity_code(
+                        entity.language,
+                        &original,
+                        span.clone(),
+                        code,
+                    );
+                    (
+                        kin_projection::Splice {
+                            byte_range: span,
+                            new_content: placed.into_bytes(),
+                        },
+                        format!("the code sent for {}", entity.name),
+                    )
+                }
+                SentAs::Patched => (
+                    kin_projection::entity_body_splice(&original, span, body),
+                    format!("{} as patched", entity.name),
+                ),
+            };
+            sent.push(kin_mcp::syntax_gate::Sent {
+                what,
+                lead: 0,
+                lines: kin_mcp::syntax_gate::Lines::Numbered,
+                replaced: kin_parser::syntax_reading::Replaced {
+                    before: splice.byte_range.clone(),
+                    now_len: splice.new_content.len(),
+                },
+            });
+            sent_for.push((splice.byte_range.start, entity.id));
+            splices.push(splice);
+        }
+        sent.sort_by_key(|sent| sent.replaced.before.start);
+        sent_for.sort();
+        let language = file_edits[0].0.language;
+        let named = file_edits
             .iter()
-            .map(|(entity, body)| {
-                let span = entity
-                    .span
-                    .as_ref()
-                    .expect("validated source edit always has a span");
-                kin_projection::entity_body_splice(&original, span.start_byte..span.end_byte, body)
-            })
-            .collect();
+            .map(|(entity, _, _)| entity.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let projected = kin_projection::apply_splices(&original, splices)
-            .map_err(|error| format!("splice exact source {file_id}: {error}"))?;
+            .map_err(|error| format!("splice the new code of {named}: {error}"))?;
         if projected == original {
             return Err(format!(
-                "exact body edit for {file_id} is a no-op; no repository commit was created"
+                "the code sent for {named} is the code it already has, so there is nothing to \
+                 change"
             ));
         }
+        // Never publish source that does not parse: read the result as its
+        // language before anything of it is stored.
+        kin_mcp::syntax_gate::refuse_unparseable(language, Some(&original), &projected, &sent)?;
         let digest = state
             .blobs
             .write(&projected)
@@ -1686,8 +1857,12 @@ fn plan_exact_transaction(
             })
             .map_err(|error| format!("install prospective exact tree for {file_id}: {error}"))?;
 
-        let indexed = pipeline
-            .index_any_content(&file_id, &projected, digest)
+        let manifests = crate::source_cas::graph_manifests(
+            &prospective,
+            state.blobs.as_ref(),
+            Some(held_authority.as_ref()),
+        );
+        let indexed = kin_index::shared_index::index_any(&file_id, &projected, digest, &manifests)
             .map_err(|error| format!("reparse projected exact source {file_id}: {error}"))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
             return Err(format!(
@@ -1697,10 +1872,26 @@ fn plan_exact_transaction(
         let mut reconciler = kin_reconcile::Reconciler::new(PathBuf::new());
         let reconcile = reconciler
             .reconcile_indexed_content(&indexed, state.blobs.as_ref(), &prospective)
-            .map_err(|error| format!("derive exact semantics for {file_id}: {error}"))?;
+            .map_err(|error| match error {
+                // Said of the edited unit rather than its path, so the reason
+                // reaches the agent that sent the edit; the path is logged.
+                // Reached only where the source already held a syntax
+                // problem beside the edit: a problem the edit brings is
+                // refused above, by its line.
+                kin_reconcile::ReconcileError::IncompleteParseWouldDelete { .. }
+                | kin_reconcile::ReconcileError::BrokenAstRejected { .. } => {
+                    tracing::warn!(file = %file_id, "an edited source unit does not parse completely");
+                    format!(
+                        "the source around {named} already has a syntax problem, and with this \
+                         change Kin can no longer tell which of its declarations remain, so fix \
+                         that problem first with a patch to the declaration that holds it"
+                    )
+                }
+                other => format!("derive exact semantics for {file_id}: {other}"),
+            })?;
         let edited_ids = file_edits
             .iter()
-            .map(|(entity, _)| entity.id)
+            .map(|(entity, _, _)| entity.id)
             .collect::<Vec<_>>();
         if let Some(delta) = crate::source_entity_guard::first_unsupported_entity_change_for_edit(
             &reconcile.delta,
@@ -1710,17 +1901,54 @@ fn plan_exact_transaction(
         )
         .map_err(|error| format!("validate reparsed source entities for {file_id}: {error}"))?
         {
-            return Err(format!(
-                "body edit for {file_id} would create or remove source entities ({delta:?}); an \
-                 edit may change the body of the entity it names, including the members nested \
-                 inside a type it edits, but not add or drop a declaration beside it. Create a \
-                 declaration with EntityCreate and remove a function with EntityRemove"
-            ));
+            // An edit changes the declaration it names, with whatever that
+            // declaration holds inside itself. One that would add or drop a
+            // declaration beside it is what the create and remove verbs are
+            // for, and says so.
+            let kind = |entity: &Entity| kin_mcp::module_code::kind_word(entity.kind);
+            // New code that declares another name drops the entity and adds
+            // one: said as what it is, whichever the reparse listed first.
+            let renamed = reconcile.delta.entity_deltas.iter().find(|change| {
+                matches!(change, kin_model::EntityDelta::Removed { old } if edited_ids.contains(&old.id))
+            });
+            return Err(match renamed.unwrap_or(delta) {
+                kin_model::EntityDelta::Added { new } => format!(
+                    "this edit of {named} would also add {} {} beside it, and an edit changes \
+                     only the declaration it names. Send the code of {named} alone, and add {} \
+                     with the create verb (payload EntityCreate)",
+                    kind(new),
+                    new.name,
+                    new.name
+                ),
+                kin_model::EntityDelta::Removed { old } if edited_ids.contains(&old.id) => {
+                    format!(
+                        "this edit of {} no longer declares {}, and an edit keeps the name and \
+                         kind of the declaration it changes. To put another declaration in its \
+                         place, add that one with the create verb (payload EntityCreate) and \
+                         take this one out with the remove verb (payload EntityRemove)",
+                        old.name, old.name
+                    )
+                }
+                kin_model::EntityDelta::Removed { old } => format!(
+                    "this edit of {named} would also drop {} {}, which stands beside it, and an \
+                     edit changes only the declaration it names. Take {} out with the remove \
+                     verb (payload EntityRemove)",
+                    kind(old),
+                    old.name,
+                    old.name
+                ),
+                kin_model::EntityDelta::Modified { new, .. } => format!(
+                    "this edit of {named} would also change {} {}, which an edit of {named} \
+                     does not reach",
+                    kind(new),
+                    new.name
+                ),
+            });
         }
         prospective
             .apply_transaction_delta(&reconcile.delta)
             .map_err(|error| format!("apply reparsed exact semantics for {file_id}: {error}"))?;
-        for (entity, _) in &file_edits {
+        for (entity, _, _) in &file_edits {
             let parsed = prospective
                 .get_entity(&entity.id)
                 .map_err(|error| format!("load reparsed entity {}: {error}", entity.id))?
@@ -1737,6 +1965,35 @@ fn plan_exact_transaction(
                 ));
             }
         }
+        // Every line that was sent for an entity is inside it. A statement
+        // dedented out of a method is valid where it lands and parses, and
+        // would be left in the source where no entity holds it.
+        let places = kin_parser::syntax_reading::Replaced::now(
+            &sent
+                .iter()
+                .map(|sent| sent.replaced.clone())
+                .collect::<Vec<_>>(),
+        );
+        for (index, (_, entity_id)) in sent_for.iter().enumerate() {
+            let Some(held) = prospective
+                .get_entity(entity_id)
+                .map_err(|error| format!("load reparsed entity {entity_id}: {error}"))?
+                .and_then(|entity| {
+                    let span = entity.span?;
+                    Some((entity.name, span.start_byte..span.end_byte))
+                })
+            else {
+                continue;
+            };
+            kin_mcp::syntax_gate::refuse_code_outside(
+                language,
+                &projected,
+                &sent[index].what,
+                &held.0,
+                &places[index],
+                &held.1,
+            )?;
+        }
         let layout = reconciler
             .projection()
             .get_layout(&file_id)
@@ -1748,11 +2005,25 @@ fn plan_exact_transaction(
         layouts.push(layout);
     }
 
+    authored_files.extend(crate::module_code_commit::plan_module_patches(
+        state,
+        held_authority,
+        base,
+        &prospective,
+        &transaction.staged_operations,
+        &mut layouts,
+    )?);
+    authored_files.extend(crate::artifact_commit::plan_artifact_operations(
+        state,
+        held_authority,
+        base,
+        &prospective,
+        &transaction.staged_operations,
+    )?);
     let unit_files = crate::unit_lifecycle::plan_unit_operations(
         state,
         authority_context,
         &prospective,
-        &pipeline,
         &transaction.staged_operations,
         &mut layouts,
     )?;
@@ -1767,8 +2038,31 @@ fn plan_exact_transaction(
     }
     authored_files.extend(unit_files);
 
+    // A manifest this transaction wrote can rename sources whose bytes it did
+    // not change, as renaming `[package] name` renames the crate's root, and
+    // the operations above parsed every source they wrote before the
+    // manifest's own change was planned. Each source the manifests now name
+    // otherwise is derived again under them, so the change sealed here names
+    // it as a parse of it would.
+    let changed_manifests: Vec<String> = authored_files
+        .iter()
+        .filter_map(|path| path.as_utf8())
+        .filter(|path| kin_parser::project_manifest::could_hold_naming_manifest(path))
+        .map(str::to_string)
+        .collect();
+    rederive_sources_renamed_by_manifests(
+        state,
+        &prospective,
+        held_authority,
+        &changed_manifests,
+        &mut layouts,
+    )?;
+
     apply_relation_operations(&prospective, relation_operations)?;
-    if semantic_workspace_matches(&prospective, &base.graph) {
+    if semantic_workspace_matches(
+        &prospective,
+        carried_baseline.as_ref().unwrap_or(&base.graph),
+    ) {
         if transaction.staged_operations.iter().all(|operation| {
             matches!(
                 operation.payload,
@@ -1786,7 +2080,7 @@ fn plan_exact_transaction(
         );
     }
 
-    let plan_against = |graph: &kin_db::InMemoryGraph| {
+    let plan_against = |graph: &kin_db::InMemoryGraph, rederived: &[RepoPath]| {
         plan_native_commit_from_base_declaring_carry(
             graph,
             state.blobs.as_ref(),
@@ -1795,13 +2089,20 @@ fn plan_exact_transaction(
             kin_model::Timestamp::now(),
             actor.author.clone(),
             &authored_files,
-            &|carried| commit_message(&transaction.transaction_id, requested_message, carried),
+            &|carried| {
+                commit_message(
+                    &transaction.transaction_id,
+                    requested_message,
+                    carried,
+                    rederived,
+                )
+            },
             base,
             Some(Arc::clone(held_authority)),
         )
         .map_err(|error| format!("plan exact MCP repository commit: {error}"))
     };
-    let native = plan_against(&prospective)?;
+    let native = plan_against(&prospective, &[])?;
     // Planned first, then read for what it carries, because the carried set is
     // not knowable until the published tree deltas are: it is the fold
     // `carried_pending_paths` computes from them. Taking it from the plan rather
@@ -1810,7 +2111,6 @@ fn plan_exact_transaction(
     let native = match derive_carried_pending_semantics(
         state,
         &prospective,
-        &pipeline,
         held_authority,
         &native,
         &mut layouts,
@@ -1824,14 +2124,30 @@ fn plan_exact_transaction(
         // same set, and re-deriving that set again would find nothing.
         CarriedDerivation::Derived => {
             drop(native);
-            plan_against(&prospective)?
+            plan_against(&prospective, &[])?
         }
     };
+    // Semantics the workspace held ahead of history for sources no operation
+    // here wrote, such as the re-derivation a daemon publishes when it starts
+    // on a store an earlier build of Kin derived, are inside `base.graph`, so
+    // this change records them whatever its operations are. The message has to
+    // say so, and it is hashed into the change, so a plan that carries any is
+    // taken once more to name them. The second plan publishes the same deltas,
+    // so it names the same set.
+    let native = if native.carried_semantic_files.is_empty() {
+        native
+    } else {
+        let rederived = native.carried_semantic_files.clone();
+        drop(native);
+        plan_against(&prospective, &rederived)?
+    };
     let carried_pending_files = native.carried_pending_files.clone();
+    let rederived_files = native.carried_semantic_files.clone();
     Ok(ExactMcpPlan {
         native,
         layouts,
         carried_pending_files,
+        rederived_files,
         authored_files,
     })
 }
@@ -1885,48 +2201,182 @@ fn requested_commit_message(arguments: &HashMap<String, serde_json::Value>) -> O
 /// is what a human reads first. A caller that named none sees exactly what it
 /// saw before this argument existed, which is why the whole shape hangs off
 /// `Option` instead of a default string.
-fn commit_message(transaction_id: &str, requested: Option<&str>, carried: &[RepoPath]) -> String {
+fn commit_message(
+    transaction_id: &str,
+    requested: Option<&str>,
+    carried: &[RepoPath],
+    rederived: &[RepoPath],
+) -> String {
     let transaction_line = format!("MCP transaction {transaction_id}");
-    if carried.is_empty() {
+    if carried.is_empty() && rederived.is_empty() {
         return match requested {
             Some(message) => format!("{message}\n\n{transaction_line}"),
             None => transaction_line,
         };
     }
-    let count = carried.len();
-    let files = if count == 1 { "file" } else { "files" };
-    let mut sample = carried
-        .iter()
-        .take(CARRIED_SAMPLE)
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if count > CARRIED_SAMPLE {
-        sample.push_str(&format!(", and {} more", count - CARRIED_SAMPLE));
-    }
+    let sample_of = |paths: &[RepoPath]| {
+        let mut sample = paths
+            .iter()
+            .take(CARRIED_SAMPLE)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if paths.len() > CARRIED_SAMPLE {
+            sample.push_str(&format!(", and {} more", paths.len() - CARRIED_SAMPLE));
+        }
+        sample
+    };
     // The subject still declares the fold even when the caller named a message,
     // because the fold is the thing a reader of a subject-only history most
     // needs to be warned about and least able to ask a follow-up question
     // about. The caller's own words open the body instead, where they are the
     // first thing read once the subject has been.
-    let subject = format!(
-        "MCP transaction {transaction_id} (also admitted {count} pending working-tree {files})"
-    );
+    let mut folds = Vec::new();
+    let mut paragraphs = Vec::new();
+    if !carried.is_empty() {
+        let count = carried.len();
+        let files = if count == 1 { "file" } else { "files" };
+        folds.push(format!(
+            "also admitted {count} pending working-tree {files}"
+        ));
+        paragraphs.push(format!(
+            "The workspace already held admitted working-tree content its base change did not \
+             carry, so this change publishes that content beside the staged operations rather \
+             than reverting it, and re-derives its semantics from the exact bytes published \
+             here, because a change that moved one without the other would describe two \
+             different sources. No operation in this transaction authored that content, so the \
+             entities inside it keep the authorship they already had.\n\
+             Carried: {}",
+            sample_of(carried)
+        ));
+    }
+    if !rederived.is_empty() {
+        let count = rederived.len();
+        let units = if count == 1 { "unit" } else { "units" };
+        folds.push(format!(
+            "also records the re-derivation of {count} source {units}"
+        ));
+        paragraphs.push(format!(
+            "The workspace held a re-derivation of these sources ahead of history, made from \
+             their exact bytes when the history held a derivation those bytes do not produce \
+             under this build of Kin, such as one an earlier build wrote. This change records it \
+             beside the staged operations rather than leaving history describing what the bytes \
+             do not say. The bytes did not change, and no operation in this transaction authored \
+             the re-derivation, so the entities it touches keep the authorship they already \
+             had.\n\
+             Re-derived: {}",
+            sample_of(rederived)
+        ));
+    }
+    let subject = format!("MCP transaction {transaction_id} ({})", folds.join("; "));
     let preamble = match requested {
         Some(message) => format!("{message}\n\n"),
         None => String::new(),
     };
-    format!(
-        "{subject}\n\n{preamble}\
-         The workspace already held admitted working-tree content its base change did not carry, \
-         so this change publishes that content beside the staged operations rather than reverting \
-         it, and re-derives its semantics from the exact bytes published here, because a change \
-         that moved one without the other would describe two different sources. No operation in \
-         this transaction authored that content, so the entities inside it keep the authorship \
-         they already had.\n\
-         Carried: {sample}"
-    )
+    format!("{subject}\n\n{preamble}{}", paragraphs.join("\n\n"))
 }
+
+/// Land what this daemon's startup repair re-derived on the values the live
+/// graph serves, in the graph one MCP commit plans, and answer whether it did.
+///
+/// The startup repair re-derives, in the live graph alone, sources whose
+/// stored declarations their bytes do not produce under this build, and the
+/// next commit records the result. The CLI route does, because it plans from
+/// the live graph. This route plans from repository authority's own graph,
+/// which still holds the older derivation, so without the carry an edit is
+/// re-derived against dependents the strict reader refuses, and the
+/// re-derivation the daemon serves is never recorded: the commit lands the
+/// live graph back on the older derivation, and every start repairs it again.
+///
+/// Each identity the repair touched moves from what authority holds now to
+/// what the live graph serves now, rather than replaying the transition the
+/// repair applied: a language-server publication that lands between the start
+/// and the commit moves authority on, and a transition captured at the start
+/// no longer applies over it. The callers' call-site ledgers are not carried.
+/// The graph retires the ledger of a caller this changes, the commit records
+/// that removal, and a later sweep proves the caller again, which is what
+/// `kin upgrade` does with them too.
+///
+/// A carry the prospective graph refuses is logged and dropped, and the commit
+/// plans as it always did.
+fn carry_startup_rederivation(state: &DaemonState, prospective: &kin_db::InMemoryGraph) -> bool {
+    let held = match state.startup_rederivation.lock() {
+        Ok(held) if !held.is_empty() => held.clone(),
+        _ => return false,
+    };
+    let mut delta = TransactionDelta::default();
+    for id in &held.entities {
+        let current = prospective.get_entity(id).ok().flatten();
+        let served = state.graph.get_entity(id).ok().flatten();
+        match (current, served) {
+            (None, Some(new)) => delta.entity_deltas.push(EntityDelta::Added { new }),
+            (Some(old), None) => delta.entity_deltas.push(EntityDelta::Removed { old }),
+            (Some(old), Some(new)) if old != new => {
+                delta.entity_deltas.push(EntityDelta::Modified { old, new })
+            }
+            _ => {}
+        }
+    }
+    for id in &held.relations {
+        match (
+            prospective.get_relation_by_id(id),
+            state.graph.get_relation_by_id(id),
+        ) {
+            (None, Some(new)) => delta.relation_deltas.push(RelationDelta::Added { new }),
+            (Some(old), None) => delta.relation_deltas.push(RelationDelta::Removed { old }),
+            (Some(old), Some(new)) if old != new => delta
+                .relation_deltas
+                .push(RelationDelta::Modified { old, new }),
+            _ => {}
+        }
+    }
+    for id in &held.external_references {
+        match (
+            prospective.get_external_reference(id),
+            state.graph.get_external_reference(id),
+        ) {
+            (None, Some(new)) => delta
+                .external_reference_deltas
+                .push(kin_model::ExternalReferenceDelta::Added { new }),
+            (Some(old), None) => delta
+                .external_reference_deltas
+                .push(kin_model::ExternalReferenceDelta::Removed { old }),
+            _ => {}
+        }
+    }
+    if delta.entity_deltas.is_empty()
+        && delta.relation_deltas.is_empty()
+        && delta.external_reference_deltas.is_empty()
+    {
+        return false;
+    }
+    match prospective.apply_transaction_delta(&delta) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not carry the startup re-derivation into this commit, so it plans against \
+                 the older derivation repository authority holds"
+            );
+            false
+        }
+    }
+}
+
+/// How a caller sent the code of an entity it edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SentAs {
+    /// The entity's whole code, written however the caller indented it, which
+    /// is placed at the entity's own indentation
+    /// ([`kin_parser::code_placement`]).
+    WholeCode,
+    /// The entity's code exactly as it was read, with a patch's edits applied
+    /// to it, which already stands at its place.
+    Patched,
+}
+
+/// The entity edits of one transaction, by source unit.
+type SourceEdits = BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>, SentAs)>)>;
 
 /// Record one entity source edit against repository authority.
 ///
@@ -1935,13 +2385,14 @@ fn commit_message(transaction_id: &str, requested: Option<&str>, carried: &[Repo
 /// by exact new bytes. `existing` is always the authority-side entity, never the
 /// staged payload, so the span is the one repository truth records.
 fn record_source_edit(
-    edits: &mut BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)>,
+    edits: &mut SourceEdits,
     edited_entities: &mut HashSet<kin_model::EntityId>,
     base: &NativeCommitBase,
     existing: Entity,
     body: &[u8],
+    sent_as: SentAs,
 ) -> Result<(), String> {
-    kin_model::require_independent_source(&existing)?;
+    kin_model::require_targeted_source(&existing)?;
     if !edited_entities.insert(existing.id) {
         return Err(format!(
             "entity {} is edited more than once in one transaction; overlapping source authority is ambiguous",
@@ -1990,7 +2441,7 @@ fn record_source_edit(
         .entry(file_id.0.clone())
         .or_insert_with(|| (file_id, Vec::new()))
         .1
-        .push((existing, body.to_vec()));
+        .push((existing, body.to_vec(), sent_as));
     Ok(())
 }
 
@@ -2117,7 +2568,7 @@ fn refuse_overlapping_file_operations(
     replacements: &BTreeMap<String, (FilePathId, Vec<u8>)>,
     retirements: &BTreeMap<String, FilePathId>,
     relocations: &BTreeMap<String, (FilePathId, FilePathId)>,
-    edits: &BTreeMap<String, (FilePathId, Vec<(Entity, Vec<u8>)>)>,
+    edits: &SourceEdits,
 ) -> Result<(), String> {
     for path in retirements.keys() {
         if relocations.contains_key(path) {
@@ -2397,6 +2848,13 @@ fn plan_retired_source_files(
 /// or a write, so the daemon's reconcile seam can map it to `DaemonError::Graph`
 /// and the commit seam can add its own context. A `String` crossing this
 /// boundary would force one of the two to invent an error class.
+///
+/// No module is renamed here. A module's name can come from its path, its
+/// declared package or its project's manifests, and only a parse at each end
+/// can say which, so every caller binds module names and signatures from the
+/// parses of the moved body at both paths
+/// ([`crate::repository_commit::plan_session_module_relocations`] and
+/// [`crate::repository_commit::bind_session_module_relocations`]).
 pub(crate) fn plan_entity_relocations(
     graph: &kin_db::InMemoryGraph,
     from_id: &FilePathId,
@@ -2412,9 +2870,6 @@ pub(crate) fn plan_entity_relocations(
             let mut new = old.clone();
             new.file_origin = Some(to_id.clone());
             if new.kind == kin_model::EntityKind::Module {
-                if let Some(name) = kin_parser::adapter::file_module_surface_name(None, to_id) {
-                    new.name = name;
-                }
                 if let Some(span) = new.span.as_mut() {
                     span.file = to_id.clone();
                 }
@@ -2468,7 +2923,43 @@ fn plan_renamed_source_files(
     prospective: &kin_db::InMemoryGraph,
     relocations: BTreeMap<String, (FilePathId, FilePathId)>,
     layouts: &mut Vec<FileLayout>,
+    blobs: &kin_blobs::BlobStore,
+    authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
 ) -> Result<(), String> {
+    if relocations.is_empty() {
+        return Ok(());
+    }
+    // Each moved body is parsed at both of its paths, under the tree before
+    // any of these moves and the tree after all of them, and where both parses
+    // are complete and in one language its modules are named by them: a Go
+    // package keeps its declared name, a Python `__init__.py` gives up its
+    // package's name, and a crate directory renamed whole with its manifest
+    // keeps its crate's name, whatever order the moves are planned in. A move
+    // those parses cannot name, as one into another language or of a body
+    // with a syntax error, still moves.
+    let before_tree = prospective.resolved_tree();
+    let moves = relocations
+        .values()
+        .map(|(from_id, to_id)| {
+            let from = RepoPath::from_utf8(from_id.0.clone())
+                .map_err(|error| format!("invalid rename origin {from_id}: {error}"))?;
+            let to = RepoPath::from_utf8(to_id.0.clone())
+                .map_err(|error| format!("invalid rename destination {to_id}: {error}"))?;
+            let artifact = before_tree.artifact_at_path(&from).ok_or_else(|| {
+                format!("renamed source artifact disappeared during planning: {from_id}")
+            })?;
+            Ok(TreeDelta::Updated {
+                artifact_id: artifact.artifact_id,
+                old: artifact.located_entry(),
+                new: LocatedEntry::new(to, artifact.entry),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut named: HashMap<FilePathId, crate::repository_commit::MovedModules> =
+        crate::repository_commit::name_moved_modules(blobs, authority, &before_tree, &moves)
+            .map_err(|error| format!("name the moved modules: {error}"))?
+            .into_iter()
+            .collect();
     for (_, (from_id, to_id)) in relocations {
         let from = RepoPath::from_utf8(from_id.0.clone())
             .map_err(|error| format!("invalid rename origin {from_id}: {error}"))?;
@@ -2482,12 +2973,24 @@ fn plan_renamed_source_files(
                 format!("renamed source artifact disappeared during planning: {from_id}")
             })?;
 
+        let mut entity_deltas = plan_entity_relocations(prospective, &from_id, &to_id)
+            .map_err(|error| format!("load entities on {from_id}: {error}"))?;
+        match named.remove(&to_id) {
+            Some(crate::repository_commit::MovedModules::Bound(bound)) => {
+                crate::repository_commit::bind_session_module_relocations(
+                    &mut entity_deltas,
+                    &bound,
+                )
+                .map_err(|error| format!("name the modules moved to {to_id}: {error}"))?;
+            }
+            _ => name_moved_modules_by_path(&mut entity_deltas, &to_id),
+        }
+
         // One transaction, entity relocation and tree move together. This is
         // the shape the reconcile seam was missing.
         prospective
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: plan_entity_relocations(prospective, &from_id, &to_id)
-                    .map_err(|error| format!("load entities on {from_id}: {error}"))?,
+                entity_deltas,
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id: artifact.artifact_id,
                     old: artifact.located_entry(),
@@ -2501,6 +3004,30 @@ fn plan_renamed_source_files(
             .map_err(|error| format!("relocate records {from_id} to {to_id}: {error}"))?;
     }
     Ok(())
+}
+
+/// Name the modules of a move its body's parses cannot name, as one into
+/// another language or of a body with a syntax error cannot be: the file's own
+/// module takes the name its new path gives it, as every move named it before
+/// modules were named from parses, and its signature names the new path, so it
+/// is still the file's own module there. A module the file declares keeps its
+/// name.
+fn name_moved_modules_by_path(deltas: &mut [EntityDelta], to: &FilePathId) {
+    let name = kin_parser::adapter::file_module_surface_name(None, to);
+    for delta in deltas {
+        let EntityDelta::Modified { old, new } = delta else {
+            continue;
+        };
+        if new.kind != kin_model::EntityKind::Module || !kin_model::is_file_module_surface(old) {
+            continue;
+        }
+        if let Some(name) = &name {
+            new.name.clone_from(name);
+        }
+        if let Some((keyword, _)) = old.signature.split_once(' ') {
+            new.signature = format!("{keyword} {}", to.0);
+        }
+    }
 }
 
 /// Turn recorded creations into prospective graph truth: exact blob, tree
@@ -2531,7 +3058,7 @@ fn plan_renamed_source_files(
 fn plan_new_source_files(
     state: &DaemonState,
     prospective: &kin_db::InMemoryGraph,
-    pipeline: &kin_index::IndexPipeline,
+    authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
     creations: BTreeMap<String, (FilePathId, Vec<u8>)>,
     layouts: &mut Vec<FileLayout>,
 ) -> Result<(), String> {
@@ -2559,8 +3086,11 @@ fn plan_new_source_files(
             })
             .map_err(|error| format!("admit new source {file_id} to the exact tree: {error}"))?;
 
-        let indexed = pipeline
-            .index_any_content(&file_id, &body, digest)
+        // Read after the source joins the tree, so the manifests are the ones
+        // it is admitted under.
+        let manifests =
+            crate::source_cas::graph_manifests(prospective, state.blobs.as_ref(), Some(authority));
+        let indexed = kin_index::shared_index::index_any(&file_id, &body, digest, &manifests)
             .map_err(|error| format!("parse new source {file_id}: {error}"))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
             continue;
@@ -2609,7 +3139,7 @@ fn plan_new_source_files(
 fn plan_replaced_source_files(
     state: &DaemonState,
     prospective: &kin_db::InMemoryGraph,
-    pipeline: &kin_index::IndexPipeline,
+    authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
     replacements: BTreeMap<String, (FilePathId, Vec<u8>)>,
     layouts: &mut Vec<FileLayout>,
 ) -> Result<(), String> {
@@ -2659,8 +3189,9 @@ fn plan_replaced_source_files(
             })
             .map_err(|error| format!("install prospective exact tree for {file_id}: {error}"))?;
 
-        let indexed = pipeline
-            .index_any_content(&file_id, &body, digest)
+        let manifests =
+            crate::source_cas::graph_manifests(prospective, state.blobs.as_ref(), Some(authority));
+        let indexed = kin_index::shared_index::index_any(&file_id, &body, digest, &manifests)
             .map_err(|error| format!("parse replaced source {file_id}: {error}"))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
             return Err(format!(
@@ -2689,6 +3220,78 @@ fn plan_replaced_source_files(
         layouts.push(layout);
     }
     Ok(())
+}
+
+/// Derive again, in `prospective`, every source the manifests at `changed`
+/// name otherwise than the graph holds it ([`kin_index::sources_renamed_by_manifests`]),
+/// from its own unchanged bytes and under the manifests `prospective` holds.
+/// Returns whether any was derived.
+fn rederive_sources_renamed_by_manifests(
+    state: &DaemonState,
+    prospective: &kin_db::InMemoryGraph,
+    authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
+    changed: &[String],
+    layouts: &mut Vec<FileLayout>,
+) -> Result<bool, String> {
+    if changed.is_empty() {
+        return Ok(false);
+    }
+    let tree = prospective.resolved_tree();
+    let manifests =
+        crate::source_cas::graph_manifests(prospective, state.blobs.as_ref(), Some(authority));
+    let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let renamed = kin_index::sources_renamed_by_manifests(prospective, &tree, &manifests, &changed)
+        .map_err(|error| format!("name the sources the changed manifests reach: {error}"))?;
+    if renamed.is_empty() {
+        return Ok(false);
+    }
+    let mut reconciler = kin_reconcile::Reconciler::new(PathBuf::new());
+    reconciler.seed_cross_file_linker_from_graph(prospective);
+    for file_id in renamed {
+        let path = RepoPath::from_utf8(file_id.0.clone())
+            .map_err(|error| format!("renamed source path {file_id}: {error}"))?;
+        let Some(TreeEntry::Blob { hash, .. }) =
+            tree.artifact_at_path(&path).map(|artifact| artifact.entry)
+        else {
+            continue;
+        };
+        let body =
+            crate::source_cas::read_publishable_source(state.blobs.as_ref(), authority, hash)
+                .map_err(|error| {
+                    format!("read the source its manifest renames, {file_id}: {error}")
+                })?
+                .body()
+                .to_vec();
+        let digest = state
+            .blobs
+            .write(&body)
+            .map_err(|error| format!("store {file_id}: {error}"))?;
+        let indexed = kin_index::shared_index::index_any(&file_id, &body, digest, &manifests)
+            .map_err(|error| {
+                format!("parse the source its manifest renames, {file_id}: {error}")
+            })?;
+        let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
+            continue;
+        };
+        let reconcile = reconciler
+            .reconcile_indexed_content(&indexed, state.blobs.as_ref(), prospective)
+            .map_err(|error| {
+                format!("derive the source its manifest renames, {file_id}: {error}")
+            })?;
+        prospective
+            .apply_transaction_delta(&reconcile.delta)
+            .map_err(|error| format!("apply the semantics of {file_id}: {error}"))?;
+        let layout = reconciler
+            .projection()
+            .get_layout(&file_id)
+            .cloned()
+            .ok_or_else(|| format!("parsing produced no file layout for {file_id}"))?;
+        prospective
+            .upsert_file_layout(&layout)
+            .map_err(|error| format!("install the layout of {file_id}: {error}"))?;
+        layouts.push(layout);
+    }
+    Ok(true)
 }
 
 /// What re-deriving the carried paths did to the prospective graph.
@@ -2741,7 +3344,6 @@ enum CarriedDerivation {
 fn derive_carried_pending_semantics(
     state: &DaemonState,
     prospective: &kin_db::InMemoryGraph,
-    pipeline: &kin_index::IndexPipeline,
     held_authority: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
     planned: &crate::repository_commit::NativeCommitPlan,
     layouts: &mut Vec<FileLayout>,
@@ -2856,8 +3458,12 @@ fn derive_carried_pending_semantics(
             .blobs
             .write(&body)
             .map_err(|error| format!("store carried source {path}: {error}"))?;
-        let indexed = pipeline
-            .index_any_content(&file_id, &body, digest)
+        let manifests = crate::source_cas::graph_manifests(
+            prospective,
+            state.blobs.as_ref(),
+            Some(held_authority),
+        );
+        let indexed = kin_index::shared_index::index_any(&file_id, &body, digest, &manifests)
             .map_err(|error| format!("parse carried source {path}: {error}"))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
             // The third shape of the same condition: content the parser cannot
@@ -2892,6 +3498,21 @@ fn derive_carried_pending_semantics(
             .map_err(|error| format!("install prospective layout for carried {path}: {error}"))?;
         layouts.push(layout);
     }
+    // A carried manifest can rename sources this commit carries no bytes for,
+    // and those are derived again under it too.
+    let carried_manifests: Vec<String> = carried
+        .iter()
+        .filter_map(|path| path.as_utf8())
+        .filter(|path| kin_parser::project_manifest::could_hold_naming_manifest(path))
+        .map(str::to_string)
+        .collect();
+    derived |= rederive_sources_renamed_by_manifests(
+        state,
+        prospective,
+        held_authority,
+        &carried_manifests,
+        layouts,
+    )?;
 
     Ok(if derived {
         CarriedDerivation::Derived
@@ -3211,9 +3832,13 @@ fn finalize_committed_transaction(
     coordination: Option<&kin_mcp::CoordinationWritePreflight>,
     application: CommitApplication,
 ) -> Result<kin_mcp::ToolCallResult, String> {
-    let (planned_layouts, planned_carry) = match planned {
-        Some(planned) => (planned.layouts, Some(planned.carried_pending_files)),
-        None => (Vec::new(), None),
+    let (planned_layouts, planned_carry, rederived_files) = match planned {
+        Some(planned) => (
+            planned.layouts,
+            Some(planned.carried_pending_files),
+            planned.rederived_files,
+        ),
+        None => (Vec::new(), None, Vec::new()),
     };
     let authority_context = authority_context(state)?;
     // Through the held resolver: the commit moved the record, so this is the
@@ -3293,6 +3918,7 @@ fn finalize_committed_transaction(
             &transaction,
             &committed,
             &carried_pending_files,
+            &rederived_files,
         )
     })?;
     // The second commit path, recorded for the same reason the first one is.
@@ -3338,6 +3964,11 @@ fn finalize_committed_transaction(
         // must preserve enrichment completed since its original finalization.
         timed_finalize_step("queue_source_enrichment", || {
             queue_committed_source_enrichment(state, &committed.change)
+        })?;
+        // An artifact Kin does not parse has no enrichment to queue, and a
+        // search finds it by its retrieval record, which follows its content.
+        timed_finalize_step("refresh_artifact_retrieval", || {
+            crate::artifact_commit::refresh_retrieval_records(state, &committed.change)
         })?;
     }
 
@@ -3413,6 +4044,64 @@ fn finalize_committed_transaction(
             .take(CREATED_SAMPLE)
             .collect::<Vec<_>>();
         result["created_entities"] = serde_json::Value::Array(created);
+    }
+    // An entity Kin holds without parsing it is no source unit: the receipt
+    // names it, and counts only the code written beside it.
+    let unparsed =
+        crate::artifact_commit::change_rows(state, &terminal.staged_operations, &committed.change);
+    let units = modified_files
+        .len()
+        .saturating_sub(crate::artifact_commit::unparsed_written(
+            &terminal.staged_operations,
+        ));
+    if units > 0 || unparsed.is_empty() {
+        result[kin_mcp::write_reply::UNITS_WRITTEN_KEY] = serde_json::json!(units);
+    }
+    if terminal
+        .staged_operations
+        .iter()
+        .any(|operation| crate::unit_lifecycle::repository_base(operation).is_some())
+    {
+        result[kin_mcp::write_reply::REPOSITORY_BASE_SENT_KEY] = serde_json::json!(true);
+    }
+    // What each operation did, entity by entity: the receipt's counts and
+    // file list never said which entity a write landed on.
+    let mut changes = crate::commit_changes::entity_changes(
+        state.graph.as_ref(),
+        &committed.change,
+        &terminal.staged_operations,
+    );
+    changes.extend(unparsed);
+    if !changes.is_empty() {
+        // A method created beside a sibling is named behind its class, which
+        // the names the operations asked for do not hold.
+        let listed = result["created_entities"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| row["entity_id"].clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let unlisted = changes
+            .iter()
+            .filter(|row| row["change"] == kin_mcp::write_reply::CREATED)
+            .filter(|row| !listed.contains(&row["entity_id"]))
+            .map(|row| {
+                serde_json::json!({
+                    "entity_id": row["entity_id"],
+                    "name": row["name"],
+                    "kind": row["kind"],
+                })
+            })
+            .collect::<Vec<_>>();
+        if !unlisted.is_empty() {
+            match result["created_entities"].as_array_mut() {
+                Some(rows) => rows.extend(unlisted),
+                None => result["created_entities"] = serde_json::Value::Array(unlisted),
+            }
+        }
+        result[kin_mcp::write_reply::ENTITY_CHANGES_KEY] = serde_json::Value::Array(changes);
     }
     let json = serde_json::to_string_pretty(&result)
         .map_err(|error| format!("serialize exact MCP commit response: {error}"))?;
@@ -3598,6 +4287,11 @@ fn rebuild_changed_layouts(
 ) -> Result<Vec<FileLayout>, String> {
     let authority_context = authority_context(state)?;
     let pipeline = kin_index::IndexPipeline::new();
+    // The recovered tree's own manifests name its units.
+    let manifests = kin_index::TreeProjectFiles::new(
+        &authority.tree,
+        crate::source_cas::source_reader_opening(state.blobs.as_ref(), &authority_context),
+    );
     let mut layouts = Vec::new();
     for file_id in changed_file_ids(change)? {
         let path = RepoPath::from_utf8(file_id.0.clone())
@@ -3612,10 +4306,11 @@ fn rebuild_changed_layouts(
         let body = load_native_source_blob(&authority_context, hash)
             .map_err(|error| format!("load recovered exact body for {file_id}: {error}"))?;
         let indexed = pipeline
-            .index_any_content(
+            .index_any_content_in(
                 &file_id,
                 &body,
                 kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+                &manifests,
             )
             .map_err(|error| format!("reindex recovered exact body for {file_id}: {error}"))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {
@@ -3676,14 +4371,71 @@ fn stabilize_layout_ids(
 #[cfg(test)]
 pub(crate) mod tests {
     include!("entity_lifecycle_commit_test.rs");
+    include!("entity_lifecycle_languages_test.rs");
     include!("commit_settled_guesses_test.rs");
     use super::*;
     use std::path::Path;
-    use std::sync::OnceLock;
 
     use kin_model::{
         AuthorId, ChangeStore, EntityFilter, LocatedEntry, SemanticChangeId, Timestamp, TreeDelta,
     };
+
+    #[test]
+    fn public_coordination_refusal_preserves_owner_and_entity_without_physical_scope() {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let caller = uuid::Uuid::new_v4().to_string();
+        let entity = kin_model::EntityId::new();
+        let violation = format!("X-Kin-Session {caller} does not own transaction session {owner}");
+        let preflight = kin_mcp::CoordinationWritePreflight {
+            schema: "kin.coordination-preflight.v1",
+            mode: kin_mcp::CoordinationEnforcementMode::Enforce,
+            evaluated: true,
+            allowed: false,
+            session_id: owner.clone(),
+            touched_scopes: vec![
+                kin_model::IntentScope::Entity(entity),
+                kin_model::IntentScope::Artifact(kin_model::FilePathId::new("src/private.rs")),
+                kin_model::IntentScope::Artifact(kin_model::FilePathId::new("LICENSE")),
+                kin_model::IntentScope::Artifact(kin_model::FilePathId::new("src/value")),
+            ],
+            blocking_intents: vec![],
+            capability_violations: vec![violation.clone()],
+            coverage: Default::default(),
+        };
+        let transaction = kin_mcp::McpTransaction {
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            session_id: owner.clone(),
+            scope: "repository".into(),
+            state: "active".into(),
+            staged_operations: vec![],
+            commit_payload_hash: None,
+            created_at: Some(Timestamp::now()),
+            last_activity_at: Timestamp::now(),
+        };
+        let refusal = require_new_commit_authority(
+            &kin_mcp::SessionRegistry::new(),
+            &transaction,
+            Some(&preflight),
+        )
+        .unwrap_err();
+        let mut result = serde_json::to_value(kin_mcp::ToolCallResult::error(refusal)).unwrap();
+        kin_mcp::semantic_surface::present_result(&mut result, "kin_transaction_commit");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["code"], "coordination_write_refused");
+        assert_eq!(payload["published"], false);
+        assert_eq!(payload["preflight"]["session_id"], owner);
+        assert_eq!(payload["preflight"]["capability_violations"][0], violation);
+        assert_eq!(
+            payload["preflight"]["touched_scopes"],
+            serde_json::json!([kin_model::IntentScope::Entity(entity)])
+        );
+        assert!(text.contains(&entity.to_string()));
+        assert!(!text.contains("src/private.rs"));
+        assert!(!text.contains("LICENSE"));
+        assert!(!text.contains("src/value"));
+        assert!(result["isError"].as_bool().unwrap());
+    }
 
     // Retained conversion-planner regressions use this test-only entry. Every
     // production commit entry chooses CommitSurface::Semantic; no wire option
@@ -3707,21 +4459,7 @@ pub(crate) mod tests {
     }
 
     fn install_test_registry_override() {
-        static REGISTRY_PATH: OnceLock<PathBuf> = OnceLock::new();
-        let _guard = crate::test_env_lock();
-        let path = REGISTRY_PATH.get_or_init(|| {
-            let root = std::env::temp_dir().join(format!(
-                "kin-daemon-exact-mcp-registry-{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            let path = root.join("registry.toml");
-            kin_core::registry::KinRegistry { repos: Vec::new() }
-                .save_to(&path)
-                .unwrap();
-            path
-        });
-        kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
+        kin_core::test_env::install_test_registry();
     }
 
     fn test_state() -> (tempfile::TempDir, Arc<DaemonState>) {
@@ -3787,6 +4525,28 @@ pub(crate) mod tests {
         content: &[u8],
         entity_name: &str,
     ) -> (Entity, SemanticChangeId) {
+        install_exact_source_with(state, file, content, entity_name, false)
+    }
+
+    /// [`install_exact_source`] with the cross-file linker seeded from the
+    /// graph first, so the source binds to declarations installed before it,
+    /// as a call into another module does once Kin has admitted both.
+    fn install_linked_source(
+        state: &Arc<DaemonState>,
+        file: &str,
+        content: &[u8],
+        entity_name: &str,
+    ) -> (Entity, SemanticChangeId) {
+        install_exact_source_with(state, file, content, entity_name, true)
+    }
+
+    fn install_exact_source_with(
+        state: &Arc<DaemonState>,
+        file: &str,
+        content: &[u8],
+        entity_name: &str,
+        link: bool,
+    ) -> (Entity, SemanticChangeId) {
         let file_id = FilePathId::new(file);
         let blob_hash = state.blobs.write(content).unwrap();
         let source_hash = Hash256::from_bytes(blob_hash.0);
@@ -3809,6 +4569,9 @@ pub(crate) mod tests {
             panic!("{file} must classify as supported source");
         };
         let mut reconciler = kin_reconcile::Reconciler::new(PathBuf::new());
+        if link {
+            reconciler.seed_cross_file_linker_from_graph(state.graph.as_ref());
+        }
         let reconciled = reconciler
             .reconcile_indexed_content(&indexed, state.blobs.as_ref(), state.graph.as_ref())
             .unwrap();
@@ -4496,7 +5259,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn semantic_module_edit_requires_an_exact_declaration_span_in_authority() {
+    fn semantic_module_edit_refuses_both_exact_and_widened_container_spans() {
         let original =
             b"pub mod defaults { pub fn inside() -> u8 { 1 } }\npub fn outside() -> u8 { 8 }\n";
         let replacement = "pub mod defaults { pub fn inside() -> u8 { 2 } }";
@@ -4514,25 +5277,39 @@ pub(crate) mod tests {
             }
             let before = load_native_commit_base(&state.layout).unwrap().roots;
             let sessions = test_sessions();
-            let (_, args) = stage_entity_edit(&state, &sessions, &module, replacement);
+            // No semantic read can issue a source base for a module. A forged
+            // exact span must be refused just as a legacy whole-file span is.
+            let span = module.span.as_ref().unwrap();
+            let forged = unissued_source_base(
+                &state,
+                module.id,
+                "src/defaults.rs",
+                span.start_byte..span.end_byte,
+            );
+            let (_, args) = stage_operations(
+                &sessions,
+                vec![kin_mcp::McpMutationOperation {
+                    verb: "update".into(),
+                    target: module.id.to_string(),
+                    payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(forged)),
+                    body: Some(replacement.into()),
+                    destination: None,
+                    description: "forged aggregate module edit".into(),
+                }],
+            );
             let result = commit_exact_transaction(&state, &sessions, &args, None);
             let bytes = std::fs::read(state.layout.working_dir().join("src/defaults.rs")).unwrap();
-            if legacy_widening {
-                assert_eq!(result.is_error, Some(true));
-                assert!(
-                    result_text(&result).contains("verified independent module declaration span"),
-                    "{}",
-                    result_text(&result)
-                );
-                assert_eq!(
-                    load_native_commit_base(&state.layout).unwrap().roots,
-                    before
-                );
-                assert_eq!(bytes, original);
-            } else {
-                assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
-                assert_eq!(bytes, b"pub mod defaults { pub fn inside() -> u8 { 2 } }\npub fn outside() -> u8 { 8 }\n");
-            }
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                result_text(&result).contains("module_body_unavailable"),
+                "{}",
+                result_text(&result)
+            );
+            assert_eq!(
+                load_native_commit_base(&state.layout).unwrap().roots,
+                before
+            );
+            assert_eq!(bytes, original);
         }
     }
 
@@ -5960,6 +6737,162 @@ pub(crate) mod tests {
             .is_none());
     }
 
+    /// A moved file's own module is named as a parse of it at its new path
+    /// names it, and keeps its identity: a Go file keeps the package it
+    /// declares, a Python package's `__init__.py` gives up the package's name
+    /// for its new stem, and a TypeScript `index.ts` gives up its directory's
+    /// name the same way. Its signature names the new path, so it is still the
+    /// file's own module there.
+    #[test]
+    fn a_moved_files_module_is_named_by_a_parse_at_its_new_path() {
+        for (from, to, body, named_before, named_after) in [
+            (
+                "cache/cache.go",
+                "cache/store.go",
+                "package cache\n\nfunc Get() int {\n\treturn 1\n}\n",
+                "cache",
+                "cache",
+            ),
+            (
+                "pkg/__init__.py",
+                "pkg/core.py",
+                "def helper():\n    return 1\n",
+                "pkg",
+                "core",
+            ),
+            (
+                "foo/index.ts",
+                "foo/main.ts",
+                "export function helper(): number {\n  return 1;\n}\n",
+                "foo",
+                "main",
+            ),
+        ] {
+            let (_dir, state) = test_state();
+            let sessions = test_sessions();
+            let commit = |operations: Vec<kin_mcp::McpMutationOperation>| {
+                let transaction = sessions
+                    .begin_transaction(TEST_SESSION, &format!("file:{from}"))
+                    .unwrap();
+                sessions
+                    .stage_transaction(&transaction.transaction_id, operations)
+                    .unwrap();
+                let result = commit_conversion_fixture(
+                    &state,
+                    &sessions,
+                    &HashMap::from([(
+                        "transaction_id".to_string(),
+                        serde_json::json!(transaction.transaction_id),
+                    )]),
+                    None,
+                );
+                assert_ne!(
+                    result.is_error,
+                    Some(true),
+                    "{from}: {}",
+                    result_text(&result)
+                );
+            };
+            let module = |file: &str| {
+                load_native_commit_base(&state.layout)
+                    .unwrap()
+                    .graph
+                    .query_entities(&EntityFilter {
+                        file_path: Some(FilePathId::new(file)),
+                        ..EntityFilter::default()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .find(kin_model::is_file_module_surface)
+            };
+
+            commit(vec![new_source_file(from, body)]);
+            let before = module(from).unwrap_or_else(|| panic!("{from} has its own module"));
+            assert_eq!(before.name, named_before, "{from}");
+
+            commit(vec![renamed_source_file(from, to)]);
+            let after = module(to).unwrap_or_else(|| panic!("{to} has its own module"));
+            assert_eq!(after.id, before.id, "{from} kept its module's identity");
+            assert_eq!(after.name, named_after, "{from} moved to {to}");
+            assert!(module(from).is_none(), "{from} left nothing behind");
+        }
+    }
+
+    /// A move whose body's parses cannot name its modules still moves, as it
+    /// did before modules were named from parses: a JavaScript file renamed to
+    /// TypeScript changes language, and a Kotlin file with a syntax error
+    /// parses incompletely at both paths. Its own module keeps its identity,
+    /// takes the name its new path gives it, and names the new path.
+    #[test]
+    fn a_move_its_parses_cannot_name_still_moves() {
+        for (from, to, body, named_after) in [
+            (
+                "src/util.js",
+                "src/util.ts",
+                "export function helper() {\n  return 1;\n}\n",
+                "util",
+            ),
+            (
+                "app/Broken.kt",
+                "app/Moved.kt",
+                "fun ok(): Int = 1\nfun broken( {\n",
+                "Moved",
+            ),
+        ] {
+            let (_dir, state) = test_state();
+            let sessions = test_sessions();
+            let commit = |operations: Vec<kin_mcp::McpMutationOperation>| {
+                let transaction = sessions
+                    .begin_transaction(TEST_SESSION, &format!("file:{from}"))
+                    .unwrap();
+                sessions
+                    .stage_transaction(&transaction.transaction_id, operations)
+                    .unwrap();
+                let result = commit_conversion_fixture(
+                    &state,
+                    &sessions,
+                    &HashMap::from([(
+                        "transaction_id".to_string(),
+                        serde_json::json!(transaction.transaction_id),
+                    )]),
+                    None,
+                );
+                assert_ne!(
+                    result.is_error,
+                    Some(true),
+                    "{from}: {}",
+                    result_text(&result)
+                );
+            };
+            let module = |file: &str| {
+                load_native_commit_base(&state.layout)
+                    .unwrap()
+                    .graph
+                    .query_entities(&EntityFilter {
+                        file_path: Some(FilePathId::new(file)),
+                        ..EntityFilter::default()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .find(|entity| entity.kind == kin_model::EntityKind::Module)
+            };
+
+            commit(vec![new_source_file(from, body)]);
+            let before = module(from).unwrap_or_else(|| panic!("{from} has its own module"));
+
+            commit(vec![renamed_source_file(from, to)]);
+            let after = module(to).unwrap_or_else(|| panic!("{to} holds the moved module"));
+            assert_eq!(after.id, before.id, "{from} kept its module's identity");
+            assert_eq!(after.name, named_after, "{from} moved to {to}");
+            assert!(
+                kin_model::is_file_module_surface(&after),
+                "{to}: {}",
+                after.signature
+            );
+            assert!(module(from).is_none(), "{from} left nothing behind");
+        }
+    }
+
     /// A rename moves the file and everything keeps its identity.
     ///
     /// This is the half of FIR-2429 that a retirement cannot cover. A rename is
@@ -7073,11 +8006,16 @@ pub(crate) mod tests {
         );
         let mut edits = BTreeMap::new();
         let mut edited = HashSet::new();
-        assert!(
-            record_source_edit(&mut edits, &mut edited, &base, legacy, b"() => 2")
-                .unwrap_err()
-                .contains("legacy derived member")
-        );
+        assert!(record_source_edit(
+            &mut edits,
+            &mut edited,
+            &base,
+            legacy,
+            b"() => 2",
+            SentAs::WholeCode
+        )
+        .unwrap_err()
+        .contains("legacy derived member"));
         assert!(edits.is_empty());
         assert!(edited.is_empty());
     }
@@ -8178,7 +9116,11 @@ pub(crate) mod tests {
         assert_eq!(failed.is_error, Some(true));
         let message = result_text(&failed);
         assert!(
-            message.contains("would create or remove source entities"),
+            message.contains(
+                "this edit of other would also add function extra beside it, and an edit changes \
+                 only the declaration it names. Send the code of other alone, and add extra \
+                 with the create verb (payload EntityCreate)"
+            ),
             "the refusal keeps naming the real problem: {message}"
         );
         assert!(
@@ -9661,6 +10603,23 @@ pub(crate) mod tests {
         );
     }
 
+    /// The removal of every relation `snapshot` holds from or to `entity`.
+    fn relations_touching(
+        snapshot: &kin_db::GraphSnapshot,
+        entity: kin_model::EntityId,
+    ) -> Vec<kin_model::RelationDelta> {
+        snapshot
+            .relations
+            .values()
+            .filter(|relation| {
+                relation.src.as_entity() == Some(entity) || relation.dst.as_entity() == Some(entity)
+            })
+            .map(|relation| kin_model::RelationDelta::Removed {
+                old: relation.clone(),
+            })
+            .collect()
+    }
+
     /// Losing an entity authority owns is still divergence: a derived view may
     /// hold more than authority, and may hold a richer value for what authority
     /// owns, but it may never hold less.
@@ -9673,18 +10632,23 @@ pub(crate) mod tests {
             b"pub fn value() -> u8 { 1 }\npub fn other() -> u8 { 3 }\n",
             "value",
         );
-        let dropped = load_native_commit_base(&state.layout)
+        let snapshot = load_native_commit_base(&state.layout)
             .unwrap()
             .graph
-            .to_snapshot()
+            .to_snapshot();
+        let dropped = snapshot
             .entities
-            .into_values()
+            .values()
             .find(|candidate| candidate.id != entity.id)
+            .cloned()
             .expect("the fixture must own a second entity to drop");
         let guard = state.begin_graph_authority_mutation();
         state
             .graph
             .apply_transaction_delta(&TransactionDelta {
+                // An entity goes with the relations that touch it, the
+                // unit's module containing it among them.
+                relation_deltas: relations_touching(&snapshot, dropped.id),
                 entity_deltas: vec![EntityDelta::Removed { old: dropped }],
                 ..TransactionDelta::default()
             })
@@ -10121,6 +11085,9 @@ pub(crate) mod tests {
         state
             .graph
             .apply_transaction_delta(&TransactionDelta {
+                // An entity goes with the relations that touch it, the
+                // unit's module containing it among them.
+                relation_deltas: relations_touching(&before.graph.to_snapshot(), entity.id),
                 entity_deltas: vec![EntityDelta::Removed {
                     old: authority_owned.clone(),
                 }],
@@ -10144,6 +11111,14 @@ pub(crate) mod tests {
             message.contains("reopen before committing an MCP transaction"),
             "the refusal must say what to do: {message}"
         );
+        // Nothing a running daemon does restores the entity, so the refusal
+        // may not ask for the same commit again. It says what ends it.
+        assert!(
+            message.contains("Sending this commit again will not help")
+                && message.contains("`kin daemon stop`")
+                && !message.contains("re-send this commit unchanged"),
+            "{message}"
+        );
         assert_eq!(
             sessions.get_transaction(&transaction_id).unwrap().state,
             "active"
@@ -10152,6 +11127,268 @@ pub(crate) mod tests {
             load_native_commit_base(&state.layout).unwrap().roots,
             before.roots,
             "no repository authority may move behind a refused precondition"
+        );
+    }
+
+    /// A store an older Kin build derived commits through MCP once this build's
+    /// daemon has repaired it, and the commit records the repair in history.
+    ///
+    /// The older build read a declaration out of `serializer.py` that this
+    /// build's parser does not, and published it with the edges the real one
+    /// has. A daemon starting on that store re-derives the module in its live
+    /// graph before it serves, and authority keeps the older derivation. An
+    /// agent then edits `want_bytes`, which `serializer.py` imports, exactly as
+    /// on the released-store reproduction.
+    ///
+    /// Two refusals stood in the way. The freshness check read what the repair
+    /// took out as lost authority, so every commit was refused, and so was
+    /// every commit on the daemon the refusal said to start. Past it, the
+    /// commit planned from authority's graph, re-derived the edited module, and
+    /// the strict dependency reader refused its dependent for still holding the
+    /// older derivation. The commit now lands, records the re-derivation in
+    /// history, says so, attributes none of it to the agent, and the next start
+    /// has nothing left to repair.
+    ///
+    /// Falsify by making `carry_startup_rederivation` carry nothing: the commit
+    /// is refused naming `serializer.py`. Falsify the first refusal by dropping
+    /// `at_startup` from `authority_semantics_divergence`: it is refused as lost
+    /// authority before it plans.
+    #[test]
+    fn a_store_an_older_derivation_wrote_commits_through_mcp_after_the_startup_repair() {
+        let (_dir, state) = test_state();
+        let (want_bytes, _) = install_exact_source(
+            &state,
+            "pkg/encoding.py",
+            // An import, as itsdangerous's own encoding module has, is what
+            // makes the edit below read every other source strictly.
+            b"import base64\n\n\ndef want_bytes(s):\n    return s\n",
+            "want_bytes",
+        );
+        let (dumps, _) = install_linked_source(
+            &state,
+            "pkg/serializer.py",
+            b"from .encoding import want_bytes\n\n\ndef dumps(value):\n    return want_bytes(value)\n",
+            "dumps",
+        );
+        assert!(
+            state
+                .graph
+                .to_snapshot()
+                .relations
+                .values()
+                .any(|relation| {
+                    relation.src.as_entity() == Some(dumps.id)
+                        && relation.dst.as_entity() == Some(want_bytes.id)
+                }),
+            "serializer.py has to bind its call to want_bytes across modules, as it does in \
+             itsdangerous, or the edit below reads no dependent and grades nothing about the \
+             strict reader"
+        );
+
+        // The older derivation, published as that build published it.
+        let mut minted = dumps.clone();
+        minted.id = kin_model::EntityId::new();
+        minted.name = "dumps_as_an_older_parser_read_it".into();
+        let retarget = |node: &kin_model::GraphNodeId| match node.as_entity() {
+            Some(id) if id == dumps.id => kin_model::GraphNodeId::Entity(minted.id),
+            _ => *node,
+        };
+        let minted_relations = state
+            .graph
+            .to_snapshot()
+            .relations
+            .values()
+            .filter(|relation| {
+                relation.src.as_entity() == Some(dumps.id)
+                    || relation.dst.as_entity() == Some(dumps.id)
+            })
+            .map(|relation| {
+                let mut edge = relation.clone();
+                edge.id = kin_model::RelationId::new();
+                edge.src = retarget(&relation.src);
+                edge.dst = retarget(&relation.dst);
+                edge
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !minted_relations.is_empty(),
+            "the minted declaration needs an edge for the repair to retire, or this proves \
+             nothing about relations"
+        );
+        state
+            .graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: vec![EntityDelta::Added {
+                    new: minted.clone(),
+                }],
+                relation_deltas: minted_relations
+                    .iter()
+                    .map(|edge| RelationDelta::Added { new: edge.clone() })
+                    .collect(),
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+        let base = load_native_commit_base(&state.layout).unwrap();
+        let plan = crate::repository_commit::plan_native_commit_from_base(
+            state.graph.as_ref(),
+            state.blobs.as_ref(),
+            &authority_context(&state).unwrap(),
+            OperationId::new(),
+            Timestamp::now(),
+            AuthorId::new("an-older-kin-build"),
+            "derive pkg/serializer.py as an older parser read it".to_string(),
+            &base,
+        )
+        .unwrap();
+        let committed = crate::repository_commit::commit_native_plan(
+            state.blobs.as_ref(),
+            &authority_context(&state).unwrap(),
+            plan,
+        )
+        .unwrap();
+        state
+            .graph
+            .create_changes(vec![committed.change.clone()])
+            .unwrap();
+        state
+            .record_repository_authority_commit(committed.receipt.generation)
+            .unwrap();
+
+        // This build's daemon starts on that store and repairs it.
+        let layout = state.layout.clone();
+        drop(state);
+        let state = Arc::new(DaemonState::open(layout.clone()).unwrap());
+        assert!(
+            state.graph.get_entity(&minted.id).unwrap().is_some(),
+            "a start loads what authority holds, the older derivation included"
+        );
+        let repair = |state: &DaemonState| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(crate::loop_runner::repair_canonical_semantics_at_startup(
+                    state,
+                ))
+                .expect("the startup repair re-derives the older derivation")
+        };
+        repair(state.as_ref());
+        let before = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            state.graph.get_entity(&minted.id).unwrap().is_none()
+                && before.graph.get_entity(&minted.id).unwrap().is_some(),
+            "the repair takes the older declaration out of the live graph and leaves \
+             authority holding it, or there is nothing for the commit to meet"
+        );
+        {
+            let held = state.startup_rederivation.lock().unwrap();
+            assert!(
+                held.entities_removed.contains(&minted.id)
+                    && minted_relations
+                        .iter()
+                        .all(|edge| held.relations_removed.contains(&edge.id)),
+                "the repair holds exactly what it took out: {held:?}"
+            );
+            assert_eq!(
+                held.files,
+                [RepoPath::from_utf8("pkg/serializer.py").unwrap()],
+                "the repair names the source it re-derived and no other"
+            );
+        }
+        assert!(
+            state.graph.get_entity(&dumps.id).unwrap().is_some(),
+            "the declaration these bytes do produce survives the repair under its id"
+        );
+
+        let sessions = test_sessions();
+        let (_, arguments) = stage_entity_edit(
+            &state,
+            &sessions,
+            &want_bytes,
+            "def want_bytes(s):\n    return bytes(s)",
+        );
+        let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "a commit on a repaired store must land: {}",
+            result_text(&result)
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert_eq!(after.roots.generation, before.roots.generation + 1);
+        assert!(
+            after.graph.get_entity(&minted.id).unwrap().is_none()
+                && after.graph.get_entity(&dumps.id).unwrap().is_some()
+                && minted_relations
+                    .iter()
+                    .all(|edge| after.graph.get_relation_by_id(&edge.id).is_none()),
+            "authority holds the re-derivation once the commit records it"
+        );
+        assert!(
+            semantic_workspace_matches(state.graph.as_ref(), &after.graph),
+            "the live graph and authority agree on the repaired derivation"
+        );
+        assert!(
+            state.startup_rederivation.lock().unwrap().is_empty(),
+            "a recorded re-derivation leaves nothing for a later commit to carry"
+        );
+
+        // The commit records the re-derivation in history and says so.
+        let change_id = commit_reply(&result)["change_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let change = state
+            .graph
+            .get_entity_history(&want_bytes.id)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id.to_string() == change_id)
+            .expect("the published change is reachable from the function the agent edited");
+        assert!(
+            change.entity_deltas.iter().any(|delta| matches!(
+                delta,
+                EntityDelta::Removed { old } if old.id == minted.id
+            )),
+            "the change records the re-derivation in history"
+        );
+        assert!(
+            change
+                .message
+                .contains("also records the re-derivation of 1 source unit")
+                && change.message.contains("Re-derived: pkg/serializer.py")
+                && !change.message.contains("pkg/encoding.py"),
+            "the change declares the re-derivation it records, and only that: {}",
+            change.message
+        );
+        let attributed = state
+            .graph
+            .query_audit_events(Some(&mcp_actor_id(TEST_SESSION)), 64)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.target_scope {
+                Some(WorkScope::Entity(entity)) => Some(entity),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            attributed.contains(&want_bytes.id)
+                && !attributed.contains(&minted.id)
+                && !attributed.contains(&dumps.id),
+            "the agent is attributed its edit and none of the re-derivation: {attributed:?}"
+        );
+        assert_eq!(
+            std::fs::read(state.layout.working_dir().join("pkg/encoding.py")).unwrap(),
+            b"import base64\n\n\ndef want_bytes(s):\n    return bytes(s)\n"
+        );
+
+        // The next start finds nothing left to repair.
+        drop(state);
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        repair(state.as_ref());
+        assert!(
+            state.startup_rederivation.lock().unwrap().is_empty(),
+            "a store whose re-derivation a commit recorded is not repaired again"
         );
     }
 

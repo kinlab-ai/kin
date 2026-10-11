@@ -94,6 +94,11 @@ pub struct ResolvedIdentity {
     /// several owners' members, and a caller is asked which one it meant
     /// rather than handed one.
     pub member_name: bool,
+    /// Whether the query reached its matches as a module-qualified name,
+    /// `flask.app._make_timedelta` for the function `_make_timedelta` in the
+    /// module `app` of the package `flask`
+    /// ([`kin_ranking::entity_ranking::NameReach::Qualified`]).
+    pub qualified_name: bool,
 }
 
 /// Resolve `query` to the entities it can mean, then narrow by `qualifiers`.
@@ -116,6 +121,7 @@ pub fn resolve_identity<G: GraphStore>(
     let addressed_by_id = uuid::Uuid::parse_str(trimmed).is_ok();
 
     let mut member_name = false;
+    let mut qualified_name = false;
     let mut matches: Vec<Entity> = if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
         graph.get_entity(&EntityId(uuid))?.into_iter().collect()
     } else {
@@ -135,6 +141,10 @@ pub fn resolve_identity<G: GraphStore>(
                 member_name = true;
                 members
             }
+            kin_ranking::entity_ranking::NameReach::Qualified(found) => {
+                qualified_name = true;
+                found
+            }
             kin_ranking::entity_ranking::NameReach::Neither => matches,
         }
     };
@@ -149,6 +159,7 @@ pub fn resolve_identity<G: GraphStore>(
         exact_name,
         addressed_by_id,
         member_name,
+        qualified_name,
     })
 }
 
@@ -435,6 +446,7 @@ pub fn resolve_entity_among<'a>(
             kin_ranking::entity_ranking::NameReach::Members(members) => {
                 (members, NameMatch::Member)
             }
+            kin_ranking::entity_ranking::NameReach::Qualified(found) => (found, NameMatch::Exact),
             kin_ranking::entity_ranking::NameReach::Neither => narrow_by_name(reached, &name),
         }
     };
@@ -526,6 +538,11 @@ fn gather_by_name<G: GraphStore>(graph: &G, name: &str) -> Result<(Vec<Entity>, 
         }
         kin_ranking::entity_ranking::NameReach::Members(members) => {
             return Ok((members, NameMatch::Member))
+        }
+        // A module-qualified name names what its qualifier pins as surely as a
+        // whole name does, and is ranked and pinned the same way.
+        kin_ranking::entity_ranking::NameReach::Qualified(found) => {
+            return Ok((found, NameMatch::Exact))
         }
         kin_ranking::entity_ranking::NameReach::Neither => {}
     }

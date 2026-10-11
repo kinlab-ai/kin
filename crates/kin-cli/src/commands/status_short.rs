@@ -83,11 +83,20 @@ pub(super) fn lines(style: Style, page: &Page, right_edge: usize) -> Vec<String>
         out.push(String::new());
         let width = right_edge.saturating_sub(INDENT.len() + 2).max(24);
         for item in &page.attention {
-            for (index, part) in screen::wrap(item, width).into_iter().enumerate() {
-                if index == 0 {
-                    out.push(format!("{INDENT}{} {part}", style.glyph(Status::Warn)));
-                } else {
-                    out.push(format!("{INDENT}  {part}"));
+            // The row's glyph is the warning marker, so a full-record line that
+            // opens with its own is not marked twice.
+            let item = item.strip_prefix("⚠ ").unwrap_or(item);
+            // Sentence by sentence, as the hint above is, so a command that
+            // opens a sentence opens its line and is not split mid-command.
+            let mut first = true;
+            for sentence in item.split_inclusive(". ") {
+                for part in screen::wrap(sentence.trim_end(), width) {
+                    if first {
+                        out.push(format!("{INDENT}{} {part}", style.glyph(Status::Warn)));
+                        first = false;
+                    } else {
+                        out.push(format!("{INDENT}  {part}"));
+                    }
                 }
             }
         }
@@ -193,6 +202,42 @@ mod tests {
         assert!(!text.contains("nothing below describes it"), "{text}");
         assert!(
             text.ends_with("More          kin status --verbose"),
+            "{text}"
+        );
+    }
+
+    /// A full-record warning keeps its words but not its own marker, so the
+    /// page shows one glyph per warning.
+    #[test]
+    fn a_warning_is_marked_once() {
+        let mut page = healthy();
+        page.attention = vec!["⚠ hydration semantics: a store an older build wrote".to_string()];
+        let text = lines(Style::plain(), &page, 80).join("\n");
+        assert!(
+            text.contains("! hydration semantics: a store an older build wrote"),
+            "{text}"
+        );
+        assert!(!text.contains('⚠'), "{text}");
+    }
+
+    /// The upgrade warning opens with its command and keeps the npm form of
+    /// that command whole on one line.
+    #[test]
+    fn a_command_in_a_warning_is_never_split() {
+        let mut page = healthy();
+        page.attention = vec![
+            "Run `kin upgrade` here. Reference and call answers over this store stay unproven \
+             until it checks the store's binding history. Through npm: `npx -y @kinlab/kin@0.8.2 \
+             upgrade`"
+                .to_string(),
+        ];
+        let lines = lines(Style::plain(), &page, 80);
+        let text = lines.join("\n");
+        assert!(text.contains("  ! Run `kin upgrade` here.\n"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim() == "Through npm: `npx -y @kinlab/kin@0.8.2 upgrade`"),
             "{text}"
         );
     }

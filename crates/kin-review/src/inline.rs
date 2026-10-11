@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use kin_model::ids::EntityId;
-use kin_model::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
@@ -867,8 +866,10 @@ fn collect_added_comments(
         start_line: span.start_line,
         end_line: span.end_line,
         kind: InlineCommentKind::Added,
+        // The signature is code, so it is quoted as code: an agent reads it
+        // as the entity's declaration rather than as prose.
         message: format!(
-            "New {:?} `{}` — {}",
+            "New {:?} `{}`: `{}`",
             entity.kind, entity.name, entity.signature,
         ),
     });
@@ -907,22 +908,15 @@ fn collect_added_comments(
     }
 }
 
-/// The zero-hash sentinel on `SemanticFingerprint.equivalence_hash`, meaning the
-/// behavior-equivalence class was not computed for that entity (unsupported
-/// language, or an entity the ingest could not classify).
-fn equivalence_not_computed(hash: Hash256) -> bool {
-    hash == Hash256::from_bytes([0; 32])
-}
-
-/// Whether the body change from `old` to `new` is provably behavior-preserving
-/// under the graph-owned `equivalence_hash` attached at ingest. True only when
-/// both revisions carry a COMPUTED class and the two are equal; the zero-hash
-/// sentinel on either side means "unknown" and never proves equivalence — the
+/// Whether the body change from `old` to `new` is provably behavior-preserving:
+/// the two records read the same token for token, or they carry one COMPUTED
+/// graph-owned `equivalence_hash`, attached at ingest. The zero-hash sentinel
+/// on either side means "unknown" and never proves equivalence, the
 /// conservative default that keeps every genuine behavior change, and every
-/// entity the ingest could not classify, in the attention channel.
+/// entity the ingest could not classify, in the attention channel. See
+/// [`crate::contract`].
 fn body_change_is_behavior_equivalent(old: &Entity, new: &Entity) -> bool {
-    let old_class = old.fingerprint.equivalence_hash;
-    !equivalence_not_computed(old_class) && old_class == new.fingerprint.equivalence_hash
+    crate::contract::body_behavior_equivalent(old, new)
 }
 
 fn collect_modified_comments(
@@ -949,7 +943,6 @@ fn collect_modified_comments(
     let consumer_count = per_entity.map_or(0, crate::impact::EntityImpact::external_consumers);
     let strong_consumer_count = per_entity.map_or(0, |e| e.strong_consumer_count);
     let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
-    let consumer_file_count = per_entity.map_or(0, |e| e.external_consumer_file_paths().len());
     let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
     // Consumers that were themselves modified in the reviewed range. When a
     // surface change has NO external consumer left but did have consumers that
@@ -967,7 +960,7 @@ fn collect_modified_comments(
     // is not a contract-surface change; anything else — including removing
     // such qualifiers — remains one.
     if !is_non_contract_surface_role(new.role)
-        && old.signature != new.signature
+        && crate::contract::signature_changed(old, new)
         && !signature_runtime_neutral(&old.signature, &new.signature)
     {
         // An arity-preserving parameter rename cannot break a caller that
@@ -1089,10 +1082,12 @@ fn collect_modified_comments(
     }
 
     // Contract entity whose own consumers are exposed to this modification.
+    // A comment or a docstring exposes them to nothing.
     if matches!(
         new.kind,
         EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
     ) && contract_consumer_count > 0
+        && !crate::contract::ContractChange::of(old, new).consumers_unaffected()
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -1138,7 +1133,7 @@ fn collect_modified_comments(
     // not feed the gate without a signature or visibility surface change.
     let body_only_fanout_has_enough_shape = new.visibility == Visibility::Public
         && fanout_gate_consumer_count >= CONSUMER_FANOUT_THRESHOLD;
-    if old.signature == new.signature
+    if !crate::contract::signature_changed(old, new)
         && old.visibility == new.visibility
         && body_only_fanout_has_enough_shape
     {
@@ -1154,17 +1149,17 @@ fn collect_modified_comments(
             (
                 InlineCommentKind::ConsumerFanoutEquivalent,
                 format!(
-                    "Behavior-preserving change to `{}` reaches {} distinct non-test consumer(s) across {} file(s); \
+                    "Behavior-preserving change to `{}` reaches {} distinct non-test consumer entities; \
                      the new body is provably equivalent to the old (docstring/comment/formatting), so this is informational",
-                    new.name, fanout_gate_consumer_count, consumer_file_count,
+                    new.name, fanout_gate_consumer_count,
                 ),
             )
         } else {
             (
                 InlineCommentKind::ConsumerFanout,
                 format!(
-                    "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
-                    new.name, fanout_gate_consumer_count, consumer_file_count,
+                    "Behavior of `{}` changed with {} distinct non-test consumer entities",
+                    new.name, fanout_gate_consumer_count,
                 ),
             )
         };
@@ -1226,6 +1221,7 @@ mod tests {
         SourceSpan, Visibility,
     };
     use kin_model::ids::*;
+    use kin_model::Hash256;
 
     fn test_entity_with_span(name: &str, file: &str, start_line: u32, end_line: u32) -> Entity {
         Entity {
@@ -3155,7 +3151,8 @@ mod tests {
         );
         assert!(fanout[0]
             .message
-            .contains("2 distinct non-test consumer(s) across 1 file(s)"));
+            .contains("2 distinct non-test consumer entities"));
+        assert!(!fanout[0].message.contains("file"));
     }
 
     #[test]

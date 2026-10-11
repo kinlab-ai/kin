@@ -11,6 +11,24 @@
 //! exact refs into graph-owned descriptors, or rehydrate those same bytes.
 //! Earlier lossy history conversion and commit-synthesizing export APIs are not
 //! part of the clean-slate model-v6 surface.
+//!
+//! Repository entry points require authority from the ingestion or projection
+//! boundary. A bare path cannot read a checkout's refs or ignore configuration:
+//!
+//! ```compile_fail,E0308
+//! kin_git::ref_identity::GitRefIdentity::of_checkout(std::path::Path::new("repo")).unwrap();
+//! ```
+//!
+//! ```compile_fail,E0308
+//! kin_git::kin_store_is_git_ignored(std::path::Path::new("repo")).unwrap();
+//! ```
+//!
+//! ```no_run
+//! let grant = kin_io::Grant::ambient();
+//! let root = kin_io::WorktreeRoot::new("repo", &grant);
+//! let identity = kin_git::ref_identity::GitRefIdentity::of_checkout(&root).unwrap();
+//! let ignored = kin_git::kin_store_is_git_ignored(&root).unwrap();
+//! ```
 
 #[cfg(all(test, unix))]
 #[test]
@@ -25,11 +43,13 @@ pub mod admission_blockers;
 pub mod admission_history;
 pub mod authority;
 pub mod error;
+pub mod gc_lock;
 pub mod global_config;
 pub mod history_spool;
 pub use history_spool::SemanticChangeSpool;
 pub mod lossless;
 pub mod preflight;
+pub mod ref_identity;
 pub mod repository_export;
 pub mod sealed_observation;
 pub mod semantic_import;
@@ -48,20 +68,22 @@ pub use error::{
     LocalGitHookFact, LocalGitHookKind, RegisteredGitWorktreeFact, RegisteredGitWorktreeKind,
     Result, UnsealedContentGap, UntolerableGitWorktree,
 };
+pub use gc_lock::{wait_for_running_git_gc, RunningGitGc, GIT_GC_WAIT};
 pub use global_config::empty_global_git_config;
 pub use lossless::{
-    capture_lossless_git_repository, closure_reconstruction_count,
-    rehydrate_lossless_git_repository, sync_git_repository_for_authority_handoff, GitObjectFormat,
-    GitRehydrationResult, LosslessGitRepository,
+    capture_lossless_git_repository, capture_lossless_git_repository_scoped,
+    closure_reconstruction_count, rehydrate_lossless_git_repository,
+    sync_git_repository_for_authority_handoff, CaptureScope, GitObjectFormat, GitRehydrationResult,
+    LosslessGitRepository,
 };
 pub use preflight::{
-    kin_store_is_git_ignored, preflight_git_migration, preflight_git_migration_after_publication,
-    reprove_git_migration, reprove_git_migration_after_publication, GitBranchTrackingFact,
-    GitIndexPreflightProof, GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind,
-    GitMigrationCompatibilityFacts, GitMigrationPreflightProof, GitRemoteConfigFact,
-    GitRemoteMappingFacts, GitTrackedWorktreeProof, GitWorkspaceDivergence,
-    GitWorkspaceDivergenceFacts, GitWorkspaceDivergenceKind, IgnoredLocalEntry,
-    IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
+    git_remote_mapping_facts, kin_store_is_git_ignored, preflight_git_migration,
+    preflight_git_migration_after_publication, reprove_git_migration,
+    reprove_git_migration_after_publication, GitBranchTrackingFact, GitIndexPreflightProof,
+    GitLocalIgnoreInputFact, GitLocalIgnoreSourceKind, GitMigrationCompatibilityFacts,
+    GitMigrationPreflightProof, GitRemoteConfigFact, GitRemoteMappingFacts,
+    GitTrackedWorktreeProof, GitWorkspaceDivergence, GitWorkspaceDivergenceFacts,
+    GitWorkspaceDivergenceKind, IgnoredLocalEntry, IgnoredLocalEntryKind, IgnoredLocalWorktreeFact,
 };
 pub use repository_export::{
     export_repository_to_git, verify_repository_git_export, RepositoryGitCommitBinding,

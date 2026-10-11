@@ -108,6 +108,11 @@ import tempfile
 import threading
 import time
 
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
+
 PASS = "PASS"
 FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
@@ -853,7 +858,11 @@ def enrichment_names_a_death(line):
     had started naming them precisely.
     """
     line = line or ""
-    return "completion not attested" in line and DEATH_CLAUSE_STEM in line
+    unattested = (
+        "completion not attested" in line
+        or "not confirmed that background analysis finished" in line
+    )
+    return unattested and DEATH_CLAUSE_STEM in line
 
 
 GRADERS = {
@@ -991,6 +1000,9 @@ class Suite(object):
         self.kin_home = os.path.join(workdir, "kin-home-%d" % os.getpid())
         os.makedirs(self.kin_home, exist_ok=True)
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         # A scratch KIN_HOME keeps this run off the fleet's stores and the
         # auto-embed opt-out keeps it off the GPU. Neither is a nicety: this
         # suite is meant to run on every pull request beside other work.
@@ -998,6 +1010,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         # An inherited endpoint would decide every probe below for it, and the

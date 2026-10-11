@@ -203,6 +203,7 @@ fn publish(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     let (receipt, authority_freeze) = commit_and_freeze_exact(&authority.manager, transaction)
         .with_context(|| format!("publish repository-v6 tag {}", request.name))?;
@@ -437,6 +438,7 @@ fn replay(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     if transaction.transaction_hash()? != receipt.transaction_hash {
         return Err(tag_conflict(format!(

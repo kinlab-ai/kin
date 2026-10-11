@@ -5,8 +5,8 @@
 
 use anyhow::Result;
 use kin_model::{
-    ArtifactId, AuthorId, EntityId, OperationId, RefName, RelationId, RepositoryId, RootBundle,
-    SemanticChangeId, WorkspaceId,
+    ArtifactId, AuthorId, EntityId, Hash256, OperationId, RefName, RelationId, RepositoryId,
+    RootBundle, SemanticChangeId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,52 @@ pub struct MergeRequest {
     pub actor: AuthorId,
 }
 
+/// Read the composition of two recorded branch heads without opening a merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePreviewRequest {
+    pub source: RefName,
+}
+
+/// The complete authority reading the person saw. Confirming compares this
+/// inside the daemon's mutation gates; the publication CAS protects the same
+/// roots against another process moving them afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeExpectation {
+    pub repository_id: RepositoryId,
+    pub workspace_id: WorkspaceId,
+    pub roots: RootBundle,
+    pub target_ref: RefName,
+    pub source_ref: RefName,
+    pub ours_change: SemanticChangeId,
+    pub theirs_change: SemanticChangeId,
+    pub workspace_tree_hash: Hash256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeConfirmRequest {
+    pub source: RefName,
+    pub operation_id: OperationId,
+    pub actor: AuthorId,
+    pub expected: MergeExpectation,
+}
+
+/// A prediction from recorded composition, never a publication receipt.
+/// Projection, admission policy and parser-certificate checks still run when
+/// confirmed. A conflict preview does not create a durable merge record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergePreviewResponse {
+    pub schema: String,
+    pub expected: MergeExpectation,
+    pub base_change: SemanticChangeId,
+    pub outcome: MergeOutcome,
+    pub conflicts: Vec<MergeConflict>,
+    pub conflicts_total: usize,
+    pub limitations: Vec<String>,
+}
+
 /// The exact identity a merge conflict is reported against.
 ///
 /// Identity is never a path: artifacts carry stable `ArtifactId`, so a move on
@@ -33,8 +79,8 @@ pub struct MergeRequest {
 pub enum MergeConflictScope {
     Entity {
         entity: EntityId,
-        /// Qualified name and file at whichever side still carries the entity,
-        /// for a refusal a human can act on. Identity stays the id.
+        /// The entity's name at whichever side still carries it, for a
+        /// refusal a human can act on. Identity stays the id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -55,12 +101,58 @@ pub enum MergeConflictScope {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MergeConflict {
     #[serde(flatten)]
     pub scope: MergeConflictScope,
     pub detail: String,
+}
+
+impl<'de> Deserialize<'de> for MergeConflict {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Serde cannot combine an outer deny_unknown_fields with a flattened
+        // internally tagged enum. Deserialize the complete tagged wire shape
+        // so valid scope fields are consumed and unknown fields still fail.
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+        enum WireConflict {
+            Entity {
+                entity: EntityId,
+                name: Option<String>,
+                detail: String,
+            },
+            Relation {
+                relation: RelationId,
+                detail: String,
+            },
+            Artifact {
+                artifact: ArtifactId,
+                path: Option<String>,
+                detail: String,
+            },
+            Path {
+                path: String,
+                detail: String,
+            },
+        }
+        let (scope, detail) = match WireConflict::deserialize(deserializer)? {
+            WireConflict::Entity {
+                entity,
+                name,
+                detail,
+            } => (MergeConflictScope::Entity { entity, name }, detail),
+            WireConflict::Relation { relation, detail } => {
+                (MergeConflictScope::Relation { relation }, detail)
+            }
+            WireConflict::Artifact {
+                artifact,
+                path,
+                detail,
+            } => (MergeConflictScope::Artifact { artifact, path }, detail),
+            WireConflict::Path { path, detail } => (MergeConflictScope::Path { path }, detail),
+        };
+        Ok(Self { scope, detail })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +275,56 @@ pub(crate) fn merge_parked_exit_line() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn every_merge_conflict_scope_roundtrips_the_flat_strict_wire_shape() {
+        let scopes = [
+            MergeConflictScope::Entity {
+                entity: EntityId::new(),
+                name: None,
+            },
+            MergeConflictScope::Entity {
+                entity: EntityId::new(),
+                name: Some("module::item".into()),
+            },
+            MergeConflictScope::Relation {
+                relation: RelationId::new(),
+            },
+            MergeConflictScope::Artifact {
+                artifact: ArtifactId::new(),
+                path: None,
+            },
+            MergeConflictScope::Artifact {
+                artifact: ArtifactId::new(),
+                path: Some("config.yaml".into()),
+            },
+            MergeConflictScope::Path {
+                path: "shared.txt".into(),
+            },
+        ];
+        for scope in scopes {
+            let conflict = MergeConflict {
+                scope,
+                detail: "Both heads changed this identity".into(),
+            };
+            let mut wire = serde_json::to_value(&conflict).unwrap();
+            assert!(
+                wire["scope"].is_string(),
+                "scope must stay a flat tag: {wire}"
+            );
+            assert_eq!(
+                serde_json::from_value::<MergeConflict>(wire.clone()).unwrap(),
+                conflict
+            );
+            wire["unexpected"] = serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<MergeConflict>(wire).is_err(),
+                "unknown fields must be refused"
+            );
+        }
+    }
+
     #[test]
     fn the_parked_exit_line_keeps_its_graded_sentence_and_names_the_file_form() {
         let line = super::merge_parked_exit_line();

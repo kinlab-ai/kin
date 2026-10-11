@@ -7,6 +7,16 @@ async fn binding_disclosure_impact(
     outstanding: bool,
     stage: &str,
 ) {
+    binding_disclosure_impact_with_coverage(state, caller, outstanding, true, stage).await;
+}
+
+async fn binding_disclosure_impact_with_coverage(
+    state: &Arc<DaemonState>,
+    caller: kin_model::EntityId,
+    outstanding: bool,
+    complete_call_coverage: bool,
+    stage: &str,
+) {
     let result = mcp_call(
         router(Arc::clone(state)),
         "impact_analysis",
@@ -16,13 +26,21 @@ async fn binding_disclosure_impact(
     assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
     let raw = tool_result_payload(&result);
     println!("binding disclosure {stage}: {raw}");
-    let report = &raw["source_derivation"]["report"];
+    // Parse and source inventory facts remain private producer evidence.
+    // The public answer carries only their semantic qualification and scope.
+    let observation =
+        serde_json::to_value(observe_live_head_sources(state, &state.graph, None)).unwrap();
+    let report = &observation["report"];
     assert_eq!(report["body_binding"], "current", "{stage}: {raw}");
     assert_eq!(report["parse_coverage"], "complete", "{stage}: {raw}");
     assert_eq!(
-        report["call_shape_parse_coverage_complete"], true,
+        report["call_shape_parse_coverage_complete"], complete_call_coverage,
         "{stage}: {raw}"
     );
+    if !complete_call_coverage {
+        assert_eq!(report["call_extraction"], "incomplete", "{stage}: {raw}");
+        assert_eq!(report["call_extraction_gaps"], 1, "{stage}: {raw}");
+    }
     assert_eq!(
         report["prior_local_binding"],
         if outstanding {
@@ -36,7 +54,39 @@ async fn binding_disclosure_impact(
         .as_u64()
         .unwrap();
     assert_eq!(count > 0, outstanding, "{stage}: {raw}");
+    assert!(raw.get("source_derivation").is_none(), "{stage}: {raw}");
+    let coverage = &raw["binding_coverage"];
+    assert_eq!(coverage["scope"], "live_head", "{stage}: {raw}");
+    assert_eq!(
+        coverage["checked_scope"], "admitted_inventory",
+        "{stage}: {raw}"
+    );
+    assert_eq!(
+        coverage["local_binding_requirement"], "required",
+        "{stage}: {raw}"
+    );
+    assert_eq!(
+        coverage["binding_scope"]["prior_local_binding"], report["prior_local_binding"],
+        "{stage}: {raw}"
+    );
+    assert_eq!(
+        coverage["binding_scope"]["outstanding_local_binding_obligations"], count,
+        "{stage}: {raw}"
+    );
     if outstanding {
+        assert_eq!(
+            raw["_kin"]["reference_gap"]["kind"], "local_bindings",
+            "{stage}: {raw}"
+        );
+        assert_eq!(
+            raw["_kin"]["reference_gap"]["count"], count,
+            "{stage}: {raw}"
+        );
+        assert_eq!(
+            raw["_kin"]["reference_gap"]["unit"],
+            "outstanding binding obligations (not a caller count)",
+            "{stage}: {raw}"
+        );
         assert_eq!(
             raw["entity_impacts"][0]["call_shapes"]["all_consumers_shaped_calls"], false,
             "{stage}: {raw}"
@@ -51,10 +101,17 @@ async fn binding_disclosure_impact(
         envelope,
         "impact_analysis",
     ));
-    assert_eq!(
-        value["_kin"]["source_derivation"]["report"], *report,
+    assert!(
+        value["_kin"].get("source_derivation").is_none(),
         "{stage}: {value}"
     );
+    assert_eq!(value["binding_coverage"], *coverage, "{stage}: {value}");
+    if !complete_call_coverage {
+        assert_eq!(
+            value["_kin"]["verdict"]["state"], "inconclusive",
+            "{stage}: {value}"
+        );
+    }
     if outstanding {
         assert_eq!(
             value["_kin"]["verdict"]["state"], "inconclusive",
@@ -312,7 +369,8 @@ async fn admit_parse_live_only(state: &Arc<DaemonState>, file: &str, stage: &str
 fn live_and_durable_calls_from(state: &DaemonState, caller: kin_model::EntityId) -> (bool, bool) {
     let calls = |graph: &kin_db::GraphSnapshot| {
         graph.relations.values().any(|relation| {
-            relation.kind == kin_model::RelationKind::Calls && relation.src.as_entity() == Some(caller)
+            relation.kind == kin_model::RelationKind::Calls
+                && relation.src.as_entity() == Some(caller)
         })
     };
     let live = state.graph.semantic_observation();
@@ -418,7 +476,10 @@ async fn local_binding_absence_stays_authoritative_after_an_offline_directory_is
                     ..Default::default()
                 })
                 .unwrap_or_default();
-            if entities.iter().any(|entity| entity.name == "dangling_links") {
+            if entities
+                .iter()
+                .any(|entity| entity.name == "dangling_links")
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -805,6 +866,7 @@ async fn local_binding_disclosure_review_does_not_requalify_unknown_or_transfer(
                         merge_transaction_delta: None,
                         sealed_observation: None,
                         collaboration_delta: None,
+                        git_snapshot_proofs: Vec::new(),
                     },
                     None,
                 )
@@ -838,11 +900,26 @@ async fn local_binding_disclosure_review_does_not_requalify_unknown_or_transfer(
                 json!({"entity_ids":[caller.to_string()],"include_traffic":false}),
             )
             .await;
-            let report = &result["source_derivation"]["report"];
+            let observation =
+                serde_json::to_value(observe_live_head_sources(&view, &view.graph, None)).unwrap();
+            let report = &observation["report"];
             assert_eq!(report["body_binding"], "current");
             assert_eq!(report["parse_coverage"], "complete");
             assert_eq!(report["prior_local_binding"], "unproven");
             assert!(report["outstanding_local_binding_obligations"].is_null());
+            assert!(result.get("source_derivation").is_none());
+            assert_eq!(
+                result["binding_coverage"]["binding_scope"]["prior_local_binding"],
+                "unproven"
+            );
+            assert!(result["binding_coverage"]["binding_scope"]
+                ["outstanding_local_binding_obligations"]
+                .is_null());
+            assert_eq!(result["_kin"]["verdict"]["state"], "inconclusive");
+            assert!(result["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .contains("local_binding_unproven"));
         }
     }
 }
@@ -913,4 +990,69 @@ async fn local_binding_disclosure_review_reply_loss_replays_exact_checked_operat
         replay.outcome,
         kin_model::RepositoryCommitOutcome::IdempotentReplay
     );
+}
+
+#[tokio::test]
+async fn a_store_that_opens_holding_binding_debt_rechecks_it_once() {
+    let (repo, state) = mcp_lifecycle_fixture();
+    std::fs::write(repo.path().join("local.py"), WAITING_TARGET).unwrap();
+    waiting_admit(&state, "reopen debt target").await;
+    std::fs::write(repo.path().join("caller.py"), WAITING_CALLER).unwrap();
+    waiting_admit(&state, "reopen debt caller").await;
+    waiting_commit(&state, "Commit reopen debt fixture").await;
+    let caller = waiting_entity(&state, "caller.py", "run").id;
+    std::fs::remove_file(repo.path().join("local.py")).unwrap();
+    waiting_admit(&state, "reopen debt remove target").await;
+    waiting_commit(&state, "Commit reopen outstanding binding").await;
+    binding_disclosure_impact(&state, caller, true, "held before reopen").await;
+    let layout = state.layout.clone();
+    drop(state);
+
+    // Held debt is re-examined only inside an enrichment publication, and a
+    // settled store has nothing else to publish. Opening it owes one, so a
+    // build whose proof now settles the debt pays it without waiting for an
+    // unrelated edit.
+    let reopened = DaemonState::open(layout.clone()).unwrap();
+    assert!(crate::state::holds_local_binding_debt(
+        reopened.graph.as_ref()
+    ));
+    assert!(
+        reopened.is_dirty(),
+        "a store that opens holding binding debt owes a publication"
+    );
+    reopened.save_snapshot().unwrap();
+    // This debt is genuine, so the publication keeps it and owes nothing more:
+    // the next idle flush does not publish again.
+    assert!(crate::state::holds_local_binding_debt(
+        reopened.graph.as_ref()
+    ));
+    assert!(
+        !reopened.is_dirty(),
+        "one publication settles what the open owed"
+    );
+    drop(reopened);
+
+    // Restoring the target pays the debt, and a store holding none owes
+    // nothing when it opens.
+    let state = waiting_cold_start(layout).await;
+    std::fs::write(repo.path().join("local.py"), WAITING_TARGET).unwrap();
+    waiting_admit(&state, "reopen debt target restored").await;
+    waiting_assert_recovered(
+        &state,
+        "caller.py",
+        WAITING_CALLER,
+        caller,
+        "local.py",
+        json!(["value"]),
+        "reopen debt recovered",
+    )
+    .await;
+    waiting_commit(&state, "Commit repaired reopen binding").await;
+    let layout = state.layout.clone();
+    drop(state);
+    let reopened = DaemonState::open(layout).unwrap();
+    assert!(!crate::state::holds_local_binding_debt(
+        reopened.graph.as_ref()
+    ));
+    assert!(!reopened.is_dirty(), "a store without debt opens clean");
 }

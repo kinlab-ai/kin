@@ -770,13 +770,16 @@ fn resolve_end<G: GraphStore>(
     // bare name that owners carry as their member name (`get` for the method
     // `Scaffold.get`) reaches every one of them, and several are refused with
     // the candidates listed, never ranked down to one. An exact name is never
-    // pooled with members.
-    let members =
+    // pooled with members. A module-qualified name (`Scheduler.advanceTimers`)
+    // reaches what its qualifier pins.
+    let (members, qualified) =
         match kin_ranking::entity_ranking::reach_by_name(store, name).map_err(graph_error)? {
-            kin_ranking::entity_ranking::NameReach::Members(members) => members,
-            _ => Vec::new(),
+            kin_ranking::entity_ranking::NameReach::Members(members) => (members, Vec::new()),
+            kin_ranking::entity_ranking::NameReach::Qualified(found) => (Vec::new(), found),
+            _ => (Vec::new(), Vec::new()),
         };
     let by_member = !members.is_empty();
+    let by_qualifier = !qualified.is_empty();
     let exact: Vec<Entity> = matches
         .iter()
         .filter(|entity| entity.name == name)
@@ -789,8 +792,11 @@ fn resolve_end<G: GraphStore>(
     // listed so the caller pins one by file or id. Measured on ripgrep, where
     // `SearchWorker::search` was refused outright while three entities named
     // `search` sat in the graph.
-    let leaf_only = matches.is_empty();
-    let mut pool = if leaf_only {
+    let leaf_only = matches.is_empty() && !by_qualifier;
+    let by_exact_name = !exact.is_empty();
+    let mut pool = if by_qualifier {
+        qualified
+    } else if leaf_only {
         let leaf = name
             .rfind("::")
             .map(|index| &name[index + 2..])
@@ -876,18 +882,64 @@ fn resolve_end<G: GraphStore>(
             detail: "no entity carries this name".to_string(),
         });
     }
-    if by_member {
-        if pool.len() > 1 {
+    // Every tier below answers with one entity only when the name stands for
+    // one once the twins of a declaration are folded (a prototype into its
+    // definition, arms of one declaration in one file into one), and refuses
+    // with the candidates otherwise. A C prototype and its definition still
+    // resolve to the definition, as they always have; two definitions in two
+    // files are two answers, and ranking one of them in was the silent pick.
+    let fold = |pool: Vec<Entity>| -> std::result::Result<Vec<Entity>, PathError> {
+        let mut distinct = kin_ranking::entity_ranking::fold_same_name_twins(store, pool)
+            .map_err(graph_error)?
+            .distinct;
+        sort_candidates(&mut distinct);
+        Ok(distinct)
+    };
+    if by_member || by_qualifier {
+        let mut distinct = fold(pool)?;
+        if distinct.len() > 1 {
+            let reason = if by_member
+                || !distinct
+                    .iter()
+                    .all(|entity| entity.name == distinct[0].name)
+            {
+                kin_ranking::entity_ranking::CandidateReason::SharedMemberName
+            } else {
+                kin_ranking::entity_ranking::same_name_reason(name, &distinct)
+            };
             return Err(PathError::EndpointAmbiguous {
                 which,
                 spec: spec.to_string(),
-                reason: kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
-                candidates: pool,
+                reason,
+                candidates: distinct,
             });
         }
-        let chosen = pool.remove(0);
+        let chosen = distinct.remove(0);
         let twins = exact_name_matches(store, &chosen.name)?;
-        let endpoint = endpoint_record(&chosen, "member_name", &twins);
+        let addressed_by = if by_member {
+            "member_name"
+        } else {
+            "qualified_name"
+        };
+        let endpoint = endpoint_record(&chosen, addressed_by, &twins);
+        return Ok(ResolvedEnd {
+            entity: chosen,
+            endpoint,
+        });
+    }
+    if by_exact_name {
+        let mut distinct = fold(pool)?;
+        if distinct.len() > 1 {
+            return Err(PathError::EndpointAmbiguous {
+                which,
+                spec: spec.to_string(),
+                reason: kin_ranking::entity_ranking::CandidateReason::SameName,
+                candidates: distinct,
+            });
+        }
+        let chosen = distinct.remove(0);
+        let twins = exact_name_matches(store, &chosen.name)?;
+        let endpoint = endpoint_record(&chosen, "name", &twins);
         return Ok(ResolvedEnd {
             entity: chosen,
             endpoint,
@@ -1520,7 +1572,7 @@ fn compose_gap(
         "edge_ceiling" | "time_budget" | "cancelled" => {
             "narrow the walk with a smaller max_depth or a closer pair; the graph beyond the ceiling was not explored".to_string()
         }
-        _ => "check that both ends resolved to the entities you meant (same_name_candidates and other_candidates on from and to), pin a twin with name@file or its entity id, or pass include_type_edges to walk type annotations too".to_string(),
+        _ => "check that both ends resolved to the entities you meant (same_name_candidates and other_candidates on from and to), pin a twin by its entity id, or pass include_type_edges to walk type annotations too".to_string(),
     };
     PathGap {
         reason: most_limiting,
@@ -1866,11 +1918,13 @@ pub fn handle_trace_path<G: GraphStore>(
             reason,
             candidates,
         }) => {
-            let mut value = crate::handlers::entities::name_candidates_json(
+            let names = crate::handlers::entities::candidate_names(store, &candidates);
+            let mut value = crate::handlers::entities::name_candidates_json_named(
                 TOOL_NAME,
                 &spec,
                 reason,
                 &candidates,
+                &names,
             );
             value["end"] = serde_json::json!(which);
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
@@ -2340,7 +2394,8 @@ mod tests {
     #[test]
     fn a_twin_is_pinned_by_file_and_disclosed_by_name() {
         let store = InMemoryGraph::new();
-        let declared = make_entity("run", "src/main.c", EntityKind::Function, 3);
+        let mut declared = make_entity("run", "src/main.c", EntityKind::Function, 3);
+        declared.signature = "void run(void);".to_string();
         let defined = make_entity("run", "src/mod1.c", EntityKind::Function, 40);
         let target = function("target", "src/mod2.c");
         seed(
@@ -2393,7 +2448,8 @@ mod tests {
     #[test]
     fn a_no_route_answer_names_a_twin_it_did_not_walk() {
         let store = InMemoryGraph::new();
-        let declared = make_entity("run", "src/main.c", EntityKind::Function, 3);
+        let mut declared = make_entity("run", "src/main.c", EntityKind::Function, 3);
+        declared.signature = "void run(void);".to_string();
         let defined = make_entity("run", "src/mod1.c", EntityKind::Function, 40);
         let target = function("target", "src/mod2.c");
         seed(

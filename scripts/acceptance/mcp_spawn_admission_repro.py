@@ -56,6 +56,11 @@ import threading
 import time
 from pathlib import Path
 
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
+
 TICKET = "FIR-3099"
 
 # The daemon's own line for "my embedding worker is past the init wait and
@@ -232,7 +237,7 @@ def build_fixture(root: Path, kin: str, env: dict) -> Path:
             raise RuntimeError(
                 f"{' '.join(argv)} failed ({done.returncode}): "
                 f"{failure_excerpt(done.stderr or done.stdout)}")
-    done = subprocess.run([kin, "init", "--no-enrich", "."], cwd=repo, env=env,
+    done = subprocess.run([kin, "init", "--defer-enrich", "."], cwd=repo, env=env,
                           capture_output=True, text=True)
     if done.returncode != 0:
         raise RuntimeError(f"kin init failed ({done.returncode}): "
@@ -252,7 +257,12 @@ def session(kin: str, daemon_bin: str, repo: Path, kin_home: Path, cwd: Path,
     window this suite is watching.
     """
     env = dict(os.environ)
+    # This fixture inspects/copies an in-tree store; central layout is
+    # qualified separately by brownfield_repro --store-layout central.
+    env["KIN_STORE_LAYOUT"] = "in-tree"
     env["KIN_HOME"] = str(kin_home)
+    # Written against a store that holds its complete history.
+    env["KIN_INIT_HISTORY"] = "full"
     env["KIN_EMBED_BACKEND"] = "cpu"
     env["KIN_MCP_TOOL_PROFILE"] = "agent-default"
     for leaked in ("KIN_DAEMON_URL", "KIN_NO_DAEMON", "KIN_MCP_REPO"):
@@ -344,6 +354,9 @@ def check_handshake_starts_no_daemon(kin, daemon_bin, workdir) -> dict:
     home = root / "kin-home"
     home.mkdir(parents=True)
     env = {**os.environ, "KIN_HOME": str(home), "KIN_EMBED_BACKEND": "cpu"}
+    # This fixture inspects/copies an in-tree store; central layout is
+    # qualified separately by brownfield_repro --store-layout central.
+    env["KIN_STORE_LAYOUT"] = "in-tree"
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, repo, None, None, WATCH_SECONDS)
     if outcome["daemons"]:
@@ -367,6 +380,9 @@ def check_roots_answer_starts_no_daemon(kin, daemon_bin, workdir) -> dict:
     outside = root / "not-a-repo"
     outside.mkdir(parents=True)
     env = {**os.environ, "KIN_HOME": str(home), "KIN_EMBED_BACKEND": "cpu"}
+    # This fixture inspects/copies an in-tree store; central layout is
+    # qualified separately by brownfield_repro --store-layout central.
+    env["KIN_STORE_LAYOUT"] = "in-tree"
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, outside, repo, None, WATCH_SECONDS)
     if outcome["daemons"]:
@@ -388,6 +404,9 @@ def check_a_tool_call_still_starts_the_daemon(kin, daemon_bin, workdir) -> dict:
     home = root / "kin-home"
     home.mkdir(parents=True)
     env = {**os.environ, "KIN_HOME": str(home), "KIN_EMBED_BACKEND": "cpu"}
+    # This fixture inspects/copies an in-tree store; central layout is
+    # qualified separately by brownfield_repro --store-layout central.
+    env["KIN_STORE_LAYOUT"] = "in-tree"
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, repo, None, "semantic_locate",
                       WATCH_SECONDS * 2, stop_when="daemon")
@@ -406,6 +425,9 @@ def check_a_tool_call_still_dispatches_the_embed(kin, daemon_bin, workdir) -> di
     home = root / "kin-home"
     home.mkdir(parents=True)
     env = {**os.environ, "KIN_HOME": str(home), "KIN_EMBED_BACKEND": "cpu"}
+    # This fixture inspects/copies an in-tree store; central layout is
+    # qualified separately by brownfield_repro --store-layout central.
+    env["KIN_STORE_LAYOUT"] = "in-tree"
     repo = build_fixture(root, kin, env)
     outcome = session(kin, daemon_bin, repo, home, repo, None, "semantic_locate",
                       WATCH_SECONDS * 2, stop_when="embed")

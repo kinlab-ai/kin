@@ -1,0 +1,6 @@
+# Sources allowed to suppress a lint that would silence the filesystem
+# boundary lint (clippy::disallowed_methods and its groups). One path per line.
+
+# The durable flush switch: the one place allowed to call File::sync_all and
+# File::sync_data, which the workspace clippy.toml disallows everywhere else.
+crates/kin-blobs/src/durable.rs

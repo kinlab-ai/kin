@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Every durable flush goes through the `durable` module of the kin-blobs crate, which is
+# the only place allowed to call these methods. A release build calls the standard
+# library's flush unchanged; a debug build can relax it for the test suite. A
+# direct call would bypass that switch and quietly slow the tests down again.
+# cap-std's File flushes through the standard library, so it is listed too;
+# `into_std()` hands kin_blobs::durable the same handle at no cost. `allow-invalid`
+# keeps crates that do not depend on cap-std from warning about its paths.
+disallowed-methods = [
+    { path = "std::fs::File::sync_all", reason = "call kin_blobs::durable::sync_all(&file) so tests can relax the flush" },
+    { path = "std::fs::File::sync_data", reason = "call kin_blobs::durable::sync_data(&file) so tests can relax the flush" },
+    { path = "cap_std::fs::File::sync_all", reason = "call kin_blobs::durable::sync_all(&file.into_std()) so tests can relax the flush", allow-invalid = true },
+    { path = "cap_std::fs::File::sync_data", reason = "call kin_blobs::durable::sync_data(&file.into_std()) so tests can relax the flush", allow-invalid = true },
+]

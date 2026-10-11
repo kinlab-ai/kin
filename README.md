@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/kin-banner-2026.png" alt="Kin, a code repository for people and AI agents" width="100%" />
+  <img src="docs/assets/kin-banner-2026.png" alt="Kin, a code repository for AI agents and the people who build with them" width="100%" />
 </p>
 
 <h3 align="center">A new foundation for code.</h3>
@@ -9,7 +9,7 @@
   <a href="https://github.com/firelock-ai/kin/releases/latest"><img src="https://img.shields.io/badge/release-latest-6E56CF.svg" alt="Latest release" /></a>
 </p>
 
-**Kin is a graph-native code repository for people and AI agents.** It stores source, recorded code relationships, and versioned history as repository state. The graph is the repository model, not a search index maintained beside another repository.
+**Kin is a graph-native code repository for AI agents and the people who build with them.** It stores source, recorded code relationships, and versioned history as repository state. The graph is the repository model, not a search index maintained beside another repository.
 
 Functions, types, and the relationships between them are data you commit, branch, and merge. Exact source is preserved byte for byte, and filesystem projections let supported tools keep working with ordinary files.
 
@@ -50,7 +50,7 @@ Kin is not published on crates.io. The `kin` crate there is an unrelated project
 
 ## Quickstart
 
-Start in a fresh, full clone of a project you know well. `kin init` reads your Git history without changing it or your tracked files. It adds a `.kin` directory and one line to `.git/info/exclude`. Import covers every commit your branches and tags reach, so time, memory and disk grow with history rather than with the size of the checkout. Before it starts, `kin init` checks memory and free disk and stops with the numbers when it can already tell the machine is short. **Shallow clones, submodules and Git LFS are not supported**, and Git hooks, a sparse checkout or an unfinished merge or rebase also stop the import. `kin init` names the fix for each, and a fresh clone avoids most of them.
+Start in a fresh, full clone of a project you know well. `kin init` reads your Git history without changing it or your tracked files. It keeps its store outside your checkout, in `~/.kin/stores`, and writes nothing into the repository; `kin store path` prints where a checkout's store is. By default it admits the checked-out commit first, so questions answer as soon as that tree is read, and then imports every commit your branches and tags reach in the background, at low priority; `kin init --history full` imports the whole history up front, and `--history none` never imports it. Importing history takes time, memory and disk that grow with history rather than with the size of the checkout. Before it starts, `kin init` checks memory and free disk and stops with the numbers when it can already tell the machine is short. **A shallow clone admits only its checked-out commit, and submodules and Git LFS are not supported**, and Git hooks, a sparse checkout or an unfinished merge or rebase also stop the import. `kin init` names the fix for each, and a fresh clone avoids most of them.
 
 ### 1. Install
 
@@ -143,19 +143,26 @@ if you said yes. There is no separate linking step. After you install another to
 `kin setup` again, and `kin setup status` shows what is connected. On Windows, connect AI
 tools inside WSL2.
 
-Semantic search runs on a local model of about 523 MB, and setup asks before anything
-downloads it. If you said no, or `kin init` says the search index is waiting for the model,
-this downloads it and builds the index:
+Graph and lexical retrieval work without a model. Embeddings and reranking are optional,
+and their model providers default to `none`. Standard CLI and daemon builds include external
+HTTP model support. Built-in models require a build with optional local inference enabled.
+
+To build an embedding index using an OpenAI-compatible endpoint you operate:
 
 ```sh
-kin embed
+KIN_MODEL_EMBEDDINGS_PROVIDER=external \
+KIN_MODEL_EMBEDDINGS_BASE_URL=http://localhost:1234/v1 \
+KIN_MODEL_EMBEDDINGS_MODEL=your-served-embedding-model kin embed
 ```
+
+Model endpoints receive the selected entity text needed for their stage.
+[Model settings](docs/env-vars.md) describe providers, model identities, and credential environment variable names.
 
 Kin supports Claude Code, Codex, Cursor, Gemini, and other MCP clients. Use `kin setup --intent editor` for VS Code. Kin also includes `kin agent run` for local or hosted OpenAI-compatible model endpoints.
 
 [Client configuration](docs/readme-reference.md#works-with-your-agent) · [MCP tools](docs/mcp-tools.md) · [Built-in agent](docs/cli-reference.md#kin-agent)
 
-Local imports, storage, and queries run on your machine. Installation and the initial embedding-model download need network access. Before embeddings are ready, `kin locate` uses lexical and graph signals and reports the missing vector coverage.
+Local imports, storage, and graph queries run on your machine. Installing Kin needs network access; the default graph retrieval path needs no model download. When an embedding provider is selected, queries report its vector coverage and any gaps.
 
 ## Review a change
 
@@ -179,7 +186,7 @@ Kin has its own commits, branches, merges, diffs, and history, including in repo
 
 **Compatibility varies.** Release archives do not include the deprecated `kin-vfs` filesystem projection, so there is no transparent projection to rely on. Check [platform notes](docs/readme-reference.md#platform-and-maturity) for what each platform supports.
 
-**Back up Kin-only state.** Commits, branches, reviews and specs you record with Kin live in `.kin`, not in Git. Deleting `.kin` and re-importing from Git does not recover them, so run `kin backup create` first. Read the [import, recovery, and upgrade notes](docs/readme-reference.md#what-is-real-today-and-what-is-beta).
+**Back up Kin-only state.** Commits, branches, reviews and specs you record with Kin live in the repository's Kin store, not in Git. Deleting the store and re-importing from Git does not recover them, so run `kin backup create` first. `kin store prune` deletes stores only when you pass `--yes`, for the same reason. Read the [import, recovery, and upgrade notes](docs/readme-reference.md#what-is-real-today-and-what-is-beta).
 
 **Windows.** Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 

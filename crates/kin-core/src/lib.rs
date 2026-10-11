@@ -17,6 +17,7 @@ pub mod config;
 pub mod dependencies;
 pub mod diff;
 pub mod disambiguation;
+pub mod enrichment_setting;
 pub mod entry_points;
 pub mod env_registry;
 pub mod error;
@@ -24,6 +25,8 @@ pub mod exact_tree;
 pub mod file_limit;
 pub mod git_init;
 pub mod graph_section;
+pub mod history_attach;
+pub mod history_state;
 pub mod hooks;
 pub mod hydration_semantics;
 pub mod identity;
@@ -33,7 +36,8 @@ pub mod init_budget;
 pub mod init_disk;
 mod init_progress;
 pub use init_progress::{
-    compact_admission_progress, report_admission_progress, AdmissionStepObserver,
+    compact_admission_progress, report_admission_progress, shown as admission_phase_shown,
+    AdmissionStepObserver, COMPLETE_ADMISSION_PHASE_LABELS,
 };
 mod init_staging;
 pub mod last_admission;
@@ -41,18 +45,22 @@ pub mod layout;
 pub mod lsp_scope;
 pub mod manifest;
 pub mod memory_pressure;
+pub mod models;
 pub mod paging;
+pub mod prepared_store;
 pub mod ranking;
 pub mod ref_view;
 pub mod reference_coverage;
 pub mod registry;
 pub mod relation_census;
 pub mod repository_authority;
+pub mod repository_origin;
 pub mod resolver;
 pub mod retained_parse;
 #[cfg(any(test, feature = "test-support"))]
 pub mod session_publication_test_support;
 pub mod shims;
+mod store_records;
 pub mod sync_state;
 /// Scoped, restoring, serialized environment mutation for test code.
 ///
@@ -62,6 +70,7 @@ pub mod sync_state;
 pub mod test_env;
 pub mod tool_prefix;
 pub mod tree;
+pub mod umask;
 pub mod vector_producer_policy;
 pub mod workspace_carry;
 pub mod workspace_semantics;
@@ -79,15 +88,18 @@ pub use assistant_sync::{
 pub use config::{
     AgentExecConfig, ExecutionPolicyConfig, ExternalToolExecutionPolicy, GitBranchTrackingConfig,
     GitCoexistenceConfig, GitPushDefault, GitRemoteTransportConfig, KinConfig, RemoteConfig,
-    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, ResourcesConfig, WorldConfig,
-    WorldPreset, RESOURCE_PROFILE_NAMES,
+    RemoteHostKind, RemoteRefConfig, RemoteTransportKind, ResourcesConfig, RetrievalConfig,
+    WorldConfig, WorldPreset, RESOURCE_PROFILE_NAMES, RETRIEVAL_ARM_NAMES, RETRIEVAL_SCORER_NAMES,
 };
 pub use error::{KinError, ProjectionConflictDetail, ProjectionConflictKind, Result};
 pub use exact_tree::{
     exact_tree_correction, plan_artifact_copy, plan_artifact_move, plan_artifact_operations,
     plan_observed_tree_deltas, ArtifactTreeOperation,
 };
-pub use git_init::{init_from_git, init_from_git_adopting};
+pub use git_init::{
+    derive_complete_history_into_stage, init_current_commit_from_git, init_from_git,
+    init_from_git_adopting,
+};
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
@@ -134,8 +146,8 @@ pub use disambiguation::{
     name_resolution_certainly_misses, prefer_definition_among_same_name, query_trace_matches,
 };
 pub use identity::{
-    resolve_commit_identity, unresolved_identity_message, CommitIdentity, IdentitySource,
-    IDENTITY_REMEDIATION,
+    git_identity_gap, resolve_commit_identity, unresolved_identity_message, CommitIdentity,
+    IdentitySource, IDENTITY_REMEDIATION,
 };
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
