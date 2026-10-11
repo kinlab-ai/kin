@@ -320,6 +320,7 @@ fn owed_publication(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     (transaction, workspace.workspace_id, path, body_hash)
 }

@@ -257,14 +257,7 @@ pub(crate) fn require_fresh_daemon_workspace(
     workspace_graph: &kin_db::GraphSnapshot,
     operation: &str,
 ) -> Result<()> {
-    let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
-    if daemon_generation != roots.generation {
-        bail!(
-            "daemon repository cursor is at generation {daemon_generation}, but the authority for \
-             {operation} is at generation {}; reopen from repository authority before mutating",
-            roots.generation
-        );
-    }
+    require_daemon_authority_generation(state, roots, operation)?;
     let live = state.graph.to_snapshot();
     if live.resolved_tree != workspace_graph.resolved_tree {
         bail!(
@@ -272,10 +265,60 @@ pub(crate) fn require_fresh_daemon_workspace(
              {operation}"
         );
     }
-    if let Some(divergence) = authority_semantics_divergence(&live, workspace_graph) {
+    let retired = || {
+        state
+            .lsp_settled_guesses
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default()
+    };
+    let at_startup = state
+        .startup_rederivation
+        .lock()
+        .map(|held| held.clone())
+        .unwrap_or_default();
+    let mut divergence =
+        authority_semantics_divergence(&live, workspace_graph, &retired(), &at_startup);
+    if divergence.is_some() {
+        // A sweep takes a batch of relations out of the live graph and records
+        // them as retired just afterwards. A snapshot taken between the two
+        // shows them gone and unrecorded, so look once more after that moment
+        // has passed, before saying something is lost.
+        std::thread::sleep(RETIREMENT_RECORD_WAIT);
+        divergence =
+            authority_semantics_divergence(&live, workspace_graph, &retired(), &at_startup);
+    }
+    if let Some(divergence) = divergence {
         bail!(
-            "daemon graph no longer holds the repository workspace authority it was planned \
-             against ({divergence}); reopen before {operation}"
+            "daemon graph {LOST_AUTHORITY} it was planned against ({divergence}); reopen before \
+             {operation}"
+        );
+    }
+    Ok(())
+}
+
+/// The words every refusal carries when the daemon's graph has lost something
+/// repository authority owns. Nothing in a running daemon brings that back, so
+/// a caller that reads them knows repeating the command cannot succeed.
+pub(crate) const LOST_AUTHORITY: &str = "no longer holds the repository workspace authority";
+
+/// How long a sweep may take to record the relations it has just retired.
+const RETIREMENT_RECORD_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Refuse a current-source read for a write while the daemon still needs to
+/// recover a published authority generation. This is the same first gate the
+/// complete workspace check uses, without cloning either graph to read a ticket.
+pub(crate) fn require_daemon_authority_generation(
+    state: &DaemonState,
+    roots: &RootBundle,
+    operation: &str,
+) -> Result<()> {
+    let daemon_generation = state.snapshot_generation.load(Ordering::SeqCst);
+    if daemon_generation != roots.generation {
+        bail!(
+            "daemon repository cursor is at generation {daemon_generation}, but the authority for \
+             {operation} is at generation {}; reopen from repository authority before mutating",
+            roots.generation
         );
     }
     Ok(())
@@ -287,7 +330,19 @@ pub(crate) fn require_fresh_daemon_workspace(
 /// A derived view may hold more than authority owns, and it may hold a richer
 /// value for something authority owns. It may never hold less: a dropped entity
 /// or relation means the daemon is answering from something other than graph
-/// truth, and no derived writer produces that.
+/// truth.
+///
+/// One derived writer does take relations out, and what it takes out is not
+/// lost. A language-server sweep retires the call guesses it contradicted and
+/// the proofs it withdrew from the live graph first, records each in
+/// `retired` ([`DaemonState::lsp_settled_guesses`]), and tells authority at its
+/// next enrichment publication. Until then authority still holds them and the
+/// live graph does not. Counting that as a loss refused every commit made
+/// between a sweep and its publication, and every commit for good once a
+/// publication failed, with an instruction to send the commit again that
+/// could never work. A commit plans from authority and then lands the live
+/// graph on exactly what it committed, so a retirement still waiting comes
+/// back with it and the next sweep settles it again.
 ///
 /// A rewrite is deliberately not divergence. Parser reconciliation and the
 /// asynchronous LSP enrichment worker publish semantic facets onto existing
@@ -309,21 +364,152 @@ pub(crate) fn require_fresh_daemon_workspace(
 /// with both generations named. After the commit the live graph is corrected
 /// onto authority and verified, which is where a genuinely corrupt derived
 /// value is caught.
+///
+/// The startup repair takes things out too, and they are not lost either. A
+/// store an older build derived is re-derived from the bytes it holds before
+/// the daemon serves, and what this build's parser does not produce from those
+/// bytes leaves the live graph while authority keeps it until a commit records
+/// the re-derivation. The repair records what it removed in `at_startup`
+/// ([`DaemonState::startup_rederivation`]). Counting that as a loss refused
+/// every commit on an upgraded store, and the daemon the refusal said to start
+/// ran the same repair and was refused the same way.
 fn authority_semantics_divergence(
     live: &kin_db::GraphSnapshot,
     authority: &kin_db::GraphSnapshot,
+    retired: &std::collections::BTreeSet<kin_model::RelationId>,
+    at_startup: &StartupRederivation,
 ) -> Option<String> {
     for entity_id in authority.entities.keys() {
-        if !live.entities.contains_key(entity_id) {
+        if !live.entities.contains_key(entity_id)
+            && !at_startup.entities_removed.contains(entity_id)
+        {
             return Some(format!("entity {entity_id} is missing"));
         }
     }
     for relation_id in authority.relations.keys() {
-        if !live.relations.contains_key(relation_id) {
+        if !live.relations.contains_key(relation_id)
+            && !retired.contains(relation_id)
+            && !at_startup.relations_removed.contains(relation_id)
+        {
             return Some(format!("relation {relation_id} is missing"));
         }
     }
     None
+}
+
+/// What this daemon's startup repair re-derived in its live graph while
+/// repository authority still holds the older derivation, held until a commit
+/// records it.
+///
+/// The repair re-derives, before the daemon serves, every admitted source whose
+/// stored declarations its bytes do not produce under this build: a store an
+/// older Kin build wrote, or edits no commit recorded. It works on the live
+/// graph alone and leaves authority and the workspace overlay as they were, so
+/// a workspace stays as clean as it was for every command that needs it clean,
+/// and the next commit records the re-derivation. This is what that needs:
+///
+/// - what the repair removed, so the freshness check above tells it from a
+///   loss;
+/// - every identity it touched, so an MCP commit, which plans from authority's
+///   own graph, can land those identities on the values the live graph serves
+///   before it plans ([`crate::mcp_commit`]). Without that, the planner
+///   re-derives an edit against dependents the strict reader refuses for still
+///   holding the older derivation, and the re-derivation is never recorded.
+///
+/// Identities rather than values, because what the commit carries is what the
+/// daemon serves when it commits: a language-server publication that lands
+/// between the start and the commit moves authority on, and a value captured at
+/// the start would no longer apply to it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StartupRederivation {
+    pub(crate) files: Vec<kin_model::RepoPath>,
+    pub(crate) entities: std::collections::BTreeSet<kin_model::EntityId>,
+    pub(crate) relations: std::collections::BTreeSet<kin_model::RelationId>,
+    pub(crate) external_references: std::collections::BTreeSet<kin_model::ExternalReferenceId>,
+    pub(crate) entities_removed: std::collections::BTreeSet<kin_model::EntityId>,
+    pub(crate) relations_removed: std::collections::BTreeSet<kin_model::RelationId>,
+}
+
+impl StartupRederivation {
+    /// The record of one repair, from the transition it applied to the live
+    /// graph.
+    pub(crate) fn new(
+        transition: &kin_model::WorkspaceSemanticDelta,
+        files: Vec<kin_model::RepoPath>,
+    ) -> Self {
+        let mut record = Self {
+            files,
+            ..Self::default()
+        };
+        for delta in transition.entity_deltas() {
+            record.entities.insert(delta.target_id());
+            if let kin_model::EntityDelta::Removed { old } = delta {
+                record.entities_removed.insert(old.id);
+            }
+        }
+        for delta in transition.relation_deltas() {
+            record.relations.insert(delta.target_id());
+            if let kin_model::RelationDelta::Removed { old } = delta {
+                record.relations_removed.insert(old.id);
+            }
+        }
+        for delta in transition.external_reference_deltas() {
+            record.external_references.insert(delta.target_id());
+        }
+        record
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entities.is_empty() && self.relations.is_empty() && self.external_references.is_empty()
+    }
+}
+
+/// The semantic domains a workspace transition compares, captured by value
+/// under one read of each, without the revision history and audit log a
+/// snapshot also clones.
+pub(crate) struct SemanticDomains {
+    entities: std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    relations: std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    external_references:
+        std::collections::HashMap<kin_model::ExternalReferenceId, kin_model::ExternalReference>,
+    resolution_records:
+        std::collections::HashMap<kin_model::ResolutionRecordId, kin_model::ResolutionRecord>,
+}
+
+impl SemanticDomains {
+    pub(crate) fn capture(graph: &kin_db::InMemoryGraph) -> Self {
+        let mut entities = std::collections::HashMap::new();
+        graph.for_each_entity(|entity| {
+            entities.insert(entity.id, entity.clone());
+        });
+        let mut relations = std::collections::HashMap::new();
+        graph.for_each_relation(|relation| {
+            relations.insert(relation.id, relation.clone());
+        });
+        Self {
+            entities,
+            relations,
+            external_references: graph
+                .list_external_references()
+                .into_iter()
+                .map(|reference| (reference.id, reference))
+                .collect(),
+            resolution_records: graph
+                .list_resolution_records()
+                .into_iter()
+                .map(|record| (record.id(), record))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn target(&self) -> TargetGraph<'_> {
+        TargetGraph {
+            entities: &self.entities,
+            relations: &self.relations,
+            external_references: &self.external_references,
+            resolution_records: &self.resolution_records,
+        }
+    }
 }
 
 /// The graph a transition moves to, by the domains a transition compares.

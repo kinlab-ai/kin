@@ -36,7 +36,7 @@
 //! particular query reads. A graph can be initialized, loaded, fully embedded and
 //! undegraded while holding no cross-file `calls`/`imports`/`references` edges at
 //! all, and every reference query against it returns an empty array for reasons
-//! that have nothing to do with the code. [`absence_cross_file_classes`] is the
+//! that have nothing to do with the code. [`absence_cross_unit_classes`] is the
 //! per-tool map of which edge classes each tool's absence claim depends on, and
 //! [`edge_coverage_gap`] is the gate that reads the observation
 //! [`crate::edge_coverage`] publishes into the payload. A tool that declares a
@@ -87,8 +87,8 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
     else {
         return Some(
             "file_coverage_unreported: this answer did not report whether a language adapter \
-             parsed the file, so an empty enumeration cannot be distinguished from a file \
-             nothing ever extracted entities from"
+             parsed the source unit, so an empty enumeration cannot be distinguished from a \
+             source unit nothing ever extracted entities from"
                 .to_string(),
         );
     };
@@ -112,9 +112,9 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
     let host_bytes = coverage.get("host_bytes").and_then(Value::as_str);
     if host_bytes == Some("diverged") {
         return Some(
-            "file_bytes_unadmitted: the working copy holds content at this path that graph \
-             truth does not carry, so every span here was derived from earlier bytes and the \
-             line numbers do not describe the file as it is now. `kin admit` takes the \
+            "file_bytes_unadmitted: the working copy holds content for this source unit that \
+             graph truth does not carry, so every span here was derived from earlier bytes and \
+             the line numbers do not describe the source unit as it is now. `kin admit` takes the \
              complete working tree, and a commit takes it anyway"
                 .to_string(),
         );
@@ -130,7 +130,8 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         return Some(
             "file_bytes_unchecked: this repository has a working copy the graph is supposed to \
              be level with and nothing in this daemon is comparing them, so whether the spans \
-             here describe the file as it is now is not known and this answer is not evidence \
+             here describe the source unit as it is now is not known and this answer is not \
+             evidence \
              either way. Filesystem-to-graph ingestion is switched off for this daemon \
              (`KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE`); `kin admit` takes the complete \
              working tree into graph authority now"
@@ -148,7 +149,8 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         return Some(
             "file_bytes_unchecked: this repository has a working copy the graph is supposed to \
              be level with and nothing in this daemon is comparing them, so whether the spans \
-             here describe the file as it is now is not known and this answer is not evidence \
+             here describe the source unit as it is now is not known and this answer is not \
+             evidence \
              either way. Filesystem-to-graph ingestion is switched off for this daemon \
              (`KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE`); `kin admit` takes the complete \
              working tree into graph authority now"
@@ -165,9 +167,9 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         return Some(format!(
-            "file_spans_stale: {stale} entity span(s) in this file were derived from bytes the \
-             repository tree no longer holds at this path, so the enumeration describes an \
-             earlier state of the file, and the graph has admitted the new source and not yet \
+            "file_spans_stale: {stale} entity span(s) in this source unit were derived from bytes \
+             the repository tree no longer holds for it, so the enumeration describes an \
+             earlier state of the source unit, and the graph has admitted the new source and not yet \
              re-derived these entities"
         ));
     }
@@ -175,31 +177,31 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         "full" => {}
         "absent" => {
             return Some(
-                "file_not_parsed: no language adapter produced a layout for this file, so the \
-                 graph holds no entity set for it to be missing from. An empty enumeration here \
-                 is a fact about Kin's extraction coverage, not about the file's contents"
+                "file_not_parsed: no language adapter produced a layout for this source unit, so \
+                 the graph holds no entity set for it to be missing from. An empty enumeration \
+                 here is a fact about Kin's extraction coverage, not about the code it holds"
                     .to_string(),
             )
         }
         "unrecorded" => {
             return Some(
-                "file_parse_unrecorded: the graph holds entities for this file and no record of \
-                 how completely they were extracted, so the rows here are real and the claim \
-                 that they are all of them is one nothing in the store stands behind. This is \
-                 not a file no adapter read: it is a parse whose completeness record did not \
+                "file_parse_unrecorded: the graph holds entities for this source unit and no \
+                 record of how completely they were extracted, so the rows here are real and the \
+                 claim that they are all of them is one nothing in the store stands behind. This \
+                 is not a source unit no adapter read: it is a parse whose completeness record did not \
                  survive. `kin admit` re-parses the working tree and writes one"
                     .to_string(),
             )
         }
         "partial" => {
             return Some(format!(
-                "file_parsed_partially: the adapter hit parse errors in this file{detail}, so the \
+                "file_parsed_partially: the adapter hit parse errors in this source unit{detail}, so the \
                  entities it produced are a floor and the enumeration may be short"
             ))
         }
         "failed" => {
             return Some(format!(
-                "file_parse_failed: the adapter could not parse this file{detail}, so whatever \
+                "file_parse_failed: the adapter could not parse this source unit{detail}, so whatever \
                  entities the graph still carries for it describe an earlier state"
             ))
         }
@@ -213,7 +215,7 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
 
     if coverage.get("enumeration_shifted").and_then(Value::as_bool) == Some(true) {
         return Some(
-            "enumeration_shifted: the file gained or lost entities between the page that minted \
+            "enumeration_shifted: the source unit gained or lost entities between the page that minted \
              this cursor and the page it served, so these pages do not assemble into one state of \
              the repository. Re-walk from the start"
                 .to_string(),
@@ -226,7 +228,7 @@ fn file_enumeration_gap(payload: &Value) -> Option<String> {
         != Some(true)
     {
         return Some(
-            "page_bounded: this response holds one page of the file rather than all of it, so its \
+            "page_bounded: this response holds one page of the source unit rather than all of it, so its \
              rows are a floor. Follow `next_cursor` to the end before reading the set as whole"
                 .to_string(),
         );
@@ -332,7 +334,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
         FILE_ENTITIES_TOOL => RetrievalSpec {
             field: "entities",
             kind: "no_file_entities",
-            subject: "the graph holds no entities for this file",
+            subject: "the graph holds no entities for this source unit",
             always: false,
             class: NegativeClass::Structural,
         },
@@ -386,7 +388,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
         // This was the last retrieval surface without the rail, which put the
         // tool with the highest blast radius per wrong absence outside the gate
         // every smaller one passes. Its declarations in
-        // [`absence_cross_file_classes`] and [`absence_is_language_scoped`] were
+        // [`absence_cross_unit_classes`] and [`absence_is_language_scoped`] were
         // already written and were waiting for this row.
         "impact_analysis" => RetrievalSpec {
             field: "entity_impacts",
@@ -487,7 +489,7 @@ fn absence_substrate(tool: &str, class: NegativeClass) -> AbsenceSubstrate {
 /// A tool absent from the map contributes no classes, so a new retrieval tool
 /// starts with no edge-derived authority to inherit and has to declare what it
 /// reads to earn one.
-pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<String> {
+pub(crate) fn absence_cross_unit_classes(tool: &str, payload: &Value) -> Vec<String> {
     match tool {
         "find_references" | "bulk_check_references" => payload
             .get("relation_kinds")
@@ -511,7 +513,7 @@ pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<Str
 /// Whether `tool`'s ABSENCE claim is a statement about one language's extracted
 /// graph, and so cannot outrun what this build can resolve for that language.
 ///
-/// Separate from [`absence_cross_file_classes`] because the two facts are
+/// Separate from [`absence_cross_unit_classes`] because the two facts are
 /// independent: a tool can traverse no edge at all and still be claiming
 /// something about a language's graph. `semantic_search` is exactly that shape,
 /// and it is why FIR-2430 happened. It filters declarations by name, kind,
@@ -603,6 +605,138 @@ pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
     requested.to_vec()
 }
 
+/// Whether a reference answer's own censuses measured every relation kind it
+/// asked for, so a language server's readiness on this process has nothing
+/// left to stand in for.
+///
+/// Readiness is a proxy. It says whether this host can produce the evidence a
+/// reference answer rests on, which matters while nothing measured that
+/// evidence. A `calls` census that read a current, settled ledger for every
+/// caller in its scope (none owed derivation or enrichment, none stale,
+/// unverified or without a resolver) and accounted for every call that spells
+/// the focal's name has measured it: those ledgers are the recorded work of the
+/// resolvers, and whether a server would start again now adds nothing to them.
+/// A mention reading that measured every non-call read of the focal against
+/// the stored rows has done the same for `imports` and `references`. Until a
+/// daemon's startup sweep reaches its tail, every language's readiness is
+/// unpublished, and before this an answer that had measured everything still
+/// read partial for that window because nobody had yet restarted a server.
+///
+/// What either census leaves open is said by its own clauses. A pending or
+/// failed readiness still qualifies every answer that measured less, and is
+/// still disclosed among the degraded signals.
+///
+/// The same holds for the two other answers that read callers off the same
+/// census. An impact answer's own verdict is its direct section, graded from
+/// the call-site reading of each changed entity's possible callers (one block,
+/// or one per changed entity under `focals`), against every kind an impact
+/// depends on. A callers trace answers with its reach reading, whose question
+/// is which entities can end up calling the focal: a calls question, with
+/// references and imports reported apart from the graph's own rows. Its census
+/// is measured when every member was read with a current ledger for every
+/// caller that could spell its names and nothing bounded the closure
+/// ([`crate::trace_reach::CALLS_MEASURED_KEY`]).
+pub(crate) fn reference_census_measured(tool: &str, payload: &Value) -> bool {
+    match tool {
+        "find_references" | "get_context_pack" => {
+            let Some(block) = payload.get(crate::call_sites::CALL_SITES_KEY) else {
+                return false;
+            };
+            let Some(kinds) = payload.get("relation_kinds").and_then(Value::as_array) else {
+                return false;
+            };
+            let kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
+            kinds.len() == payload["relation_kinds"].as_array().map_or(0, Vec::len)
+                && named_block_measures(block, &kinds)
+        }
+        "impact_analysis" => {
+            let Some(block) = payload.get(crate::call_sites::CALL_SITES_KEY) else {
+                return false;
+            };
+            let classes = reference_classes();
+            let kinds: Vec<&str> = classes.iter().map(String::as_str).collect();
+            match block.get("focals").and_then(Value::as_array) {
+                // One block per changed entity, with clauses for any changed
+                // entity no reading covers: measured only when every reading
+                // is and the joined clauses add none of their own.
+                Some(focals) => {
+                    let own: Vec<&Value> = focals
+                        .iter()
+                        .filter_map(|focal| focal.get("clauses").and_then(Value::as_array))
+                        .flatten()
+                        .collect();
+                    !focals.is_empty()
+                        && focals
+                            .iter()
+                            .all(|focal| named_block_measures(focal, &kinds))
+                        && block
+                            .get("clauses")
+                            .and_then(Value::as_array)
+                            .is_some_and(|clauses| {
+                                clauses.iter().all(|clause| own.contains(&clause))
+                            })
+                }
+                None => named_block_measures(block, &kinds),
+            }
+        }
+        "trace_data_flow" => payload
+            .as_object()
+            .and_then(crate::trace_reach::answer_view)
+            .is_some_and(|reach| {
+                reach.get("state").and_then(Value::as_str) != Some("bounded")
+                    && reach
+                        .get("bounds")
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                    && reach
+                        .get(crate::trace_reach::CALLS_MEASURED_KEY)
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            }),
+        _ => false,
+    }
+}
+
+/// Whether one call-site block a reference answer serves for a focal
+/// ([`crate::call_sites::named_block`], or the mention block) measured each
+/// of `kinds`: `calls` by a current, settled ledger for every caller in its
+/// named scope, `imports` by a measured mention reading, and `references` by
+/// one that could speak for references.
+fn named_block_measures(block: &Value, kinds: &[&str]) -> bool {
+    let count = |key: &str| block.get(key).and_then(Value::as_u64);
+    let calls_measured = || {
+        block.get("named_complete").and_then(Value::as_bool) == Some(true)
+            && [
+                "callers_owed_derivation",
+                "callers_owed_enrichment",
+                "callers_stale",
+                "callers_unproven_no_resolver",
+                "callers_unverified",
+            ]
+            .into_iter()
+            .all(|key| count(key) == Some(0))
+    };
+    let mentions = block.pointer("/focal_escape/residue/mentions");
+    let mentions_measured =
+        || mentions.and_then(|mentions| mentions.get("measured")) == Some(&Value::Bool(true));
+    let references_measured = || {
+        mentions_measured()
+            && mentions.is_some_and(|mentions| mentions.get("references_unmeasured").is_none())
+    };
+    !kinds.is_empty()
+        && kinds.iter().all(|kind| {
+            if kind.eq_ignore_ascii_case("calls") {
+                calls_measured()
+            } else if kind.eq_ignore_ascii_case("imports") {
+                mentions_measured()
+            } else if kind.eq_ignore_ascii_case("references") {
+                references_measured()
+            } else {
+                false
+            }
+        })
+}
+
 /// Pending and failed readiness are distinct from a missing installation.
 /// Only a named language can carry this qualification: an unresolved focal
 /// has no language-server observation to interpret.
@@ -623,10 +757,27 @@ pub(crate) fn reference_readiness_gap(coverage: &serde_json::Map<String, Value>)
             "reference_enrichment_unknown: this process has no completed language-server readiness \
              observation for {language}, so reference-enrichment availability is not established"
         )),
-        Some("language_server_unusable") => Some(format!(
-            "reference_enrichment_unusable: a language server for {language} failed to initialize \
-             on this host, so its reference-enrichment capability is unavailable"
-        )),
+        Some("language_server_unusable") => Some(
+            match coverage
+                .get(crate::edge_coverage::REFERENCE_ENRICHMENT_REASON_KEY)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                // The observation's reason never holds the `; ` that divides
+                // verdict clauses, so it is carried whole.
+                Some(reason) => format!(
+                    "reference_enrichment_unusable: {}, so reference enrichment for {language} \
+                     is unavailable on this host",
+                    reason.trim_end_matches('.')
+                ),
+                None => format!(
+                    "reference_enrichment_unusable: a language server for {language} failed to \
+                     initialize on this host, so its reference-enrichment capability is \
+                     unavailable"
+                ),
+            },
+        ),
         _ => None,
     }
 }
@@ -686,7 +837,7 @@ pub(crate) fn deciding_classes(requested: &[String], references_producible: bool
 /// claim actually rests on is demonstrably present.
 ///
 /// This is the one gate. Every negative-capable tool passes through it and is
-/// checked against what it DECLARES it reads: [`absence_cross_file_classes`] for
+/// checked against what it DECLARES it reads: [`absence_cross_unit_classes`] for
 /// the edges an absence is read off, and [`absence_is_language_scoped`] for
 /// whether the claim is about a language's extracted graph at all. A tool that
 /// declares either and publishes no observation is inconclusive by construction,
@@ -715,7 +866,7 @@ pub(crate) fn deciding_classes(requested: &[String], references_producible: bool
 /// A payload carrying no observation at all is the unknown case, not the healthy
 /// one. That is the reading the module's honesty contract already takes for
 /// unknown coverage, and it is the reading that makes a tool declare its
-/// dependency in [`absence_cross_file_classes`] and publish the observation
+/// dependency in [`absence_cross_unit_classes`] and publish the observation
 /// before it can certify anything.
 ///
 /// [`crate::edge_coverage`] publishes both the build's adapter support and the
@@ -743,7 +894,12 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
 /// wire and takes one; the verdict composes from the list, so no boundary is
 /// ever inferred from text a human wrote.
 pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<String> {
-    let requested = absence_cross_file_classes(tool, payload);
+    if crate::file_coordinate_query::recognizes(tool, payload) {
+        // This reads recorded adapter identities at a coordinate, not every
+        // declaration the source may contain. Keep structural runtime gates.
+        return Vec::new();
+    }
+    let requested = absence_cross_unit_classes(tool, payload);
     let language_scoped = absence_is_language_scoped(tool);
     if requested.is_empty() && !language_scoped {
         return Vec::new();
@@ -758,7 +914,7 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
         return vec![if !requested.is_empty() {
             format!(
                 "edge_coverage_unreported: this answer did not report whether the graph holds \
-                 cross-file {named} edges, so an empty result cannot be distinguished from a graph \
+                 {named} edges between modules, so an empty result cannot be distinguished from a graph \
                  that could not have found a reference in the first place"
             )
         } else if claims_absence {
@@ -787,8 +943,23 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
         .filter(|language| !language.trim().is_empty())
         .unwrap_or("an unreported language");
     let states = coverage.get("classes").and_then(Value::as_object);
+    // An answer read from the entity index whose observation carries a
+    // declaration census is decided by that census: it measured what the
+    // extractor admitted in every file the answer covers, which is the fact the
+    // language-server gates below stand in for when nothing measured it.
+    let declarations = requested
+        .is_empty()
+        .then(|| crate::declaration_coverage::clauses(coverage))
+        .flatten();
+    let census_measured = declarations.is_some()
+        && crate::declaration_coverage::class_state(coverage)
+            != Some(crate::declaration_coverage::STATE_UNMEASURED);
 
-    let mut gaps: Vec<String> = reference_readiness_gap(coverage).into_iter().collect();
+    let mut gaps: Vec<String> = if census_measured || reference_census_measured(tool, payload) {
+        Vec::new()
+    } else {
+        reference_readiness_gap(coverage).into_iter().collect()
+    };
 
     if !requested.is_empty() {
         let required = deciding_classes(&requested, references_producible(payload));
@@ -850,8 +1021,8 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
                 String::new()
             } else {
                 format!(
-                    " (cross-file {} edges are present and do not stand in for {missing}: an \
-                     entity other files reach only through {missing} is invisible to a graph \
+                    " ({} edges between modules are present and do not stand in for {missing}: an \
+                     entity other modules reach only through {missing} is invisible to a graph \
                      holding none)",
                     present.join(", ")
                 )
@@ -876,7 +1047,7 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
                 String::new()
             };
             gaps.push(format!(
-                "cross_file_edges_absent: the graph holds no cross-file {missing} edges for \
+                "cross_file_edges_absent: the graph holds no {missing} edges between modules for \
                  {language}{observed}, so a use that reaches the target through {missing} could \
                  not have been found and an empty result says nothing about whether the target is \
                  used, and the gap is in extraction/enrichment for that language rather than in \
@@ -886,7 +1057,7 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
             || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
         {
             gaps.push(format!(
-                "edge_coverage_unknown: whether the graph holds cross-file {named} edges for \
+                "edge_coverage_unknown: whether the graph holds {named} edges between modules for \
                  {language} could not be established, so an empty result may mean the query had \
                  no edges to answer from rather than that the target is unused"
             ));
@@ -988,12 +1159,13 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
     // These are completed capability findings. Pending observations for a
     // named language retain their separate readiness qualification above.
     let cause = match coverage.get("reference_enrichment").and_then(Value::as_str) {
+        _ if census_measured => None,
         Some("unsupported") => Some(format!(
             "this build wires no language-server adapter for {language}"
         )),
         Some("no_language_server") => Some(format!(
-            "no language server for {language} is installed on this host, so no cross-file \
-             reference or override edge was ever produced for it"
+            "no language server for {language} is installed on this host, so no reference \
+             or override edge between its modules was ever produced for it"
         )),
         _ => None,
     };
@@ -1053,13 +1225,15 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
     // would displace the reason such an answer actually carries, which is that
     // its focal is not in the graph or that its filter selected an empty region.
     // Both of those are reported by name, so nothing here is left ungated.
-    if coverage_classes_unmeasured(coverage, &requested) {
+    if let Some(clauses) = declarations {
+        gaps.extend(clauses);
+    } else if coverage_classes_unmeasured(coverage, &requested) {
         gaps.push(if claims_absence {
             format!(
                 "absence_coverage_unmeasured: no coverage class was measured for {language}, so \
                  nothing established what the extractor admitted for it, and an empty result \
                  cannot be separated from a declaration the extractor never admitted as an entity \
-                 or from a file the graph does not hold yet"
+                 or from a source unit the graph does not hold yet"
             )
         } else {
             format!(
@@ -1096,6 +1270,9 @@ pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<Strin
 /// is present and populated makes this false, so the rows phrasing is reached
 /// from evidence of rows rather than from the absence of evidence.
 pub(crate) fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
+    if crate::file_coordinate_query::recognizes(tool, payload) {
+        return false;
+    }
     let Some(spec) = spec_for(tool) else {
         return false;
     };
@@ -1185,7 +1362,10 @@ fn qualifies_populated_answers(tool: &str) -> bool {
 /// extracted graph has nothing for this gate to say, and silence is not
 /// agreement.
 pub(crate) fn declares_absence_dependency(tool: &str, payload: &Value) -> bool {
-    !absence_cross_file_classes(tool, payload).is_empty()
+    if crate::file_coordinate_query::recognizes(tool, payload) {
+        return false;
+    }
+    !absence_cross_unit_classes(tool, payload).is_empty()
         || absence_is_language_scoped(tool)
         || tool == FILE_ENTITIES_TOOL
 }
@@ -1267,7 +1447,7 @@ pub(crate) fn edge_coverage_degradation_labels(tool: &str, payload: &Value) -> V
 }
 
 fn edge_coverage_signal_labels(tool: &str, payload: &Value, bounding_only: bool) -> Vec<String> {
-    let requested = absence_cross_file_classes(tool, payload);
+    let requested = absence_cross_unit_classes(tool, payload);
     let requested = if bounding_only {
         deciding_classes(&requested, references_producible(payload))
     } else {
@@ -1298,6 +1478,17 @@ fn edge_coverage_signal_labels(tool: &str, payload: &Value, bounding_only: bool)
         .collect();
     if coverage_classes_unmeasured(coverage, &requested) {
         labels.push("absence_coverage:classes_unmeasured".to_string());
+    }
+    if requested.is_empty() {
+        match crate::declaration_coverage::class_state(coverage) {
+            Some(crate::declaration_coverage::STATE_COMPLETE_EXCEPT) => {
+                labels.push("declarations:residue_listed".to_string())
+            }
+            Some(crate::declaration_coverage::STATE_UNMEASURED) => {
+                labels.push("declarations:census_unmeasured".to_string())
+            }
+            _ => {}
+        }
     }
     if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
         labels.push("absence_coverage:scope_empty".to_string());
@@ -1735,6 +1926,7 @@ fn embedding_state_word(coverage: &crate::envelope::SemanticCoverage) -> &'stati
         EmbeddingState::Partial => "partial",
         EmbeddingState::Absent => "absent",
         EmbeddingState::Unknown => "unknown",
+        EmbeddingState::NotUsed => "not_used",
     }
 }
 
@@ -1934,9 +2126,21 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     // edges are frequently dropped, which is the gate `find_references` already
     // applies. It bears on the walk only when the walk read incoming edges at
     // all, which an unreported direction cannot rule out.
+    //
+    // A walk that took the named-scope reading for every method whose callers
+    // it read (`crate::trace_named_scope`) has asked the question this gate
+    // guesses at, method by method, the way a reference answer does for its
+    // focal. Its `call_sites` block then decides: it names the methods it
+    // could not account for under this same code, and carries a residue it
+    // listed under the residue codes, both of which reach this verdict through
+    // the block's own clauses. Only a walk without that reading keeps the bare
+    // rule, which reads the focal's kind and nothing else.
     let direction = payload.get("direction").and_then(Value::as_str);
     let walked_callers = !matches!(direction, Some("calls"));
-    if walked_callers && focal_is_method(payload) {
+    if walked_callers
+        && focal_is_method(payload)
+        && !crate::trace_named_scope::decides_method_gate(payload)
+    {
         gaps.push(kin_core::reference_coverage::method_absence_limiting_factor("an empty chain"));
     }
 
@@ -1947,6 +2151,29 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     // twin a question that was asked of one.
     if let Some(gap) = focal_resolution_gap(payload, "an empty chain") {
         gaps.push(gap);
+    }
+
+    // A scoped callers walk answers with its closure, which is held to the
+    // scope rather than cut at the chain's depth or per-step cap (see
+    // `crate::trace_scope`). The chain's caps say nothing about that answer;
+    // the closure's own state does, and its open places are listed in it.
+    let degraded = payload
+        .get("degradations")
+        .and_then(Value::as_array)
+        .is_some_and(|degradations| !degradations.is_empty());
+    if let Some(scope) = payload
+        .get(crate::trace_scope::SCOPE_KEY)
+        .filter(|scope| scope.get("answer").and_then(Value::as_str) == Some("reach"))
+    {
+        if scope.get("state").and_then(Value::as_str) == Some("bounded") {
+            gaps.push(
+                "trace_walk_truncated: a work bound or the reply's size stopped the reading \
+                 inside the scope, so reach.members is a floor; reach.bounds says where"
+                    .to_string(),
+            );
+        }
+        gaps.extend(trace_cap_clauses(false, degraded));
+        return gaps;
     }
 
     // Spine clipping supersedes the two general cap clauses below, and this is
@@ -2044,7 +2271,7 @@ fn spine_clipping_gap(payload: &Value, spine_clipped: u64) -> String {
         None
     } else {
         payload
-            .get("spine_dropped_crossing_file")
+            .get("spine_dropped_crossing_unit")
             .and_then(Value::as_u64)
     };
     spine_clipping_clause(payload, spine_clipped, crossing)
@@ -2084,7 +2311,9 @@ pub(crate) fn spine_clipping_clause(
     };
     let crossing = match crossing {
         Some(count) if count > 0 => {
-            format!(", {count} of the dropped neighbours lived outside the file that offered them")
+            format!(
+                ", {count} of the dropped neighbours lived outside the module that offered them"
+            )
         }
         _ => String::new(),
     };
@@ -2162,6 +2391,13 @@ pub const QUERY_SHAPE_COMPONENT: &str = "query_shape";
 /// See [`QUERY_SHAPE_COMPONENT`].
 pub const DESCRIPTION_ENTITY_RANKING_REASON: &str = "description_entity_ranking";
 
+/// Stable label for the note a ranking carries when the question itself set
+/// its scope. A note about how the run was scoped, never a lost capability.
+pub const QUESTION_SCOPE_COMPONENT: &str = "question_scope";
+/// Under [`QUESTION_SCOPE_COMPONENT`]: the question asks about tests, so test
+/// code was ranked without the caller passing `include_tests`.
+pub const TESTS_RANKED_FOR_QUESTION_REASON: &str = "tests_ranked";
+
 /// Whether a `component:reason` label advises how to read the result without
 /// reporting that the run lost a capability.
 ///
@@ -2173,17 +2409,43 @@ pub const DESCRIPTION_ENTITY_RANKING_REASON: &str = "description_entity_ranking"
 ///
 /// It stays in the payload's own `degradations[]`, where a caller reads it. This
 /// only keeps it out of the run-quality verdicts below.
+///
+/// Current producers also mark this entry `severity: "note"` (see
+/// [`is_policy_note`]); the label check stays for payloads minted before they
+/// did.
 fn describes_advice_not_run_quality(label: &str) -> bool {
     label.split_once(':').is_some_and(|(component, reason)| {
         component == QUERY_SHAPE_COMPONENT && reason == DESCRIPTION_ENTITY_RANKING_REASON
     })
 }
 
+/// The field a `degradations[]` entry states its severity in.
+pub const DEGRADATION_SEVERITY_KEY: &str = "severity";
+/// The one severity that does not refuse. See [`is_policy_note`].
+pub const DEGRADATION_NOTE: &str = "note";
+
+/// Whether a `degradations[]` entry declares itself a policy note.
+///
+/// A note records a filter the caller chose, a limit every query applies, or a
+/// kind of row the surface withholds by design. It stays visible in the
+/// payload, and it is not evidence that the run lost a capability, so no
+/// run-quality verdict refuses on it. The producer decides which entries are
+/// notes; this reads the entry's own `severity` and nothing else, so it holds
+/// for every language and every surface without a list here.
+///
+/// Only the exact word `note` exempts an entry. An entry with no `severity`,
+/// which is every entry minted before the field existed, and an entry with a
+/// word this build does not know, both read as refusing.
+fn is_policy_note(entry: &Value) -> bool {
+    entry.get(DEGRADATION_SEVERITY_KEY).and_then(Value::as_str) == Some(DEGRADATION_NOTE)
+}
+
 /// The degradations a retrieval payload reported about its OWN run, as stable
 /// `component:reason` labels.
 ///
-/// Query-shape guidance is excluded: it advises how to read the result and does
-/// not report a capability failure. See [`describes_advice_not_run_quality`].
+/// Policy notes are excluded (see [`is_policy_note`]), and so is query-shape
+/// guidance from a producer that predates the note field: neither reports a
+/// capability failure. See [`describes_advice_not_run_quality`].
 ///
 /// The envelope's [`Degraded`] flags describe the daemon; this array describes
 /// the query that just ran, and the two are not the same fact. A locate page
@@ -2204,6 +2466,7 @@ pub(crate) fn payload_degradation_labels(payload: &Value) -> Vec<String> {
     };
     entries
         .iter()
+        .filter(|entry| !is_policy_note(entry))
         .filter_map(|entry| {
             let component = entry.get("component").and_then(Value::as_str)?;
             let reason = entry.get("reason").and_then(Value::as_str)?;
@@ -2274,11 +2537,19 @@ fn bounding_signals(
 /// were accurate. Embedding coverage was never what backed that claim. A
 /// negative that names its basis and recites THAT can no longer put an unknown
 /// coverage beside a certification the coverage did not back.
-fn coverage_basis(class: NegativeClass) -> &'static str {
+fn coverage_basis(class: NegativeClass, envelope: &Envelope) -> &'static str {
     match class {
+        NegativeClass::Semantic if ranked_without_vectors(envelope) => "entity_cards",
         NegativeClass::Semantic => "embeddings",
         NegativeClass::Structural => "graph_structure",
     }
+}
+
+/// Whether the answer this envelope qualifies ranked without search vectors.
+fn ranked_without_vectors(envelope: &Envelope) -> bool {
+    envelope.semantic_coverage.as_ref().is_some_and(|coverage| {
+        coverage.embedding_state() == crate::envelope::EmbeddingState::NotUsed
+    })
 }
 
 /// The coverage the verdict rests on, as the clause [`build_advice`] recites.
@@ -2297,6 +2568,12 @@ fn coverage_clause(class: NegativeClass, payload: &Value, envelope: &Envelope) -
         // instead (FIR-2543).
         NegativeClass::Semantic => match &envelope.semantic_coverage {
             Some(coverage)
+                if coverage.embedding_state() == crate::envelope::EmbeddingState::NotUsed =>
+            {
+                "ranked by entity cards and the graph; this setup uses no search vectors"
+                    .to_string()
+            }
+            Some(coverage)
                 if coverage.embedding_state() == crate::envelope::EmbeddingState::Unknown =>
             {
                 "semantic coverage unknown".to_string()
@@ -2313,7 +2590,7 @@ fn coverage_clause(class: NegativeClass, payload: &Value, envelope: &Envelope) -
 }
 
 /// What a structural absence observed about the graph it is claiming over.
-fn structural_coverage_clause(payload: &Value, envelope: &Envelope) -> String {
+pub(crate) fn structural_coverage_clause(payload: &Value, envelope: &Envelope) -> String {
     if let Some(coverage) = payload
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
         .and_then(Value::as_object)
@@ -2337,15 +2614,23 @@ fn structural_coverage_clause(payload: &Value, envelope: &Envelope) -> String {
             })
             .filter(|rendered| !rendered.is_empty())
             .unwrap_or_else(|| "this answer reads no edge class".to_string());
+        let reason = coverage
+            .get(crate::edge_coverage::REFERENCE_ENRICHMENT_REASON_KEY)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty());
         let enrichment = match coverage.get("reference_enrichment").and_then(Value::as_str) {
-            Some("unsupported") => "no language-server adapter for it in this build",
-            Some("available") => "a language server available for it",
+            Some("unsupported") => "no language-server adapter for it in this build".to_string(),
+            Some("available") => "a language server available for it".to_string(),
             Some("no_language_server") => {
-                "an adapter wired for it but no language server installed"
+                "an adapter wired for it but no language server installed".to_string()
             }
-            Some("language_server_unusable") => "its language server failed to initialize",
-            Some("enrichment_disabled") => "language-server enrichment switched off",
-            _ => "its language-server availability unprobed",
+            Some("language_server_unusable") => match reason {
+                Some(reason) => reason.trim_end_matches('.').to_string(),
+                None => "its language server failed to initialize".to_string(),
+            },
+            Some("enrichment_disabled") => "language-server enrichment switched off".to_string(),
+            _ => "its language-server availability unprobed".to_string(),
         };
         return format!("graph coverage for {language} ({classes}; {enrichment})");
     }
@@ -2464,7 +2749,7 @@ pub(crate) fn withdraw_degraded_signal(advice: &str, label: &str) -> Option<Stri
 fn absence_consequence(tool: &str, always: bool, trustworthy: bool) -> &'static str {
     // A certified name/kind filter is a statement about DECLARATIONS, and this
     // tool reads the entity index and traverses no edge at all
-    // ([`absence_cross_file_classes`] gives it no class for exactly that
+    // ([`absence_cross_unit_classes`] gives it no class for exactly that
     // reason), so it has no basis for the word "unused". The generic sentence
     // supplied one anyway, and a stranger run quoted it back verbatim as the
     // thing it believed. Scoping it costs no authority: the verdict stays
@@ -2482,7 +2767,7 @@ fn absence_consequence(tool: &str, always: bool, trustworthy: bool) -> &'static 
         (true, false) => {
             "Do NOT treat a `has_references: false` row as proof of disuse: a false verdict here may mean the batch could not observe what it was asked about."
         }
-        (false, true) => "Absence is authoritative: safe to treat the target as genuinely absent/unused.",
+        (false, true) => "Absence is authoritative: safe to treat the target as genuinely absent or unused.",
         (false, false) => {
             "Absence is NOT authoritative: do not conclude the target is unused or deletable, because an empty result here may mean the query could not observe what it was asked about."
         }
@@ -2608,6 +2893,74 @@ fn focal_is_method(payload: &Value) -> bool {
         .is_some_and(kin_core::reference_coverage::kind_name_under_resolves_incoming_calls)
 }
 
+/// Whether the answer's `call_sites` block read every call site in the store
+/// that spells the focal's call name and proved or listed each one
+/// (`named_complete`), for a focal no language runs without a call spelling its
+/// name (no `implicit_dispatch`), or one whose other dispatch the escape census
+/// names as its protocol residue.
+///
+/// The rule a callers trace applies to each method it reads (see
+/// [`crate::trace_named_scope`]), so the two tools answer one method alike.
+/// `Flask.__call__` runs on a call of an instance, and the census names that
+/// as its protocol: the block then carries an `escape_residue_listed` clause
+/// for it, so the answer reads `certified_except` that dispatch and never
+/// certified. A hook the census names no protocol for keeps the gate.
+///
+/// A method that could run without a call spelling its name only through the
+/// decorators it is declared under is accounted for the same way: the block
+/// lists those decorators under
+/// [`crate::call_sites::DISPATCH_DECORATORS_KEY`] and carries a
+/// `decorator_dispatch_listed` clause for them, so the answer reads
+/// `certified_except` what they do with it. An empty list means Python's
+/// name-preserving decorators alone, which leave nothing to list.
+fn named_scope_accounts_for_method_calls(payload: &Value) -> bool {
+    let Some(block) = payload.get(crate::call_sites::CALL_SITES_KEY) else {
+        return false;
+    };
+    block.get("named_complete").and_then(Value::as_bool) == Some(true)
+        && (block.get("implicit_dispatch").and_then(Value::as_bool) != Some(true)
+            || block
+                .pointer("/focal_escape/residue/protocol")
+                .is_some_and(Value::is_object)
+            || block
+                .get(crate::call_sites::DISPATCH_DECORATORS_KEY)
+                .is_some_and(Value::is_array))
+}
+
+/// The gap a constructor whose named scope is complete leaves: constructions
+/// of a subclass that defines no constructor of its own, and constructions
+/// through `cls`, `type(self)` or `self.__class__`, which spell none of its
+/// call names. `None` for any other method, which keeps the method gate.
+fn constructor_dispatch_gap(payload: &Value) -> Option<String> {
+    let block = payload.get(crate::call_sites::CALL_SITES_KEY)?;
+    if block.get("named_complete").and_then(Value::as_bool) != Some(true)
+        || block
+            .get(crate::call_sites::IMPLICIT_DISPATCH_THROUGH_KEY)
+            .and_then(Value::as_str)
+            != Some(crate::call_sites::CONSTRUCTION_DISPATCH)
+    {
+        return None;
+    }
+    let names: Vec<&str> = block
+        .get("call_names")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    Some(format!(
+        "constructor_dispatch_unlisted: every call that spells {} is proven or listed, and a \
+         constructor also runs when code constructs a subclass that defines no constructor of \
+         its own, or constructs through cls, type(self) or self.__class__, none of which \
+         spells those names",
+        if names.is_empty() {
+            "its call names".to_string()
+        } else {
+            names.join(" or ")
+        }
+    ))
+}
+
 /// What a cross-repo authority report says about the answer beside it.
 ///
 /// A spine that is configured and did not answer limits the answer. A spine that
@@ -2654,7 +3007,12 @@ fn cross_repo_unavailable_qualifier(cross_repo: &Value) -> CrossRepoQualifier {
     // clause when the composed negative is read by the verdict.
     let reason = reason.replace(crate::verdict::CLAUSE_SEPARATOR, ", ");
     let qualifier = format!("{}: {reason}", code.unwrap_or("cross_repo_unavailable"));
-    if code == Some(crate::handlers::entities::SPINE_REPO_UNREGISTERED) {
+    // A spine that refused this graph on a daemon that registers no other
+    // repository would have federated nothing, so the refusal hides no
+    // reference and is a fact about the install, like an unregistered one.
+    if code == Some(crate::handlers::entities::SPINE_REPO_UNREGISTERED)
+        || code == Some(crate::handlers::entities::SPINE_REFUSED_WITHOUT_PEERS)
+    {
         CrossRepoQualifier::Note(qualifier)
     } else {
         CrossRepoQualifier::Gap(qualifier)
@@ -3083,12 +3441,25 @@ pub fn negative_for(
         }
     }
 
-    if matches!(tool, "find_references" | "get_context_pack") && focal_is_method(payload) {
-        push_gap(
-            &mut trustworthy,
-            &mut trust_reason,
-            kin_core::reference_coverage::method_absence_limiting_factor("an empty result"),
-        );
+    // The method gate says a receiver-method call linked by bare name may have
+    // missed a caller. A reference answer whose named scope is complete has
+    // already read every call site in the store that spells the method's call
+    // name and either proved it or listed it, so nothing that gate guards is
+    // left unaccounted; its residue is carried by the block's own clauses. A
+    // method a language may run without a call spelling its name (a protocol
+    // hook, an accessor, an operator) keeps the gate, because no reading of the
+    // sites that spell it can be the whole set.
+    if matches!(tool, "find_references" | "get_context_pack")
+        && focal_is_method(payload)
+        && !named_scope_accounts_for_method_calls(payload)
+    {
+        // A constructor whose named scope is complete was not missed by a
+        // bare-name link: every call that spells it was proven or listed. What
+        // is open is the constructions no name shows, so the gap says those.
+        let gap = constructor_dispatch_gap(payload).unwrap_or_else(|| {
+            kin_core::reference_coverage::method_absence_limiting_factor("an empty result")
+        });
+        push_gap(&mut trustworthy, &mut trust_reason, gap);
     }
 
     // A healthy local graph is not enough to certify "no references" when the
@@ -3302,8 +3673,12 @@ pub fn negative_for(
     };
     if !claims_absence && !relevance_unverified {
         kind = "qualified_answer";
-        subject = "this answer returned rows, so it asserts no absence; the verdict below says \
-                   how far those rows can be trusted as the whole set";
+        subject = if crate::file_coordinate_query::recognizes(tool, payload) {
+            "this lookup reports module surfaces recorded at one exact graph coordinate; it asserts no repository or declaration absence"
+        } else {
+            "this answer returned rows, so it asserts no absence; the verdict below says \
+             how far those rows can be trusted as the whole set"
+        };
     }
     if withheld_dependents > 0 {
         withheld_subject = format!(
@@ -3318,7 +3693,14 @@ pub fn negative_for(
             "response_bounded: response limits withheld known dependents".to_string(),
         );
     }
-    let consequence = if ranking_names_nothing {
+    let consequence = if crate::file_coordinate_query::recognizes(tool, payload) {
+        let scope = "Only recorded module identities at this exact coordinate were looked up. A missing surface is a graph gap; it does not establish that a source unit or its declarations are absent. Read a returned module with source by its UUID for its recorded member inventory.";
+        if trustworthy {
+            scope.to_string()
+        } else {
+            format!("{scope} This lookup remains qualified by {trust_reason}.")
+        }
+    } else if ranking_names_nothing {
         unnamed_ranking_consequence().to_string()
     } else if relevance_unverified {
         unverified_relevance_consequence().to_string()
@@ -3377,7 +3759,7 @@ pub fn negative_for(
     // is the reading that decided anything here.
     negative.insert(
         "coverage_basis".to_string(),
-        json!(coverage_basis(spec.class)),
+        json!(coverage_basis(spec.class, envelope)),
     );
     negative.insert(
         "advice".to_string(),
@@ -3435,7 +3817,7 @@ fn path_gaps(payload: &Value) -> Vec<String> {
             Some(candidates) if candidates > 1 && !pinned => gaps.push(format!(
                 "{which}_ambiguous: {candidates} entities carry the name '{}' and the walk used one \
                  of them, so no route from or to the others was looked for; pin the one you mean \
-                 with name@file or its entity id",
+                 by its entity id",
                 end.get("name").and_then(Value::as_str).unwrap_or("?")
             )),
             _ => {}
@@ -3470,7 +3852,7 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
         // siblings failing loudly with no negative beside them.
         "impact_analysis" | "semantic_diff" | "semantic_review" => Some((
             "scope_not_resolved",
-            "the files that were named resolved to no entities, so nothing was diffed or analyzed",
+            "the source units that were named resolved to no entities, so nothing was diffed or analyzed",
         )),
         "find_references" => Some((
             "focal_not_resolved",
@@ -3492,6 +3874,13 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
         "kin_provenance_query" => Some((
             "entity_not_resolved",
             "the entity that was asked about could not be resolved, so no provenance was looked up",
+        )),
+        // A body read by name or id that names no entity answers "no entity
+        // carries this", the same claim a focal miss makes, and is qualified
+        // the same way so the read carries the verdict every other answer does.
+        "get_entity_source" => Some((
+            "entity_not_resolved",
+            "the entity that was asked about could not be resolved, so no source was read",
         )),
         _ => None,
     }
@@ -3539,6 +3928,13 @@ fn is_resolution_miss(message: &str) -> bool {
 /// uses: on a daemon graph that is initialized, loaded, and undegraded, "the
 /// graph holds no entity under that name" is a real answer; on anything less it
 /// may only mean the name is not indexed yet.
+/// Whether `message`, the error `tool` returned, is a name miss this module
+/// qualifies, rather than a rejected request or a failure that says nothing
+/// about whether the named symbol exists.
+pub fn is_qualified_resolution_miss(tool: &str, message: &str) -> bool {
+    resolution_miss_spec(tool).is_some() && is_resolution_miss(message)
+}
+
 pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Option<Value> {
     let (kind, subject) = resolution_miss_spec(tool)?;
     if !is_resolution_miss(message) {
@@ -3628,7 +4024,7 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
     negative.insert("semantic_coverage".to_string(), coverage_value(envelope));
     negative.insert(
         "coverage_basis".to_string(),
-        json!(coverage_basis(NegativeClass::Structural)),
+        json!(coverage_basis(NegativeClass::Structural, envelope)),
     );
     negative.insert(
         "advice".to_string(),
@@ -3739,7 +4135,7 @@ mod tests {
             "language": "Rust",
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "present", "imports": "present", "references": "present" },
-            "cross_file_classes": ["calls", "imports", "references"],
+            "cross_unit_classes": ["calls", "imports", "references"],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 2,
@@ -3764,7 +4160,7 @@ mod tests {
             "language": "Python",
             "requested_classes": [],
             "classes": {},
-            "cross_file_classes": [],
+            "cross_unit_classes": [],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 0,
@@ -3796,7 +4192,7 @@ mod tests {
     fn scope_with_a_measured_class(scope_entities: Option<usize>) -> Value {
         let mut observation = resolvable_language_scope(scope_entities);
         observation["classes"] = json!({ "calls": "present" });
-        observation["cross_file_classes"] = json!(["calls"]);
+        observation["cross_unit_classes"] = json!(["calls"]);
         observation
     }
 
@@ -3987,8 +4383,8 @@ mod tests {
         for said in [
             "structural_authoritative",
             "caller_arrival reading",
-            "2 file(s) that import the focal's file",
-            "a same-named definition in the caller's own file",
+            "2 module(s) that import the focal's module",
+            "a same-named definition in the caller's own module",
             "a caller that reaches the focal without one is not read",
             "no degraded signals",
         ] {
@@ -4096,7 +4492,7 @@ mod tests {
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(
             reason.contains("each of the 1 entities reported with no consumers")
-                && reason.contains("a same-named definition in the caller's own file"),
+                && reason.contains("a same-named definition in the caller's own module"),
             "{reason}"
         );
 
@@ -4711,7 +5107,7 @@ mod tests {
         // The shape the stranger run hit on psf/requests, which is a fully
         // enriched Python store: `semantic_search(query: "request", kind:
         // "method")` answered zero and reported `safe_to_conclude_absent: true`
-        // with "safe to treat the target as genuinely absent/unused", about a
+        // with "safe to treat the target as genuinely absent or unused", about a
         // name the graph resolves. The scope held every method in the
         // repository, Python is a language this build enriches, and the tool
         // traverses no edge, so the class gate, the scope gate and the
@@ -4785,7 +5181,7 @@ mod tests {
         );
         let advice = negative["advice"].as_str().unwrap();
         assert!(
-            !advice.contains("genuinely absent/unused"),
+            !advice.contains("genuinely absent or unused"),
             "a name filter reads the entity index and traverses no edge, so it has no \
              basis for a verdict about use: {advice}"
         );
@@ -4810,7 +5206,7 @@ mod tests {
             references["advice"]
                 .as_str()
                 .unwrap()
-                .contains("genuinely absent/unused"),
+                .contains("genuinely absent or unused"),
             "find_references reads the edges, so its verdict about use stands: {references}"
         );
     }
@@ -5295,6 +5691,55 @@ mod tests {
         );
     }
 
+    /// An entry that declares itself a policy note is read past by every
+    /// run-quality reader, whatever it is called; the same entry without the
+    /// declaration refuses as it always did.
+    #[test]
+    fn a_policy_note_is_not_a_degraded_signal() {
+        let noted = json!({
+            "query": "where do notes get written to disk",
+            "results": [],
+            "total_ranked": 0,
+            "degradations": [
+                {"component": "graph_role_filter", "reason": "tests_withheld",
+                 "detail": "the include_tests: false filter kept 4 test-role paths out",
+                 "severity": DEGRADATION_NOTE},
+                {"component": "entity_coverage", "reason": "non_entity_candidates_omitted",
+                 "severity": DEGRADATION_NOTE},
+            ],
+        });
+        assert!(payload_degradation_labels(&noted).is_empty());
+        let negative = negative_for(
+            "semantic_locate",
+            &noted,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("empty results yields a negative");
+        assert_eq!(negative["degraded_signals"], json!([]), "{negative}");
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("retrieval_degraded"),
+            "{negative}"
+        );
+
+        let mut undeclared = noted.clone();
+        for entry in undeclared["degradations"].as_array_mut().unwrap() {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .remove(DEGRADATION_SEVERITY_KEY);
+        }
+        assert_eq!(
+            payload_degradation_labels(&undeclared),
+            vec![
+                "graph_role_filter:tests_withheld".to_string(),
+                "entity_coverage:non_entity_candidates_omitted".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn a_degradation_missing_half_its_identity_is_not_half_named() {
         // Honesty: a label is a claim about what degraded. An entry with no
@@ -5387,7 +5832,7 @@ mod tests {
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
-            "cross_file_classes": [],
+            "cross_unit_classes": [],
             "budget_exhausted": false,
             "entities_examined": 26,
         });
@@ -5535,7 +5980,7 @@ mod tests {
                 "language": "JavaScript",
                 "requested_classes": ["calls", "imports", "references"],
                 "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
-                "cross_file_classes": [],
+                "cross_unit_classes": [],
                 "budget_exhausted": false,
                 "entities_examined": 66,
             }),
@@ -5731,7 +6176,7 @@ mod tests {
             "language": "Rust",
             "requested_classes": ["calls"],
             "classes": { "calls": "unknown" },
-            "cross_file_classes": [],
+            "cross_unit_classes": [],
             "budget_exhausted": true,
             "entities_examined": 4096,
         });
@@ -5757,7 +6202,7 @@ mod tests {
             "language": "Python",
             "requested_classes": ["calls", "imports"],
             "classes": { "calls": "absent", "imports": "present" },
-            "cross_file_classes": ["imports"],
+            "cross_unit_classes": ["imports"],
             "budget_exhausted": false,
             "entities_examined": 12,
         });
@@ -5822,7 +6267,7 @@ mod tests {
             "language": "JavaScript",
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "present", "imports": "absent", "references": "absent" },
-            "cross_file_classes": ["calls"],
+            "cross_unit_classes": ["calls"],
             "reference_enrichment": "unsupported",
             "budget_exhausted": false,
             "entities_examined": 258,
@@ -5908,7 +6353,7 @@ mod tests {
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "present", "imports": "absent", "references": "present" },
-            "cross_file_classes": ["calls", "references"],
+            "cross_unit_classes": ["calls", "references"],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 12,
@@ -5937,7 +6382,7 @@ mod tests {
         // The inverse: the same answer over a graph whose import edges exist
         // certifies, so the refusal is the class and nothing else.
         payload["edge_coverage"]["classes"]["imports"] = json!("present");
-        payload["edge_coverage"]["cross_file_classes"] = json!(["calls", "imports", "references"]);
+        payload["edge_coverage"]["cross_unit_classes"] = json!(["calls", "imports", "references"]);
         let negative = negative_for("find_references", &payload, &structural_ready_envelope())
             .expect("empty references yields a negative");
         assert_eq!(
@@ -5999,7 +6444,7 @@ mod tests {
         json!({
             "budget_exhausted": false,
             "classes": { "calls": "present", "imports": "absent", "references": references },
-            "cross_file_classes": ["calls"],
+            "cross_unit_classes": ["calls"],
             "entities_examined": 371,
             "language": "JavaScript",
             "reference_enrichment": enrichment,
@@ -6035,7 +6480,7 @@ mod tests {
                 "{tool} names the absent class the verdict rested on: {gap}"
             );
             assert!(
-                gap.contains("no cross-file references edges for JavaScript"),
+                gap.contains("no references edges between modules for JavaScript"),
                 "{tool} names the class and the language: {gap}"
             );
             // The diagnosis a reader acts on: the server is already installed,
@@ -6085,6 +6530,160 @@ mod tests {
                 "{tool} must still certify when every requested class is present"
             );
         }
+    }
+
+    /// A reference answer whose call census read a current, settled ledger
+    /// for every caller in scope has measured what pending readiness stands
+    /// in for: on a daemon whose startup sweep has not yet reached its tail,
+    /// such an answer reads as its census does, not as unknown. A census that
+    /// still owes a caller its enrichment, or a question its census did not
+    /// measure, keeps the readiness clause.
+    /// An impact answer and a callers trace read callers off the same census
+    /// a reference answer does, so pending readiness stops limiting them on
+    /// the same terms: when their own census measured what it stands in for.
+    /// Anything less keeps the readiness clause.
+    #[test]
+    fn a_measured_impact_or_reach_census_is_not_qualified_by_pending_readiness() {
+        let readiness = |tool: &str, payload: &Value| {
+            absence_coverage_clauses(tool, payload)
+                .iter()
+                .any(|clause| clause.starts_with("reference_enrichment_unknown"))
+        };
+        let mut coverage = cross_file_edges_observed();
+        coverage["reference_enrichment"] = json!("unknown");
+        let measured = json!({
+            "settled": true, "clauses": [], "named_complete": true,
+            "callers_owed_derivation": 0, "callers_owed_enrichment": 0, "callers_stale": 0,
+            "callers_unproven_no_resolver": 0, "callers_unverified": 0,
+            "focal_escape": {"escape": "contained", "entities_checked": 3,
+                "residue": {"mentions": {"measured": true}}},
+        });
+
+        let impact = |block: Value| json!({"edge_coverage": coverage.clone(), "affected_callers": [], "call_sites": block});
+        assert!(!readiness("impact_analysis", &impact(measured.clone())));
+        let mut owed = measured.clone();
+        owed["named_complete"] = json!(false);
+        owed["callers_owed_enrichment"] = json!(1);
+        assert!(readiness("impact_analysis", &impact(owed)));
+        // Impact depends on imports and references too, which only a
+        // measured reading of the non-call reads speaks for.
+        let mut reads = measured.clone();
+        reads["focal_escape"]["residue"]["mentions"]["measured"] = json!(false);
+        assert!(readiness("impact_analysis", &impact(reads)));
+        let mut members = measured.clone();
+        members["focal_escape"]["residue"]["mentions"]["references_unmeasured"] =
+            json!("a focal that holds members is referenced through them");
+        assert!(readiness("impact_analysis", &impact(members)));
+        // Several changed entities: every reading measured, and no clause of
+        // the joined block beyond theirs.
+        let many = |extra: Vec<&str>| {
+            json!({"settled": extra.is_empty(), "clauses": extra,
+                "focals": [measured.clone(), measured.clone()]})
+        };
+        assert!(!readiness("impact_analysis", &impact(many(Vec::new()))));
+        assert!(readiness(
+            "impact_analysis",
+            &impact(many(vec![
+                "walk_bounded: 1 of the 66 changed entities were not read"
+            ]))
+        ));
+        assert!(readiness(
+            "impact_analysis",
+            &impact(json!({"settled": false, "clauses": [], "focals": []}))
+        ));
+        assert!(readiness(
+            "impact_analysis",
+            &json!({"edge_coverage": coverage.clone(), "affected_callers": []})
+        ));
+
+        let trace = |direction: &str, reach: Value| {
+            json!({"direction": direction, "edge_coverage": coverage.clone(), "chain": [],
+                "reach": reach})
+        };
+        let reach = json!({"state": "open", "bounds": [], "frontier_total": 3,
+            "members_total": 9, "calls_measured": true});
+        assert!(!readiness(
+            "trace_data_flow",
+            &trace("callers", reach.clone())
+        ));
+        let mut unmeasured = reach.clone();
+        unmeasured["calls_measured"] = json!(false);
+        assert!(readiness("trace_data_flow", &trace("callers", unmeasured)));
+        let mut silent = reach.clone();
+        silent.as_object_mut().unwrap().remove("calls_measured");
+        assert!(readiness("trace_data_flow", &trace("callers", silent)));
+        let mut bounded = reach.clone();
+        bounded["state"] = json!("bounded");
+        bounded["bounds"] = json!([{"which": "frontier_reads_max"}]);
+        assert!(readiness("trace_data_flow", &trace("callers", bounded)));
+        // A walk that also reads callees answers with its chain, which no
+        // reach census speaks for.
+        assert!(readiness("trace_data_flow", &trace("both", reach.clone())));
+        let mut chain_only = trace("callers", reach);
+        chain_only.as_object_mut().unwrap().remove("reach");
+        assert!(readiness("trace_data_flow", &chain_only));
+    }
+
+    #[test]
+    fn a_measured_call_census_is_not_qualified_by_pending_readiness() {
+        let answer = |owed: u64, kinds: Value| {
+            let mut payload = authoritative_empty_references("function");
+            payload["relation_kinds"] = kinds.clone();
+            payload["edge_coverage"]["requested_classes"] = kinds;
+            payload["edge_coverage"]["reference_enrichment"] = json!("unknown");
+            payload[crate::call_sites::CALL_SITES_KEY] = json!({
+                "settled": true,
+                "clauses": [],
+                "named_complete": true,
+                "callers_owed_derivation": 0,
+                "callers_owed_enrichment": owed,
+                "callers_stale": 0,
+                "callers_unproven_no_resolver": 0,
+                "callers_unverified": 0,
+                "focal_escape": {"escape": "contained", "entities_checked": 3, "residue": {}},
+            });
+            let envelope = structural_ready_envelope();
+            let negative = negative_for("find_references", &payload, &envelope).unwrap();
+            let verdict = crate::verdict::Verdict::compute(
+                "find_references",
+                &payload,
+                &envelope,
+                Some(&negative),
+            )
+            .unwrap()
+            .to_value();
+            (negative, verdict)
+        };
+        // The pending readiness stays disclosed among the degraded signals;
+        // what changes is whether it limits the answer.
+        let limited = |negative: &Value| {
+            negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("reference_enrichment_unknown")
+                || negative["trust"] != json!("authoritative")
+        };
+        let unknown = |value: &Value| value.to_string().contains("reference_enrichment_unknown");
+
+        let (negative, verdict) = answer(0, json!(["calls"]));
+        assert!(!limited(&negative), "{negative}");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
+        assert!(!unknown(&verdict), "{verdict}");
+        assert_eq!(verdict["state"], json!("certified"), "{verdict}");
+        assert_eq!(verdict["inputs"]["edge_coverage"], json!("certified"));
+
+        let (negative, verdict) = answer(1, json!(["calls"]));
+        assert!(limited(&negative), "{negative}");
+        assert_ne!(verdict["state"], json!("certified"), "{verdict}");
+
+        // No mention reading was taken, so `references` was not measured.
+        let (negative, verdict) = answer(0, json!(["calls", "references"]));
+        assert!(limited(&negative), "{negative}");
+        assert!(unknown(&verdict), "{verdict}");
     }
 
     #[test]
@@ -6189,7 +6788,7 @@ mod tests {
             "the gap leads with the class's state: {gap}"
         );
         assert!(
-            gap.contains("no cross-file imports edges for JavaScript"),
+            gap.contains("no imports edges between modules for JavaScript"),
             "and names the class and the language: {gap}"
         );
 
@@ -6343,24 +6942,24 @@ mod tests {
             "references".to_string(),
         ];
         assert_eq!(
-            absence_cross_file_classes("find_references", &json!({})),
+            absence_cross_unit_classes("find_references", &json!({})),
             all
         );
         assert_eq!(
-            absence_cross_file_classes("bulk_check_references", &json!({})),
+            absence_cross_unit_classes("bulk_check_references", &json!({})),
             all
         );
         assert_eq!(
-            absence_cross_file_classes("trace_data_flow", &json!({})),
+            absence_cross_unit_classes("trace_data_flow", &json!({})),
             all
         );
         assert_eq!(
-            absence_cross_file_classes("impact_analysis", &json!({})),
+            absence_cross_unit_classes("impact_analysis", &json!({})),
             all,
             "an absence spec added to impact_analysis must arrive already gated"
         );
         assert_eq!(
-            absence_cross_file_classes(
+            absence_cross_unit_classes(
                 "find_references",
                 &json!({ "relation_kinds": ["Calls", "other"] })
             ),
@@ -6376,7 +6975,7 @@ mod tests {
             "entity_history",
         ] {
             assert!(
-                absence_cross_file_classes(tool, &json!({})).is_empty(),
+                absence_cross_unit_classes(tool, &json!({})).is_empty(),
                 "{tool} traverses no cross-file reference edge for its absence claim"
             );
         }
@@ -6397,6 +6996,329 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("method_call_resolution_incomplete"));
+    }
+
+    /// A reference answer that read every call site in the store spelling the
+    /// method's call name, and proved or listed each one, has already done what
+    /// the method gate guards, so the gate stands aside and the block's own
+    /// clauses carry what is left. A method a language may run without a call
+    /// spelling its name keeps the gate, and so does an answer whose named
+    /// scope still owes a caller its sites.
+    #[test]
+    fn a_named_complete_reference_answer_is_not_refused_by_the_method_gate() {
+        let with_block = |named_complete: bool, implicit: Option<bool>| {
+            let mut payload = authoritative_empty_references("method");
+            payload[crate::call_sites::CALL_SITES_KEY] = json!({
+                "settled": true,
+                "clauses": [],
+                "named_complete": named_complete,
+            });
+            if let Some(implicit) = implicit {
+                payload[crate::call_sites::CALL_SITES_KEY]["implicit_dispatch"] = json!(implicit);
+            }
+            negative_for("find_references", &payload, &structural_ready_envelope())
+                .expect("empty references yields a negative")
+        };
+        let complete = with_block(true, None);
+        assert!(
+            !complete["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("method_call_resolution_incomplete"),
+            "{complete}"
+        );
+        assert_eq!(
+            complete["safe_to_conclude_absent"],
+            json!(true),
+            "{complete}"
+        );
+        for refused in [with_block(false, None), with_block(true, Some(true))] {
+            assert!(
+                refused["trust_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("method_call_resolution_incomplete"),
+                "{refused}"
+            );
+            assert_eq!(
+                refused["safe_to_conclude_absent"],
+                json!(false),
+                "{refused}"
+            );
+        }
+    }
+
+    /// A method a language runs without a call spelling its name is accounted
+    /// for once the census names that dispatch, the way a callers trace
+    /// accounts for it: `Flask.__call__` runs on a call of an instance, so its
+    /// answer is `certified_except` that listed protocol, never certified and
+    /// never refused by the method gate. The same hook with no protocol named
+    /// keeps the gate.
+    #[test]
+    fn a_hook_whose_dispatch_the_census_names_is_certified_except_that_dispatch() {
+        use kin_model::{EscapeResidue, FocalEscape, ProtocolResidue};
+        let mut focal = crate::call_sites::fixture::spanned_entity(
+            "Flask.__call__",
+            "src/flask/app.py",
+            kin_model::LanguageId::Python,
+            0,
+            "def __call__(self, environ, start_response):\n    pass\n",
+        );
+        focal.kind = kin_model::EntityKind::Method;
+        let store = kin_db::InMemoryGraph::new();
+        let answer = |escape: FocalEscape| {
+            let scan = crate::call_sites::scan_focal(
+                &store,
+                &focal,
+                &crate::call_sites::NoSiteText,
+                escape,
+            )
+            .unwrap();
+            assert!(scan.implicit_dispatch && scan.named_complete());
+            let mut payload = authoritative_empty_references("method");
+            payload[crate::call_sites::CALL_SITES_KEY] = crate::call_sites::named_block(&scan);
+            let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+                .expect("empty references yields a negative");
+            let verdict = crate::verdict::Verdict::compute(
+                "find_references",
+                &payload,
+                &crate::envelope::Envelope::daemon(),
+                Some(&negative),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+            (negative, verdict)
+        };
+        let (negative, verdict) = answer(FocalEscape::Contained {
+            entities_checked: 1,
+            residue: EscapeResidue {
+                protocol: Some(ProtocolResidue {
+                    dispatch: "implicit",
+                    through: Some("a call of an instance".to_string()),
+                    sites: Vec::new(),
+                }),
+                ..EscapeResidue::default()
+            },
+        });
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("method_call_resolution_incomplete"),
+            "{negative}"
+        );
+        assert_eq!(verdict["state"], json!("certified_except"), "{verdict}");
+        assert_eq!(
+            verdict["limiting_factor"],
+            json!("escape_residue_listed"),
+            "{verdict}"
+        );
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            json!(false),
+            "{verdict}"
+        );
+
+        let (negative, verdict) = answer(FocalEscape::contained(1));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("method_call_resolution_incomplete"),
+            "{negative}"
+        );
+        assert_ne!(verdict["state"], json!("certified"), "{verdict}");
+        assert_ne!(verdict["state"], json!("certified_except"), "{verdict}");
+    }
+
+    /// A Python method that could run without a call spelling its name only
+    /// through the decorators it is declared under is accounted for by listing
+    /// them: `@setupmethod def add_template_filter` binds what `setupmethod`
+    /// returns to the name, so the answer is `certified_except` that decorator,
+    /// listed in the block. Python's name-preserving decorators leave nothing to
+    /// list, and a property-style decorator, which runs the method on a read of
+    /// its name, keeps the gate.
+    #[test]
+    fn a_method_run_only_through_its_decorators_is_certified_except_them() {
+        let store = kin_db::InMemoryGraph::new();
+        let answer = |signature: &str| {
+            let mut focal = crate::call_sites::fixture::spanned_entity(
+                "App.add_template_filter",
+                "src/flask/sansio/app.py",
+                kin_model::LanguageId::Python,
+                0,
+                "@setupmethod\ndef add_template_filter(self, f):\n    pass\n",
+            );
+            focal.kind = kin_model::EntityKind::Method;
+            focal.signature = signature.to_string();
+            let scan = crate::call_sites::scan_focal(
+                &store,
+                &focal,
+                &crate::call_sites::NoSiteText,
+                kin_model::FocalEscape::contained(1),
+            )
+            .unwrap();
+            assert!(scan.implicit_dispatch && scan.named_complete());
+            let mut payload = authoritative_empty_references("method");
+            payload[crate::call_sites::CALL_SITES_KEY] = crate::call_sites::named_block(&scan);
+            let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+                .expect("empty references yields a negative");
+            let verdict = crate::verdict::Verdict::compute(
+                "find_references",
+                &payload,
+                &crate::envelope::Envelope::daemon(),
+                Some(&negative),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+            (payload, negative, verdict)
+        };
+        let gated = |negative: &Value| {
+            negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("method_call_resolution_incomplete")
+        };
+
+        let (payload, negative, verdict) =
+            answer("@setupmethod def add_template_filter(self, f) -> None");
+        assert!(!gated(&negative), "{negative}");
+        assert_eq!(verdict["state"], json!("certified_except"), "{verdict}");
+        assert_eq!(
+            verdict["limiting_factor"],
+            json!("decorator_dispatch_listed"),
+            "{verdict}"
+        );
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            json!(false),
+            "{verdict}"
+        );
+        let listed =
+            &payload[crate::call_sites::CALL_SITES_KEY][crate::call_sites::DISPATCH_DECORATORS_KEY];
+        assert_eq!(listed[0]["expr"], json!("@setupmethod"), "{payload}");
+        assert_eq!(
+            listed[0]["inside"],
+            json!("App.add_template_filter"),
+            "{payload}"
+        );
+
+        let (_, negative, verdict) = answer("@staticmethod def add_template_filter(f) -> None");
+        assert!(!gated(&negative), "{negative}");
+        assert_eq!(verdict["state"], json!("certified"), "{verdict}");
+
+        for accessor in [
+            "@property def add_template_filter(self)",
+            "@cached_property def add_template_filter(self)",
+            "@add_template_filter.setter def add_template_filter(self, value)",
+        ] {
+            let (_, negative, verdict) = answer(accessor);
+            assert!(gated(&negative), "{accessor}: {negative}");
+            assert_ne!(verdict["state"], json!("certified"), "{verdict}");
+            assert_ne!(verdict["state"], json!("certified_except"), "{verdict}");
+        }
+    }
+
+    /// A constructor whose every spelled call is proven or listed is not
+    /// refused for bare-name linking: the gap it keeps names the
+    /// constructions no call name shows, subclasses that define no
+    /// constructor and `cls` or `type(self)` calls, and stays open.
+    #[test]
+    fn a_named_complete_constructor_names_the_constructions_it_cannot_see() {
+        let store = kin_db::InMemoryGraph::new();
+        let answer = |signature: &str| {
+            let mut focal = crate::call_sites::fixture::spanned_entity(
+                "Flask.__init__",
+                "src/flask/app.py",
+                kin_model::LanguageId::Python,
+                0,
+                "def __init__(self, import_name):\n    pass\n",
+            );
+            focal.kind = kin_model::EntityKind::Method;
+            focal.signature = signature.to_string();
+            let scan = crate::call_sites::scan_focal(
+                &store,
+                &focal,
+                &crate::call_sites::NoSiteText,
+                kin_model::FocalEscape::contained(1),
+            )
+            .unwrap();
+            let mut payload = authoritative_empty_references("method");
+            payload[crate::call_sites::CALL_SITES_KEY] = crate::call_sites::named_block(&scan);
+            let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+                .expect("empty references yields a negative");
+            let verdict = crate::verdict::Verdict::compute(
+                "find_references",
+                &payload,
+                &crate::envelope::Envelope::daemon(),
+                Some(&negative),
+            )
+            .unwrap()
+            .to_value();
+            (negative, verdict)
+        };
+        let (negative, verdict) = answer("def __init__(self, import_name)");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("constructor_dispatch_unlisted:"),
+            "{negative}"
+        );
+        assert!(reason.contains("Flask or __init__"), "{negative}");
+        assert!(
+            !reason.contains("method_call_resolution_incomplete"),
+            "{negative}"
+        );
+        assert_eq!(verdict["state"], json!("inconclusive"), "{verdict}");
+        assert_eq!(
+            verdict["limiting_factor"],
+            json!("constructor_dispatch_unlisted"),
+            "{verdict}"
+        );
+        // A decorated constructor could run another way, and keeps the gate.
+        let (negative, _) = answer("@deprecated def __init__(self, import_name)");
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("method_call_resolution_incomplete"));
+    }
+
+    /// A spine that refused this graph on a daemon with no other repository to
+    /// federate would have held this repository alone. The refusal hides no
+    /// reference, so it is stated as a note and never as the limit.
+    #[test]
+    fn a_spine_refusal_with_no_peer_repository_is_a_note() {
+        let mut payload = authoritative_empty_references("function");
+        payload["cross_repo"] = json!({
+            "status": "unavailable",
+            "code": crate::handlers::entities::SPINE_REFUSED_WITHOUT_PEERS,
+            "reason": "the cross-repo spine refused repository r's graph and this daemon \
+                       registers no other repository for it to federate",
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
+        assert!(
+            note_matching(
+                &negative,
+                crate::handlers::entities::SPINE_REFUSED_WITHOUT_PEERS
+            )
+            .is_some(),
+            "{negative}"
+        );
+        // The same refusal where peers exist is still a gap.
+        payload["cross_repo"]["code"] = json!("spine_candidate_representation_gap");
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "{negative}"
+        );
     }
 
     #[test]
@@ -6930,7 +7852,7 @@ mod tests {
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
             "classes": { "calls": "absent", "imports": "absent", "references": "absent" },
-            "cross_file_classes": [],
+            "cross_unit_classes": [],
             "budget_exhausted": false,
             "entities_examined": 26,
         });
@@ -7482,6 +8404,44 @@ mod tests {
         assert!(reason.contains('2'), "the count must be named: {reason}");
     }
 
+    /// A scoped callers walk answers with its closure: the chain's caps say
+    /// nothing about that answer, and a bound on the closure does.
+    #[test]
+    fn a_scoped_callers_walk_is_qualified_by_its_closure_not_its_chain() {
+        let mut payload = clean_empty_trace("callers");
+        payload["truncated"] = json!(true);
+        payload["scope"] = json!({"module": "pkg", "answer": "reach", "state": "complete"});
+        let reason = |payload: &Value| {
+            negative_for("trace_data_flow", payload, &structural_ready_envelope())
+                .map(|negative| {
+                    negative["trust_reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            !reason(&payload).contains("trace_walk_truncated"),
+            "{}",
+            reason(&payload)
+        );
+        payload["scope"]["state"] = json!("bounded");
+        assert!(
+            reason(&payload).contains("trace_walk_truncated"),
+            "{}",
+            reason(&payload)
+        );
+        // A calls walk's answer is its chain, whose caps still qualify it.
+        payload["direction"] = json!("calls");
+        payload["scope"] = json!({"module": "pkg", "answer": "chain", "state": "open"});
+        assert!(
+            reason(&payload).contains("trace_walk_truncated"),
+            "{}",
+            reason(&payload)
+        );
+    }
+
     /// The method gate is the one `find_references` already applies, and it
     /// bears on a walk that read incoming edges. An outgoing-only walk never
     /// looked at them, so the gate does not apply and the absence stands.
@@ -7535,7 +8495,7 @@ mod tests {
         payload["truncated"] = json!(true);
         payload["steps_omitted"] = json!(126);
         payload["spine_clipped_steps"] = json!(1);
-        payload["spine_dropped_crossing_file"] = json!(11);
+        payload["spine_dropped_crossing_unit"] = json!(11);
         payload["degradations"] = json!([
             { "component": "fanout_cap", "reason": "spine_clipped" }
         ]);
@@ -7657,7 +8617,7 @@ mod tests {
             "the degraded fact trace_walk_degraded carried must survive: {reason}"
         );
         assert!(
-            reason.contains("11 of the dropped neighbours lived outside the file"),
+            reason.contains("11 of the dropped neighbours lived outside the module"),
             "the cross-file count must survive: {reason}"
         );
     }
@@ -7780,7 +8740,7 @@ mod tests {
                 let mut p = spine_clipped_trace();
                 p.as_object_mut()
                     .unwrap()
-                    .remove("spine_dropped_crossing_file");
+                    .remove("spine_dropped_crossing_unit");
                 p
             }),
             ("clipped but neither truncated nor degraded", {

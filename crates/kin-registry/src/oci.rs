@@ -822,7 +822,7 @@ fn read_upload_session_disk(
                 .map_err(|error| format!("failed to reopen interrupted OCI upload: {error}"))?;
             file.set_len(upload.size)
                 .map_err(|error| format!("failed to roll back interrupted OCI upload: {error}"))?;
-            file.sync_all()
+            kin_blobs::durable::sync_all(&file)
                 .map_err(|error| format!("failed to sync interrupted OCI upload: {error}"))?;
         }
         Ok(_) => return Err("OCI upload staged data does not match its metadata".to_string()),
@@ -1088,7 +1088,7 @@ impl UploadAppendGuard {
             .run_file_operation(move |file| {
                 file.set_len(original_size)
                     .map_err(|error| format!("failed to roll back OCI upload data: {error}"))?;
-                file.sync_all()
+                kin_blobs::durable::sync_all(&file)
                     .map_err(|error| format!("failed to sync rolled-back OCI upload data: {error}"))
             })
             .await;
@@ -1145,7 +1145,7 @@ impl Drop for UploadAppendGuard {
                     .map_err(|_| "OCI upload file lock was poisoned".to_string())?;
                 file.set_len(original_size)
                     .map_err(|error| format!("failed to roll back OCI upload data: {error}"))?;
-                file.sync_all()
+                kin_blobs::durable::sync_all(&file)
                     .map_err(|error| format!("failed to sync rolled-back OCI upload data: {error}"))
             })
             .await
@@ -1219,7 +1219,7 @@ async fn append_upload_body(
         .run_file_operation(|file| {
             std::io::Write::flush(file)
                 .map_err(|error| format!("failed to flush OCI upload data: {error}"))?;
-            file.sync_all()
+            kin_blobs::durable::sync_all(&file)
                 .map_err(|error| format!("failed to sync OCI upload data: {error}"))
         })
         .await

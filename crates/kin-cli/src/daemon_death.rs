@@ -242,8 +242,14 @@ pub fn enrichment_clause(record: Option<&DaemonKillRecord>) -> &'static str {
 /// actively harmful: its advice is to re-run, and re-running is what cannot
 /// terminate. This one leads with the fact that the daemon did not retire, and
 /// hands over the record's own remediation, every action in which is one the
-/// caller can perform.
-pub fn dropped_request_sentence(base_url: &str, leaf: &str, state: &DaemonNotAnswering) -> String {
+/// caller can perform. `enrichment` is how enrichment stands for the store, so
+/// the remediation never offers a switch the repository has already turned.
+pub fn dropped_request_sentence(
+    base_url: &str,
+    leaf: &str,
+    state: &DaemonNotAnswering,
+    enrichment: kin_daemon_spawn::EnrichmentState,
+) -> String {
     let opening = format!(
         "the kin daemon at {base_url} stopped answering while the {leaf} request was in \
                  flight"
@@ -252,7 +258,7 @@ pub fn dropped_request_sentence(base_url: &str, leaf: &str, state: &DaemonNotAns
         DaemonNotAnswering::Killed(record) => {
             format!(
                 "{opening}, and it did not exit its idle window: {}",
-                record.summary()
+                record.summary_in(enrichment)
             )
         }
         DaemonNotAnswering::NotRetired { pid } => format!(
@@ -310,6 +316,7 @@ mod tests {
             "http://127.0.0.1:39767",
             "lsp sweep status",
             &DaemonNotAnswering::Killed(Box::new(memory_kill())),
+            kin_daemon_spawn::EnrichmentState::Available,
         );
         assert!(
             !sentence.contains("idle window, so re-run"),
@@ -335,6 +342,7 @@ mod tests {
             "http://127.0.0.1:1",
             "locate",
             &DaemonNotAnswering::Killed(Box::new(memory_kill())),
+            kin_daemon_spawn::EnrichmentState::Available,
         );
         assert!(sentence.contains("memory limit"), "{sentence}");
         assert!(sentence.contains("12.0 GiB"), "{sentence}");
@@ -355,6 +363,7 @@ mod tests {
             "http://127.0.0.1:1",
             "locate",
             &DaemonNotAnswering::Killed(Box::new(unattributed_kill())),
+            kin_daemon_spawn::EnrichmentState::Available,
         );
         assert!(
             sentence.contains("without retiring its serving record"),
@@ -385,6 +394,7 @@ mod tests {
             "http://127.0.0.1:45917",
             "graph",
             &DaemonNotAnswering::NotRetired { pid: 4103 },
+            kin_daemon_spawn::EnrichmentState::Available,
         );
         assert!(
             !sentence.contains("idle window, so re-run"),

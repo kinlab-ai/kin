@@ -42,6 +42,7 @@ impl Fixture {
             name_line: line,
             name_col: 0,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
         // Each provider below writes `Widget` where these declare it, so a
@@ -1247,6 +1248,7 @@ impl ThreeCalls {
             name_line: start,
             name_col: 4,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
         // Line 0 is a decorator above the caller's own lines, which run 1 to 4.
@@ -1831,6 +1833,7 @@ impl DecoratedFile {
             name_line: start,
             name_col: hint,
             declares_name,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
         let module_signature = format!("module {DECORATED_PATH}");
@@ -2164,6 +2167,7 @@ async fn an_imported_value_used_as_a_receiver_is_a_reference() {
         name_line: start,
         name_col: if name == "get_db" { 4 } else { 0 },
         declares_name,
+        declares_only: false,
         kind: kin_model::EntityKind::Function,
     };
     let get_db = entity("get_db", "source.py", 1, 4, true);
@@ -2255,6 +2259,7 @@ async fn one_slow_definition_answer_skips_its_identifier_and_keeps_the_file() {
         name_line: start,
         name_col: 4,
         declares_name: true,
+        declares_only: false,
         kind: kin_model::EntityKind::Function,
     };
     let run = entity("run", "source.py", 0, 2);
@@ -2262,19 +2267,18 @@ async fn one_slow_definition_answer_skips_its_identifier_and_keeps_the_file() {
     let beta = entity("beta", "lib.py", 3, 4);
     let index = EntityIndex::new(vec![run.clone(), alpha.clone(), beta.clone()], &root);
     let mut responses = json!({});
-    responses[format!("{DEFINITION}@{uri}#2")] = json!({"hold": true});
+    responses[format!("{DEFINITION}@{uri}#2")] = json!({"hold": true, "clock_hold": true});
     responses[format!("{DEFINITION}@{uri}#6")] = json!({"result": [{
         "uri": crate::protocol::path_to_uri(&root.join("lib.py")),
         "range": {"start": {"line": 3, "character": 4}, "end": {"line": 3, "character": 8}},
     }]});
     let server = LspServer::scripted_for_tests(PEER, responses);
-    let answer = crate::file_enrichment::enrich_file_definitions(
+    let source = root.join("source.py");
+    let answer = with_held_request_clock(
         &server,
-        &root.join("source.py"),
-        text,
-        &index,
-        &root,
-        None,
+        crate::file_enrichment::enrich_file_definitions(
+            &server, &source, text, &index, &root, None,
+        ),
     )
     .await
     .unwrap();
@@ -2290,6 +2294,137 @@ async fn one_slow_definition_answer_skips_its_identifier_and_keeps_the_file() {
         "the identifier after the slow one still answers: {answer:?}"
     );
     server.shutdown().await.unwrap();
+}
+
+/// Freeze the test clock while the real child process receives and answers
+/// JSON-RPC. A blocking task prevents Tokio from auto-advancing while that
+/// external I/O runs. Only a held request both received by the peer and given
+/// its actual adaptive deadline by the client is advanced to that deadline.
+/// A concurrent peer can also report a logical reply delay and receive an
+/// explicit release at that time. Both sides then share the clock: replies,
+/// adaptive deadlines and pacing keep their original order and duration.
+/// Thus the test still exercises production timeout, cancellation and pacing
+/// without waiting out allowances such as 10 + 20 + 40 seconds in real time.
+pub(crate) async fn with_held_request_clock<T>(
+    server: &LspServer,
+    pass: impl std::future::Future<Output = T>,
+) -> T {
+    struct PausedClock(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for PausedClock {
+        fn drop(&mut self) {
+            tokio::time::resume();
+            self.0.take();
+        }
+    }
+
+    let mut progress = server.client.progress();
+    let mut deadlines = server.client.request_deadlines_for_tests();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (expired, mut watchdog) = tokio::sync::oneshot::channel();
+    let hold_clock = tokio::task::spawn_blocking(move || {
+        if matches!(
+            wait.recv_timeout(std::time::Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = expired.send(());
+        }
+    });
+    tokio::time::pause();
+    let clock = PausedClock(Some(release));
+    tokio::pin!(pass);
+    let mut observed = std::collections::BTreeMap::new();
+    let mut advanced = std::collections::HashSet::new();
+    let mut released = std::collections::HashSet::new();
+    let answer = loop {
+        tokio::select! {
+            biased;
+            answer = &mut pass => break answer,
+            _ = &mut watchdog => panic!("scripted peer did not finish within its real I/O budget"),
+            changed = progress.changed() => changed.expect("peer progress observer stays open"),
+            changed = deadlines.changed() => changed.expect("request deadline observer stays open"),
+        }
+        let requests = server.client.request_ids_for_tests().await;
+        let registered = deadlines.borrow().clone();
+        let pending = progress.borrow().active.clone();
+        observed.extend(registered.iter().map(|(id, deadline)| (*id, *deadline)));
+        // A release is acknowledged only after the peer writes the reply
+        // and the client dispatches it. Advancing while it crosses stdout
+        // would charge the answer for later timers or time it out falsely.
+        if released.iter().any(|id| {
+            requests.contains(id)
+                || registered.contains_key(id)
+                || pending.contains_key(&id.to_string())
+        }) {
+            continue;
+        }
+        // Registering a waiter precedes the actual write. Wait for every
+        // concurrent write and peer receipt before advancing any timer.
+        if requests.iter().any(|id| !observed.contains_key(id))
+            || pending.keys().any(|id| {
+                id.parse::<i64>()
+                    .map_or(true, |id| !observed.contains_key(&id))
+            })
+            || registered.keys().any(|id| {
+                requests.contains(id)
+                    && !released.contains(id)
+                    && !pending.contains_key(&id.to_string())
+            })
+        {
+            continue;
+        }
+        let scheduled: Vec<_> = pending
+            .iter()
+            .filter_map(|(id, title)| {
+                let id = id.parse::<i64>().ok()?;
+                if released.contains(&id) {
+                    return None;
+                }
+                let delay =
+                    serde_json::from_str::<Value>(title).ok()?["clock_delay_ns"].as_u64()?;
+                Some((
+                    id,
+                    observed.get(&id)?.asked_at + std::time::Duration::from_nanos(delay),
+                ))
+            })
+            .collect();
+        let next = registered
+            .values()
+            .filter(|deadline| {
+                requests.contains(&deadline.id)
+                    && !released.contains(&deadline.id)
+                    && !advanced.contains(&deadline.id)
+                    && pending.contains_key(&deadline.id.to_string())
+            })
+            .map(|deadline| deadline.at)
+            .chain(scheduled.iter().map(|(_, at)| *at))
+            .min();
+        if let Some(next) = next {
+            let remaining = next.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::advance(remaining + std::time::Duration::from_millis(1)).await;
+            let now = tokio::time::Instant::now();
+            for deadline in registered.values() {
+                if deadline.at <= now {
+                    advanced.insert(deadline.id);
+                }
+            }
+            let due: Vec<_> = scheduled
+                .iter()
+                .filter(|(_, at)| *at <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            if !due.is_empty() {
+                released.extend(due.iter().copied());
+                server
+                    .client
+                    .notify("test/release-clock", json!({"ids": due}))
+                    .await
+                    .expect("release the peer's due replies on the wire");
+            }
+        }
+    };
+    drop(clock);
+    hold_clock.await.expect("controlled-clock guard stopped");
+    answer
 }
 
 /// Every held request in `holds` times out. `answers` reply at a column of
@@ -2316,16 +2451,16 @@ async fn pass_with_held_requests(
         responses[format!("{method}@{uri}#{column}")] = answer.clone();
     }
     for (method, column) in holds {
-        responses[format!("{method}@{uri}#{column}")] = json!({"hold": true});
+        responses[format!("{method}@{uri}#{column}")] = json!({"hold": true, "clock_hold": true});
     }
     let server = LspServer::scripted_for_tests(PEER, responses);
-    let answer = crate::file_enrichment::enrich_file_definitions(
+    let source = root.join("source.py");
+    let index = EntityIndex::new(entities, &root);
+    let answer = with_held_request_clock(
         &server,
-        &root.join("source.py"),
-        text,
-        &EntityIndex::new(entities, &root),
-        &root,
-        None,
+        crate::file_enrichment::enrich_file_definitions(
+            &server, &source, text, &index, &root, None,
+        ),
     )
     .await;
     let requests = seen(&server).await;
@@ -2348,6 +2483,7 @@ fn declared_at(name: &str, file: &str, start: u32, end: u32, name_col: u32) -> E
         name_line: start,
         name_col,
         declares_name: true,
+        declares_only: false,
         kind: kin_model::EntityKind::Function,
     }
 }
@@ -2559,6 +2695,7 @@ async fn a_python_answer_inside_a_body_is_not_a_reference_to_that_body() {
 async fn a_python_module_answer_is_not_a_reference_to_the_first_declaration() {
     let surface = |name: &str, file: &str, end: u32| EntityRef {
         declares_name: false,
+        declares_only: false,
         kind: kin_model::EntityKind::Function,
         ..declared_at(name, file, 0, end, 0)
     };
@@ -2738,6 +2875,128 @@ async fn a_python_type_answer_is_the_entity_only_on_its_own_name() {
     server.shutdown().await.unwrap();
 }
 
+/// Flask's `Scaffold.route`: the nested `decorator` reads `self`, a parameter
+/// of `route`. Pyright cannot place that name's type and answers with the
+/// parameter's own declaration, which sits on the line that declares `route`.
+/// That answer is about the parameter. Only an answer on the name token names
+/// `route` itself.
+#[tokio::test]
+async fn a_python_type_answer_on_a_parameter_of_the_parent_does_not_name_the_parent() {
+    let root = std::env::temp_dir().join(format!("kin-lsp-captured-{}", EntityId::new()));
+    let text = "class Scaffold:\n    @setupmethod\n    def route(self, rule, **options):\n        \
+                def decorator(f):\n            endpoint = options.pop(\"endpoint\", None)\n            \
+                self.add_url_rule(rule, endpoint, f, **options)\n            return f\n\n        \
+                return decorator\n";
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[2], "    def route(self, rule, **options):");
+    assert_eq!(
+        lines[5],
+        "            self.add_url_rule(rule, endpoint, f, **options)"
+    );
+    let uri = crate::protocol::path_to_uri(&root.join("source.py"));
+    let route = EntityRef {
+        start_line: 1,
+        end_line: 8,
+        name_line: 2,
+        ..declared_at("Scaffold.route", "source.py", 1, 8, 8)
+    };
+    let decorator = declared_at("Scaffold.route.<locals>.decorator", "source.py", 3, 6, 12);
+    let index = EntityIndex::new(vec![route.clone(), decorator.clone()], &root);
+    let on_route_line = |start: usize, end: usize| {
+        json!({"result": [{"uri": uri, "range": {
+            "start": {"line": 2, "character": start},
+            "end": {"line": 2, "character": end}}}]})
+    };
+    let parameter = lines[2].find("self").unwrap();
+    let name = lines[2].find("route").unwrap();
+    let captured = lines[5].find("self").unwrap();
+    let returned = lines[6].find('f').unwrap();
+    let uses = |responses: Value| {
+        let (root, decorator, index) = (&root, &decorator, &index);
+        async move {
+            let server = LspServer::scripted_for_tests(PEER, responses);
+            let found = enrichment::enrich_entity_type_uses(
+                &server,
+                decorator,
+                index,
+                root,
+                Some(&|_| Some(text.to_owned())),
+            )
+            .await
+            .unwrap();
+            server.shutdown().await.unwrap();
+            found
+        }
+    };
+    // The answer the pass disproves, as (the declaration it is not about,
+    // the line and text of the identifier that was asked).
+    let disproved = |found: &enrichment::TypeUses| -> Vec<(EntityId, u32, String)> {
+        found
+            .disproved
+            .iter()
+            .map(|answer| {
+                assert_eq!(answer.source, decorator.id);
+                (
+                    answer.target,
+                    answer.site.start_line,
+                    text[answer.site.start_byte..answer.site.end_byte].to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // The captured `self` answers with the parent's own `self`.
+    let mut responses = json!({});
+    responses[format!("{TYPES}@{uri}#{captured}")] = on_route_line(parameter, parameter + 4);
+    let found = uses(responses.clone()).await;
+    assert!(
+        found.relations.is_empty(),
+        "an answer on a parameter of `route` is not a use of `route`: {:?}",
+        found.relations
+    );
+    // And the pass says so, for the identifier it asked: an edge an earlier
+    // build minted there from this answer is contradicted. The scripted
+    // server answers by column, so every identifier of `decorator` that
+    // starts where `self` does got the same answer and is disproved too.
+    let at_self = (route.id, 5, "self".to_string());
+    assert!(
+        disproved(&found).contains(&at_self),
+        "{:?}",
+        found.disproved
+    );
+    assert!(
+        disproved(&found)
+            .iter()
+            .all(|(target, _, _)| *target == route.id),
+        "{:?}",
+        found.disproved
+    );
+
+    // An answer on the name token still names it.
+    responses[format!("{TYPES}@{uri}#{returned}")] = on_route_line(name, name + 5);
+    let found = uses(responses).await;
+    assert!(
+        disproved(&found).contains(&at_self),
+        "what one identifier proves does not undo what another disproves: {:?}",
+        found.disproved
+    );
+    let relations = found.relations;
+    assert_eq!(
+        relations
+            .iter()
+            .map(|relation| (relation.kind, relation.dst))
+            .collect::<Vec<_>>(),
+        [(RelationKind::UsesType, GraphNodeId::Entity(route.id))],
+        "{relations:?}"
+    );
+    let span = relations[0].evidence[0].source_span.as_ref().unwrap();
+    assert_eq!(
+        (span.start_line, &text[span.start_byte..span.end_byte]),
+        (6, "f"),
+        "the edge is the one the name answer proved, not the parameter's"
+    );
+}
+
 /// Three call-hierarchy timeouts in a row stop asking. The entity after them
 /// is not asked, and each timeout is counted.
 #[tokio::test]
@@ -2821,6 +3080,7 @@ mod go_method_references {
                 name_line: lines.0,
                 name_col,
                 declares_name: true,
+                declares_only: false,
                 kind,
             };
             use kin_model::EntityKind::{Function, Method};
@@ -3174,6 +3434,7 @@ mod colliding_file_paths {
             name_line: lines.0,
             name_col: column,
             declares_name: true,
+            declares_only: false,
             kind,
         }
     }
@@ -3485,6 +3746,7 @@ async fn the_file_pass_answers_a_site_only_when_its_definition_is_definite() {
         name_line: start,
         name_col,
         declares_name: true,
+        declares_only: false,
         kind: kin_model::EntityKind::Function,
     };
     let run = entity("run", "source.py", 0, 5, 4);
@@ -3608,6 +3870,7 @@ fn entity_at(
         name_line,
         name_col,
         declares_name: EntityRef::kind_declares_name(kind),
+        declares_only: false,
         kind,
     }
 }
@@ -3701,6 +3964,115 @@ async fn an_answer_on_an_overload_signature_proves_the_implementation() {
         !has_edge(&pass.relations, RelationKind::References, module.id),
         "the module containing the overload signature is not its reference target: {pass:?}"
     );
+}
+
+/// A Python `@overload` stub is an entity of its own that only declares, and
+/// pyright answers a call of an overloaded function with every stub and the
+/// implementation. Read as three declarations, the answers disagreed and the
+/// site proved nothing, as Flask's `ScriptInfo.load_app` calling `locate_app`
+/// did on every sweep. Each stub now proves the implementation that follows
+/// it under the same name, so the answers agree on the code the call runs.
+#[tokio::test]
+async fn an_answer_on_a_python_overload_stub_proves_the_implementation() {
+    use kin_model::EntityKind;
+    let lib = [
+        "import typing as t",
+        "",
+        "",
+        "@t.overload",
+        "def locate_app(name: str) -> str: ...",
+        "",
+        "",
+        "@t.overload",
+        "def locate_app(name: None) -> None: ...",
+        "",
+        "",
+        "def locate_app(name):",
+        "    return name",
+    ]
+    .join("\n");
+    // The scripted server answers by column alone, so the call sits at a
+    // column no other identifier starts at.
+    let text = "def run():\n        locate_app(1)\n";
+    for stubs_declare_only in [true, false] {
+        let root = Workspace::new("python-overload");
+        let run = entity_at("run", "source.py", (0, 1), (0, 4), EntityKind::Function);
+        let stub = |start: u32| EntityRef {
+            declares_only: stubs_declare_only,
+            ..entity_at(
+                "locate_app",
+                "lib.py",
+                (start, start + 1),
+                (start + 1, 4),
+                EntityKind::Function,
+            )
+        };
+        let (first, second) = (stub(3), stub(7));
+        let implementation = entity_at(
+            "locate_app",
+            "lib.py",
+            (11, 12),
+            (11, 4),
+            EntityKind::Function,
+        );
+        let index = EntityIndex::new(
+            vec![
+                run.clone(),
+                first.clone(),
+                second.clone(),
+                implementation.clone(),
+            ],
+            &root.0,
+        );
+        let mut responses = json!({});
+        responses[format!("{DEFINITION}@{}#8", root.uri("source.py"))] = json!({"result": [
+            root.at("lib.py", 4, 4, 14),
+            root.at("lib.py", 8, 4, 14),
+            root.at("lib.py", 11, 4, 14),
+        ]});
+        let server = LspServer::scripted_for_tests(PEER, responses);
+        let provider = |path: &str| (path == "lib.py").then(|| lib.clone());
+        let pass = crate::file_enrichment::enrich_file_definitions(
+            &server,
+            &root.0.join("source.py"),
+            text,
+            &index,
+            &root.0,
+            Some(&provider),
+        )
+        .await
+        .unwrap();
+        server.shutdown().await.unwrap();
+        if !stubs_declare_only {
+            assert!(
+                pass.site_answers.is_empty(),
+                "stubs read as declarations of their own disagree with the implementation, \
+                 which is what this test guards against: {pass:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            site_answers_of(text, &pass),
+            [(
+                "locate_app",
+                1,
+                run.id,
+                Placed::Entity(implementation.id),
+                crate::call_sites::DEFINITION_RULE
+            )],
+            "{pass:?}"
+        );
+        assert!(
+            has_edge(&pass.relations, RelationKind::References, implementation.id),
+            "every stub's answer references the implementation: {pass:?}"
+        );
+        for stub in [&first, &second] {
+            assert!(
+                !has_edge(&pass.relations, RelationKind::References, stub.id),
+                "a stub is not what the call runs: {pass:?}"
+            );
+        }
+    }
 }
 
 /// A call whose answer proves nothing says what the answer came to: a local
@@ -4246,11 +4618,17 @@ async fn a_request_the_client_stops_waiting_for_is_cancelled() {
 /// an empty one or an error about the document, means it has taken the
 /// document in. A server that never answers runs the budget out, and the
 /// request is cancelled.
+///
+/// The budget times the server's answer about the document and nothing else,
+/// so each scripted peer is running before it starts. A peer is a fresh
+/// `python3` with no handshake, and its interpreter starting inside the budget
+/// made the answering cases fail on a loaded host for no fault of the code.
 #[tokio::test]
 async fn a_document_is_ready_when_the_server_answers_about_it() {
     const SYMBOLS: &str = "textDocument/documentSymbol";
     let budget = std::time::Duration::from_millis(300);
     let server = LspServer::scripted_for_tests(PEER, json!({SYMBOLS: {"result": []}}));
+    seen(&server).await;
     assert!(server
         .wait_for_document("file:///w/a.ts", budget)
         .await
@@ -4260,12 +4638,14 @@ async fn a_document_is_ready_when_the_server_answers_about_it() {
         PEER,
         json!({SYMBOLS: {"error": {"code": 1, "message": "No Project."}}}),
     );
+    seen(&server).await;
     assert!(server
         .wait_for_document("file:///w/a.ts", budget)
         .await
         .is_ok());
     server.shutdown().await.unwrap();
     let server = LspServer::scripted_for_tests(PEER, json!({SYMBOLS: {"hold": true}}));
+    seen(&server).await;
     assert!(matches!(
         server.wait_for_document("file:///w/a.ts", budget).await,
         Err(LspError::Timeout)
@@ -4626,6 +5006,80 @@ async fn a_typescript_call_through_a_union_receiver_proves_nothing() {
             && site.answer == crate::call_sites::UnprovenAnswer::AnswersDisagree),
         "the receiver's two same-line class declarations stay distinct: {pass:?}"
     );
+}
+
+/// External methods obey the same receiver authority as repository methods.
+/// A Map | WeakMap receiver must not prove whichever standard-library
+/// declaration the checker happened to name first.
+#[tokio::test]
+async fn external_union_receivers_never_prove_an_arbitrary_constituent() {
+    use kin_model::EntityKind;
+    let root = Workspace::new("external-union-receiver");
+    let text = "function run() {\n    cache.set(x, y)\n       single.set(x, y)\n         get().set(x, y)\n           sole().set(x, y)\n}\n";
+    let run = entity_at("run", "source.ts", (0, 5), (0, 9), EntityKind::Function);
+    let index = EntityIndex::new(vec![run.clone()], &root.0);
+    let source = root.uri("source.ts");
+    let location = |name: &str| json!({"uri": format!("file:///external/{name}.d.ts"), "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 5}}});
+    let map = location("Map");
+    let weak = location("WeakMap");
+    let lines = text.lines().collect::<Vec<_>>();
+    let at = |line: usize, token: &str| lines[line].find(token).unwrap();
+    for first in [&map, &weak] {
+        let mut responses = json!({});
+        for line in [1, 3] {
+            responses[format!("{DEFINITION}@{source}#{}", at(line, "set"))] =
+                json!({"result": [first]});
+        }
+        for line in [2, 4] {
+            responses[format!("{DEFINITION}@{source}#{}", at(line, "set"))] =
+                json!({"result": [map.clone()]});
+        }
+        responses[format!("{TYPES}@{source}#{}", at(1, "cache"))] =
+            json!({"result": [map.clone(), weak.clone()]});
+        responses[format!("{TYPES}@{source}#{}", at(2, "single"))] =
+            json!({"result": [map.clone()]});
+        responses[format!("{TYPES}@{source}#{}", at(3, "set"))] =
+            json!({"result": [map.clone(), weak.clone()]});
+        responses[format!("{TYPES}@{source}#{}", at(4, "set"))] = json!({"result": [map.clone()]});
+        let server = LspServer::scripted_for_tests(PEER, responses);
+        let pass = crate::file_enrichment::enrich_file_definitions(
+            &server,
+            &root.0.join("source.ts"),
+            text,
+            &index,
+            &root.0,
+            None,
+        )
+        .await
+        .unwrap();
+        server.shutdown().await.unwrap();
+        let proven = pass
+            .site_answers
+            .iter()
+            .filter(|answer| &text[answer.site.start_byte..answer.site.end_byte] == "set")
+            .map(|answer| answer.site.start_line)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proven,
+            [2, 4],
+            "unique external receivers still resolve: {pass:?}"
+        );
+        for line in [1, 3] {
+            let start = lines
+                .iter()
+                .take(line)
+                .map(|line| line.len() + 1)
+                .sum::<usize>()
+                + at(line, "set");
+            assert!(
+                pass.unproven_sites
+                    .iter()
+                    .any(|site| site.start_byte == start
+                        && site.answer == crate::call_sites::UnprovenAnswer::AnswersDisagree),
+                "a constituent's answer cannot discharge the union: {pass:?}"
+            );
+        }
+    }
 }
 
 /// A receiver that is a call's result has no name to ask the type of, so the

@@ -453,6 +453,11 @@ where
     B: StorageBackend + ?Sized + 'static,
 {
     let pipeline = IndexPipeline::new();
+    // The ref's own manifests name its units, as they named them when the
+    // ref's semantics were derived.
+    let project = kin_index::TreeProjectFiles::new(file_tree, |hash| {
+        reader.authority.load_source_blob(hash).ok().flatten()
+    });
     let mut rebuilt_entities = Vec::new();
     let mut parsed_relations = Vec::new();
     let mut parsed_files = Vec::new();
@@ -509,10 +514,11 @@ where
         let indexed = if file_entities.is_empty()
             || should_probe_sparse_historical_source(&file_entities, content.len())
         {
-            match pipeline.index_file_content_with_tests(
+            match pipeline.index_file_content_in(
                 &file_id,
                 &content,
                 kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+                &project,
             ) {
                 Ok(indexed) => Some(indexed),
                 Err(err) => {

@@ -327,6 +327,23 @@ if ((${#unexpected_cli_direct_local_opens[@]} > 0)); then
   exit 1
 fi
 
+# The agent-profile reply fixture owns an isolated registry in its unit-test
+# module. Do not allow the production file: only lines inside its exact,
+# top-level #[cfg(test)] module qualify. Like the other source guards, this
+# relies on the Rust formatting gate keeping top-level closing braces at column
+# zero. A constructor before or after that module remains a runtime violation.
+is_agent_profile_test_line() {
+  [[ "$1" == "crates/kin-mcp/src/agent_belt.rs" ]] || return 1
+  awk -v target="$2" '
+    $0 == "#[cfg(test)]" { test_attribute = 1; next }
+    test_attribute && $0 == "mod tests {" { in_test = 1 }
+    NR == target { found = in_test; exit }
+    $0 == "}" { in_test = 0 }
+    { test_attribute = 0 }
+    END { exit !found }
+  ' "$repo_root/$1"
+}
+
 unexpected_session_registry_hits=()
 while IFS=: read -r file line _; do
   [[ -z "$file" ]] && continue
@@ -334,7 +351,9 @@ while IFS=: read -r file line _; do
   case " ${allowed_session_registry_files[*]} " in
     *" $file "*) ;;
     *)
-      unexpected_session_registry_hits+=("$file:$line")
+      if ! is_agent_profile_test_line "$file" "$line"; then
+        unexpected_session_registry_hits+=("$file:$line")
+      fi
       ;;
   esac
 done < <(rg -n 'SessionRegistry::new\(' "$repo_root/crates/kin-mcp/src" -g '*.rs')
@@ -383,6 +402,15 @@ while IFS=: read -r file line text; do
       crates/kin-db/src/storage/binding_history_tests.rs | \
       crates/kin-db/src/storage/derivation_ledger_tests.rs | \
       crates/kin-index/src/binding_history.rs) ;;
+    # The Git bootstrap `kin init` commits hands the verifier to kin-db, which
+    # uses it only when the history verifier left the workspace unproven, and
+    # only on the bootstrap: the first operation in the log, whose graph is the
+    # derivation init just made. It names the verifier, never the commit.
+    crates/kin-core/src/init.rs)
+      if [[ "$text" == *commit_rederived_repository_transaction* ]]; then
+        unexpected_rederivation_hits+=("$file:$line")
+      fi
+      ;;
     # A test target, never a runtime path. The upgrade's store tests drive the
     # commit with the real verifier to show that a certificate bound to the
     # current bytes, with no derivation behind it, pays nothing.

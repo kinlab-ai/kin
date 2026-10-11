@@ -23,6 +23,11 @@ pub struct BlameRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlameResponse {
     pub lines: Vec<String>,
+    /// Present when the store's Git history is partial, so every line older
+    /// than its snapshot is attributed to the snapshot. Its sentence is also
+    /// the answer's last line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_history: Option<kin_core::history_state::PartialHistoryNotice>,
 }
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
@@ -132,7 +137,10 @@ pub fn execute_blame_request_with(
         )?);
         let closing = ref_lookup::closing_notes(&lines, head.authority_open);
         lines.extend(closing);
-        return Ok(BlameResponse { lines });
+        return Ok(BlameResponse {
+            lines,
+            partial_history: None,
+        });
     }
 
     lines.push(format!(
@@ -167,7 +175,10 @@ pub fn execute_blame_request_with(
             revision.revision_id,
             change.id,
             change.timestamp,
-            change.author,
+            // The whole identity, never the time an earlier import recorded
+            // after it: an agent session's id is its address, and blame is
+            // where it stays recoverable after the session is gone.
+            change.author.identity(),
             ref_lookup::subject_line(&change.message),
         ));
     }
@@ -195,5 +206,8 @@ pub fn execute_blame_request_with(
     let closing = ref_lookup::closing_notes(&lines, head.authority_open);
     lines.extend(closing);
 
-    Ok(BlameResponse { lines })
+    Ok(BlameResponse {
+        lines,
+        partial_history: None,
+    })
 }

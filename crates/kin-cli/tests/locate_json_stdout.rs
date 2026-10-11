@@ -93,7 +93,7 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let kindb_dir = repo.path().join(".kin/kindb");
+    let kindb_dir = runtime.layout().kindb_dir();
     fs::write(kindb_dir.join("graph.kvec"), []).expect("write stale vector index");
     fs::write(
         kindb_dir.join("graph.kvec.meta.json"),
@@ -202,8 +202,8 @@ fn locate_autostarts_daemon_when_available() {
         String::from_utf8_lossy(&locate.stderr)
     );
 
-    let daemon_port = repo.path().join(".kin/daemon.port");
-    let daemon_pid = repo.path().join(".kin/daemon.pid");
+    let daemon_port = runtime.layout().root().join("daemon.port");
+    let daemon_pid = runtime.layout().root().join("daemon.pid");
     assert!(daemon_port.exists(), "locate did not auto-start a daemon");
     assert!(daemon_pid.exists(), "locate did not record daemon pid");
 }

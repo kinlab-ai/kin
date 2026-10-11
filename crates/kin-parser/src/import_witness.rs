@@ -17,6 +17,8 @@ use tree_sitter::{Node, Tree};
 
 use crate::extract::{ExtractedRelation, FileImport};
 
+mod python_namespace;
+
 pub const IMPORT_WITNESS_MARKER_V1: &str = "kin-internal://exact-import-witness/v1";
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -50,6 +52,8 @@ pub struct CallableImportSite {
     pub module: String,
     pub original: String,
     pub kind: ImportSiteKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +64,16 @@ pub struct ExactImportWitness {
     pub source_len: usize,
     pub python_reexports: BTreeMap<String, NamedImport>,
     pub callable_import_sites: Vec<CallableImportSite>,
+    /// New Python namespace paths additionally prove which root declarations
+    /// still own their module binding. Absent on the older restricted carrier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_declarations: Option<BTreeSet<String>>,
+    /// Complete bounded module write inventory. Dotted namespace reads need
+    /// negative evidence that a parent did not replace its child binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_module_bindings: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub python_namespace_hazards: bool,
 }
 
 impl ExactImportWitness {
@@ -113,6 +127,15 @@ fn validate(witness: &ExactImportWitness) -> Result<(), String> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || witness.python_reexports.len() > MAX_BINDINGS
         || witness.callable_import_sites.len() > MAX_SITES
+        || witness.python_declarations.as_ref().is_some_and(|names| {
+            names.len() > MAX_BINDINGS || names.iter().any(|name| !identifier(name))
+        })
+        || witness
+            .python_module_bindings
+            .as_ref()
+            .is_some_and(|names| {
+                names.len() > MAX_BINDINGS || names.iter().any(|name| !identifier(name))
+            })
     {
         return fail();
     }
@@ -124,10 +147,14 @@ fn validate(witness: &ExactImportWitness) -> Result<(), String> {
     for site in &witness.callable_import_sites {
         if site.start_byte >= site.end_byte
             || site.end_byte > witness.source_len
-            || !identifier(&site.caller)
+            || !entity_name(&site.caller)
             || !identifier(&site.local)
             || !module_name(&site.module)
             || !qualified_name(&site.original)
+            || site.receiver.as_ref().is_some_and(|name| {
+                !python_namespace_name(name)
+                    || !matches!(witness.file.rsplit('.').next(), Some("py" | "pyi"))
+            })
         {
             return fail();
         }
@@ -153,6 +180,17 @@ fn identifier(value: &str) -> bool {
 
 fn qualified_name(value: &str) -> bool {
     value.len() <= 2048 && value.split("::").all(identifier)
+}
+
+fn entity_name(value: &str) -> bool {
+    value.len() <= 2048
+        && value
+            .split('.')
+            .all(|part| part == "<locals>" || identifier(part))
+}
+
+fn python_namespace_name(value: &str) -> bool {
+    value.len() <= 2048 && value.split('.').all(identifier)
 }
 
 fn module_name(value: &str) -> bool {
@@ -249,6 +287,9 @@ fn empty_witness(file: &FilePathId, source: &[u8]) -> ExactImportWitness {
         source_len: source.len(),
         python_reexports: BTreeMap::new(),
         callable_import_sites: Vec::new(),
+        python_declarations: None,
+        python_module_bindings: None,
+        python_namespace_hazards: false,
     }
 }
 
@@ -273,7 +314,8 @@ fn append(witness: ExactImportWitness, relations: &mut Vec<ExtractedRelation>) {
     });
 }
 
-/// Append source evidence without changing ordinary extraction semantics.
+/// Append exact source evidence and namespace import claims. A claim needs
+/// its matching witness even when source limits prevent producing one.
 pub fn append_python_import_witness(
     tree: &Tree,
     source: &[u8],
@@ -281,6 +323,20 @@ pub fn append_python_import_witness(
     imports: &[FileImport],
     relations: &mut Vec<ExtractedRelation>,
 ) {
+    // A namespace claim is carried even when lexical evidence refuses it.
+    // The linker must then leave a gap, not revive its name-only module tier.
+    let namespaces = python_namespace::namespaces(tree, imports);
+    for relation in relations
+        .iter_mut()
+        .filter(|relation| relation.kind == RelationKind::Calls)
+    {
+        if let Some(receiver) = relation.receiver.as_deref() {
+            let root = receiver.split('.').next().unwrap_or(receiver);
+            if let Some(module) = namespaces.get(receiver).or_else(|| namespaces.get(root)) {
+                relation.import_source = Some(module.clone());
+            }
+        }
+    }
     if file.0.is_empty()
         || file.0.len() > 4096
         || imports.len() > MAX_BINDINGS
@@ -291,18 +347,120 @@ pub fn append_python_import_witness(
     let Some(nodes) = bounded_nodes(tree, source) else {
         return;
     };
-    let Some((named, functions, import_only)) = python_module(tree, source, imports, &nodes) else {
+    let legacy = python_module(tree, source, imports, &nodes);
+    let scoped = python_namespace::bindings(tree, &nodes, source, imports);
+    if legacy.is_none() && scoped.is_none() {
         return;
-    };
-    let mut witness = empty_witness(file, source);
-    if import_only {
-        witness.python_reexports = named.clone();
     }
-    let Some(sites) = callable_sites(&nodes, source, &functions, &named, relations, true) else {
-        return;
-    };
-    witness.callable_import_sites = sites;
+    let mut witness = empty_witness(file, source);
+    if let Some((named, functions, import_only)) = legacy {
+        if import_only {
+            witness.python_reexports = named.clone();
+        }
+        let Some(sites) = callable_sites(&nodes, source, &functions, &named, relations, true)
+        else {
+            return;
+        };
+        witness.callable_import_sites = sites;
+    }
+    if let Some(scoped) = scoped {
+        witness.python_reexports.extend(scoped.reexports);
+        witness.python_declarations = Some(scoped.declarations);
+        witness.python_module_bindings = Some(scoped.module_bindings);
+        witness.python_namespace_hazards = scoped.namespace_hazards;
+        let Some(sites) = namespace_call_sites(
+            &nodes,
+            source,
+            &scoped.namespaces,
+            &scoped.mutated_paths,
+            relations,
+        ) else {
+            return;
+        };
+        witness.callable_import_sites.extend(sites);
+        witness.callable_import_sites.sort();
+        witness.callable_import_sites.dedup();
+    }
     append(witness, relations);
+}
+
+fn namespace_call_sites(
+    nodes: &[Node<'_>],
+    source: &[u8],
+    namespaces: &BTreeMap<String, String>,
+    mutated_paths: &BTreeSet<String>,
+    relations: &[ExtractedRelation],
+) -> Option<Vec<CallableImportSite>> {
+    let calls: BTreeMap<_, _> = nodes
+        .iter()
+        .filter(|node| node.kind() == "call")
+        .map(|node| ((node.start_byte(), node.end_byte()), *node))
+        .collect();
+    let mut sites = BTreeSet::new();
+    for relation in relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::Calls)
+    {
+        let Some(receiver) = relation.receiver.as_deref() else {
+            continue;
+        };
+        let Some(module) = namespaces.get(receiver) else {
+            continue;
+        };
+        let member = format!("{receiver}.{}", relation.dst_name);
+        if mutated_paths.iter().any(|path| {
+            path == &member
+                || member
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+                || path
+                    .strip_prefix(&member)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+        }) {
+            continue;
+        }
+        let Some(site) = &relation.site else { continue };
+        let Some(node) = calls.get(&(site.start_byte, site.end_byte)).copied() else {
+            continue;
+        };
+        let Some(callee) = node
+            .child_by_field_name("function")
+            .filter(|callee| callee.kind() == "attribute")
+        else {
+            continue;
+        };
+        if callee
+            .child_by_field_name("object")
+            .and_then(|object| text(object, source))
+            != Some(receiver)
+            || callee
+                .child_by_field_name("attribute")
+                .and_then(|attribute| text(attribute, source))
+                != Some(relation.dst_name.as_str())
+            || relation.import_source.as_deref() != Some(module.as_str())
+            || !crate::languages::python::module_import_read_is_unshadowed(
+                node,
+                source,
+                receiver.split('.').next()?,
+            )
+        {
+            continue;
+        }
+        if sites.len() >= MAX_SITES {
+            return None;
+        }
+        sites.insert(CallableImportSite {
+            start_byte: site.start_byte,
+            end_byte: site.end_byte,
+            caller: relation.src_name.clone(),
+            local: relation.dst_name.clone(),
+            module: module.clone(),
+            original: relation.dst_name.clone(),
+            kind: ImportSiteKind::Calls,
+            receiver: Some(receiver.to_string()),
+        });
+    }
+    Some(sites.into_iter().collect())
 }
 
 type ModuleBindings<'tree> = (BTreeMap<String, NamedImport>, Vec<Node<'tree>>, bool);
@@ -612,6 +770,7 @@ fn callable_sites(
             module: import.module.clone(),
             original: import.original.clone(),
             kind,
+            receiver: None,
         });
     }
     Some(sites.into_iter().collect())
@@ -764,7 +923,9 @@ mod tests {
             "globals()['work'] = None\n",
         ] {
             assert!(
-                python(&format!("from .implementation import work\n{tail}")).is_none(),
+                python(&format!("from .implementation import work\n{tail}"))
+                    .is_none_or(|facts| !facts.python_reexports.contains_key("work")
+                        && facts.callable_import_sites.is_empty()),
                 "{tail}"
             );
         }
@@ -774,7 +935,7 @@ mod tests {
     fn python_callable_sites_require_actual_unshadowed_root_function_reads() {
         let source = "from pkg import work as invoke\ndef run(value):\n    return invoke(value)\ndef reference():\n    return invoke\n";
         let facts = python(source).unwrap();
-        assert!(facts.python_reexports.is_empty());
+        assert_eq!(facts.python_reexports["invoke"].module, "pkg");
         assert_eq!(facts.callable_import_sites.len(), 2);
         assert_eq!(facts.callable_import_sites[0].kind, ImportSiteKind::Calls);
         assert_eq!(

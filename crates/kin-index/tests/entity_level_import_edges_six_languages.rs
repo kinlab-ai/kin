@@ -894,3 +894,121 @@ fn rust_import_owner_same_named_function_cannot_hide_the_file_module() {
         }
     }
 }
+
+/// A tree's Cargo manifests, by path.
+struct Manifests(Vec<(&'static str, &'static str)>);
+
+impl kin_parser::project_manifest::ProjectFiles for Manifests {
+    fn manifest(
+        &self,
+        path: &str,
+    ) -> Result<Option<std::sync::Arc<str>>, kin_parser::project_manifest::UnreadableManifest> {
+        Ok(self
+            .0
+            .iter()
+            .find(|(at, _)| *at == path)
+            .map(|(_, text)| std::sync::Arc::from(*text)))
+    }
+}
+
+/// A Rust unit parsed as a tree holding `manifests` parses it: named under
+/// them, with the identities the pipeline separates.
+fn rust_in(path: &str, src: &str, manifests: &Manifests) -> FileParseData {
+    let file_id = FilePathId::new(path);
+    let bytes = src.as_bytes();
+    let tree = RustAdapter.parse(bytes).expect("fixture parses");
+    let unit = RustAdapter.unit_context(&file_id, manifests).unwrap();
+    let output = RustAdapter
+        .extract_in(&tree, bytes, &file_id, &unit)
+        .expect("fixture extracts");
+    let mut entities: Vec<Entity> = output
+        .entities
+        .into_iter()
+        .map(|entity| {
+            entity.into_entity_with_source(RustAdapter.language_id(), &file_id, Some(bytes))
+        })
+        .collect();
+    kin_parser::separate_shared_identities(&mut entities, &file_id);
+    FileParseData {
+        file_path: path.to_string(),
+        entities,
+        relations: output.relations,
+        imports: output.imports,
+    }
+}
+
+/// A crate root takes its package's crate name, which its directory does not
+/// spell, and still owns the imports it writes, in every linker and from
+/// either stored order. The root here also declares a module carrying that
+/// same name, which must not take the imports from it.
+#[test]
+fn a_crate_root_named_by_its_package_owns_its_imports() {
+    let manifests = Manifests(vec![(
+        "crates/db/Cargo.toml",
+        "[package]\nname = \"kin-db\"\nedition = \"2021\"\n",
+    )]);
+    for reverse in [false, true] {
+        let mut files = vec![
+            rust_in(
+                "crates/db/src/lib.rs",
+                "mod store;\nmod kin_db;\npub use store::Store;\n",
+                &manifests,
+            ),
+            rust_in("crates/db/src/store.rs", "pub struct Store;\n", &manifests),
+            rust_in(
+                "crates/db/src/kin_db.rs",
+                "pub fn nested() {}\n",
+                &manifests,
+            ),
+        ];
+        if reverse {
+            files[0].entities.reverse();
+        }
+        let root = files[0]
+            .entities
+            .iter()
+            .find(|entity| kin_model::is_file_module_surface(entity))
+            .expect("the crate root keeps its own module")
+            .clone();
+        assert_eq!(root.name, "kin_db");
+        assert!(
+            files[0]
+                .entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::Module
+                    && entity.name == "kin_db"
+                    && entity.id != root.id),
+            "`mod kin_db;` is a module of its own: {:?}",
+            files[0].entities
+        );
+        let store = files[1]
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Store")
+            .unwrap()
+            .id;
+        let ids = artifact_ids(&files);
+        let mut linker = IncrementalLinker::new();
+        for file in &files {
+            linker.add_file(&file.file_path, ids[&file.file_path], &file.entities);
+        }
+        let restored = IncrementalLinker::from_checkpoint_v1(linker.to_checkpoint_v1()).unwrap();
+        for relations in [
+            link_cross_file(&files, &ids).unwrap(),
+            link_cross_file_incremental(&files[..1], &linker).unwrap(),
+            link_cross_file_incremental(&files[..1], &restored).unwrap(),
+        ] {
+            let imports: Vec<_> = relations
+                .iter()
+                .filter(|relation| {
+                    relation.kind == RelationKind::Imports && relation.src.as_entity().is_some()
+                })
+                .map(|relation| (relation.src, relation.dst))
+                .collect();
+            assert_eq!(
+                imports,
+                vec![(GraphNodeId::Entity(root.id), GraphNodeId::Entity(store))]
+            );
+        }
+    }
+}

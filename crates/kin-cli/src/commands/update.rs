@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use semver::Version;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 use std::time::Duration;
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 
 #[cfg(windows)]
 #[path = "update_windows.rs"]
@@ -24,11 +25,11 @@ pub(crate) mod windows_update;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/firelock-ai/kin/releases/latest";
+    "https://api.github.com/repos/kinlab-ai/kin/releases/latest";
 const GITHUB_RELEASES_LIST_URL: &str =
-    "https://api.github.com/repos/firelock-ai/kin/releases?per_page=30";
-const GITHUB_GIT_REF_TAGS_URL: &str = "https://api.github.com/repos/firelock-ai/kin/git/ref/tags/";
-const GITHUB_GIT_TAGS_URL: &str = "https://api.github.com/repos/firelock-ai/kin/git/tags/";
+    "https://api.github.com/repos/kinlab-ai/kin/releases?per_page=30";
+const GITHUB_GIT_REF_TAGS_URL: &str = "https://api.github.com/repos/kinlab-ai/kin/git/ref/tags/";
+const GITHUB_GIT_TAGS_URL: &str = "https://api.github.com/repos/kinlab-ai/kin/git/tags/";
 const MAX_ANNOTATED_TAG_DEPTH: usize = 8;
 const UPDATE_CHECK_SCHEMA: &str = "kin.update-check.v1";
 const UPDATE_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -883,6 +884,337 @@ struct UpdateCheck<'a> {
     platform_archive_sha256: &'a str,
     restart_ack_required: bool,
     mcp_repair_pending: bool,
+    /// How this `kin` was installed, from [`InstallMethod::as_str`].
+    install_method: &'static str,
+    /// Null on a completed check. A check that could not finish prints
+    /// [`UpdateCheckUnavailable`] instead, whose `reason` is never null, so a
+    /// reader keys on this one field for both shapes.
+    reason: Option<&'static str>,
+    message: Option<&'a str>,
+}
+
+/// What `kin update --check-only --json` prints when it cannot reach a
+/// verdict. It carries the same keys a reader of [`UpdateCheck`] needs to tell
+/// the two apart: `reason` is set, `latest_version` is null and
+/// `update_available` is false.
+#[derive(Debug, serde::Serialize)]
+struct UpdateCheckUnavailable<'a> {
+    schema: &'static str,
+    current_version: &'a str,
+    latest_version: Option<&'a str>,
+    update_available: bool,
+    install_method: &'static str,
+    reason: &'static str,
+    message: &'a str,
+}
+
+/// How the running `kin` reached this machine, which decides what may replace
+/// it. `kin update` replaces only the copy Kin's installer or npm launcher put
+/// in the managed install root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallMethod {
+    /// The platform installer's managed install root.
+    KinInstaller,
+    /// Homebrew's cellar, which Homebrew owns.
+    Homebrew,
+    /// The npm launcher, which provisions the same managed install root, or
+    /// a binary inside an npm package directory.
+    Npm,
+    /// `cargo install`, into Cargo's own bin directory.
+    Cargo,
+    /// Anything else, such as an archive unpacked by hand or a local build.
+    Unknown,
+}
+
+impl InstallMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KinInstaller => "kin_installer",
+            Self::Homebrew => "homebrew",
+            Self::Npm => "npm",
+            Self::Cargo => "cargo",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether `kin update` owns this copy and may replace it.
+    fn is_managed(self) -> bool {
+        matches!(self, Self::KinInstaller | Self::Npm)
+    }
+}
+
+/// The stamp the npm launcher writes beside the binaries it provisions.
+const NPM_LAUNCHER_STAMP: &str = ".kinlab-kin-version";
+
+/// Classify an executable path, already canonical, against the managed
+/// install root and Cargo's home, both canonical too. Pure, so every branch is
+/// testable without moving a real binary.
+fn classify_install_method(
+    exe: &Path,
+    kin_home: &Path,
+    cargo_home: Option<&Path>,
+) -> InstallMethod {
+    let parent = exe.parent();
+    let managed_bin = kin_home.join("bin");
+    if parent == Some(managed_bin.as_path()) {
+        return if managed_bin.join(NPM_LAUNCHER_STAMP).is_file() {
+            InstallMethod::Npm
+        } else {
+            InstallMethod::KinInstaller
+        };
+    }
+    let has_component = |name: &str| {
+        exe.components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new(name))
+    };
+    if has_component("Cellar")
+        || [
+            "/opt/homebrew",
+            "/home/linuxbrew/.linuxbrew",
+            "/usr/local/Homebrew",
+        ]
+        .iter()
+        .any(|prefix| exe.starts_with(prefix))
+    {
+        return InstallMethod::Homebrew;
+    }
+    if has_component("node_modules") {
+        return InstallMethod::Npm;
+    }
+    if let Some(cargo_bin) = cargo_home.map(|home| home.join("bin")) {
+        if parent == Some(cargo_bin.as_path()) {
+            return InstallMethod::Cargo;
+        }
+    }
+    InstallMethod::Unknown
+}
+
+/// [`classify_install_method`] for the running process.
+fn detect_install_method(kin_home: &Path) -> InstallMethod {
+    let Ok(exe) = std::env::current_exe() else {
+        return InstallMethod::Unknown;
+    };
+    let canonical = |path: PathBuf| path.canonicalize().unwrap_or(path);
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            crate::commands::setup::home_dir()
+                .ok()
+                .map(|home| home.join(".cargo"))
+        })
+        .map(canonical);
+    classify_install_method(
+        &canonical(exe),
+        &canonical(kin_home.to_path_buf()),
+        cargo_home.as_deref(),
+    )
+}
+
+/// Why a check-only report has no verdict, as a stable code and a sentence a
+/// person can act on. The codes are the contract; the sentences may change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckUnavailable {
+    reason: &'static str,
+    message: String,
+}
+
+const CHECK_INSTALL_ROOT_MISSING: &str = "install_root_missing";
+const CHECK_UNSUPPORTED_INSTALL_METHOD: &str = "unsupported_install_method";
+const CHECK_UPDATE_INTERRUPTED: &str = "update_interrupted";
+const CHECK_NETWORK_UNAVAILABLE: &str = "network_unavailable";
+const CHECK_RELEASE_LOOKUP_FAILED: &str = "release_lookup_failed";
+const CHECK_FAILED: &str = "check_failed";
+
+impl CheckUnavailable {
+    fn new(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+/// What stops a check before it starts, read without writing anything. `None`
+/// means the full check may run.
+fn check_only_precondition(
+    method: InstallMethod,
+    requested_home: &Path,
+) -> Option<CheckUnavailable> {
+    // An interrupted update outranks every other answer, whoever installed
+    // the running copy: the install root is part-way through a transaction,
+    // and a check is the one place that must say so. Read only; recovery is
+    // the mutating run's job.
+    let interrupted = validate_existing_install_root(requested_home)
+        .and_then(|root| transaction_dirs(&root))
+        .is_ok_and(|transactions| !transactions.is_empty());
+    if interrupted {
+        return Some(CheckUnavailable::new(
+            CHECK_UPDATE_INTERRUPTED,
+            "An earlier Kin update stopped partway. Run `kin update` to finish recovering it, \
+             then check again.",
+        ));
+    }
+    match method {
+        InstallMethod::Homebrew => {
+            return Some(CheckUnavailable::new(
+                CHECK_UNSUPPORTED_INSTALL_METHOD,
+                "Homebrew installed this Kin, so Homebrew updates it. Run `brew upgrade kin`.",
+            ))
+        }
+        InstallMethod::Cargo => {
+            return Some(CheckUnavailable::new(
+                CHECK_UNSUPPORTED_INSTALL_METHOD,
+                "Cargo built this Kin, so `kin update` cannot replace it. Rebuild it with Cargo \
+                 to update it.",
+            ))
+        }
+        _ => {}
+    }
+    if matches!(
+        fs::symlink_metadata(requested_home),
+        Err(ref error) if error.kind() == io::ErrorKind::NotFound
+    ) {
+        return Some(CheckUnavailable::new(
+            CHECK_INSTALL_ROOT_MISSING,
+            format!(
+                "Kin's installer has not set up this computer, so `kin update` has nothing to \
+                 update. Install Kin with `{INSTALLER_RECOVERY_COMMAND}`."
+            ),
+        ));
+    }
+    if !method.is_managed() {
+        return Some(CheckUnavailable::new(
+            CHECK_UNSUPPORTED_INSTALL_METHOD,
+            format!(
+                "This kin is not the copy Kin's installer manages, so `kin update` cannot \
+                 replace it. Update it the way it was installed, or install Kin with \
+                 `{INSTALLER_RECOVERY_COMMAND}`."
+            ),
+        ));
+    }
+    None
+}
+
+/// Name the cause of a check that started and failed. A network failure
+/// anywhere in the chain is the network; an answer that arrived and could not
+/// be used is the release lookup; anything else keeps Kin's own words.
+fn classify_check_failure(error: &anyhow::Error) -> CheckUnavailable {
+    let http = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>());
+    match http {
+        Some(http)
+            if http.is_connect() || http.is_timeout() || http.is_request() || http.is_body() =>
+        {
+            CheckUnavailable::new(
+                CHECK_NETWORK_UNAVAILABLE,
+                "Kin could not reach its release server to check for updates. Check the network \
+                 connection and try again.",
+            )
+        }
+        Some(http) => CheckUnavailable::new(
+            CHECK_RELEASE_LOOKUP_FAILED,
+            match http.status() {
+                Some(status) => format!(
+                    "Kin's release server answered {status} instead of the latest release. Try \
+                     again later."
+                ),
+                None => "Kin reached its release server but could not read the latest release. \
+                         Try again later."
+                    .to_string(),
+            },
+        ),
+        None => CheckUnavailable::new(
+            CHECK_FAILED,
+            format!("Kin could not check for updates: {error:#}"),
+        ),
+    }
+}
+
+/// The error a check-only JSON run returns after printing its report, so the
+/// process exits 1 and stderr carries the same sentence the report does. The
+/// reason rides along, so a caller in this process reads the code rather than
+/// the words.
+#[derive(Debug)]
+struct CheckReported {
+    // The process boundary prints only the message; the report on stdout
+    // already carries the code, so in-process readers are the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    reason: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for CheckReported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CheckReported {}
+
+fn report_unavailable_check(method: InstallMethod, unavailable: CheckUnavailable) -> Result<()> {
+    let report = UpdateCheckUnavailable {
+        schema: UPDATE_CHECK_SCHEMA,
+        current_version: CURRENT_VERSION,
+        latest_version: None,
+        update_available: false,
+        install_method: method.as_str(),
+        reason: unavailable.reason,
+        message: &unavailable.message,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Err(CheckReported {
+        reason: unavailable.reason,
+        message: unavailable.message,
+    }
+    .into())
+}
+
+/// `kin update --check-only --json`: exactly one JSON object on stdout, every
+/// time. A completed check exits 0 with `reason` null. A check that cannot
+/// finish exits 1 with a stable `reason` code and a plain `message`, so a
+/// program reading it never has to parse an error line.
+async fn run_check_only_json(
+    channel_flag: Option<Channel>,
+    expect_version: Option<Version>,
+    expect_sha: Option<String>,
+    expect_archive_sha256: Option<String>,
+) -> Result<()> {
+    let requested_home = match crate::commands::setup::kin_dir() {
+        Ok(home) => home,
+        Err(error) => {
+            return report_unavailable_check(
+                InstallMethod::Unknown,
+                CheckUnavailable::new(
+                    CHECK_INSTALL_ROOT_MISSING,
+                    format!("Kin could not find its install root: {error:#}"),
+                ),
+            )
+        }
+    };
+    let method = detect_install_method(&requested_home);
+    if let Some(unavailable) = check_only_precondition(method, &requested_home) {
+        return report_unavailable_check(method, unavailable);
+    }
+    match run_update_flow(
+        false,
+        channel_flag,
+        expect_version,
+        expect_sha,
+        expect_archive_sha256,
+        true,
+        true,
+        false,
+        Vec::new(),
+        false,
+        false,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => report_unavailable_check(method, classify_check_failure(&error)),
+    }
 }
 
 /// `kin update`, plus the two gestures built on top of it: setting the policy,
@@ -922,6 +1254,15 @@ pub async fn run(
     }
     if dry_run && !apply {
         anyhow::bail!("--dry-run describes what --apply would do; pass both or neither");
+    }
+    if check_only && json && !apply {
+        return run_check_only_json(
+            channel_flag,
+            expect_version,
+            expect_sha,
+            expect_archive_sha256,
+        )
+        .await;
     }
 
     run_update_flow(
@@ -1177,6 +1518,9 @@ async fn run_update_flow(
                 .context("check-only lost its selected platform archive checksum")?,
             restart_ack_required,
             mcp_repair_pending,
+            install_method: detect_install_method(&kin_home).as_str(),
+            reason: None,
+            message: None,
         };
         if json {
             println!("{}", serde_json::to_string_pretty(&check)?);
@@ -1836,8 +2180,7 @@ fn conclude_unattended(kin_home: &Path, entry: &UnattendedLedgerEntry) {
 /// shape, and a reader should not have to derive it from three separate
 /// paragraphs.
 fn probe_machine_activity(kin_home: &Path, spec: &[ComponentSpec]) -> MachineActivity {
-    let mut system = System::new_all();
-    system.refresh_all();
+    let system = managed_runtime_process_table();
     let mut activity = MachineActivity {
         managed_runtimes_active: false,
         external_sessions: false,
@@ -1866,8 +2209,7 @@ async fn stop_managed_runtimes_for_update(
     // update keep alive" is the fact an operator wants and the old behaviour
     // could only answer with a list of what it killed.
     {
-        let mut system = System::new_all();
-        system.refresh_all();
+        let system = managed_runtime_process_table();
         let kept = scan_active_managed_runtimes(&system, kin_home, spec)
             .into_iter()
             .filter(|(kind, _, _)| !kind.blocks_managed_byte_movement())
@@ -1885,8 +2227,7 @@ async fn stop_managed_runtimes_for_update(
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
     let mut signaled: HashSet<u32> = HashSet::new();
     loop {
-        let mut system = System::new_all();
-        system.refresh_all();
+        let system = managed_runtime_process_table();
         let residual = scan_blocking_managed_runtimes(&system, kin_home, spec);
         if residual.is_empty() {
             return Ok(actions);
@@ -2701,9 +3042,7 @@ impl LockedPrivateMarker {
                 anyhow::bail!("{label} exact object bytes changed; marker retained");
             }
             windows_update::dispose_private_file_handle_exact(&self.file, &self.path, label)?;
-            let sync = self
-                .file
-                .sync_all()
+            let sync = kin_blobs::durable::sync_all(&self.file)
                 .with_context(|| format!("failed to flush disposed exact {label}"));
             let path = self.path.clone();
             drop(self.file);
@@ -3044,7 +3383,7 @@ impl InstallSpawnFence {
             let (mut file, created) = open_lock_file_at(&root)?;
             if created {
                 file.write_all(b"kin-update-lock-v1\n")?;
-                file.sync_all()?;
+                kin_blobs::durable::sync_all(&file)?;
                 root.sync()?;
             }
             FileExt::lock_shared(&file).context("failed to acquire managed daemon spawn lease")?;
@@ -3175,7 +3514,7 @@ impl InstallRootLock {
                     authority_path.display()
                 )
             })?;
-            file.sync_all().with_context(|| {
+            kin_blobs::durable::sync_all(&file).with_context(|| {
                 format!(
                     "failed to sync Windows Kin install authority {}",
                     authority_path.display()
@@ -3248,7 +3587,7 @@ impl InstallRootLock {
         if created {
             file.write_all(b"kin-update-lock-v1\n")
                 .with_context(|| format!("failed to initialize update lock {}", path.display()))?;
-            file.sync_all()
+            kin_blobs::durable::sync_all(&file)
                 .with_context(|| format!("failed to sync update lock {}", path.display()))?;
             root_anchor.sync()?;
         }
@@ -3640,7 +3979,7 @@ fn open_lock_file_at(root: &AnchoredDir) -> Result<(File, bool)> {
         Ok(fd) => {
             let file = File::from(fd);
             set_and_verify_file_mode(&file, 0o600, "anchored update lock")?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
             root.sync()?;
             return Ok((file, true));
         }
@@ -3683,7 +4022,7 @@ fn open_lock_file_at(root: &AnchoredDir) -> Result<(File, bool)> {
         anyhow::bail!("anchored update lock changed while it was being opened");
     }
     set_and_verify_file_mode(&file, 0o600, "anchored update lock")?;
-    file.sync_all()?;
+    kin_blobs::durable::sync_all(&file)?;
     Ok((file, false))
 }
 
@@ -4142,7 +4481,7 @@ impl AnchoredDir {
         let result = (|| -> Result<()> {
             set_and_verify_file_mode(&file, 0o600, label)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
             self.ensure_regular_binding(&temp, created.st_dev as u64, created.st_ino as u64)?;
             before_create()?;
             self.ensure_regular_binding(&temp, created.st_dev as u64, created.st_ino as u64)?;
@@ -4227,7 +4566,7 @@ impl AnchoredDir {
                     temp
                 )
             })?;
-            file.sync_all().with_context(|| {
+            kin_blobs::durable::sync_all(&file).with_context(|| {
                 format!(
                     "failed to sync anchored temporary file {}/{}",
                     self.display.display(),
@@ -4313,7 +4652,7 @@ impl AnchoredDir {
             let mut file = File::from(fd);
             set_and_verify_file_mode(&file, mode, "exclusive anchored file")?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
             self.sync()
         })();
         if result.is_err() {
@@ -5284,7 +5623,7 @@ fn write_file_atomically(path: &Path, bytes: &[u8], unix_mode: u32) -> Result<()
             .with_context(|| format!("failed to create temporary file {}", temp.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("failed to write temporary file {}", temp.display()))?;
-        file.sync_all()
+        kin_blobs::durable::sync_all(&file)
             .with_context(|| format!("failed to sync temporary file {}", temp.display()))?;
         drop(file);
         fs::rename(&temp, path).with_context(|| {
@@ -6130,7 +6469,7 @@ impl PrivateUpdaterTempDir {
         lease.set_len(0)?;
         lease.rewind()?;
         lease.write_all(&bytes)?;
-        lease.sync_all()?;
+        kin_blobs::durable::sync_all(&lease)?;
         self.validate_root_binding()?;
         Ok(())
     }
@@ -6181,26 +6520,34 @@ fn unix_time_seconds() -> Result<u64> {
 
 fn current_process_lease_identity() -> Result<(u32, u64)> {
     let pid = sysinfo::get_current_pid().map_err(anyhow::Error::msg)?;
-    let system = System::new_all();
-    let process = system
-        .process(pid)
-        .context("failed to inspect updater process start time")?;
-    Ok((pid.as_u32(), process.start_time()))
+    let start_time =
+        live_process_start_time(pid).context("failed to inspect updater process start time")?;
+    Ok((pid.as_u32(), start_time))
 }
 
 fn lease_process_is_live(pid: u32, process_start_time: u64) -> bool {
-    let system = System::new_all();
-    system
-        .process(Pid::from_u32(pid))
-        .is_some_and(|process| process.start_time() == process_start_time)
+    live_process_start_time(Pid::from_u32(pid)) == Some(process_start_time)
+}
+
+/// The start time of `pid` when it is live. A lease names one process, so only
+/// that process is read; a whole-table snapshot with every counter sampled
+/// cost a full process scan per lease check and told the lease nothing more.
+fn live_process_start_time(pid: Pid) -> Option<u64> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).map(|process| process.start_time())
 }
 
 fn sync_private_temp_parent(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        File::open(path)
-            .with_context(|| format!("failed to open temp parent {} for sync", path.display()))?
-            .sync_all()
+        let parent = File::open(path)
+            .with_context(|| format!("failed to open temp parent {} for sync", path.display()))?;
+        kin_blobs::durable::sync_all(&parent)
             .with_context(|| format!("failed to sync temp parent {}", path.display()))?;
     }
     #[cfg(not(unix))]
@@ -8375,7 +8722,7 @@ fn write_staged_component(
             .with_context(|| format!("failed to stage release component {}", path.display()))?;
         file.write_all(contents)
             .with_context(|| format!("failed to write staged component {}", path.display()))?;
-        file.sync_all()
+        kin_blobs::durable::sync_all(&file)
             .with_context(|| format!("failed to sync staged component {}", path.display()))?;
         drop(file);
         sync_dir(path.parent().expect("component paths always have a parent"))?;
@@ -10787,7 +11134,7 @@ async fn resolve_release(client: &reqwest::Client, channel: Channel) -> Result<G
                 serde_json::from_slice(&bytes).context("failed to parse releases JSON")?;
             select_alpha(releases)?.context(
                 "no pre-release build is available on the alpha channel yet. \
-                 See https://github.com/firelock-ai/kin/releases",
+                 See https://github.com/kinlab-ai/kin/releases",
             )
         }
     }
@@ -11735,13 +12082,62 @@ fn normalized_process_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
+/// The process fields the managed-runtime matcher reads: executable, argv and
+/// working directory. CPU, memory, disk, environment and user fields are never
+/// consulted, so they are not sampled, and one refresh replaces the pair that
+/// `System::new_all` followed by `refresh_all` made. Tasks stay listed as
+/// before, so the matcher's thread filter still sees them.
+fn managed_runtime_process_fields() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_cwd(UpdateKind::OnlyIfNotSet)
+}
+
+/// One snapshot of the whole process table carrying
+/// [`managed_runtime_process_fields`], for the managed-runtime matcher.
+fn managed_runtime_process_table() -> System {
+    System::new_with_specifics(
+        RefreshKind::nothing().with_processes(managed_runtime_process_fields()),
+    )
+}
+
+/// [`normalized_process_path`] answers for one process-table snapshot.
+///
+/// The matcher compares every process's executable and argv0 against each
+/// managed component, and each comparison resolved both sides with `realpath`.
+/// On a host running about 1,200 processes that repeated the same resolutions
+/// tens of thousands of times per snapshot, and a profiled update test spent
+/// most of its time in them. The rule is unchanged: each distinct path is
+/// resolved once per snapshot and the answer reused, and every new snapshot
+/// starts with an empty cache, so a path that changes between snapshots is
+/// resolved again.
+#[derive(Default)]
+struct ProcessPathCache {
+    normalized: RefCell<HashMap<PathBuf, PathBuf>>,
+}
+
+impl ProcessPathCache {
+    fn normalized(&self, path: &Path) -> PathBuf {
+        if let Some(normalized) = self.normalized.borrow().get(path) {
+            return normalized.clone();
+        }
+        let normalized = normalized_process_path(path);
+        self.normalized
+            .borrow_mut()
+            .insert(path.to_path_buf(), normalized.clone());
+        normalized
+    }
+}
+
 fn transaction_component_path_matches(
+    paths: &ProcessPathCache,
     executable: &Path,
     kin_home: &Path,
     component: ComponentSpec,
 ) -> bool {
-    let executable = normalized_process_path(executable);
-    let kin_home = normalized_process_path(kin_home);
+    let executable = paths.normalized(executable);
+    let kin_home = paths.normalized(kin_home);
     let Ok(relative) = executable.strip_prefix(&kin_home) else {
         return false;
     };
@@ -11764,26 +12160,28 @@ fn transaction_component_path_matches(
 }
 
 fn process_path_matches_component(
+    paths: &ProcessPathCache,
     _pid: u32,
     executable: &Path,
     managed: &Path,
     kin_home: &Path,
     component: ComponentSpec,
 ) -> bool {
-    if normalized_process_path(executable) == normalized_process_path(managed)
-        || transaction_component_path_matches(executable, kin_home, component)
+    if paths.normalized(executable) == paths.normalized(managed)
+        || transaction_component_path_matches(paths, executable, kin_home, component)
     {
         return true;
     }
     #[cfg(target_os = "linux")]
     if let Ok(mapped) = fs::read_link(format!("/proc/{_pid}/exe")) {
-        return normalized_process_path(&mapped) == normalized_process_path(managed)
-            || transaction_component_path_matches(&mapped, kin_home, component);
+        return paths.normalized(&mapped) == paths.normalized(managed)
+            || transaction_component_path_matches(paths, &mapped, kin_home, component);
     }
     false
 }
 
 fn argv0_matches_component(
+    paths: &ProcessPathCache,
     command: &[String],
     cwd: Option<&Path>,
     managed: &Path,
@@ -11800,8 +12198,8 @@ fn argv0_matches_component(
     } else {
         return false;
     };
-    normalized_process_path(&candidate) == normalized_process_path(managed)
-        || transaction_component_path_matches(&candidate, kin_home, component)
+    paths.normalized(&candidate) == paths.normalized(managed)
+        || transaction_component_path_matches(paths, &candidate, kin_home, component)
 }
 
 fn command_requests_help_or_version(command: &[String]) -> bool {
@@ -11896,8 +12294,10 @@ fn runtime_executable_diagnostic(
 /// matcher, shared by the fail-closed preflight (`reject_active_managed_runtime`),
 /// the unattended activity probe, and the unattended stop's drain scan, so all
 /// three answer from the same definition of "a managed serving executable".
+/// `paths` must belong to `system`'s snapshot; see [`ProcessPathCache`].
 fn collect_active_managed_runtime_pids(
     system: &System,
+    paths: &ProcessPathCache,
     kin_home: &Path,
     kind: RuntimeKind,
     component: ComponentSpec,
@@ -11916,10 +12316,16 @@ fn collect_active_managed_runtime_pids(
             continue;
         }
         let command = process_command(process);
-        let matched =
-            process.exe().is_some_and(|executable| {
-                process_path_matches_component(pid, executable, &managed, kin_home, component)
-            }) || argv0_matches_component(&command, process.cwd(), &managed, kin_home, component);
+        let matched = process.exe().is_some_and(|executable| {
+            process_path_matches_component(paths, pid, executable, &managed, kin_home, component)
+        }) || argv0_matches_component(
+            paths,
+            &command,
+            process.cwd(),
+            &managed,
+            kin_home,
+            component,
+        );
         if matched && is_managed_serving_process(kind, component.name, &command) {
             pids.push(pid);
         }
@@ -11950,13 +12356,16 @@ fn scan_active_managed_runtimes(
     kin_home: &Path,
     spec: &[ComponentSpec],
 ) -> Vec<(RuntimeKind, &'static str, u32)> {
+    let paths = ProcessPathCache::default();
     let mut active = Vec::new();
     for kind in [RuntimeKind::Daemon, RuntimeKind::Mcp, RuntimeKind::Vfs] {
         for component in spec
             .iter()
             .filter(|component| runtime_component_matches(kind, component.name))
         {
-            for pid in collect_active_managed_runtime_pids(system, kin_home, kind, *component) {
+            for pid in
+                collect_active_managed_runtime_pids(system, &paths, kin_home, kind, *component)
+            {
                 active.push((kind, component.name, pid));
             }
         }
@@ -11966,6 +12375,7 @@ fn scan_active_managed_runtimes(
 
 fn reject_active_managed_runtime(
     system: &System,
+    paths: &ProcessPathCache,
     kin_home: &Path,
     spec: &[ComponentSpec],
     kind: RuntimeKind,
@@ -11977,7 +12387,7 @@ fn reject_active_managed_runtime(
         .with_context(|| format!("managed {} runtime component is missing", kind.label()))?;
     let managed_path = component_path(kin_home, *component);
     let managed = managed_path.canonicalize().unwrap_or(managed_path);
-    let Some(pid) = collect_active_managed_runtime_pids(system, kin_home, kind, *component)
+    let Some(pid) = collect_active_managed_runtime_pids(system, paths, kin_home, kind, *component)
         .first()
         .copied()
     else {
@@ -12020,8 +12430,8 @@ fn reject_active_managed_runtime(
 /// called idle.
 fn ensure_no_active_managed_runtimes(kin_home: &Path, spec: &[ComponentSpec]) -> Result<()> {
     for pass in 0..3 {
-        let mut system = System::new_all();
-        system.refresh_all();
+        let system = managed_runtime_process_table();
+        let paths = ProcessPathCache::default();
         for kind in [RuntimeKind::Daemon, RuntimeKind::Mcp, RuntimeKind::Vfs] {
             if !kind.blocks_managed_byte_movement() {
                 continue;
@@ -12030,7 +12440,14 @@ fn ensure_no_active_managed_runtimes(kin_home: &Path, spec: &[ComponentSpec]) ->
                 .iter()
                 .filter(|component| runtime_component_matches(kind, component.name))
             {
-                reject_active_managed_runtime(&system, kin_home, spec, kind, component.name)?;
+                reject_active_managed_runtime(
+                    &system,
+                    &paths,
+                    kin_home,
+                    spec,
+                    kind,
+                    component.name,
+                )?;
             }
         }
         if pass != 2 {
@@ -12284,7 +12701,7 @@ fn create_private_marker_absent_or_identical(path: &Path, bytes: &[u8], label: &
             Ok(mut file) => {
                 let write_result = (|| -> Result<()> {
                     file.write_all(bytes)?;
-                    file.sync_all()?;
+                    kin_blobs::durable::sync_all(&file)?;
                     sync_dir(
                         path.parent()
                             .with_context(|| format!("{label} has no parent"))?,
@@ -12328,7 +12745,7 @@ fn create_private_marker_absent_or_identical(path: &Path, bytes: &[u8], label: &
         options.write(true).create_new(true);
         let mut file = options.open(path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
         sync_dir(
             path.parent()
                 .with_context(|| format!("{label} has no parent"))?,
@@ -12738,8 +13155,6 @@ fn observe_runtime_sessions(
     record: &RestartPending,
     evidence: &[RuntimeSessionEvidence],
 ) -> Result<HashMap<u32, ObservedRuntimeProcess>> {
-    let mut system = System::new_all();
-    system.refresh_all();
     let mut kinds_by_pid = HashMap::new();
     for session in evidence {
         kinds_by_pid.insert(session.pid, session.kind);
@@ -12750,6 +13165,20 @@ fn observe_runtime_sessions(
         .flat_map(|obligation| obligation.prior_sessions.iter().map(|session| session.pid))
         .chain(evidence.iter().map(|session| session.pid))
         .collect::<HashSet<_>>();
+    // Only the recorded and offered pids are read, with the fields read below
+    // plus the start time every process carries. The rest of the table
+    // answers nothing here.
+    let refresh = wanted_pids
+        .iter()
+        .copied()
+        .map(Pid::from_u32)
+        .collect::<Vec<_>>();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&refresh),
+        true,
+        managed_runtime_process_fields(),
+    );
     let mut observed = HashMap::new();
     for pid in wanted_pids {
         let Some(process) = system.process(Pid::from_u32(pid)) else {
@@ -13065,9 +13494,8 @@ fn acknowledge_runtime_restart(evidence: &[RuntimeSessionEvidence]) -> Result<()
     Ok(())
 }
 
-/// The `firelock-ai/kin` release for an exact tag. Suffix `v{VERSION}`.
-const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/firelock-ai/kin/releases/tags/v";
+/// The `kinlab-ai/kin` release for an exact tag. Suffix `v{VERSION}`.
+const GITHUB_RELEASES_TAG_URL: &str = "https://api.github.com/repos/kinlab-ai/kin/releases/tags/v";
 
 /// Download the VFS shim from the GitHub release matching the running version
 /// and install it atomically at `dest`.
@@ -14005,6 +14433,29 @@ mod tests {
         }
     }
 
+    /// A fixture root that can hold a hard link to the running test binary.
+    ///
+    /// Start authority compares the managed `bin/kin` with the executing image
+    /// by device and inode, so the tests that need it to pass hard-link the
+    /// test binary into the fixture. A copy is a different object and would
+    /// change what they prove. A link cannot cross volumes, and a per-run
+    /// TMPDIR on another volume than the build directory fails it with EXDEV,
+    /// so in that case the root is made beside the test binary instead.
+    #[cfg(unix)]
+    fn tempdir_linkable_to_test_executable() -> tempfile::TempDir {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let executable = std::env::current_exe().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        if fs::metadata(tmp.path()).unwrap().dev() == fs::metadata(&executable).unwrap().dev() {
+            return tmp;
+        }
+        tempfile::Builder::new()
+            .prefix(".kin-update-test-")
+            .tempdir_in(executable.parent().unwrap())
+            .unwrap()
+    }
+
     fn test_restart_pending(version: &str) -> RestartPending {
         RestartPending {
             schema_version: 2,
@@ -14418,6 +14869,9 @@ mod tests {
     #[test]
     #[serial]
     fn bundle_post_mutation_failures_restore_the_old_install_immediately() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         for failure_point in [
             "after-backup-mutation-notifier-bundle",
             "after-install-mutation-notifier-bundle",
@@ -15004,6 +15458,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn update_refreshes_the_installed_notifier_bundle() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -15044,6 +15501,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn a_failed_update_restores_the_previous_notifier_bundle() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -15104,6 +15564,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn a_rollback_restores_the_bundle_over_a_partially_removed_tree() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -15160,6 +15623,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn a_failed_first_bundle_install_removes_what_it_installed() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -15938,6 +16404,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn full_bundle_install_includes_vfs_and_shim_under_custom_root() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let custom_home = tmp.path().join("custom-kin-home");
         let stage = tmp.path().join("stage");
@@ -15985,6 +16454,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn install_failure_rolls_back_every_component() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -16151,6 +16623,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn every_post_mutation_precommit_error_restores_the_old_bundle_immediately() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         for failure_point in [
             "after-backup-mutation-0",
             "after-install-mutation-0",
@@ -16736,6 +17211,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn replacing_bin_before_first_backup_cannot_redirect_mutation() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
@@ -16792,6 +17270,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn replacing_lib_before_shim_install_cannot_redirect_mutation() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
@@ -17667,6 +18148,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn replacing_install_root_aborts_before_component_mutation() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let detached = tmp.path().join("kin-home-detached");
@@ -17724,6 +18208,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn replacing_update_lock_aborts_before_component_mutation() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -17771,6 +18258,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn windows_bundle_uses_exe_names_and_removes_stale_projection_files() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let home = tmp.path().join("home");
@@ -17821,6 +18311,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn a_unix_update_removes_the_retired_projection_runtime_it_finds_installed() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let home = tmp.path().join("home");
@@ -17868,6 +18361,9 @@ cwd = {:?}
     #[tokio::test]
     #[serial]
     async fn check_only_reports_stale_transaction_without_writing_any_state() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("custom-kin-home");
         let registry = tmp.path().join("registry.toml");
@@ -17903,7 +18399,30 @@ cwd = {:?}
         )
         .await
         .expect_err("check-only must report, not recover, a stale transaction");
-        assert!(format!("{error:#}").contains("did not modify any file"));
+        let reported = error
+            .downcast_ref::<CheckReported>()
+            .expect("check-only JSON reports a reason code");
+        assert_eq!(reported.reason, CHECK_UPDATE_INTERRUPTED);
+
+        // The same check without --json is refused the same way.
+        run(
+            false,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+            Vec::new(),
+            None,
+            false,
+            false,
+            false,
+            false,
+        )
+        .await
+        .expect_err("check-only without --json must report, not recover, a stale transaction");
         assert_eq!(
             fs::read(&sentinel).unwrap(),
             b"must remain byte-for-byte unchanged"
@@ -17925,6 +18444,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn update_preflight_refuses_unsafe_registry_without_repairing_it() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -17957,6 +18479,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn post_update_mcp_refresh_uses_custom_managed_launcher_and_preserves_cwd() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("custom-kin-home");
@@ -18009,6 +18534,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn postcommit_crashes_durably_repair_mcp_before_marker_clear() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         for point in ["after-commit", "after-restart-marker", "after-cleanup"] {
             let state = crash_update_with_mcp(point, None);
             match point {
@@ -18079,6 +18607,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn malformed_mcp_config_is_byte_preserved_and_repair_stays_pending() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let state = crash_update("after-cleanup", None);
         let home = state._tmp.path().join("home-malformed");
         let repo = state._tmp.path().join("repo-malformed");
@@ -18112,6 +18643,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn exact_mcp_manifest_repairs_its_recorded_target_independent_of_cwd() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
@@ -18169,6 +18703,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn legacy_empty_and_malformed_mcp_manifests_fail_closed() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let cases = [
             serde_json::json!({
                 "schema_version": 1,
@@ -18215,6 +18752,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn unknown_mcp_lifecycle_fields_preserve_marker_and_config_bytes() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
@@ -18287,6 +18827,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn mcp_marker_self_target_fails_without_recursive_target_locking() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
@@ -18322,6 +18865,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn retained_mcp_marker_rejects_arbitrary_id_path_authority_without_writes() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         for victim_kind in ["arbitrary_json", "restart_marker", "setup_ledger"] {
             let tmp = tempfile::tempdir().unwrap();
             let kin_home = tmp.path().join("kin-home");
@@ -18367,6 +18913,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn unsupported_mcp_marker_fails_before_transaction_directory_creation() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let stage = tmp.path().join("stage");
@@ -18517,6 +19066,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn mcp_persistence_retains_different_marker_appearing_at_create_boundary() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -18570,6 +19122,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn transaction_manifest_preserves_existing_mcp_repair_targets() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
@@ -18616,9 +19171,12 @@ cwd = {:?}
     #[test]
     #[serial]
     fn automatic_mcp_repair_rejects_identical_bytes_on_replaced_inode() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir_linkable_to_test_executable();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"installed-");
         let managed = kin_home.join("bin/kin");
@@ -18640,10 +19198,13 @@ cwd = {:?}
     #[test]
     #[serial]
     fn ordinary_mcp_repair_reverifies_start_authority_after_install_lock_wait() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         use std::sync::mpsc;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir_linkable_to_test_executable();
         let kin_home = tmp.path().join("kin-home");
         write_bundle(&kin_home, LINUX_COMPONENTS, b"old-");
         let managed = kin_home.join("bin/kin");
@@ -18738,6 +19299,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn mcp_destination_directory_sync_failure_reports_error_and_retains_marker() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let state = crash_update("after-cleanup", None);
         let home = state._tmp.path().join("home-dir-sync-failure");
         let config = home.join(".codex/config.toml");
@@ -18804,7 +19368,10 @@ cwd = {:?}
     #[test]
     #[serial]
     fn explicit_restart_ack_clears_only_a_matching_release_marker() {
-        let tmp = tempfile::tempdir().unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let tmp = tempdir_linkable_to_test_executable();
         let kin_home = tmp.path().join("kin-home");
         let lock = InstallRootLock::acquire(&kin_home).unwrap();
         fs::hard_link(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
@@ -18835,10 +19402,13 @@ cwd = {:?}
     #[test]
     #[serial]
     fn unknown_restart_lifecycle_fields_retain_exact_marker_bytes() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         for location in ["marker", "obligation", "session", "commit_identity"] {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = tempdir_linkable_to_test_executable();
             let kin_home = tmp.path().join("kin-home");
             let lock = InstallRootLock::acquire(&kin_home).unwrap();
             fs::hard_link(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
@@ -19309,7 +19879,10 @@ cwd = {:?}
     #[test]
     #[serial]
     fn restart_ack_rejects_identity_mismatch_and_retains_obligation() {
-        let tmp = tempfile::tempdir().unwrap();
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let tmp = tempdir_linkable_to_test_executable();
         let kin_home = tmp.path().join("kin-home");
         let lock = InstallRootLock::acquire(&kin_home).unwrap();
         fs::hard_link(std::env::current_exe().unwrap(), kin_home.join("bin/kin")).unwrap();
@@ -19332,6 +19905,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn update_config_path_honors_kin_home_over_kin_dir() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let fallback = tmp.path().join("fallback");
         let preferred = tmp.path().join("preferred");
@@ -19344,6 +19920,9 @@ cwd = {:?}
     #[test]
     #[serial]
     fn check_only_channel_override_does_not_persist_state() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", tmp.path());
 
@@ -19373,6 +19952,9 @@ cwd = {:?}
                 "a7f58f3c51f6e6bc7c3c2f1de979b67f506e9c3826d38e08752d28daf2f11731",
             restart_ack_required: false,
             mcp_repair_pending: false,
+            install_method: InstallMethod::KinInstaller.as_str(),
+            reason: None,
+            message: None,
         };
         let value = serde_json::to_value(check).unwrap();
 
@@ -19396,11 +19978,228 @@ cwd = {:?}
         // The watchdog reads the policy here rather than parsing update.toml,
         // so it is part of the contract and not an incidental field.
         assert_eq!(value["update_policy"], "prompt");
+        // A completed check says how this Kin was installed and carries a
+        // null reason, which is how a reader tells it from a check that could
+        // not finish.
+        assert_eq!(value["install_method"], "kin_installer");
+        assert!(value["reason"].is_null());
+        assert!(value["message"].is_null());
         // The schema stays v1 because this addition is purely additive: no
         // field was removed and none changed meaning, so every existing reader
         // keeps working. The count is what makes that claim checkable, and it
         // is why adding a field has to be a deliberate edit here.
-        assert_eq!(value.as_object().unwrap().len(), 12);
+        assert_eq!(value.as_object().unwrap().len(), 15);
+    }
+
+    /// The report a check that could not finish prints: the keys a reader of
+    /// a completed check needs, with a reason code and a sentence, and nothing
+    /// that pretends a release was found.
+    #[test]
+    fn unavailable_update_check_json_names_its_reason() {
+        let report = UpdateCheckUnavailable {
+            schema: UPDATE_CHECK_SCHEMA,
+            current_version: "0.8.2",
+            latest_version: None,
+            update_available: false,
+            install_method: InstallMethod::Homebrew.as_str(),
+            reason: CHECK_UNSUPPORTED_INSTALL_METHOD,
+            message: "Homebrew installed this Kin, so Homebrew updates it.",
+        };
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["schema"], "kin.update-check.v1");
+        assert_eq!(value["current_version"], "0.8.2");
+        assert!(value["latest_version"].is_null());
+        assert_eq!(value["update_available"], false);
+        assert_eq!(value["install_method"], "homebrew");
+        assert_eq!(value["reason"], "unsupported_install_method");
+        assert!(value["message"].as_str().unwrap().contains("Homebrew"));
+        assert_eq!(value.as_object().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn install_method_follows_where_the_running_binary_lives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let cargo_home = tmp.path().join("cargo-home");
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        let managed = kin_home.join("bin").join("kin");
+
+        assert_eq!(
+            classify_install_method(&managed, &kin_home, Some(&cargo_home)),
+            InstallMethod::KinInstaller
+        );
+        fs::write(kin_home.join("bin").join(NPM_LAUNCHER_STAMP), "0.8.2\n").unwrap();
+        assert_eq!(
+            classify_install_method(&managed, &kin_home, Some(&cargo_home)),
+            InstallMethod::Npm
+        );
+        assert_eq!(
+            classify_install_method(
+                Path::new("/opt/homebrew/Cellar/kin/0.8.2/bin/kin"),
+                &kin_home,
+                Some(&cargo_home)
+            ),
+            InstallMethod::Homebrew
+        );
+        assert_eq!(
+            classify_install_method(
+                Path::new("/usr/local/Cellar/kin/0.8.2/bin/kin"),
+                &kin_home,
+                Some(&cargo_home)
+            ),
+            InstallMethod::Homebrew
+        );
+        assert_eq!(
+            classify_install_method(
+                &tmp.path()
+                    .join("prefix/lib/node_modules/@kinlab/kin/native/kin"),
+                &kin_home,
+                Some(&cargo_home)
+            ),
+            InstallMethod::Npm
+        );
+        assert_eq!(
+            classify_install_method(
+                &cargo_home.join("bin").join("kin"),
+                &kin_home,
+                Some(&cargo_home)
+            ),
+            InstallMethod::Cargo
+        );
+        assert_eq!(
+            classify_install_method(
+                &tmp.path().join("checkout/target/debug/kin"),
+                &kin_home,
+                Some(&cargo_home)
+            ),
+            InstallMethod::Unknown
+        );
+        assert!(InstallMethod::KinInstaller.is_managed());
+        assert!(InstallMethod::Npm.is_managed());
+        assert!(!InstallMethod::Homebrew.is_managed());
+        assert!(!InstallMethod::Unknown.is_managed());
+    }
+
+    /// Every reason a check stops before it starts is read without writing:
+    /// a missing install root stays missing.
+    #[test]
+    fn check_only_preconditions_name_a_stable_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-kin-home");
+
+        let reason = |method| check_only_precondition(method, &missing).map(|c| c.reason);
+        assert_eq!(
+            reason(InstallMethod::Homebrew),
+            Some(CHECK_UNSUPPORTED_INSTALL_METHOD)
+        );
+        assert_eq!(
+            reason(InstallMethod::Cargo),
+            Some(CHECK_UNSUPPORTED_INSTALL_METHOD)
+        );
+        assert_eq!(
+            reason(InstallMethod::Unknown),
+            Some(CHECK_INSTALL_ROOT_MISSING)
+        );
+        assert_eq!(
+            reason(InstallMethod::KinInstaller),
+            Some(CHECK_INSTALL_ROOT_MISSING)
+        );
+        assert!(
+            !missing.exists(),
+            "a check must never create the install root"
+        );
+
+        let present = tmp.path().join("kin-home");
+        fs::create_dir_all(present.join("bin")).unwrap();
+        assert_eq!(
+            check_only_precondition(InstallMethod::Unknown, &present).map(|c| c.reason),
+            Some(CHECK_UNSUPPORTED_INSTALL_METHOD)
+        );
+        assert_eq!(
+            check_only_precondition(InstallMethod::KinInstaller, &present),
+            None
+        );
+
+        // An interrupted update is reported first, whoever installed this kin.
+        let transaction = present.join(format!("{TRANSACTION_PREFIX}{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&transaction).unwrap();
+        for method in [
+            InstallMethod::KinInstaller,
+            InstallMethod::Npm,
+            InstallMethod::Homebrew,
+            InstallMethod::Cargo,
+            InstallMethod::Unknown,
+        ] {
+            assert_eq!(
+                check_only_precondition(method, &present).map(|c| c.reason),
+                Some(CHECK_UPDATE_INTERRUPTED),
+                "{method:?}"
+            );
+        }
+        assert!(
+            transaction.is_dir(),
+            "a check must not recover the transaction"
+        );
+    }
+
+    /// A network failure, an unusable answer and anything else each get their
+    /// own code, read from the error chain rather than its words.
+    #[tokio::test]
+    async fn check_failures_are_classified_by_their_cause() {
+        let client =
+            build_update_http_client_with_timeouts(Duration::from_secs(2), Duration::from_secs(2))
+                .unwrap();
+        // Bound and dropped, so nothing listens on it.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let refused = client
+            .get(format!("http://127.0.0.1:{port}/releases/latest"))
+            .send()
+            .await
+            .context("failed to reach GitHub releases API")
+            .unwrap_err();
+        assert_eq!(
+            classify_check_failure(&refused).reason,
+            CHECK_NETWORK_UNAVAILABLE
+        );
+
+        // A server that answers, with something other than a release.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let response = client
+            .get(format!("http://{address}/releases/latest"))
+            .send()
+            .await
+            .unwrap();
+        let forbidden = read_bounded_response(response, 1024, "GitHub release metadata")
+            .await
+            .unwrap_err();
+        let lookup = classify_check_failure(&forbidden);
+        assert_eq!(lookup.reason, CHECK_RELEASE_LOOKUP_FAILED);
+        assert!(lookup.message.contains("403"), "{}", lookup.message);
+
+        let other = anyhow::anyhow!("update preflight refused unsafe local registry authority");
+        let failed = classify_check_failure(&other);
+        assert_eq!(failed.reason, CHECK_FAILED);
+        assert!(
+            failed.message.contains("registry authority"),
+            "{}",
+            failed.message
+        );
     }
 
     #[test]

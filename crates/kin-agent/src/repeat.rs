@@ -86,9 +86,11 @@ const MIN_SHARED_WORDS: usize = 2;
 /// Every other tool is unbounded here. The run's own tool-call budget is what
 /// bounds those, and a bound invented without a measurement behind it is a
 /// number that will be wrong in a way nobody can argue with.
+///
+/// `locate` is both, served as one verb, and carries the same number.
 pub fn call_budget(tool: &str) -> Option<u32> {
     match tool {
-        "semantic_locate" | "semantic_search" => Some(4),
+        "semantic_locate" | "semantic_search" | "locate" => Some(4),
         _ => None,
     }
 }
@@ -111,6 +113,12 @@ fn returns_entities(tool: &str) -> bool {
             | "graph_neighborhood"
             | "impact_analysis"
             | "get_context_pack"
+            | "locate"
+            | "refs"
+            | "trace"
+            | "neighbors"
+            | "impact"
+            | "context"
     )
 }
 
@@ -298,8 +306,24 @@ const CLOSING_ANSWER: &str =
     "Say plainly what you could not determine and which tool could not answer it.";
 
 /// What the model is told to do instead, by the tool it was about to re-run.
+///
+/// Worded in the belt's own names: a server that serves verbs is sent to `refs`,
+/// and one that serves the names they replaced to `find_references`.
 fn escalation(tool: &str) -> &'static str {
     match tool {
+        "locate" => {
+            "Stop ranking and start walking. Take an entity you have already been given and call \
+             the trace tool with it as `focal`, naming `to` if your question has two ends, or call \
+             refs on it."
+        }
+        "trace" => {
+            "The walk is not reaching it. Call refs on the entity at the end of the hops you do \
+             have, or answer now."
+        }
+        "context" | "neighbors" | "impact" => {
+            "Walking wider is not finding it. Call the trace tool from an entity you already \
+             hold, or answer now."
+        }
         "semantic_locate" | "semantic_search" => {
             "Stop ranking and start walking. Take an entity you have already been given and call \
              the trace tool with it as `from`, naming `to` if your question has two ends, or call \

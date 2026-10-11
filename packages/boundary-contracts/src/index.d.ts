@@ -700,6 +700,27 @@ export interface RepositoryTransferBody {
   bytes_base64: string;
 }
 
+/** Canonical Git object identity at the repository transfer boundary. */
+export type RepositoryTransferGitObjectId =
+  | { algorithm: "sha1"; bytes: number[] }
+  | { algorithm: "sha256"; bytes: number[] };
+
+/**
+ * Exact raw-object evidence for one native root snapshot taken from Git.
+ * The ordered objects contain only the source commit and its complete tree/blob
+ * closure. Parent commits are an unheld boundary, not imported history.
+ * The receiver independently verifies every object and the complete snapshot.
+ */
+export interface RepositoryTransferGitSnapshotProof {
+  repository_id: string;
+  snapshot_change_id: string;
+  source_commit: RepositoryTransferGitObjectId;
+  objects: Array<{
+    kind: "commit" | "tree" | "blob";
+    oid: RepositoryTransferGitObjectId;
+  }>;
+}
+
 export interface RepositoryTransferPack {
   schema_version: 5;
   protocol: "kin-repository-v6-fast-forward";
@@ -739,11 +760,14 @@ export interface RepositoryTransferPack {
   /**
    * The replay-semantics version the SENDING store records at its own creation,
    * or `null` when it records none. A receiver keeps its own creation record
-   * only when this equals what that record says; anything else, `null`
-   * included, costs the receiver that record. A hosted sender owns no local
+   * only when this and `source_hydration_derivation` both match. Unknown
+   * provenance, including a legacy version-only pack, costs the new receiver
+   * that record. A hosted sender owns no local
    * record and sends `null`.
    */
   source_hydration_semantics: number | null;
+  /** Full creation identity, negotiated with `source-derivation-v1`. */
+  source_hydration_derivation?: string;
   /**
    * Review records this pack carries. Present only on a pack that moves no
    * history, sent after the ref phase to a peer that advertises the
@@ -751,6 +775,12 @@ export interface RepositoryTransferPack {
    * carries none serializes exactly as it did before.
    */
   collaboration?: Record<string, unknown>;
+  /**
+   * Provenance for native root changes carried in this pack, ordered by change
+   * identity. Nonempty only with the required `git-snapshot-proofs-v1` feature;
+   * omitted when empty so ordinary schema-5 packs keep their bytes and identity.
+   */
+  git_snapshot_proofs?: RepositoryTransferGitSnapshotProof[];
 }
 
 export interface RepositoryTransferReceipt {

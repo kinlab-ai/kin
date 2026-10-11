@@ -1031,6 +1031,54 @@ fn unwatched_changes_at(
     layout: &kin_core::KinLayout,
     authority: &ActiveRepositoryAuthority,
 ) -> UnwatchedChanges {
+    unwatched_changes_against(layout, || {
+        unwatched_inputs_at(authority).map_err(UnwatchedChanges::Failed)
+    })
+}
+
+/// The admitted tree a working-copy walk compares against, and which of its
+/// members are held in the graph only and never projected.
+///
+/// Recorded with a status reading, so a reading served without an open still
+/// measures the working copy against exactly the tree that open held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UnwatchedInputs {
+    admitted: Vec<(kin_model::RepoPath, kin_model::TreeEntry)>,
+    graph_only: Vec<kin_model::RepoPath>,
+}
+
+fn unwatched_inputs_at(
+    authority: &ActiveRepositoryAuthority,
+) -> std::result::Result<UnwatchedInputs, String> {
+    // Through the authority's own accessor rather than off the lease, for the
+    // reason `workspace_tip_at` gives: the zero file-search gate pins this
+    // file's `.metadata()` spellings, and this lookup is the accessor's.
+    let workspace = authority.workspace().map_err(|error| error.to_string())?;
+    let tree = &workspace.tree;
+    let mut graph_only = Vec::new();
+    for artifact in tree.artifacts_by_path() {
+        match kin_core::source_projection_disposition(&artifact.path, artifact.entry) {
+            Ok(kin_core::SourceProjectionDisposition::Materialized) => {}
+            Ok(_) => graph_only.push(artifact.path.clone()),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(UnwatchedInputs {
+        admitted: tree
+            .artifacts_by_path()
+            .map(|artifact| (artifact.path.clone(), artifact.entry))
+            .collect(),
+        graph_only,
+    })
+}
+
+/// Walk the working copy for tracked changes since the last admission, against
+/// the inputs `inputs` yields. The inputs are asked for only once a window can
+/// be placed.
+fn unwatched_changes_against(
+    layout: &kin_core::KinLayout,
+    inputs: impl FnOnce() -> std::result::Result<UnwatchedInputs, UnwatchedChanges>,
+) -> UnwatchedChanges {
     let since = match kin_core::last_admission::read(layout) {
         LastAdmissionRead::Recorded(recorded) => {
             let seconds = recorded.at.timestamp();
@@ -1052,34 +1100,23 @@ fn unwatched_changes_at(
             ))
         }
     };
-    // Through the authority's own accessor rather than off the lease, for the
-    // reason `workspace_tip_at` gives: the zero file-search gate pins this
-    // file's `.metadata()` spellings, and this lookup is the accessor's.
-    let workspace = match authority.workspace() {
-        Ok(workspace) => workspace,
-        Err(error) => return UnwatchedChanges::Failed(error.to_string()),
+    let inputs = match inputs() {
+        Ok(inputs) => inputs,
+        Err(unmeasured) => return unmeasured,
     };
-    let tree = &workspace.tree;
-    let mut graph_only = Vec::new();
-    for artifact in tree.artifacts_by_path() {
-        match kin_core::source_projection_disposition(&artifact.path, artifact.entry) {
-            Ok(kin_core::SourceProjectionDisposition::Materialized) => {}
-            Ok(_) => graph_only.push(artifact.path.clone()),
-            Err(error) => return UnwatchedChanges::Failed(error.to_string()),
-        }
-    }
-    let working_dir = layout.working_dir();
-    let ignore = match kin_index::RepositoryIgnore::load(working_dir) {
+    // Status reads the working copy to report changes no watcher saw: a
+    // reconcile boundary, so it holds the tree's authority for this one scan.
+    let working_dir = kin_io::WorktreeRoot::new(layout.working_dir(), &kin_io::Grant::ambient());
+    let ignore = match kin_index::RepositoryIgnore::load(&working_dir) {
         Ok(ignore) => ignore,
         Err(error) => return UnwatchedChanges::Failed(error.to_string()),
     };
     match kin_index::scan_working_copy_changes_since(
-        working_dir,
+        &working_dir,
         &ignore,
         None,
-        tree.artifacts_by_path()
-            .map(|artifact| (&artifact.path, artifact.entry)),
-        graph_only.iter(),
+        inputs.admitted.iter().map(|(path, entry)| (path, *entry)),
+        inputs.graph_only.iter(),
         since,
     ) {
         Ok(changes) => UnwatchedChanges::Measured {
@@ -1096,6 +1133,143 @@ fn unwatched_changes_at(
         },
         Err(error) => UnwatchedChanges::Failed(error.to_string()),
     }
+}
+
+/// What a status reading records for the publication it opened: everything
+/// the page prints from repository authority, and the tree its working-copy
+/// walk compares against.
+#[derive(Serialize, Deserialize)]
+struct RecordedStatus {
+    report: StatusReport,
+    merge: Option<MergeInProgress>,
+    workspace_tip: crate::commands::workspace_tip::WorkspaceTip,
+    binding_history_checked: bool,
+    unwatched: UnwatchedInputs,
+}
+
+/// Record what `authority` reads, for `publication`, the store's publication
+/// read before that open.
+///
+/// Best effort: a reading that cannot be recorded costs the next status an
+/// open and nothing else. Recorded only when the store still holds the
+/// publication read before the open, so the record names the bytes this open
+/// actually read: a publication record that reads identically on both sides of
+/// an open cannot have moved in between, because every commit rewrites it.
+pub(crate) fn record_status_reading(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    publication: Option<crate::commands::status_reading::Publication>,
+    authority: &ActiveRepositoryAuthority,
+    reading: &StatusReading,
+    recorded_by: &str,
+) {
+    let Some(publication) = publication else {
+        return;
+    };
+    let Ok(unwatched) = unwatched_inputs_at(authority) else {
+        return;
+    };
+    let unmoved = crate::commands::status_reading::current_publication(layout, binding)
+        .ok()
+        .flatten()
+        .is_some_and(|now| now == publication);
+    if !unmoved {
+        return;
+    }
+    let recorded = RecordedStatus {
+        report: reading.report.clone(),
+        merge: reading.merge.clone(),
+        workspace_tip: reading.workspace_tip.clone(),
+        binding_history_checked: binding_history_checked_at(authority),
+        unwatched,
+    };
+    let Ok(value) = serde_json::to_value(&recorded) else {
+        return;
+    };
+    if let Err(error) =
+        crate::commands::status_reading::record(layout, &publication, recorded_by, value)
+    {
+        tracing::debug!(%error, "could not record this store's status reading");
+    }
+}
+
+/// Take one status reading from `authority` and record it, for a command that
+/// already holds an open it paid for, such as `kin init` at the end of a
+/// conversion. `publication` is the store's publication read before the open.
+pub(crate) fn record_reading_of(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    publication: Option<crate::commands::status_reading::Publication>,
+    authority: &ActiveRepositoryAuthority,
+    recorded_by: &str,
+) {
+    let Ok(report) = inspect_at(
+        layout,
+        authority,
+        EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoRunningDaemon),
+    ) else {
+        return;
+    };
+    let reading = StatusReading {
+        merge: merge_in_progress_at(authority),
+        workspace_tip: workspace_tip_at(authority),
+        binding_history_checked: Some(binding_history_checked_at(authority)),
+        report,
+        unwatched_changes: None,
+        source: AuthoritySource::OwnAuthorityOpen,
+    };
+    record_status_reading(
+        layout,
+        binding,
+        publication,
+        authority,
+        &reading,
+        recorded_by,
+    );
+}
+
+/// The reading recorded for the publication this store holds now, served
+/// without opening it, or `None` when there is none and the caller opens.
+///
+/// The source bodies were verified by the open that recorded the reading,
+/// against the very publication the store still holds, and the answered-by
+/// line says this command re-verified nothing. It observed no live graph, so
+/// coverage carries this command's own reason. With no daemon
+/// running the working copy is still walked, against the tree the recording
+/// open held.
+fn recorded_status_reading(
+    layout: &kin_core::KinLayout,
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    reason: EmbeddingCoverageUnobserved,
+    measure_working_copy: bool,
+) -> Option<StatusReading> {
+    let publication = crate::commands::status_reading::current_publication(layout, binding)
+        .ok()
+        .flatten()?;
+    let recorded = crate::commands::status_reading::recorded_for(layout, &publication)?;
+    let RecordedStatus {
+        mut report,
+        merge,
+        workspace_tip,
+        binding_history_checked,
+        unwatched,
+    } = serde_json::from_value(recorded.reading).ok()?;
+    // Where the working tree is now is this host's fact, not the
+    // publication's: a store whose working tree moved keeps its publication.
+    report.repo_root = layout.working_dir().to_path_buf();
+    report.embedding_coverage = EmbeddingCoverage::unobserved(reason);
+    report.validate().ok()?;
+    Some(StatusReading {
+        report,
+        merge,
+        workspace_tip,
+        source: AuthoritySource::RecordedReading,
+        // Walked only with no daemon at all, as on the open arm: one that is
+        // running owns the working copy's reading.
+        unwatched_changes: measure_working_copy
+            .then(|| unwatched_changes_against(layout, || Ok(unwatched))),
+        binding_history_checked: Some(binding_history_checked),
+    })
 }
 
 /// One complete status reading: the live daemon's when it answers, and this
@@ -1144,6 +1318,21 @@ async fn read_status_once(
             source: AuthoritySource::RunningDaemon,
         }),
         Err(gap) => {
+            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+            // A reading recorded for the publication the store still holds
+            // answers without opening it. The open is the whole cost of this
+            // command, and right after a conversion it is paid for counts the
+            // conversion had just read: 13 s on a 678-commit store and 153 s on
+            // a 5,562-commit one. Beside a daemon still loading, the same
+            // record is as true, and the open would contend with that daemon.
+            if let Some(reading) = recorded_status_reading(
+                layout,
+                &binding,
+                gap.reason,
+                gap.beside_live_daemon.is_none(),
+            ) {
+                return Ok(reading);
+            }
             // Beside a daemon that is running, this open is a cost the reader did
             // not ask for and would not have paid had it answered, so it is named,
             // with its size and its reason, before it starts rather than after.
@@ -1153,14 +1342,17 @@ async fn read_status_once(
                     open_beside_live_daemon_notice(beside, &StoreFootprint::measure(layout))
                 );
             }
-            let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)?;
+            let publication =
+                crate::commands::status_reading::current_publication(layout, &binding)
+                    .ok()
+                    .flatten();
             let authority = ActiveRepositoryAuthority::open(&binding)?;
             let report = inspect_at(
                 layout,
                 &authority,
                 EmbeddingCoverage::unobserved(gap.reason),
             )?;
-            Ok(StatusReading {
+            let reading = StatusReading {
                 merge: merge_in_progress_at(&authority),
                 workspace_tip: workspace_tip_at(&authority),
                 binding_history_checked: Some(binding_history_checked_at(&authority)),
@@ -1177,7 +1369,16 @@ async fn read_status_once(
                 } else {
                     AuthoritySource::OwnAuthorityOpen
                 },
-            })
+            };
+            record_status_reading(
+                layout,
+                &binding,
+                publication,
+                &authority,
+                &reading,
+                "kin status",
+            );
+            Ok(reading)
         }
     }
 }
@@ -1242,7 +1443,7 @@ async fn live_status(
 /// size of what the open re-verifies, and that the daemon is not absent.
 fn open_beside_live_daemon_notice(beside: &str, footprint: &StoreFootprint) -> String {
     let size = match footprint.store.as_ref() {
-        Some(store) => format!("{} under .kin/ here", store.render()),
+        Some(store) => format!("{} in this repository's store", store.render()),
         None => "a store whose size this command could not measure".to_string(),
     };
     format!(
@@ -1339,9 +1540,19 @@ pub async fn run(json: bool, verbose: bool, wait_quiesce: std::time::Duration) -
             &reading.workspace_tip,
             reading.binding_history_checked,
         );
-        attention.extend(open_transaction_lines(
-            report.repository.open_transactions.as_ref(),
-        ));
+        // Staged work is worth a line on this page only when there is some.
+        // "None" is not a warning, and "not observed" repeats what the Working
+        // tree row already says about the absent daemon.
+        if report
+            .repository
+            .open_transactions
+            .as_ref()
+            .is_some_and(|observation| !observation.items.is_empty())
+        {
+            attention.extend(open_transaction_lines(
+                report.repository.open_transactions.as_ref(),
+            ));
+        }
         let page = short_page(
             style,
             &report,
@@ -1367,6 +1578,7 @@ pub async fn run(json: bool, verbose: bool, wait_quiesce: std::time::Duration) -
                 None,
                 Some(&footprint),
                 crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
+                kin_core::enrichment_setting::state_for(&layout),
                 &kin_core::last_admission::read(&layout),
                 // Read from the store rather than asked of the daemon, for the
                 // same reason the freshness line above it is: the record is
@@ -1408,7 +1620,7 @@ pub async fn run(json: bool, verbose: bool, wait_quiesce: std::time::Duration) -
         // a new key there would make an older CLI reject a newer daemon's
         // report outright; putting the budget in the payload is a v4 decision
         // for someone to take deliberately rather than a field to slip in.
-        if let Some(line) = daemon_memory_line(layout.root()) {
+        if let Some(line) = daemon_memory_line(layout.root(), daemon_is_running(&pass)) {
             println!("{line}");
         }
         // The store's replay-semantics standing, read from the store's own
@@ -1424,6 +1636,13 @@ pub async fn run(json: bool, verbose: bool, wait_quiesce: std::time::Duration) -
         // same remedy, read from the same authority as the report.
         if let Some(line) = binding_history_line(&standing, reading.binding_history_checked) {
             println!("{line}");
+        }
+        // How much Git history the store holds, from the store's own record.
+        // Silent for a complete store; a partial one says how far its history
+        // derivation got, so the first command a reader runs tells them why
+        // `kin log` shows one change.
+        if let Some(sentence) = kin_core::history_state::standing(&layout).sentence() {
+            println!("{sentence}");
         }
         // What the working copy holds that graph truth does not. Appended for
         // the same reason as the three lines above, and it is the one this
@@ -1506,19 +1725,54 @@ fn short_attention(
         attention.push(line);
     }
     if let Some(death) = crate::daemon_death::recorded_for_store(layout.root()) {
-        attention.push(death.summary());
+        attention.push(death.summary_in(kin_core::enrichment_setting::state_for(layout)));
     }
     let standing = kin_core::hydration_semantics::standing(layout);
-    if let Some(line) = crate::commands::graph::hydration_semantics_line(&standing) {
+    if let Some(line) = short_upgrade_line(&standing, binding_history_checked) {
         attention.push(line);
-    }
-    if let Some(line) = binding_history_line(&standing, binding_history_checked) {
+    } else if let Some(line) = crate::commands::graph::hydration_semantics_line(&standing) {
         attention.push(line);
     }
     if let Some(line) = admission_hold_line(pass) {
         attention.push(line);
     }
     attention
+}
+
+/// The short page's line for a store `kin upgrade` brings up to this build,
+/// opening with the command, or `None` when the store needs no upgrade or needs
+/// something else first.
+///
+/// The full record's two lines say the same thing in the terms `kin graph
+/// status` and `kin doctor` share. A person at a terminal after installing a
+/// new version needs the command first and one reason, so this page leads with
+/// it. A store a newer build wrote, or one whose record is missing or damaged,
+/// keeps the full line, because its remedy is not `kin upgrade` alone.
+fn short_upgrade_line(
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+    binding_history_checked: Option<bool>,
+) -> Option<String> {
+    use kin_core::hydration_semantics::HydrationStanding;
+    let npm = kin_core::hydration_semantics::npm_upgrade_command();
+    let behind = match standing {
+        HydrationStanding::Behind { .. } => true,
+        HydrationStanding::Rederived { under, derives, .. } => under < derives,
+        _ => false,
+    };
+    if behind {
+        return Some(format!(
+            "Run `kin upgrade` here. An older version of Kin wrote this store, so answers over it \
+             stay unproven until this version re-derives it. Every commit, branch and review is \
+             kept. Through npm: `{npm}`"
+        ));
+    }
+    if !standing.is_gap() && binding_history_checked == Some(false) {
+        return Some(format!(
+            "Run `kin upgrade` here. Reference and call answers over this store stay unproven \
+             until it checks the store's binding history. Through npm: `{npm}`"
+        ));
+    }
+    None
 }
 
 /// The short page's rows, reduced from the report the full record prints.
@@ -1772,13 +2026,47 @@ fn untracked_host_content_line(pass: &StatusAdmission) -> String {
 /// Silent when nothing has been published: no daemon has run under a build that
 /// publishes one, and inventing a figure for it would be worse than the blank
 /// this replaces.
-fn daemon_memory_line(kin_root: &std::path::Path) -> Option<String> {
+///
+/// With no daemon running, the record describes one that has exited, so it is
+/// reported as that daemon's last reading and its age, not as memory a daemon
+/// holds now.
+fn daemon_memory_line(kin_root: &std::path::Path, daemon_running: bool) -> Option<String> {
     let published = kin_core::memory_pressure::DaemonFootprint::read(kin_root)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
-    Some(format!("Daemon memory: {}", published.line(now)))
+    Some(daemon_memory_sentence(&published, now, daemon_running))
+}
+
+fn daemon_memory_sentence(
+    published: &kin_core::memory_pressure::DaemonFootprint,
+    now_unix: u64,
+    daemon_running: bool,
+) -> String {
+    if daemon_running {
+        return format!("Daemon memory: {}", published.line(now_unix));
+    }
+    format!(
+        "Daemon memory: no daemon is running; the last one (pid {}) published its reading {} ago",
+        published.pid,
+        coarse_age(published.age_secs(now_unix))
+    )
+}
+
+/// Whether this command found a daemon serving the repository.
+fn daemon_is_running(pass: &StatusAdmission) -> bool {
+    !matches!(pass, StatusAdmission::Skipped(why) if why.starts_with(NO_DAEMON))
+}
+
+/// `3d`, `2h`, `5m` or `10s`.
+fn coarse_age(secs: u64) -> String {
+    match secs {
+        86_400.. => format!("{}d", secs / 86_400),
+        3_600.. => format!("{}h", secs / 3_600),
+        60.. => format!("{}m", secs / 60),
+        _ => format!("{secs}s"),
+    }
 }
 
 fn open_transaction_lines(
@@ -1820,6 +2108,7 @@ pub fn build_command_status_response(
     build: Option<BuildStatus>,
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    enrichment_state: kin_daemon_spawn::EnrichmentState,
     admission: &LastAdmissionRead,
     retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
@@ -1831,6 +2120,7 @@ pub fn build_command_status_response(
         build.as_ref(),
         footprint,
         death,
+        enrichment_state,
         admission,
         retained,
         pass,
@@ -2085,55 +2375,17 @@ pub fn unmeasured_working_copy_banner(why: &str) -> String {
     )
 }
 
-/// One line for an author refusal inside a status sentence.
-///
-/// The refusal itself is several paragraphs, written for `kin commit`, where it
-/// is the whole answer. Status quotes the reason in its banner and again beside
-/// the tree, so the full text landed mid-sentence twice. The first line says
-/// what is missing, and the fix follows it when the cause is a missing identity.
-fn author_refusal_summary(error: &anyhow::Error) -> String {
-    let rendered = error.to_string();
-    let first = rendered
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("no author identity")
-        .trim_end_matches('.');
-    if error
-        .downcast_ref::<kin_core::KinError>()
-        .is_some_and(super::is_missing_author_identity)
-    {
-        format!(
-            "{first}; run `git config --global user.name \"Your Name\"` then \
-             `git config --global user.email \"you@example.com\"`, or set \
-             `default_author = \"Your Name <you@example.com>\"` at the top level of \
-             .kin/config.toml, above the first [section]"
-        )
-    } else if first.contains("no author identity") {
-        // A misplaced setting has the same opening sentence, followed by its
-        // exact wrong table and move-line repair. Keep that paragraph without
-        // repeating the full alternatives in every status row.
-        rendered
-            .split("\n\n")
-            .take(2)
-            .flat_map(str::lines)
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else {
-        first.to_string()
-    }
-}
-
 /// The exit code a surface owes its caller for the admission it got.
 ///
-/// One predicate for both commands and all eight [`StatusAdmission::Skipped`]
+/// One predicate for both commands and all seven [`StatusAdmission::Skipped`]
 /// arms, because every one of them means the same thing: no pass took the
 /// working copy, so the workspace side of every comparison below is whatever
 /// the last admission left. A daemon that is absent, one still opening
-/// authority, one that refused, an author this store cannot name, and an
-/// admission that failed or answered with no report are different news for a
-/// reader and the same news for a script.
+/// authority, one that could not be addressed or refused, and an admission
+/// that failed, answered with no report or did not answer are different news
+/// for a reader and the same news for a script. A missing Git identity is not
+/// among them: an admission names the daemon as its actor, so reading needs no
+/// author.
 pub fn exit_code_for_admission(pass: &StatusAdmission) -> i32 {
     match pass {
         StatusAdmission::Took(_) => 0,
@@ -2239,19 +2491,7 @@ async fn admit_with_reading(
                 .to_string(),
         );
     };
-    let request = crate::commands::admit::AdmitRequest {
-        operation_id: kin_model::OperationId::new(),
-        actor: match crate::commands::require_commit_author() {
-            Ok(actor) => actor,
-            Err(error) => {
-                return StatusAdmission::Skipped(format!(
-                    "this store cannot name an author for an admission ({}), so nothing \
-                     admitted the working copy",
-                    author_refusal_summary(&error)
-                ))
-            }
-        },
-    };
+    let request = crate::commands::admit::AdmitRequest::new();
     match client.admit(&request).await {
         crate::daemon_client::AdmitDispatch::Answered(response) => match response.report {
             // A refused pass is an answer and it is not an admission. Reporting
@@ -2380,8 +2620,19 @@ fn render_text(
     pass: &StatusAdmission,
     merge: Option<&MergeInProgress>,
 ) -> String {
+    // Available, not a store reading: these tests have no repository setting,
+    // and a developer environment switch must not change the sentence they pin.
     render_text_with_tip(
-        report, build, footprint, death, admission, retained, pass, merge, None,
+        report,
+        build,
+        footprint,
+        death,
+        kin_daemon_spawn::EnrichmentState::Available,
+        admission,
+        retained,
+        pass,
+        merge,
+        None,
     )
 }
 
@@ -2390,6 +2641,7 @@ fn render_text_with_tip(
     build: Option<&BuildStatus>,
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    enrichment_state: kin_daemon_spawn::EnrichmentState,
     admission: &LastAdmissionRead,
     retained: &kin_core::retained_parse::RetainedParseRead,
     pass: &StatusAdmission,
@@ -2517,10 +2769,11 @@ fn render_text_with_tip(
     }
     // A warning of its own rather than more parenthesis. The counts above
     // describe what was derived; this describes whether anything more was
-    // coming, and it quotes the record's own summary so this page says what
-    // `kin graph status` and `kin doctor` say about the same store.
+    // coming. The sentence is the kill record's summary for this repository's
+    // enrichment state, so a store already switched off is not offered the
+    // environment switch.
     if let Some(death) = death {
-        lines.push(format!("⚠ {}", death.summary()));
+        lines.push(format!("⚠ {}", death.summary_in(enrichment_state)));
     }
     lines.into_iter().map(|line| format!("{line}\n")).collect()
 }
@@ -2612,45 +2865,6 @@ mod tests {
         let banner = super::unmeasured_working_copy_banner("because");
         assert!(!banner.contains("  "), "{banner}");
         assert!(banner.contains("Exit 9: the numbers below"), "{banner}");
-    }
-
-    #[test]
-    fn an_author_refusal_is_quoted_as_one_line_that_names_the_fix() {
-        let error = anyhow::Error::new(kin_core::KinError::Config(
-            kin_core::unresolved_identity_message(),
-        ));
-        let summary = super::author_refusal_summary(&error);
-        assert!(!summary.contains('\n'), "{summary}");
-        assert!(summary
-            .starts_with("config error: kin has no author identity to record for this change;"));
-        assert!(
-            summary.contains("git config --global user.name \"Your Name\""),
-            "{summary}"
-        );
-        assert!(
-            summary.contains("git config --global user.email \"you@example.com\""),
-            "{summary}"
-        );
-        assert!(summary.contains("default_author"), "{summary}");
-        let misplaced = anyhow::Error::new(kin_core::KinError::Config(
-            kin_core::identity::misplaced_identity_message("resources"),
-        ));
-        let summary = super::author_refusal_summary(&misplaced);
-        assert!(!summary.contains('\n'), "{summary}");
-        assert!(
-            summary.contains("default_author under [resources]"),
-            "{summary}"
-        );
-        assert!(
-            summary.contains("Move the line to the top level"),
-            "{summary}"
-        );
-        assert!(!summary.contains("git config --global"), "{summary}");
-        let other = anyhow::anyhow!("config error: .kin/config.toml is not valid TOML\n\ndetail");
-        assert_eq!(
-            super::author_refusal_summary(&other),
-            "config error: .kin/config.toml is not valid TOML"
-        );
     }
 
     use super::*;
@@ -2779,6 +2993,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_daemon_the_supervisor_does_not_list_answers_the_status_read() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let layout = kin_core::init(root.path()).unwrap().layout;
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
@@ -2905,6 +3122,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_live_daemon_that_does_not_answer_is_not_reported_as_absent() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let layout = kin_core::init(root.path()).unwrap().layout;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2981,7 +3201,7 @@ mod tests {
             &StoreFootprint::measure(&layout),
         );
         assert!(notice.contains("pid 12538"), "{notice}");
-        assert!(notice.contains("under .kin/ here"), "{notice}");
+        assert!(notice.contains("in this repository's store"), "{notice}");
         assert!(
             notice.contains("re-verifies every persisted body"),
             "{notice}"
@@ -3883,7 +4103,7 @@ mod tests {
             None,
         );
         assert!(
-            with.contains("Store size: ") && with.contains("under .kin/"),
+            with.contains("Store size: ") && with.contains(" in the store"),
             "a measured status must print the store line: {with}"
         );
 
@@ -4005,6 +4225,64 @@ mod tests {
             "one `kin status` must open repository authority once and ask that open for the \
              report, the merge and the workspace tip; opening per reading is GAP-6"
         );
+    }
+
+    /// With no daemon running, a second status answers from the reading the
+    /// first one recorded, opening nothing, while the store holds the same
+    /// publication, and opens again the moment the record names any other.
+    ///
+    /// Right after a conversion every `kin status` opened the whole store
+    /// in-process, 13 s on a 678-commit store and 153 s on a 5,562-commit one,
+    /// to print counts the conversion had just read.
+    ///
+    /// Breaking it: serve a record without comparing its publication, and the
+    /// last half reads the tampered record instead of opening.
+    #[tokio::test]
+    async fn a_status_with_no_daemon_answers_from_the_reading_recorded_for_its_publication() {
+        let _daemon = kin_core::test_env::EnvVarGuard::unset("KIN_DAEMON_URL");
+        let root = tempfile::tempdir().expect("a temporary directory for the fixture store");
+        let init = kin_core::init(root.path()).expect("kin_core::init builds a real store");
+        let absent = crate::daemon_client::RunningDaemonReading::Absent;
+
+        let opened = read_status_once(&init.layout, &absent).await.unwrap();
+        assert_eq!(opened.source, AuthoritySource::OwnAuthorityOpen);
+        assert!(opened.report.repository.source_cas_verified);
+
+        let before = kin_core::authority_opens();
+        let recorded = read_status_once(&init.layout, &absent).await.unwrap();
+        assert_eq!(
+            kin_core::authority_opens() - before,
+            0,
+            "a recorded reading of the same publication opens nothing"
+        );
+        assert_eq!(recorded.source, AuthoritySource::RecordedReading);
+        assert_eq!(recorded.report, opened.report, "every count is the open's");
+        assert_eq!(recorded.merge, opened.merge);
+        assert_eq!(recorded.workspace_tip, opened.workspace_tip);
+        assert_eq!(
+            recorded.binding_history_checked,
+            opened.binding_history_checked
+        );
+        assert_eq!(
+            recorded.unwatched_changes, opened.unwatched_changes,
+            "the working copy is still walked, against the recorded tree"
+        );
+        let answered_by = crate::commands::repository_authority::answered_by_line(recorded.source);
+        assert!(
+            answered_by.contains("opened and re-verified nothing"),
+            "{answered_by}"
+        );
+
+        // A record of any other publication is never served.
+        let record = init.layout.root().join("status-reading.json");
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        tampered["publication"] = serde_json::Value::String("0".repeat(64));
+        std::fs::write(&record, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let before = kin_core::authority_opens();
+        let reopened = read_status_once(&init.layout, &absent).await.unwrap();
+        assert_eq!(kin_core::authority_opens() - before, 1);
+        assert_eq!(reopened.source, AuthoritySource::OwnAuthorityOpen);
     }
 
     /// An older daemon's silence about the merge reading must read as "did not

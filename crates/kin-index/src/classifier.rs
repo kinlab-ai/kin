@@ -9,6 +9,13 @@
 use std::path::Path;
 
 use kin_model::ArtifactKind;
+// The extensions that have tree-sitter adapters for full entity extraction.
+// They must mirror the adapters registered in `kin-parser`'s `AdapterRegistry`:
+// an extension the registry parses but that is missing would route whole-repo
+// ingest to a shallower tier than incremental edits, producing a smaller graph
+// for the same repository depending on ingest path. The list is the model's, so
+// the Git import tells parsed source from everything else by the same one.
+use kin_model::ENTITY_SOURCE_EXTENSIONS;
 
 /// Classification result for a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,18 +30,6 @@ pub enum FileClassification {
     /// Unknown file — track as opaque blob.
     OpaqueArtifact { mime_hint: Option<String> },
 }
-
-/// Extensions that have tree-sitter adapters for full entity extraction.
-///
-/// This must mirror the adapters registered in `kin-parser`'s `AdapterRegistry`:
-/// an extension the registry parses via `get_by_extension` but that is missing
-/// here would route whole-repo ingest to a shallower tier than incremental edits
-/// (which resolve the adapter directly), producing a smaller graph for the same
-/// repo depending on ingest path.
-const ENTITY_SOURCE_EXTENSIONS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "pyi", "go", "java", "rs", "c", "h", "cpp",
-    "hpp", "cc", "cxx", "cs", "rb", "kt", "kts", "swift", "php", "tf", "tfvars",
-];
 
 /// Extensions eligible for C2 shallow syntax extraction: a tree-sitter grammar
 /// exists (see `get_shallow_grammar` in `kin-parser`) but there is no full Kin
@@ -131,10 +126,21 @@ impl FileClassifier {
     /// A parser-capable extension is only an enrichment hint. Bytes that are
     /// not text must remain valid repository content and are therefore routed
     /// to the opaque facet instead of being forced through a language parser.
+    ///
+    /// Bytes that are not text carry the media type of the format the kind
+    /// registry recognizes them as ([`crate::kind::media_type`]), from the
+    /// signature their content opens with or else their name, and
+    /// `application/octet-stream` when it recognizes none.
     pub fn classify_with_content(path: &Path, content: &[u8]) -> FileClassification {
         if is_binary_content(content) {
+            let place = path.to_string_lossy();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let head = &content[..content.len().min(4096)];
             return FileClassification::OpaqueArtifact {
-                mime_hint: Some("application/octet-stream".to_string()),
+                mime_hint: Some(crate::kind::media_type(&place, name, head).to_string()),
             };
         }
         Self::classify(path)
@@ -321,6 +327,34 @@ mod tests {
             FileClassification::OpaqueArtifact {
                 mime_hint: Some("application/octet-stream".to_string())
             }
+        );
+    }
+
+    /// Bytes a format is recognized by carry its media type: by the
+    /// signature they open with whatever they are called, then by name.
+    #[test]
+    fn binary_bytes_carry_the_media_type_of_their_format() {
+        let typed = |path: &str, bytes: &[u8]| match FileClassifier::classify_with_content(
+            Path::new(path),
+            bytes,
+        ) {
+            FileClassification::OpaqueArtifact { mime_hint } => mime_hint,
+            other => panic!("{path}: {other:?}"),
+        };
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x08";
+        assert_eq!(typed("static/logo.png", png).as_deref(), Some("image/png"));
+        assert_eq!(typed("static/logo.dat", png).as_deref(), Some("image/png"));
+        assert_eq!(
+            typed("fonts/a.woff2", b"wOF2\0\x01").as_deref(),
+            Some("font/woff2")
+        );
+        assert_eq!(
+            typed("photos/a.tiff", b"II*\0\xff").as_deref(),
+            Some("image/tiff")
+        );
+        assert_eq!(
+            typed("data/a.blob", b"\0\xff\x01").as_deref(),
+            Some("application/octet-stream")
         );
     }
 

@@ -244,6 +244,25 @@ pub trait SpineBackend: Send + Sync {
     /// Register all entities from a repo, replacing any previous entries.
     fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str);
 
+    /// [`Self::register_repo`], with the language and derivation facts of the
+    /// graph the entries were captured from.
+    ///
+    /// A backend that keeps the facts represents an inferred member as a
+    /// candidate and narrows resolution and authority by language. The default
+    /// drops the facts and registers the entries alone, which leaves every
+    /// entry's language unknown and every entry an ordinary declaration, so a
+    /// caller must not hand such a backend an inferred member.
+    fn register_repo_with_facts(
+        &self,
+        repo_id: &str,
+        entries: Vec<EntityEntry>,
+        facts: crate::RepoGraphFacts,
+        root_hash: &str,
+    ) {
+        let _ = facts;
+        self.register_repo(repo_id, entries, root_hash);
+    }
+
     /// Resolve an entity by name and optional kind across all repos.
     fn resolve(
         &self,
@@ -607,6 +626,19 @@ impl SpineBackend for InMemorySpineBackend {
         let mut publication_heads = self.publication_heads.lock();
         publication_heads.remove(repo_id);
         self.index.register_repo(repo_id, entries, root_hash);
+    }
+
+    fn register_repo_with_facts(
+        &self,
+        repo_id: &str,
+        entries: Vec<EntityEntry>,
+        facts: crate::RepoGraphFacts,
+        root_hash: &str,
+    ) {
+        let mut publication_heads = self.publication_heads.lock();
+        publication_heads.remove(repo_id);
+        self.index
+            .register_repo_with_facts(repo_id, entries, facts, root_hash);
     }
 
     fn resolve(

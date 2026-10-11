@@ -19,6 +19,9 @@ pub enum GraphCommandRequest {
     StatusDetailed {
         #[serde(flatten)]
         request: kin_mcp::status_pages::StatusRequest,
+        /// Serialized CLI-local decorations, outside the daemon's response.
+        #[serde(default, skip_serializing_if = "status_overhead_is_zero")]
+        response_overhead_bytes: usize,
     },
     Validate,
     Inspect {
@@ -38,6 +41,10 @@ pub enum GraphCommandRequest {
     ConversionSource {
         path: String,
     },
+}
+
+fn status_overhead_is_zero(bytes: &usize) -> bool {
+    *bytes == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,10 +314,36 @@ pub enum EntitySourceOutcome {
         query: String,
         reason: kin_ranking::entity_ranking::CandidateReason,
         candidates: Vec<Entity>,
+        /// The spelling that names each candidate alone, for the caller to
+        /// pass back instead of the name that reached them all.
+        names: kin_mcp::handlers::entities::CandidateNames,
     },
 }
 
 impl GraphCommandResponse {
+    fn with_status_observation(&mut self, report: kin_mcp::handlers::entities::GraphStatusReport) {
+        self.with_call_site_observation(report.call_sites);
+        self.enrichment = report.enrichment;
+        if let Some(enrichment) = &self.enrichment {
+            if let Some(reason) = enrichment["unavailable"]["reason"].as_str() {
+                self.lines.push(format!("Enrichment detail unavailable: {reason}. Aggregate counts do not attest dependency completion."));
+            } else {
+                let count = enrichment["page"]["returned"].as_u64().unwrap_or(0);
+                let total = enrichment["page"]["total"].as_u64().unwrap_or(0);
+                self.lines.push(format!("Enrichment evidence: {count} of {total} source observations; scope is the recorded call-site census."));
+            }
+            self.lines.push("Recorded completion and proof settlement are separate; neither attests every relationship or safe absence.".into());
+            if let Some(cursor) = enrichment["page"]["next_cursor"].as_str() {
+                self.lines.push(format!(
+                    "Continue with the same dependencies and --cursor {cursor}"
+                ));
+            }
+            if report.stale.is_some() {
+                self.lines.push("Enrichment observation is cached and cannot attest current dependency completion.".into());
+            }
+        }
+    }
+
     /// Replace the rendered block together with its structured observation.
     /// Match the renderer's own prior block, never parse diagnostic prose.
     pub fn with_call_site_observation(&mut self, current: Option<serde_json::Value>) {
@@ -333,6 +366,69 @@ impl GraphCommandResponse {
     }
 }
 
+/// Select one fenced enrichment page using the exact CLI response shape.
+/// Sizing candidates and returning a page use the same adapter and observation.
+pub fn page_status_response(
+    base: &GraphCommandResponse,
+    result: kin_mcp::ToolCallResult,
+    request: &kin_mcp::status_pages::StatusRequest,
+    response_overhead_bytes: usize,
+    key: &[u8; 32],
+) -> std::result::Result<GraphCommandResponse, String> {
+    let adapt = |value: &serde_json::Value| {
+        let report = serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+        let mut response = base.clone();
+        response.with_status_observation(report);
+        Ok::<_, String>(response)
+    };
+    let result =
+        kin_mcp::status_pages::page_enrichment_for_envelope(result, request, key, |value| {
+            serde_json::to_vec(&adapt(value)?)
+                .map_err(|error| error.to_string())?
+                .len()
+                .checked_add(response_overhead_bytes)
+                .ok_or_else(|| "status decoration byte allowance exceeds its bound".into())
+        })?;
+    let Some(kin_mcp::types::ContentBlock::Text { text }) = result.content.first() else {
+        return Err("status response is not text".into());
+    };
+    if result.is_error == Some(true) {
+        return Err(text.clone());
+    }
+    adapt(&serde_json::from_str(text).map_err(|error| error.to_string())?)
+}
+
+struct StatusDecoration {
+    lines: Vec<String>,
+    history_state: serde_json::Value,
+}
+
+impl StatusDecoration {
+    fn encoded_overhead(&self) -> Result<usize> {
+        // Status health lines are nonempty. The allowance includes the comma
+        // before appended lines; an older empty response needs one byte less.
+        let lines =
+            serde_json::to_vec(&self.lines)?.len() - 2 + usize::from(!self.lines.is_empty());
+        let history = serde_json::to_vec(&serde_json::json!({
+            "history_state": self.history_state,
+        }))?
+        .len()
+            - 1;
+        Ok(lines + history)
+    }
+
+    fn encode(&self, response: &GraphCommandResponse) -> Result<String> {
+        let mut response = response.clone();
+        response.lines.extend(self.lines.iter().cloned());
+        let mut value = serde_json::to_value(&response)?;
+        value
+            .as_object_mut()
+            .context("status response is not an object")?
+            .insert("history_state".into(), self.history_state.clone());
+        Ok(serde_json::to_string(&value)?)
+    }
+}
+
 /// `kin graph status [--json]`: a quick health check of the semantic graph.
 pub async fn status(json: bool) -> Result<()> {
     status_with_request(json, kin_mcp::status_pages::StatusRequest::default()).await
@@ -344,31 +440,57 @@ pub async fn status_with_request(
 ) -> Result<()> {
     let ceiling = request.ceiling();
     let layout = crate::commands::require_repository_layout()?;
-    let mut response =
-        run_daemon_graph(&layout, &GraphCommandRequest::StatusDetailed { request }).await?;
+    // Startup can requalify these local records. Capture their one measured
+    // decoration snapshot only after the daemon is ready, then use that client.
+    let client = graph_daemon_client(&layout).await?;
+    let mut lines = Vec::new();
     append_freshness_line(
-        &mut response.lines,
+        &mut lines,
         &kin_core::last_admission::read(&layout),
         chrono::Utc::now(),
     );
     append_hydration_semantics_line(
-        &mut response.lines,
+        &mut lines,
         &kin_core::hydration_semantics::standing(&layout),
     );
+    // How much Git history the store holds, read off the store like the two
+    // lines above. Silent for a complete store; a partial one says how far its
+    // derivation got.
+    let history = kin_core::history_state::standing(&layout);
+    if let Some(sentence) = history.sentence() {
+        lines.push(format!("⚠ {sentence}"));
+    }
     // And which projection is showing that truth as files. Read here rather
     // than asked of the daemon for the same reason freshness is: the daemon
     // reports the graph it holds, and whether this host has a mount or an
     // injected shim is a property of the machine the CLI is standing on.
-    response.lines.push(format!(
+    lines.push(format!(
         "ℹ {}",
         crate::commands::projection::status_line(layout.root())
     ));
+    let decoration = StatusDecoration {
+        lines,
+        history_state: serde_json::json!({"state":history.code(), "partial":history.notice()}),
+    };
+    let response_overhead_bytes = if json {
+        decoration.encoded_overhead()?
+    } else {
+        0
+    };
+    let mut response = request_daemon_graph(
+        &client,
+        &GraphCommandRequest::StatusDetailed {
+            request,
+            response_overhead_bytes,
+        },
+    )
+    .await?;
     if json {
         // The whole response, lines included, so a script reads the same
         // report a person does. A critical issue still exits non-zero.
-        let encoded = serde_json::to_string(&response)?;
+        let encoded = decoration.encode(&response)?;
         if encoded.len() > ceiling {
-            anyhow::bail!("status envelope exceeds the response budget; increase --max-chars");
+            anyhow::bail!("status envelope cannot fit within the response budget");
         }
         println!("{encoded}");
         if let Some(error) = response.error {
@@ -376,6 +498,7 @@ pub async fn status_with_request(
         }
         return Ok(());
     }
+    response.lines.extend(decoration.lines);
     print_graph_response(response)
 }
 
@@ -560,6 +683,12 @@ async fn run_daemon_graph(
     layout: &kin_core::KinLayout,
     request: &GraphCommandRequest,
 ) -> Result<GraphCommandResponse> {
+    request_daemon_graph(&graph_daemon_client(layout).await?, request).await
+}
+
+async fn graph_daemon_client(
+    layout: &kin_core::KinLayout,
+) -> Result<crate::daemon_client::DaemonClient> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -567,8 +696,14 @@ async fn run_daemon_graph(
         .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
     let base_url = daemon_url
         .ok_or_else(|| crate::daemon_client::daemon_required_error("graph commands", layout))?;
-    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
-    graph_command_reporting_the_wait(&client, request)
+    crate::daemon_client::DaemonClient::from_base_url(base_url)
+}
+
+async fn request_daemon_graph(
+    client: &crate::daemon_client::DaemonClient,
+    request: &GraphCommandRequest,
+) -> Result<GraphCommandResponse> {
+    graph_command_reporting_the_wait(client, request)
         .await
         .map_err(|e| anyhow::anyhow!("daemon graph command failed: {e:#}"))
 }
@@ -1106,7 +1241,11 @@ fn build_graph_status_response_for_store(
     // the mistake this whole area exists to stop.
     health.reference_edge_coverage =
         match kin_mcp::edge_coverage::published_language_server_readiness() {
-            Some(readiness) => coverage.with_language_servers(&readiness),
+            Some(readiness) => coverage
+                .with_language_servers(&readiness)
+                .with_language_server_gaps(
+                    &kin_mcp::edge_coverage::published_language_server_gaps(),
+                ),
             None => coverage,
         };
 
@@ -1526,15 +1665,29 @@ fn build_graph_status_response_for_store(
     // `kin doctor` row reads both: settlement happens at the next daemon start,
     // and a reader asking this page why the numbers stopped moving may not have
     // started one since the daemon died.
-    if let Some(record) = kin_root.and_then(crate::daemon_death::recorded_for_store) {
-        warnings.push(record.summary());
+    if let Some(kin_root) = kin_root {
+        if let Some(record) = crate::daemon_death::recorded_for_store(kin_root) {
+            warnings
+                .push(record.summary_in(kin_core::enrichment_setting::state_for_store(kin_root)));
+        }
     }
     // A suspended sweep is invisible in the same way, and worse: every counter
     // above reads as work still pending, so a store whose enrichment has been
-    // switched off looks exactly like one that is converging. The producer that
-    // would close the gap is off, and only the store's tally remembers.
-    if let Some(suspended) = kin_root.and_then(kin_daemon_spawn::SuspendedSweep::read) {
-        warnings.push(suspended.summary());
+    // switched off looks exactly like one that is converging. The repository
+    // setting wins over the circuit: plain `kin daemon sweep` refuses while
+    // the setting is off, so the warning names the way back on instead.
+    if let Some(kin_root) = kin_root {
+        if !kin_core::enrichment_setting::repository_enabled(&kin_core::KinLayout::new(
+            kin_root.to_path_buf(),
+        )) {
+            warnings.push(format!(
+                "{}, so no daemon runs a sweep. `{}` turns enrichment on.",
+                kin_core::enrichment_setting::OFF_FOR_REPOSITORY,
+                kin_core::enrichment_setting::TURN_ON_COMMAND
+            ));
+        } else if let Some(suspended) = kin_daemon_spawn::SuspendedSweep::read(kin_root) {
+            warnings.push(suspended.summary());
+        }
     }
     // Work the daemon declined for want of memory is invisible in the same way
     // and for the same reason: the counters above report it as pending, and the
@@ -2178,10 +2331,12 @@ fn build_entity_source_outcome_for_view(
     let entity = match resolve_source_query(graph, entity_query)? {
         SourceQuery::One(e) => e,
         SourceQuery::Candidates(reason, candidates) => {
+            let names = kin_mcp::handlers::entities::candidate_names(graph, &candidates);
             return Ok(EntitySourceOutcome::NameCandidates {
                 query: entity_query.trim().to_string(),
                 reason,
                 candidates,
+                names,
             });
         }
         SourceQuery::Missing => {
@@ -2205,7 +2360,12 @@ fn entity_source_outcome(
     entity: &Entity,
     mint_current_source_base: bool,
 ) -> Result<EntitySourceOutcome> {
-    if let Err(reason) = kin_model::require_independent_source(entity) {
+    // A whole file's module surface: say what it is and which calls read the
+    // code in it, in the words every source surface uses.
+    if let Some(refusal) = kin_mcp::handlers::common::whole_file_source_refusal(entity) {
+        return Ok(EntitySourceOutcome::NoSource(refusal));
+    }
+    if let Err(reason) = kin_model::require_targeted_source(entity) {
         return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
             entity, &reason,
         )));
@@ -2304,7 +2464,7 @@ pub fn build_graph_source_response(
     };
     let outcome = match chosen.as_ref() {
         Some(entity) => entity_source_outcome(repository_authority, graph, entity, false)?,
-        None => EntitySourceOutcome::NotFound(entity_source_not_found_message(entity_query)),
+        None => EntitySourceOutcome::NotFound(cli_entity_source_not_found_message(entity_query)),
     };
     match outcome {
         EntitySourceOutcome::Found(record) => {
@@ -2356,8 +2516,14 @@ pub fn build_graph_source_response(
             query,
             reason,
             candidates,
+            names,
         } => {
-            let lines = crate::entity_identity::name_candidate_lines(&query, reason, &candidates);
+            let lines = kin_mcp::handlers::entities::name_candidates_lines_named(
+                &query,
+                reason,
+                &candidates,
+                &names,
+            );
             Ok(GraphCommandResponse {
                 enrichment: None,
                 error: Some(lines.join("\n")),
@@ -2389,6 +2555,27 @@ fn entity_source_not_found_message(entity_query: &str) -> String {
         format!(
             "no entity found matching '{trimmed}'. Use semantic_search or semantic_locate to \
              find the entity, then call get_entity_source with the ID it returns."
+        )
+    }
+}
+
+/// The miss `kin source` reports, in the commands a terminal runs.
+///
+/// [`entity_source_not_found_message`] answers the daemon's `get_entity_source`
+/// route in that tool's vocabulary. Printed by the CLI, it told a person at a
+/// shell to call MCP tools they cannot type there.
+fn cli_entity_source_not_found_message(entity_query: &str) -> String {
+    let trimmed = entity_query.trim();
+    if uuid::Uuid::parse_str(trimmed).is_ok() {
+        format!(
+            "no entity exists with ID '{trimmed}'. This entity ID is invalid or stale: it is \
+             not present in the graph, so retrying the same ID will not succeed. Run `kin \
+             locate \"<what it does>\"` or `kin search <name>` to get a current entity ID."
+        )
+    } else {
+        format!(
+            "no entity found matching '{trimmed}'. Find it with `kin search {trimmed}` or `kin \
+             locate \"<what it does>\"`, then run `kin source` with the ID it prints."
         )
     }
 }
@@ -2526,7 +2713,7 @@ pub(crate) fn graph_source_record_bounded_from(
     entity: &Entity,
     max_bytes: usize,
 ) -> Result<Option<GraphSourceRecord>> {
-    kin_model::require_independent_source(entity).map_err(anyhow::Error::msg)?;
+    kin_model::require_targeted_source(entity).map_err(anyhow::Error::msg)?;
     let file_origin = entity
         .file_origin
         .as_ref()
@@ -2686,6 +2873,10 @@ pub(crate) fn read_entity_file_bytes_with_digest_from(
     })?;
     Ok((bytes, hash))
 }
+
+#[cfg(test)]
+#[path = "graph_status_budget_tests.rs"]
+mod status_budget_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5940,6 +6131,32 @@ mod tests {
         );
     }
 
+    /// `kin source` names the commands a terminal runs, and the daemon's
+    /// `get_entity_source` route keeps naming the MCP tools its caller has.
+    #[test]
+    fn a_source_miss_names_cli_commands_on_the_cli_and_tools_over_mcp() {
+        let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
+        let invented = uuid::Uuid::new_v4().to_string();
+        for query in ["NoSuchThingAnywhere", invented.as_str()] {
+            let cli = build_graph_source_response(&fixture.authority(), &fixture.graph, query)
+                .unwrap()
+                .error
+                .expect("a miss is an error");
+            for tool in ["semantic_search", "semantic_locate", "get_entity_source"] {
+                assert!(!cli.contains(tool), "{query}: the CLI names {tool}: {cli}");
+            }
+            assert!(cli.contains("`kin search"), "{query}: {cli}");
+            assert!(cli.contains("`kin locate"), "{query}: {cli}");
+            match build_entity_source_outcome(&fixture.authority(), &fixture.graph, query).unwrap()
+            {
+                EntitySourceOutcome::NotFound(mcp) => {
+                    assert!(mcp.contains("semantic_locate"), "{query}: {mcp}");
+                }
+                other => panic!("expected NotFound, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn entity_source_outcome_not_found_for_invented_uuid() {
         let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
@@ -6029,6 +6246,42 @@ mod tests {
                 assert!(message.contains("ID is valid"), "{message}");
             }
             other => panic!("expected NoSource, got {other:?}"),
+        }
+    }
+
+    /// A whole file's module surface is refused in two short sentences: what
+    /// it is, and the calls that read the code in it instead.
+    #[test]
+    fn a_whole_module_refusal_names_the_calls_that_read_its_code() {
+        let text = "def pop():\n    pass\n";
+        let fixture = graph_source_fixture(Some(text.as_bytes()));
+        let mut module = source_entity("ctx", fixture.file_id.clone(), 0, text.len());
+        module.kind = EntityKind::Module;
+        module.signature = format!("module {}", fixture.file_id.0);
+        commit_source_entity(&fixture, &module);
+        match build_entity_source_outcome(
+            &fixture.authority(),
+            &fixture.graph,
+            &module.id.to_string(),
+        )
+        .unwrap()
+        {
+            EntitySourceOutcome::NoSource(message) => {
+                assert!(
+                    message.starts_with(&format!(
+                        "ctx ({}) is a whole module, {}, and Kin does not return or edit whole files.",
+                        module.id, fixture.file_id.0
+                    )),
+                    "{message}"
+                );
+                for call in ["locate", "mode literal", "source with that id", "refs"] {
+                    assert!(message.contains(call), "{call}: {message}");
+                }
+                for jargon in ["relationship node", "conversion coverage"] {
+                    assert!(!message.contains(jargon), "{jargon}: {message}");
+                }
+            }
+            other => panic!("a whole module must be refused: {other:?}"),
         }
     }
 

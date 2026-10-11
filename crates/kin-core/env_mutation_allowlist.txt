@@ -42,6 +42,30 @@ crates/kin-cli/src/commands/routed_words.rs
 # (`product_default_for`) that tests exercise without touching the environment.
 crates/kin-cli/src/resource_profile.rs
 
+# The `[retrieval]` table under the same rule, in the same prologue, right after
+# the `resource_profile` call in both binaries: a repository's recorded arm,
+# scorer and embedding model are adopted into `KIN_LOCATE_ARM`,
+# `KIN_LOCATE_SCORER` and `KIN_EMBED_MODEL_ID` for every one the operator left
+# unset, so the CLI and the daemon it spawns read one arm per query. Only an
+# unset variable is written, and the choice of what to write is a pure function
+# (`repository_retrieval_env`) that tests exercise without touching the
+# environment.
+crates/kin-cli/src/retrieval_arm.rs
+
+# Both binaries resolve repository model-slot configuration before creating
+# their runtime or worker threads. Canonical KIN_MODEL_<SLOT> variables are the
+# interface the embedding and decision providers read, and spawned daemons
+# inherit them. Provider precedence is resolved by the pure `resolve_slot`
+# function, which its tests exercise with a lookup argument and no env writes.
+crates/kin-core/src/models.rs
+
+# `kin embed` is an explicit model opt-in. If startup selected the None slot,
+# this command records built-in in repository config and publishes the same
+# canonical embedding provider in its still-single-threaded startup prologue.
+# Other commands retain the resolved slot. This is command behavior, not test
+# setup; tests in this binary still use EnvVarGuard.
+crates/kin-cli/src/main.rs
+
 # `kin` and `kin-daemon` put Kin's own tool directories on `PATH` in the same
 # single-threaded prologue, immediately after the `resource_profile` calls
 # above. Language-server discovery is `which` over `PATH` and nothing else, so a

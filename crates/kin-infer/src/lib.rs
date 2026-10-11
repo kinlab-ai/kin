@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Universal transformer inference engine — pure Rust, GPU-accelerated.
+//! The inference engine, compiled only with the `engine` feature.
 //!
+//! `root.rs` is the crate root and loads this file as a module, then re-exports
+//! everything public in it, so the engine's paths are unchanged. The resource
+//! plan lives beside it in `resource.rs`, which every build carries.
 //! Supports encoder (BERT, RoBERTa, ALBERT, DeBERTa, T5, nomic-embed, GTE) and
-//! decoder-only (LLaMA, Mistral, Gemma, GPT-2, Phi, Qwen2) architectures.
+//! decoder-only (LLaMA, Mistral, Gemma, GPT-2, Phi, Qwen2, Qwen3) architectures.
 //!
 //! GPU backends: Metal (macOS), CUDA (Linux/Windows). Custom shaders/kernels,
 //! no external ML frameworks. Transparent CPU fallback with SIMD acceleration.
@@ -13,14 +16,32 @@
 //! Positional: learned, ALiBi, RoPE, relative bias (T5), disentangled (DeBERTa).
 //! Attention: MHA, GQA, MQA. Norm: LayerNorm, RMSNorm. FFN: GELU, SwiGLU, GeGLU, ReGLU.
 
+mod cpu_decoder;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+pub mod decision;
 pub mod gpu;
+mod lora;
 pub mod macos_qos;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
-pub mod resource;
+pub mod torch_checkpoint;
 pub mod watchdog;
+
+pub use decision::{
+    CandidateQuery, CandidateScores, Choice, ChoiceQuestion, Decision, DecisionError,
+    DecisionSettings, TypedAnswer, TypedQuestion, Verdict,
+};
+#[cfg(feature = "decision")]
+pub use decision::{
+    DecisionDevice, DecisionEngine, DecisionEngineConfig, DecisionModel, PointerCheckpoint,
+    PointerDecisionModel, PointerQuestion, PointerRecord, YesNoReranker,
+};
+pub use lora::{LoraAdapter, LoraModule};
+mod decoder_scoring;
+pub use decoder_scoring::{
+    BatchOptions, PrefixState, ScoreRequest, DEFAULT_BATCH_MEMORY_BUDGET, DEFAULT_CPU_IN_FLIGHT,
+};
 
 use half::{bf16, f16};
 use ndarray::{s, Array1, Array2, ArrayView2};
@@ -70,6 +91,7 @@ pub enum ModelArchitecture {
     Phi,
     Gemma,
     Qwen2,
+    Qwen3,
     NomicBert,
     Unknown,
 }
@@ -88,6 +110,7 @@ impl ModelArchitecture {
             "phi" | "phi3" => Self::Phi,
             "gemma" | "gemma2" => Self::Gemma,
             "qwen2" => Self::Qwen2,
+            "qwen3" => Self::Qwen3,
             "nomic_bert" | "nomic-bert" => Self::NomicBert,
             _ => Self::Unknown,
         }
@@ -96,28 +119,46 @@ impl ModelArchitecture {
     pub fn is_decoder_only(self) -> bool {
         matches!(
             self,
-            Self::Gpt2 | Self::Llama | Self::Mistral | Self::Phi | Self::Gemma | Self::Qwen2
+            Self::Gpt2
+                | Self::Llama
+                | Self::Mistral
+                | Self::Phi
+                | Self::Gemma
+                | Self::Qwen2
+                | Self::Qwen3
         )
     }
 
     fn uses_rmsnorm(self) -> bool {
         matches!(
             self,
-            Self::Llama | Self::Mistral | Self::Gemma | Self::Qwen2
+            Self::Llama | Self::Mistral | Self::Gemma | Self::Qwen2 | Self::Qwen3
         )
     }
 
     fn uses_rope(self) -> bool {
         matches!(
             self,
-            Self::Llama | Self::Mistral | Self::Phi | Self::Gemma | Self::Qwen2 | Self::NomicBert
+            Self::Llama
+                | Self::Mistral
+                | Self::Phi
+                | Self::Gemma
+                | Self::Qwen2
+                | Self::Qwen3
+                | Self::NomicBert
         )
     }
 
     fn uses_pre_ln(self) -> bool {
         matches!(
             self,
-            Self::Gpt2 | Self::Llama | Self::Mistral | Self::Phi | Self::Gemma | Self::Qwen2
+            Self::Gpt2
+                | Self::Llama
+                | Self::Mistral
+                | Self::Phi
+                | Self::Gemma
+                | Self::Qwen2
+                | Self::Qwen3
         )
     }
 }
@@ -126,7 +167,10 @@ impl ModelArchitecture {
 // Model configuration (parsed from config.json)
 // ---------------------------------------------------------------------------
 
+// Deserialization goes through `BertConfig::deserialize` (derived here with
+// `remote = "Self"`) and then `normalize`, in the `Deserialize` impl below.
 #[derive(serde::Deserialize)]
+#[serde(remote = "Self")]
 pub struct BertConfig {
     #[serde(alias = "n_embd")]
     pub hidden_size: usize,
@@ -163,6 +207,10 @@ pub struct BertConfig {
     /// GQA/MQA: when < num_attention_heads, K/V heads are repeated.
     #[serde(default)]
     pub num_key_value_heads: Option<usize>,
+    /// Attention head width when it is not hidden_size / num_attention_heads.
+    /// Qwen3 sets it explicitly: Qwen3-0.6B has 16 heads of 128 on a 1024-wide model.
+    #[serde(default)]
+    pub head_dim: Option<usize>,
     /// ALBERT: shared layer groups.
     #[serde(default)]
     pub num_hidden_groups: Option<usize>,
@@ -172,9 +220,14 @@ pub struct BertConfig {
     /// Pre-LN vs Post-LN (auto-detected from architecture if not set).
     #[serde(default)]
     pub pre_ln: Option<bool>,
-    /// RoPE base frequency (default 10000.0).
-    #[serde(default = "default_rope_theta", alias = "rotary_emb_base")]
+    /// RoPE base frequency (default 10000.0). transformers 5 omits the top-level
+    /// key and writes it under `rope_parameters`, which deserialization folds in.
+    #[serde(default = "rope_theta_unset", alias = "rotary_emb_base")]
     pub rope_theta: f64,
+    /// RoPE settings in the transformers 5 layout,
+    /// `{"rope_theta": 1000000, "rope_type": "default"}`.
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
     /// RMSNorm epsilon (used by LLaMA family, defaults to layer_norm_eps).
     #[serde(default)]
     pub rms_norm_eps: Option<f64>,
@@ -203,7 +256,35 @@ pub struct BertConfig {
     pub max_trained_positions: Option<usize>,
 }
 
+/// The `rope_parameters` object of a transformers 5 config. Only the base
+/// frequency is read; other RoPE variants are not implemented.
+#[derive(serde::Deserialize, Debug, Clone, Copy, Default)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+}
+
+impl<'de> serde::Deserialize<'de> for BertConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut config = BertConfig::deserialize(deserializer)?;
+        config.normalize();
+        Ok(config)
+    }
+}
+
 impl BertConfig {
+    /// Resolve settings that more than one config layout can carry. A top-level
+    /// `rope_theta` wins; without it, `rope_parameters.rope_theta` applies, and
+    /// the default 10000 only when neither is present.
+    fn normalize(&mut self) {
+        if self.rope_theta.is_nan() {
+            self.rope_theta = self
+                .rope_parameters
+                .and_then(|p| p.rope_theta)
+                .unwrap_or_else(default_rope_theta);
+        }
+    }
+
     /// The maximum sequence length tokenization should produce. Prefer the
     /// model's trained range (`max_trained_positions`) over the advertised
     /// positional ceiling (`max_position_embeddings` / `n_positions`), which on
@@ -225,6 +306,10 @@ fn default_feed_forward_type() -> String {
 }
 fn default_rope_theta() -> f64 {
     10000.0
+}
+/// Marks a config without a top-level `rope_theta` until `normalize` resolves it.
+fn rope_theta_unset() -> f64 {
+    f64::NAN
 }
 fn default_t5_buckets() -> usize {
     32
@@ -907,6 +992,26 @@ fn record_resident_stack_decision(
     }
 }
 
+static DECODER_PREFILL_USED: AtomicU64 = AtomicU64::new(0);
+static DECODER_PREFILL_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// How `score_next_tokens` passes have been served in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderPrefillRuntimeStats {
+    /// Passes the backend ran as one device-resident prefill.
+    pub used: u64,
+    /// Passes that ran on the generic per-operation decoder, because the backend
+    /// declined, the model shape is not covered, or the path is disabled.
+    pub fallback: u64,
+}
+
+pub fn decoder_prefill_runtime_stats() -> DecoderPrefillRuntimeStats {
+    DecoderPrefillRuntimeStats {
+        used: DECODER_PREFILL_USED.load(Ordering::Relaxed),
+        fallback: DECODER_PREFILL_FALLBACK.load(Ordering::Relaxed),
+    }
+}
+
 pub fn resident_stack_runtime_stats() -> ResidentStackRuntimeStats {
     let caps = resident_stack_caps();
     ResidentStackRuntimeStats {
@@ -1010,6 +1115,13 @@ fn resident_stack_disabled() -> bool {
     std::env::var_os("KIN_INFER_NO_RESIDENT_STACK").is_some()
 }
 
+/// Escape hatch (`KIN_INFER_NO_DECODER_PREFILL`): score decoder prompts on the
+/// generic per-operation path instead of the backend's device-resident prefill.
+/// Read fresh each call so a single process can compare the two paths.
+fn decoder_prefill_disabled() -> bool {
+    std::env::var_os("KIN_INFER_NO_DECODER_PREFILL").is_some()
+}
+
 /// Which entity to trace for the per-layer dump (`KIN_INFER_DUMP_ENTITY`, default 0).
 fn dump_entity_index() -> usize {
     use std::sync::OnceLock;
@@ -1106,6 +1218,9 @@ struct TransformerLayerWeights {
     k_bias: Option<Array1<f32>>,
     k_ln_weight: Option<Array1<f32>>,
     k_ln_bias: Option<Array1<f32>>,
+    /// Per-head RMSNorm applied to every query and key head before RoPE (Qwen3).
+    q_head_norm: Option<Array1<f32>>,
+    k_head_norm: Option<Array1<f32>>,
     v_weight: Array2<f32>,
     v_bias: Option<Array1<f32>>,
     qkv_weight: Option<Array2<f32>>,
@@ -1189,6 +1304,7 @@ pub struct BertModel {
 // ---------------------------------------------------------------------------
 
 /// Per-layer key/value cache for autoregressive decoding.
+#[derive(Clone)]
 pub struct KvCache {
     /// key[layer] = [cached_seq_len, kv_dim]
     pub key: Vec<Array2<f32>>,
@@ -1618,7 +1734,9 @@ impl BertModel {
         let type_vocab = config.type_vocab_size.unwrap_or(2);
         let embed_dim = config.embedding_size.unwrap_or(h);
         let num_kv_heads = config.effective_num_kv_heads();
-        let kv_dim = num_kv_heads * (h / config.num_attention_heads);
+        let attn_head_dim = config.head_dim.unwrap_or(h / config.num_attention_heads);
+        let q_dim = config.num_attention_heads * attn_head_dim;
+        let kv_dim = num_kv_heads * attn_head_dim;
 
         // Embedding tables
         let word_embeddings = load_2d_flexible(
@@ -1704,7 +1822,7 @@ impl BertModel {
                         &format!("{lp}.attention.self.query.weight"),
                         &format!("{lp_dec}.self_attn.q_proj.weight"),
                     ],
-                    h,
+                    q_dim,
                     h,
                 )?
             };
@@ -1714,7 +1832,7 @@ impl BertModel {
                     &format!("{lp}.attention.self.query.bias"),
                     &format!("{lp_dec}.self_attn.q_proj.bias"),
                 ],
-                h,
+                q_dim,
             )?;
             let q_ln_weight = try_load_1d_flexible(
                 tensors,
@@ -1790,7 +1908,17 @@ impl BertModel {
                     &format!("{lp_nomic}.attn.out_proj.weight"),
                 ],
                 h,
-                h,
+                q_dim,
+            )?;
+            let q_head_norm = try_load_1d_flexible(
+                tensors,
+                &[&format!("{lp_dec}.self_attn.q_norm.weight")],
+                attn_head_dim,
+            )?;
+            let k_head_norm = try_load_1d_flexible(
+                tensors,
+                &[&format!("{lp_dec}.self_attn.k_norm.weight")],
+                attn_head_dim,
             )?;
             let attn_out_bias = try_load_1d_flexible(
                 tensors,
@@ -1958,6 +2086,8 @@ impl BertModel {
                 k_bias,
                 k_ln_weight,
                 k_ln_bias,
+                q_head_norm,
+                k_head_norm,
                 v_weight,
                 v_bias,
                 qkv_weight,
@@ -1995,8 +2125,8 @@ impl BertModel {
         // Classification head (for cross-encoders)
         let classifier = load_classifier_head(tensors, h)?;
 
-        let head_dim = h / config.num_attention_heads;
-        let kv_head_dim = h / config.num_attention_heads;
+        let head_dim = attn_head_dim;
+        let kv_head_dim = attn_head_dim;
 
         // Precompute RoPE tables
         let (rope_cos, rope_sin) = if arch.uses_rope() {
@@ -4404,6 +4534,12 @@ impl BertModel {
             )?;
 
             let (mut q, mut k, v) = self.project_qkv(&normed, layer, eps)?;
+            if let Some(ref w) = layer.q_head_norm {
+                rms_norm_heads(&mut q, w, head_dim, rms_eps);
+            }
+            if let Some(ref w) = layer.k_head_norm {
+                rms_norm_heads(&mut k, w, head_dim, rms_eps);
+            }
 
             // RoPE
             self.rope(&mut q, start_pos, seq_len, head_dim)?;
@@ -4425,7 +4561,7 @@ impl BertModel {
 
             // Multi-head causal attention
             let scale = 1.0 / (head_dim as f32).sqrt();
-            let mut attn_output = Array2::<f32>::zeros((seq_len, h));
+            let mut attn_output = Array2::<f32>::zeros((seq_len, num_heads * head_dim));
 
             for head in 0..num_heads {
                 let offset = head * head_dim;
@@ -4433,11 +4569,13 @@ impl BertModel {
                 let k_h = k_rep.slice(s![.., offset..offset + head_dim]);
                 let v_h = v_rep.slice(s![.., offset..offset + head_dim]);
 
-                // Q × K^T (GPU-accelerated: matmul_transb)
+                // Q × K^T (GPU-accelerated: matmul_transb). K is this call's
+                // activation, not a weight, so it must not enter a weight cache.
                 let mut scores = if let Some(ref gpu) = self.gpu {
                     let q_data: Vec<f32> = q_h.iter().copied().collect();
                     let k_data: Vec<f32> = k_h.iter().copied().collect();
-                    let c = gpu.matmul(&q_data, &k_data, seq_len, kv_seq_len, head_dim)?;
+                    let c =
+                        gpu.matmul_activations(&q_data, &k_data, seq_len, kv_seq_len, head_dim)?;
                     Array2::from_shape_vec((seq_len, kv_seq_len), c)
                         .unwrap_or_else(|_| q_h.dot(&k_h.t()))
                 } else {
@@ -4467,7 +4605,7 @@ impl BertModel {
                             v_t[col * kv_seq_len + row] = v_h[[row, col]];
                         }
                     }
-                    let c = gpu.matmul(&s_data, &v_t, seq_len, head_dim, kv_seq_len)?;
+                    let c = gpu.matmul_activations(&s_data, &v_t, seq_len, head_dim, kv_seq_len)?;
                     Array2::from_shape_vec((seq_len, head_dim), c)
                         .unwrap_or_else(|_| scores.dot(&v_h))
                 } else {
@@ -4556,6 +4694,319 @@ impl BertModel {
         } else {
             Array2::zeros((hidden.nrows(), self.config.vocab_size))
         }
+    }
+
+    /// Next-token logits after a prompt, for the given token ids only.
+    ///
+    /// A typed decision reads the probability of a handful of answer tokens that follow a
+    /// prompt. Only the last position's hidden state matters, and only the candidate rows of
+    /// the output projection, so this skips the full-vocabulary projection entirely. Logits are
+    /// returned in `candidate_ids` order; apply a softmax over them for the decision's
+    /// distribution.
+    pub fn score_next_tokens(
+        &self,
+        token_ids: &[u32],
+        candidate_ids: &[u32],
+    ) -> Result<Vec<f32>, InferError> {
+        if !self.config.architecture().is_decoder_only() {
+            return Err(InferError::ModelIncompatible(
+                "score_next_tokens needs a decoder-only model".into(),
+            ));
+        }
+        if token_ids.is_empty() {
+            return Err(InferError::Internal(
+                "score_next_tokens: empty prompt".into(),
+            ));
+        }
+        if let Some(last) = self.decoder_prefill_last_hidden(token_ids)? {
+            DECODER_PREFILL_USED.fetch_add(1, Ordering::Relaxed);
+            return self.candidate_logits(last.view(), candidate_ids);
+        }
+        DECODER_PREFILL_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        // The CPU backend has a prefill built for it (`cpu_decoder`). An accelerator whose
+        // device prefill declined, and layouts neither prefill implements, take the
+        // generic decoder pass.
+        if !self.has_accelerator_backend() {
+            if let Some(hidden) = self.cpu_prefill_last_hidden(token_ids)? {
+                return self
+                    .candidate_logits(ndarray::ArrayView1::from(&hidden[..]), candidate_ids);
+            }
+        }
+        self.score_next_tokens_reference(token_ids, candidate_ids)
+    }
+
+    /// [`BertModel::score_next_tokens`] through the generic decoder pass on the loaded
+    /// backend, whatever that backend is.
+    ///
+    /// The generic pass is the numerical reference that the fast CPU prefill is tested
+    /// against. Callers that want a decision should use `score_next_tokens`.
+    #[doc(hidden)]
+    pub fn score_next_tokens_reference(
+        &self,
+        token_ids: &[u32],
+        candidate_ids: &[u32],
+    ) -> Result<Vec<f32>, InferError> {
+        if !self.config.architecture().is_decoder_only() {
+            return Err(InferError::ModelIncompatible(
+                "score_next_tokens needs a decoder-only model".into(),
+            ));
+        }
+        if token_ids.is_empty() {
+            return Err(InferError::Internal(
+                "score_next_tokens: empty prompt".into(),
+            ));
+        }
+        let kv_dim = self.config.effective_num_kv_heads() * self.head_dim;
+        let mut cache = KvCache::new(self.config.num_hidden_layers, kv_dim);
+        let hidden = self.decoder_forward(token_ids, &mut cache, 0)?;
+        self.candidate_logits(hidden.row(hidden.nrows() - 1), candidate_ids)
+    }
+
+    /// The final-normed hidden state at the prompt's last position, computed by the
+    /// backend's device-resident prefill, or `None` when the backend or the model
+    /// shape does not support it.
+    ///
+    /// The backend path covers pre-norm decoders with RMSNorm, full-width RoPE, a
+    /// bias-free SwiGLU feed-forward block, separate bias-free q/k/v projections and
+    /// optional per-head q/k RMSNorm. `decoder_forward` computes exactly that for
+    /// such a model, so it stays the reference and the fallback for everything else.
+    fn decoder_prefill_last_hidden(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<Option<Array1<f32>>, InferError> {
+        Ok(self
+            .decoder_prefill_tail_hidden(token_ids, 1)?
+            .map(|rows| rows.row(0).to_owned()))
+    }
+
+    /// [`decoder_prefill_last_hidden`](Self::decoder_prefill_last_hidden) for the last `tail`
+    /// positions: a `[tail, hidden]` array of final-normed hidden states, or `None` when the
+    /// backend or the model shape does not support the device prefill.
+    fn decoder_prefill_tail_hidden(
+        &self,
+        token_ids: &[u32],
+        tail: usize,
+    ) -> Result<Option<Array2<f32>>, InferError> {
+        if decoder_prefill_disabled() || !self.has_accelerator_backend() {
+            return Ok(None);
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Ok(None);
+        };
+        let (Some(cos), Some(sin), Some(final_norm)) = (
+            self.rope_cos.as_ref(),
+            self.rope_sin.as_ref(),
+            self.weights.final_norm_weight.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if !self.config.uses_rmsnorm() || self.weights.position_embeddings.is_some() {
+            return Ok(None);
+        }
+        let (Some(rope_cos), Some(rope_sin), Some(word_embeddings)) = (
+            cos.as_slice(),
+            sin.as_slice(),
+            self.weights.word_embeddings.as_slice(),
+        ) else {
+            return Ok(None);
+        };
+
+        let mut layers = Vec::with_capacity(self.weights.layers.len());
+        for layer in &self.weights.layers {
+            // `qkv_weight` is the loader's row concatenation of q, k and v, so the
+            // separate matrices below describe the same projection.
+            let has_extra_terms = layer.qkv_bias.is_some()
+                || layer.q_bias.is_some()
+                || layer.k_bias.is_some()
+                || layer.v_bias.is_some()
+                || layer.q_ln_weight.is_some()
+                || layer.k_ln_weight.is_some()
+                || layer.attn_out_bias.is_some()
+                || layer.ffn_up_bias.is_some()
+                || layer.ffn_down_bias.is_some()
+                || layer.relative_attention_bias.is_some()
+                || layer.rel_pos_embeddings.is_some();
+            if has_extra_terms {
+                return Ok(None);
+            }
+            let (Some(gate), Some(up)) =
+                (layer.ffn_gate_weight.as_ref(), layer.ffn_up_weight.as_ref())
+            else {
+                return Ok(None);
+            };
+            let slices = (
+                layer.norm1_weight.as_slice(),
+                layer.q_weight.as_slice(),
+                layer.k_weight.as_slice(),
+                layer.v_weight.as_slice(),
+                layer.attn_out_weight.as_slice(),
+                layer.norm2_weight.as_slice(),
+                gate.as_slice(),
+                up.as_slice(),
+                layer.ffn_down_weight.as_slice(),
+            );
+            let (
+                Some(attn_norm),
+                Some(q_weight),
+                Some(k_weight),
+                Some(v_weight),
+                Some(o_weight),
+                Some(ffn_norm),
+                Some(gate_weight),
+                Some(up_weight),
+                Some(down_weight),
+            ) = slices
+            else {
+                return Ok(None);
+            };
+            layers.push(gpu::DecoderLayerTensors {
+                attn_norm,
+                q_weight,
+                k_weight,
+                v_weight,
+                q_head_norm: layer.q_head_norm.as_ref().and_then(|w| w.as_slice()),
+                k_head_norm: layer.k_head_norm.as_ref().and_then(|w| w.as_slice()),
+                o_weight,
+                ffn_norm,
+                gate_weight,
+                up_weight,
+                down_weight,
+            });
+        }
+        let Some(inter_size) = self
+            .weights
+            .layers
+            .first()
+            .map(|l| l.ffn_down_weight.ncols())
+        else {
+            return Ok(None);
+        };
+
+        let input = gpu::DecoderPrefill {
+            token_ids,
+            word_embeddings,
+            layers: &layers,
+            config: gpu::DecoderPrefillConfig {
+                hidden_size: self.config.hidden_size,
+                num_heads: self.config.num_attention_heads,
+                num_kv_heads: self.config.effective_num_kv_heads(),
+                head_dim: self.head_dim,
+                inter_size,
+                rms_eps: self.config.effective_rms_eps(),
+            },
+            rope_cos,
+            rope_sin,
+        };
+        let Some(rows) = gpu.decoder_prefill_tail_hidden(&input, tail)? else {
+            return Ok(None);
+        };
+        // The final norm touches only the tail rows, so it runs on the host with the
+        // reference kernel.
+        let mut rows =
+            Array2::from_shape_vec((tail, self.config.hidden_size), rows).map_err(|e| {
+                InferError::Internal(format!("decoder prefill returned malformed rows: {e}"))
+            })?;
+        rms_norm_2d(&mut rows, final_norm, self.config.effective_rms_eps());
+        Ok(Some(rows))
+    }
+
+    /// The final-normed hidden states of the last `tail` positions of a prompt, as a
+    /// `[tail, hidden]` array, from a decoder-only model.
+    ///
+    /// A model with a head that reads several positions near the end of a prompt, rather than
+    /// next-token logits, needs exactly these rows. The device-resident prefill serves them on
+    /// an accelerator and the CPU prefill on the CPU, each running the last layer's query side
+    /// for the tail rows only. Layouts neither implements take the generic decoder pass.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the model is not a decoder, when the prompt is empty, when `tail` is zero or
+    /// longer than the prompt, when a token id is outside the vocabulary, when the prompt is
+    /// longer than the model's positions, or when the forward pass fails.
+    pub fn final_hidden_tail(
+        &self,
+        token_ids: &[u32],
+        tail: usize,
+    ) -> Result<Array2<f32>, InferError> {
+        if !self.config.architecture().is_decoder_only() {
+            return Err(InferError::ModelIncompatible(
+                "final_hidden_tail needs a decoder-only model".into(),
+            ));
+        }
+        if token_ids.is_empty() {
+            return Err(InferError::Internal(
+                "final_hidden_tail: empty prompt".into(),
+            ));
+        }
+        if tail == 0 || tail > token_ids.len() {
+            return Err(InferError::Internal(format!(
+                "final_hidden_tail: {tail} tail rows asked of a {}-token prompt",
+                token_ids.len()
+            )));
+        }
+        let vocab = self.weights.word_embeddings.nrows();
+        if let Some(id) = token_ids.iter().find(|&&id| id as usize >= vocab) {
+            return Err(InferError::Internal(format!(
+                "token {id} outside vocabulary of {vocab}"
+            )));
+        }
+        if let Some(ref cos) = self.rope_cos {
+            if token_ids.len() > cos.nrows() {
+                return Err(InferError::Internal(format!(
+                    "prompt of {} tokens exceeds the model's {} positions",
+                    token_ids.len(),
+                    cos.nrows()
+                )));
+            }
+        }
+        if let Some(rows) = self.decoder_prefill_tail_hidden(token_ids, tail)? {
+            DECODER_PREFILL_USED.fetch_add(1, Ordering::Relaxed);
+            return Ok(rows);
+        }
+        DECODER_PREFILL_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        if !self.has_accelerator_backend() {
+            if let Some(rows) = self.cpu_prefill_tail_hidden(token_ids, tail)? {
+                return Array2::from_shape_vec((tail, self.config.hidden_size), rows).map_err(
+                    |e| InferError::Internal(format!("cpu prefill returned malformed rows: {e}")),
+                );
+            }
+        }
+        let kv_dim = self.config.effective_num_kv_heads() * self.head_dim;
+        let mut cache = KvCache::new(self.config.num_hidden_layers, kv_dim);
+        let hidden = self.decoder_forward(token_ids, &mut cache, 0)?;
+        Ok(hidden.slice(s![hidden.nrows() - tail.., ..]).to_owned())
+    }
+
+    /// Project one hidden state onto the output-projection rows of `candidate_ids`.
+    fn candidate_logits(
+        &self,
+        hidden: ndarray::ArrayView1<f32>,
+        candidate_ids: &[u32],
+    ) -> Result<Vec<f32>, InferError> {
+        let head = match self.weights.lm_head_weight {
+            Some(ref w) => w,
+            None if self.config.tie_word_embeddings => &self.weights.word_embeddings,
+            None => {
+                return Err(InferError::ModelIncompatible(
+                    "model has no output projection".into(),
+                ))
+            }
+        };
+        candidate_ids
+            .iter()
+            .map(|&id| {
+                if (id as usize) >= head.nrows() {
+                    return Err(InferError::Internal(format!(
+                        "candidate token {id} outside vocabulary"
+                    )));
+                }
+                let mut logit = head.row(id as usize).dot(&hidden);
+                if let Some(ref b) = self.weights.lm_head_bias {
+                    logit += b[id as usize];
+                }
+                Ok(logit)
+            })
+            .collect()
     }
 
     /// Autoregressive text generation.
@@ -4912,6 +5363,25 @@ fn alibi_head_slopes(n_heads: usize) -> Vec<f32> {
 // Math primitives
 // ---------------------------------------------------------------------------
 
+/// RMSNorm every `head_dim`-wide head of each row, sharing one weight across heads.
+///
+/// Qwen3 normalizes each query and key head on its own before RoPE; a whole-row norm would
+/// mix heads that the model keeps independent.
+fn rms_norm_heads(x: &mut Array2<f32>, weight: &Array1<f32>, head_dim: usize, eps: f32) {
+    for mut row in x.rows_mut() {
+        let row = row
+            .as_slice_mut()
+            .expect("rows of an owned Array2 are contiguous");
+        for head in row.chunks_mut(head_dim) {
+            let mean_sq = head.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            for (v, w) in head.iter_mut().zip(weight.iter()) {
+                *v = *v * inv * w;
+            }
+        }
+    }
+}
+
 pub fn linear(x: &Array2<f32>, weight: &Array2<f32>, bias: &Array1<f32>) -> Array2<f32> {
     let mut out = x.dot(&weight.t());
     for mut row in out.rows_mut() {
@@ -4968,16 +5438,20 @@ fn gpu_linear(
     let m = x.nrows();
     let k = x.ncols();
     let n = weight.nrows(); // weight is [N, K], we want X[M,K] × W^T[K,N] = [M,N]
-                            // Borrow contiguous storage so persistent GPU weight caches can hit.
     let a_data: Cow<'_, [f32]> = x
         .as_slice()
         .map(Cow::Borrowed)
         .unwrap_or_else(|| Cow::Owned(x.iter().copied().collect()));
-    let w_data: Cow<'_, [f32]> = weight
-        .as_slice()
-        .map(Cow::Borrowed)
-        .unwrap_or_else(|| Cow::Owned(weight.iter().copied().collect()));
-    let c = gpu.matmul(a_data.as_ref(), w_data.as_ref(), m, n, k)?;
+    let c = match weight.as_slice() {
+        // Borrow contiguous storage so the backend's weight cache hits.
+        Some(w) => gpu.matmul(a_data.as_ref(), w, m, n, k)?,
+        // A non-contiguous weight is copied for this call only, so the copy must
+        // not enter the backend's weight cache.
+        None => {
+            let w: Vec<f32> = weight.iter().copied().collect();
+            gpu.matmul_activations(a_data.as_ref(), &w, m, n, k)?
+        }
+    };
     Ok(Array2::from_shape_vec((m, n), c).unwrap_or_else(|_| linear_without_bias(x, weight)))
 }
 
@@ -5058,7 +5532,20 @@ fn gpu_linear_many_bias(
         .iter()
         .map(|(weight, _)| weight.nrows())
         .collect();
-    let outputs = gpu.matmul_many(x_data.as_ref(), &weight_refs, m, &ns, k)?;
+    let outputs = if weight_data
+        .iter()
+        .all(|data| matches!(data, Cow::Borrowed(_)))
+    {
+        gpu.matmul_many(x_data.as_ref(), &weight_refs, m, &ns, k)?
+    } else {
+        // A copied (non-contiguous) weight lives only for this call, so it must
+        // not enter the backend's weight cache.
+        weight_refs
+            .iter()
+            .zip(ns.iter().copied())
+            .map(|(weight, n)| gpu.matmul_activations(x_data.as_ref(), weight, m, n, k))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     outputs
         .into_iter()
@@ -5509,6 +5996,9 @@ mod tests {
     struct PooledOutputOverrideGuard;
     struct PooledOutputCapsOverrideGuard;
     struct ResidentStackCapsOverrideGuard;
+    /// Serializes every test that runs a forward pass. The pooled-output and
+    /// resident-stack runtime stats are process-wide, so a forward pass in one
+    /// test changes the counters another test is asserting on.
     static POOLED_OUTPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn pooled_output_test_lock() -> MutexGuard<'static, ()> {
@@ -5915,6 +6405,40 @@ mod tests {
         assert_eq!(config.effective_max_seq_len(), 1024);
     }
 
+    fn qwen3_config(rope: &str) -> BertConfig {
+        let json = format!(
+            r#"{{
+                "model_type": "qwen3", "hidden_size": 1024, "num_hidden_layers": 28,
+                "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+                "intermediate_size": 3072, "max_position_embeddings": 32768,
+                "vocab_size": 151936{rope}
+            }}"#
+        );
+        serde_json::from_str(&json).expect("parse config")
+    }
+
+    #[test]
+    fn rope_theta_reads_the_transformers_5_rope_parameters_object() {
+        // transformers 5 omits the top-level key and nests it.
+        let config =
+            qwen3_config(r#", "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"}"#);
+        assert_eq!(config.rope_theta, 1e6);
+    }
+
+    #[test]
+    fn rope_theta_prefers_the_top_level_key_and_defaults_without_either() {
+        let both =
+            qwen3_config(r#", "rope_theta": 500000, "rope_parameters": {"rope_theta": 1000000}"#);
+        assert_eq!(both.rope_theta, 5e5);
+        let top_level = qwen3_config(r#", "rope_theta": 1000000"#);
+        assert_eq!(top_level.rope_theta, 1e6);
+        let alias = qwen3_config(r#", "rotary_emb_base": 1000"#);
+        assert_eq!(alias.rope_theta, 1000.0);
+        assert_eq!(qwen3_config("").rope_theta, 10000.0);
+        let empty_parameters = qwen3_config(r#", "rope_parameters": {"rope_type": "default"}"#);
+        assert_eq!(empty_parameters.rope_theta, 10000.0);
+    }
+
     /// Validate that the single-dispatch batched RoPE (`rope_qk_batched` →
     /// `rope_pair_batched`, used by `forward_batched`) is numerically identical to
     /// the proven per-element RoPE path (`rope_qk`, used by `forward`). Embeds the
@@ -5923,6 +6447,7 @@ mod tests {
     /// config.json is not a parseable `BertConfig` (e.g. a modeling-code-only config).
     #[test]
     fn batched_rope_matches_per_element_forward() {
+        let _lock = pooled_output_test_lock();
         let dir = std::path::Path::new("/tmp/nomic");
         if !dir.join("model.safetensors").exists() {
             eprintln!("SKIP: nomic model absent at /tmp/nomic; batched-RoPE parity test skipped.");
@@ -6010,6 +6535,7 @@ mod tests {
     /// BYTE-IDENTICAL.
     #[test]
     fn batched_cold_matches_single_forward() {
+        let _lock = pooled_output_test_lock();
         let dir = std::path::Path::new("/tmp/nomic");
         if !dir.join("model.safetensors").exists() {
             eprintln!("SKIP: nomic model absent at /tmp/nomic; cold-batched regression skipped.");
@@ -6110,6 +6636,7 @@ mod tests {
     #[allow(clippy::type_complexity)]
     #[test]
     fn embedding_is_invariant_to_batch_size_and_composition() {
+        let _lock = pooled_output_test_lock();
         let dir = std::path::Path::new("/tmp/nomic");
         if !dir.join("model.safetensors").exists() {
             eprintln!(
@@ -6232,6 +6759,7 @@ mod tests {
     /// Requires `/tmp/nomic` (model.safetensors + config.json); skips if absent.
     #[test]
     fn bucket_composition_parity() {
+        let _lock = pooled_output_test_lock();
         let dir = std::path::Path::new("/tmp/nomic");
         if !dir.join("model.safetensors").exists() {
             eprintln!(
@@ -6718,6 +7246,8 @@ mod tests {
             k_bias: None,
             k_ln_weight: None,
             k_ln_bias: None,
+            q_head_norm: None,
+            k_head_norm: None,
             v_weight: Array2::zeros((h, h)),
             v_bias: None,
             qkv_weight: None,
@@ -7386,6 +7916,7 @@ mod tests {
 
     #[test]
     fn absent_ffn_up_weight_is_model_incompatible_not_panic() {
+        let _lock = pooled_output_test_lock();
         // GELU FFN path: no gate, no up -> the required up projection is absent.
         let model = mock_encoder(mock_layer(4, 4, None, None));
         let err = model
@@ -7399,6 +7930,7 @@ mod tests {
 
     #[test]
     fn swiglu_missing_up_weight_is_model_incompatible() {
+        let _lock = pooled_output_test_lock();
         // SwiGLU path: gate present but up absent -> still a model-shape problem.
         let gate = Array2::zeros((4, 4));
         let model = mock_encoder(mock_layer(4, 4, Some(gate), None));
@@ -7559,5 +8091,284 @@ mod tests {
 
         drop(weights);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Forwards every operation to the CPU backend and records the operands a
+    /// backend may cache as model weights: `b` of `matmul` (which `matmul_many`
+    /// and the fused defaults reach) as `(address, len)`, plus a count of
+    /// `matmul_activations` calls.
+    struct WeightProvenanceGpu {
+        cached_operands: Arc<Mutex<Vec<(usize, usize)>>>,
+        activation_calls: Arc<AtomicUsize>,
+    }
+
+    impl gpu::GpuCompute for WeightProvenanceGpu {
+        fn matmul(
+            &self,
+            a: &[f32],
+            b: &[f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            self.cached_operands
+                .lock()
+                .unwrap()
+                .push((b.as_ptr() as usize, b.len()));
+            gpu::CpuCompute.matmul(a, b, m, n, k)
+        }
+
+        fn matmul_activations(
+            &self,
+            a: &[f32],
+            b: &[f32],
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            self.activation_calls.fetch_add(1, Ordering::Relaxed);
+            gpu::CpuCompute.matmul(a, b, m, n, k)
+        }
+
+        fn batched_matmul(
+            &self,
+            q: &[f32],
+            k: &[f32],
+            num_heads: usize,
+            seq_len: usize,
+            head_dim: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            gpu::CpuCompute.batched_matmul(q, k, num_heads, seq_len, head_dim)
+        }
+
+        fn batched_attn_values(
+            &self,
+            scores: &[f32],
+            v: &[f32],
+            num_heads: usize,
+            seq_len: usize,
+            head_dim: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            gpu::CpuCompute.batched_attn_values(scores, v, num_heads, seq_len, head_dim)
+        }
+
+        fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError> {
+            gpu::CpuCompute.softmax(data, rows, cols)
+        }
+
+        fn layer_norm(
+            &self,
+            data: &mut [f32],
+            gamma: &[f32],
+            beta: &[f32],
+            rows: usize,
+            cols: usize,
+            eps: f32,
+        ) -> Result<(), InferError> {
+            gpu::CpuCompute.layer_norm(data, gamma, beta, rows, cols, eps)
+        }
+
+        fn rms_norm(
+            &self,
+            data: &mut [f32],
+            weight: &[f32],
+            rows: usize,
+            cols: usize,
+            eps: f32,
+        ) -> Result<(), InferError> {
+            gpu::CpuCompute.rms_norm(data, weight, rows, cols, eps)
+        }
+
+        fn gelu(&self, data: &mut [f32]) -> Result<(), InferError> {
+            gpu::CpuCompute.gelu(data)
+        }
+
+        fn silu(&self, data: &mut [f32]) -> Result<(), InferError> {
+            gpu::CpuCompute.silu(data)
+        }
+
+        fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) -> Result<(), InferError> {
+            gpu::CpuCompute.elementwise_mul(a, b)
+        }
+
+        fn rope(
+            &self,
+            data: &mut [f32],
+            cos_table: &[f32],
+            sin_table: &[f32],
+            seq_offset: usize,
+            seq_len: usize,
+            head_dim: usize,
+            total_dim: usize,
+        ) -> Result<(), InferError> {
+            gpu::CpuCompute.rope(
+                data, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim,
+            )
+        }
+
+        fn backend(&self) -> gpu::GpuBackend {
+            gpu::GpuBackend::Metal
+        }
+
+        fn device_name(&self) -> &str {
+            "weight-provenance-test"
+        }
+    }
+
+    /// A two-layer Qwen3-shaped decoder (grouped KV heads, per-head q/k norms,
+    /// head width times heads wider than the model) with fixed pseudo-random
+    /// weights, so two builds hold identical values.
+    fn tiny_qwen3_decoder(gpu: Option<Box<dyn gpu::GpuCompute>>) -> BertModel {
+        let json = r#"{
+            "model_type": "qwen3", "hidden_size": 8, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 4,
+            "intermediate_size": 16, "max_position_embeddings": 64,
+            "vocab_size": 32, "rms_norm_eps": 1e-6, "tie_word_embeddings": true
+        }"#;
+        let config: BertConfig = serde_json::from_str(json).expect("parse config");
+        let (h, head_dim, inter) = (8usize, 4usize, 16usize);
+        let (q_dim, kv_dim) = (4 * head_dim, 2 * head_dim);
+        let mut seed = 0u32;
+        let mut next = move || {
+            seed += 1;
+            ((seed as f32) * 0.618_034).sin() * 0.5
+        };
+        let mut matrix = |rows: usize, cols: usize| Array2::from_shape_fn((rows, cols), |_| next());
+        let norm = |len: usize| Array1::from_shape_fn(len, |i| 1.0 + 0.05 * i as f32);
+        let word_embeddings = matrix(config.vocab_size, h);
+        let layers = (0..config.num_hidden_layers)
+            .map(|_| TransformerLayerWeights {
+                q_weight: matrix(q_dim, h),
+                q_bias: None,
+                q_ln_weight: None,
+                q_ln_bias: None,
+                k_weight: matrix(kv_dim, h),
+                k_bias: None,
+                k_ln_weight: None,
+                k_ln_bias: None,
+                q_head_norm: Some(norm(head_dim)),
+                k_head_norm: Some(norm(head_dim)),
+                v_weight: matrix(kv_dim, h),
+                v_bias: None,
+                qkv_weight: None,
+                qkv_bias: None,
+                attn_out_weight: matrix(h, q_dim),
+                attn_out_bias: None,
+                norm1_weight: norm(h),
+                norm1_bias: None,
+                ffn_up_weight: Some(matrix(inter, h)),
+                ffn_up_bias: None,
+                ffn_gate_weight: Some(matrix(inter, h)),
+                ffn_up_gated_weight: None,
+                ffn_down_weight: matrix(h, inter),
+                ffn_down_bias: None,
+                norm2_weight: norm(h),
+                norm2_bias: None,
+                relative_attention_bias: None,
+                rel_pos_embeddings: None,
+            })
+            .collect();
+        let (rope_cos, rope_sin) =
+            precompute_rope(config.max_position_embeddings, head_dim, config.rope_theta);
+        BertModel {
+            config,
+            weights: ModelWeights {
+                word_embeddings,
+                position_embeddings: None,
+                token_type_embeddings: None,
+                embed_ln_weight: None,
+                embed_ln_bias: None,
+                embed_projection: None,
+                layers,
+                final_norm_weight: Some(norm(h)),
+                final_norm_bias: None,
+                lm_head_weight: None,
+                lm_head_bias: None,
+                classifier: None,
+            },
+            head_dim,
+            kv_head_dim: head_dim,
+            rope_cos: Some(rope_cos),
+            rope_sin: Some(rope_sin),
+            gpu,
+        }
+    }
+
+    /// `(address, len)` of every matrix and vector the model owns.
+    fn model_weight_extents(model: &BertModel) -> Vec<(usize, usize)> {
+        fn m(a: &Array2<f32>) -> (usize, usize) {
+            (a.as_ptr() as usize, a.len())
+        }
+        fn v(a: &Array1<f32>) -> (usize, usize) {
+            (a.as_ptr() as usize, a.len())
+        }
+        let w = &model.weights;
+        let mut out = vec![m(&w.word_embeddings)];
+        out.extend(w.final_norm_weight.iter().map(v));
+        for layer in &w.layers {
+            out.extend([
+                m(&layer.q_weight),
+                m(&layer.k_weight),
+                m(&layer.v_weight),
+                m(&layer.attn_out_weight),
+                m(&layer.ffn_down_weight),
+                v(&layer.norm1_weight),
+                v(&layer.norm2_weight),
+            ]);
+            out.extend(layer.ffn_up_weight.iter().map(m));
+            out.extend(layer.ffn_gate_weight.iter().map(m));
+            out.extend(layer.q_head_norm.iter().map(v));
+            out.extend(layer.k_head_norm.iter().map(v));
+        }
+        out
+    }
+
+    /// The generic decoder must hand a weight-caching entry point only slices of
+    /// the model's own weights. It once passed each attention head's keys and
+    /// transposed values to `matmul`, and the Metal backend cached them by
+    /// address: every call leaked device buffers, and a later prompt with the
+    /// same length and the same first and last tokens was scored against an
+    /// earlier prompt's keys and values.
+    #[test]
+    fn decoder_passes_only_model_weights_to_weight_caching_matmul() {
+        let cached_operands = Arc::new(Mutex::new(Vec::new()));
+        let activation_calls = Arc::new(AtomicUsize::new(0));
+        let model = tiny_qwen3_decoder(Some(Box::new(WeightProvenanceGpu {
+            cached_operands: Arc::clone(&cached_operands),
+            activation_calls: Arc::clone(&activation_calls),
+        })));
+        let reference = tiny_qwen3_decoder(None);
+        let extents = model_weight_extents(&model);
+
+        let prompts: [&[u32]; 3] = [&[3, 7, 1, 9, 4], &[3, 2, 2, 9, 4], &[5]];
+        let candidates = [1u32, 4, 9, 17];
+        for prompt in prompts {
+            let got = model.score_next_tokens(prompt, &candidates).unwrap();
+            let want = reference.score_next_tokens(prompt, &candidates).unwrap();
+            for (g, w) in got.iter().zip(&want) {
+                assert!(
+                    (g - w).abs() < 1e-4,
+                    "prompt {prompt:?}: {got:?} vs {want:?}"
+                );
+            }
+        }
+
+        let operands = cached_operands.lock().unwrap();
+        assert!(!operands.is_empty(), "the projections must reach matmul");
+        for &(addr, len) in operands.iter() {
+            let inside_a_weight = extents
+                .iter()
+                .any(|&(start, n)| addr >= start && addr + len * 4 <= start + n * 4);
+            assert!(
+                inside_a_weight,
+                "matmul received a {len}-element operand that is not a model weight"
+            );
+        }
+        // Two attention products per head per layer, for each prompt.
+        let per_prompt = 2 * model.config.num_hidden_layers * model.config.num_attention_heads;
+        assert_eq!(
+            activation_calls.load(Ordering::Relaxed),
+            per_prompt * prompts.len()
+        );
     }
 }

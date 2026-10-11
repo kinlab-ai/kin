@@ -266,6 +266,7 @@ impl ReviewPublication {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: Some(delta),
+            git_snapshot_proofs: Vec::new(),
         };
         Ok(Self {
             transaction,

@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use kin_index::linker::ArtifactIdentityMap;
 use kin_index::{FileParseData, IndexPipeline};
-use kin_model::{ArtifactId, FilePathId, Relation, RelationEvidence, RelationId};
+use kin_model::{ArtifactId, FilePathId, Relation, RelationEvidence, RelationId, RelationKind};
 
 /// A two-file program in one language. Two files so the cross-file linker arm
 /// has something to resolve, and every fixture repeats at least one call so
@@ -778,7 +778,32 @@ fn print_table(rows: &[(String, Counts)], title: &str) {
 /// 35 to 38 with Swift, whose three call edges in this fixture all carry a
 /// site now. Every `Calls` edge the fleet's fixtures produce carries one
 /// from here, which the by-kind table below reads as 35 of 35.
-const MEASURED_RELATIONS_WITH_SPAN: usize = 38;
+///
+/// 38 to 46 when Python lexical containment gained child-declaration spans.
+/// The four fixture edges are defs -> compute, defs -> Widget, Widget ->
+/// Widget.render and caller -> run. Each ingest arm carries its own relation
+/// id in this measurement, so their spans account for eight records, not
+/// eight new calls. The endpoint-and-site test below pins this attribution.
+///
+/// 46 to 94 when every unit's module came to contain the declarations at its
+/// top (parser semantics 33): each such edge names its child by the child's
+/// span in the TypeScript, JavaScript, Go, Rust, Java, Kotlin, PHP and Swift
+/// fixtures, counted once per ingest arm as the Python edges are. Calls stay
+/// at 35 of 35 with a site.
+///
+/// 94 to 96 when Ruby resolves the same-file sibling call. `Defs.render`
+/// calls `Defs.compute` once. Each ingest arm carries its own relation id,
+/// as the containment edges do, and each of those two edges carries the
+/// call's site. `Caller.run` still reaches `Defs.compute` on one edge, at
+/// both of its call sites. Calls are 37 of 37 with a site.
+///
+/// 96 to 57 when a same-file edge took the linker's id. This count had been
+/// keeping the pipeline id and the linker id of one (src, dst, kind) as two
+/// relations. The sites stayed on the surviving edge, so the span-backed
+/// evidence count below did not move, and Calls are 26 of 26 with a site.
+/// Ruby's `Defs.render` -> `Defs.compute` is one of the collapsed edges, so
+/// that fixture keeps two span-backed relations.
+const MEASURED_RELATIONS_WITH_SPAN: usize = 57;
 
 /// Span-backed evidence RECORDS, which exceed span-backed relations whenever one
 /// caller reaches one callee at more than one site. Each fixture calls `compute`
@@ -819,7 +844,103 @@ const MEASURED_RELATIONS_WITH_SPAN: usize = 38;
 /// 43 to 47 with Kotlin, four records over its three edges.
 ///
 /// 47 to 51 with Swift, four records over its three edges.
-const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 51;
+///
+/// 51 to 59 with those same eight Python containment records. Each carries
+/// one exact child span; the repeated-call surplus is unchanged.
+///
+/// 59 to 107 with the 48 module containment records of parser semantics 33,
+/// one exact child span each; the repeated-call surplus is unchanged.
+///
+/// 107 to 109 with Ruby's same-file sibling call. Each arm's
+/// `Defs.render` -> `Defs.compute` edge carries one span-backed record.
+/// The two `Caller.run` sites stay two records on their one edge, so the
+/// repeated-call surplus is unchanged.
+///
+/// 109 again after those duplicate relation ids collapsed. Each surviving
+/// edge kept the records the two ids had carried, Ruby included, so this
+/// count did not move.
+const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 109;
+
+#[test]
+fn python_contains_population_has_exact_declaration_endpoints_and_sites_in_both_arms() {
+    let fixture = FIXTURES
+        .iter()
+        .find(|fixture| fixture.language == "Python")
+        .unwrap();
+    let pipeline = IndexPipeline::new();
+    let mut files = Vec::new();
+    let mut local = Vec::new();
+    let mut artifacts = ArtifactIdentityMap::new();
+    for &(path, source) in fixture.files {
+        let indexed = pipeline
+            .index_file_content_with_tests(
+                &FilePathId::new(path),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
+            .unwrap()
+            .indexed_file;
+        local.extend(indexed.relations);
+        artifacts.insert(path.to_string(), ArtifactId::new());
+        files.push(FileParseData {
+            file_path: path.to_string(),
+            entities: indexed.entities,
+            relations: indexed.extracted_relations,
+            imports: indexed.imports,
+        });
+    }
+    let linked = pipeline.resolve_cross_file(&files, &artifacts).unwrap();
+    let entities: HashMap<_, _> = files
+        .iter()
+        .flat_map(|file| &file.entities)
+        .map(|entity| (entity.id, entity))
+        .collect();
+    let mut expected = vec![
+        ("defs", "compute", "defs.py", "module_contains"),
+        ("defs", "Widget", "defs.py", "module_contains"),
+        ("Widget", "Widget.render", "defs.py", "lexical_contains"),
+        ("caller", "run", "caller.py", "module_contains"),
+    ];
+    expected.sort();
+    for relations in [&local, &linked] {
+        let mut actual = Vec::new();
+        for relation in relations
+            .iter()
+            .filter(|relation| relation.kind == RelationKind::Contains)
+        {
+            let parent = entities[&relation.src.as_entity().unwrap()];
+            let child = entities[&relation.dst.as_entity().unwrap()];
+            let records = kin_index::occurrence::original_evidence(relation).unwrap();
+            assert_eq!(records.len(), 1, "one child site per containment edge");
+            let span = records[0]
+                .source_span
+                .as_ref()
+                .expect("child declaration span");
+            assert_eq!(Some(span), child.span.as_ref());
+            assert_eq!(child.file_origin.as_ref(), Some(&span.file));
+            let source = fixture
+                .files
+                .iter()
+                .find(|entry| entry.0 == span.file.0.as_str())
+                .unwrap()
+                .1;
+            assert!(span.start_byte < span.end_byte && span.end_byte <= source.len());
+            let declaration = &source[span.start_byte..span.end_byte];
+            assert!(declaration.starts_with("def ") || declaration.starts_with("class "));
+            actual.push((
+                parent.name.as_str(),
+                child.name.as_str(),
+                span.file.0.as_str(),
+                records[0].parser_rule.as_deref().unwrap(),
+            ));
+        }
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "each arm records exactly the four declared parents and children"
+        );
+    }
+}
 
 #[test]
 fn relation_evidence_span_population_per_language() {

@@ -70,8 +70,8 @@ fn run_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> Output {
-    run_kin_with(repo, home, args, None)
+fn run_kin(repo: &Path, runtime: &common::IsolatedDaemonRuntime, args: &[&str]) -> Output {
+    run_kin_with(repo, runtime, args, None)
 }
 
 /// Like [`run_kin`], but pointed at a daemon this test is holding open.
@@ -84,16 +84,24 @@ fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> Output {
 /// pass ran AND a daemon is still serving" has to hold that state rather than
 /// hope for it, so it spawns its own daemon the way the sibling suites do and
 /// names it explicitly.
-fn run_kin_served_by(repo: &Path, home: &Path, args: &[&str], port: u16) -> Output {
-    run_kin_with(repo, home, args, Some(port))
+fn run_kin_served_by(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    args: &[&str],
+    port: u16,
+) -> Output {
+    run_kin_with(repo, runtime, args, Some(port))
 }
 
-fn run_kin_with(repo: &Path, home: &Path, args: &[&str], daemon_port: Option<u16>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+fn run_kin_with(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    args: &[&str],
+    daemon_port: Option<u16>,
+) -> Output {
+    let mut command = runtime.kin_command();
     command
         .args(args)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         // Embedding is not what any case here is about, and a first embed pass
         // fetches a model this test must never depend on.
@@ -103,7 +111,7 @@ fn run_kin_with(repo: &Path, home: &Path, args: &[&str], daemon_port: Option<u16
         .current_dir(repo);
     match daemon_port {
         Some(port) => {
-            command.env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"));
+            command.fixture_daemon_url(format!("http://127.0.0.1:{port}"));
         }
         None => {
             command.env_remove("KIN_DAEMON_URL");
@@ -119,12 +127,21 @@ fn run_kin_with(repo: &Path, home: &Path, args: &[&str], daemon_port: Option<u16
 /// rather than by an idle clock the test would be racing.
 struct HeldDaemon {
     child: Option<common::RuntimeOwnedChild>,
+    log: std::path::PathBuf,
 }
 
 impl HeldDaemon {
-    fn spawn(repo: &Path, runtime: &common::IsolatedDaemonRuntime) -> Self {
+    fn spawn(
+        repo: &Path,
+        layout: &kin_core::KinLayout,
+        runtime: &common::IsolatedDaemonRuntime,
+    ) -> Self {
+        let log = runtime.registry_path().with_file_name("held-daemon.log");
+        let sink = fs::File::create(&log).expect("create the held daemon log");
         let child = runtime
             .daemon_command()
+            .arg("--store")
+            .arg(layout.root())
             .arg("--repo")
             .arg(repo)
             .arg("--port")
@@ -133,10 +150,13 @@ impl HeldDaemon {
             .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(sink))
             .spawn_owned()
             .expect("spawn the held kin-daemon");
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            log,
+        }
     }
 
     fn wait_until_serving(&mut self, kin_root: &Path) -> u16 {
@@ -144,7 +164,10 @@ impl HeldDaemon {
         loop {
             let child = self.child.as_mut().expect("daemon child exists");
             if let Some(status) = child.try_wait().expect("inspect daemon child") {
-                panic!("the held daemon exited before readiness: {status}");
+                panic!(
+                    "the held daemon exited before readiness: {status}; log:\n{}",
+                    fs::read_to_string(&self.log).unwrap_or_default()
+                );
             }
             if let Some(port) = fs::read_to_string(kin_root.join("daemon.port"))
                 .ok()
@@ -192,9 +215,9 @@ fn code_of(output: &Output) -> i32 {
 /// would satisfy every assertion below for a reason unrelated to the defect.
 /// `kin daemon status` names this repository's worker directly, and that
 /// sentence is what the cases stand on.
-fn require_no_daemon(repo: &Path, home: &Path) {
-    run_kin(repo, home, &["daemon", "stop"]);
-    let status = run_kin(repo, home, &["daemon", "status"]);
+fn require_no_daemon(repo: &Path, runtime: &common::IsolatedDaemonRuntime) {
+    run_kin(repo, runtime, &["daemon", "stop"]);
+    let status = run_kin(repo, runtime, &["daemon", "status"]);
     let text = stdout_of(&status) + &String::from_utf8_lossy(&status.stderr);
     assert!(
         text.contains("worker daemon not running"),
@@ -204,10 +227,8 @@ fn require_no_daemon(repo: &Path, home: &Path) {
 }
 
 /// A repository with one commit behind it, and no daemon.
-fn seeded_repo(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-    let home = root.join("home");
+fn seeded_repo(root: &Path) -> (std::path::PathBuf, common::IsolatedDaemonRuntime) {
     let repo = root.join("repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     run_git(&repo, &["init", "--initial-branch=main"]);
     run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
@@ -219,14 +240,16 @@ fn seeded_repo(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     .expect("write module");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "seed"]);
-    let init = run_kin(&repo, &home, &["init", "."]);
+    // The held daemon and every CLI process resolve the same central store.
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let init = run_kin(&repo, &runtime, &["init", "."]);
     assert!(
         init.status.success(),
         "kin init failed: stdout={} stderr={}",
         stdout_of(&init),
         String::from_utf8_lossy(&init.stderr)
     );
-    (repo, home)
+    (repo, runtime)
 }
 
 /// The index of a line starting with `prefix`, or a failure naming the page.
@@ -241,7 +264,7 @@ const BANNER: &str = "Working copy: NOT MEASURED";
 #[test]
 fn workspace_diff_with_no_daemon_exits_unmeasured_with_the_gap_above_the_count() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = seeded_repo(root.path());
+    let (repo, runtime) = seeded_repo(root.path());
 
     // Dirty the tree the way the stranger did: a one-line docstring into a
     // tracked function, which moves the artifact and nothing else.
@@ -250,9 +273,9 @@ fn workspace_diff_with_no_daemon_exits_unmeasured_with_the_gap_above_the_count()
         b"def append(entry, path):\n    \"\"\"Append one entry.\"\"\"\n    open(path, 'a').write(repr(entry))\n",
     )
     .expect("edit module");
-    require_no_daemon(&repo, &home);
+    require_no_daemon(&repo, &runtime);
 
-    let diff = run_kin(&repo, &home, &["diff", "HEAD", "WORKSPACE"]);
+    let diff = run_kin(&repo, &runtime, &["diff", "HEAD", "WORKSPACE"]);
     let text = stdout_of(&diff);
 
     assert_eq!(
@@ -276,7 +299,7 @@ fn workspace_diff_with_no_daemon_exits_unmeasured_with_the_gap_above_the_count()
 #[test]
 fn status_over_untracked_work_with_no_daemon_exits_unmeasured_with_the_gap_above_the_tree_line() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = seeded_repo(root.path());
+    let (repo, runtime) = seeded_repo(root.path());
 
     // Three brand-new untracked modules, the shape that produced output
     // byte-identical to the empty repository.
@@ -291,9 +314,9 @@ fn status_over_untracked_work_with_no_daemon_exits_unmeasured_with_the_gap_above
     )
     .expect("write reporting");
     fs::write(repo.join("cli.py"), b"def main():\n    return 0\n").expect("write cli");
-    require_no_daemon(&repo, &home);
+    require_no_daemon(&repo, &runtime);
 
-    let status = run_kin(&repo, &home, &["status"]);
+    let status = run_kin(&repo, &runtime, &["status"]);
     let text = stdout_of(&status);
 
     assert_eq!(
@@ -310,14 +333,14 @@ fn status_over_untracked_work_with_no_daemon_exits_unmeasured_with_the_gap_above
 #[test]
 fn the_json_arm_carries_the_gap_in_its_exit_code_and_still_parses() {
     let root = tempdir().expect("temp root");
-    let (repo, home) = seeded_repo(root.path());
+    let (repo, runtime) = seeded_repo(root.path());
     fs::write(repo.join("untracked.py"), b"VALUE = 1\n").expect("write untracked");
-    require_no_daemon(&repo, &home);
+    require_no_daemon(&repo, &runtime);
 
     // The arm with no other channel. `StatusReportWire` denies unknown fields,
     // so the gap cannot be a key in this payload, and the text banner is not
     // rendered here at all. If the exit code does not carry it, nothing does.
-    let status = run_kin(&repo, &home, &["status", "--json"]);
+    let status = run_kin(&repo, &runtime, &["status", "--json"]);
     let text = stdout_of(&status);
     assert_eq!(
         code_of(&status),
@@ -331,7 +354,7 @@ fn the_json_arm_carries_the_gap_in_its_exit_code_and_still_parses() {
         "the report itself must be unchanged by the exit code: {report}"
     );
 
-    let diff = run_kin(&repo, &home, &["diff", "HEAD", "WORKSPACE", "--json"]);
+    let diff = run_kin(&repo, &runtime, &["diff", "HEAD", "WORKSPACE", "--json"]);
     let diff_text = stdout_of(&diff);
     assert_eq!(
         code_of(&diff),
@@ -349,10 +372,10 @@ fn a_diff_between_two_changes_needs_no_admission_and_still_exits_zero() {
     // it is about, with or without a daemon, so it must keep its clean exit and
     // must not carry the banner.
     let root = tempdir().expect("temp root");
-    let (repo, home) = seeded_repo(root.path());
-    require_no_daemon(&repo, &home);
+    let (repo, runtime) = seeded_repo(root.path());
+    require_no_daemon(&repo, &runtime);
 
-    let diff = run_kin(&repo, &home, &["diff", "HEAD", "HEAD"]);
+    let diff = run_kin(&repo, &runtime, &["diff", "HEAD", "HEAD"]);
     let text = stdout_of(&diff);
     assert_eq!(
         code_of(&diff),
@@ -381,14 +404,14 @@ fn a_measured_working_copy_still_gets_its_clean_exit_and_no_banner() {
     // serving, both commands admit the tree themselves, so the answer IS about
     // the working copy and has to say so by being silent and exiting 0.
     let root = tempdir().expect("temp root");
-    let (repo, home) = seeded_repo(root.path());
+    let (repo, runtime) = seeded_repo(root.path());
     dirty_the_tracked_module(&repo);
 
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let mut daemon = HeldDaemon::spawn(&repo, &runtime);
-    let port = daemon.wait_until_serving(&repo.join(".kin"));
+    let layout = runtime.layout();
+    let mut daemon = HeldDaemon::spawn(&repo, &layout, &runtime);
+    let port = daemon.wait_until_serving(layout.root());
 
-    let diff = run_kin_served_by(&repo, &home, &["diff", "HEAD", "WORKSPACE"], port);
+    let diff = run_kin_served_by(&repo, &runtime, &["diff", "HEAD", "WORKSPACE"], port);
     let text = stdout_of(&diff);
     assert_eq!(
         code_of(&diff),
@@ -406,7 +429,7 @@ fn a_measured_working_copy_still_gets_its_clean_exit_and_no_banner() {
         "the measured diff did not report the one edited artifact:\n{text}"
     );
 
-    let status = run_kin_served_by(&repo, &home, &["status"], port);
+    let status = run_kin_served_by(&repo, &runtime, &["status"], port);
     let status_text = stdout_of(&status);
     assert_eq!(
         code_of(&status),
@@ -434,19 +457,19 @@ fn a_correct_answer_from_a_stale_graph_is_still_reported_as_unmeasured() {
     // and a build that decided to trust a fresh-looking answer would put the
     // whole defect back one layer down.
     let root = tempdir().expect("temp root");
-    let (repo, home) = seeded_repo(root.path());
+    let (repo, runtime) = seeded_repo(root.path());
     dirty_the_tracked_module(&repo);
 
-    let admit = run_kin(&repo, &home, &["admit"]);
+    let admit = run_kin(&repo, &runtime, &["admit"]);
     assert!(
         admit.status.success(),
         "kin admit failed, so this case never reached the state it is about: stdout={} stderr={}",
         stdout_of(&admit),
         String::from_utf8_lossy(&admit.stderr)
     );
-    require_no_daemon(&repo, &home);
+    require_no_daemon(&repo, &runtime);
 
-    let diff = run_kin(&repo, &home, &["diff", "HEAD", "WORKSPACE"]);
+    let diff = run_kin(&repo, &runtime, &["diff", "HEAD", "WORKSPACE"]);
     let text = stdout_of(&diff);
     // The positive control for the state: without this the case is satisfied by
     // a fixture whose admission never landed, which is the ordinary arm again.

@@ -13,6 +13,8 @@
 // The model lives outside the repo (273 MB); the test skips cleanly when it is
 // absent so it never breaks an ordinary `cargo test`.
 
+#![cfg(feature = "engine")]
+
 use std::fs;
 use std::path::Path;
 

@@ -10,6 +10,7 @@ description = "Shared contract for starting a repo daemon and learning the port 
 repository.workspace = true
 
 [dependencies]
+kin-blobs = { workspace = true }
 fs2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

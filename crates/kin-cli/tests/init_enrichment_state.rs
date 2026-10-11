@@ -35,6 +35,15 @@ const DECISION_BUDGET: Duration = Duration::from_secs(5);
 /// fixture takes seconds; the supervisor's idle timeout alone was sixty.
 const COMMAND_BUDGET: Duration = Duration::from_secs(45);
 
+/// Every command here is about the language-server sweep, so each one turns
+/// enrichment back on over the harness default, which leaves it off. The
+/// servers it meets are the fakes each test puts on `fixture_path_prefix`.
+const ENRICHMENT_ON: (&str, &str) = ("KIN_DAEMON_DISABLE_LSP", "0");
+
+/// These enrichment lifecycle fixtures use the supported in-tree layout:
+/// their fake servers inspect its log during shutdown, and the isolated
+/// runtime cleans up its recorded endpoints. Default central-store discovery
+/// is qualified separately rather than inferred from these sweep controls.
 struct Fixture {
     _root: tempfile::TempDir,
     home: PathBuf,
@@ -91,15 +100,17 @@ impl Fixture {
             .args(extra)
             .env("HOME", &self.home)
             .env("KIN_HOME", &self.kin_home)
+            .env("KIN_STORE_LAYOUT", "in-tree")
             .env("KIN_EMBED_BACKEND", "cpu")
-            .env("KIN_DAEMON_AUTO_EMBED", "0");
+            .env("KIN_DAEMON_AUTO_EMBED", "0")
+            .env(ENRICHMENT_ON.0, ENRICHMENT_ON.1);
         let started = Instant::now();
         let output = command.output().expect("run kin init");
         (output, started.elapsed())
     }
 
     fn supervisor_pid_file(&self) -> PathBuf {
-        self.home.join(".kin").join("supervisor.pid")
+        self.kin_home.join("supervisor.pid")
     }
 }
 
@@ -187,17 +198,24 @@ fn kin_no_daemon_reports_the_sweep_owed_at_once() {
     );
 }
 
-/// `--no-enrich` is the caller asking for no sweep, and the field says that
-/// rather than leaving the caller to remember it.
+/// `--no-enrich` records enrichment off for the repository. The field names
+/// that, rather than a sweep this command merely skipped, and says off rather
+/// than owed, because no daemon will ever pay it.
 #[test]
-fn no_enrich_reports_the_sweep_owed_as_not_requested() {
+fn no_enrich_reports_enrichment_off_for_the_repository() {
     let fixture = Fixture::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
     let (output, waited) = fixture.init_json(&mut command, &["--no-enrich"]);
 
     let field = enrichment_field(&output);
-    assert_eq!(field["state"], "owed", "{field}");
-    assert_eq!(field["reason"], "not_requested", "{field}");
+    assert_eq!(field["state"], "off", "{field}");
+    assert_eq!(field["reason"], "switched_off", "{field}");
+    assert!(
+        field["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("kin daemon sweep --enable")),
+        "the detail names how to turn enrichment back on: {field}"
+    );
     assert_decided_quickly(&field, &output, waited);
 }
 
@@ -586,6 +604,10 @@ RECORD = "@RECORD@"
 PUBLISHED = "@PUBLISHED@"
 MODE = "@MODE@"
 STALLED = RECORD + ".stalled"
+# The daemon that started this server. Signal only it, and only while it is
+# still the parent: once the server is orphaned, getppid() names a reaper
+# (init, or a CI runner agent acting as subreaper) that must never get SIGTERM.
+DAEMON = os.getppid()
 
 if any(arg in ("version", "--version", "-version") for arg in sys.argv[1:]):
     print("golang.org/x/tools/gopls (kin test fixture)")
@@ -658,7 +680,8 @@ while True:
             # daemon's shutdown budget.
             open(STALLED, "w").close()
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            os.kill(os.getppid(), signal.SIGTERM)
+            if DAEMON > 1 and os.getppid() == DAEMON:
+                os.kill(DAEMON, signal.SIGTERM)
             continue
     send({"jsonrpc": "2.0", "id": message["id"], "result": result})
 "#;
@@ -827,6 +850,7 @@ while True:
             .args(["status", "--json"])
             .env("HOME", &fixture.home)
             .env("KIN_HOME", &fixture.kin_home)
+            .env(ENRICHMENT_ON.0, ENRICHMENT_ON.1)
             .env_remove("KIN_DAEMON_URL")
             .current_dir(&fixture.repo)
             .output()
@@ -1159,8 +1183,19 @@ process.stdin.on("data", (chunk) => {
     /// `kin daemon stop`, then `kin daemon sweep` in a fresh daemon, which
     /// knows no proof context until it settles one.
     fn sweep_in_a_fresh_daemon(fixture: &Fixture, bin: &Path) -> Output {
+        sweep_in_runtime(fixture, bin, None)
+    }
+
+    fn sweep_in_runtime(
+        fixture: &Fixture,
+        bin: &Path,
+        runtime: Option<&common::IsolatedDaemonRuntime>,
+    ) -> Output {
         for args in [&["daemon", "stop"][..], &["daemon", "sweep"][..]] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+            let mut command: Command<'_> = match runtime {
+                Some(runtime) => runtime.kin_command(),
+                None => Command::new(env!("CARGO_BIN_EXE_kin")),
+            };
             command
                 .fixture_path_prefix(bin)
                 .args(args)
@@ -1168,7 +1203,8 @@ process.stdin.on("data", (chunk) => {
                 .env("HOME", &fixture.home)
                 .env("KIN_HOME", &fixture.kin_home)
                 .env("KIN_EMBED_BACKEND", "cpu")
-                .env("KIN_DAEMON_AUTO_EMBED", "0");
+                .env("KIN_DAEMON_AUTO_EMBED", "0")
+                .env(ENRICHMENT_ON.0, ENRICHMENT_ON.1);
             let output = command.output().expect("run kin daemon");
             if args[1] == "sweep" {
                 return output;
@@ -1209,6 +1245,91 @@ process.stdin.on("data", (chunk) => {
     const ASKED_AGAIN: &str = "sweep asks about a finished file again";
     const STARTED_TO_SETTLE: &str = "starting the language server to learn whether finished";
 
+    /// The failed server must withdraw the old proof's current validity from
+    /// both the live answer and the authority a later reader reopens. Stopping
+    /// the daemon publishes its pending validation without another server start.
+    fn assert_unverified_live_and_reopened(
+        fixture: &Fixture,
+        bin: &Path,
+        runtime: &common::IsolatedDaemonRuntime,
+    ) {
+        let output = runtime
+            .kin_command()
+            .fixture_path_prefix(bin)
+            .args(["refs", "Greet", "--kind", "calls", "--json"])
+            .current_dir(&fixture.repo)
+            .env("HOME", &fixture.home)
+            .env("KIN_HOME", &fixture.kin_home)
+            .env(ENRICHMENT_ON.0, ENRICHMENT_ON.1)
+            .env("KIN_NO_DAEMON", "1")
+            .output()
+            .expect("read the running daemon's references");
+        assert!(
+            output.status.success(),
+            "the live reference query must answer: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let answer: Value =
+            serde_json::from_slice(&output.stdout).expect("the live reference answer is JSON");
+        let calls = &answer["call_sites"];
+        assert_eq!(
+            calls["settled"], false,
+            "old proofs cannot certify callers: {answer}"
+        );
+        assert!(
+            calls["callers_unverified"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "the caller's held evidence must disclose its unverified context: {answer}"
+        );
+
+        let stopped = runtime
+            .kin_command()
+            .fixture_path_prefix(bin)
+            .args(["daemon", "stop"])
+            .current_dir(&fixture.repo)
+            .env("HOME", &fixture.home)
+            .env("KIN_HOME", &fixture.kin_home)
+            .env(ENRICHMENT_ON.0, ENRICHMENT_ON.1)
+            .output()
+            .expect("stop the daemon and publish its pending validation");
+        assert!(
+            stopped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+
+        let layout = kin_core::KinLayout::new(fixture.repo.join(".kin"));
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+            .expect("bind the persisted repository");
+        let manager = binding
+            .open_manager()
+            .expect("reopen persisted repository authority");
+        let snapshot = manager
+            .read_authority()
+            .workspace_graph_snapshot(&binding.workspace_id())
+            .expect("read the persisted workspace graph")
+            .expect("the initialized workspace remains present");
+        let validation = snapshot
+            .resolution_records
+            .get(&kin_model::ResolutionRecordId::context_validation(
+                kin_model::LanguageId::Go,
+            ))
+            .and_then(|record| record.as_context_validation())
+            .expect("the failed server's proof validation was persisted");
+        assert!(
+            matches!(
+                validation.state,
+                kin_model::ContextValidationState::Unverified { .. }
+            ),
+            "the reopened graph must not restore the previous server's certainty: {validation:?}"
+        );
+        assert!(
+            validation.current_context().is_none(),
+            "unverified proofs cannot certify callers"
+        );
+    }
+
     #[test]
     fn a_matching_server_is_not_started_and_a_changed_one_is_asked_again() {
         if !node_available() {
@@ -1216,7 +1337,10 @@ process.stdin.on("data", (chunk) => {
             return;
         }
         let (fixture, bin, record, manifest) = fixture();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        // Hold one owner through the live query and final flush. A standalone
+        // command retires the daemon it launched as soon as it returns.
+        let runtime = common::IsolatedDaemonRuntime::new(&fixture.repo);
+        let mut command = runtime.kin_command();
         command.fixture_path_prefix(bin.path());
         let (output, _) = fixture.init_json(&mut command, &[]);
         let field = enrichment_field(&output);
@@ -1232,7 +1356,7 @@ process.stdin.on("data", (chunk) => {
         // A fresh daemon must observe one handshake. Subsequent no-op passes
         // share that observation without starting a second probe.
         let before = daemon_log(&fixture);
-        let output = sweep_in_a_fresh_daemon(&fixture, bin.path());
+        let output = sweep_in_runtime(&fixture, bin.path(), Some(&runtime));
         let log = daemon_log_since(&fixture, &before);
         assert!(
             output.status.success(),
@@ -1251,7 +1375,7 @@ process.stdin.on("data", (chunk) => {
         fs::write(&manifest, r#"{"name": "fake-gopls", "version": "1.0.1"}"#)
             .expect("release the fake again");
         let before = daemon_log(&fixture);
-        let output = sweep_in_a_fresh_daemon(&fixture, bin.path());
+        let output = sweep_in_runtime(&fixture, bin.path(), Some(&runtime));
         let log = daemon_log_since(&fixture, &before);
         assert!(
             output.status.success(),
@@ -1281,7 +1405,7 @@ process.stdin.on("data", (chunk) => {
         fs::write(&server, "#!/bin/sh\nexit 127\n").expect("write the unavailable server");
         fs::set_permissions(&server, fs::Permissions::from_mode(0o755))
             .expect("make the refusing server executable");
-        let _ = sweep_in_a_fresh_daemon(&fixture, bin.path());
+        let _ = sweep_in_runtime(&fixture, bin.path(), Some(&runtime));
         let log = daemon_log_since(&fixture, &before);
         bounded_passes(&log, "LSP cold sweep ended with incomplete enrichment");
         // The refusing executable may be attempted, but it never initializes:
@@ -1292,10 +1416,12 @@ process.stdin.on("data", (chunk) => {
             &[("1.0.0", matching_probes), ("1.0.1", changed_probes)],
         );
         assert!(
-            log.contains("could not start the language server to check finished files"),
+            log.contains("could not start the language server for this sweep")
+                || log.contains("could not start the language server to check finished files"),
             "daemon.log:\n{log}"
         );
         assert!(log.contains(ASKED_AGAIN), "daemon.log:\n{log}");
+        assert_unverified_live_and_reopened(&fixture, bin.path(), &runtime);
     }
 
     /// Through a shim that replaces itself with the server, the running
@@ -1365,5 +1491,54 @@ process.stdin.on("data", (chunk) => {
             log.contains(ASKED_AGAIN),
             "a changed server behind the shim re-asks; daemon.log:\n{log}"
         );
+    }
+
+    /// A daemon that refused its startup sweep because the machine had no
+    /// memory to spare starts no language server for a readiness handshake
+    /// instead. The `kin init` that started it still asks for its sweep, and
+    /// that sweep's server is the only one that runs.
+    ///
+    /// The level is pinned. The two tests above grade whatever host they run
+    /// on, and on a host whose swap is mostly used every moment above three
+    /// quarters of its memory reads as critical, so this is the start they met
+    /// there whenever the reading crossed that line.
+    #[test]
+    fn a_sweep_refused_for_memory_starts_no_readiness_probe() {
+        if !node_available() {
+            eprintln!("skipping: this test's fake language server needs node");
+            return;
+        }
+        let (fixture, bin, record, _manifest) = fixture();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        command
+            .fixture_path_prefix(bin.path())
+            .env(kin_core::memory_pressure::PRESSURE_OVERRIDE_ENV, "critical");
+        let (output, _) = fixture.init_json(&mut command, &[]);
+        assert_eq!(
+            enrichment_field(&output)["state"],
+            "produced",
+            "the sweep init asks for runs at any pressure; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = daemon_log(&fixture);
+        assert!(
+            log.contains("enrichment sweep did not start"),
+            "the daemon's start must have refused its sweep for memory; daemon.log:\n{log}"
+        );
+        assert_eq!(
+            completed_passes(&log),
+            1,
+            "only the sweep init asked for runs; daemon.log:\n{log}"
+        );
+        // Neither the fake nor any server the host carries starts before it.
+        let (before_sweep, _) = log
+            .split_once("LSP cold sweep started")
+            .unwrap_or_else(|| panic!("the sweep init asked for must start; daemon.log:\n{log}"));
+        assert!(
+            !before_sweep.contains("starting LSP server"),
+            "a start that refused its sweep for memory launched a language server anyway; \
+             daemon.log:\n{log}"
+        );
+        assert_sweep_sessions(&record, &[("1.0.0", true)], &[("1.0.0", 0)]);
     }
 }

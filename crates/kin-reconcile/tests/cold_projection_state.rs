@@ -56,7 +56,9 @@ impl Fixture {
                     ..Default::default()
                 })
                 .unwrap();
-            std::fs::write(self.root.path().join(file), body).unwrap();
+            let host = self.root.path().join(file);
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            std::fs::write(host, body).unwrap();
         }
         let prior = kin_model::graph::ResolvedGraphState {
             entities: old.entities,
@@ -350,6 +352,75 @@ fn cold_checked_source_state_refuses_source_identity_mismatch_without_host_fallb
     );
 }
 
+/// The census reads its sources in parallel and must still answer as a walk in
+/// path order does: every stale source named, in path order, however the
+/// sources fall into parallel chunks; the strict restore refused at the first
+/// stale source in that order; and a coherent store restored whole.
+#[test]
+fn cold_census_answers_in_path_order_across_parallel_chunks() {
+    // More sources than one parallel chunk holds, so the census crosses a
+    // chunk boundary, with stale sources on both sides of it.
+    let names: Vec<String> = (0..600).map(|i| format!("m{i:04}.py")).collect();
+    let bodies: Vec<String> = (0..600)
+        .map(|i| format!("def f{i}(value):\n    return value + {i}\n"))
+        .collect();
+    let files: Vec<(&str, &str)> = names
+        .iter()
+        .zip(&bodies)
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    let fixture = Fixture::new(&files);
+
+    let graph = fixture.cold_graph();
+    let mut reconciler = fixture.cold_reconciler(&graph);
+    assert!(reconciler
+        .restore_canonical_source_state_or_name_stale(&graph, &fixture.blobs)
+        .unwrap()
+        .is_empty());
+    assert_eq!(reconciler.projection().file_ids().len(), names.len());
+    assert_eq!(
+        reconciler
+            .projection()
+            .get_content(&FilePathId::new("m0599.py")),
+        Some(bodies[599].as_bytes())
+    );
+
+    let stale = [3_usize, 511, 512, 599];
+    for i in stale.iter().rev() {
+        let mut entity = fixture.entity(&format!("f{i}"));
+        entity.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::json!(kin_blobs::digest(b"unrelated").to_string()),
+        );
+        fixture.graph.upsert_entity(&entity).unwrap();
+    }
+    let graph = fixture.cold_graph();
+    let mut reconciler = fixture.cold_reconciler(&graph);
+    let named = reconciler
+        .restore_canonical_source_state_or_name_stale(&graph, &fixture.blobs)
+        .unwrap();
+    assert_eq!(
+        named
+            .iter()
+            .map(|source| source.file.0.clone())
+            .collect::<Vec<_>>(),
+        stale.iter().map(|i| names[*i].clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        reconciler.projection().file_ids().is_empty(),
+        "a census that named a stale source must install nothing"
+    );
+    let error = reconciler
+        .restore_canonical_source_state(&graph, &fixture.blobs)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("m0003.py") && error.contains("metadata differs from its admitted blob"),
+        "the strict restore must refuse at the first stale source in path order: {error}"
+    );
+    assert!(reconciler.projection().file_ids().is_empty());
+}
+
 #[test]
 fn cold_checked_source_state_partial_neighbor_retains_lkg_without_blocking_complete_source() {
     let fixture = Fixture::new(&[
@@ -516,4 +587,100 @@ fn cold_checked_source_state_preserves_opaque_facet_with_source_extension() {
         .projection()
         .get_content(&FilePathId::new("work.py"))
         .is_some());
+}
+
+/// The `.d.ts` shapes resend/react-email carries. Its shorthand
+/// `declare module 'postcss-import';` once gave two declarations one identity,
+/// and the graph's one entity never matched the parse's two, so every reopen
+/// refused the unit's layout and with it the whole start.
+const DECLARATION_SHAPES: &[(&str, &str)] = &[
+    (
+        "packages/editor/postcss-import.d.ts",
+        "declare module 'postcss-import';\n",
+    ),
+    (
+        "packages/ui/inline-css.d.ts",
+        "declare module '*.css?inline' {\n  const content: string;\n  export default content;\n}\ndeclare module '*.css?raw' {\n  const content: string;\n  export default content;\n}\n",
+    ),
+    (
+        "packages/render/src/react-internals.d.ts",
+        "declare module \"react-dom/server.browser\" {\n  export * from \"react-dom/server\";\n}\n",
+    ),
+    ("src/render.ts", "export function render(): string { return ''; }\n"),
+];
+
+#[test]
+fn cold_checked_source_state_restores_ambient_module_declarations() {
+    let fixture = Fixture::new(DECLARATION_SHAPES);
+    let graph = fixture.cold_graph();
+    let mut reconciler = fixture.cold_reconciler(&graph);
+    reconciler
+        .restore_canonical_source_state(&graph, &fixture.blobs)
+        .expect("every declaration shape restores");
+    for (file, body) in DECLARATION_SHAPES {
+        assert_eq!(
+            reconciler.projection().get_content(&FilePathId::new(*file)),
+            Some(body.as_bytes()),
+            "{file} has no projection"
+        );
+    }
+}
+
+#[test]
+fn cold_census_names_a_disagreeing_layout_and_the_restore_withholds_only_that_unit() {
+    let fixture = Fixture::new(DECLARATION_SHAPES);
+    let unit = FilePathId::new("packages/editor/postcss-import.d.ts");
+    let mut layout = fixture.graph.get_file_layout(&unit).unwrap().unwrap();
+    for region in &mut layout.regions {
+        if let SourceRegion::EntityRef { entity_id, .. } = region {
+            *entity_id = kin_model::EntityId::new();
+        }
+    }
+    fixture.graph.upsert_file_layout(&layout).unwrap();
+    let graph = fixture.cold_graph();
+
+    let mut reconciler = fixture.cold_reconciler(&graph);
+    let named = reconciler
+        .restore_canonical_source_state_or_name_stale(&graph, &fixture.blobs)
+        .expect("a disagreeing layout is named for re-derivation, not refused");
+    assert_eq!(
+        named,
+        vec![kin_reconcile::StaleCanonicalSource {
+            file: unit.clone(),
+            reason: kin_reconcile::LAYOUT_DIFFERS_FROM_SOURCE,
+        }]
+    );
+    assert!(
+        reconciler.projection().file_ids().is_empty(),
+        "a census that named a source installs nothing"
+    );
+
+    let withheld = reconciler
+        .restore_canonical_source_state_withholding(&graph, &fixture.blobs)
+        .expect("one disagreeing unit does not stop the restore");
+    assert_eq!(withheld, named);
+    let mut installed: Vec<_> = reconciler
+        .projection()
+        .file_ids()
+        .into_iter()
+        .map(|file| file.0.clone())
+        .collect();
+    installed.sort();
+    let mut expected: Vec<_> = DECLARATION_SHAPES
+        .iter()
+        .map(|(file, _)| file.to_string())
+        .filter(|file| *file != unit.0)
+        .collect();
+    expected.sort();
+    assert_eq!(installed, expected, "every other unit is installed");
+
+    let error = fixture
+        .cold_reconciler(&graph)
+        .restore_canonical_source_state(&graph, &fixture.blobs)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("canonical projection layout differs"),
+        "the strict restore still refuses: {error}"
+    );
 }

@@ -129,7 +129,7 @@ fn mcp_answers(
     home: &Path,
     calls: &[(&str, Value)],
 ) -> Vec<Value> {
-    let port = fs::read_to_string(repo.join(".kin/daemon.port"))
+    let port = fs::read_to_string(runtime.layout_for(repo).root().join("daemon.port"))
         .expect("a daemon serves the repository")
         .trim()
         .parse::<u16>()
@@ -155,6 +155,10 @@ fn mcp_answers(
         .args(["mcp", "start"])
         .current_dir(repo)
         .env_clear()
+        // After `env_clear`, which removes everything set before it. The codes
+        // this test reads are served on an agent profile only as machine
+        // replies.
+        .env("KIN_MCP_MACHINE_REPLIES", "1")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("USERPROFILE", home)

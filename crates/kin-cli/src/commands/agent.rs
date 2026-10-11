@@ -78,9 +78,11 @@ pub fn run(args: RunArgs) -> Result<i32> {
         };
 
     let session_stamp = kin_agent::run::timestamp().replace(':', "-");
-    let out = args
-        .out
-        .unwrap_or_else(|| repo.join(".kin").join("agent").join(session_stamp));
+    let out = args.out.unwrap_or_else(|| {
+        kin_core::layout::store_root_for(&repo)
+            .join("agent")
+            .join(session_stamp)
+    });
     std::fs::create_dir_all(&out)
         .with_context(|| format!("could not create the output directory {}", out.display()))?;
 

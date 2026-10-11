@@ -102,8 +102,8 @@ fn stop_daemon(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
 /// since the last time the working copy was observed. Recording that
 /// observation after the edit reproduces the shape deterministically, without
 /// racing a watcher that is entitled to admit the edit.
-fn record_an_admission_after_the_edits(repo: &Path) {
-    let layout = kin_core::KinLayout::discover(repo).expect("discover the store");
+fn record_an_admission_after_the_edits(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let layout = runtime.layout_for(repo);
     let later = chrono::Utc::now() + chrono::Duration::hours(1);
     kin_core::last_admission::write(
         &layout,
@@ -224,7 +224,7 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     // raced.
     stop_daemon(&runtime, &repo);
     fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
-    record_an_admission_after_the_edits(&repo);
+    record_an_admission_after_the_edits(&runtime, &repo);
     let dirty = drift_report(&runtime, &repo);
     assert_eq!(dirty["clean"], false);
     assert_eq!(dirty["drift_count"], 1);
@@ -258,7 +258,7 @@ fn drift_reports_diverged_tracked_bytes_without_admitting_them() {
     // A removed tracked member is drift the report also must not repair.
     stop_daemon(&runtime, &repo);
     fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
-    record_an_admission_after_the_edits(&repo);
+    record_an_admission_after_the_edits(&runtime, &repo);
     let deleted = drift_report(&runtime, &repo);
     assert!(
         deleted["drift_count"].as_u64().expect("drift count") >= 1,
@@ -328,7 +328,7 @@ fn heal_restores_diverged_tracked_members_from_graph_truth() {
     stop_daemon(&runtime, &repo);
     fs::write(repo.join("README.md"), b"host edited these bytes\n").expect("edit tracked doc");
     fs::remove_file(repo.join("src/lib.rs")).expect("remove tracked source");
-    record_an_admission_after_the_edits(&repo);
+    record_an_admission_after_the_edits(&runtime, &repo);
 
     let dirty = drift_report(&runtime, &repo);
     assert_eq!(dirty["clean"], false);

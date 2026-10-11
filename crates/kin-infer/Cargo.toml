@@ -11,34 +11,62 @@ description = "Universal transformer inference engine, pure Rust, GPU-accelerate
 repository = "https://github.com/firelock-ai/kin-infer"
 
 [lib]
+# The crate root is `src/root.rs`, which always carries the resource plan and
+# loads `src/lib.rs`, the inference engine, only under the `engine` feature.
+path = "src/root.rs"
 doctest = false
 
 [features]
-default = []
+default = ["engine"]
+# The transformer inference engine: weight loading, the encoder and decoder
+# forward passes, and their CPU and GPU compute. Without it the crate is the
+# resource plan alone (host, memory and accelerator detection and the
+# per-profile budgets), which is all a build without embeddings reads, and none
+# of the dependencies below that are optional get compiled.
+engine = [
+    "dep:ndarray",
+    "dep:safetensors",
+    "dep:half",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:hashbrown",
+    "dep:thiserror",
+    "dep:parking_lot",
+    "dep:rayon",
+    "dep:memmap2",
+]
 # GPU backends, zero external ML framework deps, custom shaders/kernels
 # macOS: Apple Metal compute shaders (M1/M2/M3)
-metal = ["dep:metal", "dep:objc2", "dep:block"]
+metal = ["engine", "dep:metal", "dep:objc2", "dep:block"]
 # Linux/Windows: NVIDIA CUDA via driver API (no toolkit needed at build time)
-cuda = []
+cuda = ["engine"]
 # CPU BLAS: Apple Accelerate (macOS) via the system framework, no build-time
 # deps, raw cblas FFI (same posture as the CUDA driver-API backend). Linked and
 # auto-selected at runtime when present; force the deterministic pure-Rust path
 # with KIN_INFER_CPU_BACKEND=pure-rust for bit-reproducible runs.
-accelerate = []
+accelerate = ["engine"]
+# Typed decisions from a model directory: `decision::DecisionModel` reads the checkpoint's
+# tokenizer.json to render and score multiple-choice prompts. The question, prompt and
+# probability types in `decision` compile without it.
+decision = ["engine", "dep:tokenizers"]
 
 [dependencies]
-ndarray = "0.16"
-safetensors = "0.5"
-half = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-hashbrown = "0.15"
-thiserror = "2"
-parking_lot = "0.12"
-rayon = "1"
 tracing = "0.1"
-memmap2 = "0.9"
+ndarray = { version = "0.16", optional = true }
+safetensors = { version = "0.5", optional = true }
+half = { version = "2", optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+hashbrown = { version = "0.15", optional = true }
+thiserror = { version = "2", optional = true }
+parking_lot = { version = "0.12", optional = true }
+rayon = { version = "1", optional = true }
+memmap2 = { version = "0.9", optional = true }
+# Only with the `decision` feature. onig provides the regex engine byte-level BPE
+# pre-tokenizers such as Qwen's need. The version matches kin-db's, so a binary that has both
+# links one tokenizer.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 # Unix-only: getppid() for the embed parent-death watchdog (orphan self-exit).
 # Already present transitively (metal/objc2); named directly so the watchdog can
@@ -55,8 +83,40 @@ objc2 = { version = "0.5", optional = true }
 # rather than relying on the transitive dep.
 block = { version = "0.1", optional = true }
 
+# Runs a forward pass, so it needs the engine.
+[[example]]
+name = "det_probe"
+required-features = ["engine"]
+
+[[example]]
+name = "cpu_prefill_check"
+required-features = ["engine"]
+
+[[example]]
+name = "decision_bench"
+required-features = ["engine"]
+
+[[example]]
+name = "prefix_batch_bench"
+required-features = ["engine"]
+
+# Loads a model through `DecisionEngine`, which only the `decision` feature builds.
+[[example]]
+name = "decision_engine_check"
+required-features = ["decision"]
+
+# Loads a pointer decision model (adapter, head and base), which only the `decision` feature builds.
+[[example]]
+name = "pointer_decision_check"
+required-features = ["decision"]
+
+# Loads a yes-or-no reranker, which only the `decision` feature builds.
+[[example]]
+name = "reranker_check"
+required-features = ["decision"]
+
 [dev-dependencies]
 # Used only by the SweRank/nomic_bert self-retrieval probe to tokenize text
 # and parse the model config.json.
-tokenizers = "0.20.4"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 serde_json = "1"

@@ -200,6 +200,6 @@ export function notProvisionedMessage(name = 'kin', env = process.env, platform 
     `Host target: ${triple}. @kinlab/kin ${packageVersion()} provisions the managed Kin`,
     'release on first run; if you are seeing this, provisioning failed or was disabled',
     '(KIN_NO_PROVISION=1). Re-run with network access, set KIN_MANAGED_BIN to an existing',
-    'kin binary, or install via https://github.com/firelock-ai/kin (scripts/install.sh).',
+    'kin binary, or install via https://github.com/kinlab-ai/kin (scripts/install.sh).',
   ].join('\n');
 }

@@ -158,7 +158,7 @@ pub async fn run(
     if let Some(error) = response.error {
         anyhow::bail!(error);
     }
-    for line in response.lines {
+    for line in crate::plain_words::trace_lines(&response.lines) {
         println!("{line}");
     }
     Ok(())
@@ -1202,6 +1202,9 @@ fn resolve_trace_target(
     // pooled with them.
     let (matches, by_member) = match kin_ranking::entity_ranking::reach_by_name(graph, entity)? {
         kin_ranking::entity_ranking::NameReach::Members(members) => (members, true),
+        // A module-qualified name reaches what its qualifier pins, which the
+        // name index alone does not know how to read.
+        kin_ranking::entity_ranking::NameReach::Qualified(found) => (found, false),
         kin_ranking::entity_ranking::NameReach::Exact(_)
         | kin_ranking::entity_ranking::NameReach::Neither => (matches, false),
     };

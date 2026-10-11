@@ -1,0 +1,231 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["build.rs", "src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/diff.rs",
+    "src/git_init.rs",
+    "src/init.rs",
+    "src/lib.rs",
+    "src/ref_view.rs",
+    "src/workspace_semantics.rs",
+]
+
+[[excluded]]
+reason = "composes the derivation keys; changes to what it reads move them through the inputs themselves"
+files = [
+    "build.rs",
+]
+
+[[excluded]]
+reason = "tests and test support, compiled only under cfg(test) or the test-support feature"
+files = [
+    "src/session_publication_observer_test.rs",
+    "src/session_publication_test_support.rs",
+    "src/test_env.rs",
+    "src/tree_prepared_publication_test.rs",
+    "src/tree_prepared_recovery_test.rs",
+]
+
+[[excluded]]
+reason = "records the derivation identity a store was created and upgraded under, compares it on open and carries it across transfers; derives nothing"
+files = [
+    "src/hydration_semantics.rs",
+]
+
+[[excluded]]
+reason = "transfer: a replica clone commits history and bodies another store derived, reconciles their declared derivation record and materializes the tree; it derives no entity or relation"
+files = [
+    "src/init/replica.rs",
+]
+
+[[excluded]]
+reason = "storage layout and identity files: where a store lives and its manifest, whose repository and workspace ids are minted at random or adopted, never derived from source"
+files = [
+    "src/layout.rs",
+    "src/manifest.rs",
+]
+
+[[excluded]]
+reason = "init staging and preflight: capture-directory leases, interruption post-mortems, progress lines, and the memory and disk forecasts that refuse or allow a conversion without changing what it derives"
+files = [
+    "src/init_attempt.rs",
+    "src/init_budget.rs",
+    "src/init_disk.rs",
+    "src/init_progress.rs",
+    "src/init_staging.rs",
+]
+
+[[excluded]]
+reason = "memory pressure and process resources: measure host memory, raise the open-file limit and narrow the umask; they gate or defer heavy work or set file permissions, and never change what a run derives"
+files = [
+    "src/file_limit.rs",
+    "src/memory_pressure.rs",
+    "src/umask.rs",
+]
+
+[[excluded]]
+reason = "workspace projection and publication IO: materializes a store's tree to disk, validates projected paths and commits prepared transactions with recovery; the transactions it commits are built and derived elsewhere"
+files = [
+    "src/tree.rs",
+    "src/tree_prepared_recovery.rs",
+    "src/tree_session_publication.rs",
+]
+
+[[excluded]]
+reason = "history state bookkeeping: how much Git history a store admitted, when an admission last completed, and swapping a staged complete-history store into place; the derivation itself runs in git_init.rs"
+files = [
+    "src/history_attach.rs",
+    "src/history_state.rs",
+    "src/last_admission.rs",
+]
+
+[[excluded]]
+reason = "prepared-store catalog and cross-repo registry: find existing stores on this machine by source identity or registration; reuse defers to the derivation record"
+files = [
+    "src/prepared_store.rs",
+    "src/registry.rs",
+]
+
+[[excluded]]
+reason = "observational records kept beside the graph (relation-kind census, paths whose bytes did not parse), keyed separately"
+files = [
+    "src/relation_census.rs",
+    "src/retained_parse.rs",
+]
+
+[[excluded]]
+reason = "status reads of the stored graph: graph-section standing, reference and parse coverage, and binding and counting persisted repository authority; they write nothing into the graph"
+files = [
+    "src/graph_section.rs",
+    "src/reference_coverage.rs",
+    "src/repository_authority.rs",
+]
+
+[[excluded]]
+reason = "Git identity and repository configuration: commit author resolution, remotes and the owner and name they give a repository for display, Git coexistence, LSP, retrieval and resource settings; no field reaches admission, parsing or linking"
+files = [
+    "src/config.rs",
+    "src/config/windows.rs",
+    "src/enrichment_setting.rs",
+    "src/identity.rs",
+    "src/repository_origin.rs",
+]
+
+[[excluded]]
+reason = "query-time selection and reports: entity disambiguation and ranking, locate paging, declared entry points for dead-code, and the cross-repo dependency listing read what is stored and derive nothing"
+files = [
+    "src/dependencies.rs",
+    "src/disambiguation.rs",
+    "src/entry_points.rs",
+    "src/paging.rs",
+    "src/ranking.rs",
+]
+
+[[excluded]]
+reason = "exported import resolver that no workspace crate calls; derivation resolves imports in the kin-index linker"
+files = [
+    "src/resolver.rs",
+]
+
+[[excluded]]
+reason = "editing paths after a store exists: tree deltas for explicit moves, copies and observed working-copy edits, and carrying pending work across a branch switch; neither init nor upgrade calls them, and the source they admit is derived like any other"
+files = [
+    "src/exact_tree.rs",
+    "src/workspace_carry.rs",
+]
+
+[[excluded]]
+reason = "language-server enrichment, embeddings and models (separate products): the Python LSP relation scope an upgrade retires, the vector producer policy and model slots"
+files = [
+    "src/lsp_scope.rs",
+    "src/models.rs",
+    "src/vector_producer_policy.rs",
+]
+
+[[excluded]]
+reason = "assistant integration and tooling: assistant docs, hook templates, projection command shims and provisioned tool paths"
+files = [
+    "src/assistant.rs",
+    "src/assistant_sync.rs",
+    "src/hooks.rs",
+    "src/shims.rs",
+    "src/tool_prefix.rs",
+]
+
+[[excluded]]
+reason = "registry and validation of KIN_* environment knobs and the daemon's captured-environment comparison; no derivation path in this crate reads a knob through them"
+files = [
+    "src/behavior_env.rs",
+    "src/env_registry.rs",
+    "src/env_registry_generated.rs",
+]
+
+[[excluded]]
+reason = "remote sync state: the last sync point per remote, transport bookkeeping only"
+files = [
+    "src/sync_state.rs",
+]
+
+[[excluded]]
+reason = "error types and messages: an error refuses a run, it never changes what a successful run stores"
+files = [
+    "src/error.rs",
+]
+
+[[excluded]]
+reason = "not compiled: no module declaration in this crate names it"
+files = [
+    "src/federation.rs",
+]
+
+
+
+[[excluded_items]]
+file = "src/ref_view.rs"
+reason = "reads, searches and maintains what is stored (the text index, vectors and embeddings, recall, counts, impact and neighbourhood queries, entity history pages and warnings); answering calls them, deriving never does"
+items = [
+    "fn filter_vector_results_to_scope",
+]
+
+[[excluded]]
+reason = "capability-scoped IO for store sidecars and configuration; reads and writes the caller's record bytes without deriving an entity or relation"
+files = ["src/store_records.rs"]
+
+[dependencies]
+kin-io = { reason = "worktree authority tokens and confined store/config record IO; graph derivation uses the supplied source bytes and never derives a value through this crate" }
+semver = { reason = "compares recorded Kin releases before an upgrade; never derives graph data" }
+kin-model = { decides = ["graph"] }
+kin-db = { decides = ["graph"] }
+kin-git = { decides = ["graph"] }
+kin-index = { decides = ["graph"] }
+kin-parser = { decides = ["graph"] }
+kin-blobs = { reason = "content-addressed byte storage that returns bytes verified against their digest; the capture CAS and source-body reads go through it, so it cannot change what is derived from them" }
+kin-daemon-spawn = { reason = "process-group guardian and the cgroup reader memory_pressure.rs consults; process lifecycle only" }
+kin-ranking = { reason = "query-time entity selection: disambiguation.rs calls carries_body and qualifier_splits for trace and lookup; no derivation path in this crate calls it" }
+gix = { reason = "used here only at the Git boundary for probes and records: shallow and single-root checks, the snapshot commit's parent ids for the history-state record, size surveys, Git config, refspec validation and author identity. Git object bytes are verified against their ids, and the capture and decode that feed derivation run in kin-git, so a release cannot change what this crate derives" }
+unicode-normalization = { reason = "used only by tree.rs to build path comparison keys that detect projection collisions on case- and normalization-insensitive filesystems before a tree is materialized; no derivation path normalizes text with it" }
+which = { reason = "finds executables on PATH for provisioned tools (tool_prefix.rs); no derivation path" }
+serde = { reason = "serialization with a fixed, specified format; a release changes no derived value" }
+serde_json = { reason = "JSON values and encoding with a specified format; entity metadata holds serde_json values, but a release cannot change a value's content" }
+toml = { reason = "TOML parsing of config, registry and catalog files, a specified format; no derived value" }
+thiserror = { reason = "derives error trait impls; no derived value" }
+tracing = { reason = "logging and spans only" }
+chrono = { reason = "timestamps from recorded values or the clock; calendar arithmetic is specified, so a release changes no derived value" }
+uuid = { reason = "random and parsed repository, workspace and staging ids under a fixed specification; never derived from source" }
+sha2 = { reason = "SHA-256, a fixed specification; used for seals, record digests and catalog keys" }
+directories = { reason = "locates per-user home and data directories for store placement and the registry" }
+fs2 = { reason = "advisory file locks for staging, registry and projection; process coordination only" }
+tempfile = { reason = "temporary files and directories for staging and the case-folding probe; a release cannot change what the filesystem reports" }
+cap-std = { reason = "capability-scoped filesystem access for projection and config writes; IO only" }
+cap-fs-ext = { reason = "capability-scoped filesystem extensions for projection on Windows; IO only" }
+libc = { reason = "OS calls for locks, durability, file identity and resource limits; IO only" }
+rustix = { reason = "OS calls for directory capabilities and atomic renames; IO only" }
+windows-sys = { reason = "Windows file-system and memory calls for projection, staging and pressure readings; IO only" }
+winapi-util = { reason = "Windows file identity pair for staging and config ownership checks; IO only" }

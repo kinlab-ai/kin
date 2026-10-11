@@ -103,7 +103,7 @@ fn change_summary(change: &SemanticChange, include_deltas: bool) -> Result<serde
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
         "timestamp": change.timestamp,
-        "author": change.author.to_string(),
+        "author": change.author.identity().0,
         "message": change.message,
         "entity_delta_count": change.entity_deltas.len(),
         "relation_delta_count": change.relation_deltas.len(),

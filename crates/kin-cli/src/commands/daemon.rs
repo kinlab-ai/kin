@@ -270,6 +270,10 @@ pub enum DaemonLiveness {
     Stale,
     /// No pid was recorded — no endpoint files present.
     NotRunning,
+    /// The recorded process is alive but holds some other store's lock, not
+    /// this store's: a copied store's endpoint files name its source's
+    /// daemon. Nothing serves this store.
+    ServesAnotherStore,
 }
 
 impl DaemonLiveness {
@@ -285,6 +289,10 @@ impl DaemonLiveness {
             }
             DaemonLiveness::Stale => "stale (recorded process is gone)",
             DaemonLiveness::NotRunning => "not running",
+            DaemonLiveness::ServesAnotherStore => {
+                "not running (the recorded process serves another store, such as the one this \
+                 store was copied from)"
+            }
         }
     }
 
@@ -323,6 +331,20 @@ pub fn classify_liveness(
             DaemonPortProbe::OpenNotAccepting => DaemonLiveness::NotAccepting,
             DaemonPortProbe::Closed => DaemonLiveness::Unresponsive,
         },
+    }
+}
+
+/// Whether a daemon in this state can be asked what it is doing.
+fn activity_reachability(state: DaemonLiveness) -> crate::commands::daemon_activity::Reachability {
+    use crate::commands::daemon_activity::Reachability;
+    match state {
+        DaemonLiveness::Running => Reachability::Answering,
+        DaemonLiveness::NotAccepting
+        | DaemonLiveness::NotAnswering
+        | DaemonLiveness::Unresponsive => Reachability::NotAnswering,
+        DaemonLiveness::Stale | DaemonLiveness::NotRunning | DaemonLiveness::ServesAnotherStore => {
+            Reachability::Gone
+        }
     }
 }
 
@@ -998,6 +1020,19 @@ fn wait_after_escalation_refusal(
     }
 }
 
+/// Spend image-observation time only when recorded image evidence permits it.
+#[cfg(unix)]
+fn escalation_image_budget(
+    target: &AttributedStopTarget,
+    minimum: Duration,
+    observe_budget: impl FnOnce(u32, Duration) -> Duration,
+) -> Duration {
+    if target.expected_image().is_err() {
+        return minimum;
+    }
+    observe_budget(target.pid(), minimum)
+}
+
 /// Escalate only with the executable evidence recorded at publication (or the
 /// explicit uninstall-only installation proof). A name which happens to look
 /// like Kin is not signal authority. Retain one Linux pidfd across both stages.
@@ -1008,12 +1043,13 @@ fn escalate_to_recorded_pid(
     sigkill_wait: Duration,
     steps: &mut Vec<String>,
 ) -> Option<StopOutcome> {
-    // Executable observation consumes this stage's existing budget, rather
+    // With image authority, observation consumes this stage's budget, rather
     // than adding an unbounded read/hash before either wait. Preserve the full
     // TERM grace after delivery; observation reduces the final KILL wait. The
     // stage is never shorter than reading the recorded image takes on a loaded
     // machine, or a large image would be refused for its size alone.
-    let sigkill_wait = process_executable::observation_budget(target.pid(), sigkill_wait);
+    let sigkill_wait =
+        escalation_image_budget(target, sigkill_wait, process_executable::observation_budget);
     let deadline = Instant::now() + sigterm_wait.saturating_add(sigkill_wait);
     try_escalate_to_recorded_pid_until(target, sigterm_wait, deadline, steps)
         .or_else(|| wait_after_escalation_refusal(target, deadline, steps))
@@ -1147,7 +1183,7 @@ fn stop_worker_at(
             legacy_managed_identity(
                 legacy_install_root.context("legacy install root disappeared")?,
                 pid,
-                Some(kin_root.parent().unwrap_or(kin_root)),
+                Some(store_working_dir(kin_root).as_path()),
                 deadline.min(Instant::now() + Duration::from_secs(5)),
             )
             .with_context(|| format!("legacy worker attribution failed after: {error:#}"))?
@@ -1270,7 +1306,7 @@ fn canonical(path: &Path) -> String {
 // ── status ──────────────────────────────────────────────────────────────────
 
 /// `kin daemon status` — report the supervisor and every repo worker daemon.
-pub async fn status(json: bool) -> Result<()> {
+pub async fn status(json: bool, path: Option<&Path>) -> Result<()> {
     let (sup_pid, sup_port) = supervisor_recorded_endpoint();
     let sup_alive = sup_pid.map(is_process_alive).unwrap_or(false);
     let sup_port_probe = probe_recorded_port(sup_port);
@@ -1287,7 +1323,7 @@ pub async fn status(json: bool) -> Result<()> {
 
     // The current repo's own worker endpoint files, classified independently so a
     // stale local endpoint is visible even when the supervisor has pruned it.
-    let current = current_repo_status();
+    let current = current_repo_status(path);
     // Whether the supervisor's registry holds the current repository's daemon.
     // One started outside it is running all the same and is still reported.
     let supervised = current
@@ -1302,11 +1338,60 @@ pub async fn status(json: bool) -> Result<()> {
     let caller_home = caller_home_id();
 
     if json {
-        let daemons_json: Vec<_> = daemons
+        let states: Vec<DaemonLiveness> = daemons
             .iter()
             .map(|d| {
-                let alive = is_process_alive(d.pid);
-                let state = classify_liveness(Some(d.pid), alive, probe_daemon_port(d.port));
+                classify_liveness(
+                    Some(d.pid),
+                    is_process_alive(d.pid),
+                    probe_daemon_port(d.port),
+                )
+            })
+            .collect();
+        // Every daemon is asked at once, so the slowest one bounds the wait
+        // rather than their sum.
+        let reads: Vec<_> = daemons
+            .iter()
+            .zip(&states)
+            .map(|(d, state)| {
+                tokio::spawn(crate::commands::daemon_activity::read_activity(
+                    d.endpoint.clone(),
+                    d.repo_root.clone(),
+                    activity_reachability(*state),
+                ))
+            })
+            .collect();
+        let current_read = current.as_ref().map(|c| {
+            tokio::spawn(crate::commands::daemon_activity::read_activity(
+                c.port
+                    .map(|port| format!("http://127.0.0.1:{port}"))
+                    .unwrap_or_default(),
+                c.repo_root.clone(),
+                activity_reachability(c.state),
+            ))
+        });
+        // A read that panicked says nothing, and is reported as unknown.
+        let settle = |read: Result<_, tokio::task::JoinError>| {
+            read.unwrap_or_else(|_| {
+                crate::commands::daemon_activity::activity_without_health(
+                    crate::commands::daemon_activity::Reachability::NotAnswering,
+                    None,
+                )
+            })
+        };
+        let mut activities = Vec::with_capacity(reads.len());
+        for read in reads {
+            activities.push(settle(read.await));
+        }
+        let current_activity = match current_read {
+            Some(read) => Some(settle(read.await)),
+            None => None,
+        };
+        let daemons_json: Vec<_> = daemons
+            .iter()
+            .zip(states)
+            .zip(activities)
+            .map(|((d, state), activity)| {
                 serde_json::json!({
                     "repo_id": d.repo_id,
                     "display_name": d.display_name,
@@ -1317,6 +1402,7 @@ pub async fn status(json: bool) -> Result<()> {
                     "graph_entity_count": d.graph_entity_count,
                     "last_heartbeat_at": d.last_heartbeat_at,
                     "state": state.label(),
+                    "activity": activity,
                     "kin_home": d.kin_home,
                     "home_scope": home_scope_label(d.home_scope(&caller_home)),
                 })
@@ -1342,8 +1428,13 @@ pub async fn status(json: bool) -> Result<()> {
                 "port": c.port,
                 "pid_file": c.pid_file,
                 "port_file": c.port_file,
+                "store": c.store,
+                "layout": c.layout,
+                "lock_held": c.lock_held,
+                "daemon_binary": c.daemon_binary,
                 "serving_since_unix": c.serving_since_unix,
                 "supervised": supervised,
+                "activity": current_activity,
             })),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1430,35 +1521,70 @@ pub async fn status(json: bool) -> Result<()> {
 struct CurrentRepoStatus {
     label: String,
     repo_root: String,
+    /// The store this repository is served from, in whichever layout it is.
+    store: String,
+    /// `in-tree` for a store in the working tree's `.kin`, `outside-tree` for
+    /// one kept elsewhere (the central stores directory or `KIN_STORE`).
+    layout: &'static str,
+    /// Whether a daemon holds this store's lock right now. Only the daemon
+    /// serving this store can, so a recorded pid that is alive while this is
+    /// false belongs to some other store's daemon, such as the source of a
+    /// copied store.
+    lock_held: bool,
     state: DaemonLiveness,
     pid: Option<u32>,
     port: Option<u16>,
     pid_file: String,
     port_file: String,
+    /// The executable the serving daemon runs, read from the process, when
+    /// it serves this store.
+    daemon_binary: Option<String>,
     /// When the daemon began serving this store, from the serving record it
     /// publishes, and only when that record names the recorded pid.
     serving_since_unix: Option<u64>,
 }
 
-fn current_repo_status() -> Option<CurrentRepoStatus> {
-    let cwd = std::env::current_dir().ok()?;
-    let layout = kin_core::KinLayout::discover(&cwd)?;
+fn current_repo_status(path: Option<&Path>) -> Option<CurrentRepoStatus> {
+    let start = match path {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let layout = kin_core::KinLayout::discover(&start)?;
     let kin_root = layout.root();
-    let working_dir = kin_root.parent().unwrap_or(kin_root);
+    let working_dir = layout.working_dir();
     let (pid, port) = repo_daemon_recorded_endpoint(kin_root);
+    let lock_held = kin_core::layout::store_daemon_is_running(kin_root);
     let alive = pid.map(is_process_alive).unwrap_or(false);
-    let state = classify_liveness(pid, alive, probe_recorded_port(port));
+    // A live recorded pid while nothing holds this store's lock is another
+    // store's daemon, so this store has none.
+    let state = if alive && !lock_held {
+        DaemonLiveness::ServesAnotherStore
+    } else {
+        classify_liveness(pid, alive, probe_recorded_port(port))
+    };
     let serving_since_unix = kin_daemon_spawn::read_serving_daemon(kin_root)
         .filter(|serving| Some(serving.pid) == pid)
         .map(|serving| serving.at_unix);
+    let daemon_binary = pid
+        .filter(|_| alive && lock_held)
+        .and_then(crate::daemon_client::process_executable_path);
+    let layout_label = if kin_core::layout::is_in_tree_store_root(working_dir, kin_root) {
+        "in-tree"
+    } else {
+        "outside-tree"
+    };
     Some(CurrentRepoStatus {
         label: repo_label(working_dir),
         repo_root: canonical(working_dir),
+        store: canonical(kin_root),
+        layout: layout_label,
+        lock_held,
         state,
         pid,
         port,
         pid_file: repo_daemon_pid_path(kin_root).display().to_string(),
         port_file: repo_daemon_port_path(kin_root).display().to_string(),
+        daemon_binary,
         serving_since_unix,
     })
 }
@@ -1609,40 +1735,72 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Loud when no daemon answers, rather than quietly doing nothing: a command
 /// whose whole purpose is to make enrichment happen must never exit zero having
 /// enriched nothing.
-pub async fn sweep(no_wait: bool, json: bool, verbose: bool) -> Result<()> {
+///
+/// A repository whose own setting switches enrichment off is refused before any
+/// daemon is asked, in words that name the way to turn it on, rather than
+/// answered with a daemon's account of a sweep it was never going to run.
+/// `enable` is that way: it records the setting on, makes sure the daemon
+/// serving the repository started with it on, and then sweeps.
+pub async fn sweep(no_wait: bool, json: bool, verbose: bool, enable: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    let carried = CarriedSwitches::of_this_process();
+    let mut restarted = false;
+    if enable {
+        restarted = turn_enrichment_on(&layout, json, carried).await?;
+    } else if !kin_core::enrichment_setting::repository_enabled(&layout) {
+        bail!("{}", enrichment_off_for_repository_refusal());
+    }
     // A person at a terminal gets one live line and one row; `--json`,
     // `--verbose`, a pipe and CI keep the daemon's own words and a line per
     // file.
     let view = (!json && crate::screen::short_form(verbose))
         .then(|| crate::first_run::Screen::new(crate::screen::Style::for_stdout()));
-    let base_url = crate::daemon_client::resolve_daemon_url(&layout)
-        .await?
-        .ok_or_else(|| crate::daemon_client::daemon_required_error("daemon sweep", &layout))?;
-    // FOR_LAYOUT, because the plain constructor resolves the bearer token from
-    // the PROCESS working directory. This command is about the repository the
-    // layout names, and its `.kin` is where that daemon's token lives.
-    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, &layout)?;
-
-    let queued = client
-        .queue_lsp_sweep()
-        .await
-        .context("ask the daemon for a language-server sweep")?;
+    let (mut client, mut asked) = ask_for_sweep(&layout, no_wait).await?;
+    // A daemon keeps the enrichment setting it started with. Asked to turn
+    // enrichment on, a command that finds the daemon serving this repository
+    // switched off for a cause a restart from here lifts, such as a daemon
+    // started before the setting was recorded on, or one another command
+    // started with a switch this one does not carry, restarts it once. A cause
+    // a restart would bring straight back, a switch this command carries or a
+    // graph-only store, is left to the refusal below, which names it and its
+    // way out, so `--enable` never sends its reader round again.
+    if enable && !restarted {
+        if let Some(off) = asked.switched_off {
+            if restart_lifts(off.by, carried) {
+                stop_current_repo_quiet(layout.root())
+                    .await
+                    .context("stop the daemon that started with enrichment off")?;
+                (client, asked) = ask_for_sweep(&layout, no_wait).await?;
+                restarted = true;
+            }
+        }
+    }
+    let SweepAsked {
+        answer: queued,
+        switched_off,
+    } = asked;
 
     // The daemon's own words, not a paraphrase. `status` distinguishes a sweep
     // this call queued from one that was already running, and
     // `enrichment_available` is false on a daemon that found no language
-    // server, which is a different problem with a different fix.
+    // server, which is a different problem with a different fix. A daemon
+    // switched off runs no sweep, so no sentence says it started one.
     if json {
         println!("{}", serde_json::to_string_pretty(&queued)?);
-    } else if view.is_none() {
-        println!("daemon: {queued}");
+    } else if view.is_none() && switched_off.is_none() {
+        println!("{}", sweep_started_words(&queued));
     }
 
+    if let Some(off) = switched_off {
+        bail!(
+            "{}",
+            switched_off_daemon_refusal(off.by, carried, restarted)
+        );
+    }
     if queued.get("enrichment_available").and_then(|v| v.as_bool()) == Some(false) {
         bail!(
-            "this daemon found no language server, so it can produce no cross-file reference \
-             edges. Install one with `kin doctor --fix --install-language-servers`, then \
+            "this daemon found no language server, so it cannot link references across files. \
+             Install one with `kin doctor --fix --install-language-servers`, then \
              `kin daemon stop` and run this again."
         );
     }
@@ -1672,6 +1830,313 @@ pub async fn sweep(no_wait: bool, json: bool, verbose: bool) -> Result<()> {
         screen.facts().servers = servers;
     }
     wait_for_sweep(&client, baseline, json, view.as_ref()).await
+}
+
+/// Resolve this repository's daemon, starting one when none serves it, and ask
+/// it for a sweep.
+async fn ask_for_sweep(
+    layout: &kin_core::KinLayout,
+    no_wait: bool,
+) -> Result<(crate::daemon_client::DaemonClient, SweepAsked)> {
+    let base_url = crate::daemon_client::resolve_daemon_url(layout)
+        .await?
+        .ok_or_else(|| crate::daemon_client::daemon_required_error("daemon sweep", layout))?;
+    // FOR_LAYOUT, because the plain constructor resolves the bearer token from
+    // the PROCESS working directory. This command is about the repository the
+    // layout names, and its `.kin` is where that daemon's token lives.
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)?;
+
+    // A waiting command names itself, so a daemon asked to retire stays up
+    // until this command has read the status that says the sweep ended.
+    let answered = if no_wait {
+        client.queue_lsp_sweep().await
+    } else {
+        client.queue_lsp_sweep_waiting().await
+    };
+    let asked = match answered {
+        Ok(answer) => SweepAsked {
+            switched_off: SwitchedOffAnswer::read(&answer),
+            answer,
+        },
+        Err(error) => {
+            let refused = error
+                .downcast_ref::<crate::daemon_client::SweepRefusal>()
+                .and_then(|refused| {
+                    SwitchedOffAnswer::from_refusal(&refused.refusal)
+                        .map(|off| (refused.refusal.clone(), off))
+                });
+            match refused {
+                Some((answer, off)) => SweepAsked {
+                    answer,
+                    switched_off: Some(off),
+                },
+                None => return Err(error.context("ask the daemon for a language-server sweep")),
+            }
+        }
+    };
+    Ok((client, asked))
+}
+
+/// A daemon's answer to a sweep request, and whether it says enrichment is
+/// switched off.
+///
+/// A daemon whose checkout may not change its graph refuses the request
+/// instead of answering it. That refusal is read as switched off, with the
+/// cause it names, and it is the answer `--json` prints, in the daemon's own
+/// words.
+struct SweepAsked {
+    answer: serde_json::Value,
+    switched_off: Option<SwitchedOffAnswer>,
+}
+
+/// Record that enrichment is on for this repository, and stop the daemon
+/// serving it, which started while it was off. Answers whether a daemon was
+/// stopped, so the caller does not stop the next one again.
+///
+/// A daemon reads the setting once, when it starts, so recording it reaches
+/// only daemons that start afterwards. The one serving the repository now is
+/// stopped through the same path `kin daemon stop` takes, by the process the
+/// store records as serving it, and the sweep below starts the next. A command
+/// carrying a switch that keeps every daemon it starts switched off says so
+/// here instead, because the daemon it would start is switched off too.
+async fn turn_enrichment_on(
+    layout: &kin_core::KinLayout,
+    json: bool,
+    carried: CarriedSwitches,
+) -> Result<bool> {
+    let changed = kin_core::enrichment_setting::record(layout, true)
+        .context("record that language-server enrichment is on for this repository")?;
+    if !changed {
+        return Ok(false);
+    }
+    if !json {
+        eprintln!("Language-server enrichment is now on for this repository.");
+    }
+    if carried.any() {
+        bail!(
+            "Language-server enrichment is on for this repository now, but {}",
+            carried_switches_way_out(carried)
+        );
+    }
+    stop_current_repo_quiet(layout.root())
+        .await
+        .context("stop the daemon that started with enrichment off")?;
+    Ok(true)
+}
+
+/// What `kin daemon sweep` says on a repository whose own setting switches
+/// enrichment off.
+pub(crate) fn enrichment_off_for_repository_refusal() -> String {
+    format!(
+        "{}, so no daemon runs a sweep for it. `{}` turns it on and sweeps.",
+        capitalized(kin_core::enrichment_setting::OFF_FOR_REPOSITORY),
+        kin_core::enrichment_setting::TURN_ON_COMMAND
+    )
+}
+
+/// The environment switches this process carries. Every daemon it starts
+/// inherits them, so each one keeps that daemon's enrichment off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CarriedSwitches {
+    /// `KIN_DAEMON_DISABLE_LSP`.
+    enrichment: bool,
+    /// `KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE`.
+    filesystem_reconcile: bool,
+}
+
+impl CarriedSwitches {
+    fn of_this_process() -> Self {
+        Self {
+            enrichment: kin_daemon_spawn::enrichment_disabled(),
+            filesystem_reconcile: kin_daemon_spawn::filesystem_reconcile_disabled(),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.enrichment || self.filesystem_reconcile
+    }
+
+    /// The switches, as `NAME=1`, joined for a sentence.
+    fn named(self) -> String {
+        let mut names = Vec::new();
+        if self.enrichment {
+            names.push(format!("`{}=1`", kin_daemon_spawn::DISABLE_ENRICHMENT_ENV));
+        }
+        if self.filesystem_reconcile {
+            names.push(format!(
+                "`{}=1`",
+                kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV
+            ));
+        }
+        names.join(" and ")
+    }
+}
+
+/// The way out for a command whose own switches keep every daemon it starts
+/// switched off, as the end of a sentence.
+fn carried_switches_way_out(carried: CarriedSwitches) -> String {
+    let (it, carries) = if carried.enrichment && carried.filesystem_reconcile {
+        ("them", "which switch")
+    } else {
+        ("it", "which switches")
+    };
+    format!(
+        "this command carries {}, {carries} enrichment off for every daemon it starts. Unset \
+         {it}, run `kin daemon stop`, and run `kin daemon sweep`.",
+        carried.named()
+    )
+}
+
+/// A daemon's answer that its enrichment is switched off, with the cause when
+/// it names one. A daemon older than the cause field names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwitchedOffAnswer {
+    by: Option<kin_daemon_spawn::EnrichmentSwitchedOffBy>,
+}
+
+impl SwitchedOffAnswer {
+    /// Read from a daemon's refusal of a sweep request, or `None` when the
+    /// refusal is not that its checkout may not change its graph. A daemon
+    /// older than the cause field names neither of the two causes that refuse
+    /// this way, a graph-only store and the filesystem-reconcile switch.
+    fn from_refusal(refusal: &serde_json::Value) -> Option<Self> {
+        (refusal.get("error")?.as_str()? == "filesystem_admission_disabled").then(|| Self {
+            by: refusal
+                .get("switched_off_by")
+                .and_then(|cause| cause.as_str())
+                .and_then(kin_daemon_spawn::EnrichmentSwitchedOffBy::from_wire),
+        })
+    }
+
+    /// Read from a daemon's answer to a sweep request, or `None` when the
+    /// answer does not say enrichment is switched off, as opposed to having
+    /// found no language server.
+    fn read(queued: &serde_json::Value) -> Option<Self> {
+        let unavailable = queued.get("enrichment_unavailable")?;
+        (unavailable.get("reason")?.as_str()? == "enrichment_disabled").then(|| Self {
+            by: unavailable
+                .get("switched_off_by")
+                .and_then(|cause| cause.as_str())
+                .and_then(kin_daemon_spawn::EnrichmentSwitchedOffBy::from_wire),
+        })
+    }
+}
+
+/// Whether stopping a daemon switched off for `by` and starting another from
+/// this process gives a daemon that enriches.
+///
+/// Never for a graph-only store, whoever starts its daemon, and never while
+/// this process carries a switch, which the next daemon inherits. Otherwise
+/// yes: the repository setting is on by the time this is asked, and a switch
+/// this process does not carry came from whichever command started the daemon.
+fn restart_lifts(
+    by: Option<kin_daemon_spawn::EnrichmentSwitchedOffBy>,
+    carried: CarriedSwitches,
+) -> bool {
+    by != Some(kin_daemon_spawn::EnrichmentSwitchedOffBy::GraphOnlyStore) && !carried.any()
+}
+
+/// What `kin daemon sweep` says when the daemon serving the repository has
+/// enrichment switched off, naming the cause the daemon gave and the way out
+/// that cause has.
+///
+/// `restarted` is whether this command already stopped a daemon and started
+/// this one, so a cause a restart could have lifted is one that came back.
+/// Only the repository's own setting is turned on with
+/// `kin daemon sweep --enable`, and that is named only where running it would
+/// change the answer: telling a reader to run it again over a switch or a
+/// graph-only store is how this command used to send them round in a loop.
+fn switched_off_daemon_refusal(
+    by: Option<kin_daemon_spawn::EnrichmentSwitchedOffBy>,
+    carried: CarriedSwitches,
+    restarted: bool,
+) -> String {
+    use kin_daemon_spawn::EnrichmentSwitchedOffBy as Cause;
+    let switch_way_out = |name: &str, what: &str| {
+        if restarted {
+            format!(
+                "this command restarted the daemon serving this repository, and it came back \
+                 with language-server enrichment switched off by `{name}=1`{what}, so another \
+                 command carrying that switch started it first, such as an editor or an MCP \
+                 server configured with it. Remove the switch from that command's environment, \
+                 then run `kin daemon stop` and `kin daemon sweep`."
+            )
+        } else {
+            format!(
+                "the daemon serving this repository was started by a command carrying \
+                 `{name}=1`{what}, so its language-server enrichment is switched off, and a \
+                 daemon keeps the switches it started with. Run `kin daemon stop`, then \
+                 `kin daemon sweep` from a command without the switch."
+            )
+        }
+    };
+    match by {
+        Some(Cause::GraphOnlyStore) => "the daemon serving this repository holds a graph-only \
+                                        store, whose graph is its only write authority, so no \
+                                        language server may add relations to it and no daemon \
+                                        that serves it runs a sweep. Language-server enrichment \
+                                        does not run on a graph-only store, so there is nothing \
+                                        here to turn on."
+            .to_string(),
+        _ if carried.any() => format!(
+            "the daemon serving this repository has language-server enrichment switched off, \
+             and {}",
+            carried_switches_way_out(carried)
+        ),
+        Some(Cause::EnrichmentSwitch) => {
+            switch_way_out(kin_daemon_spawn::DISABLE_ENRICHMENT_ENV, "")
+        }
+        Some(Cause::FilesystemReconcileSwitch) => switch_way_out(
+            kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV,
+            ", which keeps the checkout from changing the graph",
+        ),
+        Some(Cause::RepositorySetting) if restarted => format!(
+            "this command turned language-server enrichment on for this repository and \
+             restarted its daemon, and the daemon still read enrichment as off for this \
+             repository, so another command switched it off again in between, such as a \
+             `kin init --no-enrich`. Nothing was swept. Once that command has finished, `{}` \
+             turns it on.",
+            kin_core::enrichment_setting::TURN_ON_COMMAND
+        ),
+        Some(Cause::RepositorySetting) => format!(
+            "the daemon serving this repository started while language-server enrichment was \
+             off for this repository, and a daemon keeps the setting it started with. `{}` \
+             restarts it with enrichment on and sweeps.",
+            kin_core::enrichment_setting::TURN_ON_COMMAND
+        ),
+        None if restarted => format!(
+            "this command restarted the daemon serving this repository, and it came back with \
+             language-server enrichment switched off without saying why, as a daemon older \
+             than this command does. A graph-only store keeps it off, and so does `{}=1` or \
+             `{}=1` in the environment of whatever started it; `kin doctor` shows which build \
+             is serving.",
+            kin_daemon_spawn::DISABLE_ENRICHMENT_ENV,
+            kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV
+        ),
+        None => "the daemon serving this repository was started with language-server \
+                 enrichment switched off, and a daemon keeps the setting it started with. Run \
+                 `kin daemon stop`, then run this again."
+            .to_string(),
+    }
+}
+
+fn capitalized(clause: &str) -> String {
+    let mut chars = clause.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// What the daemon said about the sweep this command asked for, in a sentence.
+fn sweep_started_words(queued: &serde_json::Value) -> String {
+    match queued.get("status").and_then(|status| status.as_str()) {
+        Some("sweep_already_running") => {
+            "A sweep is already running, so this command will wait for it.".to_string()
+        }
+        Some("sweep_queued") => "Started a sweep to link references across files.".to_string(),
+        _ => "Asked the daemon to link references across files.".to_string(),
+    }
 }
 
 /// The language servers installed for this repository's languages, by name.
@@ -1706,7 +2171,7 @@ async fn wait_for_sweep(
     view: Option<&crate::first_run::Screen>,
 ) -> Result<()> {
     wait_for_sweep_with(
-        || client.lsp_sweep_status(),
+        || client.lsp_sweep_status_waiting(),
         baseline,
         SWEEP_WAIT_BUDGET,
         SWEEP_POLL_INTERVAL,
@@ -1751,7 +2216,7 @@ where
             Some(_) => {}
             None if done > last_reported && !json => {
                 last_reported = done;
-                println!("  enriched {done}/{total} files");
+                println!("  checked {done} of {total} files");
             }
             None => {}
         }
@@ -1805,7 +2270,7 @@ where
                 );
                 // The leading indent belongs to the note block `kin init` prints
                 // this under. Continuation lines keep their own.
-                println!("{}", line.trim_start());
+                println!("{}", crate::plain_words::text(line.trim_start()));
             }
             return Ok(());
         }
@@ -2110,7 +2575,12 @@ async fn stop_current_repo_outcome(
     // daemon the conversion phase had started was left running. The next daemon
     // on that repository then refused to start because one already owned it.
     let layout = match kin_root {
-        Some(root) => kin_core::KinLayout::discover(root),
+        // A maintenance caller already names the store itself. Discovery
+        // starts in a working tree, which an external store is not inside.
+        Some(root) => root
+            .join("manifest.json")
+            .is_file()
+            .then(|| kin_core::KinLayout::new(root.to_path_buf())),
         None => kin_core::KinLayout::discover(&std::env::current_dir()?),
     };
     let Some(layout) = layout else {
@@ -2120,7 +2590,7 @@ async fn stop_current_repo_outcome(
         );
     };
     let kin_root = layout.root().to_path_buf();
-    let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
+    let working_dir = layout.working_dir().to_path_buf();
     let label = repo_label(&working_dir);
 
     let pid = match resolve_repo_worker(&kin_root, &working_dir).await? {
@@ -2431,7 +2901,7 @@ async fn stop_all_inner(
 
     for daemon in daemons {
         let label = daemon_label(&daemon);
-        let kin_root = Path::new(&daemon.repo_root).join(".kin");
+        let kin_root = worker_store_root(Path::new(&daemon.repo_root));
         let mut steps = Vec::new();
         let outcome = match mode {
             StopMode::Now => stop_worker_at(
@@ -2477,7 +2947,7 @@ async fn stop_all_inner(
                         )
                     })
                 {
-                    let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
+                    let working_dir = store_working_dir(&kin_root);
                     reports.push(LocalWorker::busy_report(
                         *pid,
                         reason.clone(),
@@ -2492,7 +2962,7 @@ async fn stop_all_inner(
                     foreign.iter().map(|skipped| skipped.pid),
                 );
                 if may_stop && is_process_alive(pid) {
-                    let working_dir = kin_root.parent().unwrap_or(&kin_root).to_path_buf();
+                    let working_dir = store_working_dir(&kin_root);
                     let mut steps = Vec::new();
                     let outcome = match mode {
                         StopMode::Now => stop_worker_at(
@@ -2662,6 +3132,17 @@ impl StopDisclosure {
             println!("  Supervisor left running: it is shared with the daemons above.");
         }
     }
+}
+
+/// The store a worker daemon serving the working tree `repo_root` uses, in the
+/// tree or kept outside it.
+fn worker_store_root(repo_root: &Path) -> PathBuf {
+    kin_core::layout::store_root_for(repo_root)
+}
+
+/// The working tree the store at `kin_root` serves.
+fn store_working_dir(kin_root: &Path) -> PathBuf {
+    kin_core::layout::working_dir_of_store(kin_root).unwrap_or_else(|| kin_root.to_path_buf())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2871,7 +3352,7 @@ pub(crate) fn stop_install_owned_daemons_for_update(install_root: &Path) -> Resu
         let mut steps = Vec::new();
         let (kind, label, outcome, preserved_endpoint) = match &process.kind {
             ManagedDaemonKind::Worker { repo_root } => {
-                let kin_root = repo_root.join(".kin");
+                let kin_root = worker_store_root(repo_root);
                 let outcome = stop_worker_identity(&kin_root, &target, remaining_budget(deadline));
                 let outcome = escalate_if_unstopped(&target, outcome, &mut steps);
                 let preserved = retire_worker_endpoint(&kin_root, &outcome, &mut steps);
@@ -2922,7 +3403,7 @@ fn install_owned_stop_target(
     };
     let (published, owner_path) = match repo_root {
         Some(root) => {
-            let kin_root = root.join(".kin");
+            let kin_root = worker_store_root(root);
             (
                 attributed_worker_identity(&kin_root, pid),
                 repo_daemon_owner_path(&kin_root),
@@ -2987,7 +3468,7 @@ fn stop_install_owned_daemons(
             }
             match process.kind {
                 ManagedDaemonKind::Worker { repo_root } => {
-                    let kin_root = repo_root.join(".kin");
+                    let kin_root = worker_store_root(&repo_root);
                     let mut steps = Vec::new();
                     let outcome = stop_worker_at(
                         &kin_root,
@@ -3218,7 +3699,199 @@ fn finish_stop_with_output(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_queued_sweep_is_announced_in_a_sentence() {
+        let running = sweep_started_words(&serde_json::json!({"status": "sweep_already_running"}));
+        assert!(
+            running.starts_with("A sweep is already running"),
+            "{running}"
+        );
+        let started = sweep_started_words(&serde_json::json!({"status": "sweep_queued"}));
+        assert!(started.starts_with("Started a sweep"), "{started}");
+        assert!(!started.contains('{') && !running.contains('{'));
+    }
     use super::*;
+
+    /// A switched-off answer is read with its cause, an older daemon's answer
+    /// without one still reads as switched off, and an answer about a missing
+    /// language server is not mistaken for either.
+    #[test]
+    fn a_switched_off_answer_is_read_with_the_cause_it_names() {
+        use kin_daemon_spawn::EnrichmentSwitchedOffBy as Cause;
+        let answer = |unavailable: serde_json::Value| {
+            SwitchedOffAnswer::read(&serde_json::json!({
+                "status": "sweep_queued",
+                "enrichment_available": false,
+                "enrichment_unavailable": unavailable,
+            }))
+        };
+        for cause in Cause::ALL {
+            assert_eq!(
+                answer(serde_json::json!({
+                    "reason": "enrichment_disabled",
+                    "detail": "off",
+                    "switched_off_by": cause.wire(),
+                })),
+                Some(SwitchedOffAnswer { by: Some(cause) })
+            );
+        }
+        assert_eq!(
+            answer(serde_json::json!({"reason": "enrichment_disabled", "detail": "off"})),
+            Some(SwitchedOffAnswer { by: None }),
+            "a daemon older than the cause field is still switched off"
+        );
+        assert_eq!(
+            answer(serde_json::json!({"reason": "no_language_server", "detail": "none"})),
+            None
+        );
+        assert_eq!(
+            SwitchedOffAnswer::read(&serde_json::json!({"status": "sweep_queued"})),
+            None
+        );
+
+        // A daemon whose checkout may not change its graph refuses instead,
+        // and the refusal is read the same way.
+        let refusal = |cause: Option<&str>| {
+            let mut refusal = serde_json::json!({
+                "error": "filesystem_admission_disabled",
+                "endpoint": "/lsp/sweep",
+                "mutation_applied": false,
+                "configuration": "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE",
+            });
+            if let Some(cause) = cause {
+                refusal["switched_off_by"] = serde_json::json!(cause);
+            }
+            SwitchedOffAnswer::from_refusal(&refusal)
+        };
+        assert_eq!(
+            refusal(Some("graph_only_store")),
+            Some(SwitchedOffAnswer {
+                by: Some(Cause::GraphOnlyStore)
+            })
+        );
+        assert_eq!(
+            refusal(Some("filesystem_reconcile_switch")),
+            Some(SwitchedOffAnswer {
+                by: Some(Cause::FilesystemReconcileSwitch)
+            })
+        );
+        assert_eq!(refusal(None), Some(SwitchedOffAnswer { by: None }));
+        assert_eq!(
+            SwitchedOffAnswer::from_refusal(&serde_json::json!({"error": "read_only_session"})),
+            None
+        );
+    }
+
+    /// `--enable` restarts a switched-off daemon only when the daemon this
+    /// process would start enriches: never over a graph-only store, never
+    /// while this process carries a switch, and otherwise yes.
+    #[test]
+    fn enable_restarts_only_where_a_restart_turns_enrichment_on() {
+        use kin_daemon_spawn::EnrichmentSwitchedOffBy as Cause;
+        let clean = CarriedSwitches::default();
+        for by in Cause::ALL.map(Some).into_iter().chain([None]) {
+            assert_eq!(
+                restart_lifts(by, clean),
+                by != Some(Cause::GraphOnlyStore),
+                "{by:?}"
+            );
+            for carried in [
+                CarriedSwitches {
+                    enrichment: true,
+                    filesystem_reconcile: false,
+                },
+                CarriedSwitches {
+                    enrichment: false,
+                    filesystem_reconcile: true,
+                },
+            ] {
+                assert!(!restart_lifts(by, carried), "{by:?} {carried:?}");
+            }
+        }
+    }
+
+    /// The loop this replaces: `kin daemon sweep --enable` restarted a daemon
+    /// that came back switched off, and the refusal told its reader to run
+    /// `kin daemon sweep --enable` again. Wherever running it again would
+    /// change nothing, the refusal now names the cause and a different way
+    /// out. The one exception is a repository setting switched off again
+    /// between this command's record and its restart, a race whose way out is
+    /// that command.
+    #[test]
+    fn a_refusal_never_sends_its_reader_round_to_enable_again() {
+        use kin_daemon_spawn::EnrichmentSwitchedOffBy as Cause;
+        let carries = [
+            CarriedSwitches::default(),
+            CarriedSwitches {
+                enrichment: true,
+                filesystem_reconcile: false,
+            },
+            CarriedSwitches {
+                enrichment: false,
+                filesystem_reconcile: true,
+            },
+            CarriedSwitches {
+                enrichment: true,
+                filesystem_reconcile: true,
+            },
+        ];
+        for by in Cause::ALL.map(Some).into_iter().chain([None]) {
+            for carried in carries {
+                for restarted in [false, true] {
+                    let refusal = switched_off_daemon_refusal(by, carried, restarted);
+                    let offers_enable = refusal.contains("kin daemon sweep --enable");
+                    let enable_would_change_it = !restarted && restart_lifts(by, carried);
+                    let race = restarted && by == Some(Cause::RepositorySetting) && !carried.any();
+                    assert!(
+                        !offers_enable || enable_would_change_it || race,
+                        "{by:?} {carried:?} restarted={restarted}: {refusal}"
+                    );
+                    assert!(!refusal.contains("file"), "{refusal}");
+                    let names = match by {
+                        Some(Cause::GraphOnlyStore) => "graph-only".to_string(),
+                        _ if carried.enrichment => kin_daemon_spawn::DISABLE_ENRICHMENT_ENV.into(),
+                        _ if carried.filesystem_reconcile => {
+                            kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV.into()
+                        }
+                        Some(Cause::EnrichmentSwitch) => {
+                            kin_daemon_spawn::DISABLE_ENRICHMENT_ENV.into()
+                        }
+                        Some(Cause::FilesystemReconcileSwitch) => {
+                            kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV.into()
+                        }
+                        Some(Cause::RepositorySetting) => "off for this repository".into(),
+                        None if restarted => "graph-only".into(),
+                        None => "kin daemon stop".into(),
+                    };
+                    assert!(
+                        refusal.contains(&names),
+                        "{by:?} {carried:?} restarted={restarted} must name {names}: {refusal}"
+                    );
+                }
+            }
+        }
+        // Both switches carried are both named, and both are to be unset.
+        let both = switched_off_daemon_refusal(Some(Cause::EnrichmentSwitch), carries[3], false);
+        assert!(
+            both.contains(kin_daemon_spawn::DISABLE_ENRICHMENT_ENV)
+                && both.contains(kin_daemon_spawn::DISABLE_FILESYSTEM_RECONCILE_ENV)
+                && both.contains("Unset them"),
+            "{both}"
+        );
+    }
+
+    /// The plain refusal on a repository switched off by its own setting names
+    /// the setting and the one command that turns it on.
+    #[test]
+    fn the_plain_refusal_names_the_setting_and_enable() {
+        let refusal = enrichment_off_for_repository_refusal();
+        assert!(
+            refusal.starts_with("Language-server enrichment is off for this repository"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("`kin daemon sweep --enable`"), "{refusal}");
+    }
 
     fn stop_report(preserved: Option<PreservedDaemonEndpoint>) -> StopReport {
         StopReport {
@@ -3442,6 +4115,37 @@ mod tests {
         assert!(!refused.is_wedged(), "{}", refused.label());
     }
 
+    /// Status for a repository by its path names its store, layout and lock in
+    /// either layout. A copied in-tree store whose endpoint files name a live
+    /// process that holds no lock of this store reads as served by nothing:
+    /// that process is some other store's daemon, such as the copy's source.
+    #[test]
+    fn status_names_the_store_and_reads_a_copys_borrowed_endpoint_as_not_running() {
+        let repo = tempfile::tempdir().unwrap();
+        let kin_root = repo.path().join(".kin");
+        std::fs::create_dir_all(kin_root.join("kindb")).unwrap();
+        std::fs::write(kin_root.join("version"), "1").unwrap();
+        std::fs::write(kin_root.join("manifest.json"), "{}").unwrap();
+        let status = current_repo_status(Some(repo.path())).expect("a store");
+        assert_eq!(status.layout, "in-tree");
+        assert_eq!(
+            status.store,
+            kin_root.canonicalize().unwrap().display().to_string()
+        );
+        assert!(!status.lock_held);
+        assert_eq!(status.state, DaemonLiveness::NotRunning);
+        assert_eq!(status.daemon_binary, None);
+
+        // The endpoint files a copy carries: a live pid (this test's own
+        // process) that holds no lock of this store.
+        std::fs::write(kin_root.join("daemon.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(kin_root.join("daemon.port"), "1").unwrap();
+        let status = current_repo_status(Some(repo.path())).expect("a store");
+        assert!(!status.lock_held);
+        assert_eq!(status.state, DaemonLiveness::ServesAnotherStore);
+        assert_eq!(status.daemon_binary, None);
+    }
+
     /// A wedged daemon's line still names the pid and port, because those are
     /// what the operator acts on.
     #[test]
@@ -3449,6 +4153,10 @@ mod tests {
         let current = CurrentRepoStatus {
             label: "cli90".to_string(),
             repo_root: "/work/cli90".to_string(),
+            store: "/work/cli90/.kin".to_string(),
+            layout: "in-tree",
+            lock_held: true,
+            daemon_binary: None,
             state: DaemonLiveness::NotAccepting,
             pid: Some(99108),
             port: Some(63357),
@@ -3474,6 +4182,10 @@ mod tests {
         let current = CurrentRepoStatus {
             label: "kin".to_string(),
             repo_root: "/work/kin".to_string(),
+            store: "/work/kin/.kin".to_string(),
+            layout: "in-tree",
+            lock_held: true,
+            daemon_binary: None,
             state: DaemonLiveness::Running,
             pid: Some(12538),
             port: Some(56698),
@@ -4133,6 +4845,56 @@ mod tests {
         assert!(process_identity_is_current(&target).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn image_observation_budget_requires_published_or_install_authority() {
+        let identity: ProcessIdentity = serde_json::from_value(serde_json::json!({
+            "pid": 4242,
+            "boot_id": "budget-test-boot",
+            "birth_token": "budget-test-incarnation",
+        }))
+        .unwrap();
+        let target = AttributedStopTarget::published(EndpointOwnerRecord::for_identity(identity));
+        assert!(target.expected_image().is_err());
+        let minimum = Duration::ZERO;
+        assert_eq!(
+            escalation_image_budget(&target, minimum, |_, _| {
+                panic!("an incarnation-only target must not observe or budget its live image")
+            }),
+            minimum,
+        );
+
+        // A large image keeps its full allowance when publication or explicit
+        // installation ownership authorizes observing it. No process or image
+        // is read: the injected allowance represents the Linux size floor.
+        let image = ExecutableIdentity::LinuxProcExeSha256V1 {
+            device: 1,
+            inode: 1,
+            sha256: "0".repeat(64),
+        };
+        image.validate().unwrap();
+        let mut owner = serde_json::to_value(&target.owner).unwrap();
+        owner["executable"] = serde_json::to_value(&image).unwrap();
+        let published = AttributedStopTarget::published(serde_json::from_value(owner).unwrap());
+        let mut installed = target;
+        installed.selected_install_image = Some(image);
+        let large_image_budget = Duration::from_secs(32);
+        for authorized in [published, installed] {
+            assert!(authorized.expected_image().is_ok());
+            let mut observations = 0;
+            assert_eq!(
+                escalation_image_budget(&authorized, minimum, |pid, requested| {
+                    observations += 1;
+                    assert_eq!(pid, 4242);
+                    assert_eq!(requested, minimum);
+                    large_image_budget
+                }),
+                large_image_budget,
+            );
+            assert_eq!(observations, 1);
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn incarnation_only_drain_fixture() -> (OwnedTestChild, AttributedStopTarget) {
         // This owned native child finishes successfully only when its input
@@ -4230,6 +4992,14 @@ mod tests {
     fn a_live_unsignalable_daemon_preserves_its_failure_at_the_deadline() {
         let (mut child, target) = incarnation_only_drain_fixture();
         let window = Duration::from_millis(80);
+        // A loaded CI host can stall the 50 ms polls and the identity reads
+        // around them for seconds, so the ceiling is not a latency budget. It
+        // only has to tell a wait bounded by this window from one that spends
+        // a production budget instead: the 25 s TERM grace, or the Linux
+        // image-observation budget, which ran 33 s when it was applied to a
+        // target without image authority.
+        let ceiling = Duration::from_secs(10);
+        assert!(ceiling < ESCALATION_SIGTERM_WAIT);
         for original in [
             StopOutcome::SignalFailed("cooperative listener closed".into()),
             StopOutcome::Timeout,
@@ -4238,13 +5008,14 @@ mod tests {
             let mut steps = Vec::new();
             let outcome = escalate_to_recorded_pid(&target, window, Duration::ZERO, &mut steps)
                 .unwrap_or_else(|| original.clone());
+            let elapsed = started.elapsed();
             assert!(
-                started.elapsed() >= window,
-                "the passive wait returned early"
+                elapsed >= window,
+                "the passive wait returned early, after {elapsed:?}"
             );
             assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "the passive wait exceeded its bounded window"
+                elapsed < ceiling,
+                "the passive wait ran {elapsed:?}, past its {window:?} window: {steps:?}"
             );
             assert_eq!(outcome, original, "{steps:?}");
             assert!(process_identity_is_current(&target).unwrap());

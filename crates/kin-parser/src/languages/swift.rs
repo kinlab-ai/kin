@@ -12,6 +12,10 @@ use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
     ParseOutput,
 };
+use crate::nested::{
+    local_scope_name, LocalScopeNames, NestedDefinitionCensus, UnadmittedNestedDefinition,
+};
+use crate::value_origins::swift::{SwiftFileTypes, SwiftScopeReader};
 
 pub struct SwiftAdapter;
 
@@ -34,6 +38,14 @@ impl LanguageAdapter for SwiftAdapter {
             })
     }
 
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::swift_declarations::census(tree, source))
+    }
+
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         let error_ranges = collect_error_ranges(tree);
         let parse_state = if error_ranges.is_empty() {
@@ -46,10 +58,21 @@ impl LanguageAdapter for SwiftAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let root = tree.root_node();
+        let types = SwiftFileTypes::read(root, source);
+        let mut nested = SwiftNestedState::default();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            extract_swift_node(&child, source, file_id, None, &mut entities, &mut relations);
+            extract_swift_node(
+                &child,
+                source,
+                file_id,
+                &types,
+                None,
+                &mut entities,
+                &mut relations,
+                &mut nested,
+            );
             if child.kind() == "import_declaration" {
                 if let Some(file_import) = extract_swift_import(&child, source) {
                     imports.push(file_import);
@@ -76,6 +99,30 @@ impl LanguageAdapter for SwiftAdapter {
                     ),
                 );
             }
+        }
+
+        // Calls no callable's walk reached (top-level code, a global or stored
+        // property's initializer, a closure passed there) go to the innermost
+        // entity holding each one: the property, else the type, else the
+        // file's module surface.
+        {
+            let accounted = crate::call_owner::accounted_call_sites(&relations);
+            let mut swept = Vec::new();
+            let reader = SwiftScopeReader::for_callable(root, source, None, &types);
+            let scope = CallScope {
+                owner: None,
+                reader: &reader,
+                types: &types,
+            };
+            collect_calls(
+                &root,
+                source,
+                "",
+                &scope,
+                &NestedCalls::default(),
+                &mut swept,
+            );
+            crate::call_owner::adopt_unowned_calls(&entities, &accounted, swept, &mut relations);
         }
 
         // Build import lookup: local_name -> module_path
@@ -119,6 +166,10 @@ impl LanguageAdapter for SwiftAdapter {
             }
         }
 
+        // The unit's module owns what is declared at its top.
+        let held = crate::module_contains::module_contains(&entities, &relations, file_id);
+        relations.extend(held);
+
         Ok(ParseOutput {
             derived_members: Vec::new(),
             entities,
@@ -127,17 +178,21 @@ impl LanguageAdapter for SwiftAdapter {
             tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: Some(nested.census),
         })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_swift_node(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
+    types: &SwiftFileTypes,
     class_ctx: Option<&str>,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    nested: &mut SwiftNestedState,
 ) {
     match node.kind() {
         "class_declaration" => {
@@ -170,15 +225,25 @@ fn extract_swift_node(
                                     &member,
                                     source,
                                     file_id,
+                                    types,
                                     Some(&name),
                                     entities,
                                     relations,
+                                    nested,
                                 );
                             }
                         }
                         return;
                     }
                     _ => EntityKind::Class,
+                };
+                // A type declared inside a type is named under it
+                // (`Point.Inner`), as its members are, so two types'
+                // same-named nested types cannot collide in one unit. An
+                // extension names the type it extends and is not renamed.
+                let name = match class_ctx {
+                    Some(owner) => format!("{owner}.{name}"),
+                    None => name,
                 };
 
                 let vis = detect_swift_visibility(node, source);
@@ -209,9 +274,11 @@ fn extract_swift_node(
                             &member,
                             source,
                             file_id,
+                            types,
                             Some(&name),
                             entities,
                             relations,
+                            nested,
                         );
                     }
                 }
@@ -247,9 +314,11 @@ fn extract_swift_node(
                             &member,
                             source,
                             file_id,
+                            types,
                             Some(&name),
                             entities,
                             relations,
+                            nested,
                         );
                     }
                 }
@@ -292,7 +361,10 @@ fn extract_swift_node(
                     });
                 }
 
-                extract_calls_from_body(node, source, &qualified, relations);
+                extract_callable_body(
+                    node, source, file_id, types, &qualified, class_ctx, entities, relations,
+                    nested,
+                );
             }
         }
         "init_declaration" => {
@@ -325,7 +397,9 @@ fn extract_swift_node(
                 });
             }
 
-            extract_calls_from_body(node, source, &init_name, relations);
+            extract_callable_body(
+                node, source, file_id, types, &init_name, class_ctx, entities, relations, nested,
+            );
         }
         "deinit_declaration" => {
             if let Some(cls) = class_ctx {
@@ -347,9 +421,20 @@ fn extract_swift_node(
                     call_shape: None,
                     kind: kin_model::RelationKind::Contains,
                     src_name: cls.to_string(),
-                    dst_name: deinit_name,
+                    dst_name: deinit_name.clone(),
                     import_source: None,
                 });
+                extract_callable_body(
+                    node,
+                    source,
+                    file_id,
+                    types,
+                    &deinit_name,
+                    class_ctx,
+                    entities,
+                    relations,
+                    nested,
+                );
             }
         }
         "property_declaration" | "protocol_property_declaration" => {
@@ -414,37 +499,42 @@ fn extract_swift_node(
             }
         }
         "enum_entry" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
+            // `case fast, safe` declares two cases, each its own name.
+            let mut names = node.walk();
+            let name_nodes: Vec<tree_sitter::Node> =
+                node.children_by_field_name("name", &mut names).collect();
+            for name_node in name_nodes {
                 let case_name = extract_name_text(&name_node, source);
-                if !case_name.is_empty() {
-                    let qualified = if let Some(cls) = class_ctx {
-                        format!("{}.{}", cls, case_name)
-                    } else {
-                        case_name
-                    };
+                if case_name.is_empty() {
+                    continue;
+                }
+                let qualified = if let Some(cls) = class_ctx {
+                    format!("{}.{}", cls, case_name)
+                } else {
+                    case_name
+                };
 
-                    entities.push(ExtractedEntity {
-                        kind: EntityKind::Constant,
-                        name: qualified.clone(),
-                        signature: node_signature(node, source),
-                        visibility: detect_swift_visibility(node, source),
-                        doc_summary: None,
-                        fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Constant,
+                    name: qualified.clone(),
+                    signature: node_signature(node, source),
+                    visibility: detect_swift_visibility(node, source),
+                    doc_summary: None,
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                    declaration_line: None,
+                });
+
+                if let Some(cls) = class_ctx {
+                    relations.push(ExtractedRelation {
+                        site: None,
+                        receiver: None,
+                        call_shape: None,
+                        kind: kin_model::RelationKind::Contains,
+                        src_name: cls.to_string(),
+                        dst_name: qualified,
+                        import_source: None,
                     });
-
-                    if let Some(cls) = class_ctx {
-                        relations.push(ExtractedRelation {
-                            site: None,
-                            receiver: None,
-                            call_shape: None,
-                            kind: kin_model::RelationKind::Contains,
-                            src_name: cls.to_string(),
-                            dst_name: qualified,
-                            import_source: None,
-                        });
-                    }
                 }
             }
         }
@@ -625,18 +715,263 @@ fn find_child_by_kind<'a>(
     result
 }
 
-/// Recursively walk a function/method body to find call_expression nodes.
-fn extract_calls_from_body(
+/// Walk a function, method, initializer or deinitializer body: admit what it
+/// defines and emit its calls.
+///
+/// A call through `self` is emitted owner-qualified (`Store.save`), the shape
+/// the linker's inheritance-aware tier reads. A call through a receiver with
+/// a value-origin fact the linker can follow (a declared type, an
+/// initializer, a same-file function's declared return, a method called on
+/// one of those, or the enclosing type's property) carries its receiver and
+/// the bare method, so the linker's value-origin tier binds it to the class
+/// the declarations name. Every other call keeps the bare rightmost name.
+///
+/// A function declared in the body becomes `F.<locals>.helper` and a type
+/// declared there `F.<locals>.Local` with its members (see
+/// [`crate::nested`]); their calls move onto them, and a bare call of the
+/// function's name in its scope reaches it.
+#[allow(clippy::too_many_arguments)]
+fn extract_callable_body(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    types: &SwiftFileTypes,
+    context_name: &str,
+    class_ctx: Option<&str>,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    nested: &mut SwiftNestedState,
+) {
+    let reader = SwiftScopeReader::for_callable(*node, source, class_ctx, types);
+    let scope = CallScope {
+        owner: class_ctx,
+        reader: &reader,
+        types,
+    };
+    admit_nested(
+        node,
+        source,
+        file_id,
+        types,
+        context_name,
+        &scope,
+        entities,
+        relations,
+        nested,
+    );
+}
+
+/// Admit what `node`'s body defines and emit the calls `node` makes itself,
+/// read against `scope`, the outermost callable's declarations: a nested
+/// function reads its enclosing function's locals.
+#[allow(clippy::too_many_arguments)]
+fn admit_nested(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    types: &SwiftFileTypes,
+    context_name: &str,
+    scope: &CallScope<'_>,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    nested: &mut SwiftNestedState,
+) {
+    let plan = super::swift_nested::plan(*node, source);
+    let mut calls = NestedCalls::default();
+    let mut functions = Vec::new();
+    for function in &plan.functions {
+        let entity = local_scope_name(context_name, &function.name);
+        let line = function.node.start_position().row as u32;
+        if !nested.names.claim(&entity) {
+            nested.decline(
+                &entity,
+                EntityKind::Function,
+                line,
+                context_name,
+                Vec::new(),
+            );
+            continue;
+        }
+        calls
+            .skip
+            .push((function.node.start_byte(), function.node.end_byte()));
+        if let Some((from, until)) = function.scope {
+            calls
+                .renames
+                .push((function.name.clone(), from, until, entity.clone()));
+        }
+        functions.push((entity, function.node));
+    }
+    let mut local_types = Vec::new();
+    for (name, type_node, (from, until)) in &plan.types {
+        let entity = local_scope_name(context_name, name);
+        let line = type_node.start_position().row as u32;
+        if !nested.names.claim(&entity) {
+            nested.decline(&entity, EntityKind::Class, line, context_name, Vec::new());
+            continue;
+        }
+        calls
+            .skip
+            .push((type_node.start_byte(), type_node.end_byte()));
+        calls
+            .renames
+            .push((name.clone(), *from, *until, entity.clone()));
+        local_types.push((entity, *type_node));
+    }
+    for (name, kind, line) in &plan.declined {
+        let entity = local_scope_name(context_name, name);
+        nested.decline(&entity, *kind, *line, context_name, Vec::new());
+    }
+
+    collect_calls(node, source, context_name, scope, &calls, relations);
+
+    for (entity, function) in functions {
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Function,
+            name: entity.clone(),
+            signature: node_signature(&function, source),
+            visibility: Visibility::Private,
+            doc_summary: extract_preceding_comment(&function, source),
+            fingerprint: compute_fingerprint(&function, source),
+            span: span_from_node(&function, file_id),
+            declaration_line: None,
+        });
+        admit_nested(
+            &function, source, file_id, types, &entity, scope, entities, relations, nested,
+        );
+    }
+    for (entity, type_node) in local_types {
+        let kind = match type_node
+            .child_by_field_name("declaration_kind")
+            .map(|kind| kind.kind())
+        {
+            Some("enum") => EntityKind::EnumDef,
+            _ => EntityKind::Class,
+        };
+        entities.push(ExtractedEntity {
+            kind,
+            name: entity.clone(),
+            signature: node_signature(&type_node, source),
+            visibility: Visibility::Private,
+            doc_summary: extract_preceding_comment(&type_node, source),
+            fingerprint: compute_fingerprint(&type_node, source),
+            span: span_from_node(&type_node, file_id),
+            declaration_line: None,
+        });
+        extract_inheritance(&type_node, source, &entity, relations);
+        let Some(body) = crate::value_origins::swift::type_body(type_node) else {
+            continue;
+        };
+        let mut cursor = body.walk();
+        for member in body.children(&mut cursor) {
+            if matches!(member.kind(), "class_declaration" | "protocol_declaration") {
+                if let Some(name) =
+                    crate::value_origins::swift::type_declaration_name(member, source)
+                {
+                    nested.decline(
+                        &format!("{entity}.{name}"),
+                        EntityKind::Class,
+                        member.start_position().row as u32,
+                        &entity,
+                        Vec::new(),
+                    );
+                }
+                continue;
+            }
+            extract_swift_node(
+                &member,
+                source,
+                file_id,
+                types,
+                Some(&entity),
+                entities,
+                relations,
+                nested,
+            );
+        }
+    }
+}
+
+/// The definitions admitted inside one callable body: the byte ranges whose
+/// calls belong to them, and the local names a bare call reaches them by.
+#[derive(Default)]
+struct NestedCalls {
+    skip: Vec<(usize, usize)>,
+    /// (name, visible from, visible until, entity name).
+    renames: Vec<(String, usize, usize, String)>,
+}
+
+impl NestedCalls {
+    fn skips(&self, node: &tree_sitter::Node) -> bool {
+        self.skip
+            .iter()
+            .any(|&(start, end)| node.start_byte() == start && node.end_byte() == end)
+    }
+
+    fn renamed(&self, name: &str, at: usize) -> Option<&str> {
+        self.renames
+            .iter()
+            .find(|(bound, from, until, _)| bound == name && *from <= at && at < *until)
+            .map(|(_, _, _, entity)| entity.as_str())
+    }
+}
+
+/// What the walk accumulates about definitions nested in callable bodies.
+#[derive(Default)]
+struct SwiftNestedState {
+    census: NestedDefinitionCensus,
+    names: LocalScopeNames,
+}
+
+impl SwiftNestedState {
+    fn decline(
+        &mut self,
+        name: &str,
+        kind: EntityKind,
+        line: u32,
+        enclosing: &str,
+        bases: Vec<String>,
+    ) {
+        self.census.record(UnadmittedNestedDefinition {
+            name: name.to_string(),
+            kind,
+            start_line: line,
+            enclosing: Some(enclosing.to_string()),
+            bases,
+        });
+    }
+}
+
+/// What the calls of one callable body are read against.
+struct CallScope<'a> {
+    owner: Option<&'a str>,
+    reader: &'a SwiftScopeReader,
+    types: &'a SwiftFileTypes,
+}
+
+fn collect_calls(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    scope: &CallScope<'_>,
+    nested: &NestedCalls,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if nested.skips(&child) {
+            continue;
+        }
         if child.kind() == "call_expression" {
             if let Some((callee, callee_node)) = extract_callee(&child, source) {
                 if !callee.is_empty() {
+                    let (dst_name, receiver) = match (callee_node.kind() == "simple_identifier")
+                        .then(|| nested.renamed(&callee, callee_node.start_byte()))
+                        .flatten()
+                    {
+                        Some(entity) => (entity.to_string(), None),
+                        None => call_shape(&callee, &callee_node, source, scope),
+                    };
                     relations.push(ExtractedRelation {
                         // The call as written, so a reference row can report the
                         // line it sits on. Without it the linker has no span to
@@ -649,17 +984,68 @@ fn extract_calls_from_body(
                         // `first`. The span then covers `compute()`, which is
                         // the use, not the whole operator expression around it.
                         site: Some(swift_call_site(&callee_node, &child)),
-                        receiver: None,
+                        receiver,
                         call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
-                        dst_name: callee,
+                        dst_name,
                         import_source: None,
                     });
                 }
             }
         }
-        extract_calls_from_body(&child, source, context_name, relations);
+        collect_calls(&child, source, context_name, scope, nested, relations);
+    }
+}
+
+/// The callee name and receiver one call is emitted with.
+fn call_shape(
+    callee: &str,
+    callee_node: &tree_sitter::Node,
+    source: &[u8],
+    scope: &CallScope<'_>,
+) -> (String, Option<String>) {
+    let bare = (callee.to_string(), None);
+    if callee_node.kind() != "navigation_expression" {
+        return bare;
+    }
+    let Some(target) = callee_node.child_by_field_name("target") else {
+        return bare;
+    };
+    match target.kind() {
+        "self_expression" => match scope.owner {
+            Some(owner) => (format!("{owner}.{callee}"), None),
+            None => bare,
+        },
+        "simple_identifier" => {
+            let name = target.utf8_text(source).unwrap_or("");
+            if scope.reader.linker_can_follow(name, scope.types) {
+                (callee.to_string(), Some(name.to_string()))
+            } else {
+                bare
+            }
+        }
+        "navigation_expression" => {
+            // `self.store.save()` reads the property `store` exactly as an
+            // unqualified `store` does when no local shadows it.
+            let through_self = target
+                .child_by_field_name("target")
+                .is_some_and(|inner| inner.kind() == "self_expression");
+            let member = target
+                .child_by_field_name("suffix")
+                .and_then(|suffix| suffix.child_by_field_name("suffix"))
+                .and_then(|name| name.utf8_text(source).ok())
+                .unwrap_or("");
+            if through_self
+                && scope.reader.is_member(member)
+                && scope.reader.linker_can_follow(member, scope.types)
+            {
+                (callee.to_string(), Some(member.to_string()))
+            } else {
+                bare
+            }
+        }
+        _ => bare,
     }
 }
 

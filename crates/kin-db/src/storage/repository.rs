@@ -129,7 +129,8 @@ pub const MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
 // Revision 5: open validation checks resolution records, in history replay and in
 // snapshot admission: their identities, and that every node and record they name
 // exists.
-const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 5;
+// Revision 6: native Git snapshots carry a checked raw commit/tree proof.
+const HISTORY_VALIDATION_COVERAGE_REVISION: u32 = 6;
 
 /// Version of the complete open-time validation a durable history-validation
 /// record stands for.
@@ -768,6 +769,10 @@ pub struct PersistedRepositoryAuthority {
     /// makes an older binary refuse it at the header rather than drop it.
     #[serde(default)]
     pub owed_derivations: super::derivation_ledger::OwedDerivationLedger,
+    /// Checked Git provenance for native bootstrap roots. These proofs
+    /// are replicated authority, not local history-state hints.
+    #[serde(default)]
+    pub git_snapshot_proofs: Vec<kin_model::GitSnapshotProof>,
 }
 
 impl Serialize for PersistedRepositoryAuthority {
@@ -775,12 +780,16 @@ impl Serialize for PersistedRepositoryAuthority {
         use serde::ser::SerializeStruct;
         // Positional: a trailing collection is written only when it, or one
         // after it, is, so every earlier position stays filled.
-        let has_ledger = !self.owed_derivations.is_empty();
+        let has_proofs = !self.git_snapshot_proofs.is_empty();
+        let has_ledger = !self.owed_derivations.is_empty() || has_proofs;
         let has_binding = !self.binding_history.is_empty() || has_ledger;
         let has_merge = !self.merge_transactions.is_empty() || has_binding;
         let mut out = serializer.serialize_struct(
             "PersistedRepositoryAuthority",
-            12 + usize::from(has_merge) + usize::from(has_binding) + usize::from(has_ledger),
+            12 + usize::from(has_merge)
+                + usize::from(has_binding)
+                + usize::from(has_ledger)
+                + usize::from(has_proofs),
         )?;
         out.serialize_field("schema_version", &self.schema_version)?;
         out.serialize_field("repository_id", &self.repository_id)?;
@@ -802,6 +811,9 @@ impl Serialize for PersistedRepositoryAuthority {
         }
         if has_ledger {
             out.serialize_field("owed_derivations", &self.owed_derivations)?;
+        }
+        if has_proofs {
+            out.serialize_field("git_snapshot_proofs", &self.git_snapshot_proofs)?;
         }
         out.end()
     }
@@ -888,6 +900,7 @@ impl PersistedRepositoryAuthority {
             merge_transactions: Vec::new(),
             binding_history: Vec::new(),
             owed_derivations: Default::default(),
+            git_snapshot_proofs: Vec::new(),
         };
         authority.roots = compute_roots(snapshot, &authority, 0)?;
         Ok(authority)
@@ -964,6 +977,7 @@ impl PersistedRepositoryAuthority {
         }
         self.roots.validate()?;
         super::binding_history::validate_metadata(self)?;
+        git_snapshot_proof::validate_metadata(snapshot, self)?;
         self.ref_state.validate()?;
 
         require_sorted_unique(
@@ -1235,7 +1249,48 @@ pub struct RepositoryAuthorityState {
     /// it. Unset on a state an open loaded, and on one whose record its writer
     /// cannot name. Bound and carried exactly as `durable` is.
     installed_record: std::sync::OnceLock<[u8; 32]>,
+    /// Set once persistence has acknowledged this exact state or an open has
+    /// loaded it, which is when it stops being written to. A successor is
+    /// still being written while it is prepared: its binding history is set
+    /// after its workspace graph has been read to qualify it. No clone
+    /// carries the mark.
+    published: std::sync::atomic::AtomicBool,
+    /// The workspace graph this state last materialized, kept so the next
+    /// reader of the same workspace is handed a copy. See
+    /// [`KeptWorkspaceGraph`]. Never serialized, and no clone or successor
+    /// carries it: it is derived from this exact state and from nothing else.
+    workspace_graph: std::sync::Mutex<Option<KeptWorkspaceGraph>>,
 }
+
+/// One workspace's graph as an immutable [`RepositoryAuthorityState`]
+/// materialized it.
+///
+/// A state never changes after it is published, and a workspace's graph is a
+/// function of the state alone, so every materialization of one workspace
+/// from one published state reaches the same snapshot and the same admission
+/// verdict. Nothing is kept from a state that is not yet published, since the
+/// commit preparing it may still write to it.
+/// One commit asked for it again and again: to load the base it plans
+/// against, to take the authority's side of the plan's semantic diff, twice
+/// while its binding history was qualified, and to reload what it had just
+/// published. Each of those resolved the base, cloned the carried domains,
+/// rebuilt adjacency and ran storage admission over the result. The first
+/// one still does all of that. The rest are handed a copy of what it
+/// produced.
+///
+/// One workspace is kept, the last one asked for, and only while its graph
+/// holds no more than [`KEPT_WORKSPACE_GRAPH_NODES_MAX`] entities and
+/// relations, because the kept snapshot is a second copy of the workspace's
+/// graph for as long as the state is held.
+#[derive(Debug)]
+struct KeptWorkspaceGraph {
+    workspace_id: WorkspaceId,
+    graph: Arc<GraphSnapshot>,
+}
+
+/// Most entities and relations a workspace graph may hold and still be kept
+/// by the state that materialized it.
+const KEPT_WORKSPACE_GRAPH_NODES_MAX: usize = 1_000_000;
 
 impl Clone for RepositoryAuthorityState {
     fn clone(&self) -> Self {
@@ -1246,6 +1301,8 @@ impl Clone for RepositoryAuthorityState {
             prepared: self.prepared.clone(),
             durable: std::sync::OnceLock::new(),
             installed_record: std::sync::OnceLock::new(),
+            published: std::sync::atomic::AtomicBool::new(false),
+            workspace_graph: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1279,6 +1336,8 @@ impl RepositoryAuthorityState {
             prepared: None,
             durable: std::sync::OnceLock::new(),
             installed_record: std::sync::OnceLock::new(),
+            published: std::sync::atomic::AtomicBool::new(false),
+            workspace_graph: std::sync::Mutex::new(None),
         }
     }
 
@@ -1315,6 +1374,8 @@ impl RepositoryAuthorityState {
             prepared: None,
             durable: std::sync::OnceLock::new(),
             installed_record: std::sync::OnceLock::new(),
+            published: std::sync::atomic::AtomicBool::new(false),
+            workspace_graph: std::sync::Mutex::new(None),
         }
     }
 
@@ -1337,6 +1398,8 @@ impl RepositoryAuthorityState {
             prepared: None,
             durable: std::sync::OnceLock::new(),
             installed_record: std::sync::OnceLock::new(),
+            published: std::sync::atomic::AtomicBool::new(false),
+            workspace_graph: std::sync::Mutex::new(None),
         }
     }
 
@@ -1377,6 +1440,17 @@ impl RepositoryAuthorityState {
     /// the persistence that read or wrote them has bound them.
     fn durable_identity(&self) -> Option<&DurableAuthorityIdentity> {
         self.durable.get()
+    }
+
+    /// Record that persistence acknowledged this exact state, or that an open
+    /// loaded it: from here on it is shared and never written to.
+    fn mark_published(&self) {
+        self.published
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_published(&self) -> bool {
+        self.published.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Bind the head persistence just acknowledged for this exact state.
@@ -1458,6 +1532,12 @@ impl RepositoryAuthorityState {
             return Ok(None);
         };
 
+        // This state already materialized this workspace: the same inputs,
+        // so the same snapshot, which passed the same admission.
+        if let Some(kept) = self.kept_workspace_graph(workspace_id) {
+            return Ok(Some(kept));
+        }
+
         let prepared = self
             .prepared
             .as_ref()
@@ -1469,6 +1549,7 @@ impl RepositoryAuthorityState {
                     *workspace_id,
                     &mut snapshot,
                 )?;
+                self.keep_workspace_graph(workspace_id, &snapshot);
                 return Ok(Some(snapshot));
             }
         }
@@ -1481,7 +1562,45 @@ impl RepositoryAuthorityState {
         if let Some(prepared) = prepared {
             prepared.record(self.generation(), workspace, &materialized);
         }
+        self.keep_workspace_graph(workspace_id, &materialized);
         Ok(Some(materialized))
+    }
+
+    /// A copy of the graph this state last materialized for `workspace_id`.
+    fn kept_workspace_graph(&self, workspace_id: &WorkspaceId) -> Option<GraphSnapshot> {
+        if !self.is_published() {
+            return None;
+        }
+        let kept = self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let graph = kept
+            .as_ref()
+            .filter(|kept| &kept.workspace_id == workspace_id)
+            .map(|kept| Arc::clone(&kept.graph))?;
+        drop(kept);
+        #[cfg(test)]
+        WORKSPACE_GRAPHS_SERVED_FROM_STATE.with(|count| count.set(count.get() + 1));
+        Some(GraphSnapshot::clone(&graph))
+    }
+
+    /// Keep `graph` as this state's materialization of `workspace_id`, unless
+    /// it is too large to hold a second copy of.
+    fn keep_workspace_graph(&self, workspace_id: &WorkspaceId, graph: &GraphSnapshot) {
+        if !self.is_published()
+            || graph.entities.len().saturating_add(graph.relations.len())
+                > KEPT_WORKSPACE_GRAPH_NODES_MAX
+        {
+            return;
+        }
+        *self
+            .workspace_graph
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(KeptWorkspaceGraph {
+            workspace_id: *workspace_id,
+            graph: Arc::new(graph.clone()),
+        });
     }
 }
 
@@ -2370,6 +2489,7 @@ impl RepositorySnapshotPersistence<LocalFileBackend> {
                 state.head = Some(retained.identity().clone())
                     .filter(|head| head.head_generation() == committed_cursor.backend_generation());
                 state.record = record.filter(|_| state.head.is_some());
+                next.mark_published();
                 if let Some(head) = state.head.clone() {
                     next.bind_durable_identity(head);
                 }
@@ -2509,6 +2629,9 @@ impl<B: StorageBackend + ?Sized> RepositorySnapshotPersistence<B> {
         outcome: &PersistOutcome,
         next: &RepositoryAuthorityState,
     ) {
+        if matches!(outcome, PersistOutcome::Committed) {
+            next.mark_published();
+        }
         if let (PersistOutcome::Committed, Some(head)) = (outcome, state.head.as_ref()) {
             next.bind_durable_identity(head.clone());
             if let Some(record) = state.record {
@@ -3445,6 +3568,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         if let Some(prepared) = &prepared {
             initial = initial.with_prepared_workspace_graphs(Arc::clone(prepared));
         }
+        initial.mark_published();
         if let Some(identity) = durable_identity.clone() {
             initial.bind_durable_identity(identity);
         }
@@ -3933,20 +4057,42 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
         self.commit_git_bootstrap_with_verifier(transaction, changes, None)
     }
 
+    /// Commit a complete Git bootstrap and start the workspace's checked
+    /// binding history at it.
+    ///
+    /// `verifier` checks every historical transition the bootstrap admits, so
+    /// a lineage it qualifies reaches back to the history's genesis. One local
+    /// binding withdrawn anywhere in that history that it cannot account for
+    /// leaves the workspace unproven, and a real repository's history nearly
+    /// always holds one. `rederivation` then starts the lineage at this same
+    /// bootstrap instead, the way `kin upgrade` and a daemon's first start
+    /// would have: it re-derives the committed workspace graph from the exact
+    /// bytes its tree names and qualifies it only on an exact match. The
+    /// bootstrap is the operation that made that graph, so nothing before it
+    /// is left outside the lineage, and the store is checked from its first
+    /// generation rather than re-qualified by the first daemon that opens it.
     pub fn commit_git_bootstrap_with_binding_history(
         &self,
         transaction: RepositoryTransaction,
         changes: ChangeMap,
         verifier: &dyn super::binding_history::BindingHistoryVerifier,
+        rederivation: &dyn super::binding_history::RederivationVerifier,
     ) -> Result<RepositoryCommitReceipt, KinDbError> {
-        self.commit_git_bootstrap_with_verifier(transaction, changes, Some(verifier))
+        self.commit_git_bootstrap_with_verifier(
+            transaction,
+            changes,
+            Some((verifier, rederivation)),
+        )
     }
 
     fn commit_git_bootstrap_with_verifier(
         &self,
         transaction: RepositoryTransaction,
         changes: ChangeMap,
-        verifier: Option<&dyn super::binding_history::BindingHistoryVerifier>,
+        verifier: Option<(
+            &dyn super::binding_history::BindingHistoryVerifier,
+            &dyn super::binding_history::RederivationVerifier,
+        )>,
     ) -> Result<RepositoryCommitReceipt, KinDbError> {
         if transaction.expected_generation != 0 || !transaction.changes.is_empty() {
             return Err(ModelError::InvalidOperation(
@@ -3982,16 +4128,35 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
                 Some(&changes),
                 None,
             )?;
-            match verifier {
-                Some(verifier) => self.qualify_binding_history_decision(
-                    current,
-                    &transaction,
-                    decision,
-                    verifier,
-                    None,
-                ),
-                None => Ok(decision),
+            let Some((verifier, rederivation)) = verifier else {
+                return Ok(decision);
+            };
+            let decision = self.qualify_binding_history_decision(
+                current,
+                &transaction,
+                decision,
+                verifier,
+                None,
+            )?;
+            let unproven = match &decision {
+                AuthorityCommitDecision::Publish { next, .. } => next
+                    .snapshot
+                    .repository_authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.binding_history.is_empty()),
+                AuthorityCommitDecision::IdempotentReplay { .. } => false,
+            };
+            if !unproven {
+                return Ok(decision);
             }
+            self.qualify_binding_history_decision_with(
+                current,
+                &transaction,
+                decision,
+                &super::binding_history::RederivationTransitionVerifier(rederivation),
+                None,
+                true,
+            )
         })
     }
 
@@ -4372,6 +4537,13 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
 }
 
 impl RepositoryAuthorityManager<LocalFileBackend> {
+    /// Local storage selected when this manager opened. This identifies the
+    /// retained backend, not a new discovery result; filesystem users must
+    /// still acquire capabilities and validate their identity before mutation.
+    pub fn local_storage_path(&self) -> &std::path::Path {
+        self.backend.base_path()
+    }
+
     /// Whether these are the exact local publication record bytes this
     /// manager's own commit installed for the state it now publishes.
     ///
@@ -4919,6 +5091,7 @@ fn prepare_successor_with_history<B: StorageBackend + ?Sized>(
         external_history,
         history,
     )?;
+    git_snapshot_proof::admit(current, &snapshot, &mut metadata, transaction, source)?;
     // A carried successor keeps the predecessor's policies, which were derived
     // from this same history.
     if history.history_required() {
@@ -5234,6 +5407,9 @@ fn admit_external_objects<B: StorageBackend + ?Sized>(
     }
 }
 
+/// How many external objects one parallel run proves before folding them.
+const EXTERNAL_OBJECT_RUN: usize = 1024;
+
 fn admitted_external_objects<B: StorageBackend + ?Sized>(
     backend: &B,
     repository_id: &RepositoryId,
@@ -5246,15 +5422,35 @@ fn admitted_external_objects<B: StorageBackend + ?Sized>(
         .cloned()
         .map(|record| (record.object, record))
         .collect();
+    // Each object's body is loaded and proven on its own, so a run of them is
+    // proven in parallel; the fold below reads the outcomes in the order the
+    // objects came, stopping at the first failure as a sequential walk did.
+    let mut proven: std::collections::VecDeque<Result<(), KinDbError>> =
+        std::collections::VecDeque::new();
+    let mut runs = incoming.chunks(EXTERNAL_OBJECT_RUN);
     for record in incoming {
-        let body = load_exact_body(
-            backend,
-            repository_id,
-            record.body_hash,
-            record.body_len,
-            &format!("external object {}", record.object.oid),
-        )?;
-        record.validate_raw(&body)?;
+        if proven.is_empty() {
+            use rayon::prelude::*;
+            let run = runs.next().unwrap_or_default();
+            proven.extend(
+                run.par_iter()
+                    .map(|record| {
+                        let body = load_exact_body(
+                            backend,
+                            repository_id,
+                            record.body_hash,
+                            record.body_len,
+                            &format!("external object {}", record.object.oid),
+                        )?;
+                        record.validate_raw(&body)?;
+                        Ok(())
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        proven
+            .pop_front()
+            .expect("every incoming object has an outcome")?;
         if let Some(existing) = objects.get(&record.object) {
             if existing != record {
                 return Err(ModelError::Conflict(format!(
@@ -5602,6 +5798,7 @@ impl HistoryProof {
             && transaction.aliases.is_empty()
             && transaction.external_objects.is_empty()
             && transaction.git_authority_delta.is_none()
+            && transaction.git_snapshot_proofs.is_empty()
             && transaction
                 .changes
                 .iter()
@@ -6828,8 +7025,26 @@ fn verify_transaction_admission<B: StorageBackend + ?Sized>(
     transaction: &RepositoryTransaction,
     source: NativeAdmissionSource,
 ) -> Result<(), KinDbError> {
-    verify_workspace_admission(backend, current, replay, snapshot, metadata, transaction)?;
-    verify_native_change_admission(backend, current, replay, metadata, transaction, source)
+    let checked =
+        git_snapshot_proof::check_incoming(backend, current, snapshot, metadata, transaction)?;
+    verify_workspace_admission(
+        backend,
+        current,
+        replay,
+        snapshot,
+        metadata,
+        transaction,
+        &checked,
+    )?;
+    verify_native_change_admission(
+        backend,
+        current,
+        replay,
+        metadata,
+        transaction,
+        source,
+        &checked,
+    )
 }
 
 /// The exclusion-rule generation that judges what a transaction introduces.
@@ -6982,6 +7197,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
     snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
+    checked: &git_snapshot_proof::CheckedSnapshots,
 ) -> Result<(), KinDbError> {
     let Some(mutation) = &transaction.workspace_mutation else {
         return Ok(());
@@ -7060,6 +7276,12 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
         }
     }
 
+    let checked_snapshot = workspace
+        .base_target
+        .as_ref()
+        .map(|target| target_change_id(metadata, target))
+        .transpose()?
+        .and_then(|change| checked.get(&change));
     for artifact in workspace.tree.artifacts_by_path() {
         let gitlink_is_admitted = match artifact.entry {
             TreeEntry::Gitlink { target } => {
@@ -7075,6 +7297,7 @@ fn verify_workspace_admission<B: StorageBackend + ?Sized>(
             artifact,
             ArtifactAdmissionContext {
                 policy: &workspace.shared_admission_policy,
+                git_snapshot: checked_snapshot,
                 root_unignore: root_unignore.as_ref(),
                 tracked: tracked.contains(&artifact.artifact_id),
                 gitlink_is_admitted,
@@ -7132,13 +7355,21 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
     source: NativeAdmissionSource,
+    checked: &git_snapshot_proof::CheckedSnapshots,
 ) -> Result<(), KinDbError> {
     let native_changes = transaction
         .changes
         .iter()
-        .filter(|change| matches!(change.origin, kin_model::ChangeOrigin::Native))
+        .filter(|change| {
+            matches!(change.origin, kin_model::ChangeOrigin::Native)
+                && !current.snapshot.changes.contains_key(&change.id)
+        })
         .collect::<Vec<_>>();
-    // A transaction with no Native change reaches no lineage at all, which is
+    // admit_changes has already required byte-identical contents for every
+    // held ID. A transfer may repeat a shared ancestor; its old artifacts are
+    // not new admissions. Workspace mutations are checked separately, so this
+    // does not let a held snapshot proof authorize fresh workspace input.
+    // A transaction with no new Native change reaches no lineage at all, which is
     // what a Git import is: kin-git refuses a native-origin change inside a
     // semantic Git import, so every change it commits is Git-origin.
     if native_changes.is_empty() {
@@ -7374,6 +7605,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
                 artifact,
                 ArtifactAdmissionContext {
                     policy,
+                    git_snapshot: checked.get(&change.id),
                     root_unignore: root_unignore.as_ref(),
                     tracked: workspace_tracked.contains(&artifact.artifact_id),
                     gitlink_is_admitted,
@@ -7530,6 +7762,7 @@ fn push_resolved_rule(
 }
 
 struct ArtifactAdmissionContext<'a> {
+    git_snapshot: Option<&'a git_snapshot_proof::CheckedSnapshotTree>,
     root_unignore: Option<&'a CheckedRootUnignore>,
     policy: &'a SharedAdmissionPolicy,
     tracked: bool,
@@ -7653,7 +7886,18 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
     context: ArtifactAdmissionContext<'_>,
 ) -> Result<(), KinDbError> {
     let decision = matcher.decide(&artifact.path, false, context.tracked);
+    // Only a raw-object-verified bootstrap snapshot can carry a committed
+    // artifact past an ignore rule. This neither marks the artifact tracked
+    // nor skips the independent sensitive-content check below.
+    let granted = matches!(
+        decision.reason,
+        crate::admission::AdmissionDecisionReason::Rule(_)
+            | crate::admission::AdmissionDecisionReason::IgnoredAncestor { .. }
+    ) && context
+        .git_snapshot
+        .is_some_and(|proof| proof.allows(artifact));
     if decision.is_ignored()
+        && !granted
         && !context
             .root_unignore
             .is_some_and(|checked| checked.allows(&artifact.path, context.tracked))
@@ -8355,6 +8599,9 @@ thread_local! {
     /// workspace-base hash answers without entering this fold.
     static REPLAY_TREE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
+    /// Workspace graphs a state handed out from the one it had kept.
+    static WORKSPACE_GRAPHS_SERVED_FROM_STATE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
     /// Base-graph resolutions performed on this thread, ever.
     ///
     /// Read only as the endpoints of a span; the running total is meaningless
@@ -8597,11 +8844,21 @@ fn resolve_workspace_base_graph_snapshot_capturing(
                     });
                 }
                 if let Err(refusal) = section {
-                    if !matches!(refusal, MaterializedGraphRefusal::Absent) {
+                    // A section for another change is the ordinary state once
+                    // any change lands after the last full snapshot, and every
+                    // `kin upgrade` records one, so only a schema this binary
+                    // cannot read is a warning.
+                    if matches!(refusal, MaterializedGraphRefusal::Schema { .. }) {
                         tracing::warn!(
                             refusal = %refusal,
                             change = %change_id,
                             "refused the materialized graph section; folding the current projection from history instead"
+                        );
+                    } else if !matches!(refusal, MaterializedGraphRefusal::Absent) {
+                        tracing::debug!(
+                            refusal = %refusal,
+                            change = %change_id,
+                            "the materialized graph section is for another change; folding the current projection from history"
                         );
                     }
                 }
@@ -8639,21 +8896,26 @@ fn resolve_workspace_base_graph_snapshot_capturing(
                         #[cfg(test)]
                         BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.set(count.get() + 1));
                         // Absent is the ordinary case on every store written
-                        // before v14 and on every workspace whose base has
-                        // moved since the last full snapshot, so it is not a
-                        // warning. The other reasons are, because each of them
-                        // means a section was written and is not being used.
-                        if matches!(refusal, MaterializedGraphRefusal::Absent) {
-                            tracing::trace!(
+                        // before v14. A section for another change is ordinary
+                        // too, on every workspace whose base has moved since
+                        // the last full snapshot, which includes every store
+                        // `kin upgrade` has just re-derived. Only a schema this
+                        // binary cannot read means a section was written that
+                        // should have been usable, so only that one warns.
+                        match refusal {
+                            MaterializedGraphRefusal::Absent => tracing::trace!(
                                 change = %change_id,
                                 "no materialized graph section for this base; folding it from history"
-                            );
-                        } else {
-                            tracing::warn!(
+                            ),
+                            MaterializedGraphRefusal::Target => tracing::debug!(
+                                change = %change_id,
+                                "the materialized graph section is for another change; folding the base from history"
+                            ),
+                            MaterializedGraphRefusal::Schema { .. } => tracing::warn!(
                                 refusal = %refusal,
                                 change = %change_id,
                                 "refused the materialized graph section; folding the base from history instead"
-                            );
+                            ),
                         }
                         let view = AuthorityHistoryView {
                             changes: &authority_snapshot.changes,
@@ -10041,6 +10303,17 @@ fn validate_all_authority_bodies_with<B: StorageBackend + ?Sized>(
                         )))
                     })?;
             }
+            if !metadata.git_snapshot_proofs.is_empty() {
+                let mut loader = StreamingRepositoryGitObjectBodyLoader {
+                    batch,
+                    metadata,
+                    requirements: &requirements,
+                    external_record_indexes: &external_record_indexes,
+                    validated_digests: &mut validated_digests,
+                    verified_bytes: &mut verified_bytes,
+                };
+                git_snapshot_proof::check_all(snapshot, metadata, &mut loader)?;
+            }
             validation_completed = true;
             Ok(())
         };
@@ -10557,6 +10830,11 @@ fn replication_root(authority: &PersistedRepositoryAuthority) -> Result<Hash256,
         &authority.git_external_authority.iter().collect::<Vec<_>>(),
     )?;
     root.ordered("aliases", &authority.aliases)?;
+    // An absent proof collection contributes no leaf, preserving every
+    // pre-proof replication root. A present collection is authority.
+    if !authority.git_snapshot_proofs.is_empty() {
+        root.ordered("git_snapshot_proofs", &authority.git_snapshot_proofs)?;
+    }
     Ok(root.finish())
 }
 
@@ -11600,6 +11878,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         }
     }
 
@@ -14870,6 +15149,88 @@ mod tests {
                 "workspace-external-reference",
             ),
         ));
+    }
+
+    /// A state materializes a workspace's graph once. A state is immutable,
+    /// so a second reader of the same workspace is handed a copy of what the
+    /// first produced, and the base is not resolved or admitted again. A
+    /// commit publishes a new state, which materializes its own.
+    #[test]
+    fn a_state_materializes_a_workspace_graph_once_and_a_successor_its_own() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let transaction = arbitrary_repository_transaction(&manager);
+        manager.commit_repository_transaction(transaction).unwrap();
+        let workspace_id = manager.read_authority().metadata().workspaces[0].workspace_id;
+        let resolutions = || WORKSPACE_BASE_RESOLUTIONS.with(|count| count.get());
+        let served = || WORKSPACE_GRAPHS_SERVED_FROM_STATE.with(|count| count.get());
+
+        let state = manager.read_authority();
+        let (resolved_before, served_before) = (resolutions(), served());
+        let first = state
+            .workspace_graph_snapshot(&workspace_id)
+            .unwrap()
+            .expect("workspace exists");
+        let resolved_once = resolutions();
+        assert!(resolved_once > resolved_before, "the first reader resolves");
+        assert_eq!(served(), served_before);
+        let mut second = state
+            .workspace_graph_snapshot(&workspace_id)
+            .unwrap()
+            .expect("workspace exists");
+        assert_eq!(
+            resolutions(),
+            resolved_once,
+            "the second reader resolved again"
+        );
+        assert_eq!(served(), served_before + 1);
+        assert_eq!(second.entities, first.entities);
+        assert_eq!(second.relations, first.relations);
+        assert_eq!(second.resolved_tree, first.resolved_tree);
+        assert_eq!(second.version, first.version);
+        // A reader owns its copy: changing it changes nobody else's.
+        second.entities.clear();
+        second.resolved_tree = ResolvedTree::default();
+        let third = state
+            .workspace_graph_snapshot(&workspace_id)
+            .unwrap()
+            .expect("workspace exists");
+        assert_eq!(third.entities, first.entities);
+        assert_eq!(third.resolved_tree, first.resolved_tree);
+        // A workspace this state does not hold is still no workspace.
+        assert!(state
+            .workspace_graph_snapshot(&WorkspaceId::new())
+            .unwrap()
+            .is_none());
+        // Neither a clone of the state nor the state a later publication
+        // installs carries what this one kept.
+        let cloned = RepositoryAuthorityState::clone(&state);
+        let served_by_clone = served();
+        cloned.workspace_graph_snapshot(&workspace_id).unwrap();
+        assert_eq!(
+            served(),
+            served_by_clone,
+            "a clone served another state's graph"
+        );
+        drop(state);
+
+        manager
+            .materialize_workspace_base_graph_section(&repository_id(), &workspace_id)
+            .unwrap()
+            .expect("the workspace exists");
+        let successor = manager.read_authority();
+        let (resolved_before, served_before) = (resolutions(), served());
+        let after = successor
+            .workspace_graph_snapshot(&workspace_id)
+            .unwrap()
+            .expect("workspace exists");
+        assert!(
+            resolutions() > resolved_before,
+            "the successor resolves its own"
+        );
+        assert_eq!(served(), served_before);
+        assert_eq!(after.entities, first.entities);
+        assert_eq!(after.resolved_tree, successor.metadata().workspaces[0].tree);
     }
 
     #[test]
@@ -18391,6 +18752,76 @@ mod tests {
         assert_eq!(before, freeze_storage_bytes(directory.path()));
     }
 
+    /// A crash between installing the recovery candidate and renaming it onto
+    /// the authority leaves the previous record installed. A writable open
+    /// drops that uncommitted candidate, even when its bytes differ, and reads
+    /// the installed record. The read-only freeze still refuses and changes
+    /// nothing.
+    #[test]
+    fn writable_open_discards_an_unpromoted_authority_candidate() {
+        let directory = TempDir::new().unwrap();
+        let (backend, manager) = framed_local_repository(&directory);
+        let expected = manager.read_authority();
+        let authority = directory
+            .path()
+            .join(repository_id().as_str())
+            .join("authority.json");
+        let installed = std::fs::read(&authority).unwrap();
+        let mut staged = installed.clone();
+        staged.extend_from_slice(b"uncommitted");
+        crate::storage::mmap::write_recovery_candidate_bytes(&authority, &staged).unwrap();
+        let before = freeze_storage_bytes(directory.path());
+
+        let error = LocalRepositoryAuthorityFreeze::open_existing_read_only(
+            repository_id(),
+            backend.as_ref(),
+        )
+        .expect_err("a staged candidate must not be confirmed as installed");
+        assert!(error.to_string().contains("still staged"), "{error}");
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+
+        let opened = RepositoryAuthorityManager::open(
+            repository_id(),
+            Arc::new(LocalFileBackend::new(directory.path())),
+        )
+        .expect("a writable open reads the installed authority");
+        assert_same_authority(
+            &expected,
+            &opened.read_authority(),
+            "unpromoted candidate discarded",
+        );
+        assert_eq!(std::fs::read(&authority).unwrap(), installed);
+        let root = directory.path();
+        let tmp_rel = crate::storage::mmap::recovery_tmp_path(&authority)
+            .strip_prefix(root)
+            .unwrap()
+            .to_path_buf();
+        let marker_rel = crate::storage::mmap::recovery_marker_path(&authority)
+            .strip_prefix(root)
+            .unwrap()
+            .to_path_buf();
+        let after = freeze_storage_bytes(root);
+        let mut dropped: Vec<_> = before
+            .iter()
+            .map(|(path, _)| path.clone())
+            .filter(|path| !after.iter().any(|(other, _)| other == path))
+            .collect();
+        let mut expected_dropped = vec![tmp_rel.clone(), marker_rel.clone()];
+        dropped.sort();
+        expected_dropped.sort();
+        assert_eq!(dropped, expected_dropped);
+        for (path, bytes) in &before {
+            if path == &tmp_rel || path == &marker_rel {
+                continue;
+            }
+            let kept = after
+                .iter()
+                .find(|(other, _)| other == path)
+                .unwrap_or_else(|| panic!("open removed {}", path.display()));
+            assert_eq!(&kept.1, bytes, "{}", path.display());
+        }
+    }
+
     /// The read-only envelope read answers what the recovery-load read answers
     /// and leaves storage exactly as it found it, where the recovery load
     /// cleans up. A superseded snapshot beside the current one and an installed
@@ -18470,37 +18901,36 @@ mod tests {
             backend.as_ref(),
         )
         .unwrap();
-        let started = std::time::Instant::now();
-        let refused = RepositoryAuthorityMetadata::open_local_read_only(
-            repository_id(),
-            Arc::clone(&backend),
-            wait,
-        )
-        .err()
-        .expect("a held lock refuses the envelope read");
-        assert!(started.elapsed() >= wait, "it refused before its bound");
-        assert!(
-            refused
-                .to_string()
-                .contains("another process held the repository authority lock"),
-            "{refused}"
-        );
-        let started = std::time::Instant::now();
-        let refused = LocalRepositoryAuthorityFreeze::open_existing_read_only_within(
-            repository_id(),
-            backend.as_ref(),
-            wait,
-        )
-        .expect_err("a held lock refuses the full validation");
-        assert!(started.elapsed() >= wait, "it refused before its bound");
-        assert!(
-            refused
-                .to_string()
-                .contains("another process held the repository authority lock"),
-            "{refused}"
-        );
-        assert_eq!(before, freeze_storage_bytes(directory.path()));
-
+        // The two bounded reads and the reader that outlasts the hold start
+        // together, so the test waits out one bound instead of two bounds and
+        // a settling sleep. Each bounded read times its own wait from its own
+        // start, and the reader waits on the held lock for at least a bound.
+        let envelope = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let refused = RepositoryAuthorityMetadata::open_local_read_only(
+                    repository_id(),
+                    backend,
+                    wait,
+                )
+                .err();
+                (started.elapsed(), refused)
+            })
+        };
+        let validation = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let refused = LocalRepositoryAuthorityFreeze::open_existing_read_only_within(
+                    repository_id(),
+                    backend.as_ref(),
+                    wait,
+                )
+                .err();
+                (started.elapsed(), refused)
+            })
+        };
         let reader = {
             let backend = Arc::clone(&backend);
             std::thread::spawn(move || {
@@ -18512,7 +18942,27 @@ mod tests {
                 .map(|read| read.map(|read| read.metadata().clone()))
             })
         };
-        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let (elapsed, refused) = envelope.join().unwrap();
+        let refused = refused.expect("a held lock refuses the envelope read");
+        assert!(elapsed >= wait, "it refused before its bound");
+        assert!(
+            refused
+                .to_string()
+                .contains("another process held the repository authority lock"),
+            "{refused}"
+        );
+        let (elapsed, refused) = validation.join().unwrap();
+        let refused = refused.expect("a held lock refuses the full validation");
+        assert!(elapsed >= wait, "it refused before its bound");
+        assert!(
+            refused
+                .to_string()
+                .contains("another process held the repository authority lock"),
+            "{refused}"
+        );
+        assert_eq!(before, freeze_storage_bytes(directory.path()));
+
         drop(held);
         let read = reader
             .join()
@@ -19233,8 +19683,8 @@ mod tests {
         // HISTORY_VALIDATION_COVERAGE_REVISION and update this expectation
         // together; if nothing about coverage moved, leave both alone.
         assert_eq!(
-            HISTORY_VALIDATION_VERSION, 1_505,
-            "envelope schema 5 and coverage revision 5 compose to 1505"
+            HISTORY_VALIDATION_VERSION, 1_506,
+            "envelope schema 5 and coverage revision 6 compose to 1506"
         );
         // That literal is the whole test. The rest of this comment exists so
         // nobody reads the test as stronger than it is, or pads it with
@@ -25433,7 +25883,7 @@ mod tests {
         file.read_exact(&mut byte).unwrap();
         file.seek(SeekFrom::Start(middle)).unwrap();
         file.write_all(&[byte[0] ^ 0x01]).unwrap();
-        file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&file).unwrap();
         drop(file);
 
         let expected = manager.read_authority().roots().clone();
@@ -27523,6 +27973,7 @@ mod replaywall_measurements {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         }
     }
 
@@ -27646,6 +28097,7 @@ mod replaywall_measurements {
                 merge_transaction_delta: None,
                 sealed_observation: None,
                 collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
             };
             drop(lease);
 
@@ -27894,6 +28346,7 @@ mod clockhalf_whole_history {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
 
@@ -28460,6 +28913,7 @@ mod native_admission_lineage {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         transaction
@@ -29372,6 +29826,7 @@ mod fir3527_refusal_wording {
             &artifact(path),
             ArtifactAdmissionContext {
                 policy: &policy,
+                git_snapshot: None,
                 root_unignore: None,
                 tracked,
                 gitlink_is_admitted: false,
@@ -29518,3 +29973,172 @@ mod fir3527_refusal_wording {
         );
     }
 }
+
+/// A sensitive-content allowance is not proof of Git provenance and never
+/// overrides an ignore rule, even when its actor and reason claim a snapshot.
+#[cfg(test)]
+mod committed_artifact_under_an_ignored_directory {
+    use super::*;
+    use crate::admission::AdmissionCase;
+    use kin_model::SensitiveArtifactAllowance;
+
+    /// The path React tracks under `compiler/.gitignore`'s `.vscode` rule.
+    const COMMITTED: &str = "compiler/apps/playground/.vscode/extensions.json";
+    const BODY: &[u8] = b"{\"recommendations\": []}\n";
+
+    fn digest(body: &[u8]) -> Hash256 {
+        Hash256::from_bytes(Sha256::digest(body).into())
+    }
+
+    fn blob(path: &str, body: &[u8]) -> ResolvedArtifact {
+        ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8(path).unwrap(),
+            TreeEntry::Blob {
+                hash: digest(body),
+                executable: false,
+            },
+        )
+    }
+
+    fn allowance(path: &str, body: &[u8]) -> SensitiveArtifactAllowance {
+        SensitiveArtifactAllowance {
+            path: RepoPath::from_utf8(path).unwrap(),
+            content_hash: digest(body),
+            kind: SensitiveArtifactKind::Blob { executable: false },
+            approved_by: AuthorId::new("kin-git-import"),
+            reason: "committed in Git commit 0123, which this store admitted as its checked-out \
+                     snapshot"
+                .to_string(),
+        }
+    }
+
+    /// Judge one untracked artifact, whose body is in CAS, under `.vscode` and
+    /// `.git` exclusion rules and the given allowances, through the real
+    /// verifier.
+    fn judge(
+        artifact: &ResolvedArtifact,
+        body: &[u8],
+        allowances: Vec<SensitiveArtifactAllowance>,
+    ) -> Result<(), KinDbError> {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let backend = crate::storage::backend::LocalFileBackend::new(directory.path());
+        let repository_id = RepositoryId::new("committed-under-ignored").expect("repository id");
+        backend
+            .save_source_blob(repository_id.as_str(), *digest(body).as_bytes(), body)
+            .expect("store the artifact's body");
+        let case = AdmissionCase::Sensitive;
+        let matcher = ResolvedAdmissionMatcher::compile(
+            case,
+            vec![ResolvedAdmissionRuleSet::from_bytes(
+                ResolvedAdmissionRuleSource::GlobalExclude,
+                0,
+                None,
+                b".vscode\n".to_vec(),
+            )],
+        )
+        .expect("one global rule set compiles");
+        let policy = SharedAdmissionPolicy::new(0, Vec::new(), allowances).expect("policy");
+        verify_artifact_admission(
+            &backend,
+            &repository_id,
+            &matcher,
+            artifact,
+            ArtifactAdmissionContext {
+                policy: &policy,
+                root_unignore: None,
+                tracked: false,
+                gitlink_is_admitted: false,
+                git_snapshot: None,
+                label: "workspace",
+                case,
+            },
+        )
+    }
+
+    #[test]
+    fn a_forged_git_snapshot_allowance_does_not_override_an_ignore_rule() {
+        judge(
+            &blob(COMMITTED, BODY),
+            BODY,
+            vec![allowance(COMMITTED, BODY)],
+        )
+        .expect_err("an allowance and claimed Git actor do not prove a committed snapshot");
+    }
+
+    #[test]
+    fn the_same_path_with_other_bytes_is_refused() {
+        let edited = b"{\"recommendations\": [\"evil\"]}\n";
+        let message = judge(
+            &blob(COMMITTED, edited),
+            edited,
+            vec![allowance(COMMITTED, BODY)],
+        )
+        .expect_err("an allowance names one digest, and other bytes at its path are new input")
+        .to_string();
+        assert!(
+            message.contains("ancestor compiler/apps/playground/.vscode excluded"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_ignored_artifact_proposed_without_an_allowance_is_refused_as_before() {
+        let message = judge(&blob(COMMITTED, BODY), BODY, Vec::new())
+            .expect_err("nothing says this artifact is tracked")
+            .to_string();
+        assert!(
+            message.contains("is excluded by the exact graph-owned admission policy"),
+            "{message}"
+        );
+        let other = "compiler/apps/playground/.vscode/settings.json";
+        judge(&blob(other, BODY), BODY, vec![allowance(COMMITTED, BODY)])
+            .expect_err("an allowance for one path admits nothing beside it");
+    }
+
+    #[test]
+    fn an_allowance_never_admits_an_intrinsic_control_path() {
+        for path in [".git/config", ".kin/config.toml", "vendor/other/.git/HEAD"] {
+            let message = judge(&blob(path, BODY), BODY, vec![allowance(path, BODY)])
+                .expect_err("a control path is refused whatever an allowance says")
+                .to_string();
+            assert!(message.contains("is not repository content"), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_allowance_does_not_approve_a_different_executable_bit() {
+        let mut executable = blob(COMMITTED, BODY);
+        executable.entry = TreeEntry::blob(digest(BODY), true);
+        let message = judge(&executable, BODY, vec![allowance(COMMITTED, BODY)])
+            .expect_err("an approval for a non-executable blob must not approve an executable")
+            .to_string();
+        assert!(message.contains("is excluded"), "{message}");
+
+        let mut approved = allowance(COMMITTED, BODY);
+        approved.kind = SensitiveArtifactKind::Blob { executable: true };
+        judge(&executable, BODY, vec![approved.clone()])
+            .expect_err("a matching executable approval still cannot override an ignore rule");
+        judge(&blob(COMMITTED, BODY), BODY, vec![approved])
+            .expect_err("an executable approval must not approve a non-executable blob either");
+    }
+
+    #[test]
+    fn blob_and_symlink_allowances_are_not_interchangeable() {
+        let mut symlink = blob(COMMITTED, BODY);
+        symlink.entry = TreeEntry::symlink(digest(BODY));
+        let message = judge(&symlink, BODY, vec![allowance(COMMITTED, BODY)])
+            .expect_err("a blob approval must not approve a symlink with the same digest")
+            .to_string();
+        assert!(message.contains("is excluded"), "{message}");
+
+        let mut approved = allowance(COMMITTED, BODY);
+        approved.kind = SensitiveArtifactKind::Symlink;
+        judge(&symlink, BODY, vec![approved.clone()])
+            .expect_err("a matching symlink approval still cannot override an ignore rule");
+        judge(&blob(COMMITTED, BODY), BODY, vec![approved])
+            .expect_err("a symlink approval must not approve a blob with the same digest");
+    }
+}
+
+mod git_snapshot_proof;

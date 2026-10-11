@@ -476,6 +476,92 @@ fn resolve_git_object(
     })
 }
 
+/// The width of a whole SHA-1 Git object id in hexadecimal. Anything shorter
+/// after `git:` is a prefix, the form `git log --oneline` prints.
+const GIT_SHA1_HEX: usize = 40;
+
+/// Whether `value` is a short Git object id rather than a whole one.
+///
+/// Lowercase only, for the reason [`is_change_prefix`] gives: Git prints its ids
+/// lowercase, and a whole id keeps its own parser either way.
+fn is_git_object_prefix(value: &str) -> bool {
+    (MIN_PREFIX..GIT_SHA1_HEX).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value == value.to_ascii_lowercase()
+}
+
+/// Every imported Git object that can name a point in history, from both
+/// records that name one.
+///
+/// Commits and tags only. A tree or a blob never resolves to a semantic change,
+/// so letting one share a short id with a commit would refuse as ambiguous a
+/// selector that has one possible answer, which is Git's own commit-ish rule.
+fn imported_git_objects(
+    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+) -> impl Iterator<Item = GitObjectId> + '_ {
+    let metadata = lease.metadata();
+    metadata
+        .external_objects
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.object.kind,
+                kin_model::ExternalObjectKind::Commit | kin_model::ExternalObjectKind::Tag
+            )
+        })
+        .map(|record| record.object.oid)
+        .chain(metadata.aliases.iter().map(|alias| alias.oid))
+}
+
+/// The one imported Git object whose id starts with `prefix`, or a refusal.
+///
+/// Matched against the objects the import recorded, never against a Git object
+/// database: the store answers for what it admitted. One commit can appear in
+/// both records, so candidates are deduplicated before they are counted, and
+/// ambiguity is refused for the reason [`resolve_change_prefix`] gives.
+fn resolve_git_object_prefix(
+    candidates: impl Iterator<Item = GitObjectId>,
+    original: &str,
+    prefix: &str,
+) -> Result<GitObjectId> {
+    let matches: std::collections::BTreeSet<GitObjectId> = candidates
+        .filter(|oid| oid.to_string().starts_with(prefix))
+        .collect();
+    let mut matches = matches.into_iter();
+    match (matches.next(), matches.len()) {
+        (None, _) => Err(ref_error(
+            original,
+            format!(
+                "no Git object imported into this repository begins with '{prefix}'; import it \
+                 with `kin init` in the source checkout, or name a ref kin already holds"
+            ),
+        )),
+        (Some(only), 0) => Ok(only),
+        (Some(first), rest) => {
+            let count = rest + 1;
+            let preview = std::iter::once(first)
+                .chain(matches)
+                .take(AMBIGUITY_PREVIEW)
+                .map(|oid| oid.to_string()[..12].to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let unnamed = count.saturating_sub(AMBIGUITY_PREVIEW);
+            let elision = if unnamed == 0 {
+                String::new()
+            } else {
+                format!(", and {unnamed} more")
+            };
+            Err(ref_error(
+                original,
+                format!(
+                    "'{prefix}' is ambiguous: {count} imported Git objects begin with it \
+                     ({preview}{elision}); use more characters"
+                ),
+            ))
+        }
+    }
+}
+
 /// A change that must already be in the graph the caller will read it from.
 fn resolve_present_change<G>(
     graph: &G,
@@ -630,6 +716,10 @@ where
 
     if let Some(value) = core.strip_prefix("git:") {
         let (lease, _) = authority.parts(original)?;
+        if is_git_object_prefix(value) {
+            let oid = resolve_git_object_prefix(imported_git_objects(lease), original, value)?;
+            return resolve_git_object(lease, original, oid);
+        }
         return resolve_git_object(lease, original, parse_git_object_id(value)?);
     }
 
@@ -665,12 +755,99 @@ where
 
     if is_change_prefix(core) {
         let (lease, _) = authority.parts(original)?;
-        let change_id =
-            resolve_change_prefix(lease.snapshot().changes.keys().copied(), original, core)?;
+        let change_id = resolve_bare_prefix(lease, original, core)?;
         return resolve_present_change(graph, original, change_id);
     }
 
     Err(ref_error(original, UNRESOLVABLE))
+}
+
+/// A bare short hexadecimal value: the start of a change id, or the short
+/// Git commit id `git log --oneline` prints, which is what a developer types.
+///
+/// Both are searched. One that only one of them holds resolves there, with
+/// the refusals each search already gives, and a prefix both hold resolves
+/// only when every match names the same change, as a commit and the change
+/// its import recorded do. Otherwise it is refused with the tagged forms that
+/// say which was meant, never resolved to whichever was found first.
+fn resolve_bare_prefix(
+    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+    original: &str,
+    prefix: &str,
+) -> Result<SemanticChangeId> {
+    let changes: Vec<SemanticChangeId> = lease
+        .snapshot()
+        .changes
+        .keys()
+        .copied()
+        .filter(|change_id| change_id.to_string().starts_with(prefix))
+        .collect();
+    let git: std::collections::BTreeSet<GitObjectId> = if is_git_object_prefix(prefix) {
+        imported_git_objects(lease)
+            .filter(|oid| oid.to_string().starts_with(prefix))
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let mut commits = Vec::with_capacity(git.len());
+    for oid in git {
+        commits.push((oid, resolve_git_object(lease, original, oid)?.change_id));
+    }
+    choose_bare_prefix(original, prefix, changes, commits)
+}
+
+/// The change a bare prefix names, from what each search matched.
+fn choose_bare_prefix(
+    original: &str,
+    prefix: &str,
+    changes: Vec<SemanticChangeId>,
+    commits: Vec<(GitObjectId, SemanticChangeId)>,
+) -> Result<SemanticChangeId> {
+    if changes.is_empty() && commits.is_empty() {
+        return Err(ref_error(
+            original,
+            format!(
+                "no semantic change and no imported Git commit begins with '{prefix}'; run \
+                 `kin log` to see the changes kin holds"
+            ),
+        ));
+    }
+    if commits.is_empty() {
+        return resolve_change_prefix(changes.into_iter(), original, prefix);
+    }
+    if changes.is_empty() {
+        let oid = resolve_git_object_prefix(commits.iter().map(|(oid, _)| *oid), original, prefix)?;
+        return Ok(commits
+            .into_iter()
+            .find(|(candidate, _)| *candidate == oid)
+            .map(|(_, change)| change)
+            .expect("the chosen object is one of the candidates"));
+    }
+    let named: std::collections::BTreeSet<SemanticChangeId> = changes
+        .iter()
+        .copied()
+        .chain(commits.iter().map(|(_, change)| *change))
+        .collect();
+    if named.len() == 1 {
+        return Ok(*named.iter().next().expect("one change"));
+    }
+    Err(ref_error(
+        original,
+        format!(
+            "'{prefix}' is ambiguous: it begins {} and {}; name one with `change:{prefix}` or \
+             `git:{prefix}`, or use more characters",
+            if changes.len() == 1 {
+                "1 semantic change id".to_string()
+            } else {
+                format!("{} semantic change ids", changes.len())
+            },
+            if commits.len() == 1 {
+                "1 imported Git commit id".to_string()
+            } else {
+                format!("{} imported Git commit ids", commits.len())
+            }
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -929,6 +1106,126 @@ mod tests {
         assert!(
             forward.contains("and 2 more"),
             "a refusal that names only {AMBIGUITY_PREVIEW} of 6 must say so: {forward}"
+        );
+    }
+
+    fn oid_with_prefix(prefix: &str, fill: char) -> GitObjectId {
+        let mut hex = String::from(prefix);
+        while hex.len() < GIT_SHA1_HEX {
+            hex.push(fill);
+        }
+        parse_git_object_id(&hex).expect("constructed a whole SHA-1 object id")
+    }
+
+    /// `git:<short>` is the form `git log --oneline` prints, so it resolves when
+    /// exactly one imported object begins with it, and a commit that both
+    /// import records name is one candidate rather than two.
+    #[test]
+    fn a_short_git_id_resolves_to_the_one_imported_object_it_names() {
+        let commit = oid_with_prefix("1971f65", 'a');
+        let other = oid_with_prefix("479aa9b", 'b');
+        let resolved = resolve_git_object_prefix(
+            [commit, other, commit].into_iter(),
+            "git:1971f65",
+            "1971f65",
+        )
+        .expect("one imported object begins with 1971f65, named by both records");
+        assert_eq!(resolved, commit);
+        assert!(is_git_object_prefix("1971f65"));
+        assert!(!is_git_object_prefix("197"), "shorter than Git's own floor");
+        assert!(!is_git_object_prefix("1971F65"), "Git prints lowercase");
+        assert!(
+            !is_git_object_prefix(&commit.to_string()),
+            "a whole id keeps the whole-id parser"
+        );
+    }
+
+    fn change_with_prefix(prefix: &str, fill: char) -> SemanticChangeId {
+        let mut hex = String::from(prefix);
+        while hex.len() < CHANGE_ID_HEX {
+            hex.push(fill);
+        }
+        parse_change_id(&hex).expect("constructed a whole change id")
+    }
+
+    /// A bare short value is what a developer types: the short Git id `git
+    /// log --oneline` prints, or the start of a change id `kin log` prints.
+    /// Either resolves without a tag when only one search holds it.
+    #[test]
+    fn a_bare_short_id_resolves_as_a_change_prefix_or_a_short_git_id() {
+        let change = change_with_prefix("b54bd354", 'a');
+        let imported = change_with_prefix("0cf20dd9", 'b');
+        let commit = oid_with_prefix("f966a62", 'c');
+
+        let by_git = choose_bare_prefix("f966a62", "f966a62", vec![], vec![(commit, imported)])
+            .expect("a short Git id resolves to the change its import recorded");
+        assert_eq!(by_git, imported);
+
+        let by_change = choose_bare_prefix("b54bd354", "b54bd354", vec![change], vec![])
+            .expect("a change-id prefix still resolves");
+        assert_eq!(by_change, change);
+
+        // A commit and the change recorded for it can share a prefix only by
+        // accident, and when every match names one change that is the answer.
+        let same = choose_bare_prefix("0cf2", "0cf2", vec![imported], vec![(commit, imported)])
+            .expect("both searches name the same change");
+        assert_eq!(same, imported);
+    }
+
+    /// A bare prefix both searches hold for different changes is refused with
+    /// the tagged forms, and one neither holds says that both were searched.
+    #[test]
+    fn a_bare_short_id_both_searches_hold_is_refused_with_the_tagged_forms() {
+        let change = change_with_prefix("adfc", 'a');
+        let imported = change_with_prefix("1234", 'b');
+        let commit = oid_with_prefix("adfc", 'c');
+        let message = format!(
+            "{:#}",
+            choose_bare_prefix("adfc", "adfc", vec![change], vec![(commit, imported)])
+                .expect_err("two different changes begin with adfc")
+        );
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(
+            message.contains("`change:adfc`") && message.contains("`git:adfc`"),
+            "{message}"
+        );
+
+        let message = format!(
+            "{:#}",
+            choose_bare_prefix("dead", "dead", vec![], vec![])
+                .expect_err("nothing begins with dead")
+        );
+        assert!(
+            message.contains("no semantic change and no imported Git commit"),
+            "{message}"
+        );
+    }
+
+    /// A short Git id two imported objects share is refused with the count and
+    /// the candidates, and one nothing begins with is refused as absent.
+    #[test]
+    fn a_short_git_id_is_refused_when_ambiguous_or_absent() {
+        let first = oid_with_prefix("adfc", 'a');
+        let second = oid_with_prefix("adfc", 'b');
+        let message = format!(
+            "{:#}",
+            resolve_git_object_prefix([first, second].into_iter(), "git:adfc", "adfc")
+                .expect_err("two imported objects begin with adfc")
+        );
+        assert!(message.contains("'git:adfc'"), "{message}");
+        assert!(message.contains("2 imported Git objects"), "{message}");
+        for candidate in [first, second] {
+            assert!(message.contains(&candidate.to_string()[..12]), "{message}");
+        }
+
+        let message = format!(
+            "{:#}",
+            resolve_git_object_prefix([first].into_iter(), "git:dead", "dead")
+                .expect_err("no imported object begins with dead")
+        );
+        assert!(
+            message.contains("no Git object imported") && !message.contains("ambiguous"),
+            "{message}"
         );
     }
 }

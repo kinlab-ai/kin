@@ -7,9 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.2] - 2026-09-27
+## [0.8.2] - 2026-10-10
 
 ### Added
+
+- `kin update --check-only --json` always prints one JSON object. It now says
+  how this Kin was installed (`install_method`: `kin_installer`, `homebrew`,
+  `npm`, `cargo` or `unknown`), and a check that cannot finish exits 1 with a
+  stable `reason` code (`install_root_missing`, `unsupported_install_method`,
+  `update_interrupted`, `network_unavailable`, `release_lookup_failed` or
+  `check_failed`) and a plain-English `message`, instead of an error line
+  alone. Output without `--json` is unchanged.
+- `kin daemon status --json` gives each repository daemon an `activity`
+  object: a stable `phase` (`starting`, `reconciling`, `indexing`,
+  `enriching`, `reading_history`, `idle`, `stopped` or `unknown`), `since`,
+  and a plain `detail`, read from the daemon's own health answer and the
+  store's history record.
+- `kin setup --shell-only` adds kin to your shell, the same step a full setup
+  takes, and connects no AI client. `--json` reports it as
+  `kin.setup-shell.v1`. `kin setup --clients ""` keeps working.
+- `kin setup clients` lists every AI client Kin can connect, whether it is
+  installed on this machine, whether Kin is connected to it, and its id.
+  `--json` answers under `kin.setup-clients.v1`. `kin setup --clients
+  claude-code,cursor` connects only the clients named and leaves every other
+  one as it is. The choice is recorded, so a client whose Kin entry waits for
+  a repository (Codex CLI, Grok CLI) connects at `kin init` only if it was
+  chosen.
+- `kin places <ENTITY_ID>...` and the daemon's `POST /projection/places` say where
+  each entity's declaration sits in the working copy, from its 1-based start
+  to its end, so an editor can land on the entity. It reads the graph only,
+  gives the reason for any entity it cannot place, and is no MCP tool, so
+  agent replies are unchanged.
+- `kin review guide` walks one recorded change step by step. Changed entities
+  the graph connects form a chapter, read dependency first, and each step
+  carries the entity's text before and after the change, the recorded
+  consumers and tests that reach it, and the record each line stands on.
+  `--json` answers the same walkthrough under `kin.review.guide.v1`.
+- `kin review open` serves that walkthrough as a page from this machine, beside
+  the repository's recorded changes. It binds 127.0.0.1 only, is built into
+  the `kin` binary and loads nothing from the network.
+- A Markdown or reStructuredText text is held with parts. Each section its
+  headings open is an entity addressed `module.stem :: title`, found by
+  `locate` by its title, read by itself, and patched, updated or removed by
+  itself with the ticket of its read, so a changelog gains an entry under one
+  version without the rest of it being read. A text with parts over 4 KB is
+  read as its outline: the text before its first section and its sections by
+  id. A section's read lists the code its code spans name, and a name in such
+  a text is credited to the section that holds it.
+- The `kin review open` page records a review. A decision or a note is
+  written by the repository's daemon the way `kin review decide` and
+  `kin review note` write it, and a guide lists the reviews recorded against
+  its change. A write needs a token minted for that run and the page's own
+  origin.
+- `kin review guide --working` walks the uncommitted work in the working
+  tree, with "before" read at the last recorded change and "after" from the
+  tree, and `kin review guide <base>..<head>` or `--base <ref>` walks every
+  change between two refs as one review, read from the change they share.
+  `kin review open` takes the same arguments.
+- The `kin review open` page opens each guide with one sentence on what the
+  change means and a map of what it touched and what relies on it, colours
+  changed lines by language, and reads them in one column or side by side. Its
+  list starts with the uncommitted work, which is read again as the working
+  tree changes, offers the current branch against the default one, shows where
+  each change's review stands, and follows the repository. A step shows the
+  recorded changes that changed its entity and opens in VS Code, Cursor or
+  Zed. The page has search, keyboard shortcuts, light and dark themes, and
+  copies a walk as Markdown.
+- A guide places a step and each entity that reaches it by what contains
+  them, such as their class, in the terminal, on the page and in a copied
+  summary, and shows no path. Where the checkout holds an entity is kept only
+  for opening it in an editor.
+- `source` on a Python module returns the module's own code, its imports and
+  top-level statements, with one marker line standing for each function and
+  class it holds. A patch made with that read's ticket edits only that code, so
+  an agent can add an import without reading or rewriting a file.
+- `source` on a Python class too large to serve whole returns the class's own
+  code, its header, docstring and class-level statements, with one marker line
+  per member, and a patch with that read's ticket edits only that code.
+- `mutate` creates a method or a class beside a sibling or as a class's last
+  member, and removes a method, without the class being read or sent back.
+- A description that never names the function it is about is ranked over
+  entities by what they hold, body included, and a `context` question is
+  resolved through the same ranking. A description whose subject is tests is
+  ranked with test code, and the answer line says when test code was left out.
 
 - Graph status exposes atomic per-artifact enrichment metadata through MCP and
   CLI, with exact dependency selection, whole-row continuation pages, and
@@ -23,6 +103,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   creation age for legacy transactions and whole-row MCP continuation.
 
 ### Changed
+
+- The shell installer introduces Kin as a graph-native code repository for AI
+  agents and the people who build with them, shows its registry check only
+  when the check refuses, and ends with the same next step as the Windows
+  installer: open a new terminal and run `kin init` in a Git repository.
+
+- A Rust crate root's module is named by the crate name Rust code writes,
+  read from the repository's `Cargo.toml` when Kin takes the source in: a
+  library by its `[lib] name` or package name, a binary, example, test or
+  bench by its target name, with `-` read as `_`. A crate root used to read
+  as `crate` in every crate of a workspace, so a row could not say which
+  crate held an entity. Any other `lib.rs` or `main.rs` is a module named by
+  its stem, a manifest reached through an in-tree link is followed the way
+  Cargo follows it, and a crate without a manifest keeps its directory name.
+  An existing store is re-derived on its next `kin upgrade`.
+
+- A callers trace returns its closed reach set: every caller the walk reached,
+  with the walk stated as complete when nothing is left to follow.
+- Each agent reply's verdict now means what its own tool did. A name search is
+  complete when the declaration search finished over its stated scope, and one
+  that finds no entity lists the declarations the name matched that Kin holds no
+  entity for, with file and line, under `not_held`. A description search returns
+  its ranked results and never claims to have found every match. A source read is
+  complete when it delivered the code at its revision, a history read when it
+  delivered its page of recorded history, a context when it delivered the code
+  asked about, and a neighbourhood when it explored the hops asked for. Wording
+  about uses that could not be checked, or reached indirectly, appears only on
+  `refs`, `impact` and `trace`, and no reply suggests running `refs` on rows it
+  does not have.
+- A literal `locate` says in one line which stored fields it searched, and a miss
+  says it is not proof the text is absent from the repository. Each hit keeps how
+  sure Kin is of its location: an exact line, the declaration line, or the
+  entity's lines when the line could not be confirmed, which is never shown as a
+  line.
+- `source` on the agent profiles returns the code, its `entity_id`, file, lines
+  and `revision`, and a compact ticket in place of the whole `source_base`. A
+  write that carries the ticket is resolved to exactly the base the read served
+  or refused; see [guarded source edits](docs/mcp-source-bases.md).
+- `context` packs the code asked about first, then the routes between focals and
+  the code each focal binds to, then optional neighbours, so a pack cut to fit
+  loses a neighbour a hop further away before a dependency. A neighbour left out
+  to fit no longer makes the answer read as unfinished; a focal body that did not
+  fit still does.
+- `status` on the agent profiles says when Kin last took in changes from the
+  working copy and names what the daemon paused, and a status page carries its
+  continuation once, in `status_page`. `history` says its latest change once and
+  where Kin's recorded history begins. `neighbors` returns its links as records
+  naming both ends. Every plain reply names an entity by `entity_id`, never `id`.
+- Every verb's input schema is rendered from one typed request, and the server
+  holds every verb call to it before it runs, with a refusal that names the fix
+  and one call that works. The schemas now carry the real domain: enums for
+  `neighbors` and `trace` directions, `refs` reference kinds and `locate` modes,
+  bounds on depths, limits, budgets and cursors, and non-empty lists. Rules a
+  flat schema cannot state are checked by the server and said in the
+  descriptions: `refs` takes one target or a cursor, `impact` one of
+  `entity_ids`, `change_ids` or `base` with `head`, `context` any of its three
+  selectors, `trace` a `focal` or a cursor. Spellings a handler always accepted,
+  such as `outgoing` for `out`, are still taken.
+- The reply budget is served as `max_output_bytes` on every read verb, the most
+  UTF-8 bytes of serialized JSON a reply is cut toward. `max_chars` and
+  `max_response_chars` are accepted as older names for one release, and a call
+  that sends two with different numbers is refused.
+- A `mutate` operation carries exactly one payload variant, and each variant goes
+  with its verb, as the backend's own operation forms say; the served schema and
+  the server both hold it. On the agent profiles, `mutate` with a
+  `transaction_id` stages into an open transaction, and `transaction` begins,
+  commits and aborts.
+- A cursor is a handle on a frozen answer: `refs`, `trace` and `impact` continue
+  from `cursor` alone, with the same targets, filters, ordering and graph.
+- A write never needs a session first. A write, an intent or a toolchain run that
+  names no session runs in the connection's own, which the server opens on the
+  first one, keeps alive while the connection lasts and ends when it closes. The
+  toolchain run is its own verb, `exec`, the name `kin exec` has in the CLI, and
+  `session` is retired: a call to it is still answered, and no profile lists it.
+- A client that declares `capabilities.experimental.kin.readOnly` at
+  `initialize` is served only the tools that read.
+- The server negotiates MCP 2025-11-25 and 2025-06-18 as well as 2024-11-05. A
+  client on a version with structured tool output, on a connection that serves
+  machine replies, gets each verb's `outputSchema` and a `structuredContent` copy
+  of each successful reply; a connection that serves plain words gets neither.
+
+- The agent MCP profiles serve plain verbs named the way the `kin` CLI names the
+  same capability: `locate`, `refs`, `trace`, `context`, `source`, `neighbors`,
+  `impact`, `status`, `history`, `init`, `mutate`, `exec` and `transaction`.
+  A choice that used to be a choice between tools is an option with a default.
+  `locate` reads its `query` by name, by description or as literal text through
+  `mode`, and the default, `auto`, reads an identifier or a dotted name as a
+  name and anything else as a description. `trace` returns the route between two
+  entities when given `to`, and `transaction` takes an `action`.
+  `agent-default`'s `tools/list` goes from 14,719 bytes over 22 tools to 10,392
+  over 13, and `agent-query`'s from 8,184 bytes to 6,082. The routed `kin` tool's
+  commands are the same verbs.
+- The agent profiles always answer `refs` in the answer-only shape, and no longer
+  advertise `answer_only`, `explain` or `compact` on `refs`, `trace` or `context`.
+  A call that sends one anyway is answered answer-only, with one line after the
+  answer saying which it did not take. `locate` in literal mode is described as a
+  text match secondary to name and description, and on the agent profiles it
+  answers in at most 12,000 characters whatever `max_chars` asks.
+- Agent replies open with the answer and keep its parts apart. `_kin.verdict`
+  says whether the answer suffices for the question, and `_kin.meaning` states it
+  first, as in "Answer: these 6 functions call AppContext.pop. Each row shows the
+  line of code that calls it. Kin checked all 83 code files". `_kin.delivered`
+  says what a reply left out to fit and the exact call that returns the rest, so
+  a list cut to fit is no longer a partial answer, and `_kin.searched` says what
+  was searched, including that code which builds a name while it runs is outside
+  what any reader of code can follow. A reference answer lists rows a type proved
+  under `references`, rows matched by name alone under `name_only`, and calls that
+  pass the entity to other code as an argument under `passed_to_calls`, each with
+  its line of code, and an answer with no rows says it checked every use of the
+  name in every code file and every place that could hold it as a value. A trace
+  step shows the line of code that links it to its parent, and a walk stopped by
+  its depth says so and how to go further. `status` is a health report of what
+  Kin holds and what is settled, with no verdict. `source` names an outline as
+  one, and `full_body` serves a whole container only up to 16 KB. A literal
+  `locate` answers complete over the text it reads, and its cursor is a short,
+  checked handle that is refused, with what to do, when it was not copied
+  exactly. `refs`, `trace` and `impact` take the `cursor` their replies hand
+  back, and `history` the `offset`, on every agent profile. Agent replies name
+  the verbs a profile serves, never a retired tool name, and the server
+  instructions add that re-reading source to confirm a complete answer's rows
+  only costs time.
+
+- Upgrading from an older version reads plainly. On a terminal, `kin status`
+  opens its upgrade warning with "Run `kin upgrade` here", gives one reason and
+  the npm form of the command on its own line, and marks each warning once.
+  Staged session work appears only when a transaction is open. `kin upgrade`
+  reports what it changed per branch with short change ids and elapsed seconds,
+  and no longer prints log warnings for a saved graph section that belongs to
+  an earlier change, which every upgrade produces. With no daemon running, the
+  full record reports the last daemon's memory reading as past, with its age.
 
 - `find_references` rows and `kin refs` rows no longer give file lines. A row
   addresses its caller by entity id and each usage inside that caller: `sites`
@@ -79,7 +289,348 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authority frame version 9. Kin 0.8.1 refuses these newer records; stores
   without them retain their earlier format.
 
+### Deprecated
+
+- The 22 tool names the verbs replaced, from `semantic_search`,
+  `semantic_locate` and `lexical_lookup` to `kin_mutate` and the session and
+  transaction tools, and the routed `search`, `path` and `exec` commands, are
+  still accepted on a call and reach the same handler, and are no longer listed.
+  They are removed in the next release. The `benchmark` and `context-bench`
+  profiles still list the names their published numbers were measured under.
+  [docs/mcp-tools.md](docs/mcp-tools.md#deprecated-names) maps each one to the
+  call that replaces it.
+
+### Removed
+
+- The launcher that ran a toolchain command for an agent session, and the
+  daemon route that recorded its write-back as a change. The MCP surface
+  stopped serving `exec` and `kin_init`; run `kin exec` and `kin init` in a
+  shell instead.
+
 ### Fixed
+
+- Installing Kin works on Ubuntu, Debian and every other distribution whose
+  logins get a umask of 0002. The shell installer and the npm launcher create
+  `~/.kin` and its directories at 0755, and `kin` and `kin-daemon` take group
+  and world write out of their own umask at startup, so nothing Kin creates is
+  group writable. Before, `curl -fsSL https://get.kinlab.dev/install | sh`
+  failed with "registry parent must not be group/world writable", and the npm
+  route finished with a registry nothing could use. The npm launcher now
+  initializes the registry the way the shell installer does. A Kin home an
+  earlier install left group writable is named with its exact repair,
+  `chmod go-w <path>`, and `kin doctor --fix`, `kin registry authority --fix`
+  and `KIN_REGISTRY_REPAIR=1` now make that repair with consent. `kin setup`
+  exits non-zero while the registry is unusable instead of reporting success.
+- When the daemon `kin init` starts is still loading the repository at the
+  end of the readiness wait, `kin init` says which process it is, that it
+  keeps running and links references once it has loaded, and that
+  `kin status` says when it is ready, instead of printing about twenty lines
+  of its colour-coded log. That daemon is left to finish rather than stopped.
+  `kin init --json` reports the case as `cross_file_enrichment.reason`
+  `daemon_still_loading`, with the same plain explanation as its `cause`. The
+  daemon writes its log without terminal colour codes when the log is not a
+  terminal, and a log quoted in an error is stripped of them, so no escape
+  codes reach a JSON answer.
+- Conversion progress names each replay it counts, and each pass of one. The
+  first save of a full history checks every commit's tree and replays the
+  history twice over the same changes, and every one of them counted as
+  `changes validated`, so a 5,562-change history read as falling from
+  5376/5562 back to 2048/5562. They now read `commit trees checked`, `changes
+  replayed` and `changes replayed, pass 2`, beside `Git objects admitted`,
+  each counting up from zero, and a replay's first line no longer shows an
+  internal `kindb:` message.
+- `kin init` no longer recommends `kin embed` on a build or configuration
+  that cannot embed, such as the default build with no external embedding
+  provider selected. It says search by meaning is off and why, and that
+  locate, search, refs and context answer from the graph, and its Search
+  index row says the same. `kin embed` there stops before asking the daemon
+  and names what is missing, a local embedding model or a selected provider,
+  instead of failing as an HTTP 500, and the daemon refuses such a pass with
+  HTTP 409 and the same words.
+- `kin status` with no daemon running answers without opening the store
+  when the store still holds the publication an earlier open read. `kin init`
+  and each status that opens the store record what that open read, keyed by
+  the store's exact durable publication, so the first `kin status` after a
+  conversion no longer decodes and re-verifies the whole store again, which
+  took 13 s on a 678-commit store and 153 s on a 5,562-commit one. It still
+  walks the working copy, exits 9 because no daemon measured it, and says
+  which reading answered and that it re-verified nothing itself. A store that
+  has published anything since is opened as before.
+- `kin overview` speaks in entities and parsed units: `Parsed units: 83` and
+  `2054 entities in 83 parsed units` replace `Files: 83` and `across 83
+  files`, and an entity with no origin is listed by its name alone instead of
+  beside a `?`. The `--json` answer is unchanged.
+- An imported Git commit's author is recorded the way Git names one, `Name
+  <email>`, the form a native change already records, and the commit's time
+  stays in the change's own timestamp. Imports recorded the whole author line,
+  seconds since 1970 and offset included, and history, blame, log, review,
+  provenance and the daemon's history showed that line. Text now shows the
+  author's name and JSON carries `Name <email>` without the time, for a store
+  an earlier import wrote as well, without rewriting its history, and
+  `kin eject` and `kin git export` still prove such a store's history exactly. A native change exports to Git with its author's
+  name and address in the commit's own fields.
+- Reading an entity's history through the daemon no longer opens and
+  re-verifies the whole store on every read. The review reads resolve the
+  current change through the authority the daemon holds for the current
+  store, as `kin history` and `kin blame` do, and a history verifies each
+  change record once per store generation and keeps it, up to 64 MiB of
+  records, so repeated history and reference reads stop decoding the whole
+  line of history again. A store that changes is a new generation and is
+  verified again before anything from it is served.
+- Branch switch, merge, stash and rollback refusals, the switch summary and
+  merge conflict listings name pending work by entity, with its kind and
+  name, and count work no entity shows as unsaved changes in the working
+  copy, instead of naming where it is projected. Each refusal keeps its
+  condition, status and remedy.
+
+- A Python class whose base is subscripted, such as `PromptBase[bool]`, now
+  extends that base, so impact and override answers reach it, and a library
+  base written that way still proves which library method a call runs.
+- An awaited generic call such as `await f<T>(x)` in TypeScript or JavaScript
+  is recorded as a call.
+- A Rust `Type.method` lookup that matches nothing finds `Type::method`, and
+  the answer says the name was read that way under `respelled_from`.
+- Impact on a changed Go interface method lists the methods whose types
+  satisfy the interface, each with its module and role, and says so when that
+  walk could not run.
+- Reference and dead-code answers list a module whose own top-level code uses
+  the entity apart from the functions, keep a module matched by name alone
+  among the name matches, and name the caller's module on every call site left
+  to check.
+- Whether a name several declarations share is used is answered for each
+  declaration, up to eight, within the question's scope and with the reply
+  budget shared among them. The verdict stays partial when any declaration
+  was not established or not checked.
+- An answer about Go or Rust code no longer suggests `kin upgrade` for
+  non-call reads, which those languages do not record and an upgrade would
+  not add.
+
+- `kin ui` no longer warns that its environment differs from a repository's
+  daemon when it opens a repository whose daemon is already running. The check
+  compared raw variables, and `kin ui` leaves each repository's model slots,
+  `[resources]` profile and `[retrieval]` table to that repository's daemon, so
+  the four model providers always read as `cli=(unset) daemon="none"` and the
+  restart the warning advised brought the same values back. A command attaching
+  to a daemon now compares against what a daemon started from it would hold, so
+  a provider or profile it sets that the daemon lacks still warns, and every
+  other command compares exactly as before.
+- A language server that will not start says why on every surface that
+  reports it: `kin graph status`, `kin doctor`, the MCP edge coverage, the
+  verdict clause and the plain reply. The reason names the exit code and the
+  end of the server's stderr, the limit it ran out answering `initialize`, the
+  message of an `initialize` error, or the directories a missing server was
+  looked for in, as "TypeScript enrichment unavailable: <reason>". `kin doctor`
+  starts each server with the launch the daemon gives it and no longer counts
+  an installed server that cannot start as a missing one.
+- typescript-language-server starts in a repository whose dependencies are not
+  installed. With no TypeScript in the workspace, Kin offers it one installed
+  outside the repository as `tsserver.fallbackPath`: the `typescript` package
+  beside the server, then the one behind `tsserver` or `tsc` on `PATH`,
+  skipping any without `lib/tsserver.js`. The launch names which TypeScript
+  runs and why dependencies are missing, and coverage reports the gap as
+  partial enrichment, where calls into dependencies get no answer.
+- A review guide counts entities the way a reader sees them. A class whose own
+  text held still is read through the members that changed in it, so one
+  method edit is one step, and the summary counts such classes in
+  `containers_through_members`. Overload stubs fold into the callable they
+  declare, listed in its `overloads`, and definitions that share a name carry
+  their `parameters`. `relation_changes` leaves out relations that only moved
+  with the lines around them, which `relation_changes_position_only` counts.
+  One edit to four Python functions read as 7 steps, 17 consumers, 8 tests and
+  67 relation changes, and now reads as 4 steps, 3 consumers, 2 tests and 35
+  relation changes, with 32 that only moved.
+- A review guide says what each change asks of the consumers that did not
+  change with it. A comment, the layout or a docstring asks nothing, so a
+  comment written inside a parameter list no longer reads as a broken
+  signature whose consumers were not updated, and the guide says they need no
+  update. A body that changed under a signature that held says its consumers
+  may need review, and only a signature change, a removal or a lost public
+  visibility the review finds breaking leaves them not updated. The guide
+  reads this from the graph's fingerprint, which skips comments and
+  whitespace, and the behaviour equivalence class, which reads past a
+  docstring. Each step's `consumer_verdict` carries the verdict and its
+  `reason`, and the summary counts consumers in `consumers_not_updated`,
+  `consumers_may_need_review` and `consumers_need_no_update`. The review
+  itself no longer reports a signature change, a breaking change or a
+  contract change for an entity whose tokens did not move.
+- A short Git commit id, as `git log --oneline` prints it, resolves wherever a
+  change prefix does, and a prefix both could mean is refused with the
+  `change:` and `git:` forms that tell them apart. `kin review` takes any ref
+  the history commands take, so the command the review page prints for a
+  change no longer fails.
+- A review of a range is titled by its newest change and how many came before
+  it instead of by two ids, and an imported author reads as the person's name
+  rather than the whole Git signature, which stays in `author_recorded`.
+- The `kin review open` page scrolls a change map wider than its card from
+  the map's left edge. It used to centre the map and cut off both sides, out
+  of reach of the scroll bar. Entity names on the map and in the outline wrap
+  after a dot or inside a snake_case word instead of ending in an ellipsis,
+  and names two entities share carry the parameters that tell them apart.
+- The page's list of changes reads older history a page at a time, past the
+  500 changes it used to stop at, and shows how many entities each change's
+  guide walks, so a change reads the same in the list and in its walk. A merge
+  says so instead of "0 entities".
+- The page counts relations that changed apart from relations that only moved
+  with the lines around them, names the classes read through their members,
+  and marks a row that stands for a callable's overload declarations.
+- A machine `semantic_locate` answer larger than the `max_chars` its caller
+  named is paged instead of cut. Its verdict and evidence alone measure past
+  7,000 characters on a small repository, so below that it was refused
+  outright, and above it the ranking was cut from the end with no cursor to
+  the rows it dropped. Now every page fits the budget, `next_cursor` walks the
+  rest, every row and safety reading arrives, and the ranking's own cursor
+  comes back among the readings for the ranking page after it. A partial page
+  says so with `locate_page_partial`. An answer that fits is served as before.
+- Edge coverage names the classes that need edges across source units
+  `cross_unit_classes`. Under its old name the semantic surface withheld the
+  list, so no MCP client ever received it.
+- Reference answers place their focal by the module that holds it, as their
+  rows already placed each caller, and every unsettled call-site candidate
+  carries its caller's `module`. The projection paths beside them are withheld
+  at the agent surface, so these were the only places a reader had no module.
+- A name a module and a function it declares share is refused with each
+  candidate's address and, because the two addresses read the same, its kind,
+  so a caller can pick the function without reading either.
+- A write whose code does not parse is refused before anything is stored, in
+  one sentence that names the problem and its line in what was sent. A body
+  written at another indentation is placed at its entity's indentation, and a
+  patch anchor that matches only after indentation is added or removed is
+  accepted when exactly one place fits.
+- A source ticket holds until its own entity changes, so several entities read
+  first can be edited one after another without a stale refusal.
+- A name one scope declares more than once, such as a property and its setter,
+  is answered with every declaration and its address, and is always written
+  with its id, so a bare name never stands for one of two.
+- An edit may add, change or remove a declaration nested in the entity it
+  names. A declaration added beside it is refused with the verb to use.
+- Three committed edits to one file, each followed by enrichment, no longer
+  leave the daemon unable to save its graph and every later commit refused. A
+  store already in that state recovers on the next enrichment.
+- A `locate` reply is held to the caller's budget in the form it is delivered
+  in. Detail is shed before any row, and a name lookup shows every declaration
+  that fits instead of withholding one from a reply far under its budget.
+- A call or read whose receiver Kin proves is a type declared outside the
+  repository, or a class of another hierarchy, is counted as settled instead of
+  listed for the reader to check, and an answer with nothing left open reads as
+  complete.
+- A workspace import written with its file extension resolves to that file, so
+  callers through it are no longer lost.
+- A type-use edge an earlier version read off a parent function's parameter is
+  retired by the next enrichment sweep after an upgrade.
+- A daemon that refuses its language-server sweep for memory no longer starts
+  every language server it can find for a readiness handshake instead.
+  Readiness comes from the sweep that does run, and reads as unknown, never as
+  a missing server, until then.
+- A sweep refused for memory now runs in the same daemon once the machine has
+  room again, as the refusal says it will. The daemon reads the machine every
+  five seconds and queues the sweep after three readings in a row under bars
+  five points below the ones that refused it, so a host that hovers at a bar
+  does not start and refuse it over and over. It used to wait for an explicit
+  `kin daemon sweep` or the next daemon start.
+- A verdict's reasons, a reference reading's scope and the coverage notes an
+  agent reads now name modules, source units and relationships instead of
+  files, so they reach the agent as written. Before, the MCP server's semantic
+  surface withheld each one for its storage wording and the agent read a
+  withheld note in its place. A reason's code is unchanged.
+- An MCP tool call with no daemon to answer it is refused with the reason and
+  the remedy again. The refusal named the repository's path, so the semantic
+  surface withheld it whole; the path and the probe's detail now go to the
+  server log at warn level.
+- A change's commit message reaches an agent in `history` replies with only its
+  paths and file names redacted, instead of being replaced whole by an internal
+  diagnostic sentence.
+- `kin call kin_init` and `kin call init` name `kin init`, the command that
+  sets a repository up, instead of reading as names nothing takes.
+- `source` with `full_body` serves a body whole only up to 16 KB, for a
+  function as it already did for a class. A longer body is served from its
+  first excerpt with or without `full_body`, and every excerpt of it carries
+  the ticket a patch needs, so one read of a long generated function no longer
+  fills an agent's context and the function still changes by patch. A whole
+  replacement of a body that long is refused.
+- The retrieval record of an unparsed entity held as bytes names the media
+  type of its format, such as `image/png` or `font/woff2`, read from the
+  signature its content opens with or else its name, instead of
+  `application/octet-stream` for every one. Kind detection is one registry,
+  which describes an entity and gives the indexer its media type. Records
+  of such entities are derived again with the new type.
+- An unparsed entity that a Git commit moves without changing it keeps its
+  identity through Git import, so its history and what refers to it follow
+  it to its new place. In a commit that is not a merge, the one such path
+  removed and the one added with the same content and mode are recorded as
+  one move. Source Kin parses, a pair that is not unique, and content edited
+  as it moved are unchanged. Hydration semantics moves to 49, so a store
+  admitted earlier reports itself behind.
+- A `trace_data_flow` walk the per-step cap clipped tells an agent again how
+  many of the dropped neighbours lived in another source unit, as
+  `dropped_crossing_unit` on each clip record and `spine_dropped_crossing_unit`
+  beside `spine_clipped_steps`, marked by `spine_dropped_crossing_unit_is_floor`
+  when the count is a floor. The counts used to travel under key names the
+  semantic surface withholds, so a clip that lost the hop leaving the module
+  read like lost breadth. The focal's record and every step also name the
+  module they are declared in, as `entity_module`, so a reader can tell which
+  unit each hop sits in.
+
+- `locate` answers from entity cards when a store holds no search vectors,
+  rather than reporting its search incomplete while embeddings are pending.
+
+- A language server whose own state fails, so that it answers every question
+  with the same error, is restarted and the file it failed on is asked again,
+  instead of every later answer being recorded as settled. tsserver asserting
+  while it updated its project is recognized at once, and for any server one
+  identical error repeated across several files after earlier answers is read
+  the same way. The sites it failed at read `server_failed`, the file stays
+  owed until a server answers it, and restarts stay bounded. On React, 1615
+  files were recorded as finished with no answer while tsserver was in this
+  state, and no later sweep asked them again.
+- A call site where the language server returned an error of its own reads
+  `unresolved` with the new reason `server_refused`, never `no_answer`, which
+  now means only that the server found no location. A file whose server
+  refused or declined every question and answered none is owed rather than
+  finished.
+- JavaScript workspace packages resolve for tsserver the way Node resolves
+  them: a package's JavaScript entry from `exports` or `main`, `exports`
+  subpath patterns, and any other subpath inside the package itself. Only a
+  package whose manifest names build output resolves through its `src`
+  mirror. In a JavaScript monorepo such as React, `import {useContext} from
+  'react'` resolved nowhere, so every value it returned was `any` and no call
+  through it had a definition.
+- The incremental language-server worker replaces a server that died or whose
+  state failed, instead of failing every later edit's questions against it.
+- An import from a JavaScript or TypeScript module that does not declare the
+  name follows the module's `export * from` chains and named re-exports,
+  bounded and cycle safe, to the one declaration they reach. An import from a
+  stub module whose sibling `forks/` directory holds build variants, the way
+  React's reconciler imports its host config, links to the declaration each
+  variant reaches, at its own `import_scoped` tier with `module_fork:v1`
+  evidence naming the stub and the variant. The set is enumerated and open:
+  it is never `type_resolved` and never claims to list every destination.
+  Stores re-derive history under hydration semantics 32 and parser semantics
+  19.
+- The default embedding model, nomic-embed-text-v1.5, is served the way its
+  model card specifies: mean pooling, `search_query: ` before every query,
+  `search_document: ` before every entity's text, and L2 normalization at its
+  full 768 dimensions. It had been served with CLS pooling and CodeRankEmbed's
+  code query instruction, because both models are `nomic_bert` models. Each
+  supported model's pooling, prefixes and normalization now come from one table
+  checked against the model's own card, so CodeRankEmbed and SweRankEmbed-Small
+  keep their settings and bge-small-en-v1.5 moves to the CLS pooling and query
+  instruction its card gives. A local model directory holding one of these
+  models' published weights is served as that model, and a model outside the
+  table is served as its own config says, with no prefix. The serving settings
+  are part of the embedding identity stored with the vectors, so the first open
+  of a store embedded under the old serving refuses those vectors and embeds
+  every entity again. On Flask, with the CPU backend, vector search ranked the
+  right entity higher for three of eight description queries and lower for
+  none.
+- An embed pass no longer rebuilds the whole vector index at every
+  checkpoint. Each checkpoint saved the index through a canonical HNSW rebuild
+  that inserts every vector again on one core, and on a large repository that
+  rebuild was most of each batch. While vectors are still owed, a checkpoint
+  now writes the index as its incremental inserts and removals left it, and
+  the save that finds nothing owed rebuilds it once, so a settled index is
+  written in the same canonical order as before. Filling an index with 20,000
+  vectors of 768 dimensions and checkpointing every 256, the checkpoints took
+  52 seconds in total, 46 of them in the final rebuild, against 1,364 seconds.
 
 - Language-server enrichment covers `.mjs`, `.cjs`, `.mts` and `.cts` modules.
   The sweep read them as an unsupported language, so their callers stayed owed

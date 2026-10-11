@@ -216,6 +216,27 @@ pub fn host_profile_for<'a>(
     }
 }
 
+/// The profile [`apply_repository_profile`] adopts over the environment `lookup`
+/// reads, or `None` when it leaves the value in effect alone. Pure, so a process
+/// can learn what a repository daemon runs under without adopting it.
+pub fn repository_profile_to_adopt<F>(configured: Option<&str>, lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let current = lookup(RESOURCE_PROFILE_ENV);
+    if inherited_repository_profile(current.as_deref(), &lookup) {
+        return None;
+    }
+    // Kin's own ship default and the machine profile setup recorded are both
+    // values nobody typed, so a repository's recorded choice takes over from
+    // either. Reading only the first is what would have made a recorded machine
+    // profile silently disable every repository `[resources]` config on that
+    // host.
+    let current_is_unchosen = inherited_product_default(current.as_deref(), &lookup)
+        || inherited_host_profile(current.as_deref(), &lookup);
+    repository_profile_for(configured, current.as_deref(), current_is_unchosen).map(str::to_string)
+}
+
 /// Adopt this repository's recorded resource profile when the operator has not
 /// chosen one (FIR-2504).
 ///
@@ -237,16 +258,7 @@ pub fn apply_repository_profile(configured: Option<&str>) -> Option<String> {
         PRODUCT_SELECTED.store(false, Ordering::Relaxed);
         return current;
     }
-    // Kin's own ship default and the machine profile setup recorded are both
-    // values nobody typed, so a repository's recorded choice takes over from
-    // either. Reading only the first is what would have made a recorded machine
-    // profile silently disable every repository `[resources]` config on that
-    // host.
-    let current_is_unchosen =
-        inherited_product_default(current.as_deref(), |key| std::env::var(key).ok())
-            || inherited_host_profile(current.as_deref(), |key| std::env::var(key).ok());
-    let adopt =
-        repository_profile_for(configured, current.as_deref(), current_is_unchosen)?.to_string();
+    let adopt = repository_profile_to_adopt(configured, |key| std::env::var(key).ok())?;
     std::env::set_var(RESOURCE_PROFILE_ENV, &adopt);
     std::env::set_var(RESOURCE_PROFILE_REPOSITORY_CONFIG_ENV, &adopt);
     // The value is no longer kin's ship default, nor the machine profile, so no
@@ -360,6 +372,14 @@ pub fn reset_host_config_selected_for_tests() {
 /// reported with its real message by the command that actually needs it.
 pub fn apply_repository_profile_at(from: &std::path::Path) -> Option<String> {
     let layout = kin_core::KinLayout::discover(from)?;
+    apply_repository_profile_for_layout(&layout)
+}
+
+/// Adopt the resource profile from an already selected store without
+/// rediscovering its working tree through the ambient registry. Call while the
+/// process is still single-threaded, with the same precedence and silent
+/// config-failure behavior as [`apply_repository_profile_at`].
+pub fn apply_repository_profile_for_layout(layout: &kin_core::KinLayout) -> Option<String> {
     let config = kin_core::KinConfig::load_or_default(&layout.config_path()).ok()?;
     apply_repository_profile(config.resources.normalized_profile().as_deref())
 }

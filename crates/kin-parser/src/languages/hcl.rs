@@ -79,8 +79,103 @@ impl LanguageAdapter for HclAdapter {
             tests: Vec::new(),
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: None,
         })
     }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(hcl_declaration_census(tree, source))
+    }
+}
+
+/// Count named top-level configuration declarations and local bindings.
+/// Attributes and nested blocks inside a resource configure that declaration;
+/// they do not declare independent names. Module/provider blocks are module
+/// entities, which the shared census deliberately does not pair. Named block
+/// kinds extraction does not understand still count, so an unsupported `check`
+/// is reported as unadmitted rather than hidden by a clean census.
+fn hcl_declaration_census(
+    tree: &Tree,
+    source: &[u8],
+) -> Vec<crate::declaration_census::SeenDeclaration> {
+    use crate::declaration_census::{DeclarationKind, DeclarationScope, SeenDeclaration};
+
+    fn binding(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+        find_child_by_kind(node, "identifier")?
+            .utf8_text(source)
+            .ok()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
+
+    let mut declarations = Vec::new();
+    let mut push = |node: &tree_sitter::Node, name: String, kind, owner| {
+        declarations.push(SeenDeclaration {
+            name,
+            kind,
+            scope: DeclarationScope::Module,
+            in_callable: false,
+            owner,
+            site: crate::adapter::site_from_node(node),
+        });
+    };
+    let root = tree.root_node();
+    let body = find_child_by_kind(&root, "body").unwrap_or(root);
+    let mut cursor = body.walk();
+    for node in body.named_children(&mut cursor) {
+        if node.kind() == "attribute" {
+            if let Some(name) = binding(&node, source) {
+                push(&node, name, DeclarationKind::Variable, None);
+            }
+            continue;
+        }
+        if node.kind() != "block" {
+            continue;
+        }
+        let block_type = binding(&node, source).unwrap_or_default();
+        match block_type.as_str() {
+            "module" | "provider" | "terraform" => continue,
+            "locals" => {
+                if let Some(locals) = find_child_by_kind(&node, "body") {
+                    let mut local_cursor = locals.walk();
+                    for attribute in locals.named_children(&mut local_cursor) {
+                        if attribute.kind() == "attribute" {
+                            if let Some(name) = binding(&attribute, source) {
+                                push(
+                                    &attribute,
+                                    name,
+                                    DeclarationKind::Variable,
+                                    Some("local".into()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                let mut labels = node.walk();
+                let name = node
+                    .named_children(&mut labels)
+                    .filter(|child| child.kind() == "string_lit")
+                    .filter_map(|label| label.utf8_text(source).ok())
+                    .last()
+                    .map(strip_quotes);
+                if let Some(name) = name.filter(|name| !name.is_empty()) {
+                    let kind = if matches!(block_type.as_str(), "variable" | "output") {
+                        DeclarationKind::Variable
+                    } else {
+                        DeclarationKind::Class
+                    };
+                    push(&node, name, kind, None);
+                }
+            }
+        }
+    }
+    declarations
 }
 
 /// Extract entities from a top-level HCL block.
@@ -139,8 +234,11 @@ fn extract_hcl_block(
                     visibility: Visibility::Public,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
             }
         }
@@ -157,8 +255,11 @@ fn extract_hcl_block(
                     visibility: Visibility::Public,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
             }
         }
@@ -172,8 +273,11 @@ fn extract_hcl_block(
                     visibility: Visibility::Public,
                     doc_summary: extract_description_attr(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
             }
         }
@@ -187,8 +291,11 @@ fn extract_hcl_block(
                     visibility: Visibility::Public,
                     doc_summary: extract_description_attr(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
             }
         }
@@ -202,8 +309,11 @@ fn extract_hcl_block(
                     visibility: Visibility::Public,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
 
                 // Extract source attribute as an import
@@ -248,8 +358,11 @@ fn extract_hcl_block(
                     visibility: Visibility::Public,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
             }
         }
@@ -545,6 +658,69 @@ fn find_first_identifier(node: &tree_sitter::Node, source: &[u8]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn census_pairs_bindings_and_schema_blocks_without_counting_configuration_members() {
+        let source = br#"
+region = "west"
+module "network" { source = "./network" }
+provider "cloud" { region = "west" }
+terraform { required_version = ">= 1.0" }
+
+# A named input.
+variable "image" { default = "stable" }
+output "address" { value = cloud_instance.web.address }
+locals {
+  label = "web"
+  tags = { tier = "frontend" }
+}
+# A named resource, including its configuration rather than separate names.
+resource "cloud_instance" "web" {
+  image = var.image
+  network { address = "private" }
+}
+data "cloud_image" "current" { label = "stable" }
+"#;
+        let tree = HclAdapter.parse(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let output = HclAdapter
+            .extract(&tree, source, &FilePathId::new("main.tf"))
+            .unwrap();
+        let seen = HclAdapter.declaration_census(&tree, source).unwrap();
+        let names: Vec<_> = seen.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["region", "image", "address", "label", "tags", "web", "current"]
+        );
+        let census = crate::declaration_census::take_census(seen, &output.entities);
+        assert_eq!(census.seen, 7);
+        assert_eq!(census.admitted, 7);
+        assert!(census.unadmitted.is_empty());
+    }
+
+    #[test]
+    fn census_reports_a_named_block_the_extractor_does_not_admit() {
+        let source = br#"
+check "health" {
+  assert {
+    condition = true
+    error_message = "unhealthy"
+  }
+}
+"#;
+        let tree = HclAdapter.parse(source).unwrap();
+        assert!(!tree.root_node().has_error());
+        let output = HclAdapter
+            .extract(&tree, source, &FilePathId::new("checks.tf"))
+            .unwrap();
+        let seen = HclAdapter.declaration_census(&tree, source).unwrap();
+        let census = crate::declaration_census::take_census(seen, &output.entities);
+        assert_eq!(census.seen, 1);
+        assert_eq!(census.admitted, 0);
+        assert_eq!(census.unadmitted.len(), 1);
+        assert_eq!(census.unadmitted[0].name, "health");
+        assert_eq!(census.unadmitted[0].reason, "not_admitted");
+    }
 
     #[test]
     fn parse_resource_block() {

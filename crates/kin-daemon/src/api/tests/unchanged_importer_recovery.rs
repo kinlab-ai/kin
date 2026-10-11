@@ -630,7 +630,9 @@ async fn waiting_assert_proof_retry_is_unproven(
             .any(|entity| entity["id"] == caller.to_string()),
         "{label}: {impact}"
     );
-    let report = &impact["source_derivation"]["report"];
+    let observation = serde_json::to_value(observe_live_head_sources(state, &state.graph, None))
+        .unwrap();
+    let report = &observation["report"];
     assert_eq!(report["body_binding"], "current", "{label}: {impact}");
     assert_eq!(report["parse_coverage"], "complete", "{label}: {impact}");
     assert_eq!(report["call_extraction"], "complete", "{label}: {impact}");
@@ -643,6 +645,14 @@ async fn waiting_assert_proof_retry_is_unproven(
         report["outstanding_local_binding_obligations"].is_null(),
         "{label}: {impact}"
     );
+    assert!(impact.get("source_derivation").is_none(), "{label}: {impact}");
+    assert_eq!(impact["binding_coverage"]["binding_scope"]["prior_local_binding"],
+        "unproven", "{label}: {impact}");
+    assert!(impact["binding_coverage"]["binding_scope"]["outstanding_local_binding_obligations"].is_null(),
+        "{label}: {impact}");
+    assert_eq!(impact["_kin"]["verdict"]["state"], "inconclusive", "{label}: {impact}");
+    assert!(impact["_kin"]["verdict"]["limiting_factor"].as_str().unwrap()
+        .contains("local_binding_unproven"), "{label}: {impact}");
     assert_eq!(
         kin_model::EntityStore::binding_history_observation(state.graph.as_ref()),
         kin_model::BindingHistoryObservation::Unproven

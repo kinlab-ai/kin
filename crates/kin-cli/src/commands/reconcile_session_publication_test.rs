@@ -189,13 +189,159 @@ fn prepared_recovery_observer_preserves_historical_receipt_after_newer_work() {
     assert_eq!(f.manager.read_authority().roots(), &before);
 }
 
+#[test]
+fn retained_store_root_round_trip_for_default_in_tree_and_external_placements() {
+    for placement in [
+        FixturePlacement::Default,
+        FixturePlacement::InTree,
+        FixturePlacement::External,
+    ] {
+        let f = Fixture::with_placement("session-store-placement", placement);
+        match placement {
+            FixturePlacement::Default => {}
+            FixturePlacement::InTree => assert!(!f.layout.is_external()),
+            FixturePlacement::External => assert!(f.layout.is_external()),
+        }
+        let body = b"exact store-owned target\n";
+        std::fs::write(f.session.join("answer.txt"), body).unwrap();
+        let observation = f.observe(false).unwrap();
+        assert_eq!(admitted(&observation), vec!["answer.txt"]);
+        assert_eq!(
+            observation
+                .desired_tree()
+                .artifact_at_path(&RepoPath::from_utf8("answer.txt").unwrap())
+                .unwrap()
+                .entry
+                .blob_identity(),
+            Some(kin_blobs::digest(body)),
+            "{placement:?}"
+        );
+        observation
+            .revalidate_publication_inputs(&f.layout, &f.blobs)
+            .unwrap();
+        let prepared = f.prepare(&observation, false);
+        let loaded = f.lookup().unwrap().unwrap();
+        assert_eq!(loaded.expected_receipt(), prepared.expected_receipt());
+        assert_eq!(
+            f.recover(&loaded).unwrap().desired_tree(),
+            observation.desired_tree(),
+            "{placement:?}"
+        );
+        let (receipt, freeze) = f
+            .manager
+            .commit_prepared_session_publication(&loaded)
+            .unwrap();
+        drop(freeze);
+        let replay = f.lookup().unwrap().unwrap();
+        assert_eq!(replay.expected_receipt(), &receipt);
+        assert_eq!(
+            f.recover(&replay).unwrap().desired_tree(),
+            observation.desired_tree(),
+            "{placement:?}"
+        );
+    }
+}
+
+#[test]
+fn external_store_observation_ignores_a_same_named_workspace_decoy() {
+    for placement in [FixturePlacement::Default, FixturePlacement::External] {
+        let f = Fixture::with_placement("session-store-decoy", placement);
+        assert!(f.layout.is_external(), "{placement:?}");
+        let body = b"actual external target\n";
+        std::fs::write(f.session.join("answer.txt"), body).unwrap();
+        let decoy = f
+            .layout
+            .working_dir()
+            .join(f.layout.root().file_name().unwrap())
+            .join("runs")
+            .join(f.session.file_name().unwrap());
+        std::fs::create_dir_all(decoy.join(".kin-session")).unwrap();
+        std::fs::copy(
+            f.session.join(".kin-session/base.json"),
+            decoy.join(".kin-session/base.json"),
+        )
+        .unwrap();
+        std::fs::write(decoy.join("answer.txt"), b"workspace decoy target\n").unwrap();
+        std::fs::write(decoy.join("decoy-only.txt"), b"not in the actual session\n").unwrap();
+
+        let observation = f.observe(false).unwrap();
+        assert_eq!(admitted(&observation), vec!["answer.txt"], "{placement:?}");
+        assert_eq!(
+            observation
+                .desired_tree()
+                .artifact_at_path(&RepoPath::from_utf8("answer.txt").unwrap())
+                .unwrap()
+                .entry
+                .blob_identity(),
+            Some(kin_blobs::digest(body)),
+            "{placement:?}"
+        );
+        observation
+            .revalidate_publication_inputs(&f.layout, &f.blobs)
+            .unwrap();
+        let prepared = f.prepare(&observation, false);
+        assert_eq!(f.lookup().unwrap().unwrap().binding(), prepared.binding());
+        assert_eq!(
+            f.recover(&prepared).unwrap().desired_tree(),
+            observation.desired_tree(),
+            "{placement:?}"
+        );
+    }
+}
+
+#[test]
+fn retained_store_root_symlink_replacement_refuses_all_placements() {
+    use std::os::unix::fs::symlink;
+    for placement in [
+        FixturePlacement::Default,
+        FixturePlacement::InTree,
+        FixturePlacement::External,
+    ] {
+        let f = Fixture::with_placement("session-store-symlink", placement);
+        std::fs::write(f.session.join("answer.txt"), b"exact target\n").unwrap();
+        let observation = f.observe(false).unwrap();
+        let prepared = f.prepare(&observation, false);
+        let displaced = f.layout.root().with_extension("displaced");
+        std::fs::rename(f.layout.root(), &displaced).unwrap();
+        symlink(&displaced, f.layout.root()).unwrap();
+
+        assert!(
+            observation
+                .revalidate_publication_inputs(&f.layout, &f.blobs)
+                .is_err(),
+            "{placement:?}"
+        );
+        assert!(
+            RetainedSession::open(&f.layout, &f.session).is_err(),
+            "{placement:?}"
+        );
+        assert!(f.lookup().is_err(), "{placement:?}");
+        assert!(f.recover(&prepared).is_err(), "{placement:?}");
+
+        std::fs::remove_file(f.layout.root()).unwrap();
+        std::fs::rename(&displaced, f.layout.root()).unwrap();
+        observation
+            .revalidate_publication_inputs(&f.layout, &f.blobs)
+            .unwrap();
+        f.recover(&prepared).unwrap();
+    }
+}
+
 struct Fixture {
     _repo: tempfile::TempDir,
+    _store: Option<tempfile::TempDir>,
     layout: kin_core::KinLayout,
     binding: kin_core::LocalRepositoryAuthorityBinding,
     blobs: kin_blobs::BlobStore,
     session: PathBuf,
     manager: RepositoryAuthorityManager<LocalFileBackend>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FixturePlacement {
+    Default,
+    InTree,
+    External,
 }
 
 fn transaction(base: &SessionWorkspaceBase, desired: &ResolvedTree) -> RepositoryTransaction {
@@ -231,6 +377,7 @@ fn transaction(base: &SessionWorkspaceBase, desired: &ResolvedTree) -> Repositor
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     }
 }
 
@@ -248,9 +395,33 @@ fn expectation(current: &WorkspaceState) -> WorkspaceExpectation {
 
 impl Fixture {
     fn new(leaf: &str) -> Self {
+        Self::with_placement(leaf, FixturePlacement::Default)
+    }
+
+    fn with_placement(leaf: &str, placement: FixturePlacement) -> Self {
         let repo = tempfile::tempdir().unwrap();
+        let store =
+            matches!(placement, FixturePlacement::External).then(|| tempfile::tempdir().unwrap());
+        if let Some(store) = &store {
+            kin_core::layout::register_external_store(
+                repo.path(),
+                &store.path().join("retained external-東京"),
+            )
+            .unwrap();
+        }
         let initialized = kin_core::init(repo.path()).unwrap();
-        let layout = initialized.layout;
+        let root = match placement {
+            FixturePlacement::Default | FixturePlacement::External => {
+                initialized.layout.root().to_path_buf()
+            }
+            FixturePlacement::InTree => repo.path().canonicalize().unwrap().join(".kin"),
+        };
+        if root != initialized.layout.root() {
+            std::fs::rename(initialized.layout.root(), &root).unwrap();
+            kin_core::layout::stage_store_placement(&root, &root, initialized.layout.working_dir())
+                .unwrap();
+        }
+        let layout = kin_core::KinLayout::new(root);
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
         let blobs = kin_blobs::BlobStore::new(layout.ingest_cas_dir()).unwrap();
         let manager = RepositoryAuthorityManager::open(
@@ -271,6 +442,7 @@ impl Fixture {
         .unwrap();
         Self {
             _repo: repo,
+            _store: store,
             layout,
             binding,
             blobs,
@@ -819,8 +991,16 @@ fn prepared_locator_publication_rescan_refuses_post_observation_body_and_members
 
 #[test]
 fn prepared_locator_physical_ancestor_replacement_refuses_even_with_retained_descendants() {
-    for ancestor in ["workspace", "control-root", "runs"] {
-        let f = Fixture::new("session-ancestor");
+    for (placement, ancestor) in [
+        FixturePlacement::Default,
+        FixturePlacement::InTree,
+        FixturePlacement::External,
+    ]
+    .into_iter()
+    .flat_map(|placement| {
+        ["workspace", "control-root", "runs"].map(|ancestor| (placement, ancestor))
+    }) {
+        let f = Fixture::with_placement("session-ancestor", placement);
         std::fs::write(f.session.join("answer.txt"), b"target\n").unwrap();
         let observation = f.observe(false).unwrap();
         let prepared = f.prepare(&observation, false);
@@ -830,7 +1010,9 @@ fn prepared_locator_physical_ancestor_replacement_refuses_even_with_retained_des
             "workspace" => {
                 std::fs::rename(f.layout.working_dir(), &displaced).unwrap();
                 std::fs::create_dir(f.layout.working_dir()).unwrap();
-                std::fs::rename(displaced.join(".kin"), f.layout.root()).unwrap();
+                if !f.layout.is_external() {
+                    std::fs::rename(displaced.join(".kin"), f.layout.root()).unwrap();
+                }
             }
             "control-root" => {
                 std::fs::rename(f.layout.root(), &displaced).unwrap();
@@ -851,12 +1033,12 @@ fn prepared_locator_physical_ancestor_replacement_refuses_even_with_retained_des
             observation
                 .revalidate_publication_inputs(&f.layout, &f.blobs)
                 .is_err(),
-            "{ancestor}"
+            "{placement:?}: {ancestor}"
         );
         let error = f.recover(&prepared).err().expect(ancestor);
         assert!(
             format!("{error:#}").contains("identity differs"),
-            "{ancestor}: {error:#}"
+            "{placement:?}: {ancestor}: {error:#}"
         );
     }
 }

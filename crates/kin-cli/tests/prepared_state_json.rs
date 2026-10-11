@@ -227,7 +227,7 @@ fn prepared_state_publish_and_materialize_preserve_indexed_state() {
     let init_payload = parse_json_output(&init, "kin init --json");
     assert_eq!(init_payload["schema"], "kin.init-result.v6");
 
-    seed_local_vectors(&repo1.join(".kin"));
+    seed_local_vectors(runtime.layout_for(&repo1).root());
 
     let publish = kin(&runtime, &repo1)
         .args([
@@ -348,7 +348,7 @@ fn prepared_state_materialize_rejects_repo_state_mismatch() {
         .expect("run kin init");
     let _ = parse_json_output(&init, "kin init --json");
 
-    seed_local_vectors(&repo1.join(".kin"));
+    seed_local_vectors(runtime.layout_for(&repo1).root());
 
     let publish = kin(&runtime, &repo1)
         .args([

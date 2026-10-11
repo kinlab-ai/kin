@@ -8,7 +8,10 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedName, ParseOutput};
+use crate::extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 
 pub struct CAdapter;
 
@@ -30,12 +33,8 @@ pub fn partial_call_sites(
 ) -> Option<Vec<PartialCallSite>> {
     partial_function_context(tree, source, declaration.start_byte, declaration.end_byte)?;
     let root = tree.root_node();
-    let mut cursor = root.walk();
-    let function = root.children(&mut cursor).find(|node| {
-        node.kind() == "function_definition"
-            && node.start_byte() == declaration.start_byte
-            && node.end_byte() == declaration.end_byte
-    })?;
+    let function =
+        top_level_function_at(tree, source, declaration.start_byte, declaration.end_byte)?;
     let mut unavailable = std::collections::HashSet::new();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
@@ -92,6 +91,25 @@ pub fn partial_call_sites(
     Some(sites)
 }
 
+/// The top-level function definition an entity spanning `start..end` was
+/// extracted from: one that ends at `end` and whose span, with the comments
+/// directly above it, starts at `start`.
+fn top_level_function_at<'t>(
+    tree: &'t Tree,
+    source: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<tree_sitter::Node<'t>> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let found = root.children(&mut cursor).find(|node| {
+        node.kind() == "function_definition"
+            && node.end_byte() == end
+            && c_span(node, source, &FilePathId::new("")).0.start_byte == start
+    });
+    found
+}
+
 /// Context that must remain identical before refreshing one declaration in an
 /// incomplete C file. Only direct, complete function definitions qualify. The
 /// full-file tree, including zero-width recovery nodes at either boundary, is
@@ -103,10 +121,7 @@ pub fn partial_function_context(
     end: usize,
 ) -> Option<Vec<String>> {
     let root = tree.root_node();
-    let mut cursor = root.walk();
-    let node = root.children(&mut cursor).find(|node| {
-        node.kind() == "function_definition" && node.start_byte() == start && node.end_byte() == end
-    })?;
+    let node = top_level_function_at(tree, source, start, end)?;
     if node.has_error()
         || collect_error_ranges(tree).iter().any(|&(a, b)| {
             if a == b {
@@ -303,6 +318,14 @@ impl LanguageAdapter for CAdapter {
         LanguageId::C
     }
 
+    /// A prototype: `declaration_signature` cuts a definition off at its
+    /// body, so a definition's stored signature ends at its parameter list
+    /// while a prototype keeps the `;` that ended its statement.
+    fn declares_only(&self, kind: EntityKind, signature: &str) -> bool {
+        matches!(kind, EntityKind::Function | EntityKind::Method)
+            && signature.trim_end().ends_with(';')
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["c", "h"]
     }
@@ -315,6 +338,14 @@ impl LanguageAdapter for CAdapter {
                 file: String::new(),
                 reason: "tree-sitter returned None".into(),
             })
+    }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::cpp_declarations::census(tree, source, false))
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
@@ -356,6 +387,35 @@ impl LanguageAdapter for CAdapter {
             }
         }
 
+        // A struct or union contains its fields.
+        for field in entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Field)
+        {
+            if let Some((owner, _)) = field.name.rsplit_once('.') {
+                relations.push(ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: kin_model::RelationKind::Contains,
+                    src_name: owner.to_string(),
+                    dst_name: field.name.clone(),
+                    import_source: None,
+                });
+            }
+        }
+
+        // Calls no function's walk reached go to the innermost entity holding
+        // each one, such as a file-scope variable whose initializer calls. C
+        // has no file module entity, so a call-shaped macro at file scope
+        // (`EXPORT_SYMBOL(f);`) that no declaration holds stays out.
+        {
+            let accounted = crate::call_owner::accounted_call_sites(&relations);
+            let mut swept = Vec::new();
+            extract_calls_from_body(&root, source, "", &mut swept);
+            crate::call_owner::adopt_unowned_calls(&entities, &accounted, swept, &mut relations);
+        }
+
         // Recursively extract all includes and ALL_CAPS macro usages across the whole file
         extract_includes_and_macros_recursive(&root, source, file_id, &mut imports, &mut relations);
 
@@ -381,16 +441,169 @@ impl LanguageAdapter for CAdapter {
             }
         }
 
+        let nested_definitions = Some(c_nested_definitions(&root, source, &entities));
+        let tests = c_tests(&root, source, file_id, &imports);
+
         Ok(ParseOutput {
             derived_members: Vec::new(),
             entities,
             relations,
             imports,
-            tests: Vec::new(),
+            tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions,
         })
     }
+}
+
+/// The tests a C unit defines. C has no one test convention, so a function
+/// is a test only by evidence its unit carries, and a production helper such
+/// as `test_bit` in a header stays a plain function:
+///
+/// - a framework registers it by name, as Unity's `RUN_TEST(test_total)` and
+///   CMocka's `cmocka_unit_test(test_total)` family do;
+/// - or the unit is a test unit by the shared path conventions
+///   (`test_ledger.c`, `ledger_test.c`, a unit under `tests/`) and the
+///   function is a `test_*` definition, which Unity's generated runner or the
+///   unit's own `main` calls.
+///
+/// The runner is the framework the unit includes (`unity` or `cmocka`), or
+/// `c` when it includes neither and the unit's own `main` runs its tests.
+fn c_tests(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    imports: &[FileImport],
+) -> Vec<ExtractedTest> {
+    let includes = |header: &str| {
+        imports
+            .iter()
+            .any(|import| import.module_path.rsplit('/').next() == Some(header))
+    };
+    let runner = if includes("unity.h") {
+        "unity"
+    } else if includes("cmocka.h") {
+        "cmocka"
+    } else {
+        "c"
+    };
+    let mut defined = Vec::new();
+    let mut registered = std::collections::BTreeSet::new();
+    let mut stack = vec![*root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_definition" => {
+                if let Some(name) = extract_function_name(&node, source) {
+                    defined.push((node.start_byte(), name));
+                }
+            }
+            "call_expression" => {
+                let callee = node
+                    .child_by_field_name("function")
+                    .and_then(|function| function.utf8_text(source).ok())
+                    .unwrap_or("");
+                if callee == "RUN_TEST" || callee.starts_with("cmocka_unit_test") {
+                    let registered_name = node
+                        .child_by_field_name("arguments")
+                        .and_then(|arguments| arguments.named_child(0))
+                        .filter(|argument| argument.kind() == "identifier")
+                        .and_then(|argument| argument.utf8_text(source).ok());
+                    if let Some(name) = registered_name {
+                        registered.insert(name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    // The walk pops children last first; tests are listed in source order.
+    defined.sort();
+    let test_unit = kin_model::test_paths::is_test_path(&file_id.0);
+    let mut seen = std::collections::BTreeSet::new();
+    defined
+        .into_iter()
+        .map(|(_, name)| name)
+        .filter(|name| registered.contains(name) || (test_unit && name.starts_with("test_")))
+        .filter(|name| seen.insert(name.clone()))
+        .map(|name| ExtractedTest {
+            name,
+            kind: ExtractedTestKind::Unit,
+            runner: runner.to_string(),
+        })
+        .collect()
+}
+
+/// The definitions C code writes inside a function body, none of which the
+/// adapter admits: a GNU C nested function, and a named struct, union or
+/// enum type local to the function. Standard C has no nested functions, and
+/// the calls in a GNU nested function stay with the function around it.
+/// A block the grammar reads as a definition with no function declarator is
+/// how a macro that opens a block parses, and declares nothing.
+fn c_nested_definitions(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    entities: &[ExtractedEntity],
+) -> crate::nested::NestedDefinitionCensus {
+    let mut census = crate::nested::NestedDefinitionCensus::default();
+    let mut stack = vec![(*root, None::<String>)];
+    while let Some((node, enclosing)) = stack.pop() {
+        let mut inner = enclosing.clone();
+        match node.kind() {
+            "function_definition" => {
+                let name = extract_function_name(&node, source);
+                if let (Some(outer), Some(name)) = (&enclosing, &name) {
+                    // A nested function has a return type and a function
+                    // declarator; `FOREACH(s) { ... }` reads as a type and a
+                    // parenthesized name.
+                    let real = node.child_by_field_name("type").is_some()
+                        && node
+                            .child_by_field_name("declarator")
+                            .is_some_and(|declarator| has_function_declarator(&declarator));
+                    if real {
+                        census.record(crate::nested::UnadmittedNestedDefinition {
+                            name: crate::nested::local_scope_name(outer, name),
+                            kind: EntityKind::Function,
+                            start_line: node.start_position().row as u32,
+                            enclosing: Some(outer.clone()),
+                            bases: Vec::new(),
+                        });
+                    }
+                }
+                if enclosing.is_none() {
+                    inner = name.filter(|name| {
+                        entities.iter().any(|entity| {
+                            entity.kind == EntityKind::Function && &entity.name == name
+                        })
+                    });
+                }
+            }
+            "struct_specifier" | "union_specifier" | "enum_specifier" => {
+                if let (Some(outer), Some(name), Some(_)) = (
+                    &enclosing,
+                    node_field_text(&node, "name", source),
+                    node.child_by_field_name("body"),
+                ) {
+                    census.record(crate::nested::UnadmittedNestedDefinition {
+                        name: crate::nested::local_scope_name(outer, &name),
+                        kind: specifier_entity_kind(&node).unwrap_or(EntityKind::Class),
+                        start_line: node.start_position().row as u32,
+                        enclosing: Some(outer.clone()),
+                        bases: Vec::new(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push((child, inner.clone()));
+        }
+    }
+    census
 }
 
 fn extract_c_node(
@@ -405,6 +618,8 @@ fn extract_c_node(
         "function_definition" => {
             if let Some(name) = extract_function_name(node, source) {
                 let vis = c_visibility(node, source);
+                let (span, declaration_line) =
+                    crate::declaration_extent::span_with_comments(node, source, file_id);
                 entities.push(ExtractedEntity {
                     kind: EntityKind::Function,
                     name: name.clone(),
@@ -412,8 +627,8 @@ fn extract_c_node(
                     visibility: vis,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span,
+                    declaration_line,
                 });
                 extract_calls_from_body(node, source, &name, relations);
             }
@@ -550,8 +765,8 @@ fn extract_declaration(
                     visibility: c_visibility(node, source),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: c_span(node, source, file_id).0,
+                    declaration_line: c_span(node, source, file_id).1,
                 });
                 return;
             }
@@ -569,12 +784,22 @@ fn extract_declaration(
                     visibility: c_visibility(node, source),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: c_span(node, source, file_id).0,
+                    declaration_line: c_span(node, source, file_id).1,
                 });
             }
         }
     }
+}
+
+/// A C declaration's span with the comments directly above it, and the line
+/// its id keys on.
+fn c_span(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+) -> (kin_model::SourceSpan, Option<u32>) {
+    crate::declaration_extent::span_with_comments(node, source, file_id)
 }
 
 /// Record the struct, union or enum a `struct_specifier`, `union_specifier` or
@@ -601,18 +826,68 @@ fn extract_type_specifier(
     };
     let entity = ExtractedEntity {
         kind,
-        name,
+        name: name.clone(),
         signature: node_signature(span_node, source),
         visibility: Visibility::Public,
         doc_summary: extract_preceding_comment(span_node, source),
         fingerprint: compute_fingerprint(span_node, source),
-        span: span_from_node(span_node, file_id),
-        declaration_line: None,
+        span: c_span(span_node, source, file_id).0,
+        declaration_line: c_span(span_node, source, file_id).1,
     };
-    if specifier.child_by_field_name("body").is_some() {
+    if let Some(body) = specifier.child_by_field_name("body") {
         entities.push(entity);
+        if kind == EntityKind::Class {
+            push_c_fields(&body, &name, source, file_id, entities);
+        }
     } else {
         forward_decls.push(entity);
+    }
+}
+
+/// Every named field of a struct or union body, as a field entity
+/// `owner.field`. A declaration of one field spans the whole declaration; one
+/// of several (`int x, y;`) gives each its own declarator's span. An
+/// anonymous nested struct names no field and stays out.
+fn push_c_fields(
+    body: &tree_sitter::Node,
+    owner: &str,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+) {
+    let mut cursor = body.walk();
+    for field in body.children(&mut cursor) {
+        if field.kind() != "field_declaration" {
+            continue;
+        }
+        let declarators: Vec<tree_sitter::Node> = (0..field.child_count())
+            .filter_map(|index| {
+                let index = index.try_into().ok()?;
+                (field.field_name_for_child(index) == Some("declarator"))
+                    .then(|| field.child(index))
+                    .flatten()
+            })
+            .collect();
+        for declarator in &declarators {
+            let Some(name) = declarator_name(declarator, source) else {
+                continue;
+            };
+            let spanned = if declarators.len() == 1 {
+                field
+            } else {
+                *declarator
+            };
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Field,
+                name: format!("{owner}.{name}"),
+                signature: node_signature(&field, source),
+                visibility: Visibility::Public,
+                doc_summary: extract_preceding_comment(&field, source),
+                fingerprint: compute_fingerprint(&spanned, source),
+                span: span_from_node(&spanned, file_id),
+                declaration_line: None,
+            });
+        }
     }
 }
 
@@ -741,8 +1016,8 @@ fn extract_type_definition(
                 visibility: Visibility::Public,
                 doc_summary: extract_preceding_comment(node, source),
                 fingerprint: compute_fingerprint(node, source),
-                span: span_from_node(node, file_id),
-                declaration_line: None,
+                span: c_span(node, source, file_id).0,
+                declaration_line: c_span(node, source, file_id).1,
             });
         }
         return;
@@ -774,8 +1049,8 @@ fn extract_type_definition(
             visibility: Visibility::Public,
             doc_summary: extract_preceding_comment(node, source),
             fingerprint: compute_fingerprint(node, source),
-            span: span_from_node(node, file_id),
-            declaration_line: None,
+            span: c_span(node, source, file_id).0,
+            declaration_line: c_span(node, source, file_id).1,
         };
         if defined_here {
             entities.push(entity);
@@ -936,6 +1211,54 @@ fn is_valid_callee(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tests_in(path: &str, source: &str) -> Vec<(String, String)> {
+        let adapter = CAdapter;
+        let tree = adapter.parse(source.as_bytes()).unwrap();
+        let output = adapter
+            .extract(&tree, source.as_bytes(), &FilePathId::new(path))
+            .unwrap();
+        output
+            .tests
+            .into_iter()
+            .map(|test| (test.name, test.runner))
+            .collect()
+    }
+
+    #[test]
+    fn a_test_function_is_found_by_registration_or_by_its_test_unit() {
+        // Unity registers a test by name, whatever the unit is called.
+        let unity = "#include \"unity.h\"\n\
+            void sums_two(void) { TEST_ASSERT_EQUAL(3, 1 + 2); }\n\
+            void helper(void) {}\n\
+            int main(void) { UNITY_BEGIN(); RUN_TEST(sums_two); return UNITY_END(); }\n";
+        assert_eq!(
+            tests_in("src/check_math.c", unity),
+            vec![("sums_two".to_string(), "unity".to_string())]
+        );
+        // CMocka registers through `cmocka_unit_test` in a test table.
+        let cmocka = "#include <cmocka.h>\n\
+            static void sums(void **state) { (void)state; }\n\
+            int main(void) {\n\
+            const struct CMUnitTest tests[] = { cmocka_unit_test(sums) };\n\
+            return cmocka_run_group_tests(tests, NULL, NULL);\n}\n";
+        assert_eq!(
+            tests_in("src/math_suite.c", cmocka),
+            vec![("sums".to_string(), "cmocka".to_string())]
+        );
+        // A plain `test_*` function counts only inside a test unit.
+        let plain = "#include <assert.h>\n\
+            void test_sum(void) { assert(1 + 2 == 3); }\n\
+            int main(void) { test_sum(); return 0; }\n";
+        assert_eq!(
+            tests_in("tests/sum.c", plain),
+            vec![("test_sum".to_string(), "c".to_string())]
+        );
+        // A production helper named like a test stays a function.
+        let production = "static inline int test_bit(int n, const unsigned long *addr) {\n\
+            return (int)((addr[n / 64] >> (n % 64)) & 1UL);\n}\n";
+        assert!(tests_in("include/bitops.h", production).is_empty());
+    }
 
     #[test]
     fn extract_function() {

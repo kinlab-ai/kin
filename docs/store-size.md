@@ -1,15 +1,17 @@
 # Store size
 
-`kin init` writes a `.kin/` store beside your repository, and `kin init` and
-`kin status` both report how large it is next to the Git object store it was
-admitted from. This page explains what drives that number and records what has
+`kin init` writes a store for your repository, in `~/.kin/stores/<name>` by
+default or in `.kin/` for a repository an earlier version initialized, and
+`kin init` and `kin status` both report how large it is next to the Git object
+store it was admitted from. `kin store path` prints where a repository's store
+is, and `kin store list --size` measures every store on the machine. This page explains what drives that number and records what has
 actually been measured.
 
 ## What the number means
 
 Two directories are walked and their file bytes summed.
 
-- **Store**, everything under `.kin/`. That is the graph snapshot, the admitted
+- **Store**, everything in the store directory. That is the graph snapshot, the admitted
   source bodies, the repository authority record, and any index built beside
   them.
 - **Git object store**, everything under `.git/objects`, following a `.git`

@@ -819,7 +819,14 @@ mod tests {
 
         let search = search_dirs_from(&recorded, Some(home.path()), |_| None);
         assert_eq!(search.first(), Some(&custom), "recorded directories lead");
-        let path = path_with_tool_dirs(Some(&os("/usr/bin:/bin")), &search, &managed).unwrap();
+        // The operator's own PATH comes first by design, so a system directory
+        // that already holds the server would answer ahead of the recorded one.
+        // A real /usr/bin does on a host with pyright installed, which is a fact
+        // about the host rather than about this composition, so the system
+        // entry here is an empty directory the test owns.
+        let system = home.path().join("usr/bin");
+        std::fs::create_dir_all(&system).unwrap();
+        let path = path_with_tool_dirs(Some(&system.into_os_string()), &search, &managed).unwrap();
         assert_eq!(
             which::which_in("pyright-langserver", Some(&path), home.path()).ok(),
             Some(custom.join("pyright-langserver"))

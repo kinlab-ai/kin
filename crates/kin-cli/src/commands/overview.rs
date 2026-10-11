@@ -87,9 +87,11 @@ pub fn build_overview_response(
             .collect();
         let mut relation_ids = std::collections::HashSet::new();
         let mut kinds = HashMap::<String, usize>::new();
+        let mut languages = HashMap::<String, usize>::new();
 
         for entity in &entities {
             *kinds.entry(format!("{:?}", entity.kind)).or_default() += 1;
+            *languages.entry(entity.language.to_string()).or_default() += 1;
             for rel in graph.get_all_relations_for_entity(&entity.id)? {
                 relation_ids.insert(rel.id);
             }
@@ -101,12 +103,16 @@ pub fn build_overview_response(
                 "edges": relation_ids.len(),
                 "files": unique_files.len(),
                 "kinds": kinds,
+                "languages": languages,
             }))?],
         });
     }
 
-    // Count unique files
-    let unique_files: std::collections::HashSet<_> = entities
+    // The parsed units these entities were parsed from. Counted by origin, and
+    // said as units: Kin holds entities, and the reader of this page is asking
+    // how much of the repository was parsed into them, not how many files the
+    // checkout has.
+    let parsed_units: std::collections::HashSet<_> = entities
         .iter()
         .filter_map(|e| e.file_origin.as_ref().map(|f| f.0.clone()))
         .collect();
@@ -114,10 +120,10 @@ pub fn build_overview_response(
     let mut lines = Vec::new();
     lines.push("=== Kin Overview ===".to_string());
     lines.push(format!(
-        "Repository: {}  |  Entities: {}  |  Files: {}",
+        "Repository: {}  |  Entities: {}  |  Parsed units: {}",
         repo_name,
         entities.len(),
-        unique_files.len()
+        parsed_units.len()
     ));
     lines.push(String::new());
 
@@ -136,12 +142,12 @@ pub fn build_overview_response(
     lines.push("--- Languages ---".to_string());
     let mut langs: Vec<_> = by_lang.iter().collect();
     langs.sort_by_key(|b| std::cmp::Reverse(b.1 .0));
-    for (lang, (count, files)) in &langs {
+    for (lang, (count, units)) in &langs {
         lines.push(format!(
-            "  {}: {} entities across {} files",
+            "  {}: {} entities in {} parsed units",
             lang,
             count,
-            files.len()
+            units.len()
         ));
     }
     lines.push(String::new());
@@ -169,16 +175,22 @@ pub fn build_overview_response(
         for (kind, ents) in &kinds {
             lines.push(format!("{} ({}):", kind, ents.len()));
             for e in ents.iter().take(top_n) {
-                let file = e.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("?");
                 // The graph stores tree-sitter rows, which are 0-based; a
                 // `file:line` a reader pastes into an editor is 1-based. An entity
-                // the graph carries no span for names its file alone rather than
-                // the `:0` that used to appear here.
-                let location = match entity_presentation_start_line(e) {
-                    Some(line) => format!("{file}:{line}"),
-                    None => file.to_string(),
-                };
-                lines.push(format!("  {}  {}", e.name, location));
+                // the graph carries no span for names its origin alone rather than
+                // the `:0` that used to appear here, and one with no origin at all
+                // is named alone rather than beside a `?`.
+                let location =
+                    e.file_origin
+                        .as_ref()
+                        .map(|origin| match entity_presentation_start_line(e) {
+                            Some(line) => format!("{}:{line}", origin.0),
+                            None => origin.0.clone(),
+                        });
+                match location {
+                    Some(location) => lines.push(format!("  {}  {}", e.name, location)),
+                    None => lines.push(format!("  {}", e.name)),
+                }
             }
             if ents.len() > top_n {
                 lines.push(format!("  ... and {} more", ents.len() - top_n));
@@ -288,6 +300,82 @@ mod tests {
         assert!(
             joined.contains("src/spanless.py") && !joined.contains("src/spanless.py:0"),
             "a spanless entity names its file without a fabricated line: {joined}"
+        );
+    }
+
+    /// The page speaks in entities and parsed units, never in files: Kin holds
+    /// entities, and a first conversion's overview that said `Files: 83` told a
+    /// reader the opposite. An entity with no origin is named alone rather
+    /// than beside a `?`.
+    #[test]
+    fn the_overview_counts_parsed_units_and_never_says_files() {
+        let graph = InMemoryGraph::new();
+        for (name, path) in [
+            ("first", "src/a.py"),
+            ("second", "src/a.py"),
+            ("third", "src/b.py"),
+        ] {
+            graph
+                .upsert_entity(&overview_entity(name, path, Some(0)))
+                .expect("upsert entity");
+        }
+        let mut originless = overview_entity("originless", "src/c.py", None);
+        originless.file_origin = None;
+        graph.upsert_entity(&originless).expect("upsert entity");
+        for compact in [true, false] {
+            let response = build_overview_response(
+                "probe-repo",
+                &graph,
+                &OverviewRequest {
+                    json: false,
+                    compact,
+                },
+            )
+            .expect("build overview");
+            let joined = response.lines.join("\n");
+            assert!(
+                joined.contains("Entities: 4  |  Parsed units: 2"),
+                "{joined}"
+            );
+            assert!(
+                joined.contains(&format!(
+                    "{}: 4 entities in 2 parsed units",
+                    LanguageId::Python
+                )),
+                "{joined}"
+            );
+            assert!(!joined.to_lowercase().contains("file"), "{joined}");
+            assert!(!joined.contains('?'), "{joined}");
+        }
+    }
+
+    /// The machine answer counts entities by language as well as by kind, so
+    /// a reader that renders the repository's languages reads a number rather
+    /// than parsing the terminal listing.
+    #[test]
+    fn the_json_answer_counts_entities_by_language() {
+        let graph = InMemoryGraph::new();
+        for name in ["first", "second"] {
+            graph
+                .upsert_entity(&overview_entity(name, "src/probe.py", Some(0)))
+                .expect("upsert entity");
+        }
+        let response = build_overview_response(
+            "probe-repo",
+            &graph,
+            &OverviewRequest {
+                json: true,
+                compact: true,
+            },
+        )
+        .expect("build overview");
+        let answer: serde_json::Value =
+            serde_json::from_str(&response.lines[0]).expect("one JSON line");
+        assert_eq!(answer["entities"], 2);
+        assert_eq!(
+            answer["languages"][LanguageId::Python.to_string()],
+            2,
+            "{answer}"
         );
     }
 }

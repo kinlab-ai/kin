@@ -1279,9 +1279,6 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "fallible-iterator"
@@ -2484,7 +2481,7 @@ checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
 dependencies = [
  "dirs",
  "http",
- "indicatif 0.18.4",
+ "indicatif",
  "libc",
  "log",
  "rand 0.9.4",
@@ -2845,19 +2842,6 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.17.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
-dependencies = [
- "console 0.15.11",
- "number_prefix",
- "portable-atomic",
- "unicode-width",
- "web-time",
-]
-
-[[package]]
-name = "indicatif"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25470f23803092da7d239834776d653104d551bc4d7eacaf31e6837854b8e9eb"
@@ -2975,24 +2959,6 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
-name = "itertools"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
 
 [[package]]
 name = "itertools"
@@ -3148,6 +3114,7 @@ version = "0.8.2"
 dependencies = [
  "anyhow",
  "chrono",
+ "kin-io",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3161,6 +3128,7 @@ name = "kin-blobs"
 version = "0.1.5"
 dependencies = [
  "hex",
+ "libc",
  "schemars",
  "serde",
  "sha2 0.11.0",
@@ -3209,6 +3177,7 @@ dependencies = [
  "kin-git",
  "kin-index",
  "kin-infer",
+ "kin-io",
  "kin-lsp",
  "kin-mcp",
  "kin-migrate",
@@ -3221,6 +3190,7 @@ dependencies = [
  "kin-remote",
  "kin-review",
  "kin-runtime",
+ "kin-search",
  "kin-semantic-contracts",
  "kin-spine",
  "kin-vfs-core",
@@ -3287,13 +3257,17 @@ dependencies = [
  "kin-blobs",
  "kin-daemon-spawn",
  "kin-db",
+ "kin-derivation-inputs",
  "kin-git",
  "kin-index",
+ "kin-io",
  "kin-model",
  "kin-parser",
+ "kin-ranking",
  "libc",
  "pretty_assertions",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3334,6 +3308,7 @@ dependencies = [
  "kin-grammar-typescript",
  "kin-index",
  "kin-infer",
+ "kin-io",
  "kin-lsp",
  "kin-mcp",
  "kin-migrate",
@@ -3349,6 +3324,7 @@ dependencies = [
  "mimalloc",
  "object_store",
  "pretty_assertions",
+ "rayon",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3361,6 +3337,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -3375,6 +3352,7 @@ name = "kin-daemon-spawn"
 version = "0.8.2"
 dependencies = [
  "fs2",
+ "kin-blobs",
  "libc",
  "pretty_assertions",
  "serde",
@@ -3404,6 +3382,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "hex",
  "hf-hub",
+ "kin-blobs",
  "kin-infer",
  "kin-model",
  "kin-search",
@@ -3430,11 +3409,20 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tinyvec",
- "tokenizers 0.23.1",
+ "tokenizers",
  "tokio",
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "kin-derivation-inputs"
+version = "0.8.2"
+dependencies = [
+ "sha2 0.11.0",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -3447,6 +3435,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-daemon-spawn",
+ "kin-io",
  "kin-model",
  "libc",
  "pretty_assertions",
@@ -3480,6 +3469,7 @@ dependencies = [
  "kin-daemon-spawn",
  "kin-db",
  "kin-git",
+ "kin-io",
  "kin-model",
  "kin-parser",
  "kin-projection",
@@ -3519,7 +3509,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
- "tokenizers 0.20.4",
+ "tokenizers",
  "tracing",
 ]
 
@@ -3535,6 +3525,7 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
+ "kin-io",
  "kin-migrate",
  "kin-model",
  "kin-parser",
@@ -3544,11 +3535,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-io"
+version = "0.8.2"
+dependencies = [
+ "cap-std",
+ "kin-blobs",
+ "tempfile",
+]
+
+[[package]]
 name = "kin-lsp"
 version = "0.7.19"
 dependencies = [
  "ed25519-dalek",
  "flate2",
+ "futures-util",
+ "kin-blobs",
+ "kin-daemon-spawn",
  "kin-grammar-typescript",
  "kin-model",
  "kin-parser",
@@ -3559,6 +3562,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tinyvec",
  "tokio",
@@ -3583,6 +3587,7 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
+ "kin-io",
  "kin-model",
  "kin-parser",
  "kin-ranking",
@@ -3592,6 +3597,7 @@ dependencies = [
  "kin-spine",
  "libc",
  "pretty_assertions",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3613,7 +3619,6 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
- "kin-infer",
  "kin-model",
  "kin-parser",
  "kin-projection",
@@ -3681,6 +3686,7 @@ name = "kin-parser"
 version = "0.8.2"
 dependencies = [
  "kin-grammar-typescript",
+ "kin-io",
  "kin-model",
  "pretty_assertions",
  "serde",
@@ -3688,6 +3694,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tree-sitter",
  "tree-sitter-c",
@@ -3715,6 +3722,7 @@ dependencies = [
  "kin-model",
  "pretty_assertions",
  "proptest",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -3725,9 +3733,11 @@ dependencies = [
 name = "kin-ranking"
 version = "0.8.2"
 dependencies = [
+ "kin-io",
  "kin-model",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3742,6 +3752,7 @@ dependencies = [
  "kin-projection",
  "notify",
  "pretty_assertions",
+ "rayon",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -3832,6 +3843,7 @@ dependencies = [
  "chrono",
  "kin-blobs",
  "kin-core",
+ "kin-io",
  "kin-model",
  "pretty_assertions",
  "serde",
@@ -3848,6 +3860,7 @@ version = "0.1.9"
 dependencies = [
  "bincode",
  "fst",
+ "kin-blobs",
  "memmap2",
  "parking_lot",
  "rayon",
@@ -3899,6 +3912,7 @@ version = "0.2.1"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
+ "kin-blobs",
  "memmap2",
  "parking_lot",
  "rayon",
@@ -4347,12 +4361,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
 ]
-
-[[package]]
-name = "number_prefix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "objc"
@@ -4988,17 +4996,6 @@ checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",
-]
-
-[[package]]
-name = "rayon-cond"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "059f538b55efd2309c9794130bc149c6a553db90e9d99c2030785c82f0bd7df9"
-dependencies = [
- "either",
- "itertools 0.11.0",
- "rayon",
 ]
 
 [[package]]
@@ -6109,38 +6106,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizers"
-version = "0.20.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b08cc37428a476fc9e20ac850132a513a2e1ce32b6a31addf2b74fa7033b905"
-dependencies = [
- "aho-corasick",
- "derive_builder",
- "esaxx-rs",
- "getrandom 0.2.17",
- "indicatif 0.17.11",
- "itertools 0.12.1",
- "lazy_static",
- "log",
- "macro_rules_attribute",
- "monostate",
- "onig",
- "paste",
- "rand 0.8.6",
- "rayon",
- "rayon-cond 0.3.0",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror 1.0.69",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
-
-[[package]]
-name = "tokenizers"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44e5bea67576e04b6ff8564c5d9e09c2ef0cf476502245f2f120e497769d3112"
@@ -6152,7 +6117,7 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.3.4",
- "indicatif 0.18.4",
+ "indicatif",
  "itertools 0.14.0",
  "log",
  "macro_rules_attribute",
@@ -6161,7 +6126,7 @@ dependencies = [
  "paste",
  "rand 0.9.4",
  "rayon",
- "rayon-cond 0.4.0",
+ "rayon-cond",
  "regex",
  "regex-syntax",
  "serde",

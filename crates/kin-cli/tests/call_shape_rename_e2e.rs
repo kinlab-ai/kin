@@ -269,6 +269,11 @@ fn rename_diff_for_entity(
     old.signature = old_sig.to_string();
     let mut new = target.clone();
     new.signature = new_sig.to_string();
+    // Two declarations are two token streams, as a parse of each records, so
+    // the review reads the rename as a signature change and not as a comment
+    // inside the same declaration.
+    old.fingerprint.behavior_hash = kin_blobs::digest(old_sig.as_bytes());
+    new.fingerprint.behavior_hash = kin_blobs::digest(new_sig.as_bytes());
     SemanticDiff {
         entity_changes: vec![EntityChange {
             entity_id: new.id,

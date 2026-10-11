@@ -1,8 +1,8 @@
 # Kin for Cursor
 
-Kin keeps a living map of the software itself so humans and agents can understand what
-every change touches. Locate, search, context packs, data-flow tracing, and impact
-analysis without raw file search.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. Its MCP server lets your agent look up callers, references, history and what a
+change might affect, from the same record you inspect with the kin CLI.
 
 ## Install
 
@@ -29,11 +29,10 @@ that downloads the matching Kin release for your platform, verifies its publishe
 and serves the curated `agent-default` tool profile. Until that first download finishes,
 the server lists one tool, `kin_startup_status`, which reports its progress.
 
-The tools worth knowing: `semantic_search` finds parsed declarations by name, kind, and
-language. `semantic_locate` ranks code against a natural-language description using the
-vector index. `get_context_pack` returns an entity with its callers and imports in one
-call. `find_references` and `graph_neighborhood` walk the reference graph. `trace_data_flow`
-returns the ordered chain a value travels. `impact_analysis` answers what a change can
+The tools worth knowing: `locate` finds parsed declarations by name, kind, and
+language, or ranks code against a natural-language description using the vector index. `context` returns an entity with its callers and imports in one
+call. `refs` and `neighbors` walk the reference graph. `trace`
+returns the ordered chain a value travels. `impact` answers what a change can
 reach. The full surface is documented in
 [docs/mcp-tools.md](https://github.com/firelock-ai/kin/blob/main/docs/mcp-tools.md).
 
@@ -44,9 +43,9 @@ search.
 ## Before the tools can answer
 
 Kin answers from a graph, so a repository has to be admitted first. Ask the agent to call
-`kin_init`, or run `npx -y @kinlab/kin init .` in the repository yourself: the plugin puts no
+`init`, or run `npx -y @kinlab/kin init .` in the repository yourself: the plugin puts no
 `kin` on your PATH, so `npx` runs it. Then run `npx -y @kinlab/kin embed` to build the vector
-index that `semantic_locate` ranks against. The structural tools work as soon as admission
+index that `locate` ranks against. The structural tools work as soon as admission
 finishes.
 [llms-install.md](https://github.com/firelock-ai/kin/blob/main/llms-install.md) is the
 step-by-step version, written so an agent can follow it unattended.

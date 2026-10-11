@@ -138,10 +138,15 @@ fn decode(token: &str, key: &[u8; 32]) -> Result<Cursor, String> {
 
 /// Validate the selected-observation contract at both producer and consumer.
 /// A page describes metadata coverage, never semantic completeness.
+/// Check a selected enrichment observation. `status_page_continues` says the
+/// observation rides in a mixed status page, whose `status_page.next_cursor`
+/// is the one continuation, so its own page must not repeat it; on an
+/// enrichment-only page, its own page carries it.
 pub fn validate_observation(
     value: &Value,
     current: bool,
     scope: crate::handlers::entities::GraphStatusScope,
+    status_page_continues: bool,
 ) -> Result<(), String> {
     if value["schema"] != "kin.enrichment-status.v1"
         || value["proof_scope"] != "recorded_call_site_census"
@@ -200,9 +205,14 @@ pub fn validate_observation(
             .checked_add(returned)
             .filter(|end| *end <= total)
             .ok_or("invalid enrichment page range")?;
+        let continuation_described = if status_page_continues {
+            page.get("next_cursor").is_none()
+        } else {
+            page["next_cursor"].is_string() == (end < total)
+        };
         if returned != rows.len() as u64
             || page["complete"].as_bool() != Some(start == 0 && end == total)
-            || page["next_cursor"].is_string() != (end < total)
+            || !continuation_described
         {
             return Err("enrichment page does not describe its rows".into());
         }
@@ -362,7 +372,12 @@ fn page_collections(
     } else {
         Vec::new()
     };
-    if !enrichment_unavailable && !paths.is_empty() {
+    // An unavailable graph status still pages operational work. Its original
+    // error is not an incomplete dependency observation.
+    if !enrichment_unavailable
+        && !paths.is_empty()
+        && (has_enrichment || result.is_error != Some(true))
+    {
         let selected = paths
             .iter()
             .map(serde_json::to_value)
@@ -424,11 +439,13 @@ fn page_collections(
         let tx_end = end.min(transactions.len());
         let file_start = start.saturating_sub(transactions.len()).min(files.len());
         let file_end = end.saturating_sub(transactions.len()).min(files.len());
+        // Each collection says which of its rows this page holds; the one
+        // continuation is `status_page.next_cursor`, which covers both, so no
+        // collection repeats it.
         value["open_transactions"]["items"] = json!(&transactions[tx_start..tx_end]);
         value["open_transactions"]["page"] = json!({
             "start":tx_start,"returned":tx_end-tx_start,"total":transactions.len(),
             "complete":tx_start==0 && tx_end==transactions.len(),
-            "next_cursor":if tx_end<transactions.len(){next.clone()}else{None},
         });
         if has_enrichment {
             value["enrichment"]["files"] = json!(&files[file_start..file_end]);
@@ -436,8 +453,7 @@ fn page_collections(
             if enrichment_available {
                 value["enrichment"]["page"] = json!({
                 "start":file_start,"returned":file_end-file_start,"total":files.len(),
-                "complete":file_start==0 && file_end==files.len(),
-                "next_cursor":if file_end<files.len(){next.clone()}else{None},"max_chars":ceiling,
+                "complete":file_start==0 && file_end==files.len(),"max_chars":ceiling,
                 });
             }
         }
@@ -474,9 +490,39 @@ fn page_collections(
 /// Page only after the complete observation passed its source/truth fence.
 /// This never changes the underlying proof or repository-wide limitations.
 fn page_enrichment(
+    result: ToolCallResult,
+    request: &StatusRequest,
+    key: &[u8; 32],
+) -> Result<ToolCallResult, String> {
+    // Leave room for the stdio standing envelope. Its final boundary checks
+    // actual serialized bytes too, rather than assuming this reserve suffices.
+    let ceiling = request.ceiling();
+    let target = ceiling.saturating_sub(ENVELOPE_RESERVE).max(ceiling / 2);
+    page_enrichment_measured(result, request, key, target, |value| {
+        serde_json::to_vec(value)
+            .map(|encoded| encoded.len())
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Admit whole enrichment rows against the caller's actual delivered envelope.
+/// The measurement includes transport decorations; it never changes the
+/// requested ceiling, observation identity, proof rows, or cursor contract.
+pub fn page_enrichment_for_envelope(
+    result: ToolCallResult,
+    request: &StatusRequest,
+    key: &[u8; 32],
+    measure: impl Fn(&Value) -> Result<usize, String>,
+) -> Result<ToolCallResult, String> {
+    page_enrichment_measured(result, request, key, request.ceiling(), measure)
+}
+
+fn page_enrichment_measured(
     mut result: ToolCallResult,
     request: &StatusRequest,
     key: &[u8; 32],
+    target: usize,
+    measure: impl Fn(&Value) -> Result<usize, String>,
 ) -> Result<ToolCallResult, String> {
     if result.is_error == Some(true) {
         return Ok(result);
@@ -499,7 +545,11 @@ fn page_enrichment(
         return if request.cursor.is_some() || !paths.is_empty() {
             Err("selected graph enrichment observation is unavailable".into())
         } else {
-            Ok(result)
+            if measure(&value)? > target {
+                Err("status envelope cannot fit within the response budget".into())
+            } else {
+                Ok(result)
+            }
         };
     };
     enrichment["current"] = json!(current);
@@ -508,6 +558,9 @@ fn page_enrichment(
             return Err("enrichment detail is unavailable; restart without cursor".into());
         }
         enrichment["requested_dependencies"] = json!(paths);
+        if measure(&value)? > target {
+            return Err("status envelope cannot fit within the response budget".into());
+        }
         *text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
         return Ok(result);
     }
@@ -544,11 +597,23 @@ fn page_enrichment(
         0
     };
     let total = rows.len();
-    // Leave room for the stdio standing envelope. Its final boundary checks
-    // actual serialized bytes too, rather than assuming this reserve suffices.
     let ceiling = request.ceiling();
-    let target = ceiling.saturating_sub(ENVELOPE_RESERVE).max(ceiling / 2);
-    let mut end = start;
+    // A terminal page omits the cursor. It can fit even when a smaller prefix
+    // cannot, so measure all remaining whole rows before assuming size grows.
+    value["enrichment"]["files"] = json!(&rows[start..]);
+    value["enrichment"]["page"] = json!({
+        "start": start, "returned": total - start, "total": total,
+        "complete": start == 0, "next_cursor": null, "max_chars": ceiling,
+    });
+    value["enrichment"]["requested_dependencies"] = json!(paths);
+    if measure(&value)? <= target {
+        *text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        return Ok(result);
+    }
+    // Measure the first deliverable whole row, or the empty inventory. A
+    // zero-row preview's cursor can be larger than a terminal one-row page.
+    let mut end = start.saturating_add(1).min(total);
+    let mut previous = None;
     loop {
         let next = (end < total).then(|| {
             encode(
@@ -569,25 +634,20 @@ fn page_enrichment(
         });
         value["enrichment"]["requested_dependencies"] = json!(paths);
         let encoded = serde_json::to_string(&value).map_err(|e| e.to_string())?;
-        if encoded.len() > target {
+        if measure(&value)? > target {
             if end <= start + 1 {
-                return Err("status metadata row or envelope exceeds the response budget; increase max_chars".into());
+                return Err(
+                    "status metadata row or envelope cannot fit within the response budget".into(),
+                );
             }
-            end -= 1;
-            value["enrichment"]["files"] = json!(&rows[start..end]);
-            value["enrichment"]["page"] = json!({
-                "start": start, "returned": end-start, "total": total,
-                "complete": false,
-                "next_cursor": encode(&Cursor {version:1,snapshot,query,offset:end},key),
-                "max_chars": ceiling,
-            });
-            *text = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            *text = previous.ok_or("status page has no fitting metadata row")?;
             return Ok(result);
         }
         if end == total {
             *text = encoded;
             return Ok(result);
         }
+        previous = Some(encoded);
         end += 1;
     }
 }
@@ -753,8 +813,108 @@ mod tests {
     }
 
     #[test]
+    fn status_dependency_queries_preserve_unavailable_errors_and_transaction_pages() {
+        let original = "kin_graph_status could not sample the selected graph: authority moved; no settled reading. \"λ\"\nWait for graph mutation to quiesce.";
+        let standing = json!({
+            "runtime":"repo-daemon",
+            "answered_by":{"pid":7,"repo_id":"00000000-0000-0000-0000-000000000007"},
+            "verdict":{"state":"inconclusive","safe_to_conclude_absent":false}
+        });
+        for count in [0, 30] {
+            let observation = transaction_fixture(count);
+            let wrapped = with_open_transactions(
+                ToolCallResult::error(original),
+                &observation,
+                &json!("selected-repository"),
+            )
+            .unwrap();
+            let mut full: Value = serde_json::from_str(text(&wrapped)).unwrap();
+            full["_kin"] = standing.clone();
+            let make = || {
+                let mut result = ToolCallResult::text(full.to_string());
+                result.is_error = Some(true);
+                result
+            };
+            let mut request = StatusRequest {
+                dependencies: (0..8).map(|index| format!("src/{index}.py")).collect(),
+                max_chars: Some(6000),
+                ..Default::default()
+            };
+            let mut reconstructed = Vec::new();
+            let mut pages = 0;
+            loop {
+                let result = page(make(), &request, &[4; 32]).unwrap();
+                let result = enforce_ceiling(result, request.ceiling());
+                assert_eq!(result.is_error, Some(true));
+                assert!(text(&result).len() <= request.ceiling());
+                let value: Value = serde_json::from_str(text(&result)).unwrap();
+                assert_eq!(value["message"], original);
+                assert_eq!(value["graph_status"], "unavailable");
+                assert_eq!(value["_kin"], standing);
+                assert!(value.get("enrichment").is_none());
+                assert!(value.get("entity_count").is_none());
+                assert_eq!(value["status_page"]["start"], reconstructed.len());
+                assert_eq!(value["status_page"]["total"], count);
+                reconstructed.extend(
+                    value["open_transactions"]["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .cloned(),
+                );
+                request.cursor = value["status_page"]["next_cursor"]
+                    .as_str()
+                    .map(str::to_owned);
+                pages += 1;
+                if request.cursor.is_none() {
+                    break;
+                }
+                let mut changed = request.clone();
+                changed.dependencies.push("src/another.py".into());
+                assert!(page(make(), &changed, &[4; 32])
+                    .unwrap_err()
+                    .contains("changed"));
+            }
+            assert_eq!(
+                json!(reconstructed),
+                serde_json::to_value(&observation.items).unwrap()
+            );
+            assert_eq!(pages > 1, count > 0);
+        }
+    }
+
+    #[test]
+    fn status_dependency_queries_still_refuse_missing_successful_rows() {
+        let request = StatusRequest {
+            dependencies: vec!["src/000.py".into(), "missing.py".into()],
+            max_chars: Some(6000),
+            ..Default::default()
+        };
+        for transactions in [false, true] {
+            let mut result = ToolCallResult::text(fixture(1).to_string());
+            if transactions {
+                result =
+                    with_open_transactions(result, &transaction_fixture(2), &json!("repository"))
+                        .unwrap();
+            }
+            assert_eq!(
+                page(result, &request, &[4; 32]).unwrap_err(),
+                "status did not account for every requested dependency"
+            );
+        }
+    }
+
+    #[test]
     fn status_pages_preserve_every_transaction_and_source_row_across_age_changes() {
-        let full = fixture(25);
+        let mut full = fixture(25);
+        for (key, value) in [
+            ("schema", json!("kin.enrichment-status.v1")),
+            ("current", json!(true)),
+            ("truth_epoch", json!(0)),
+            ("scope", json!({"kind": "workspace_head"})),
+        ] {
+            full["enrichment"][key] = value;
+        }
         let mut observation = transaction_fixture(30);
         let original = serde_json::to_value(&observation.items).unwrap();
         let mut request = StatusRequest {
@@ -802,6 +962,22 @@ mod tests {
                     .iter()
                     .cloned(),
             );
+            // One continuation for the whole page: neither collection
+            // repeats it, and a page that did would not validate.
+            for collection in ["open_transactions", "enrichment"] {
+                assert!(
+                    value[collection]["page"].get("next_cursor").is_none(),
+                    "{collection} repeats the continuation: {}",
+                    value[collection]["page"]
+                );
+            }
+            let head = crate::handlers::entities::GraphStatusScope::Head;
+            validate_observation(&value["enrichment"], true, head, true).unwrap();
+            if value["status_page"]["next_cursor"].is_string() {
+                let mut repeated = value["enrichment"].clone();
+                repeated["page"]["next_cursor"] = value["status_page"]["next_cursor"].clone();
+                assert!(validate_observation(&repeated, true, head, true).is_err());
+            }
             request.cursor = value["status_page"]["next_cursor"]
                 .as_str()
                 .map(str::to_owned);

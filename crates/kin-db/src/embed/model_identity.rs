@@ -3,6 +3,7 @@
 
 //! Local artifact locations are acquisition details, never embedding identity.
 
+use super::serving::{self, Serving, ServingProfile};
 use super::{parse_model_config, BertConfig, EMBEDDING_CACHE_PIPELINE_EPOCH, EMBED_MAX_SEQ_LEN};
 use crate::error::KinDbError;
 use sha2::{Digest, Sha256};
@@ -12,13 +13,16 @@ use std::path::Path;
 
 pub(super) const LOCAL_CONTENT_PREFIX: &str = "local-content-sha256:";
 const IDENTITY_SCHEMA: &[u8] = b"kin-local-embedding-space-v1";
-const PROCESSING_SCHEMA: &str = "right-truncate;longest-first;batch-longest-pad;right-pad;pad-type-0;mean-or-config-pool;l2-normalize-v1";
+const PROCESSING_SCHEMA: &str = "right-truncate;longest-first;batch-longest-pad;right-pad;pad-type-0;served-pooling;l2-normalize-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LocalModelIdentity {
     pub model_id: String,
     pub dimensions: usize,
-    pub query_prefix: String,
+    /// How these artifacts are served, bound into `model_id`.
+    pub serving: Serving,
+    /// The serving table entry whose published weights these are, if any.
+    pub profile: Option<&'static ServingProfile>,
 }
 
 /// Metadata detects replacements and some concurrent writes, but equal metadata
@@ -146,29 +150,47 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
 }
 
 /// Content digest for a set of model artifacts in canonical role order.
-/// Paths locate the bytes but do not contribute to the digest.
+/// Paths locate the bytes but do not contribute to the digest. `serving` is
+/// the [`Serving::descriptor`] the artifacts are served with.
 pub(super) fn artifact_identity<const N: usize>(
     paths: [&Path; N],
     dimensions: usize,
     pipeline: &str,
-    query_prefix: &str,
+    serving: &str,
     max_sequence_len: usize,
 ) -> Result<String, KinDbError> {
+    let mut digests = [[0u8; 32]; N];
+    for (digest, path) in digests.iter_mut().zip(paths) {
+        *digest = artifact_digest(path)?;
+    }
+    Ok(identity_from_digests(
+        &digests,
+        dimensions,
+        pipeline,
+        serving,
+        max_sequence_len,
+    ))
+}
+
+fn identity_from_digests(
+    digests: &[[u8; 32]],
+    dimensions: usize,
+    pipeline: &str,
+    serving: &str,
+    max_sequence_len: usize,
+) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, IDENTITY_SCHEMA);
     hash_field(&mut hasher, pipeline.as_bytes());
     hash_field(&mut hasher, PROCESSING_SCHEMA.as_bytes());
-    hash_field(&mut hasher, query_prefix.as_bytes());
+    hash_field(&mut hasher, serving.as_bytes());
     hash_field(&mut hasher, &(dimensions as u64).to_le_bytes());
     hash_field(&mut hasher, &(max_sequence_len as u64).to_le_bytes());
-    for (role, path) in paths.into_iter().enumerate() {
+    for (role, digest) in digests.iter().enumerate() {
         hash_field(&mut hasher, &(role as u64).to_le_bytes());
-        hash_field(&mut hasher, &artifact_digest(path)?);
+        hash_field(&mut hasher, digest);
     }
-    Ok(format!(
-        "{LOCAL_CONTENT_PREFIX}{}",
-        hex::encode(hasher.finalize())
-    ))
+    format!("{LOCAL_CONTENT_PREFIX}{}", hex::encode(hasher.finalize()))
 }
 
 pub(super) fn resolve(dir: &Path) -> Result<LocalModelIdentity, KinDbError> {
@@ -184,27 +206,56 @@ pub(super) fn resolve(dir: &Path) -> Result<LocalModelIdentity, KinDbError> {
         parse_model_config(&config_data).map_err(|error| artifact_error(&config_path, error))?;
     let raw: serde_json::Value =
         serde_json::from_str(&config_data).map_err(|error| artifact_error(&config_path, error))?;
-    let query_prefix = match raw.get("kin_query_prefix") {
-        Some(serde_json::Value::String(prefix)) => prefix.clone(),
+    let stated_query_prefix = match raw.get("kin_query_prefix") {
+        Some(serde_json::Value::String(prefix)) => Some(prefix.clone()),
         Some(_) => {
             return Err(artifact_error(
                 &config_path,
                 "kin_query_prefix must be a string",
             ))
         }
-        None => super::local_query_prefix("", config.model_type.as_deref()),
+        None => None,
     };
     let dimensions = config.hidden_size;
     if dimensions == 0 {
         return Err(artifact_error(&config_path, "hidden_size must be positive"));
     }
-    let model_id = artifact_identity(
-        [&config_path, &tokenizer_path, &weights_path],
+    let digests = [
+        artifact_digest(&config_path)?,
+        artifact_digest(&tokenizer_path)?,
+        artifact_digest(&weights_path)?,
+    ];
+    // Published weights are recognized by their bytes, so a local copy of a
+    // supported model is served as its card says whatever its directory is
+    // called. A stated query prefix still wins, since the directory's owner
+    // wrote it down.
+    let profile = serving::profile_for_weights(&digests[2]);
+    let serving = match profile {
+        Some(profile) => {
+            if profile.dimensions != dimensions {
+                return Err(artifact_error(
+                    &config_path,
+                    format!(
+                        "these are {}'s weights, served at {} dimensions, but hidden_size is {dimensions}",
+                        profile.model_id, profile.dimensions
+                    ),
+                ));
+            }
+            let mut serving = Serving::from_profile(profile);
+            if let Some(prefix) = stated_query_prefix {
+                serving.query_prefix = prefix;
+            }
+            serving
+        }
+        None => Serving::unlisted(stated_query_prefix),
+    };
+    let model_id = identity_from_digests(
+        &digests,
         dimensions,
         EMBEDDING_CACHE_PIPELINE_EPOCH,
-        &query_prefix,
+        &serving.descriptor(),
         config.effective_max_seq_len().min(EMBED_MAX_SEQ_LEN),
-    )?;
+    );
     let after = paths
         .map(|path| artifact_generation(path))
         .into_iter()
@@ -220,7 +271,8 @@ pub(super) fn resolve(dir: &Path) -> Result<LocalModelIdentity, KinDbError> {
     Ok(LocalModelIdentity {
         model_id,
         dimensions,
-        query_prefix,
+        serving,
+        profile,
     })
 }
 
@@ -246,10 +298,12 @@ mod tests {
         let a = resolve(&first).unwrap();
         let b = resolve(&second).unwrap();
         assert_eq!(a, b);
-        assert!(
-            a.query_prefix.is_empty(),
+        assert_eq!(
+            a.serving,
+            Serving::unlisted(None),
             "directory names cannot choose preprocessing"
         );
+        assert_eq!(a.profile, None);
         assert!(!a.model_id.contains(root.path().to_str().unwrap()));
     }
 
@@ -294,6 +348,70 @@ mod tests {
         ] {
             assert_ne!(base, changed.unwrap());
         }
+    }
+
+    /// A local directory may state its query prefix, and the statement is
+    /// part of its identity.
+    #[test]
+    fn local_model_stated_query_prefix_is_served_and_bound() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_model(root.path());
+        let plain = resolve(root.path()).unwrap();
+        let config = root.path().join("config.json");
+        let stated = std::fs::read_to_string(&config).unwrap().replacen(
+            '{',
+            r#"{"kin_query_prefix":"query: ","#,
+            1,
+        );
+        std::fs::write(&config, stated).unwrap();
+        let prefixed = resolve(root.path()).unwrap();
+        assert_eq!(prefixed.serving, Serving::unlisted(Some("query: ".into())));
+        assert_ne!(plain.model_id, prefixed.model_id);
+    }
+
+    /// A local copy of a supported model's published weights is served by
+    /// that model's table entry, whatever its directory is called. Runs where
+    /// the Hugging Face cache already holds the default model and is skipped
+    /// elsewhere; it never downloads.
+    #[test]
+    fn local_copy_of_published_weights_is_served_as_its_card_specifies() {
+        let Some(snapshot) = cached_hub_snapshot("models--nomic-ai--nomic-embed-text-v1.5") else {
+            eprintln!("skipped: nomic-embed-text-v1.5 is not in the Hugging Face cache");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let copy = root.path().join("CodeRankEmbed-named-copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            let source = std::fs::canonicalize(snapshot.join(name)).unwrap();
+            // A symlink reads the cached bytes without touching the shared
+            // cache's inodes, which another process may be hashing.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&source, copy.join(name)).unwrap();
+            #[cfg(not(unix))]
+            std::fs::copy(&source, copy.join(name)).unwrap();
+        }
+        let identity = resolve(&copy).unwrap();
+        let profile = serving::profile_for_model_id("nomic-ai/nomic-embed-text-v1.5").unwrap();
+        assert_eq!(identity.profile, Some(profile));
+        assert_eq!(identity.serving, Serving::from_profile(profile));
+        assert_eq!(identity.dimensions, 768);
+    }
+
+    fn cached_hub_snapshot(repo: &str) -> Option<std::path::PathBuf> {
+        let hub = std::env::var_os("HF_HOME")
+            .map(|home| std::path::PathBuf::from(home).join("hub"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".cache/huggingface/hub"))
+            })?;
+        let repo = hub.join(repo);
+        let revision = std::fs::read_to_string(repo.join("refs/main")).ok()?;
+        let snapshot = repo.join("snapshots").join(revision.trim());
+        ["config.json", "tokenizer.json", "model.safetensors"]
+            .iter()
+            .all(|name| snapshot.join(name).is_file())
+            .then_some(snapshot)
     }
 
     #[test]

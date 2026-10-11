@@ -12,18 +12,19 @@
 //!
 //! The logo is the brand lockup: the Kin mark beside the KIN wordmark, with
 //! the brand line under the wordmark, nine rows and at most [`WIDTH`]
-//! columns. The mark follows `docs/assets/kin-icon.svg`, two filled bands, an
-//! arm and a leg, split by a hairline. Each terminal row carries two pixel
-//! rows through the half-block glyphs, which makes the pixels square, and the
-//! mark is eighteen of them tall. The split survives as a one-pixel channel
-//! and no cell holds both pieces, so the arm and the leg stay two shapes even
-//! without colour. The wordmark's cap height is two thirds of the mark and its
-//! strokes are two pixels, the brand's proportions.
+//! columns. The mark is `docs/assets/kin-icon.svg` sampled onto a grid of
+//! square pixels: each terminal row carries two pixel rows through the
+//! half-block glyphs, and the mark is eighteen of them tall. Its two bands, an
+//! arm and a leg, keep the brand's split as a one-pixel channel, and no cell
+//! holds both, so they stay two shapes even without colour. The wordmark
+//! follows the brand lockup's proportions: its cap height is two thirds of the
+//! mark, its strokes are two pixels, and its K's arm meets the stem low, with
+//! the leg springing from the arm, as the brand K does.
 //!
 //! A terminal narrower than [`FULL_MIN_COLUMNS`] gets the compact lockup
-//! instead: the small mark from [`crate::mark`] beside a letter-spaced
-//! `K  I  N`, with the brand line under it. A terminal too narrow even for
-//! that gets no logo.
+//! instead: the mark drawn ten pixels tall beside a letter-spaced `K  I  N`,
+//! with the brand line under it. A terminal too narrow even for that gets no
+//! logo.
 //!
 //! Words keep the terminal's own foreground, so they read on a light theme and
 //! a dark one alike. The wordmark is never painted, the compact `K  I  N` is
@@ -35,12 +36,18 @@
 //! or when the terminal is too narrow to hold it. `NO_COLOR` and `TERM=dumb`
 //! take the colour away and leave the logo. The colour depth is
 //! [`crate::mark`]'s decision: the brand gradients on a truecolor terminal,
-//! one 256-colour index per piece, or ANSI magenta and bright blue.
+//! one 256-colour index per band, or ANSI magenta and bright blue.
 //!
 //! The half blocks are drawn only where the terminal reliably reads UTF-8: a
 //! UTF-8 locale, or on Windows, Windows Terminal or a console on the UTF-8
 //! code page. Anywhere else the logo is ASCII, with the arm hatched in `/` and
 //! the leg in `\`, the directions the two bands run.
+//!
+//! Terminal.app, the terminal a new Mac opens, draws block glyphs from its
+//! font, one em tall in a taller line, so half blocks print there as tiles
+//! with a seam under every row. With colour on it gets the logo in painted
+//! cells instead (see [`CELLS`]): each inked cell's background takes the ink,
+//! which fills the cell edge to edge, at one pixel row a cell.
 
 use std::io::{IsTerminal, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,52 +57,56 @@ use crate::mark::{Glyphs, Paint};
 /// The logo in pixels, two to a terminal row.
 ///
 /// `A` is the mark's arm, `L` its leg, `W` the wordmark and `.` background.
-/// The mark fills the first thirteen columns. The wordmark starts at
-/// [`WORDMARK_COLUMN`], two pixels down, and is twelve pixels tall, two thirds
-/// of the mark as in the brand lockup. It sits on whole terminal rows, so every
-/// stem is solid blocks with square ends. The one-pixel gap between the arm's
-/// last rows and the leg's first is the split.
+/// The mark fills the first thirteen columns and is the brand mark sampled at
+/// this size: a pixel is inked when the mark covers half of it or more. The
+/// arm is a 45 degree band with a flat top and a flat left side that ends in a
+/// point, and the leg a parallel band, cut square at its top and flat at its
+/// foot. The one-pixel channel between the arm's point and the leg's cut is the
+/// split.
 ///
-/// The arm is a 45 degree band with a flat top and a flat left side, and the
-/// leg a parallel band with a flat foot. The K's arm and leg are 45 degrees and
-/// meet its stem at the middle, and the N's diagonal moves one column every
-/// two pixel rows, like the brand N.
+/// The wordmark starts at [`WORDMARK_COLUMN`], two pixels down, and is twelve
+/// pixels tall, two thirds of the mark as in the brand lockup. It sits on whole
+/// terminal rows, so every stem is solid blocks with square ends. The K's arm
+/// runs down to the stem and its leg springs from the arm, and the N's diagonal
+/// moves one column every two pixel rows. The letters are spaced as the brand
+/// lockup spaces them, a little wider between the I and the N.
 const PIXELS: [&str; 18] = [
-    "....AAAAAAA........................................",
-    "...AAAAAAAA........................................",
-    "..AAAAAAAA...........WW.....WWW....WW....WWWW....WW",
-    ".AAAAAAAA............WW....WWW.....WW....WWWW....WW",
-    "AAAAAAAA.............WW...WWW......WW....WW.WW...WW",
-    "AAAAAAA..............WW..WWW.......WW....WW.WW...WW",
-    "AAAAAA...............WW.WWW........WW....WW..WW..WW",
-    "AAAAA................WWWWW.........WW....WW..WW..WW",
-    "AAAA.................WWWWW.........WW....WW...WW.WW",
-    "AAA..................WW.WWW........WW....WW...WW.WW",
-    "....LLL..............WW..WWW.......WW....WW....WWWW",
-    "...LLLLL.............WW...WWW......WW....WW....WWWW",
-    "..LLLLLLL............WW....WWW.....WW....WW.....WWW",
-    "..LLLLLLLL...........WW.....WWW....WW....WW.....WWW",
-    "..LLLLLLLLL........................................",
-    "...LLLLLLLLL.......................................",
-    "....LLLLLLLLL......................................",
-    ".....LLLLLLLL......................................",
+    "....AAAAAAA.........................................",
+    "...AAAAAAAA.........................................",
+    "..AAAAAAAA...........WW......WW....WW.....WWWW....WW",
+    ".AAAAAAAA............WW.....WW.....WW.....WWWW....WW",
+    "AAAAAAAA.............WW....WW......WW.....WW.WW...WW",
+    "AAAAAAA..............WW...WW.......WW.....WW.WW...WW",
+    "AAAAAA...............WW..WW........WW.....WW..WW..WW",
+    "AAAAA................WW.WWWW.......WW.....WW..WW..WW",
+    "AAAA.................WWWW..WW......WW.....WW...WW.WW",
+    "AAA..................WWW...WW......WW.....WW...WW.WW",
+    "AA..LLL..............WW.....WW.....WW.....WW....WWWW",
+    "...LLLLL.............WW.....WW.....WW.....WW....WWWW",
+    "..LLLLLLL............WW......WW....WW.....WW.....WWW",
+    ".LLLLLLLLL...........WW......WW....WW.....WW.....WWW",
+    ".LLLLLLLLLL.........................................",
+    "..LLLLLLLLLL........................................",
+    "...LLLLLLLLLL.......................................",
+    "....LLLLLLLLL.......................................",
 ];
 
 /// The logo in ASCII, one string per terminal row.
 ///
-/// Left of [`WORDMARK_COLUMN`], `/` is the arm and `\` the leg. From that
-/// column on, every glyph is the wordmark, whose K and N diagonals repeat the
-/// mark's hatching.
+/// Left of [`WORDMARK_COLUMN`], `/` is the arm and `\` the leg, inked in
+/// exactly the cells the half blocks ink. From that column on, every glyph is
+/// the wordmark: `#` for the stems, and the K and N diagonals hatched one
+/// stroke wide in the directions they run.
 const ASCII_ROWS: [&str; ROWS] = [
     r"   ////////",
-    r" /////////           ##   //       ##    ##\\    ##",
-    r"////////             ##  //        ##    ## \\   ##",
-    r"//////               ## //         ##    ##  \\  ##",
-    r"////                 ## \\         ##    ##   \\ ##",
-    r"   \\\\\             ##  \\        ##    ##    \\##",
-    r"  \\\\\\\\           ##   \\       ##    ##     \##",
-    r"  \\\\\\\\\\",
-    r"    \\\\\\\\\",
+    r" /////////           ##     //     ##     ##\\    ##",
+    r"////////             ##   //       ##     ## \\   ##",
+    r"//////               ## //\\       ##     ##  \\  ##",
+    r"////                 ##//  \\      ##     ##   \\ ##",
+    r"// \\\\\             ##     \\     ##     ##    \\##",
+    r" \\\\\\\\\           ##      \\    ##     ##     \##",
+    r" \\\\\\\\\\\",
+    r"   \\\\\\\\\\",
 ];
 
 /// Terminal rows the logo takes.
@@ -114,8 +125,88 @@ const BRAND_LINE: &str = "A new foundation for code.";
 /// The row the brand line sits on: the last, under the wordmark.
 const BRAND_LINE_ROW: usize = ROWS - 1;
 
+/// The compact lockup's mark: the brand mark ten pixels tall, five rows.
+///
+/// Drawn rather than sampled. At this size a sampled leg rounds into a mound,
+/// so each band is kept four pixels wide and stepped one column a row, which
+/// is what makes two bands read as the arm and the leg. The arm's point and the
+/// leg's cut keep the split.
+#[rustfmt::skip]
+const COMPACT_PIXELS: [&str; 10] = [
+    "..AAAA..",
+    ".AAAAA..",
+    "AAAA....",
+    "AAA.....",
+    "AA......",
+    "A.......",
+    "..LL....",
+    ".LLLL...",
+    "..LLLL..",
+    "...LLLL.",
+];
+
+/// The compact mark in ASCII, inked in the cells its half blocks ink.
+#[rustfmt::skip]
+const COMPACT_ASCII_ROWS: [&str; COMPACT_ROWS] = [
+    r" /////",
+    r"////",
+    r"//",
+    r" \\\\",
+    r"  \\\\\",
+];
+
+/// The full lockup at whole-cell resolution, for a terminal that draws block
+/// glyphs from its font, one character per cell.
+///
+/// Such a terminal, Terminal.app the one most people meet, draws a block glyph
+/// one em tall in a line taller than that, so half-block art prints as tiles
+/// with a seam under every row. A cell's background fills the whole cell, so
+/// this drawing paints each inked cell's background instead and draws no glyph.
+/// A cell is one pixel wide and two tall, half the half blocks' vertical
+/// resolution: the arm and the leg step two columns a row, and the split
+/// stays a one-cell channel. The wordmark keeps its stems two columns wide and
+/// takes the terminal's own foreground through reverse video.
+const CELLS: [&str; ROWS] = [
+    "...AAAAAAAA.........................................",
+    ".AAAAAAAA............WW......WW....WW.....WWWW....WW",
+    "AAAAAAA..............WW....WW......WW.....WW.WW...WW",
+    "AAAAA................WW..WW........WW.....WW..WW..WW",
+    "AAA..................WWWW..WW......WW.....WW...WW.WW",
+    "A...LLLL.............WW.....WW.....WW.....WW....WWWW",
+    "..LLLLLLLL...........WW......WW....WW.....WW.....WWW",
+    "..LLLLLLLLLL........................................",
+    "....LLLLLLLLL.......................................",
+];
+
+/// The compact mark at whole-cell resolution, six rows.
+///
+/// Each band is a parallelogram: the arm four rows stepping down to the left,
+/// the leg two rows stepping down to the right, a clear row between the arm's
+/// point and the leg.
+#[rustfmt::skip]
+const COMPACT_CELLS: [&str; 6] = [
+    "..AAAAA..",
+    "AAAAA....",
+    "AAA......",
+    "A........",
+    "..LLLLL..",
+    "...LLLLLL",
+];
+
+/// Terminal rows the compact lockup takes, drawn in half blocks.
+const COMPACT_ROWS: usize = COMPACT_PIXELS.len() / 2;
+
+/// The column the compact lockup's words start at, counted from the mark's
+/// first column.
+const COMPACT_TEXT_COLUMN: usize = 11;
+
 /// The compact lockup's wordmark: the three letters, set bold and spaced.
 const SET_WORDMARK: &str = "K  I  N";
+
+/// The row the compact wordmark sits on, beside the arm, in each compact
+/// drawing. The brand line sits on the row under it.
+const COMPACT_WORDMARK_ROW: usize = 1;
+const COMPACT_CELLS_WORDMARK_ROW: usize = 2;
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b {
@@ -137,7 +228,7 @@ pub const WIDTH: usize = max(
 
 // The lockup's width is a budget, and a change that widens it past that budget
 // fails the build rather than a reader's terminal.
-const _: () = assert!(WIDTH <= 53, "the logo is wider than 53 columns");
+const _: () = assert!(WIDTH <= 54, "the logo is wider than 54 columns");
 
 /// Below this width the compact lockup prints instead of the full one.
 ///
@@ -152,17 +243,112 @@ const _: () = assert!(
 );
 
 /// The widest line the compact lockup prints: the brand line beside the
-/// small mark, margin included. Below this width no logo prints.
-const COMPACT_WIDTH: usize = MARGIN + crate::mark::TEXT_COLUMN + BRAND_LINE.len();
+/// compact mark, margin included. Below this width no logo prints.
+const COMPACT_WIDTH: usize = MARGIN + COMPACT_TEXT_COLUMN + BRAND_LINE.len();
 
-/// The brand gradients' end points, in this grid's pixels.
-///
-/// `kin-icon.svg` runs the arm's gradient from (391, 52) to (105, 338) and the
-/// leg's from (177, 309) to (436, 460). The mark's top-left corner there is
-/// (105, 52) and it is 408.1 units tall, so at eighteen pixels one pixel is
-/// 22.67 units.
-const ARM_GRADIENT: [(f32, f32); 2] = [(12.61, 0.0), (0.0, 12.61)];
-const LEG_GRADIENT: [(f32, f32); 2] = [(3.18, 11.34), (14.60, 18.0)];
+/// A linear gradient's two end points, in a drawing's pixels.
+type Gradient = [(f32, f32); 2];
+
+/// How a drawing's pixel rows become terminal rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fill {
+    /// Two pixel rows a terminal row, drawn with the half-block glyphs in the
+    /// ink's foreground colour. Crisp on a terminal that draws block glyphs
+    /// itself, which most do.
+    HalfBlocks,
+    /// One pixel row a terminal row, each inked cell a space painted with the
+    /// ink's background colour. For a terminal whose block glyphs come from
+    /// its font and leave seams; see [`CELLS`].
+    Cells,
+}
+
+/// One drawing of the mark: its pixels, how they fill the terminal, its ASCII
+/// rows, where its words go, and the brand gradients placed on its pixels.
+struct Art {
+    pixels: &'static [&'static str],
+    fill: Fill,
+    /// The ASCII rows, for a half-block drawing. A cell drawing needs none: it
+    /// is spaces and escapes, which any locale carries.
+    ascii: &'static [&'static str],
+    /// The first column of the wordmark, for a drawing that carries one.
+    wordmark_column: Option<usize>,
+    /// The row a compact drawing sets `K  I  N` on.
+    wordmark_row: usize,
+    arm: Gradient,
+    leg: Gradient,
+}
+
+impl Art {
+    /// Terminal rows the drawing takes.
+    fn rows(&self) -> usize {
+        match self.fill {
+            Fill::HalfBlocks => self.pixels.len() / 2,
+            Fill::Cells => self.pixels.len(),
+        }
+    }
+}
+
+/// The full lockup's drawing.
+const FULL: Art = Art {
+    pixels: &PIXELS,
+    fill: Fill::HalfBlocks,
+    ascii: &ASCII_ROWS,
+    wordmark_column: Some(WORDMARK_COLUMN),
+    wordmark_row: 0,
+    arm: brand_gradient(ARM_STOPS, 18.0),
+    leg: brand_gradient(LEG_STOPS, 18.0),
+};
+
+/// The full lockup in cells. Nine rows of cells two pixels tall are the same
+/// eighteen pixels, so the gradients are the half-block drawing's.
+const FULL_CELLS: Art = Art {
+    pixels: &CELLS,
+    fill: Fill::Cells,
+    ascii: &[],
+    wordmark_column: Some(WORDMARK_COLUMN),
+    wordmark_row: 0,
+    arm: brand_gradient(ARM_STOPS, 18.0),
+    leg: brand_gradient(LEG_STOPS, 18.0),
+};
+
+/// The compact lockup's mark.
+const COMPACT: Art = Art {
+    pixels: &COMPACT_PIXELS,
+    fill: Fill::HalfBlocks,
+    ascii: &COMPACT_ASCII_ROWS,
+    wordmark_column: None,
+    wordmark_row: COMPACT_WORDMARK_ROW,
+    arm: brand_gradient(ARM_STOPS, 10.0),
+    leg: brand_gradient(LEG_STOPS, 10.0),
+};
+
+/// The compact mark in cells, twelve pixels tall.
+const COMPACT_IN_CELLS: Art = Art {
+    pixels: &COMPACT_CELLS,
+    fill: Fill::Cells,
+    ascii: &[],
+    wordmark_column: None,
+    wordmark_row: COMPACT_CELLS_WORDMARK_ROW,
+    arm: brand_gradient(ARM_STOPS, 12.0),
+    leg: brand_gradient(LEG_STOPS, 12.0),
+};
+
+/// Where `kin-icon.svg` starts and ends each band's gradient, in its own
+/// units: the arm from (391, 52) to (105, 338), the leg from (177, 309) to
+/// (436, 460).
+const ARM_STOPS: Gradient = [(391.0, 52.0), (105.0, 338.0)];
+const LEG_STOPS: Gradient = [(177.0, 309.0), (436.0, 460.0)];
+
+/// A gradient from `kin-icon.svg`'s units into the pixels of a mark `height`
+/// pixels tall. The mark's top-left corner there is (105, 52) and it is 408.1
+/// units tall.
+const fn brand_gradient(stops: Gradient, height: f32) -> Gradient {
+    let unit = height / 408.1;
+    [
+        ((stops[0].0 - 105.0) * unit, (stops[0].1 - 52.0) * unit),
+        ((stops[1].0 - 105.0) * unit, (stops[1].1 - 52.0) * unit),
+    ]
+}
 
 /// One 256-colour index per piece: the cube's purple nearest the arm's first
 /// stop, and its blue nearest the leg's last.
@@ -179,6 +365,15 @@ const BOLD: &str = "\u{1b}[1m";
 const FAINT: &str = "\u{1b}[2m";
 
 const RESET: &str = "\u{1b}[0m";
+
+/// Reverse video: a cell drawing's wordmark, painted in the terminal's own
+/// foreground.
+const REVERSE: &str = "\u{1b}[7m";
+
+/// The sixteen-colour arm and leg as backgrounds: magenta and bright blue, as
+/// [`crate::mark::BASIC_ARM`] and [`crate::mark::BASIC_LEG`] are foregrounds.
+const BASIC_ARM_BACKGROUND: &str = "\u{1b}[45m";
+const BASIC_LEG_BACKGROUND: &str = "\u{1b}[104m";
 
 /// Set once the logo has printed, so a process prints it at most once.
 static PRINTED: AtomicBool = AtomicBool::new(false);
@@ -276,6 +471,7 @@ struct Style {
     lockup: Lockup,
     glyphs: Glyphs,
     paint: Paint,
+    fill: Fill,
 }
 
 /// What the decision reads, gathered in one place.
@@ -353,10 +549,21 @@ fn plan(surroundings: &Surroundings<'_>, human_mode: bool) -> Option<Style> {
         windows_terminal,
         surroundings.utf8_console,
     );
+    // Terminal.app draws block glyphs from the font, one em tall in a taller
+    // line, so half blocks print as tiles. Painted cells fill the whole cell,
+    // and need colour to paint with.
+    let fill = if paint != Paint::None
+        && surroundings.set("TERM_PROGRAM").as_deref() == Some("Apple_Terminal")
+    {
+        Fill::Cells
+    } else {
+        Fill::HalfBlocks
+    };
     Some(Style {
         lockup,
         glyphs,
         paint,
+        fill,
     })
 }
 
@@ -446,13 +653,13 @@ struct Cell {
     ink: Option<(Piece, f32, f32)>,
 }
 
-/// One row of the half-block logo, built from the two pixel rows it carries.
+/// One row of a half-block drawing, built from the two pixel rows it carries.
 ///
 /// A half block takes its colour at the centre of the pixel it draws, and a
 /// full block at the centre of the cell.
-fn unicode_row(row: usize) -> Vec<Cell> {
-    let top = PIXELS[2 * row].as_bytes();
-    let bottom = PIXELS[2 * row + 1].as_bytes();
+fn unicode_row(art: &Art, row: usize) -> Vec<Cell> {
+    let top = art.pixels[2 * row].as_bytes();
+    let bottom = art.pixels[2 * row + 1].as_bytes();
     let y = (2 * row) as f32;
     top.iter()
         .zip(bottom)
@@ -470,16 +677,19 @@ fn unicode_row(row: usize) -> Vec<Cell> {
         .collect()
 }
 
-/// One row of the ASCII logo.
-fn ascii_row(row: usize) -> Vec<Cell> {
+/// One row of an ASCII drawing.
+fn ascii_row(art: &Art, row: usize) -> Vec<Cell> {
     let y = (2 * row) as f32 + 1.0;
-    ASCII_ROWS[row]
+    art.ascii[row]
         .chars()
         .enumerate()
         .map(|(column, glyph)| {
+            let in_wordmark = art
+                .wordmark_column
+                .is_some_and(|wordmark| column >= wordmark);
             let piece = match glyph {
                 ' ' => None,
-                _ if column >= WORDMARK_COLUMN => Some(Piece::Wordmark),
+                _ if in_wordmark => Some(Piece::Wordmark),
                 '/' => Some(Piece::Arm),
                 '\\' => Some(Piece::Leg),
                 _ => Some(Piece::Wordmark),
@@ -492,29 +702,58 @@ fn ascii_row(row: usize) -> Vec<Cell> {
         .collect()
 }
 
+/// One row of a cell drawing: a space per cell, inked cells carrying the
+/// piece and the centre of the cell, in pixels, that their colour is sampled
+/// at.
+fn cell_row(art: &Art, row: usize) -> Vec<Cell> {
+    art.pixels[row]
+        .bytes()
+        .enumerate()
+        .map(|(column, pixel)| Cell {
+            glyph: ' ',
+            ink: pixel_piece(pixel)
+                .map(|piece| (piece, column as f32 + 0.5, (2 * row) as f32 + 1.0)),
+        })
+        .collect()
+}
+
+/// A drawing's row, painted, with nothing after its last inked cell, and the
+/// number of columns it takes.
+fn drawn_row(art: &Art, glyphs: Glyphs, paint: Paint, row: usize) -> (String, usize) {
+    let cells = match (art.fill, glyphs) {
+        (Fill::Cells, _) => cell_row(art, row),
+        (Fill::HalfBlocks, Glyphs::Unicode) => unicode_row(art, row),
+        (Fill::HalfBlocks, Glyphs::Ascii) => ascii_row(art, row),
+    };
+    let drawn = cells
+        .iter()
+        .rposition(|cell| cell.ink.is_some())
+        .map_or(0, |last| last + 1);
+    (paint_cells(art, &cells[..drawn], paint), drawn)
+}
+
 /// The logo's lines, without the blank lines around it.
+///
+/// A cell drawing needs colour to paint with, so without it the half-block
+/// drawing prints whatever the fill.
 fn render(style: Style) -> Vec<String> {
-    match style.lockup {
-        Lockup::Full => render_full(style.glyphs, style.paint),
-        Lockup::Compact => render_compact(style.glyphs, style.paint),
+    let cells = style.fill == Fill::Cells && style.paint != Paint::None;
+    match (style.lockup, cells) {
+        (Lockup::Full, false) => render_full(&FULL, style.glyphs, style.paint),
+        (Lockup::Full, true) => render_full(&FULL_CELLS, style.glyphs, style.paint),
+        (Lockup::Compact, false) => render_compact(&COMPACT, style.glyphs, style.paint),
+        (Lockup::Compact, true) => render_compact(&COMPACT_IN_CELLS, style.glyphs, style.paint),
     }
 }
 
 /// The brand lockup: the mark beside the drawn wordmark, and the brand line
 /// under the wordmark on the mark's last row, starting at the K's stem.
-fn render_full(glyphs: Glyphs, paint: Paint) -> Vec<String> {
-    (0..ROWS)
+fn render_full(art: &Art, glyphs: Glyphs, paint: Paint) -> Vec<String> {
+    (0..art.rows())
         .map(|row| {
-            let cells = match glyphs {
-                Glyphs::Unicode => unicode_row(row),
-                Glyphs::Ascii => ascii_row(row),
-            };
-            let drawn = cells
-                .iter()
-                .rposition(|cell| cell.glyph != ' ')
-                .map_or(0, |last| last + 1);
+            let (painted, drawn) = drawn_row(art, glyphs, paint, row);
             let mut line = " ".repeat(MARGIN);
-            line.push_str(&paint_cells(&cells[..drawn], paint));
+            line.push_str(&painted);
             if row == BRAND_LINE_ROW {
                 line.push_str(&" ".repeat(WORDMARK_COLUMN.saturating_sub(drawn)));
                 line.push_str(&words(paint, FAINT, BRAND_LINE));
@@ -524,18 +763,28 @@ fn render_full(glyphs: Glyphs, paint: Paint) -> Vec<String> {
         .collect()
 }
 
-/// The compact lockup: the small mark beside `K  I  N` in bold, with the brand
-/// line under it in faint.
-fn render_compact(glyphs: Glyphs, paint: Paint) -> Vec<String> {
-    let wordmark = words(paint, BOLD, SET_WORDMARK);
-    let brand_line = words(paint, FAINT, BRAND_LINE);
-    crate::mark::beside(
-        crate::mark::MarkStyle::new(glyphs, paint),
-        &["", &wordmark, &brand_line, ""],
-    )
-    .into_iter()
-    .map(|line| format!("{}{line}", " ".repeat(MARGIN)))
-    .collect()
+/// The compact lockup: the compact mark beside `K  I  N` in bold, with the
+/// brand line under it in faint.
+fn render_compact(art: &Art, glyphs: Glyphs, paint: Paint) -> Vec<String> {
+    (0..art.rows())
+        .map(|row| {
+            let (painted, drawn) = drawn_row(art, glyphs, paint, row);
+            let mut line = " ".repeat(MARGIN);
+            line.push_str(&painted);
+            let text = if row == art.wordmark_row {
+                Some(words(paint, BOLD, SET_WORDMARK))
+            } else if row == art.wordmark_row + 1 {
+                Some(words(paint, FAINT, BRAND_LINE))
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                line.push_str(&" ".repeat(COMPACT_TEXT_COLUMN.saturating_sub(drawn)));
+                line.push_str(&text);
+            }
+            line
+        })
+        .collect()
 }
 
 /// `text` in bold or faint when this terminal takes escapes, and plain when it
@@ -551,17 +800,24 @@ fn words(paint: Paint, weight: &str, text: &str) -> String {
 ///
 /// An escape is written only where the colour changes, and a reset only where
 /// colour stops, so the 256- and 16-colour rows carry one escape per run
-/// rather than one per cell. The wordmark is never painted: it takes the
-/// terminal's own foreground, which is light on a dark theme and dark on a
-/// light one, as the brand's two lockups are.
-fn paint_cells(cells: &[Cell], paint: Paint) -> String {
+/// rather than one per cell. The wordmark is never given a colour: it takes
+/// the terminal's own foreground, which is light on a dark theme and dark on a
+/// light one, as the brand's two lockups are. A cell drawing paints
+/// backgrounds, and reaches that foreground through reverse video.
+fn paint_cells(art: &Art, cells: &[Cell], paint: Paint) -> String {
     let mut out = String::new();
     let mut open: Option<String> = None;
     for cell in cells {
-        let escape = cell
-            .ink
-            .and_then(|(piece, x, y)| ink_escape(paint, piece, x, y));
+        let escape = cell.ink.and_then(|(piece, x, y)| match art.fill {
+            Fill::HalfBlocks => ink_escape(art, paint, piece, x, y),
+            Fill::Cells => cell_escape(art, paint, piece, x, y),
+        });
         if escape != open {
+            // Reverse video outlives a colour change, so a cell drawing
+            // closes each run before the next opens.
+            if art.fill == Fill::Cells && open.is_some() && escape.is_some() {
+                out.push_str(RESET);
+            }
             match &escape {
                 Some(escape) => out.push_str(escape),
                 None => out.push_str(RESET),
@@ -576,21 +832,18 @@ fn paint_cells(cells: &[Cell], paint: Paint) -> String {
     out
 }
 
-/// The escape that colours one inked cell, or `None` when it stays uncoloured.
-fn ink_escape(paint: Paint, piece: Piece, x: f32, y: f32) -> Option<String> {
+/// The escape that colours one inked cell of a drawing, or `None` when it
+/// stays uncoloured.
+fn ink_escape(art: &Art, paint: Paint, piece: Piece, x: f32, y: f32) -> Option<String> {
     let stops = &crate::mark::TRUECOLOR_STOPS;
     match (paint, piece) {
         (Paint::None, _) | (_, Piece::Wordmark) => None,
-        (Paint::Truecolor, Piece::Arm) => Some(truecolor(mix(
-            stops[0],
-            stops[1],
-            along(ARM_GRADIENT, x, y),
-        ))),
-        (Paint::Truecolor, Piece::Leg) => Some(truecolor(mix(
-            stops[2],
-            stops[3],
-            along(LEG_GRADIENT, x, y),
-        ))),
+        (Paint::Truecolor, Piece::Arm) => {
+            Some(truecolor(mix(stops[0], stops[1], along(art.arm, x, y))))
+        }
+        (Paint::Truecolor, Piece::Leg) => {
+            Some(truecolor(mix(stops[2], stops[3], along(art.leg, x, y))))
+        }
         (Paint::Indexed, Piece::Arm) => Some(format!("\u{1b}[38;5;{INDEXED_ARM}m")),
         (Paint::Indexed, Piece::Leg) => Some(format!("\u{1b}[38;5;{INDEXED_LEG}m")),
         (Paint::Basic, Piece::Arm) => Some(crate::mark::BASIC_ARM.to_string()),
@@ -598,9 +851,30 @@ fn ink_escape(paint: Paint, piece: Piece, x: f32, y: f32) -> Option<String> {
     }
 }
 
+/// The escape that paints one inked cell of a cell drawing: the ink as the
+/// cell's background, or reverse video for the wordmark, so it takes the
+/// terminal's own foreground. `None` when this terminal takes no colour.
+fn cell_escape(art: &Art, paint: Paint, piece: Piece, x: f32, y: f32) -> Option<String> {
+    let stops = &crate::mark::TRUECOLOR_STOPS;
+    match (paint, piece) {
+        (Paint::None, _) => None,
+        (_, Piece::Wordmark) => Some(REVERSE.to_string()),
+        (Paint::Truecolor, Piece::Arm) => {
+            Some(background(mix(stops[0], stops[1], along(art.arm, x, y))))
+        }
+        (Paint::Truecolor, Piece::Leg) => {
+            Some(background(mix(stops[2], stops[3], along(art.leg, x, y))))
+        }
+        (Paint::Indexed, Piece::Arm) => Some(format!("\u{1b}[48;5;{INDEXED_ARM}m")),
+        (Paint::Indexed, Piece::Leg) => Some(format!("\u{1b}[48;5;{INDEXED_LEG}m")),
+        (Paint::Basic, Piece::Arm) => Some(BASIC_ARM_BACKGROUND.to_string()),
+        (Paint::Basic, Piece::Leg) => Some(BASIC_LEG_BACKGROUND.to_string()),
+    }
+}
+
 /// How far along a linear gradient a point sits, from 0 at its start to 1 at
 /// its end, as SVG measures it: by projection onto the gradient's vector.
-fn along(gradient: [(f32, f32); 2], x: f32, y: f32) -> f32 {
+fn along(gradient: Gradient, x: f32, y: f32) -> f32 {
     let [(x0, y0), (x1, y1)] = gradient;
     let (dx, dy) = (x1 - x0, y1 - y0);
     (((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0)
@@ -621,6 +895,10 @@ fn truecolor((r, g, b): (u8, u8, u8)) -> String {
     format!("\u{1b}[38;2;{r};{g};{b}m")
 }
 
+fn background((r, g, b): (u8, u8, u8)) -> String {
+    format!("\u{1b}[48;2;{r};{g};{b}m")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,11 +911,14 @@ mod tests {
         for lockup in [Lockup::Full, Lockup::Compact] {
             for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
                 for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic, Paint::None] {
-                    styles.push(Style {
-                        lockup,
-                        glyphs,
-                        paint,
-                    });
+                    for fill in [Fill::HalfBlocks, Fill::Cells] {
+                        styles.push(Style {
+                            lockup,
+                            glyphs,
+                            paint,
+                            fill,
+                        });
+                    }
                 }
             }
         }
@@ -649,6 +930,7 @@ mod tests {
             lockup: Lockup::Full,
             glyphs,
             paint,
+            fill: Fill::HalfBlocks,
         }
     }
 
@@ -657,8 +939,21 @@ mod tests {
             lockup: Lockup::Compact,
             glyphs,
             paint,
+            fill: Fill::HalfBlocks,
         }
     }
+
+    fn in_cells(lockup: Lockup, paint: Paint) -> Style {
+        Style {
+            lockup,
+            glyphs: Glyphs::Unicode,
+            paint,
+            fill: Fill::Cells,
+        }
+    }
+
+    /// Every drawing, half blocks and cells.
+    const ARTS: [&Art; 4] = [&FULL, &COMPACT, &FULL_CELLS, &COMPACT_IN_CELLS];
 
     /// An ordinary truecolor UTF-8 terminal on a Unix machine, with the
     /// variables a test names set on top. A name written `-NAME` unsets it.
@@ -716,14 +1011,14 @@ mod tests {
             drawn,
             vec![
                 "     ▄███████",
-                "   ▄███████▀           ██    ▄██▀    ██    ████    ██",
-                "  ███████▀             ██  ▄██▀      ██    ██ ██   ██",
-                "  █████▀               ██▄██▀        ██    ██  ██  ██",
-                "  ███▀                 ██▀██▄        ██    ██   ██ ██",
-                "     ▄███▄             ██  ▀██▄      ██    ██    ████",
-                "    ███████▄           ██    ▀██▄    ██    ██     ███",
-                "    ▀████████▄",
-                "      ▀████████        A new foundation for code.",
+                "   ▄███████▀           ██     ▄█▀    ██     ████    ██",
+                "  ███████▀             ██   ▄█▀      ██     ██ ██   ██",
+                "  █████▀               ██ ▄██▄       ██     ██  ██  ██",
+                "  ███▀                 ███▀  ██      ██     ██   ██ ██",
+                "  ▀▀ ▄███▄             ██     ██     ██     ██    ████",
+                "   ▄███████▄           ██      ██    ██     ██     ███",
+                "   ▀█████████▄",
+                "     ▀█████████        A new foundation for code.",
             ]
         );
     }
@@ -735,14 +1030,14 @@ mod tests {
             drawn,
             vec![
                 r"     ////////",
-                r"   /////////           ##   //       ##    ##\\    ##",
-                r"  ////////             ##  //        ##    ## \\   ##",
-                r"  //////               ## //         ##    ##  \\  ##",
-                r"  ////                 ## \\         ##    ##   \\ ##",
-                r"     \\\\\             ##  \\        ##    ##    \\##",
-                r"    \\\\\\\\           ##   \\       ##    ##     \##",
-                r"    \\\\\\\\\\",
-                r"      \\\\\\\\\        A new foundation for code.",
+                r"   /////////           ##     //     ##     ##\\    ##",
+                r"  ////////             ##   //       ##     ## \\   ##",
+                r"  //////               ## //\\       ##     ##  \\  ##",
+                r"  ////                 ##//  \\      ##     ##   \\ ##",
+                r"  // \\\\\             ##     \\     ##     ##    \\##",
+                r"   \\\\\\\\\           ##      \\    ##     ##     \##",
+                r"   \\\\\\\\\\\",
+                r"     \\\\\\\\\\        A new foundation for code.",
             ]
         );
         for line in &drawn {
@@ -750,27 +1045,37 @@ mod tests {
         }
     }
 
-    /// The compact lockup is the small mark beside set type.
+    /// The compact lockup is the compact mark beside set type.
     #[test]
-    fn the_compact_logo_is_the_small_mark_beside_set_type() {
+    fn the_compact_logo_is_the_compact_mark_beside_set_type() {
         assert_eq!(
             render(compact(Glyphs::Unicode, Paint::None)),
             vec![
-                "    ▄▀",
-                "  ▄▀     K  I  N",
-                "   ▀▄    A new foundation for code.",
-                "     ▀▄",
+                "   ▄████",
+                "  ███▀       K  I  N",
+                "  █▀         A new foundation for code.",
+                "   ▄██▄",
+                "    ▀███▄",
             ]
         );
         assert_eq!(
             render(compact(Glyphs::Ascii, Paint::None)),
             vec![
-                "    /",
-                r"  /      K  I  N",
-                r"   \     A new foundation for code.",
-                r"     \",
+                "   /////",
+                "  ////       K  I  N",
+                "  //         A new foundation for code.",
+                r"   \\\\",
+                r"    \\\\\",
             ]
         );
+    }
+
+    fn inked(line: &str) -> Vec<usize> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, glyph)| *glyph != ' ')
+            .map(|(column, _)| column)
+            .collect()
     }
 
     /// The ASCII logo keeps the Unicode one's shape: every row inks the same
@@ -780,13 +1085,6 @@ mod tests {
         let unicode = render(full(Glyphs::Unicode, Paint::None));
         let ascii = render(full(Glyphs::Ascii, Paint::None));
         for (row, (blocks, hatched)) in unicode.iter().zip(&ascii).enumerate() {
-            let inked = |line: &str| -> Vec<usize> {
-                line.chars()
-                    .enumerate()
-                    .filter(|(_, glyph)| *glyph != ' ')
-                    .map(|(column, _)| column)
-                    .collect()
-            };
             // Only the mark and the wordmark's stems are compared; the K and
             // N diagonals are hatched one stroke wide rather than drawn.
             let stems = |columns: Vec<usize>| -> Vec<usize> {
@@ -794,7 +1092,7 @@ mod tests {
                     .into_iter()
                     .filter(|column| {
                         *column < MARGIN + WORDMARK_COLUMN
-                            || [23, 24, 37, 38, 43, 44, 51, 52].contains(column)
+                            || [23, 24, 37, 38, 44, 45, 52, 53].contains(column)
                     })
                     .collect()
             };
@@ -802,6 +1100,15 @@ mod tests {
                 stems(inked(blocks)),
                 stems(inked(hatched)),
                 "row {row}: {blocks:?} against {hatched:?}"
+            );
+        }
+        let unicode = render(compact(Glyphs::Unicode, Paint::None));
+        let ascii = render(compact(Glyphs::Ascii, Paint::None));
+        for (row, (blocks, hatched)) in unicode.iter().zip(&ascii).enumerate() {
+            assert_eq!(
+                inked(blocks),
+                inked(hatched),
+                "compact row {row}: {blocks:?} against {hatched:?}"
             );
         }
     }
@@ -908,6 +1215,9 @@ mod tests {
     #[test]
     fn stripping_the_escapes_yields_the_plain_logo() {
         for style in all_styles() {
+            if style.fill == Fill::Cells && style.paint != Paint::None {
+                continue;
+            }
             let plain = render(Style {
                 paint: Paint::None,
                 ..style
@@ -950,20 +1260,61 @@ mod tests {
         }
     }
 
-    /// Truecolor paints the brand's stops at the ends of each gradient.
+    /// Truecolor paints the brand's stops at the ends of each gradient, on
+    /// both drawings.
     #[test]
     fn truecolor_reaches_the_brand_stops() {
-        let arm_start = ink_escape(Paint::Truecolor, Piece::Arm, 12.61, 0.0);
-        let arm_end = ink_escape(Paint::Truecolor, Piece::Arm, 0.0, 12.61);
-        let leg_start = ink_escape(Paint::Truecolor, Piece::Leg, 3.18, 11.34);
-        let leg_end = ink_escape(Paint::Truecolor, Piece::Leg, 14.60, 18.0);
-        assert_eq!(arm_start.as_deref(), Some("\u{1b}[38;2;174;90;255m"));
-        assert_eq!(arm_end.as_deref(), Some("\u{1b}[38;2;108;72;250m"));
-        assert_eq!(leg_start.as_deref(), Some("\u{1b}[38;2;91;85;253m"));
-        assert_eq!(leg_end.as_deref(), Some("\u{1b}[38;2;59;116;251m"));
-        assert_eq!(
-            ink_escape(Paint::Truecolor, Piece::Wordmark, 20.0, 5.0),
-            None
+        for art in [&FULL, &COMPACT] {
+            let at =
+                |piece: Piece, (x, y): (f32, f32)| ink_escape(art, Paint::Truecolor, piece, x, y);
+            assert_eq!(
+                at(Piece::Arm, art.arm[0]).as_deref(),
+                Some("\u{1b}[38;2;174;90;255m")
+            );
+            assert_eq!(
+                at(Piece::Arm, art.arm[1]).as_deref(),
+                Some("\u{1b}[38;2;108;72;250m")
+            );
+            assert_eq!(
+                at(Piece::Leg, art.leg[0]).as_deref(),
+                Some("\u{1b}[38;2;91;85;253m")
+            );
+            assert_eq!(
+                at(Piece::Leg, art.leg[1]).as_deref(),
+                Some("\u{1b}[38;2;59;116;251m")
+            );
+            assert_eq!(at(Piece::Wordmark, (20.0, 5.0)), None);
+        }
+    }
+
+    /// The gradients sit where `kin-icon.svg` puts them, scaled to each
+    /// drawing: at eighteen pixels tall one pixel is 22.67 of its units.
+    #[test]
+    fn the_gradients_follow_the_brand_icon() {
+        let close = |a: Gradient, b: Gradient| {
+            a.iter()
+                .zip(&b)
+                .all(|(p, q)| (p.0 - q.0).abs() < 0.01 && (p.1 - q.1).abs() < 0.01)
+        };
+        assert!(
+            close(FULL.arm, [(12.61, 0.0), (0.0, 12.61)]),
+            "{:?}",
+            FULL.arm
+        );
+        assert!(
+            close(FULL.leg, [(3.18, 11.34), (14.60, 18.0)]),
+            "{:?}",
+            FULL.leg
+        );
+        assert!(
+            close(COMPACT.arm, [(7.01, 0.0), (0.0, 7.01)]),
+            "{:?}",
+            COMPACT.arm
+        );
+        assert!(
+            close(COMPACT.leg, [(1.76, 6.30), (8.11, 10.0)]),
+            "{:?}",
+            COMPACT.leg
         );
     }
 
@@ -971,8 +1322,8 @@ mod tests {
     #[test]
     fn every_colour_depth_tells_the_arm_from_the_leg() {
         for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic] {
-            let arm = ink_escape(paint, Piece::Arm, 3.0, 3.0);
-            let leg = ink_escape(paint, Piece::Leg, 7.0, 15.0);
+            let arm = ink_escape(&FULL, paint, Piece::Arm, 3.0, 3.0);
+            let leg = ink_escape(&FULL, paint, Piece::Leg, 7.0, 15.0);
             assert!(
                 arm.is_some() && leg.is_some(),
                 "{paint:?} left a piece bare"
@@ -987,14 +1338,16 @@ mod tests {
     /// would close there.
     #[test]
     fn no_cell_holds_both_pieces() {
-        for row in 0..ROWS {
-            let top = PIXELS[2 * row].as_bytes();
-            let bottom = PIXELS[2 * row + 1].as_bytes();
-            for column in 0..top.len() {
-                if let (Some(upper), Some(lower)) =
-                    (pixel_piece(top[column]), pixel_piece(bottom[column]))
-                {
-                    assert_eq!(upper, lower, "row {row}, column {column} mixes pieces");
+        for art in ARTS.into_iter().filter(|art| art.fill == Fill::HalfBlocks) {
+            for row in 0..art.pixels.len() / 2 {
+                let top = art.pixels[2 * row].as_bytes();
+                let bottom = art.pixels[2 * row + 1].as_bytes();
+                for column in 0..top.len() {
+                    if let (Some(upper), Some(lower)) =
+                        (pixel_piece(top[column]), pixel_piece(bottom[column]))
+                    {
+                        assert_eq!(upper, lower, "row {row}, column {column} mixes pieces");
+                    }
                 }
             }
         }
@@ -1007,26 +1360,28 @@ mod tests {
     /// pixel moves, and at terminal size it reads as the two bands joining.
     #[test]
     fn the_arm_and_the_leg_never_touch() {
-        let at = |row: isize, column: isize| -> Option<Piece> {
-            let row = usize::try_from(row).ok()?;
-            let column = usize::try_from(column).ok()?;
-            PIXELS
-                .get(row)
-                .and_then(|line| line.as_bytes().get(column))
-                .and_then(|&pixel| pixel_piece(pixel))
-        };
-        for (row, line) in PIXELS.iter().enumerate() {
-            for (column, &pixel) in line.as_bytes().iter().enumerate() {
-                if pixel_piece(pixel) != Some(Piece::Arm) {
-                    continue;
-                }
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        assert_ne!(
-                            at(row as isize + dy, column as isize + dx),
-                            Some(Piece::Leg),
-                            "the arm at row {row}, column {column} touches the leg"
-                        );
+        for art in ARTS {
+            let at = |row: isize, column: isize| -> Option<Piece> {
+                let row = usize::try_from(row).ok()?;
+                let column = usize::try_from(column).ok()?;
+                art.pixels
+                    .get(row)
+                    .and_then(|line| line.as_bytes().get(column))
+                    .and_then(|&pixel| pixel_piece(pixel))
+            };
+            for (row, line) in art.pixels.iter().enumerate() {
+                for (column, &pixel) in line.as_bytes().iter().enumerate() {
+                    if pixel_piece(pixel) != Some(Piece::Arm) {
+                        continue;
+                    }
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            assert_ne!(
+                                at(row as isize + dy, column as isize + dx),
+                                Some(Piece::Leg),
+                                "the arm at row {row}, column {column} touches the leg"
+                            );
+                        }
                     }
                 }
             }
@@ -1035,9 +1390,24 @@ mod tests {
 
     #[test]
     fn every_pixel_row_is_the_same_width() {
-        for line in PIXELS {
-            assert_eq!(line.len(), PIXELS[0].len(), "{line:?}");
+        for art in ARTS {
+            for line in art.pixels {
+                assert_eq!(line.len(), art.pixels[0].len(), "{line:?}");
+            }
+            if art.fill == Fill::HalfBlocks {
+                assert_eq!(
+                    art.pixels.len() % 2,
+                    0,
+                    "a pixel row is left without a partner"
+                );
+                assert_eq!(art.ascii.len(), art.rows());
+            }
         }
+        assert_eq!(
+            CELLS[0].len(),
+            PIXELS[0].len(),
+            "the two full drawings differ in width"
+        );
     }
 
     /// An ordinary terminal gets the full logo.
@@ -1144,9 +1514,10 @@ mod tests {
         assert_eq!(lockup(Some(COMPACT_WIDTH - 1)), None);
         assert_eq!(lockup(None), Some(Lockup::Full));
         // The literals, so a constant that drifts is caught rather than
-        // followed: the compact lockup is 35 columns and the full one is
-        // chosen from 60.
-        assert_eq!(COMPACT_WIDTH, 35);
+        // followed: the compact lockup is 39 columns, the full one 54, and
+        // the full one is chosen from 60.
+        assert_eq!(COMPACT_WIDTH, 39);
+        assert_eq!(WIDTH, 54);
         assert_eq!(FULL_MIN_COLUMNS, 60);
     }
 
@@ -1233,5 +1604,280 @@ mod tests {
         assert!(block.starts_with("\n     ▄"), "{block:?}");
         assert!(block.ends_with("code.\n\n"), "{block:?}");
         assert_eq!(block.lines().count(), ROWS + 2);
+    }
+
+    /// The terminals a first run meets, by what they set: the colour depth
+    /// each one gets, and the escapes that depth may and may not write.
+    const COLOUR_MODES: [(&str, &[(&str, &str)], Paint); 6] = [
+        ("truecolor", &[], Paint::Truecolor),
+        (
+            "256 colours",
+            &[("-COLORTERM", ""), ("TERM", "xterm-256color")],
+            Paint::Indexed,
+        ),
+        (
+            "16 colours",
+            &[("-COLORTERM", ""), ("TERM", "xterm")],
+            Paint::Basic,
+        ),
+        ("NO_COLOR", &[("NO_COLOR", "1")], Paint::None),
+        (
+            "TERM=dumb",
+            &[("-COLORTERM", ""), ("TERM", "dumb")],
+            Paint::None,
+        ),
+        (
+            "NO_COLOR on a truecolor terminal",
+            &[("NO_COLOR", ""), ("COLORTERM", "truecolor")],
+            Paint::None,
+        ),
+    ];
+
+    /// Each colour mode writes only its own kind of escape, at every width
+    /// that draws a logo, and every line fits the terminal it was drawn for.
+    #[test]
+    fn each_colour_mode_writes_only_its_own_escapes_at_each_width() {
+        for (name, vars, paint) in COLOUR_MODES {
+            for columns in [200, 120, 80, FULL_MIN_COLUMNS, 59, 50, COMPACT_WIDTH] {
+                let style = decide_with(true, Some(columns), false, false, vars)
+                    .unwrap_or_else(|| panic!("{name} at {columns} columns drew nothing"));
+                assert_eq!(style.paint, paint, "{name} at {columns} columns");
+                let expected = if columns >= FULL_MIN_COLUMNS {
+                    Lockup::Full
+                } else {
+                    Lockup::Compact
+                };
+                assert_eq!(style.lockup, expected, "{name} at {columns} columns");
+                let drawn = render(style).join("\n");
+                let has = |escape: &str| drawn.contains(escape);
+                match paint {
+                    Paint::Truecolor => {
+                        assert!(has("\u{1b}[38;2;"), "{name}: no 24-bit escape");
+                        assert!(!has("\u{1b}[38;5;"), "{name}: a 256-colour escape");
+                    }
+                    Paint::Indexed => {
+                        assert!(has("\u{1b}[38;5;135m"), "{name}: the arm is not 135");
+                        assert!(has("\u{1b}[38;5;69m"), "{name}: the leg is not 69");
+                        assert!(!has("\u{1b}[38;2;"), "{name}: a 24-bit escape");
+                    }
+                    Paint::Basic => {
+                        assert!(has(crate::mark::BASIC_ARM), "{name}: no magenta arm");
+                        assert!(has(crate::mark::BASIC_LEG), "{name}: no blue leg");
+                        assert!(!has("\u{1b}[38;"), "{name}: an extended colour escape");
+                    }
+                    Paint::None => assert!(!has("\u{1b}"), "{name}: an escape"),
+                }
+                for line in render(style) {
+                    let width = console::measure_text_width(&line);
+                    assert!(
+                        width <= columns,
+                        "{name} at {columns} columns draws {line:?} {width} wide"
+                    );
+                }
+            }
+            assert_eq!(
+                decide_with(true, Some(COMPACT_WIDTH - 1), false, false, vars),
+                None,
+                "{name} drew a logo too narrow to hold one"
+            );
+        }
+    }
+
+    /// Terminal.app gets painted cells, which fill the whole cell, instead
+    /// of half blocks it would draw as tiles. Only colour can paint a cell,
+    /// so without it Terminal.app keeps the plain half blocks, and no other
+    /// terminal changes.
+    #[test]
+    fn terminal_app_gets_painted_cells_while_it_has_colour() {
+        let apple = ("TERM_PROGRAM", "Apple_Terminal");
+        let fill = |vars: &[(&str, &str)]| decide(vars).map(|style| style.fill);
+        assert_eq!(
+            fill(&[apple, ("-COLORTERM", "")]),
+            Some(Fill::Cells),
+            "Terminal.app on 256 colours"
+        );
+        assert_eq!(
+            fill(&[apple]),
+            Some(Fill::Cells),
+            "Terminal.app on truecolor"
+        );
+        assert_eq!(fill(&[apple, ("NO_COLOR", "1")]), Some(Fill::HalfBlocks));
+        assert_eq!(fill(&[]), Some(Fill::HalfBlocks));
+        for other in ["iTerm.app", "vscode", "ghostty", "WezTerm", "tmux", ""] {
+            assert_eq!(
+                fill(&[("TERM_PROGRAM", other)]),
+                Some(Fill::HalfBlocks),
+                "TERM_PROGRAM={other:?}"
+            );
+        }
+        let no_colour = decide(&[apple, ("NO_COLOR", "1")]).unwrap();
+        for line in render(no_colour) {
+            assert!(!line.contains('\u{1b}'), "{line:?}");
+        }
+    }
+
+    /// What a rendered cell row paints, read back as the drawing's letters:
+    /// `A` and `L` for the two 256-colour backgrounds, `W` for reverse video,
+    /// and any other character as itself.
+    fn painted(line: &str) -> String {
+        let mut out = String::new();
+        let mut state = ' ';
+        let mut rest = line;
+        while let Some(start) = rest.find('\u{1b}') {
+            for glyph in rest[..start].chars() {
+                out.push(if glyph == ' ' { state } else { glyph });
+            }
+            let end = rest[start..].find('m').expect("an SGR escape") + start;
+            state = match &rest[start..=end] {
+                "\u{1b}[48;5;135m" => 'A',
+                "\u{1b}[48;5;69m" => 'L',
+                "\u{1b}[7m" => 'W',
+                _ => ' ',
+            };
+            rest = &rest[end + 1..];
+        }
+        for glyph in rest.chars() {
+            out.push(if glyph == ' ' { state } else { glyph });
+        }
+        out
+    }
+
+    /// The cell drawings print exactly the cells they name, as painted spaces
+    /// with no glyph, the wordmark in reverse video and the words in place.
+    #[test]
+    fn a_cell_drawing_paints_exactly_its_cells() {
+        let full = render(in_cells(Lockup::Full, Paint::Indexed));
+        assert_eq!(full.len(), ROWS);
+        for (row, line) in full.iter().enumerate() {
+            let expected = format!("  {}", CELLS[row].replace('.', " "));
+            let expected = expected.trim_end();
+            let read = painted_line(line);
+            if row == BRAND_LINE_ROW {
+                assert!(read.starts_with(expected), "row {row}: {read:?}");
+                assert!(read.ends_with(BRAND_LINE), "row {row}: {read:?}");
+            } else {
+                assert_eq!(read, expected, "row {row}");
+            }
+            assert!(
+                !line.contains(['\u{2580}', '\u{2584}', '\u{2588}']),
+                "a cell drawing draws no block glyph: {line:?}"
+            );
+        }
+        let compact = render(in_cells(Lockup::Compact, Paint::Indexed));
+        assert_eq!(compact.len(), COMPACT_CELLS.len());
+        assert!(painted_line(&compact[COMPACT_CELLS_WORDMARK_ROW]).ends_with(SET_WORDMARK));
+        assert!(painted_line(&compact[COMPACT_CELLS_WORDMARK_ROW + 1]).ends_with(BRAND_LINE));
+        assert_eq!(painted_line(&compact[0]), "    AAAAA");
+        assert_eq!(painted_line(&compact[5]), "     LLLLLL");
+    }
+
+    /// [`painted`] over a whole rendered line.
+    fn painted_line(line: &str) -> String {
+        painted(line).trim_end().to_string()
+    }
+
+    /// Each colour depth paints cells with its own kind of background, and
+    /// every run is closed before the next opens, so reverse video never
+    /// leaks into a colour.
+    #[test]
+    fn cells_paint_backgrounds_in_each_colour_depth() {
+        for lockup in [Lockup::Full, Lockup::Compact] {
+            let truecolor = render(in_cells(lockup, Paint::Truecolor)).join("\n");
+            assert!(truecolor.contains("\u{1b}[48;2;"), "{lockup:?}");
+            assert!(
+                !truecolor.contains("\u{1b}[38;"),
+                "{lockup:?}: a foreground colour"
+            );
+            let basic = render(in_cells(lockup, Paint::Basic)).join("\n");
+            assert!(basic.contains(BASIC_ARM_BACKGROUND) && basic.contains(BASIC_LEG_BACKGROUND));
+            for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic] {
+                for line in render(in_cells(lockup, paint)) {
+                    let mut open = false;
+                    let mut rest = line.as_str();
+                    while let Some(start) = rest.find('\u{1b}') {
+                        let end = rest[start..].find('m').unwrap() + start;
+                        let escape = &rest[start..=end];
+                        if escape == RESET {
+                            open = false;
+                        } else if escape.starts_with("\u{1b}[48") || escape == REVERSE {
+                            assert!(
+                                !open,
+                                "{lockup:?} {paint:?} opens a run inside another: {line:?}"
+                            );
+                            open = true;
+                        } else {
+                            open = false;
+                        }
+                        rest = &rest[end + 1..];
+                    }
+                    assert!(
+                        line.ends_with(RESET) || !line.contains('\u{1b}'),
+                        "{line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bold and faint are not colour: they stay when colour is on and go
+    /// with it, so a `NO_COLOR` reader gets plain words.
+    #[test]
+    fn words_carry_weight_only_when_colour_is_on() {
+        for (name, vars, paint) in COLOUR_MODES {
+            for columns in [120, 50] {
+                let style = decide_with(true, Some(columns), false, false, vars).unwrap();
+                let drawn = render(style).join("\n");
+                let weighted = drawn.contains(FAINT);
+                assert_eq!(weighted, paint != Paint::None, "{name} at {columns}");
+            }
+        }
+    }
+
+    /// The ASCII drawings are ASCII, so a C locale never sees a stray byte.
+    #[test]
+    fn the_ascii_drawings_are_ascii() {
+        for lockup in [Lockup::Full, Lockup::Compact] {
+            for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic, Paint::None] {
+                for fill in [Fill::HalfBlocks, Fill::Cells] {
+                    for line in render(Style {
+                        lockup,
+                        glyphs: Glyphs::Ascii,
+                        paint,
+                        fill,
+                    }) {
+                        let plain = console::strip_ansi_codes(&line);
+                        assert!(plain.is_ascii(), "{lockup:?} {paint:?} {fill:?}: {plain:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The compact mark is the same mark: its two bands run the same ways
+    /// and its split is in the same place, the arm's point above the leg's
+    /// cut.
+    #[test]
+    fn the_compact_mark_keeps_the_marks_bands_and_split() {
+        for art in ARTS {
+            let rows_of = |piece: u8| -> Vec<usize> {
+                art.pixels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.as_bytes().contains(&piece))
+                    .map(|(row, _)| row)
+                    .collect()
+            };
+            let arm = rows_of(b'A');
+            let leg = rows_of(b'L');
+            assert_eq!(arm.first(), Some(&0), "the arm starts the mark");
+            assert_eq!(leg.last(), Some(&(art.pixels.len() - 1)), "the leg ends it");
+            assert!(arm.last() < leg.last() && arm.first() < leg.first());
+            // The arm runs down to the left and the leg down to the right.
+            let first = |row: usize, piece: u8| art.pixels[row].bytes().position(|p| p == piece);
+            let last = |row: usize, piece: u8| art.pixels[row].bytes().rposition(|p| p == piece);
+            assert!(last(arm[0], b'A') > last(arm[arm.len() - 1], b'A'));
+            assert!(last(leg[0], b'L') < last(leg[leg.len() - 1], b'L'));
+            assert!(first(arm[0], b'A') > first(arm[arm.len() - 1], b'A'));
+        }
     }
 }

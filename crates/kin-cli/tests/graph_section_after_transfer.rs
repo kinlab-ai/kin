@@ -132,8 +132,8 @@ fn base_change(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> String {
         .collect()
 }
 
-fn configure_author(repo: &Path) {
-    let path = repo.join(".kin/config.toml");
+fn configure_author(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let path = runtime.layout_for(repo).config_path();
     let mut config = kin_core::KinConfig::load_or_default(&path).unwrap();
     config.default_author =
         Some("Graph Section Transfer Test <graph-section@example.invalid>".to_string());
@@ -142,10 +142,11 @@ fn configure_author(repo: &Path) {
 
 fn initialize_source(runtime: &common::IsolatedDaemonRuntime, source: &Path) -> (String, String) {
     fs::create_dir(source).unwrap();
-    let initialized = kin_core::init_replica(source, "trunk").unwrap();
-    let repository = initialized.repository_id.to_string();
-    drop(initialized);
-    configure_author(source);
+    let layout = runtime.initialize_native_replica(source, "trunk");
+    let repository = kin_core::KinManifest::load(&layout.manifest_path())
+        .unwrap()
+        .repo_id;
+    configure_author(runtime, source);
     fs::create_dir(source.join("src")).unwrap();
     fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 42 }\n").unwrap();
     require_success(run(
@@ -153,7 +154,7 @@ fn initialize_source(runtime: &common::IsolatedDaemonRuntime, source: &Path) -> 
         source,
         &["commit", "-m", "Add a native source body"],
     ));
-    let port = fs::read_to_string(source.join(".kin/daemon.port")).unwrap();
+    let port = fs::read_to_string(runtime.layout_for(source).root().join("daemon.port")).unwrap();
     (repository, format!("http://127.0.0.1:{}", port.trim()))
 }
 
@@ -161,11 +162,11 @@ fn clone_from(
     runtime: &common::IsolatedDaemonRuntime,
     parent: &Path,
     destination: &Path,
-    source: &Path,
+    source_store: &Path,
     endpoint: &str,
     repository: &str,
 ) -> Output {
-    let token = fs::read_to_string(source.join(".kin/daemon.token")).unwrap();
+    let token = fs::read_to_string(source_store.join("daemon.token")).unwrap();
     runtime
         .kin_command()
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
@@ -182,10 +183,10 @@ fn clone_from(
 fn transfer(
     runtime: &common::IsolatedDaemonRuntime,
     destination: &Path,
-    source: &Path,
+    source_store: &Path,
     verb: &str,
 ) {
-    let token = fs::read_to_string(source.join(".kin/daemon.token")).unwrap();
+    let token = fs::read_to_string(source_store.join("daemon.token")).unwrap();
     require_success(
         runtime
             .kin_command()
@@ -202,7 +203,7 @@ fn transfer(
 
 /// One commit in a replica, so it has a head of its own to push.
 fn commit_in_clone(runtime: &common::IsolatedDaemonRuntime, destination: &Path) {
-    configure_author(destination);
+    configure_author(runtime, destination);
     fs::write(
         destination.join("src/added.rs"),
         b"pub fn introduced() -> bool { true }\n",
@@ -247,7 +248,7 @@ fn a_fresh_clone_serves_its_workspace_base_from_a_section() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
     ));
@@ -273,7 +274,7 @@ fn a_cold_reopen_of_a_fresh_clone_still_serves_from_its_section() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
     ));
@@ -299,7 +300,7 @@ fn a_replica_that_pulled_serves_its_workspace_base_from_a_section() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
     ));
@@ -310,7 +311,12 @@ fn a_replica_that_pulled_serves_its_workspace_base_from_a_section() {
         &["commit", "-m", "Advance the origin past the clone"],
     ));
     let pulled = base_change(&source_runtime, &source);
-    transfer(&clone_runtime, &destination, &source, "pull");
+    transfer(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+        "pull",
+    );
     let line = graph_section_line(&clone_runtime, &destination);
     assert_serving(&line, "a replica that pulled new history");
     assert!(
@@ -344,12 +350,17 @@ fn an_origin_that_received_a_push_still_serves_its_own_workspace_base() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
     ));
     commit_in_clone(&clone_runtime, &destination);
-    transfer(&clone_runtime, &destination, &source, "push");
+    transfer(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+        "push",
+    );
     let line = graph_section_line(&source_runtime, &source);
     assert_serving(&line, "an origin that received a push");
     assert!(
@@ -382,7 +393,7 @@ fn the_section_an_origin_serves_names_the_head_the_push_delivered() {
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
     ));
@@ -392,7 +403,12 @@ fn the_section_an_origin_serves_names_the_head_the_push_delivered() {
         delivered, before_push,
         "the push must deliver a head the origin did not already hold"
     );
-    transfer(&clone_runtime, &destination, &source, "push");
+    transfer(
+        &clone_runtime,
+        &destination,
+        source_runtime.layout_for(&source).root(),
+        "push",
+    );
     require_success(run(
         &source_runtime,
         &source,
@@ -422,20 +438,27 @@ fn a_clone_with_no_base_reports_the_state_it_is_in_rather_than_a_section() {
     let source = scratch.path().join("source");
     let destination = scratch.path().join("replica");
     fs::create_dir(&source).unwrap();
-    let initialized = kin_core::init_replica(&source, "trunk").unwrap();
-    let repository = initialized.repository_id.to_string();
-    drop(initialized);
-    configure_author(&source);
     let source_runtime = common::IsolatedDaemonRuntime::new(&source);
+    let layout = source_runtime.initialize_native_replica(&source, "trunk");
+    let repository = kin_core::KinManifest::load(&layout.manifest_path())
+        .unwrap()
+        .repo_id;
+    configure_author(&source_runtime, &source);
     let clone_runtime = common::IsolatedDaemonRuntime::new(&destination);
     require_success(run(&source_runtime, &source, &["admit"]));
-    let port = fs::read_to_string(source.join(".kin/daemon.port")).unwrap();
+    let port = fs::read_to_string(
+        source_runtime
+            .layout_for(&source)
+            .root()
+            .join("daemon.port"),
+    )
+    .unwrap();
     let endpoint = format!("http://127.0.0.1:{}", port.trim());
     require_success(clone_from(
         &clone_runtime,
         scratch.path(),
         &destination,
-        &source,
+        source_runtime.layout_for(&source).root(),
         &endpoint,
         &repository,
     ));
