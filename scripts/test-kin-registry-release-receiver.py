@@ -2740,5 +2740,102 @@ class WorkflowContractTests(unittest.TestCase):
         )
 
 
+
+def run_block(step: str) -> str:
+    body = step.split("        run: |\n", 1)[1]
+    lines = [line[10:] if line.startswith("          ") else line.strip() for line in body.splitlines()]
+    return "\n".join(lines) + "\n"
+
+
+class RegistryUnavailableTests(unittest.TestCase):
+    """Updater exit 4 (registry 5xx after retries) warns and exits cleanly;
+    every other failure still fails the run."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        cls.attest_workflow = ATTEST_WORKFLOW_PATH.read_text(encoding="utf-8")
+        cls.script = run_block(step_block(cls.workflow, "Update the allowed root-manifest pins"))
+
+    def run_update(self, updater_body: str) -> tuple[subprocess.CompletedProcess[str], str, str]:
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            scripts = work / ".kin-actions" / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "update-cargo-registry-deps.py").write_text(
+                "import sys\n" + updater_body, encoding="utf-8"
+            )
+            output, summary = work / "out", work / "summary"
+            env = {
+                **os.environ,
+                "GITHUB_EVENT_NAME": "schedule",
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "RUNNER_TEMP": str(work / "tmp"),
+                "EVENT_CRATE": "",
+                "EVENT_VERSION": "",
+                "VFS_CORE_ROLL": "false",
+                "VFS_CORE_REASON": "held",
+            }
+            result = subprocess.run(
+                ["bash", "-c", self.script], cwd=work, env=env, text=True, capture_output=True
+            )
+            read = lambda p: p.read_text(encoding="utf-8") if p.exists() else ""
+            return result, read(output), read(summary)
+
+    def test_registry_unavailable_warns_and_exits_cleanly(self) -> None:
+        result, output, summary = self.run_update(
+            "print('dependency wave skipped: registry unavailable: HTTP 502 after 4 attempts', file=sys.stderr)\n"
+            "raise SystemExit(4)\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("::warning title=Kin registry unavailable::HTTP 502 after 4 attempts", result.stdout)
+        self.assertNotIn("::error", result.stdout)
+        self.assertIn("changed=unavailable", output)
+        self.assertIn("Kin registry unavailable", summary)
+
+    def test_exit_four_without_marker_still_fails(self) -> None:
+        result, output, _ = self.run_update("raise SystemExit(4)\n")
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("::error::", result.stdout)
+        self.assertNotIn("changed=unavailable", output)
+
+    def test_other_failures_still_fail(self) -> None:
+        for code in (1, 5):
+            result, output, _ = self.run_update(
+                "print('dependency wave skipped: registry unavailable: x', file=sys.stderr)\n"
+                f"raise SystemExit({code})\n"
+            )
+            self.assertEqual(result.returncode, code)
+            self.assertIn(f"failed with exit code {code}", result.stdout)
+            self.assertNotIn("changed=", output)
+
+    def test_blocked_and_no_change_paths_unchanged(self) -> None:
+        result, output, _ = self.run_update("raise SystemExit(2)\n")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("changed=false", output)
+        result, _, _ = self.run_update(
+            "print('dependency wave blocked: nope', file=sys.stderr)\nraise SystemExit(3)\n"
+        )
+        self.assertEqual(result.returncode, 3)
+
+    def test_unavailable_skips_mutation_and_attestation_only(self) -> None:
+        mutate = job_block(self.workflow, "mutate-wave")
+        self.assertIn("if: needs.prepare-wave.outputs.changed != 'unavailable'", mutate)
+        record = step_block(self.workflow, "Record the registry-unavailable skip")
+        self.assertIn("if: steps.update.outputs.changed == 'unavailable'", record)
+        self.assertIn("kin-registry-unavailable-${{ github.run_id }}-${{ github.run_attempt }}", record)
+        gate = step_block(self.attest_workflow, "Detect a registry-unavailable receiver run")
+        self.assertIn('kin-registry-unavailable-${suffix}', gate)
+        self.assertIn('! grep -qxF "kin-registry-result-${suffix}"', gate)
+        for name in (
+            "Download the exact completed-run admission",
+            "Validate terminal server authority and live admitted head",
+        ):
+            self.assertIn(
+                "if: steps.gate.outputs.skip != 'true'", step_block(self.attest_workflow, name)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

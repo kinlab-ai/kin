@@ -30,7 +30,7 @@ repository, and walks the everyday loop end to end. Once Kin is running, the
   how a deployment reads what an image needs instead of tracking it by hand.
 - **[Language support](language-support.md)** states what semantic enrichment
   each language actually gets. No tier is implied beyond what extraction emits.
-- **[Store size](store-size.md)** explains what drives the size of `.kin/` and
+- **[Store size](store-size.md)** explains what drives the size of a Kin store and
   records what has been measured.
 - **[Windows](windows-wsl2.md)** covers what works natively and why WSL2 is the
   recommended path.

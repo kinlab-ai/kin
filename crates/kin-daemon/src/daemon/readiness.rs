@@ -7,14 +7,20 @@
 //! callers reuse the completed attempt, including a failure; a later request
 //! retries a failure. Only an identified, unchanged successful launch can be
 //! reused across attempts. Dropping an in-flight attempt leaves it unknown.
+//!
+//! A process that runs no sweep makes no later request of its own, so its
+//! startup probe repeats a failed launch itself ([`probe_until_settled`]).
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use kin_core::reference_coverage::{LanguageServerReadiness, LanguageServerReadinessMap};
+use kin_core::reference_coverage::{
+    LanguageServerGapMap, LanguageServerReadiness, LanguageServerReadinessMap,
+};
 use kin_lsp::adapters::ServerLaunch;
 use kin_model::{LanguageId, ProofContext};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -185,6 +191,73 @@ impl LaunchKey {
     }
 }
 
+/// One probe's finding, and whether it is a failed launch: a server that was
+/// started and did not complete its handshake, or left straight after it. A
+/// loaded host produces that from a working server, so it is looked at
+/// again. A server that is not installed, or that the resolver says cannot
+/// serve, was never started, and asking again would answer the same.
+pub(super) struct ProbeOutcome {
+    pub(super) readiness: LanguageServerReadiness,
+    pub(super) launch_failed: bool,
+}
+
+/// Times a failed launch is probed again before its finding stands.
+pub(super) const REPEAT_PROBES: usize = 4;
+
+/// The pause before the first repeat. Each later pause is twice the last, so
+/// the repeats span seven and a half minutes of pauses.
+pub(super) const FIRST_REPEAT_PAUSE: Duration = Duration::from_secs(30);
+
+/// Probe until the finding is one that asking again would not change.
+///
+/// `probe` runs one probe with the handshake limit it is given, and `pause`
+/// waits. The first probe has the short limit a startup path can afford. A
+/// failed launch is probed again after a pause, with the longer limit, up to
+/// [`REPEAT_PROBES`] times, and each failure is logged with its reason. The
+/// finding each probe publishes is the latest one, so a repeat that succeeds
+/// replaces the failure before it.
+pub(super) async fn probe_until_settled<P, PFut, S, SFut>(
+    language: LanguageId,
+    mut probe: P,
+    mut pause: S,
+) -> LanguageServerReadiness
+where
+    P: FnMut(Duration) -> PFut,
+    PFut: std::future::Future<Output = ProbeOutcome>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let mut limit = kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT;
+    let mut wait = FIRST_REPEAT_PAUSE;
+    let mut repeats_left = REPEAT_PROBES;
+    loop {
+        let outcome = probe(limit).await;
+        let LanguageServerReadiness::Unusable { reason } = &outcome.readiness else {
+            return outcome.readiness;
+        };
+        if !outcome.launch_failed || repeats_left == 0 {
+            tracing::warn!(
+                %language,
+                %reason,
+                "the language server could not complete its readiness handshake"
+            );
+            return outcome.readiness;
+        }
+        tracing::warn!(
+            %language,
+            %reason,
+            retry_in_secs = wait.as_secs(),
+            repeats_left,
+            "the language server did not complete its readiness handshake; it will be \
+             probed again with a longer limit"
+        );
+        pause(wait).await;
+        repeats_left -= 1;
+        wait *= 2;
+        limit = kin_lsp::lifecycle::READINESS_REPEAT_TIMEOUT;
+    }
+}
+
 #[derive(Default)]
 struct Observation {
     key: Option<LaunchKey>,
@@ -202,9 +275,39 @@ struct Slot {
 pub(super) struct ReadinessObservations {
     slots: Mutex<HashMap<LanguageId, Arc<Slot>>>,
     published: Mutex<LanguageServerReadinessMap>,
+    gaps: Mutex<LanguageServerGapMap>,
+}
+
+/// Why the server `launch` starts analyses without the environment the
+/// repository chose, so calls into dependencies get no answer from it, as its
+/// adapter reported. `None` when the environment is there.
+pub(super) fn environment_gap(launch: &ServerLaunch) -> Option<String> {
+    launch
+        .resolution
+        .as_ref()
+        .and_then(|resolution| resolution.environment.missing_reason())
+        .map(str::to_string)
 }
 
 impl ReadinessObservations {
+    /// Record, for a language whose server started, why it runs without the
+    /// environment the repository chose, or that it does not, and publish it
+    /// beside readiness. A server that runs that way answers for the
+    /// repository's own code and nothing it imports, which every coverage
+    /// surface names as partial enrichment rather than reading whole.
+    pub(super) fn note_environment_gap(&self, language: LanguageId, gap: Option<String>) {
+        let mut gaps = self.gaps.lock().expect("environment gaps");
+        match gap {
+            Some(gap) => {
+                gaps.insert(language, gap);
+            }
+            None => {
+                gaps.remove(&language);
+            }
+        }
+        kin_mcp::edge_coverage::publish_language_server_gaps(gaps.clone());
+    }
+
     pub(super) async fn acquire(&self, language: LanguageId) -> Attempt<'_> {
         let slot = Arc::clone(
             self.slots
@@ -249,6 +352,21 @@ impl ReadinessObservations {
         }
     }
 
+    /// Why `language`'s server could not start, as this owner last published
+    /// it, for a sweep that must report a language it could not serve and
+    /// lost its own copy of why.
+    pub(super) fn recorded_failure(&self, language: LanguageId) -> Option<String> {
+        match self
+            .published
+            .lock()
+            .expect("readiness observations")
+            .get(&language)
+        {
+            Some(LanguageServerReadiness::Unusable { reason }) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
     /// The completed findings this owner has published, for a test to read.
     #[cfg(test)]
     pub(super) fn published_findings(&self) -> LanguageServerReadinessMap {
@@ -264,55 +382,98 @@ impl ReadinessObservations {
         attempt.finish(None, LanguageServerReadiness::Unusable { reason }, None);
     }
 
+    /// One probe with the handshake limit a startup or sweep path can afford.
     pub(super) async fn probe(
         &self,
         language: LanguageId,
         workspace: &Path,
     ) -> LanguageServerReadiness {
+        self.probe_within(
+            language,
+            workspace,
+            kin_lsp::lifecycle::READINESS_PROBE_TIMEOUT,
+        )
+        .await
+        .readiness
+    }
+
+    /// One probe that waits up to `limit` for the handshake, and says whether
+    /// its finding is a failed launch.
+    pub(super) async fn probe_within(
+        &self,
+        language: LanguageId,
+        workspace: &Path,
+        limit: Duration,
+    ) -> ProbeOutcome {
+        let verdict = |readiness| ProbeOutcome {
+            readiness,
+            launch_failed: false,
+        };
         // Resolve after acquiring the slot: another caller may have waited
         // while the executable, adapter settings or environment changed.
         let mut attempt = self.acquire(language).await;
         let Some((command, args, launch)) = super::lsp_adapter_for(language, workspace) else {
             attempt.begin();
-            return attempt.finish(None, LanguageServerReadiness::Absent, None);
+            return verdict(attempt.finish(None, LanguageServerReadiness::Absent, None));
         };
         let resolved =
             crate::language_server_command::resolve_on_this_host(command, workspace.to_path_buf())
                 .await;
         let program = match resolved {
             crate::language_server_command::ServerCommand::Resolved { program, .. } => program,
-            crate::language_server_command::ServerCommand::NotInstalled => {
+            crate::language_server_command::ServerCommand::NotInstalled { .. } => {
                 attempt.begin();
-                return attempt.finish(None, LanguageServerReadiness::Absent, None);
+                return verdict(attempt.finish(None, LanguageServerReadiness::Absent, None));
             }
             crate::language_server_command::ServerCommand::Unresolvable { reason } => {
                 attempt.begin();
-                return attempt.finish(None, LanguageServerReadiness::Unusable { reason }, None);
+                return verdict(attempt.finish(
+                    None,
+                    LanguageServerReadiness::Unusable { reason },
+                    None,
+                ));
             }
         };
         let key = LaunchKey::capture(workspace, &program, &args, &launch);
         if let Some(result) = attempt.reuse(&key) {
-            return result;
+            return verdict(result);
         }
         attempt.begin();
-        match super::probe_server(&program, &args, workspace, &launch).await {
-            Ok(server) => {
+        match super::probe_server(&program, &args, workspace, &launch, limit).await {
+            Ok(mut server) => {
                 let context = server.proof_context(language);
+                // A server that answered the handshake and went away left its
+                // exit and its stderr behind, and they are the reason.
                 let result = if server.is_disconnected() {
                     LanguageServerReadiness::Unusable {
-                        reason: "the language server disconnected after its handshake".into(),
+                        reason: format!(
+                            "`{}` disconnected after its handshake ({})",
+                            program.display(),
+                            server
+                                .departure()
+                                .await
+                                .describe(kin_lsp::lifecycle::START_FAILURE_STDERR)
+                        ),
                     }
                 } else {
+                    self.note_environment_gap(language, environment_gap(&launch));
                     LanguageServerReadiness::Usable
                 };
                 drop(server);
-                attempt.finish(Some(key), result, Some(&context))
+                let launch_failed = result != LanguageServerReadiness::Usable;
+                ProbeOutcome {
+                    readiness: attempt.finish(Some(key), result, Some(&context)),
+                    launch_failed,
+                }
             }
-            Err(reason) => attempt.finish(
-                Some(key),
-                LanguageServerReadiness::Unusable { reason },
-                None,
-            ),
+            Err(reason) => ProbeOutcome {
+                readiness: attempt.finish(
+                    Some(key),
+                    LanguageServerReadiness::Unusable { reason },
+                    None,
+                ),
+                launch_failed: true,
+            },
         }
     }
 }
@@ -530,6 +691,79 @@ mod tests {
                 reference_enrichment_for(LanguageId::Python, &owner.published_findings()),
                 ReferenceEnrichment::NoLanguageServer
             );
+        }
+    }
+
+    /// Run [`probe_until_settled`] over scripted outcomes, answering with its
+    /// finding, the handshake limit each probe was given and each pause.
+    async fn settled(
+        script: Vec<(LanguageServerReadiness, bool)>,
+    ) -> (LanguageServerReadiness, Vec<u64>, Vec<u64>) {
+        let script = std::cell::RefCell::new(script.into_iter());
+        let limits = std::cell::RefCell::new(Vec::new());
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let finding = probe_until_settled(
+            LanguageId::Python,
+            |limit| {
+                limits.borrow_mut().push(limit.as_secs());
+                let (readiness, launch_failed) =
+                    script.borrow_mut().next().expect("a scripted outcome");
+                std::future::ready(ProbeOutcome {
+                    readiness,
+                    launch_failed,
+                })
+            },
+            |pause| {
+                pauses.borrow_mut().push(pause.as_secs());
+                std::future::ready(())
+            },
+        )
+        .await;
+        (finding, limits.into_inner(), pauses.into_inner())
+    }
+
+    /// One slow handshake on a loaded host is not the server's finding for
+    /// the life of the process: it is probed again with a longer limit, and
+    /// the repeat's answer is the one that stands.
+    #[tokio::test]
+    async fn a_failed_launch_is_probed_again_with_a_longer_limit() {
+        let slow = || {
+            (
+                LanguageServerReadiness::Unusable {
+                    reason: "did not complete the initialize handshake within 10s".into(),
+                },
+                true,
+            )
+        };
+        let (finding, limits, pauses) =
+            settled(vec![slow(), (LanguageServerReadiness::Usable, false)]).await;
+        assert_eq!(finding, LanguageServerReadiness::Usable);
+        assert_eq!(limits, [10, 30]);
+        assert_eq!(pauses, [30]);
+
+        // A server that never answers is asked a bounded number of times,
+        // further apart each time, and then its finding stands.
+        let (finding, limits, pauses) = settled(vec![slow(); REPEAT_PROBES + 1]).await;
+        assert!(matches!(finding, LanguageServerReadiness::Unusable { .. }));
+        assert_eq!(limits, [10, 30, 30, 30, 30]);
+        assert_eq!(pauses, [30, 60, 120, 240]);
+    }
+
+    /// A finding no start produced is not asked for again: a server that is
+    /// not installed, one the resolver refuses, and one that is usable.
+    #[tokio::test]
+    async fn a_finding_no_launch_produced_is_not_probed_again() {
+        for readiness in [
+            LanguageServerReadiness::Absent,
+            LanguageServerReadiness::Usable,
+            LanguageServerReadiness::Unusable {
+                reason: "no interpreter on this host can run it".into(),
+            },
+        ] {
+            let (finding, limits, pauses) = settled(vec![(readiness.clone(), false)]).await;
+            assert_eq!(finding, readiness);
+            assert_eq!(limits, [10]);
+            assert!(pauses.is_empty());
         }
     }
 

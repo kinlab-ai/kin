@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/layout_tracker.rs",
+    "src/lib.rs",
+]
+
+[[excluded]]
+reason = "editing paths that write new source (entity body splices, import edits, placement of new entities, projection of entity mutations to bytes); the source they write is then derived like any other, and kin-index calls none of them"
+files = [
+    "src/engine.rs",
+    "src/splice.rs",
+]
+
+[[excluded]]
+reason = "materializes a stored resolved tree into a working directory (bytes, symlinks, modes) and verifies it; it reads the store and writes the filesystem, deriving nothing"
+files = [
+    "src/tree.rs",
+]
+
+[[excluded]]
+reason = "renders architecture, agents and context markdown from stored entities; output goes to a docs directory, never to the store"
+files = [
+    "src/living_docs.rs",
+]
+
+[[excluded]]
+reason = "error type and its messages; build_layout returns no error, and a failed projection stores nothing"
+files = [
+    "src/error.rs",
+]
+
+[[excluded]]
+reason = "answers where an editor opens an entity by reading its stored span and the tracked tree; it writes nothing to the store and no derivation calls it"
+files = [
+    "src/places.rs",
+]
+
+[dependencies]
+kin-model = { decides = ["graph"] }
+kin-db = { reason = "only the unit tests use it (InMemoryGraph fixtures in engine.rs); no non-test source in this crate calls it" }
+kin-blobs = { reason = "blob reads and durable syncs for tree materialization and the projection engine; layout derivation never reaches it" }
+serde = { reason = "derives the wire types of the projection places answer; the store never holds them" }
+serde_json = { reason = "reads a blob hash string from entity metadata in the projection engine, and parses requested entity ids for places; JSON with a fixed, specified format" }
+thiserror = { reason = "error type derive; it shapes error messages, not derived data" }
+tracing = { reason = "logging only" }

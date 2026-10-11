@@ -270,15 +270,10 @@ fn context_pack_excludes_closed_work_and_stale_annotations() {
 
 #[test]
 fn todo_import_extracts_markers() {
-    let dir = tempfile::tempdir().unwrap();
-
-    write_rust_file(
-        dir.path(),
-        "src/lib.rs",
+    let todos = kin_parser::todos_in_text(
         "// TODO: add retry logic\nfn process() {}\n// FIXME: race condition\n// HACK: temporary\n",
+        "src/lib.rs",
     );
-
-    let todos = kin_parser::extract_todos(dir.path()).unwrap();
     assert_eq!(todos.len(), 3);
     assert_eq!(todos[0].kind, "TODO");
     assert!(todos[0].body.contains("retry logic"));

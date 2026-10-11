@@ -66,7 +66,7 @@ not be accounted for, and the two halves contradict. Which branch of the join
 runs is a property of the store, and the result names it. Every check names the
 ticket it is about, so a failure is attributable without reading the code.
 Check 25 covers FIR-2955. It initializes a committed Git repository with
-`--no-enrich`, then runs `kin graph materialize --json` twice. The first call
+`--defer-enrich`, then runs `kin graph materialize --json` twice. The first call
 must report `already_current`, proving init persisted the section before any
 daemon reopen, and the second must keep the same repository, workspace,
 authority generation and base target, proving the explicit verb is idempotent.
@@ -180,6 +180,30 @@ The brownfield fixtures are one commit each, so its recall results are
 one-commit-shape results. The suite prints that scope on every run and records it
 in the JSON. History-shaped behavior, meaning conversion cost, provenance depth,
 and commit peak memory, is not exercised here.
+
+Brownfield follows `kin store path --json` for logs, manifests and cleanup. It
+requires the returned working directory to match the fixture exactly and the
+store to remain inside the owned run directory. Its registry is also inside that
+directory. `--store-layout default` tests the binary's default placement;
+`--store-layout central` and `--store-layout in-tree` require the named placement
+and record it, along with each resolved store, in the report. For a focused central
+run, use `--store-layout central --only 0,2,11` with the usual binary, daemon and
+corpus-cache arguments. Run that separately from any in-tree comparison. A passing
+in-tree run says nothing about central placement.
+
+Check 9 retains its original in-tree interrupted-conversion fixture even in a
+central run, and discloses that exception. The following older suites also pin
+`KIN_STORE_LAYOUT=in-tree` because they inspect, mutate or copy private store
+records: `agent_write_publish_repro`, `coverage_read_open`, `eject_journal_repro`,
+`first_contact_honesty`, `first_query_readiness_repro`, `graph_viz_local_render`,
+`hydration_semantics_repro`, `init_budget_refusal`, `magic_repro`,
+`mcp_spawn_admission_repro`, `memory_pressure_refusal`, `parse_hole_repro`,
+`published_store_upgrade_repro`, `registry_home_isolation`,
+`response_budget_elisions`, `same_owner_call_repro`, `source_view_authority_opens`
+and `trace_spine_clipping_repro`. Their verdicts retain that layout scope. Central
+move/reattach, refusal without mutation, interrupted admission, upgrade, eject and
+editor discovery require their own witnesses; the brownfield reference checks do
+not establish those behaviors.
 
 `response_budget_elisions.py` covers the one rule the response budget owes every
 answer it shortens: a list it cut is never rendered as an empty one. An empty
@@ -545,7 +569,10 @@ commit to land and the carried copy to be retired while the archive's own is
 untouched. Check `refusal` plants a journal bound to nothing the store can
 verify and requires the refusal to name the file and the remedy in words, with
 no `HTTP 500`, `Internal Server Error` or `Core error` in it, then removes the
-file as the message says and requires the same store to commit. Check `hook`
+file as the message says and requires the same store to commit. Checks
+`author` and `author_global` require a native commit to record the configured
+Git identity, `Name <email>`, read from `kin log --json` at repository and at
+global scope, and `kin log` to show that person's name. Check `hook`
 covers the second half of the same run: `kin eject` builds its replacement Git
 with gitoxide, whose template writes `.git/hooks/docs.url`, a URL Git never
 runs, and `kin init` refused the ejected repository over it; the check requires
@@ -640,15 +667,17 @@ carries a nonzero tree delta read off `kin log`'s own `Deltas:` line. Check
 covers to still hold the `--ours` bytes, so the rule reads as precedence rather
 than as take-theirs. Check `refusal` settles two entities in one file to opposite
 sides, which no side's committed bytes can carry, and requires the merge to
-refuse naming the file and both decisions and to move no ref. Check `uniform` is
+refuse naming both decisions and the unit that holds them, as an entity by its
+own name with the identity that re-settles it, and to move no ref. Check `uniform` is
 the control that keeps the other three honest: an ordinary `--all-theirs` merge
 must still publish, so a build that refused every merge would satisfy `refusal`
 and lose nothing else.
 
 The self-test drives every grader against one fixture per assertion. A merge log
 reading `tree=0` must fail, a one-parent change must read UNREADABLE rather than
-graded, and a refusal that names the file but neither entity, or both entities
-but only one side, must each fail on their own assertion.
+graded, and a refusal that names the unit only by where it is projected, names
+the unit but neither entity, or names both entities but only one side, must each
+fail on their own assertion.
 
 `graph_viz_local_render.py` grades whether `kin graph viz` draws the store it was
 pointed at. It served `{"nodes": [], "links": [], "unresolved_links": 0}` on a
@@ -686,7 +715,22 @@ are the readers `check_6` and `check_14` use, which is what keeps the per pull
 request gate and main's gate one gate. Its check 0 is a positive control on the
 resolved tool profile: a run that graded `full` would pass every assertion below
 while saying nothing about the surface an agent is served. Check 6 is the
-general form, and refuses any served name the registry does not carry.
+general form, and refuses any served name the registry does not carry. Check 16
+holds `agent-default` to its exact set and its byte ceiling, which it reads from
+`AGENT_DEFAULT_LIST_CEILING_BYTES` in `crates/kin-mcp/src/tools.rs`: every client
+that loads what it is handed resends that listing on every turn. Every byte
+ceiling the suite grades is read from the crate constant a crate test also holds,
+and the suite exits 3 when it cannot read one, so the two gates cannot drift.
+
+The agent profiles serve plain verbs, so the names this suite holds are the
+verbs: the proofs search with `locate` by name, check 3 reads the shape knob off
+`trace`, check 4 reads the `status` description, and check 13 writes through
+`session`, `mutate` and `source`. The names the verbs replaced, such as
+`semantic_search` and `kin_mutate`, are accepted on a call for one version and
+never listed, so check 6 refuses one that comes back in a listing, and check 11
+discovers and runs `refs`, which `agent-search` withholds. The other suites
+here still call several tools by those older names, which is the accepted-alias
+path working as it should until the next version removes it.
 
 `mcp_surface_contract.py --self-test`, `brownfield_repro.py --self-test` and
 `response_budget_elisions.py --self-test` exercise their verdict graders on

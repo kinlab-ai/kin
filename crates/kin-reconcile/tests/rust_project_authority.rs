@@ -346,3 +346,38 @@ fn inline_single_source_cargo_call_has_exact_project_binding() {
         "inline source must resolve through Cargo authority"
     );
 }
+
+/// Moving `[lib] path` renames the two sources it moves the root between,
+/// though neither one's bytes changed: the old root becomes a plain module
+/// named by its stem and the new root takes the crate's name.
+#[test]
+fn a_manifest_edit_renames_the_crate_roots_it_moves() {
+    let module = |repo: &Repo, file: &str| -> String {
+        let surfaces: Vec<_> = repo
+            .graph
+            .list_all_entities()
+            .unwrap()
+            .into_iter()
+            .filter(|entity| {
+                entity.file_origin == Some(FilePathId::new(file))
+                    && kin_model::is_file_module_surface(entity)
+            })
+            .collect();
+        assert_eq!(surfaces.len(), 1, "{file}: {surfaces:?}");
+        surfaces[0].name.clone()
+    };
+    let mut repo = project();
+    assert_eq!(module(&repo, "app.rs"), "fixture");
+    assert_eq!(module(&repo, "other.rs"), "other");
+    repo.admit("Cargo.toml", &MANIFEST.replace("app.rs", "other.rs"));
+    repo.batch(&["Cargo.toml"]);
+    assert_eq!(module(&repo, "app.rs"), "app");
+    assert_eq!(module(&repo, "other.rs"), "fixture");
+    // Every Rust source now reads back strictly against its own bytes: a
+    // later batch reads each one as an admitted dependent and refuses one the
+    // graph holds stale declarations for.
+    repo.admit("caller.rs", &format!("{CALLER}\n"));
+    repo.batch(&["caller.rs"]);
+    assert_eq!(module(&repo, "app.rs"), "app");
+    assert_eq!(module(&repo, "other.rs"), "fixture");
+}

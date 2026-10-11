@@ -212,12 +212,15 @@ impl<'a> SourcePositions<'a> {
         let (_, content) = self.line(line)?;
         let tail = &content[start_col as usize..];
         let mut chars = tail.chars();
-        if !chars.next().is_some_and(|c| c.is_alphabetic() || c == '_') {
+        if !chars
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || matches!(c, '_' | '$'))
+        {
             return Err(self.invalid());
         }
         let length: usize = tail
             .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .take_while(|c| c.is_alphanumeric() || matches!(*c, '_' | '$'))
             .map(char::len_utf8)
             .sum();
         Ok(SourceSpan {
@@ -342,6 +345,7 @@ mod tests {
             name_line: line,
             name_col: hint,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         }
     }
@@ -539,6 +543,20 @@ mod tests {
     }
 
     /// The search answers in UTF-16 units, like every other request position.
+    #[test]
+    fn a_dollar_callee_token_keeps_its_full_utf8_range_after_unicode() {
+        let text = "😀; db.$with(value)";
+        let source = SourcePositions::new("run.ts", text);
+        let byte = text.find("$with").unwrap();
+        let scalar = text[..byte].chars().count() as u32;
+        let token = source.token(0, scalar).unwrap();
+        assert_eq!((token.start_byte, token.end_byte), (byte, byte + 5));
+        assert_eq!(
+            source.scalar_position(0, scalar).unwrap().character,
+            scalar + 1
+        );
+    }
+
     #[test]
     fn a_located_name_is_converted_to_utf16() {
         let text = "é = 1; name = 2\n";

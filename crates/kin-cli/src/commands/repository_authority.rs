@@ -252,15 +252,24 @@ impl RequestRepositoryAuthority {
     /// Serve scoped source through the common projector without reopening or
     /// revalidating the repository this request already holds.
     pub(crate) fn source_authority(&self) -> Result<kin_mcp::handlers::RequestRepositoryAuthority> {
-        let authority = self.open()?;
-        Ok(kin_mcp::handlers::RequestRepositoryAuthority::already_open(
+        Ok(self.source_authority_from(self.open()?.as_ref()))
+    }
+
+    /// [`Self::source_authority`] over an open this request already holds, so a
+    /// command that opened once for its bodies reads source through the same
+    /// open rather than paying for a second.
+    pub(crate) fn source_authority_from(
+        &self,
+        authority: &ActiveRepositoryAuthority,
+    ) -> kin_mcp::handlers::RequestRepositoryAuthority {
+        kin_mcp::handlers::RequestRepositoryAuthority::already_open(
             self.binding.clone(),
             std::sync::Arc::new(kin_mcp::handlers::ActiveRepositoryAuthority::from_shared(
                 std::sync::Arc::clone(&authority.manager),
                 authority.repository_id.clone(),
                 authority.workspace_id,
             )),
-        ))
+        )
     }
 
     /// The open authority to read this command from.
@@ -313,6 +322,10 @@ pub enum AuthoritySource {
     /// Its own arm because the remedy is the opposite of the one above: that
     /// line tells a reader to start a daemon, and this daemon is already up.
     OwnAuthorityOpenBesideLiveDaemon,
+    /// No daemon answered, and this command opened nothing: the store has
+    /// published nothing since an earlier open recorded its reading, so that
+    /// reading is what an open would report now.
+    RecordedReading,
 }
 
 /// The line naming which authority open answered this invocation.
@@ -339,6 +352,11 @@ pub fn answered_by_line(source: AuthoritySource) -> String {
              repository-authority open, which re-verifies every persisted body; no daemon \
              answered. Start this repository's daemon to serve it from one open per publication \
              instead"
+            .to_string(),
+        AuthoritySource::RecordedReading => "Answered by: the reading recorded the last time this \
+             store was opened. It has published nothing since, so every count above is what an \
+             open would report now, and this command opened and re-verified nothing; a daemon \
+             re-verifies every persisted body when it opens this store"
             .to_string(),
         AuthoritySource::OwnAuthorityOpenBesideLiveDaemon => "Answered by: this command's own \
              repository-authority open, which re-verifies every persisted body, because this \
@@ -555,10 +573,35 @@ pub(crate) fn materialize_workspace_base_offline(
     )
 }
 
+pub(crate) fn materialize_workspace_base_with_dependencies_offline(
+    layout: &kin_core::KinLayout,
+) -> Result<(
+    GraphSectionMaterialization,
+    Result<kin_core::dependencies::HeldContent>,
+)> {
+    materialize_workspace_base_and_dependencies_within(
+        layout,
+        kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
+        true,
+    )
+}
+
 fn materialize_workspace_base_offline_within(
     layout: &kin_core::KinLayout,
     budget: std::time::Duration,
 ) -> Result<GraphSectionMaterialization> {
+    materialize_workspace_base_and_dependencies_within(layout, budget, false)
+        .map(|(outcome, _)| outcome)
+}
+
+fn materialize_workspace_base_and_dependencies_within(
+    layout: &kin_core::KinLayout,
+    budget: std::time::Duration,
+    read_dependencies: bool,
+) -> Result<(
+    GraphSectionMaterialization,
+    Result<kin_core::dependencies::HeldContent>,
+)> {
     let runtime = crate::daemon_client::acquire_repository_runtime_authority_within(
         layout.root(),
         budget,
@@ -581,7 +624,17 @@ fn materialize_workspace_base_offline_within(
             .context("bind repository authority for offline graph-section materialization")?;
         let authority = ActiveRepositoryAuthority::open(&binding)
             .context("open repository authority for offline graph-section materialization")?;
-        authority.materialize_workspace_base_graph_section()
+        let materialized = authority.materialize_workspace_base_graph_section()?;
+        let content = if read_dependencies {
+            authority.workspace().and_then(|workspace| {
+                kin_core::dependencies::HeldTree::new(&workspace.tree, &binding)
+                    .dependency_content()
+                    .map_err(anyhow::Error::from)
+            })
+        } else {
+            Ok(kin_core::dependencies::HeldContent::default())
+        };
+        Ok((materialized, content))
     };
     drop(runtime);
     outcome

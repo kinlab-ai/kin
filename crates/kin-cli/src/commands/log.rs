@@ -38,6 +38,18 @@ pub const LOG_REPORT_REVISION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRequest {
     pub count: usize,
+    /// How many of the newest entries to pass over first, so a reader can
+    /// page through a history longer than one answer. The walk order is the
+    /// same for every page of one head.
+    ///
+    /// `#[serde(default)]` because this crosses the daemon wire and an older
+    /// peer sends none; it then answers from the newest entry, as before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skip: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +147,19 @@ pub fn inspect(
 /// and the workspace-tip reading takes ONE open and asks it for both, rather
 /// than reaching for the binding-taking wrapper twice.
 pub fn inspect_at(authority: &ActiveRepositoryAuthority, count: usize) -> Result<LogReport> {
+    inspect_page_at(authority, 0, count)
+}
+
+/// The same report, passing over the `skip` newest entries first.
+///
+/// The walk is the one `inspect_at` takes, so pages of one head join without
+/// a gap or a repeat. The entries passed over are walked and not decoded into
+/// the answer, which is what a page past the first costs.
+pub fn inspect_page_at(
+    authority: &ActiveRepositoryAuthority,
+    skip: usize,
+    count: usize,
+) -> Result<LogReport> {
     let lease = authority.manager().read_authority();
     let metadata = lease.metadata();
     let snapshot = lease.snapshot();
@@ -160,59 +185,12 @@ pub fn inspect_at(authority: &ActiveRepositoryAuthority, count: usize) -> Result
         .transpose()
         .context("resolve active repository-v6 workspace history")?;
 
-    let mut entries = Vec::with_capacity(count.min(snapshot.changes.len()));
-    let mut scheduled = BTreeSet::new();
-    let mut pending = VecDeque::new();
-    if let Some(change_id) = start_change {
-        scheduled.insert(change_id);
-        pending.push_back((change_id, 0_usize));
-    }
-
-    while entries.len() < count {
-        let Some((change_id, depth)) = pending.pop_front() else {
-            break;
-        };
-        let change = snapshot.changes.get(&change_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "repository-v6 history target {} is absent from the immutable change DAG",
-                change_id
-            )
-        })?;
-        if change.id != change_id {
-            anyhow::bail!(
-                "repository-v6 history key {} contains mismatched change {}",
-                change_id,
-                change.id
-            );
-        }
-        for parent in &change.parents {
-            if !snapshot.changes.contains_key(parent) {
-                anyhow::bail!(
-                    "repository-v6 change {} names absent parent {}",
-                    change_id,
-                    parent
-                );
-            }
-            if scheduled.insert(*parent) {
-                pending.push_back((*parent, depth + 1));
-            }
-        }
-        let entity_deltas_unchanged = unchanged_entity_deltas(change);
-        entries.push(LogEntry {
-            change_id,
-            depth,
-            origin: change.origin,
-            parents: change.parents.clone(),
-            timestamp: change.timestamp.clone(),
-            author: change.author.clone(),
-            message: change.message.clone(),
-            entity_delta_count: change.entity_deltas.len() - entity_deltas_unchanged,
-            entity_deltas_unchanged,
-            relation_delta_count: change.relation_deltas.len(),
-            tree_delta_count: change.tree_deltas.len(),
-            admission_policy_changed: change.admission_policy_delta.is_some(),
-        });
-    }
+    let (entries, truncated) = walk_history(
+        |change_id| snapshot.changes.get(change_id),
+        start_change,
+        skip,
+        count.min(snapshot.changes.len()),
+    )?;
 
     Ok(LogReport {
         schema: LOG_SCHEMA.to_string(),
@@ -226,9 +204,85 @@ pub fn inspect_at(authority: &ActiveRepositoryAuthority, count: usize) -> Result
         start_target,
         start_change,
         requested_count: count,
-        truncated: !pending.is_empty(),
+        truncated,
         entries,
     })
+}
+
+/// The history from `start`, newest first, as `count` entries after the
+/// `skip` the walk passes over, and whether anything is left after them.
+///
+/// Breadth first from the start, each change once, so every page of one head
+/// is cut from the same order and pages join without a gap or a repeat.
+fn walk_history<'a>(
+    lookup: impl Fn(&SemanticChangeId) -> Option<&'a kin_model::SemanticChange>,
+    start: Option<SemanticChangeId>,
+    skip: usize,
+    count: usize,
+) -> Result<(Vec<LogEntry>, bool)> {
+    // Grown as entries are found, never reserved from `count`: the caller's
+    // number is a request, and a history shorter than it allocates nothing more.
+    let mut entries = Vec::new();
+    let mut passed = 0_usize;
+    let mut scheduled = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    if let Some(change_id) = start {
+        scheduled.insert(change_id);
+        pending.push_back((change_id, 0_usize));
+    }
+
+    while entries.len() < count {
+        let Some((change_id, depth)) = pending.pop_front() else {
+            break;
+        };
+        let change = lookup(&change_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository-v6 history target {} is absent from the immutable change DAG",
+                change_id
+            )
+        })?;
+        if change.id != change_id {
+            anyhow::bail!(
+                "repository-v6 history key {} contains mismatched change {}",
+                change_id,
+                change.id
+            );
+        }
+        for parent in &change.parents {
+            if lookup(parent).is_none() {
+                anyhow::bail!(
+                    "repository-v6 change {} names absent parent {}",
+                    change_id,
+                    parent
+                );
+            }
+            if scheduled.insert(*parent) {
+                pending.push_back((*parent, depth + 1));
+            }
+        }
+        if passed < skip {
+            passed += 1;
+            continue;
+        }
+        let entity_deltas_unchanged = unchanged_entity_deltas(change);
+        entries.push(LogEntry {
+            change_id,
+            depth,
+            origin: change.origin,
+            parents: change.parents.clone(),
+            timestamp: change.timestamp.clone(),
+            // The author as Git names them, never the time and offset an
+            // earlier import recorded after the address.
+            author: change.author.identity(),
+            message: change.message.clone(),
+            entity_delta_count: change.entity_deltas.len() - entity_deltas_unchanged,
+            entity_deltas_unchanged,
+            relation_delta_count: change.relation_deltas.len(),
+            tree_delta_count: change.tree_deltas.len(),
+            admission_policy_changed: change.admission_policy_delta.is_some(),
+        });
+    }
+    Ok((entries, !pending.is_empty()))
 }
 
 /// Where this workspace sits relative to its branch, with the distance in
@@ -288,7 +342,7 @@ async fn daemon_log(layout: &kin_core::KinLayout, count: usize) -> Option<LogRes
     let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
     let client =
         crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout).ok()?;
-    client.log(&LogRequest { count }).await.ok()
+    client.log(&LogRequest { count, skip: 0 }).await.ok()
 }
 
 /// Everything `kin log` prints when no daemon answers, from ONE authority open.
@@ -350,6 +404,25 @@ fn daemon_report_this_build_may_print(response: &LogResponse) -> Option<&LogRepo
 /// of `run`'s call to the daemon, so the decision lives here in one place that a
 /// test can drive. Against a whole-store open the round trip is not close, and
 /// the arm it costs is the mixed-build one rather than the ordinary one.
+/// A rendered JSON answer with the partial-history qualifier added as its own
+/// top-level key, leaving every existing field and its bytes as they were.
+pub(crate) fn with_partial_history(
+    rendered: String,
+    partial: Option<&kin_core::history_state::PartialHistoryNotice>,
+) -> Result<String> {
+    let Some(partial) = partial else {
+        return Ok(rendered);
+    };
+    let mut value: serde_json::Value = serde_json::from_str(&rendered)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "partial_history".to_string(),
+            serde_json::to_value(partial)?,
+        );
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 fn json_log(
     layout: &kin_core::KinLayout,
     count: usize,
@@ -397,13 +470,20 @@ pub async fn run(count: usize, json: bool) -> Result<()> {
     // prints a clean tree over a workspace holding a merge open, and this prints
     // a line saying the reading was not taken.
     let answered = daemon_log(&layout, count).await;
+    // A partial store's log is one snapshot of its checked-out commit, and the
+    // answer says so in both renderings.
+    let partial = kin_core::history_state::standing(&layout).notice();
     if json {
-        println!("{}", json_log(&layout, count, answered.as_ref())?);
+        let rendered = json_log(&layout, count, answered.as_ref())?;
+        println!("{}", with_partial_history(rendered, partial.as_ref())?);
         return Ok(());
     }
     if let Some(response) = answered {
         for line in response.lines {
             println!("{line}");
+        }
+        if let Some(partial) = &partial {
+            println!("{}", partial.sentence);
         }
         println!(
             "{}",
@@ -430,6 +510,9 @@ pub async fn run(count: usize, json: bool) -> Result<()> {
     for line in render_lines(&report) {
         println!("{line}");
     }
+    if let Some(partial) = &partial {
+        println!("{}", partial.sentence);
+    }
     println!("{}", crate::commands::workspace_tip::line(&tip));
     println!(
         "{}",
@@ -454,7 +537,7 @@ pub fn build_log_response_at(
     authority: &ActiveRepositoryAuthority,
     request: &LogRequest,
 ) -> Result<LogResponse> {
-    let report = inspect_at(authority, request.count)?;
+    let report = inspect_page_at(authority, request.skip, request.count)?;
     Ok(LogResponse {
         lines: render_lines(&report),
         report: Some(report),
@@ -505,7 +588,7 @@ fn render_lines(report: &LogReport) -> Vec<String> {
             lines.push(String::new());
         }
         lines.push(format!("change {}", entry.change_id));
-        lines.push(format!("Author: {}", entry.author));
+        lines.push(format!("Author: {}", entry.author.name()));
         lines.push(format!("Date:   {}", entry.timestamp));
         lines.push(format!("Origin: {}", render_origin(entry.origin)));
         if !entry.parents.is_empty() {
@@ -628,7 +711,7 @@ mod tests {
     ) -> LogResponse {
         let authority =
             ActiveRepositoryAuthority::open(binding).expect("the fixture store opens once more");
-        build_log_response_at(&authority, &LogRequest { count })
+        build_log_response_at(&authority, &LogRequest { count, skip: 0 })
             .expect("the daemon route builds a response")
     }
 
@@ -923,7 +1006,9 @@ mod tests {
             visibility: Visibility::Public,
             role: EntityRole::Source,
             doc_summary: None,
-            metadata: EntityMetadata { extra },
+            metadata: EntityMetadata {
+                extra: extra.into(),
+            },
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
@@ -949,6 +1034,57 @@ mod tests {
             external_reference_deltas: Vec::new(),
             resolution_record_deltas: Vec::new(),
         }
+    }
+
+    /// A history longer than one answer pages: each page is cut from the same
+    /// walk, so pages of one head join with no gap and no repeat, and only the
+    /// last says nothing is left. The review page asks this way to list
+    /// histories past its 500-change page.
+    ///
+    /// Breaking it: drop the `passed < skip` arm and every page repeats the
+    /// newest changes.
+    #[test]
+    fn a_long_history_pages_without_a_gap_or_a_repeat() {
+        let mut chain: Vec<SemanticChange> = Vec::new();
+        for index in 0..7u8 {
+            let mut change = change_with(Vec::new());
+            change.id = SemanticChangeId::from_hash(Hash256::from_bytes([index + 1; 32]));
+            change.parents = chain
+                .last()
+                .map(|parent| vec![parent.id])
+                .unwrap_or_default();
+            change.message = format!("change {index}");
+            chain.push(change);
+        }
+        let by_id: std::collections::HashMap<SemanticChangeId, SemanticChange> = chain
+            .iter()
+            .map(|change| (change.id, change.clone()))
+            .collect();
+        let head = chain.last().map(|change| change.id);
+        let (whole, rest) = walk_history(|id| by_id.get(id), head, 0, 10).unwrap();
+        assert_eq!(whole.len(), 7);
+        assert!(!rest);
+
+        let mut paged = Vec::new();
+        let mut skip = 0;
+        loop {
+            let (page, more) = walk_history(|id| by_id.get(id), head, skip, 3).unwrap();
+            skip += page.len();
+            paged.extend(page.into_iter().map(|entry| entry.change_id));
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(
+            paged,
+            whole
+                .iter()
+                .map(|entry| entry.change_id)
+                .collect::<Vec<_>>(),
+            "pages of three join into the whole walk, newest first"
+        );
+        let (past_the_end, more) = walk_history(|id| by_id.get(id), head, 7, 3).unwrap();
+        assert!(past_the_end.is_empty() && !more);
     }
 
     /// The vcs stranger run's `kin log` finding, rebuilt.

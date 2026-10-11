@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sha2::{Digest, Sha256};
+
+#[path = "src/watch_set.rs"]
+mod watch_set;
 
 const SHA_OVERRIDE_ENV: &str = "KIN_BUILD_GIT_SHA_OVERRIDE";
 const DIRTY_OVERRIDE_ENV: &str = "KIN_BUILD_DIRTY_OVERRIDE";
@@ -90,7 +91,6 @@ fn main() {
     };
 
     watch_existing(git_path("HEAD"));
-    watch_existing(git_path("index"));
     // HEAD's reflog gains a line on every commit, checkout and reset in this
     // checkout, which is the signal that still moves when the branch's own ref
     // lives in packed-refs.
@@ -102,25 +102,6 @@ fn main() {
             // its loose file, which stays absent until the next commit on the
             // branch writes it back.
             _ => watch_existing(git_path("packed-refs")),
-        }
-    }
-
-    // The build identity is an authority input for persisted semantic caches.
-    // Watching only HEAD/reference files can leave KIN_BUILD_DIRTY stale when
-    // another workspace crate changes without touching kin-buildinfo. Watch
-    // every tracked top-level source subtree (but never target/) so any source
-    // edit, newly created file below a tracked subtree, stage, commit, or
-    // checkout reruns this build script before a binary is linked. A subtree
-    // holding this build's target directory is watched through its tracked
-    // children instead, since the build itself writes below it.
-    if let Some(files) = git(&root, &["ls-files", "-z"]) {
-        let tracked: Vec<&Path> = files
-            .split('\0')
-            .filter(|file| !file.is_empty())
-            .map(Path::new)
-            .collect();
-        for path in source_watch_set(&root, &tracked, out_dir.as_deref()) {
-            watch_existing(Some(path));
         }
     }
 
@@ -152,6 +133,58 @@ fn main() {
             source_identity_known,
         )
     };
+    // The build identity is an authority input for persisted semantic caches.
+    // Watching only HEAD/reference files can leave KIN_BUILD_DIRTY stale when
+    // another workspace crate changes without touching kin-buildinfo. While
+    // the identity reads clean, or could not be read, watch every tracked
+    // top-level source subtree (but never target/) so any source edit or newly
+    // created file below a tracked subtree reruns this build script before a
+    // binary is linked. A subtree holding this build's target directory, the
+    // workspace's default target directory, or any path Git ignores is watched
+    // through its tracked children instead: builds, tests and tools write
+    // below those (nextest's JUnit report, Python bytecode).
+    //
+    // A known dirty identity is left alone by further edits and by staging.
+    // What can still change it, a commit, a checkout or a reset, moves HEAD or
+    // writes its reflog, watched above; see `watch_set::watches_source_trees`.
+    // So a dirty identity watches neither the source trees nor the index,
+    // which `git status`, `git diff` and editors rewrite whenever they refresh
+    // an entry's stat data. Rerunning on every edit bought nothing and cost a
+    // great deal: cargo rebuilds every dependent of a rerun build script even
+    // when its output is identical, so a one-line change anywhere in the
+    // repository, a test or a doc included, recompiled kin-cli and kin-daemon
+    // (measured at about 30 s). The one case this misses is a dirty tree
+    // returned to exactly HEAD without moving HEAD, an editor's undo or
+    // `git restore`, which leaves the binary saying dirty about a clean tree:
+    // the fail-closed direction for any cache keyed by this identity. The
+    // KIN_BUILD_TIME of a dirty build records when its dirty identity was
+    // captured, not the latest relink.
+    if watch_set::watches_source_trees(dirty, source_identity_known) {
+        // Staging or removing a file from the index can turn a clean identity
+        // dirty without touching the working tree.
+        watch_existing(git_path("index"));
+        if let Some(files) = git(&root, &["ls-files", "-z"]) {
+            let tracked: Vec<&Path> = files
+                .split('\0')
+                .filter(|file| !file.is_empty())
+                .map(Path::new)
+                .collect();
+            let mut blocked = ignored_paths(&root);
+            blocked.extend(out_dir.clone());
+            // Cargo's default target directory, where `cargo nextest` keeps its
+            // store and JUnit report, is blocked before it first exists, so the
+            // first test run in a fresh checkout does not rerun this either.
+            if let Some(workspace_root) = &workspace_root {
+                let workspace_root =
+                    fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.clone());
+                blocked.push(workspace_root.join("target"));
+            }
+            for path in watch_set::source_watch_set(&root, &tracked, &blocked) {
+                watch_existing(Some(path));
+            }
+        }
+    }
+
     let dependency_provenance = dependency_provenance(workspace_root.as_deref().unwrap_or(&root));
     let source_known = source_identity_known && dependency_provenance.is_some();
     let dependency_provenance = dependency_provenance.unwrap_or_else(|| "unknown".to_string());
@@ -282,40 +315,28 @@ fn watch_existing(path: Option<PathBuf>) {
     }
 }
 
-/// Each tracked top-level entry of the repository, except that an entry holding
-/// `out_dir` is replaced by its tracked children, and so on down. Untracked
-/// directories, a target directory among them, never appear.
-fn source_watch_set(root: &Path, tracked: &[&Path], out_dir: Option<&Path>) -> BTreeSet<PathBuf> {
-    let mut watched = BTreeSet::new();
-    collect_source_watches(root, Path::new(""), tracked, out_dir, &mut watched);
-    watched
-}
-
-fn collect_source_watches(
-    root: &Path,
-    prefix: &Path,
-    tracked: &[&Path],
-    out_dir: Option<&Path>,
-    watched: &mut BTreeSet<PathBuf>,
-) {
-    let children: BTreeSet<&OsStr> = tracked
-        .iter()
-        .filter_map(|file| file.strip_prefix(prefix).ok())
-        .filter_map(|rest| rest.components().next())
-        .map(|component| component.as_os_str())
-        .collect();
-    for child in children {
-        if prefix.as_os_str().is_empty() && child == OsStr::new("target") {
-            continue;
-        }
-        let relative = prefix.join(child);
-        let path = root.join(&relative);
-        if out_dir.is_some_and(|out_dir| out_dir.starts_with(&path)) {
-            collect_source_watches(root, &relative, tracked, out_dir, watched);
-        } else {
-            watched.insert(path);
-        }
-    }
+/// Every path Git ignores below the repository, as absolute paths. An ignored
+/// directory is reported once, without its contents.
+fn ignored_paths(root: &Path) -> Vec<PathBuf> {
+    git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )
+    .map(|listing| {
+        listing
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| root.join(path.trim_end_matches('/')))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

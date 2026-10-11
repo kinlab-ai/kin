@@ -134,6 +134,46 @@ pub const RECEIVER_NAME_FANOUT_CONFIDENCE: f32 = 0.3;
 /// because the linker recovers it from the value at more than one call site.
 pub const DISPATCH_CANDIDATE_CONFIDENCE: f32 = 0.86;
 
+/// Confidence for a call whose receiver an adapter's value-origin facts typed
+/// through a chain in which every link is written down: a declared type, a
+/// constructor call, a declared return type, or a provider found under the
+/// lookup rule its framework documents (see [`crate::receiver_origin`]).
+///
+/// Each link is as strong as the annotation or rule behind it, which is the
+/// trust the declared-receiver tier (`RECEIVER_TYPE_CONFIDENCE` in the
+/// linker) already places in an annotation, so the chain classifies
+/// `type_resolved`. It is named separately, following
+/// [`DISPATCH_CANDIDATE_CONFIDENCE`], so the tier is recoverable from the
+/// value and a reader can tell a chain-typed call from a directly annotated
+/// one; the edge also carries the chain itself on a
+/// [`crate::receiver_origin::RECEIVER_ORIGIN_RULE`] evidence record.
+pub const RECEIVER_ORIGIN_CONFIDENCE: f32 = 0.93;
+
+/// Confidence for a receiver-origin chain one of whose links was settled only
+/// because exactly one method in the repository carries the called name. A
+/// class outside the graph, a mock or a dependency may define the same name,
+/// so the destination is a candidate, never a counted caller.
+pub const RECEIVER_ORIGIN_NAME_CONFIDENCE: f32 = 0.65;
+
+/// Confidence for a call or reference that reaches one member of a module fork
+/// family.
+///
+/// A fork stub is a module that declares none of the names its importers ask
+/// for while a sibling `forks/` directory holds `<stub>.<variant>.<ext>` files.
+/// A build aliases the stub to exactly one variant, and nothing in the
+/// repository says which one a given build picks, so an import from the stub
+/// is linked to the declaration each variant reaches. Every such destination is
+/// a real declaration the importer can run under some build of this
+/// repository, which is why the tier is `import_scoped`: the module family is
+/// settled and the symbol was selected inside it.
+///
+/// The set is enumerated and open, and it is never proven closed. A build can
+/// alias the stub somewhere this repository never names, and a third-party
+/// renderer can pass its own configuration at runtime. A reader must never
+/// treat the members as the only possible destinations, and this tier must
+/// never classify as `type_resolved`.
+pub const MODULE_FORK_CONFIDENCE: f32 = 0.82;
+
 /// Whether this edge is a receiver-method call the linker matched on the bare
 /// leaf name alone.
 ///
@@ -187,6 +227,9 @@ pub const RESOLUTION_TIER_LADDER: &[(f32, RelationResolution)] = &[
     // A pinned dispatch class walked its Extends chain to the defining
     // ancestor: the receiver type is known, so the destination is proven.
     (0.85, RelationResolution::TypeResolved),
+    // A receiver typed by adapter value-origin facts through a chain whose
+    // every link is declared, constructed, or provided by a documented rule.
+    (RECEIVER_ORIGIN_CONFIDENCE, RelationResolution::TypeResolved),
     // A self/cls call whose resolved definition is itself an `Overrides` base:
     // real symbol, unsettled destination.
     (
@@ -195,6 +238,9 @@ pub const RESOLUTION_TIER_LADDER: &[(f32, RelationResolution)] = &[
     ),
     // Module known, symbol selected inside it.
     (0.9, RelationResolution::ImportScoped),
+    // One member of a module fork family: an enumerated, open set of
+    // declarations the build may alias the stub to.
+    (MODULE_FORK_CONFIDENCE, RelationResolution::ImportScoped),
     // Ambiguous same-name bucket settled by the caller's own directory,
     // imports, or include closure.
     (0.8, RelationResolution::ImportScoped),
@@ -202,6 +248,11 @@ pub const RESOLUTION_TIER_LADDER: &[(f32, RelationResolution)] = &[
     (0.7, RelationResolution::NameOnly),
     // A path-qualified callee reduced by dropping its module prefix.
     (0.6, RelationResolution::NameOnly),
+    // A receiver-origin chain with a link settled by a unique method name.
+    (
+        RECEIVER_ORIGIN_NAME_CONFIDENCE,
+        RelationResolution::NameOnly,
+    ),
     // Receiver-method fan-out: every same-named method in the repo.
     (
         RECEIVER_NAME_FANOUT_CONFIDENCE,
@@ -325,6 +376,29 @@ mod tests {
             RelationResolution::ImportScoped
         );
         assert!(RelationResolution::ImportScoped.is_proven());
+    }
+
+    #[test]
+    fn a_module_fork_edge_is_import_scoped_never_type_resolved() {
+        // A module fork member is one of an open set of destinations a build
+        // may alias the stub to. It is real enough to count as use, and never
+        // strong enough to claim the destination is the one that runs.
+        let mut fork = relation(MODULE_FORK_CONFIDENCE, RelationOrigin::Inferred);
+        fork.evidence.push(kin_model::RelationEvidence {
+            parser_rule: Some("module_fork:v1".into()),
+            source_path: Some("src/Config.js".into()),
+            resolved_path: Some("src/forks/Config.dom.js".into()),
+            ..Default::default()
+        });
+        let resolution = RelationResolution::of(&fork);
+        assert_eq!(resolution, RelationResolution::ImportScoped);
+        assert_ne!(resolution, RelationResolution::TypeResolved);
+        assert_eq!(
+            RelationResolution::from_confidence(MODULE_FORK_CONFIDENCE),
+            RelationResolution::ImportScoped
+        );
+        assert!(resolution.is_proven());
+        assert!(!is_receiver_name_guess(&fork));
     }
 
     #[test]

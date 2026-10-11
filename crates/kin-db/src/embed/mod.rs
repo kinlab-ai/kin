@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub mod cache_admin;
+#[cfg(all(feature = "external-embeddings", not(feature = "embeddings")))]
+mod external;
+#[cfg(all(feature = "external-embeddings", not(feature = "embeddings")))]
+pub use external::CodeEmbedder;
 mod producer;
 pub use producer::{
     EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch, VectorProducerProvenance,
@@ -13,6 +17,8 @@ mod inference;
 mod model_identity;
 #[cfg(feature = "embeddings")]
 pub mod rerank;
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+pub mod serving;
 
 #[cfg(feature = "embeddings")]
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -20,19 +26,19 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 use kin_infer::gpu::GpuBackend;
 #[cfg(feature = "embeddings")]
 use rayon::prelude::*;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use reqwest::blocking::Client as BlockingHttpClient;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use sha2::{Digest, Sha256};
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use std::borrow::Cow;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use std::collections::HashMap;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use std::io::Write;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "embeddings")]
 use tokenizers::tokenizer::{
@@ -81,7 +87,7 @@ pub trait EmbeddingWork: Send + Sync {
 
 impl EmbeddingWork for () {}
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn observe_completed_chunk<T>(
     work: &dyn EmbeddingWork,
     expected_vectors: usize,
@@ -620,23 +626,25 @@ pub mod adaptive_split {
 ///
 /// The default nomic-embed-text-v1.5 keeps semantic search local while bringing
 /// embedding build time down enough for repo-scale indexing to stay practical on
-/// developer machines.
-#[cfg(feature = "embeddings")]
+/// developer machines. It is served as its card says, with mean pooling and a
+/// task prefix on queries and documents; [`serving::SERVING_PROFILES`] holds
+/// those settings for it and for every other model Kin knows.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const DEFAULT_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
-/// Asymmetric query instruction for SweRankEmbed / nomic_bert code retrievers.
-///
-/// SweRankEmbed-Small prepends this exact string (trailing space included) to
-/// queries and encodes documents raw. BGE stays symmetric, so this only fires
-/// when the loaded model reports a nomic_bert architecture.
+
+/// CodeRankEmbed, the code retriever a repository may embed with in place of
+/// the default text model (`KIN_EMBED_MODEL_ID=nomic-ai/CodeRankEmbed`). It
+/// is served with its own settings from [`serving::SERVING_PROFILES`]: CLS
+/// pooling, its code instruction on queries and raw documents.
 #[cfg(feature = "embeddings")]
-const SWERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code: ";
-#[cfg(feature = "embeddings")]
+pub const CODERANKEMBED_MODEL_ID: &str = "nomic-ai/CodeRankEmbed";
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const DEFAULT_LMSTUDIO_EMBED_MODEL_ID: &str = "text-embedding-nomic-embed-text-v1.5";
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const DEFAULT_OPENAI_EMBED_MODEL_ID: &str = "text-embedding-3-small";
 
 /// Default model revision.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const DEFAULT_REVISION: &str = "main";
 
 /// Decides whether this process may download embedding model files that the
@@ -644,10 +652,10 @@ const DEFAULT_REVISION: &str = "main";
 ///
 /// `kin-db` cannot see the choices an operator recorded, so the binary that
 /// embeds installs one at startup. `kin` and `kin-daemon` install a gate that
-/// reads the model-download decision `kin setup` recorded. A machine that
-/// declined the download then never fetches the model, whichever trigger
-/// reaches the embedder: the daemon's background pass, a query, `kin init`'s
-/// first embed pass or `kin embed`. A model already in the cache loads without
+/// lets a download go ahead only when someone asked for the model (`kin embed`,
+/// or a yes in `kin setup`). A machine where nobody asked, or that declined,
+/// then never fetches the model, whichever trigger reaches the embedder: the
+/// daemon's background pass, a query or `kin init`'s first embed pass. A model already in the cache loads without
 /// asking, because loading it downloads nothing. With no gate installed, a
 /// fetch is allowed, as it always was.
 ///
@@ -662,6 +670,72 @@ static MODEL_FETCH_GATE: std::sync::OnceLock<ModelFetchGate> = std::sync::OnceLo
 /// call returns `false`.
 pub fn install_model_fetch_gate(gate: ModelFetchGate) -> bool {
     MODEL_FETCH_GATE.set(gate).is_ok()
+}
+
+/// Unselected slots owe no model work. Legacy explicit settings remain opt-ins.
+pub fn embedding_slot_enabled() -> bool {
+    let read = |name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(provider) = read("KIN_MODEL_EMBEDDINGS_PROVIDER") {
+        return matches!(provider.as_str(), "built-in" | "external");
+    }
+    if let Some(provider) = read("KIN_EMBED_PROVIDER") {
+        return provider != "none";
+    }
+    read("KIN_EMBED_MODEL_ID").is_some() || read("KIN_EMBED_OPENAI_MODEL").is_some()
+}
+
+/// Why this process cannot embed anything with its build and configuration, or
+/// `None` when an embedder can be built.
+///
+/// Read without building one, so it loads no model and downloads nothing. It
+/// names exactly the refusals [`CodeEmbedder::new`] returns before doing any
+/// work, so a caller told `None` that then fails is failing on something
+/// else: a download, or a provider that does not answer. A surface that would
+/// recommend an embed pass asks this first, because recommending `kin embed`
+/// on a build that cannot run one sends a reader to a command that fails.
+pub fn embedding_unavailable_reason() -> Option<String> {
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
+    {
+        Some("this Kin build has no embedding support".to_string())
+    }
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+    {
+        provider_unavailable_reason(
+            &configured_embedding_provider(),
+            cfg!(feature = "embeddings"),
+        )
+    }
+}
+
+/// [`embedding_unavailable_reason`] for one resolved provider, on a build that
+/// carries a local model or not. Pure, so every arm is provable without
+/// touching the process environment.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+fn provider_unavailable_reason(provider: &EmbeddingProvider, local: bool) -> Option<String> {
+    match provider {
+        EmbeddingProvider::None if local => {
+            Some("no embedding provider is selected for this repository".to_string())
+        }
+        EmbeddingProvider::None => Some(
+            "this Kin build has no local embedding model, and no external embedding provider is \
+             selected for this repository"
+                .to_string(),
+        ),
+        EmbeddingProvider::Local if !local => Some(
+            "this Kin build has no local embedding model: it was built without the `embeddings` \
+             feature"
+                .to_string(),
+        ),
+        EmbeddingProvider::Invalid(value) => Some(format!(
+            "the embeddings model provider '{value}' is not one this build knows"
+        )),
+        EmbeddingProvider::Local | EmbeddingProvider::OpenAiCompat { .. } => None,
+    }
 }
 
 /// The files [`CodeEmbedder::with_model`] loads from a Hugging Face model
@@ -736,9 +810,9 @@ const METAL_MAX_BATCH_TOKENS: usize = 16_384;
 // Metal hard guard until the inference engine has a real allocator-level bound.
 #[cfg(feature = "embeddings")]
 const METAL_MAX_ATTENTION_AREA: usize = 8_388_608;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v4";
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-05-31-swerank";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 pub(crate) const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
@@ -767,7 +841,7 @@ const EMBED_MAX_SEQ_LEN: usize = 2048;
 /// only the embed projection is bounded. Mirrors the 800-char body preview.
 const EMBED_DOC_SUMMARY_MAX_CHARS: usize = 8000;
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingRuntimeConfig {
     pub provider: String,
@@ -782,6 +856,7 @@ pub struct EmbeddingRuntimeConfig {
 ///
 /// Uses nomic-embed-text-v1.5 by default (768 dimensions; override via KIN_EMBED_MODEL_ID).
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
+#[cfg(any(feature = "embeddings", not(feature = "external-embeddings")))]
 pub struct CodeEmbedder {
     #[cfg(feature = "embeddings")]
     backend: CodeEmbedderBackend,
@@ -870,12 +945,12 @@ struct BertEmbedder {
     #[cfg(feature = "embeddings")]
     cpu_model_source: std::sync::Mutex<Option<CpuModelSource>>,
     tokenizer: Tokenizer,
-    /// Instruction prepended to queries for asymmetric retrievers (SweRank /
-    /// nomic_bert). Empty for symmetric models like BGE.
-    query_prefix: String,
+    /// The pooling, task prefixes and normalization this model is served
+    /// with, from its [`serving::SERVING_PROFILES`] entry.
+    serving: serving::Serving,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 struct OpenAiCompatEmbedder {
     client: BlockingHttpClient,
     endpoint: String,
@@ -887,14 +962,14 @@ struct OpenAiCompatEmbedder {
     document_prefix: String,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone, PartialEq)]
 struct AttributedEmbedding {
     vector: Vec<f32>,
     producers: EmbeddingProducerSet,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 impl AttributedEmbedding {
     fn remote(vector: Vec<f32>) -> Self {
         Self {
@@ -977,7 +1052,7 @@ where
     Ok((vectors, returning_model, actual_producer))
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EmbeddingInputRole {
     Query,
@@ -992,6 +1067,9 @@ enum EmbeddingInputRole {
 struct CpuModelSource {
     weights_path: PathBuf,
     config_json: String,
+    /// The primary's served pooling, applied to the twin's config so both
+    /// arms of a hybrid batch produce vectors in the same space.
+    pooling: Option<serving::Pooling>,
     local_identity: Option<(PathBuf, String)>,
 }
 
@@ -1067,6 +1145,7 @@ where
     })
 }
 
+#[cfg(any(feature = "embeddings", not(feature = "external-embeddings")))]
 impl std::fmt::Debug for CodeEmbedder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodeEmbedder")
@@ -1084,18 +1163,19 @@ impl std::fmt::Debug for CodeEmbedder {
     }
 }
 
+#[cfg(any(feature = "embeddings", not(feature = "external-embeddings")))]
 impl CodeEmbedder {
     /// Create a new embedder with the default code model.
     pub fn new() -> Result<Self, KinDbError> {
         let _span = tracing::info_span!("kindb.embedder.new").entered();
         #[cfg(feature = "embeddings")]
-        kin_infer::init_performance_threads();
-        #[cfg(feature = "embeddings")]
         {
             let provider = configured_embedding_provider();
             return match provider {
                 EmbeddingProvider::Local => {
-                    let model_id = env_nonempty("KIN_EMBED_MODEL_ID")
+                    kin_infer::init_performance_threads();
+                    let model_id = env_nonempty("KIN_MODEL_EMBEDDINGS_MODEL")
+                        .or_else(|| env_nonempty("KIN_EMBED_MODEL_ID"))
                         .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
                     let revision = env_nonempty("KIN_EMBED_MODEL_REVISION")
                         .unwrap_or_else(|| DEFAULT_REVISION.to_string());
@@ -1104,6 +1184,12 @@ impl CodeEmbedder {
                 EmbeddingProvider::OpenAiCompat { profile } => {
                     Self::with_openai_compat(OpenAiCompatConfig::from_profile(profile)?)
                 }
+                EmbeddingProvider::None => Err(KinDbError::IndexError(
+                    "the embeddings model slot is none; graph retrieval remains available".into(),
+                )),
+                EmbeddingProvider::Invalid(value) => Err(KinDbError::IndexError(format!(
+                    "unknown embeddings model provider '{value}'"
+                ))),
             };
         }
 
@@ -1298,14 +1384,28 @@ impl CodeEmbedder {
 
         let config_data = std::fs::read_to_string(&config_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
-        let config: BertConfig = parse_model_config(&config_data)
+        let mut config: BertConfig = parse_model_config(&config_data)
             .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let dimensions = config.hidden_size;
-        let query_prefix = local_identity
-            .as_ref()
-            .map(|identity| identity.query_prefix.clone())
-            .unwrap_or_else(|| local_query_prefix(model_id, config.model_type.as_deref()));
+        // A hub model is served by its id and a local directory by its
+        // content, so a directory's name never chooses preprocessing.
+        let (serving, profile) = match local_identity.as_ref() {
+            Some(identity) => (identity.serving.clone(), identity.profile),
+            None => (
+                serving::Serving::for_hub_model(model_id),
+                serving::profile_for_model_id(model_id),
+            ),
+        };
+        if let Some(profile) = profile {
+            if profile.dimensions != dimensions {
+                return Err(KinDbError::IndexError(format!(
+                    "{model_id} declares {dimensions} dimensions, but {} is served at {}",
+                    profile.model_id, profile.dimensions
+                )));
+            }
+        }
+        apply_served_pooling(&mut config, serving.pooling);
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to load tokenizer: {e}")))?;
@@ -1346,7 +1446,7 @@ impl CodeEmbedder {
                 model_id: model_id.to_string(),
                 revision: revision.to_string(),
                 dimensions: Some(dimensions),
-                pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.into(),
+                pipeline_epoch: served_pipeline_epoch(&serving),
             },
             local_identity_runtime,
         );
@@ -1357,6 +1457,7 @@ impl CodeEmbedder {
                 model_id,
                 revision,
                 dimensions,
+                &serving,
                 [&config_path, &tokenizer_path, &weights_path],
             )?
         };
@@ -1374,10 +1475,11 @@ impl CodeEmbedder {
             cpu_model_source: std::sync::Mutex::new(Some(CpuModelSource {
                 weights_path: weights_path.clone(),
                 config_json: config_data,
+                pooling: serving.pooling,
                 local_identity: local_dir.zip(local_identity.map(|identity| identity.model_id)),
             })),
             tokenizer,
-            query_prefix,
+            serving,
         };
 
         Ok(Self {
@@ -1753,15 +1855,7 @@ impl BertEmbedder {
         texts: &'a [String],
         role: EmbeddingInputRole,
     ) -> Cow<'a, [String]> {
-        if self.query_prefix.is_empty() || role != EmbeddingInputRole::Query {
-            return Cow::Borrowed(texts);
-        }
-        Cow::Owned(
-            texts
-                .iter()
-                .map(|text| format!("{}{}", self.query_prefix, text))
-                .collect(),
-        )
+        prefixed_inputs(texts, served_prefix(&self.serving, role))
     }
 
     fn embed_uncached_batch(
@@ -2249,9 +2343,10 @@ impl BertEmbedder {
                 Ok(())
             };
             verify_source()?;
-            let config: BertConfig = parse_model_config(&source.config_json).map_err(|e| {
+            let mut config: BertConfig = parse_model_config(&source.config_json).map_err(|e| {
                 KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
             })?;
+            apply_served_pooling(&mut config, source.pooling);
 
             // Pin this single load to the CPU backend. load_bert_model passes
             // the backend explicitly to kin-infer, so the primary (GPU) model
@@ -2269,14 +2364,16 @@ impl BertEmbedder {
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EmbeddingProvider {
+    None,
+    Invalid(String),
     Local,
     OpenAiCompat { profile: OpenAiCompatProfile },
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiCompatProfile {
     OpenAi,
@@ -2284,7 +2381,7 @@ enum OpenAiCompatProfile {
     Compatible,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone)]
 struct OpenAiCompatConfig {
     provider_label: String,
@@ -2299,7 +2396,7 @@ struct OpenAiCompatConfig {
     document_prefix: String,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 impl OpenAiCompatConfig {
     fn from_profile(profile: OpenAiCompatProfile) -> Result<Self, KinDbError> {
         let provider_label = match profile {
@@ -2321,19 +2418,27 @@ impl OpenAiCompatConfig {
                 DEFAULT_LMSTUDIO_EMBED_MODEL_ID
             }
         };
-        let base_url = env_nonempty("KIN_EMBED_OPENAI_BASE_URL")
+        let base_url = env_nonempty("KIN_MODEL_EMBEDDINGS_BASE_URL")
+            .or_else(|| env_nonempty("KIN_EMBED_OPENAI_BASE_URL"))
             .or_else(|| env_nonempty("KIN_EMBED_BASE_URL"))
             .unwrap_or_else(|| default_base_url.to_string());
-        let model_id = env_nonempty("KIN_EMBED_OPENAI_MODEL")
+        let model_id = env_nonempty("KIN_MODEL_EMBEDDINGS_MODEL")
+            .or_else(|| env_nonempty("KIN_EMBED_OPENAI_MODEL"))
             .or_else(|| env_nonempty("KIN_EMBED_MODEL_ID"))
             .unwrap_or_else(|| default_model.to_string());
-        let api_key = env_nonempty("KIN_EMBED_OPENAI_API_KEY").or_else(|| {
-            if matches!(profile, OpenAiCompatProfile::OpenAi) {
-                env_nonempty("OPENAI_API_KEY")
-            } else {
-                None
-            }
-        });
+        let api_key = if let Some(name) = env_nonempty("KIN_MODEL_EMBEDDINGS_API_KEY_ENV") {
+            Some(env_nonempty(&name).ok_or_else(|| {
+                KinDbError::IndexError(format!("embedding credential variable {name} is unset"))
+            })?)
+        } else {
+            env_nonempty("KIN_EMBED_OPENAI_API_KEY").or_else(|| {
+                if matches!(profile, OpenAiCompatProfile::OpenAi) {
+                    env_nonempty("OPENAI_API_KEY")
+                } else {
+                    None
+                }
+            })
+        };
         let dimensions = env_nonempty("KIN_EMBED_OPENAI_DIMENSIONS")
             .map(|value| parse_positive_usize("KIN_EMBED_OPENAI_DIMENSIONS", &value))
             .transpose()?;
@@ -2404,7 +2509,7 @@ impl OpenAiCompatConfig {
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 impl OpenAiCompatEmbedder {
     fn new(config: OpenAiCompatConfig) -> Result<Self, KinDbError> {
         let client = BlockingHttpClient::builder()
@@ -2448,10 +2553,7 @@ impl OpenAiCompatEmbedder {
             EmbeddingInputRole::Query => &self.query_prefix,
             EmbeddingInputRole::Document => &self.document_prefix,
         };
-        if prefix.is_empty() {
-            return Cow::Borrowed(texts);
-        }
-        Cow::Owned(texts.iter().map(|text| format!("{prefix}{text}")).collect())
+        prefixed_inputs(texts, prefix)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, KinDbError> {
@@ -2496,14 +2598,16 @@ impl OpenAiCompatEmbedder {
             .send()
             .map_err(|e| KinDbError::IndexError(format!("embedding request failed: {e}")))?;
         let status = resp.status();
+        if !status.is_success() {
+            // Endpoint error bodies can echo request credentials or source
+            // text. Keep them out of user-facing errors and degradation logs.
+            return Err(KinDbError::IndexError(format!(
+                "embedding endpoint error (HTTP {status})"
+            )));
+        }
         let text = resp
             .text()
             .map_err(|e| KinDbError::IndexError(format!("embedding response read failed: {e}")))?;
-        if !status.is_success() {
-            return Err(KinDbError::IndexError(format!(
-                "embedding endpoint error (HTTP {status}): {text}"
-            )));
-        }
         parse_openai_embedding_response(&text, texts.len())
     }
 
@@ -2535,13 +2639,13 @@ impl OpenAiCompatEmbedder {
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Deserialize)]
 struct OpenAiEmbeddingResponse {
     data: Vec<OpenAiEmbeddingData>,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Deserialize)]
 struct OpenAiEmbeddingData {
     embedding: Vec<f32>,
@@ -2549,7 +2653,7 @@ struct OpenAiEmbeddingData {
     index: Option<usize>,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn parse_openai_embedding_response(
     text: &str,
     expected: usize,
@@ -2588,14 +2692,35 @@ fn parse_openai_embedding_response(
         .collect()
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn configured_embedding_provider() -> EmbeddingProvider {
+    let canonical = env_nonempty("KIN_MODEL_EMBEDDINGS_PROVIDER");
+    if let Some(value) = canonical {
+        return match value.as_str() {
+            "none" => EmbeddingProvider::None,
+            "built-in" => EmbeddingProvider::Local,
+            "external" => EmbeddingProvider::OpenAiCompat {
+                profile: OpenAiCompatProfile::Compatible,
+            },
+            _ => EmbeddingProvider::Invalid(value),
+        };
+    }
     match env_nonempty("KIN_EMBED_PROVIDER")
-        .unwrap_or_else(|| "local".to_string())
+        .unwrap_or_else(|| {
+            if env_nonempty("KIN_EMBED_MODEL_ID").is_some()
+                || env_nonempty("KIN_EMBED_OPENAI_MODEL").is_some()
+            {
+                "local"
+            } else {
+                "none"
+            }
+            .to_string()
+        })
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
+        "none" => EmbeddingProvider::None,
         "local" | "hf" | "huggingface" | "bge" => EmbeddingProvider::Local,
         "openai" => EmbeddingProvider::OpenAiCompat {
             profile: OpenAiCompatProfile::OpenAi,
@@ -2606,17 +2731,11 @@ fn configured_embedding_provider() -> EmbeddingProvider {
         "openai-compat" | "openai-compatible" | "compatible" => EmbeddingProvider::OpenAiCompat {
             profile: OpenAiCompatProfile::Compatible,
         },
-        other => {
-            tracing::warn!(
-                provider = %other,
-                "unknown KIN_EMBED_PROVIDER value, falling back to local embeddings"
-            );
-            EmbeddingProvider::Local
-        }
+        other => EmbeddingProvider::Invalid(other.to_string()),
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -2624,14 +2743,14 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn env_flag(name: &str) -> bool {
     env_nonempty(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn parse_positive_usize(name: &str, value: &str) -> Result<usize, KinDbError> {
     let parsed = value
         .parse::<usize>()
@@ -2644,7 +2763,7 @@ fn parse_positive_usize(name: &str, value: &str) -> Result<usize, KinDbError> {
     Ok(parsed)
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn parse_positive_u64(name: &str, value: &str) -> Result<u64, KinDbError> {
     let parsed = value
         .parse::<u64>()
@@ -2657,7 +2776,7 @@ fn parse_positive_u64(name: &str, value: &str) -> Result<u64, KinDbError> {
     Ok(parsed)
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn parse_json_object_env(
     name: &str,
     value: &str,
@@ -2710,41 +2829,82 @@ pub(crate) fn resolve_local_model_artifacts(
     ))
 }
 
+/// Make a model serve with `pooling`, or leave its own config's pooling in
+/// place for a model outside the serving table.
 #[cfg(feature = "embeddings")]
-fn local_query_prefix(model_id: &str, model_type: Option<&str>) -> String {
-    let lower_id = model_id.to_ascii_lowercase();
-    if lower_id.contains("swerank") {
-        SWERANK_QUERY_PREFIX.to_string()
-    } else {
-        match model_type.map(str::trim) {
-            Some("nomic_bert") | Some("nomic-bert") => SWERANK_QUERY_PREFIX.to_string(),
-            _ => String::new(),
-        }
+fn apply_served_pooling(config: &mut BertConfig, pooling: Option<serving::Pooling>) {
+    if let Some(pooling) = pooling {
+        config.pooling_mode = Some(pooling.config_value().to_string());
     }
 }
 
+/// The task prefix a local model's inputs carry in `role`.
 #[cfg(feature = "embeddings")]
+fn served_prefix(serving: &serving::Serving, role: EmbeddingInputRole) -> &str {
+    match role {
+        EmbeddingInputRole::Query => &serving.query_prefix,
+        EmbeddingInputRole::Document => &serving.document_prefix,
+    }
+}
+
+/// `texts` with `prefix` prepended, borrowed unchanged when there is none.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+fn prefixed_inputs<'a>(texts: &'a [String], prefix: &str) -> Cow<'a, [String]> {
+    if prefix.is_empty() {
+        return Cow::Borrowed(texts);
+    }
+    Cow::Owned(texts.iter().map(|text| format!("{prefix}{text}")).collect())
+}
+
+/// The pipeline epoch a local hub model's vectors carry. It names the
+/// serving settings, so vectors a model made under other settings (the CLS
+/// pooling and code instruction nomic-embed-text-v1.5 was once served with)
+/// are refused and re-embedded rather than mixed with these.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+fn served_pipeline_epoch(serving: &serving::Serving) -> String {
+    format!(
+        "{EMBEDDING_CACHE_PIPELINE_EPOCH};serving-{}",
+        serving.digest()
+    )
+}
+
+/// The task prefixes an OpenAI-compatible server's model gets when the
+/// operator sets none, from the serving table by the name the server uses.
+/// Pooling and normalization are the server's own.
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn default_openai_embedding_prefixes(model_id: &str) -> (String, String) {
-    let lower = model_id.to_ascii_lowercase();
-    if lower.contains("nomic-embed") || lower.contains("nomic_embed") {
-        (
-            "search_query: ".to_string(),
-            "search_document: ".to_string(),
-        )
-    } else {
-        (String::new(), String::new())
-    }
+    serving::profile_for_served_name(model_id).map_or_else(
+        || (String::new(), String::new()),
+        |profile| {
+            (
+                profile.query_prefix.to_string(),
+                profile.document_prefix.to_string(),
+            )
+        },
+    )
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub fn configured_embedding_runtime() -> EmbeddingRuntimeConfig {
     match configured_embedding_provider() {
-        EmbeddingProvider::Local => EmbeddingRuntimeConfig {
-            provider: "local".to_string(),
-            model_id: env_nonempty("KIN_EMBED_MODEL_ID")
-                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
-            revision: env_nonempty("KIN_EMBED_MODEL_REVISION")
-                .unwrap_or_else(|| DEFAULT_REVISION.to_string()),
+        EmbeddingProvider::Local => {
+            let model_id = env_nonempty("KIN_MODEL_EMBEDDINGS_MODEL")
+                .or_else(|| env_nonempty("KIN_EMBED_MODEL_ID"))
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+            let pipeline_epoch = served_pipeline_epoch(&serving::Serving::for_hub_model(&model_id));
+            EmbeddingRuntimeConfig {
+                provider: "local".to_string(),
+                model_id,
+                revision: env_nonempty("KIN_EMBED_MODEL_REVISION")
+                    .unwrap_or_else(|| DEFAULT_REVISION.to_string()),
+                dimensions: None,
+                pipeline_epoch,
+            }
+        }
+        EmbeddingProvider::None | EmbeddingProvider::Invalid(_) => EmbeddingRuntimeConfig {
+            provider: "none".into(),
+            model_id: String::new(),
+            revision: String::new(),
             dimensions: None,
             pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.to_string(),
         },
@@ -2804,6 +2964,16 @@ pub fn resolved_embedding_runtime() -> Result<EmbeddingRuntimeConfig, KinDbError
     Ok(runtime)
 }
 
+#[cfg(all(feature = "external-embeddings", not(feature = "embeddings")))]
+pub fn resolved_embedding_runtime() -> Result<EmbeddingRuntimeConfig, KinDbError> {
+    Ok(configured_embedding_runtime())
+}
+
+#[cfg(all(feature = "external-embeddings", not(feature = "embeddings")))]
+pub(crate) fn is_local_content_identity(model_id: &str) -> bool {
+    model_id.starts_with("local-content-sha256:")
+}
+
 #[cfg(feature = "embeddings")]
 #[cfg_attr(not(feature = "vector"), allow(dead_code))] // used by vector sidecar checks
 pub(crate) fn is_local_content_identity(model_id: &str) -> bool {
@@ -2818,6 +2988,55 @@ pub(crate) fn model_identity_hash_reads() -> usize {
 #[cfg(all(test, feature = "embeddings"))]
 pub(crate) fn write_test_local_model(dir: &Path) {
     model_identity::write_test_model(dir);
+}
+
+/// Run the test at `test_path` again in a child process that selects the
+/// built-in embedding provider with its default model, and say whether the
+/// caller is that child.
+///
+/// Every model slot defaults to `none`, so a build with the `embeddings`
+/// feature embeds nothing until someone selects the built-in provider. A test
+/// about the default model has to select it, and the selection is process
+/// environment, so it is made in a child of its own and never in a process
+/// other tests share. The parent asserts that the child ran exactly this one
+/// test and passed, then returns `false`; the child returns `true` and runs the
+/// body. `offline` sets `HF_HUB_OFFLINE` in the child, which proves the body
+/// downloads nothing.
+#[cfg(all(test, feature = "embeddings"))]
+pub(crate) fn in_built_in_embeddings_child(test_path: &str, offline: bool) -> bool {
+    const CHILD: &str = "KIN_TEST_BUILT_IN_EMBEDDINGS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", test_path, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .env("KIN_MODEL_EMBEDDINGS_PROVIDER", "built-in");
+    // Anything that would pick another model, revision or provider for the
+    // slot. The canonical provider above already outranks the legacy one.
+    for name in [
+        "KIN_MODEL_EMBEDDINGS_MODEL",
+        "KIN_MODEL_EMBEDDINGS_BASE_URL",
+        "KIN_MODEL_EMBEDDINGS_API_KEY_ENV",
+        "KIN_EMBED_PROVIDER",
+        "KIN_EMBED_MODEL_ID",
+        "KIN_EMBED_MODEL_REVISION",
+        "KIN_EMBED_OPENAI_MODEL",
+    ] {
+        child.env_remove(name);
+    }
+    if offline {
+        child.env("HF_HUB_OFFLINE", "1");
+    }
+    let output = child.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "the built-in embeddings child for {test_path} did not run and pass exactly one test\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }
 
 #[cfg(feature = "embeddings")]
@@ -2868,7 +3087,7 @@ fn metal_hard_guard_rejection(count: usize, max_seq: usize) -> Option<(usize, us
 
 /// True only when `KIN_RESOURCE_PROFILE` is explicitly set to `throughput`.
 /// Read live (never cached) so behavior tracks the current environment.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub(crate) fn resource_profile_is_throughput() -> bool {
     std::env::var("KIN_RESOURCE_PROFILE")
         .map(|value| value.trim().eq_ignore_ascii_case("throughput"))
@@ -2926,6 +3145,17 @@ fn throughput_embedding_plan(backend: GpuBackend) -> &'static kin_infer::resourc
 #[cfg(all(feature = "embeddings", feature = "vector"))]
 pub(crate) fn throughput_graph_chunk_size() -> usize {
     throughput_embedding_plan(GpuBackend::Cpu).max_entities_per_graph_chunk
+}
+
+#[cfg(all(
+    feature = "external-embeddings",
+    not(feature = "embeddings"),
+    feature = "vector"
+))]
+pub(crate) fn throughput_graph_chunk_size() -> usize {
+    // Endpoint work has its own HTTP batch boundary. Keep graph materialization
+    // bounded without initializing the local inference resource planner.
+    64
 }
 
 /// Per-sub-batch embed shape + forward-timing trace (`KIN_EMBED_BATCH_TRACE`).
@@ -3945,7 +4175,7 @@ fn balanced_partition_with_cpu_max_seq_len(
     (metal, cpu)
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn produced_batch_from_attributed(attributed: Vec<AttributedEmbedding>) -> ProducedEmbeddingBatch {
     let mut producers = EmbeddingProducerSet::new();
     let mut vectors = Vec::with_capacity(attributed.len());
@@ -3956,7 +4186,7 @@ fn produced_batch_from_attributed(attributed: Vec<AttributedEmbedding>) -> Produ
     ProducedEmbeddingBatch { vectors, producers }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn fanout_attributed_embedding(
     results: &mut [Option<AttributedEmbedding>],
     slots: &[usize],
@@ -4355,7 +4585,7 @@ fn disabled_error() -> KinDbError {
 /// Capacity of the in-memory LRU in front of the on-disk embedding vector
 /// cache: ~1024 vectors (≈3 MB at 768-dim f32) bounds resident memory while
 /// keeping the hot working set warm.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const EMBED_MEMORY_CACHE_CAPACITY: usize = 1024;
 
 /// Bounded least-recently-used cache for embedding vectors held in memory in
@@ -4368,7 +4598,7 @@ const EMBED_MEMORY_CACHE_CAPACITY: usize = 1024;
 /// unchanged. Recency uses a monotonic counter; eviction scans for the minimum,
 /// which is cheap because the cache is small and eviction is rare relative to
 /// embedding cost.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug)]
 struct VectorLruCache {
     capacity: usize,
@@ -4376,14 +4606,14 @@ struct VectorLruCache {
     entries: std::collections::HashMap<String, LruEntry>,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug)]
 struct LruEntry {
     embedding: AttributedEmbedding,
     last_used: u64,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 impl VectorLruCache {
     fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.max(1);
@@ -4439,18 +4669,18 @@ impl VectorLruCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embeddings"))]
     fn len(&self) -> usize {
         self.entries.len()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embeddings"))]
     fn contains_key(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 #[derive(Debug, Clone)]
 struct EmbeddingCache {
     root: PathBuf,
@@ -4458,7 +4688,7 @@ struct EmbeddingCache {
     memory_cache: std::sync::Arc<std::sync::Mutex<VectorLruCache>>,
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 impl EmbeddingCache {
     fn new(namespace: String, dimensions: usize) -> Option<Self> {
         if std::env::var("KIN_EMBED_CACHE")
@@ -4545,7 +4775,7 @@ impl EmbeddingCache {
         self.root.join(prefix).join(format!("{key}.bin"))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embeddings"))]
     fn test_is_empty(&self) -> bool {
         self.memory_cache.lock().unwrap().len() == 0
             && std::fs::read_dir(&self.root)
@@ -4559,21 +4789,25 @@ fn model_namespace<const N: usize>(
     _model_id: &str,
     _revision: &str,
     dimensions: usize,
+    serving: &serving::Serving,
     artifact_paths: [&Path; N],
 ) -> Result<String, KinDbError> {
     // Inputs are already query/document-prefixed before their per-text cache
-    // key is computed. This namespace binds the model and processing epoch.
+    // key is computed, but the same prefixed text pools differently under
+    // another pooling. This namespace binds the model, the processing epoch
+    // and the serving settings, so a cached vector is reused only by the
+    // serving that made it.
     let identity = model_identity::artifact_identity(
         artifact_paths,
         dimensions,
         EMBEDDING_CACHE_PIPELINE_EPOCH,
-        "",
+        &serving.descriptor(),
         EMBED_MAX_SEQ_LEN,
     )?;
     Ok(sanitize_component(&identity))
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn sanitize_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -4586,14 +4820,14 @@ fn sanitize_component(value: &str) -> String {
     out
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const EMBEDDING_CACHE_ENTRY_MAGIC: [u8; 4] = *b"KEC4";
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const EMBEDDING_CACHE_ENTRY_DOMAIN: &[u8] = b"kindb-embedding-cache-entry-v4\0";
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 const MAX_EMBEDDING_CACHE_PRODUCERS: usize = 5;
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn read_cached_embedding(path: &Path, dimensions: usize) -> Option<AttributedEmbedding> {
     let vector_bytes = dimensions.checked_mul(std::mem::size_of::<f32>())?;
     let max_entry_bytes = EMBEDDING_CACHE_ENTRY_MAGIC
@@ -4677,7 +4911,7 @@ fn read_cached_embedding(path: &Path, dimensions: usize) -> Option<AttributedEmb
 /// not by the runtime that failed, so preserving CPU/Metal/CUDA/Remote here
 /// would manufacture producer evidence. `Unspecified` keeps local sentinel
 /// behavior while making hosted persistence fail closed and preventing caching.
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn sanitize_attributed_embedding<'a, F>(
     mut embedding: AttributedEmbedding,
     dimensions: usize,
@@ -4707,7 +4941,7 @@ where
     embedding
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 fn write_cached_embedding(
     path: &Path,
     vector: &[f32],
@@ -4750,7 +4984,9 @@ fn write_cached_embedding(
         .write(true)
         .create_new(true)
         .open(&tmp)?;
-    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    let write_result = file
+        .write_all(&bytes)
+        .and_then(|()| kin_blobs::durable::sync_all(&file));
     drop(file);
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&tmp);
@@ -4770,6 +5006,45 @@ mod tests {
         EntityId, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, Hash256,
         LanguageId, SemanticFingerprint, Visibility,
     };
+
+    /// Every provider resolution says whether an embedder can be built, and a
+    /// refusal names what is missing. A build without a local model cannot
+    /// embed with no provider or with the built-in one, which is the pair a
+    /// first conversion met: `kin init` recommended `kin embed`, and `kin
+    /// embed` then failed as an HTTP 500.
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+    #[test]
+    fn provider_unavailable_reason_names_what_a_build_cannot_embed_with() {
+        let external = EmbeddingProvider::OpenAiCompat {
+            profile: OpenAiCompatProfile::Compatible,
+        };
+        for local in [false, true] {
+            assert_eq!(provider_unavailable_reason(&external, local), None);
+        }
+        assert_eq!(
+            provider_unavailable_reason(&EmbeddingProvider::Local, true),
+            None
+        );
+
+        let without_model = provider_unavailable_reason(&EmbeddingProvider::Local, false)
+            .expect("a built-in provider needs the local model");
+        assert!(
+            without_model.contains("`embeddings` feature"),
+            "{without_model}"
+        );
+        let nothing_selected = provider_unavailable_reason(&EmbeddingProvider::None, false)
+            .expect("no provider on a build without a model embeds nothing");
+        assert!(
+            nothing_selected.contains("no local embedding model")
+                && nothing_selected.contains("no external embedding provider"),
+            "{nothing_selected}"
+        );
+        assert!(provider_unavailable_reason(&EmbeddingProvider::None, true).is_some());
+        let typo =
+            provider_unavailable_reason(&EmbeddingProvider::Invalid("sideways".into()), true)
+                .expect("an unknown provider builds no embedder");
+        assert!(typo.contains("sideways"), "{typo}");
+    }
 
     /// Default embedding dimensions (768, nomic-embed-text-v1.5).
     #[cfg(feature = "embeddings")]
@@ -5162,7 +5437,14 @@ mod tests {
             // See `EMBED_MODEL_DOWNLOAD_LOCK`: shares the HF Hub cache
             // download with
             // `engine::graph::tests::test_vector_index_dimension_mismatch_auto_recovery`.
+            // The parent holds it while its child downloads.
             let _download_guard = EMBED_MODEL_DOWNLOAD_LOCK.lock();
+            if !in_built_in_embeddings_child(
+                "embed::tests::default_dimensions_match_default_model",
+                false,
+            ) {
+                return;
+            }
             let embedder = CodeEmbedder::new().unwrap();
             assert_eq!(embedder.dimensions(), DEFAULT_EMBED_DIMS);
         }
@@ -6107,11 +6389,13 @@ mod tests {
             std::fs::write(original.join(name), name.as_bytes()).unwrap();
             std::fs::copy(original.join(name), moved.join(name)).unwrap();
         }
+        let serving = serving::Serving::unlisted(None);
         let namespace = |dir: &Path| {
             model_namespace(
                 dir.to_str().unwrap(),
                 "same-revision",
                 2,
+                &serving,
                 [
                     dir.join("config.json").as_path(),
                     dir.join("tokenizer.json").as_path(),
@@ -6136,12 +6420,45 @@ mod tests {
     fn model_namespace_changed_bytes_at_same_path_invalidate() {
         let root = tempfile::tempdir().unwrap();
         let artifact = root.path().join("model.safetensors");
+        let serving = serving::Serving::unlisted(None);
         std::fs::write(&artifact, b"original weights").unwrap();
-        let before =
-            model_namespace(root.path().to_str().unwrap(), "same", 2, [&artifact]).unwrap();
+        let before = model_namespace(
+            root.path().to_str().unwrap(),
+            "same",
+            2,
+            &serving,
+            [&artifact],
+        )
+        .unwrap();
         std::fs::write(&artifact, b"modified weights").unwrap();
-        let after = model_namespace(root.path().to_str().unwrap(), "same", 2, [&artifact]).unwrap();
+        let after = model_namespace(
+            root.path().to_str().unwrap(),
+            "same",
+            2,
+            &serving,
+            [&artifact],
+        )
+        .unwrap();
         assert_ne!(before, after, "changed weights must not reuse old vectors");
+    }
+
+    /// The text cache is keyed by prefixed text, and one prefixed text pools
+    /// to different vectors under different pooling. Vectors cached under the
+    /// old serving of the same weights must not answer the new serving.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn model_namespace_changed_serving_invalidates() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("model.safetensors");
+        std::fs::write(&artifact, b"same weights").unwrap();
+        let served = serving::Serving::for_hub_model(DEFAULT_MODEL_ID);
+        let mut cls = served.clone();
+        cls.pooling = Some(serving::Pooling::Cls);
+        let id = root.path().to_str().unwrap();
+        assert_ne!(
+            model_namespace(id, "same", 2, &served, [&artifact]).unwrap(),
+            model_namespace(id, "same", 2, &cls, [&artifact]).unwrap(),
+        );
     }
 
     #[cfg(feature = "embeddings")]
@@ -7078,11 +7395,82 @@ mod tests {
         assert!(err.to_string().contains("returned 1 vectors for 2 inputs"));
     }
 
+    /// The settings the embedder actually applies, read from the same places
+    /// a load reads them: the config kin-infer pools by, and the text each
+    /// role hands the tokenizer.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn the_embedder_serves_each_model_as_its_card_specifies() {
+        // nomic_bert's architecture default in kin-infer is CLS pooling, which
+        // is what served the default model wrongly. The served pooling must
+        // override it for every listed model, whichever way it goes.
+        let nomic_bert = r#"{"hidden_size":768,"num_hidden_layers":12,"num_attention_heads":12,"intermediate_size":3072,"max_position_embeddings":2048,"vocab_size":30528,"model_type":"nomic_bert"}"#;
+        let texts = vec!["parse a config file".to_string()];
+        for (model_id, pooling, query, document) in [
+            (
+                DEFAULT_MODEL_ID,
+                "mean",
+                "search_query: parse a config file",
+                "search_document: parse a config file",
+            ),
+            (
+                CODERANKEMBED_MODEL_ID,
+                "cls",
+                "Represent this query for searching relevant code: parse a config file",
+                "parse a config file",
+            ),
+        ] {
+            let serving = serving::Serving::for_hub_model(model_id);
+            let mut config: BertConfig = parse_model_config(nomic_bert).unwrap();
+            assert_eq!(config.pooling_mode, None);
+            apply_served_pooling(&mut config, serving.pooling);
+            assert_eq!(config.pooling_mode.as_deref(), Some(pooling), "{model_id}");
+            assert_eq!(
+                prefixed_inputs(&texts, served_prefix(&serving, EmbeddingInputRole::Query))[0],
+                query,
+                "{model_id}"
+            );
+            assert_eq!(
+                prefixed_inputs(
+                    &texts,
+                    served_prefix(&serving, EmbeddingInputRole::Document)
+                )[0],
+                document,
+                "{model_id}"
+            );
+        }
+
+        // A model outside the table keeps its own config's pooling and gets
+        // no prefix: no architecture or name guesses a model's instruction.
+        let unlisted = serving::Serving::for_hub_model("someone/other-nomic-bert");
+        let mut config: BertConfig = parse_model_config(nomic_bert).unwrap();
+        apply_served_pooling(&mut config, unlisted.pooling);
+        assert_eq!(config.pooling_mode, None);
+        assert!(matches!(
+            prefixed_inputs(&texts, served_prefix(&unlisted, EmbeddingInputRole::Query)),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// The stored identity of a hub model's vectors names its serving, so the
+    /// default model's vectors and CodeRankEmbed's can never share an epoch,
+    /// and neither shares the epoch the default model's CLS-pooled vectors
+    /// were stored under.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_hub_models_pipeline_epoch_names_its_serving() {
+        let default = served_pipeline_epoch(&serving::Serving::for_hub_model(DEFAULT_MODEL_ID));
+        let code = served_pipeline_epoch(&serving::Serving::for_hub_model(CODERANKEMBED_MODEL_ID));
+        assert!(default.starts_with(EMBEDDING_CACHE_PIPELINE_EPOCH));
+        assert_ne!(default, code);
+        assert_ne!(default, "embed-pipeline-2026-05-31-swerank");
+        assert_ne!(code, "embed-pipeline-2026-05-31-swerank");
+    }
+
     #[cfg(feature = "embeddings")]
     #[test]
     fn nomic_defaults_use_search_prefixes() {
-        let (query, document) =
-            default_openai_embedding_prefixes("text-embedding-nomic-embed-text-v1.5");
+        let (query, document) = default_openai_embedding_prefixes(DEFAULT_LMSTUDIO_EMBED_MODEL_ID);
         assert_eq!(query, "search_query: ");
         assert_eq!(document, "search_document: ");
 
@@ -7124,7 +7512,7 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn test_openai_embedder_at(
         endpoint: String,
         query_prefix: &str,
@@ -7142,7 +7530,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     fn serve_one_embedding_response(
         status: &str,
         body: &str,
@@ -7197,6 +7585,26 @@ mod tests {
         // the remote producer alongside the vector rather than relabeling it.
         let cached = embedder.embed_batch_with_producers(&texts).unwrap();
         assert_eq!(cached, fresh);
+    }
+
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+    #[test]
+    fn openai_error_body_cannot_echo_credentials_or_entity_text() {
+        let credential = "test-secret-credential";
+        let source = "private-entity-text";
+        let (endpoint, server) = serve_one_embedding_response(
+            "401 Unauthorized",
+            &format!("Authorization: Bearer {credential}; input: {source}"),
+        );
+        let mut embedder = test_openai_embedder_at(endpoint, "", "");
+        embedder.api_key = Some(credential.into());
+        let error = embedder.embed_batch(&[source]).unwrap_err();
+        server.join().unwrap();
+        let error = error.to_string();
+        assert!(error.contains("HTTP 401"));
+        assert!(!error.contains(credential));
+        assert!(!error.contains(source));
+        assert!(!error.contains("Authorization"));
     }
 
     #[cfg(feature = "embeddings")]

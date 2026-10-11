@@ -470,6 +470,9 @@ class Suite(object):
 
     def env(self, home, daemon):
         env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        env["KIN_STORE_LAYOUT"] = "in-tree"
         # A sealed KIN_HOME per build: the published daemon and the one under
         # test must not share a supervisor or a registry, and neither may reach
         # the operator's own stores. Nothing here runs inference.
@@ -478,6 +481,8 @@ class Suite(object):
         env["KIN_DAEMON_AUTO_EMBED"] = "0"
         env["KIN_EMBED_BACKEND"] = "cpu"
         env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        env["KIN_INIT_HISTORY"] = "full"
         env["KIN_DAEMON_DISABLE_LSP"] = "1"
         env["KIN_DAEMON_READY_TIMEOUT_SECS"] = str(SERVE_BOUND_SECONDS)
         for name in ("KIN_MCP_REPO", "KIN_DIR", "KIN_DAEMON_URL"):

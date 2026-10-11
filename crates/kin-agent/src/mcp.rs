@@ -14,7 +14,7 @@
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
@@ -198,7 +198,12 @@ impl McpClient {
     }
 
     /// Spawn the server and complete `initialize`.
-    pub fn start(argv: &[String], cwd: &Path, timeout: Duration) -> Result<Self, McpError> {
+    pub fn start(
+        spawner: &kin_io::Spawner,
+        argv: &[String],
+        cwd: &Path,
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
         let command = argv.join(" ");
         let (program, args) = argv.split_first().ok_or_else(|| McpError::Spawn {
             command: command.clone(),
@@ -207,7 +212,8 @@ impl McpClient {
                 "the MCP command was empty",
             ),
         })?;
-        let mut child = Command::new(program)
+        let mut child = spawner
+            .command(program)
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -250,7 +256,12 @@ impl McpClient {
                 // new body back through `kin_mutate`, so this harness asks for
                 // exact bodies whatever the server's profile would present.
                 // kin-mcp reads the flag as `entity_lines::EXACT_BODIES_CAPABILITY`.
-                "capabilities": { "experimental": { "kin": { "exactEntityBodies": true } } },
+                // It reads the verdict codes itself, so it asks for machine
+                // replies too (`plain_reply::MACHINE_REPLIES_CAPABILITY`).
+                "capabilities": { "experimental": { "kin": {
+                    "exactEntityBodies": true,
+                    "machineReplies": true,
+                } } },
                 "clientInfo": { "name": "kin-agent", "version": env!("CARGO_PKG_VERSION") },
             }),
         )?;
@@ -430,8 +441,18 @@ pub fn unwrap_tool_result(result: &Value, wall_ms: u128) -> ToolOutcome {
     }
 
     // The payload lives inside the text block. Read the envelope off the payload, not off
-    // the wrapper, because the wrapper never carries it.
-    let payload = serde_json::from_str::<Value>(text.trim()).ok();
+    // the wrapper, because the wrapper never carries it. A server may add a line of its
+    // own after the payload, such as a note that a profile did not take an argument, so
+    // the first block is read on its own when the joined text is not one payload.
+    let payload = serde_json::from_str::<Value>(text.trim()).ok().or_else(|| {
+        result
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("text"))
+            .and_then(Value::as_str)
+            .and_then(|first| serde_json::from_str::<Value>(first.trim()).ok())
+    });
     let (envelope, negative, unreadable) = match payload.as_ref() {
         Some(Value::Object(map)) => (
             map.get("_kin").cloned(),

@@ -93,8 +93,14 @@ jobs:
           cache-targets: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # With the local embedding engine. The default build carries no local
+      # model, so its `kin embed` refuses before any work and coverage stays
+      # unobserved, which `--require-observed` below rightly rejects as proving
+      # nothing. On this build every model slot still starts at `none`, so the
+      # first capture still sees what a new user sees, and `kin embed` is what
+      # selects the built-in provider and asks for the model.
       - name: Build kin + kin-daemon from this branch
-        run: cargo build --bin kin --bin kin-daemon --locked
+        run: cargo build --bin kin --bin kin-daemon --locked --features kin-cli/embeddings,kin-daemon/embeddings
 
       # The public installer puts both binaries in ~/.kin/bin, and several health
       # checks resolve the launcher by that path rather than by whatever happens

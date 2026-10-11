@@ -349,6 +349,10 @@ fn prepared_guard_actual_daemon_child() {
         return;
     };
     let init = kin_core::init(Path::new(&repo)).unwrap();
+    assert_eq!(
+        init.layout.root(),
+        Path::new(&repo).canonicalize().unwrap().join(".kin")
+    );
     let singleton = crate::lifecycle::acquire_singleton_lock(init.layout.root())
         .unwrap()
         .unwrap();
@@ -406,7 +410,9 @@ pub(crate) fn spawn_child_test(
             repo.join(".controlled-runtime/registry.toml"),
         )
         .env("KIN_HOME", repo.join(".controlled-runtime/managed"))
-        .env("KINTEST_PAUSE_BEFORE_EXIT_MS", "1800")
+        // A protected stop holds its exit this long after its note, so the
+        // 500 ms custody probe that follows the note runs with room to spare.
+        .env("KINTEST_PAUSE_BEFORE_EXIT_MS", "900")
         .env("KIN_DAEMON_AUTO_EMBED", "0")
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_EMBED_BACKEND", "cpu");
@@ -423,71 +429,101 @@ fn child(mode: &str, repo: &Path) -> Child {
         &[
             (CHILD_REPO, repo.as_os_str().to_owned()),
             (CHILD_MODE, std::ffi::OsString::from(mode)),
+            // These controls read and reopen repo/.kin in the parent. Pin the
+            // same placement in their child instead of inheriting a host default.
+            ("KIN_STORE_LAYOUT", std::ffi::OsString::from("in-tree")),
         ],
     )
 }
 
 #[test]
 fn prepared_guard_actual_daemon_drop_panic_and_shutdown_hold_singleton_until_exit_without_save() {
-    for mode in ["drop", "panic", "shutdown"] {
-        let repo = tempfile::tempdir().unwrap();
-        let root = repo.path().join(".kin");
-        let mut worker = child(mode, repo.path());
-        let deadline = Instant::now() + Duration::from_secs(45);
-        let note = loop {
-            if let Some(note) = kin_daemon_spawn::read_daemon_death_note(&root) {
-                break note;
-            }
-            assert!(
-                worker.0.try_wait().unwrap().is_none(),
-                "{mode} child exited without diagnostic"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "{mode} child did not protected-stop"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(note.killed_by, "kin-daemon prepared publication");
-        let until = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < until {
-            assert!(worker.0.try_wait().unwrap().is_none());
-            assert!(
-                crate::lifecycle::acquire_singleton_lock_within(&root, Duration::ZERO)
+    // Each mode is its own child daemon over its own store, registry and home,
+    // so the three run side by side rather than one after another. Each runs on
+    // a thread named for its mode, which a failure's panic line names. Every
+    // mode is joined before any failure is reported, and the first failure is
+    // re-raised as it was.
+    let failures: Vec<_> = std::thread::scope(|scope| {
+        let runs: Vec<_> = ["drop", "panic", "shutdown"]
+            .into_iter()
+            .map(|mode| {
+                std::thread::Builder::new()
+                    .name(format!("protected-stop-{mode}"))
+                    .spawn_scoped(scope, move || {
+                        prepared_guard_protected_stop_holds_custody(mode)
+                    })
                     .unwrap()
-                    .is_none()
-            );
-            assert!(!root.join("prepared-custody-released").exists());
-            std::thread::sleep(Duration::from_millis(10));
+            })
+            .collect();
+        runs.into_iter()
+            .filter_map(|run| run.join().err())
+            .collect()
+    });
+    if let Some(failure) = failures.into_iter().next() {
+        std::panic::resume_unwind(failure);
+    }
+}
+
+/// One protected stop, `drop`, `panic` or `shutdown`: the child notes it, holds
+/// the singleton and its custody until it exits 70, and saves nothing.
+fn prepared_guard_protected_stop_holds_custody(mode: &str) {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().join(".kin");
+    let mut worker = child(mode, repo.path());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let note = loop {
+        if let Some(note) = kin_daemon_spawn::read_daemon_death_note(&root) {
+            break note;
         }
-        let status = loop {
-            if let Some(status) = worker.0.try_wait().unwrap() {
-                break status;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(status.code(), Some(70));
-        let singleton = crate::lifecycle::acquire_singleton_lock_within(&root, Duration::ZERO)
-            .unwrap()
-            .unwrap();
-        let state = DaemonState::open(kin_core::KinLayout::new(repo.path().join(".kin"))).unwrap();
         assert!(
-            !state
-                .graph
-                .to_snapshot()
-                .audit_events
-                .iter()
-                .any(|event| event.action == UNSAVED_ACTION),
-            "{mode}: ordinary shutdown saved unresolved live state"
+            worker.0.try_wait().unwrap().is_none(),
+            "{mode} child exited without diagnostic"
         );
         assert!(
-            !root.join("prepared-normal-save-observed").exists(),
-            "{mode}: actual save entered after protected custody was acquired"
+            Instant::now() < deadline,
+            "{mode} child did not protected-stop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(note.killed_by, "kin-daemon prepared publication");
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        assert!(worker.0.try_wait().unwrap().is_none());
+        assert!(
+            crate::lifecycle::acquire_singleton_lock_within(&root, Duration::ZERO)
+                .unwrap()
+                .is_none()
         );
         assert!(!root.join("prepared-custody-released").exists());
-        drop(singleton);
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let status = loop {
+        if let Some(status) = worker.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(70));
+    let singleton = crate::lifecycle::acquire_singleton_lock_within(&root, Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    let state = DaemonState::open(kin_core::KinLayout::new(repo.path().join(".kin"))).unwrap();
+    assert!(
+        !state
+            .graph
+            .to_snapshot()
+            .audit_events
+            .iter()
+            .any(|event| event.action == UNSAVED_ACTION),
+        "{mode}: ordinary shutdown saved unresolved live state"
+    );
+    assert!(
+        !root.join("prepared-normal-save-observed").exists(),
+        "{mode}: actual save entered after protected custody was acquired"
+    );
+    assert!(!root.join("prepared-custody-released").exists());
+    drop(singleton);
 }
 
 #[test]

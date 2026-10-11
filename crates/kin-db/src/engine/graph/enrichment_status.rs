@@ -36,6 +36,9 @@ pub struct FileEnrichmentStatus {
     pub body_digest: Option<String>,
     pub admitted: bool,
     pub parse: String,
+    /// Currency of the admitted body and recorded entity seals only. This does
+    /// not attest complete entity discovery, parse coverage or native proofs.
+    pub recorded_source_inputs: RecordedSourceInputsStatus,
     pub source: String,
     pub source_reason: Option<String>,
     pub contexts: Vec<EnrichmentContextStatus>,
@@ -50,6 +53,15 @@ pub struct FileEnrichmentStatus {
     pub call_sites: serde_json::Value,
     pub clauses: Vec<String>,
     pub outstanding_binding_obligations: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordedSourceInputsStatus {
+    pub scope: String,
+    pub state: String,
+    pub reason: Option<String>,
+    /// The selected file's recorded entity census, not all entities in its body.
+    pub entity_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,13 +264,41 @@ impl InMemoryGraph {
                 .and_then(|file| data.file_layouts.get(file))
                 .map(|layout| layout.parse_completeness.bucket())
                 .unwrap_or("unrecorded");
-            let source_current = body.is_some()
-                && parse == "full"
+            let recorded_source_inputs_current = body.is_some()
                 && !entities.is_empty()
                 && entities.iter().all(|entity| {
                     SourceEntityBinding::from_entity(entity).is_some()
                         && !facts.derivation_owed(entity)
                 });
+            let source_current = recorded_source_inputs_current && parse == "full";
+            let recorded_source_inputs = RecordedSourceInputsStatus {
+                scope: "recorded_entity_census".into(),
+                state: if recorded_source_inputs_current {
+                    "current"
+                } else {
+                    "unverified"
+                }
+                .into(),
+                reason: if recorded_source_inputs_current {
+                    None
+                } else {
+                    Some(
+                        if artifact.is_none() {
+                            "not_admitted"
+                        } else if body.is_none() {
+                            "not_source_blob"
+                        } else if file.is_none() {
+                            "non_utf8_projection_path"
+                        } else if entities.is_empty() {
+                            "no_recorded_entity_census"
+                        } else {
+                            "source_seal_mismatch"
+                        }
+                        .into(),
+                    )
+                },
+                entity_count: entities.len(),
+            };
             let mut languages: Vec<LanguageId> = entities.iter().map(|e| e.language).collect();
             if let Some(language) = path.as_utf8().and_then(language_of_path) {
                 languages.push(language);
@@ -325,7 +365,7 @@ impl InMemoryGraph {
             } else if mark
                 .is_some_and(|mark| mark.version < kin_model::ENRICHMENT_PROOF_MARK_VERSION)
             {
-                ("unverified_legacy_marker", "legacy marker identities do not attest exact ledger and context payload publication")
+                ("unverified_legacy_marker", "an older completion proof version does not attest the current selected proof inputs")
             } else if recorded
                 && mark.is_some_and(|mark| version_covers(mark.version, &mark.path))
                 && source_current
@@ -374,6 +414,7 @@ impl InMemoryGraph {
                 body_digest: body.map(|body| body.to_string()),
                 admitted: artifact.is_some(),
                 parse: parse.into(),
+                recorded_source_inputs,
                 source: if source_current {
                     "current"
                 } else {
@@ -565,6 +606,178 @@ mod tests {
         (graph, entity, context, mark)
     }
 
+    fn proof_input_mark(graph: &InMemoryGraph, mut mark: EnrichmentMark) -> EnrichmentMark {
+        mark.version = kin_model::ENRICHMENT_PROOF_MARK_VERSION;
+        let data = graph.entities.read();
+        mark.relations = kin_model::enrichment_proof_inputs_by_file(
+            [mark.path.as_str()],
+            data.entities.values(),
+            data.relations.values(),
+            data.resolution_records.records().values(),
+        )
+        .unwrap()[&mark.path];
+        mark
+    }
+
+    fn set_partial_parse(graph: &InMemoryGraph) {
+        graph
+            .entities
+            .write()
+            .file_layouts
+            .get_mut(&FilePathId::new("src/a.py"))
+            .unwrap()
+            .parse_completeness = ParseCompleteness::Partial("unparsed syntax remains".into());
+    }
+
+    #[test]
+    fn enrichment_status_partial_parse_separates_recorded_input_currency_from_completion() {
+        let (graph, _, _, mark) = fixture();
+        set_partial_parse(&graph);
+        let mark = proof_input_mark(&graph, mark);
+        let facts = graph
+            .enrichment_status_facts(&[], Some(&[mark]), |_, _| true)
+            .unwrap();
+        let row = &facts.files[0];
+        assert_eq!(
+            serde_json::to_value(&row.recorded_source_inputs).unwrap(),
+            serde_json::json!({"scope":"recorded_entity_census", "state":"current", "reason":null, "entity_count":1})
+        );
+        assert_eq!(row.parse, "partial");
+        assert_eq!(row.source, "unverified");
+        assert_eq!(row.source_reason.as_deref(), Some("parse_not_complete"));
+        assert_eq!(row.proof, "unverified");
+        assert_eq!(row.current_completion, "owed");
+        assert_eq!(row.recorded_source_observation, "matches_marker_inputs");
+        assert_eq!(row.contexts[0].state, "validated");
+        for count in [
+            "callers_owed_derivation",
+            "callers_owed_enrichment",
+            "callers_stale",
+            "callers_unverified",
+        ] {
+            assert_eq!(row.call_sites[count], 0, "{count}");
+        }
+        assert_eq!(row.call_sites["unverified_contexts"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn enrichment_status_partial_parse_cannot_hide_missing_census_or_any_invalid_source_seal() {
+        let (graph, _, _, mark) = fixture();
+        set_partial_parse(&graph);
+        graph.entities.write().entities.clear();
+        let mark = proof_input_mark(&graph, mark);
+        let facts = graph
+            .enrichment_status_facts(&[], Some(&[mark]), |_, _| true)
+            .unwrap();
+        let row = &facts.files[0];
+        assert_eq!(row.recorded_source_inputs.scope, "recorded_entity_census");
+        assert_eq!(row.recorded_source_inputs.state, "unverified");
+        assert_eq!(
+            row.recorded_source_inputs.reason.as_deref(),
+            Some("no_recorded_entity_census")
+        );
+        assert_eq!(row.recorded_source_inputs.entity_count, 0);
+        assert_eq!(row.source_reason.as_deref(), Some("parse_not_complete"));
+        assert_eq!(row.recorded_source_observation, "matches_marker_inputs");
+        assert_eq!(row.current_completion, "owed");
+
+        for seal in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("not-a-source-digest")),
+            Some(serde_json::json!("AB".repeat(32))),
+            Some(serde_json::json!(Hash256::from_bytes([8; 32]).to_string())),
+        ] {
+            let (graph, mut entity, _, mut mark) = fixture();
+            set_partial_parse(&graph);
+            {
+                let mut data = graph.entities.write();
+                let body = Hash256::from_bytes([0xab; 32]);
+                mark.body = body;
+                entity
+                    .metadata
+                    .extra
+                    .insert("blob_hash".into(), serde_json::json!(body.to_string()));
+                data.entities.insert(entity.id, entity.clone());
+                data.resolved_tree = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+                    ArtifactId::new(),
+                    RepoPath::from_utf8("src/a.py").unwrap(),
+                    TreeEntry::blob(body, false),
+                )])
+                .unwrap();
+                // One current seal cannot hide a second missing, malformed or
+                // stale seal in the same recorded entity census.
+                let mut other = entity;
+                other.id = EntityId::new();
+                other.kind = EntityKind::Class;
+                other.metadata.extra.remove("blob_hash");
+                if let Some(seal) = seal {
+                    other.metadata.extra.insert("blob_hash".into(), seal);
+                }
+                data.entities.insert(other.id, other);
+            }
+            let mark = proof_input_mark(&graph, mark);
+            let facts = graph
+                .enrichment_status_facts(&[], Some(&[mark]), |_, _| true)
+                .unwrap();
+            let row = &facts.files[0];
+            assert_eq!(row.recorded_source_inputs.scope, "recorded_entity_census");
+            assert_eq!(row.recorded_source_inputs.state, "unverified");
+            assert_eq!(
+                row.recorded_source_inputs.reason.as_deref(),
+                Some("source_seal_mismatch")
+            );
+            assert_eq!(row.recorded_source_inputs.entity_count, 2);
+            assert_eq!(row.source, "unverified");
+            assert_eq!(row.source_reason.as_deref(), Some("parse_not_complete"));
+            assert_eq!(row.recorded_source_observation, "matches_marker_inputs");
+            assert_eq!(row.current_completion, "owed");
+        }
+    }
+
+    #[test]
+    fn enrichment_status_partial_parse_requires_the_current_admitted_body() {
+        for (entry, reason) in [
+            (None, "not_admitted"),
+            (
+                Some(TreeEntry::symlink(Hash256::from_bytes([7; 32]))),
+                "not_source_blob",
+            ),
+            (
+                Some(TreeEntry::blob(Hash256::from_bytes([8; 32]), false)),
+                "source_seal_mismatch",
+            ),
+        ] {
+            let (graph, _, _, mark) = fixture();
+            set_partial_parse(&graph);
+            let mark = proof_input_mark(&graph, mark);
+            {
+                let mut data = graph.entities.write();
+                data.resolved_tree = ResolvedTree::from_artifacts(entry.map(|entry| {
+                    ResolvedArtifact::new(
+                        ArtifactId::new(),
+                        RepoPath::from_utf8("src/a.py").unwrap(),
+                        entry,
+                    )
+                }))
+                .unwrap();
+            }
+            let facts = graph
+                .enrichment_status_facts(&[], Some(&[mark]), |_, _| true)
+                .unwrap();
+            let row = &facts.files[0];
+            assert_eq!(row.recorded_source_inputs.scope, "recorded_entity_census");
+            assert_eq!(row.recorded_source_inputs.state, "unverified");
+            assert_eq!(row.recorded_source_inputs.reason.as_deref(), Some(reason));
+            assert_eq!(row.recorded_source_inputs.entity_count, 1);
+            assert_eq!(row.parse, "partial");
+            assert_eq!(row.source, "unverified");
+            assert_eq!(row.current_completion, "owed");
+            assert_eq!(row.proof, "unverified");
+            assert_ne!(row.recorded_source_observation, "matches_marker_inputs");
+        }
+    }
+
     #[test]
     fn enrichment_status_joins_source_context_and_completion_without_certifying_unresolved_sites() {
         let (graph, entity, _, mark) = fixture();
@@ -633,7 +846,19 @@ mod tests {
                 })
                 .unwrap()
         };
-        assert_eq!(read().files[0].current_completion, "recorded");
+        let baseline = read();
+        assert_eq!(baseline.files[0].parse, "full");
+        assert_eq!(baseline.files[0].source, "current");
+        assert_eq!(baseline.files[0].source_reason, None);
+        assert_eq!(
+            baseline.files[0].recorded_source_inputs.scope,
+            "recorded_entity_census"
+        );
+        assert_eq!(baseline.files[0].recorded_source_inputs.state, "current");
+        assert_eq!(baseline.files[0].recorded_source_inputs.reason, None);
+        assert_eq!(baseline.files[0].recorded_source_inputs.entity_count, 1);
+        assert_eq!(baseline.files[0].current_completion, "recorded");
+        assert_eq!(baseline.files[0].proof, "settled");
         {
             let mut data = graph.entities.write();
             let mut records = data.resolution_records.records().clone();
@@ -791,6 +1016,10 @@ mod tests {
                 .find(|row| &row.projection_path == path)
                 .unwrap();
             assert_eq!(row.proof, "unverified");
+            assert_eq!(row.recorded_source_inputs.scope, "recorded_entity_census");
+            assert_eq!(row.recorded_source_inputs.state, "unverified");
+            assert!(row.recorded_source_inputs.reason.is_some());
+            assert_eq!(row.recorded_source_inputs.entity_count, 0);
             assert_ne!(row.recorded_source_observation, "matches_marker_inputs");
         }
         assert!(

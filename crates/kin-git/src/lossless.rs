@@ -9,6 +9,7 @@
 //! returned. Rehydration performs the inverse operation in a private staging
 //! repository and publishes the destination only after an exact recapture.
 
+use kin_io::WorktreeRoot;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(unix)]
@@ -29,6 +30,11 @@ use kin_model::{
 };
 
 use crate::error::{GitError, Result};
+
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 #[cfg(unix)]
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -311,6 +317,44 @@ pub struct LosslessGitRepository {
     pub objects: Vec<ExternalObjectRecord>,
     pub refs: RepositoryRefState,
     pub head: WorkspaceHead,
+    /// Captured commits whose parents this capture deliberately did not take.
+    ///
+    /// Empty for every [`CaptureScope::Reachable`] capture, which is a complete
+    /// history or a refusal. A [`CaptureScope::CheckedOutCommit`] capture takes
+    /// the checked-out commit and its tree closure only, and names here every
+    /// commit it took without its parents, so a snapshot states exactly where
+    /// its history stops instead of presenting a truncated history as whole.
+    /// Closure validation walks past a boundary commit's parents and nothing
+    /// else, so an object missing anywhere else still fails closed.
+    pub history_boundary: BTreeSet<GitObjectId>,
+    /// How much of the repository this snapshot was captured over. A proof
+    /// re-captures under the same scope, so a checked-out-commit snapshot is
+    /// compared with a checked-out-commit capture and never with the whole
+    /// repository.
+    pub scope: CaptureScope,
+}
+
+impl LosslessGitRepository {
+    /// Whether this snapshot holds the complete reachable history of every ref
+    /// in the repository.
+    pub fn is_complete_history(&self) -> bool {
+        self.scope == CaptureScope::Reachable && self.history_boundary.is_empty()
+    }
+}
+
+/// How much of a repository one capture takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureScope {
+    #[default]
+    /// Every object reachable from every `refs/*` reference and detached
+    /// `HEAD`. A shallow repository is refused.
+    Reachable,
+    /// The commit `HEAD` resolves to, its tree closure, and the refs `HEAD`
+    /// names on the way there. Parents are not taken; every captured commit
+    /// that has parents is recorded in
+    /// [`LosslessGitRepository::history_boundary`]. A shallow repository is
+    /// accepted, because nothing past the checked-out commit is read.
+    CheckedOutCommit,
 }
 
 /// Result of atomically rehydrating an exact Git repository.
@@ -322,15 +366,15 @@ pub struct GitRehydrationResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RawTarget {
+pub(crate) enum RawTarget {
     Direct(gix::ObjectId),
     Symbolic(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RawRef {
-    name: Vec<u8>,
-    target: RawTarget,
+pub(crate) struct RawRef {
+    pub(crate) name: Vec<u8>,
+    pub(crate) target: RawTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -348,18 +392,52 @@ struct PendingObject {
 /// Shallow repositories and any missing, malformed, or hash-invalid reachable
 /// objects fail closed.
 pub fn capture_lossless_git_repository(
-    repo_path: &Path,
+    repo_path: &WorktreeRoot,
     repository_id: RepositoryId,
     blob_store: &BlobStore,
 ) -> Result<LosslessGitRepository> {
+    capture_lossless_git_repository_scoped(
+        repo_path,
+        repository_id,
+        blob_store,
+        CaptureScope::Reachable,
+    )
+}
+
+/// [`capture_lossless_git_repository`] over an explicit [`CaptureScope`].
+///
+/// A [`CaptureScope::CheckedOutCommit`] capture is the same capture with two
+/// rules changed: the refs are only the ones `HEAD` names on its way to a
+/// commit, and a commit's parents are never followed. Every body it does take
+/// is verified exactly as a complete capture verifies it, and refs and `HEAD`
+/// are read again afterwards and must not have moved.
+pub fn capture_lossless_git_repository_scoped(
+    repo_path: &WorktreeRoot,
+    repository_id: RepositoryId,
+    blob_store: &BlobStore,
+    scope: CaptureScope,
+) -> Result<LosslessGitRepository> {
+    capture_lossless_git_repository_at(repo_path.path(), repository_id, blob_store, scope)
+}
+
+/// The capture itself, for a repository this crate is already working in
+/// under its caller's authority, such as a staging copy it just wrote.
+pub(crate) fn capture_lossless_git_repository_at(
+    repo_path: &Path,
+    repository_id: RepositoryId,
+    blob_store: &BlobStore,
+    scope: CaptureScope,
+) -> Result<LosslessGitRepository> {
     let repo = open_repo(repo_path)?;
-    reject_shallow_repository(&repo)?;
+    if scope == CaptureScope::Reachable {
+        reject_shallow_repository(&repo)?;
+    }
     let object_format = object_format(&repo)?;
 
-    let mut raw_refs = collect_refs(&repo)?;
+    let raw_head = collect_head(&repo)?;
+    let mut raw_refs = scoped_refs(collect_refs(&repo)?, &raw_head, scope)?;
     raw_refs.sort_by(|left, right| left.name.cmp(&right.name));
     ensure_unique_ref_names(&raw_refs)?;
-    let raw_head = collect_head(&repo)?;
 
     let mut pending = VecDeque::new();
     for repository_ref in &raw_refs {
@@ -379,12 +457,16 @@ pub fn capture_lossless_git_repository(
         });
     }
 
-    let (mut objects, object_kinds) = capture_objects(&repo, blob_store, pending)?;
+    let follow_parents = scope == CaptureScope::Reachable;
+    let (mut objects, object_kinds, history_boundary) =
+        capture_objects(&repo, blob_store, pending, follow_parents)?;
     objects.sort_by_key(|record| record.object);
-    reject_shallow_repository(&repo)?;
-    let mut confirmed_refs = collect_refs(&repo)?;
-    confirmed_refs.sort_by(|left, right| left.name.cmp(&right.name));
+    if scope == CaptureScope::Reachable {
+        reject_shallow_repository(&repo)?;
+    }
     let confirmed_head = collect_head(&repo)?;
+    let mut confirmed_refs = scoped_refs(collect_refs(&repo)?, &confirmed_head, scope)?;
+    confirmed_refs.sort_by(|left, right| left.name.cmp(&right.name));
     if confirmed_refs != raw_refs || confirmed_head != raw_head {
         return Err(GitError::InvalidSnapshot(
             "Git refs or HEAD changed during lossless capture; retry".to_string(),
@@ -426,9 +508,49 @@ pub fn capture_lossless_git_repository(
         objects,
         refs,
         head,
+        history_boundary,
+        scope,
     };
     validate_snapshot(&snapshot, blob_store)?;
     Ok(snapshot)
+}
+
+/// The refs one capture takes.
+///
+/// Every ref for a complete capture. For a checked-out-commit capture, only the
+/// chain of symbolic refs `HEAD` follows and the ref it ends at, so the capture
+/// names the branch a person has checked out and no branch whose commits it
+/// did not take. A detached `HEAD` takes no ref at all.
+fn scoped_refs(refs: Vec<RawRef>, head: &RawTarget, scope: CaptureScope) -> Result<Vec<RawRef>> {
+    if scope == CaptureScope::Reachable {
+        return Ok(refs);
+    }
+    let mut by_name = refs
+        .into_iter()
+        .map(|raw| (raw.name.clone(), raw))
+        .collect::<BTreeMap<_, _>>();
+    let mut taken = Vec::new();
+    let mut next = match head {
+        RawTarget::Symbolic(name) => Some(name.clone()),
+        RawTarget::Direct(_) => None,
+    };
+    while let Some(name) = next.take() {
+        // An unborn branch has no ref yet; `HEAD` still names it.
+        let Some(raw) = by_name.remove(&name) else {
+            if taken.iter().any(|raw: &RawRef| raw.name == name) {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "symbolic ref chain from HEAD loops through {}",
+                    display_bytes(&name)
+                )));
+            }
+            break;
+        };
+        if let RawTarget::Symbolic(target) = &raw.target {
+            next = Some(target.clone());
+        }
+        taken.push(raw);
+    }
+    Ok(taken)
 }
 
 /// Rehydrate an exact SHA-1 Git repository from a lossless snapshot.
@@ -443,12 +565,21 @@ pub fn capture_lossless_git_repository(
 pub fn rehydrate_lossless_git_repository(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
-    output_path: &Path,
+    output_path: &WorktreeRoot,
 ) -> Result<GitRehydrationResult> {
+    let output_path = output_path.path();
     if snapshot.object_format != GitObjectFormat::Sha1 {
         return Err(GitError::UnsupportedObjectFormat(
             snapshot.object_format.to_string(),
         ));
+    }
+    // A Git repository written from a snapshot that stops at a boundary would
+    // hold commits whose parents it does not have, which Git reads as a
+    // corrupt repository rather than a partial one.
+    if !snapshot.is_complete_history() {
+        return Err(GitError::PartialHistory {
+            boundary: snapshot.history_boundary.len(),
+        });
     }
     reject_existing_destination(output_path)?;
     // Fresh, never shared. This function's contract is that every CAS body is
@@ -506,7 +637,7 @@ pub(crate) fn reject_shallow_repository(repo: &gix::Repository) -> Result<()> {
     Ok(())
 }
 
-fn object_format(repo: &gix::Repository) -> Result<GitObjectFormat> {
+pub(crate) fn object_format(repo: &gix::Repository) -> Result<GitObjectFormat> {
     match repo.object_hash().len_in_bytes() {
         20 => Ok(GitObjectFormat::Sha1),
         32 => Ok(GitObjectFormat::Sha256),
@@ -516,7 +647,7 @@ fn object_format(repo: &gix::Repository) -> Result<GitObjectFormat> {
     }
 }
 
-fn collect_refs(repo: &gix::Repository) -> Result<Vec<RawRef>> {
+pub(crate) fn collect_refs(repo: &gix::Repository) -> Result<Vec<RawRef>> {
     let platform = repo
         .references()
         .map_err(|error| GitError::Git(format!("open reference store: {error}")))?;
@@ -540,7 +671,7 @@ fn collect_refs(repo: &gix::Repository) -> Result<Vec<RawRef>> {
         .collect()
 }
 
-fn collect_head(repo: &gix::Repository) -> Result<RawTarget> {
+pub(crate) fn collect_head(repo: &gix::Repository) -> Result<RawTarget> {
     let head = repo
         .find_reference("HEAD")
         .map_err(|error| GitError::Git(format!("read HEAD: {error}")))?;
@@ -573,12 +704,15 @@ fn capture_objects(
     repo: &gix::Repository,
     blob_store: &BlobStore,
     mut pending: VecDeque<PendingObject>,
+    follow_parents: bool,
 ) -> Result<(
     Vec<ExternalObjectRecord>,
     BTreeMap<GitObjectId, ExternalObjectKind>,
+    BTreeSet<GitObjectId>,
 )> {
     let mut records = Vec::new();
     let mut object_kinds = BTreeMap::new();
+    let mut history_boundary = BTreeSet::new();
 
     while let Some(next) = pending.pop_front() {
         let model_oid = git_object_id(next.oid)?;
@@ -621,22 +755,36 @@ fn capture_objects(
             }
         })?;
         persist_verified_body(blob_store, &record, &body)?;
-        enqueue_dependencies(model_oid, kind, &body, &next.context, &mut pending)?;
+        let unfollowed_parents = enqueue_dependencies(
+            model_oid,
+            kind,
+            &body,
+            &next.context,
+            &mut pending,
+            follow_parents,
+        )?;
+        if unfollowed_parents {
+            history_boundary.insert(model_oid);
+        }
 
         object_kinds.insert(model_oid, kind);
         records.push(record);
     }
 
-    Ok((records, object_kinds))
+    Ok((records, object_kinds, history_boundary))
 }
 
+/// Queue what one captured object depends on, and answer whether it is a
+/// commit whose parents were left out because `follow_parents` is off.
 fn enqueue_dependencies(
     object_id: GitObjectId,
     object_kind: ExternalObjectKind,
     body: &[u8],
     context: &str,
     pending: &mut VecDeque<PendingObject>,
-) -> Result<()> {
+    follow_parents: bool,
+) -> Result<bool> {
+    let mut unfollowed_parents = false;
     let hash_kind = match object_id {
         GitObjectId::Sha1(_) => gix::hash::Kind::Sha1,
         GitObjectId::Sha256(_) => gix::hash::Kind::Sha256,
@@ -655,6 +803,10 @@ fn enqueue_dependencies(
                 context: format!("tree of commit {object_id} reached from {context}"),
             });
             for parent in decoded.parents() {
+                if !follow_parents {
+                    unfollowed_parents = true;
+                    continue;
+                }
                 pending.push_back(PendingObject {
                     oid: parent,
                     expected_kind: Some(ExternalObjectKind::Commit),
@@ -709,7 +861,7 @@ fn enqueue_dependencies(
         }
         ExternalObjectKind::Blob => {}
     }
-    Ok(())
+    Ok(unfollowed_parents)
 }
 
 fn external_kind(kind: gix::objs::Kind) -> ExternalObjectKind {
@@ -887,6 +1039,11 @@ fn validate_snapshot_with(
         }
     }
     validate_head_and_default(snapshot)?;
+    if snapshot.scope == CaptureScope::Reachable && !snapshot.history_boundary.is_empty() {
+        return Err(GitError::InvalidSnapshot(
+            "a complete-history snapshot cannot carry a history boundary".to_string(),
+        ));
+    }
 
     let bodies = decompressed_closure(snapshot, blob_store, sharing)?;
 
@@ -1036,6 +1193,7 @@ fn validate_reachable_closure(
     enqueue_head_target(&snapshot.head, &mut pending)?;
 
     let mut reached = BTreeSet::new();
+    let mut boundary_reached = BTreeSet::new();
     while let Some((object, expected_kind, context)) = pending.pop_front() {
         if let Some(expected_kind) = expected_kind {
             ensure_expected_kind(object.oid, object.kind, expected_kind, &context)?;
@@ -1058,14 +1216,39 @@ fn validate_reachable_closure(
         }
         if object.kind != ExternalObjectKind::Blob {
             let body = bodies.body(&object)?;
-            enqueue_raw_dependencies(
+            let boundary = object.kind == ExternalObjectKind::Commit
+                && snapshot.history_boundary.contains(&object.oid);
+            let skipped_parents = enqueue_raw_dependencies(
                 snapshot.object_format,
                 object,
                 &body,
                 &context,
                 &mut pending,
+                !boundary,
             )?;
+            // A boundary names a commit whose parents were left out. One with
+            // no parents to leave out is a claim about history the snapshot
+            // does not need, so it is refused rather than carried.
+            if boundary && !skipped_parents {
+                return Err(GitError::InvalidSnapshot(format!(
+                    "history boundary commit {} has no parents to leave out",
+                    object.oid
+                )));
+            }
+            if boundary {
+                boundary_reached.insert(object.oid);
+            }
         }
+    }
+    if boundary_reached != snapshot.history_boundary {
+        let stray = snapshot
+            .history_boundary
+            .iter()
+            .find(|oid| !boundary_reached.contains(oid))
+            .expect("unequal boundary sets hold an unreached member");
+        return Err(GitError::InvalidSnapshot(format!(
+            "history boundary commit {stray} is not a reachable captured commit"
+        )));
     }
 
     // Counted over the descriptors, never over what is resident. Answering this
@@ -1125,13 +1308,17 @@ fn enqueue_head_target(
     }
 }
 
+/// Queue what one reached object depends on, and answer whether a commit's
+/// parents were left out because `follow_parents` is off.
 fn enqueue_raw_dependencies(
     object_format: GitObjectFormat,
     object: ExternalObjectId,
     body: &[u8],
     context: &str,
     pending: &mut VecDeque<(ExternalObjectId, Option<ExternalObjectKind>, String)>,
-) -> Result<()> {
+    follow_parents: bool,
+) -> Result<bool> {
+    let mut skipped_parents = false;
     let hash_kind = match object_format {
         GitObjectFormat::Sha1 => gix::hash::Kind::Sha1,
         GitObjectFormat::Sha256 => gix::hash::Kind::Sha256,
@@ -1147,6 +1334,10 @@ fn enqueue_raw_dependencies(
                 format!("tree of commit {} reached from {context}", object.oid),
             ));
             for parent in commit.parents() {
+                if !follow_parents {
+                    skipped_parents = true;
+                    continue;
+                }
                 pending.push_back((
                     external_object_id(ExternalObjectKind::Commit, parent)?,
                     Some(ExternalObjectKind::Commit),
@@ -1197,7 +1388,7 @@ fn enqueue_raw_dependencies(
         }
         ExternalObjectKind::Blob => {}
     }
-    Ok(())
+    Ok(skipped_parents)
 }
 
 fn external_object_id(kind: ExternalObjectKind, oid: gix::ObjectId) -> Result<ExternalObjectId> {
@@ -1641,7 +1832,7 @@ fn sync_git_directory_capability(directory: &cap_std::fs::Dir, display: &Path) -
                     child_display.display()
                 )));
             }
-            file.sync_all()
+            kin_blobs::durable::sync_all(&file)
                 .map_err(|error| GitError::io(&child_display, error))?;
             continue;
         }
@@ -1739,7 +1930,11 @@ fn validate_publication_name_identity(
 /// flushes children before parents, and opens Unix files/directories with
 /// `NOFOLLOW`. Namespace publication must still durably sync the destination
 /// parent after moving this tree into place.
-pub fn sync_git_repository_for_authority_handoff(path: &Path) -> Result<()> {
+pub fn sync_git_repository_for_authority_handoff(path: &WorktreeRoot) -> Result<()> {
+    sync_git_repository_tree(path.path())
+}
+
+fn sync_git_repository_tree(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| GitError::io(path, error))?;
     if metadata.file_type().is_symlink() {
         return Err(GitError::InvalidSnapshot(format!(
@@ -1766,7 +1961,7 @@ pub fn sync_git_repository_for_authority_handoff(path: &Path) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     for child in children {
-        sync_git_repository_for_authority_handoff(&child)?;
+        sync_git_repository_tree(&child)?;
     }
     sync_publication_directory(path)
 }
@@ -1790,7 +1985,7 @@ fn sync_publication_file(path: &Path) -> Result<()> {
             path.display()
         )));
     }
-    file.sync_all().map_err(|error| GitError::io(path, error))
+    kin_blobs::durable::sync_all(&file).map_err(|error| GitError::io(path, error))
 }
 
 #[cfg(windows)]
@@ -1810,7 +2005,7 @@ fn sync_publication_file(path: &Path) -> Result<()> {
             path.display()
         )));
     }
-    file.sync_all().map_err(|error| GitError::io(path, error))
+    kin_blobs::durable::sync_all(&file).map_err(|error| GitError::io(path, error))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1833,9 +2028,7 @@ fn sync_publication_directory(path: &Path) -> Result<()> {
     )
     .map(fs::File::from)
     .map_err(|error| GitError::io(path, error.into()))?;
-    directory
-        .sync_all()
-        .map_err(|error| GitError::io(path, error))
+    kin_blobs::durable::sync_all(&directory).map_err(|error| GitError::io(path, error))
 }
 
 #[cfg(windows)]
@@ -1850,9 +2043,7 @@ fn sync_publication_directory(path: &Path) -> Result<()> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| GitError::io(path, error))?;
-    directory
-        .sync_all()
-        .map_err(|error| GitError::io(path, error))
+    kin_blobs::durable::sync_all(&directory).map_err(|error| GitError::io(path, error))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1905,8 +2096,12 @@ fn build_staging_repository(
         .map_err(|error| GitError::Git(format!("write refs and HEAD: {error}")))?;
     drop(repo);
 
-    let recaptured =
-        capture_lossless_git_repository(staging, snapshot.repository_id.clone(), blob_store)?;
+    let recaptured = capture_lossless_git_repository_at(
+        staging,
+        snapshot.repository_id.clone(),
+        blob_store,
+        CaptureScope::Reachable,
+    )?;
     if recaptured != *snapshot {
         return Err(GitError::InvalidSnapshot(
             "rehydrated repository did not recapture byte-exactly".to_string(),
@@ -1991,7 +2186,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
-    use crate::test_support::fixture_git;
+    use crate::test_support::{fixture_git, FixtureGitBatch};
 
     /// Gitlink target recorded by the polyglot fixture, which is never a
     /// capturable object in the source repository.
@@ -2142,8 +2337,6 @@ mod tests {
             let root = tempdir().unwrap();
             let repo = root.path().join("source");
             fs::create_dir(&repo).unwrap();
-            git_ok(&repo, ["init", "--initial-branch=main"]);
-            configure_git(&repo);
 
             write(&repo, "Cargo.toml", b"[package]\nname = \"mixed\"\n");
             write(&repo, "src/lib.rs", b"pub fn rust_value() -> u8 { 7 }\n");
@@ -2192,7 +2385,14 @@ mod tests {
             fs::set_permissions(&executable, permissions).unwrap();
             symlink("config/app.yaml", repo.join("config-link")).unwrap();
 
-            git_ok(&repo, ["add", "--all"]);
+            // Each batch is the same Git invocations, in the same order, as
+            // separate launches would be; a batch ends wherever the next step
+            // needs a file written or an id read back first.
+            let mut seed = FixtureGitBatch::new();
+            seed.git(["init", "--initial-branch=main"]);
+            configure_git_steps(&mut seed);
+            seed.git(["add", "--all"]);
+            seed.run_in(&repo);
             let non_utf8_oid = git_stdin_text(
                 &repo,
                 ["hash-object", "-w", "--stdin"],
@@ -2201,43 +2401,44 @@ mod tests {
             let mut index_entry = format!("100644 {non_utf8_oid}\t").into_bytes();
             index_entry.extend_from_slice(b"odd-\xff.bin\0");
             git_stdin_ok(&repo, ["update-index", "-z", "--index-info"], &index_entry);
-            git_ok(
-                &repo,
-                [
+            let mut initial = FixtureGitBatch::new();
+            initial
+                .git([
                     "update-index",
                     "--add",
                     "--cacheinfo",
                     &format!("160000,{POLYGLOT_GITLINK_OID},vendor/sub"),
-                ],
-            );
-            git_ok(&repo, ["commit", "-m", "initial exact tree"]);
-            let first_commit = git_text(&repo, ["rev-parse", "HEAD"]);
+                ])
+                .git(["commit", "-m", "initial exact tree"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .git(["switch", "-c", "feature"]);
+            let first_commit = batch_text(initial.run_in(&repo));
 
-            git_ok(&repo, ["switch", "-c", "feature"]);
             write(&repo, "src/app.ts", b"export const tsValue: number = 10;\n");
-            git_ok(&repo, ["add", "src/app.ts"]);
-            git_ok(&repo, ["commit", "-m", "change typescript"]);
+            FixtureGitBatch::new()
+                .git(["add", "src/app.ts"])
+                .git(["commit", "-m", "change typescript"])
+                .git(["switch", "main"])
+                .run_in(&repo);
 
-            git_ok(&repo, ["switch", "main"]);
             write(
                 &repo,
                 "python/app.py",
                 b"def python_value():\n    return 11\n",
             );
-            git_ok(&repo, ["add", "python/app.py"]);
-            git_ok(&repo, ["commit", "-m", "change python"]);
-            git_ok(
-                &repo,
-                ["merge", "--no-ff", "feature", "-m", "merge feature"],
-            );
-            git_ok(&repo, ["tag", "-a", "release-v1", "-m", "annotated"]);
-            git_ok(&repo, ["tag", "lightweight", &first_commit]);
-            let merge_commit = git_text(&repo, ["rev-parse", "HEAD"]);
-            git_ok(&repo, ["replace", &first_commit, &merge_commit]);
-            git_ok(
-                &repo,
-                ["symbolic-ref", "refs/aliases/stable", "refs/heads/main"],
-            );
+            let mut merged = FixtureGitBatch::new();
+            merged
+                .git(["add", "python/app.py"])
+                .git(["commit", "-m", "change python"])
+                .git(["merge", "--no-ff", "feature", "-m", "merge feature"])
+                .git(["tag", "-a", "release-v1", "-m", "annotated"])
+                .git(["tag", "lightweight", &first_commit])
+                .git_stdout(["rev-parse", "HEAD"]);
+            let merge_commit = batch_text(merged.run_in(&repo));
+            FixtureGitBatch::new()
+                .git(["replace", &first_commit, &merge_commit])
+                .git(["symbolic-ref", "refs/aliases/stable", "refs/heads/main"])
+                .run_in(&repo);
 
             let cas_root = root.path().join("cas");
             let blob_store = BlobStore::new(cas_root.clone()).unwrap();
@@ -2254,12 +2455,14 @@ mod tests {
             let root = tempdir().unwrap();
             let repo = root.path().join("source");
             fs::create_dir(&repo).unwrap();
-            git_ok(&repo, ["init", "--initial-branch=main"]);
-            configure_git(&repo);
             write(&repo, "README.md", b"exact\n");
-            git_ok(&repo, ["add", "README.md"]);
-            git_ok(&repo, ["commit", "-m", "initial"]);
-            let first_commit = git_text(&repo, ["rev-parse", "HEAD"]);
+            let mut seed = FixtureGitBatch::new();
+            seed.git(["init", "--initial-branch=main"]);
+            configure_git_steps(&mut seed);
+            seed.git(["add", "README.md"])
+                .git(["commit", "-m", "initial"])
+                .git_stdout(["rev-parse", "HEAD"]);
+            let first_commit = batch_text(seed.run_in(&repo));
             let cas_root = root.path().join("cas");
             let blob_store = BlobStore::new(cas_root.clone()).unwrap();
             Self {
@@ -2272,13 +2475,170 @@ mod tests {
         }
     }
 
+    /// A three-commit `main` and a `side` branch with a commit of its own.
+    fn history_with_side_branch() -> (Fixture, String) {
+        let fixture = Fixture::simple();
+        write(&fixture.repo, "README.md", b"second\n");
+        // Untracked until it is added, so `commit -a` and `branch` leave it out
+        // exactly as they would had it been written between them.
+        write(&fixture.repo, "src.py", b"def head():\n    return 1\n");
+        FixtureGitBatch::new()
+            .git(["commit", "-am", "second"])
+            .git(["branch", "side"])
+            .git(["add", "src.py"])
+            .git(["commit", "-m", "third"])
+            .git(["checkout", "-q", "side"])
+            .run_in(&fixture.repo);
+        write(&fixture.repo, "side.txt", b"side\n");
+        let mut side = FixtureGitBatch::new();
+        side.git(["add", "side.txt"])
+            .git(["commit", "-m", "side only"])
+            .git(["checkout", "-q", "main"])
+            .git_stdout(["rev-parse", "HEAD"]);
+        let head = batch_text(side.run_in(&fixture.repo));
+        (fixture, head)
+    }
+
+    #[test]
+    fn a_checked_out_commit_capture_takes_one_commit_and_names_its_boundary() {
+        let (fixture, head) = history_with_side_branch();
+        let snapshot = capture_lossless_git_repository_scoped(
+            &worktree(&fixture.repo),
+            RepositoryId::new("scoped").unwrap(),
+            &fixture.blob_store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .unwrap();
+
+        let commits = snapshot
+            .objects
+            .iter()
+            .filter(|record| record.object.kind == ExternalObjectKind::Commit)
+            .map(|record| record.object.oid.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(commits, vec![head.clone()]);
+        assert_eq!(
+            snapshot
+                .history_boundary
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec![head]
+        );
+        assert!(!snapshot.is_complete_history());
+        // Only the branch HEAD names, never `side`, whose commit it did not take.
+        let refs = snapshot
+            .refs
+            .refs
+            .iter()
+            .map(|repository_ref| repository_ref.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(refs, vec!["refs/heads/main".to_string()]);
+        // The head tree's blobs are there; the side branch's are not.
+        assert_eq!(
+            snapshot
+                .objects
+                .iter()
+                .filter(|record| record.object.kind == ExternalObjectKind::Blob)
+                .count(),
+            2
+        );
+        // A second capture of an unchanged source is the same snapshot, which is
+        // what every source proof compares.
+        assert_eq!(
+            capture_lossless_git_repository_scoped(
+                &worktree(&fixture.repo),
+                RepositoryId::new("scoped").unwrap(),
+                &fixture.blob_store,
+                CaptureScope::CheckedOutCommit,
+            )
+            .unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn a_boundary_is_exact_and_never_carried_by_a_complete_capture() {
+        let (fixture, _head) = history_with_side_branch();
+        let repository_id = RepositoryId::new("scoped").unwrap();
+        let mut snapshot = capture_lossless_git_repository_scoped(
+            &worktree(&fixture.repo),
+            repository_id.clone(),
+            &fixture.blob_store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .unwrap();
+
+        // Dropping the boundary claims a closure the snapshot does not hold.
+        let boundary = std::mem::take(&mut snapshot.history_boundary);
+        assert!(matches!(
+            validate_snapshot(&snapshot, &fixture.blob_store),
+            Err(GitError::MissingObject { .. })
+        ));
+        snapshot.history_boundary = boundary;
+        validate_snapshot(&snapshot, &fixture.blob_store).unwrap();
+
+        // A complete capture of the same repository carries none and takes
+        // every commit on both branches.
+        let complete = capture_lossless_git_repository(
+            &worktree(&fixture.repo),
+            repository_id,
+            &fixture.blob_store,
+        )
+        .unwrap();
+        assert!(complete.is_complete_history());
+        assert_eq!(
+            complete
+                .objects
+                .iter()
+                .filter(|record| record.object.kind == ExternalObjectKind::Commit)
+                .count(),
+            4
+        );
+        let mut forged = complete.clone();
+        forged.history_boundary = snapshot.history_boundary.clone();
+        assert!(validate_snapshot(&forged, &fixture.blob_store).is_err());
+    }
+
+    #[test]
+    fn a_partial_snapshot_is_never_written_out_as_a_git_repository() {
+        let (fixture, _head) = history_with_side_branch();
+        let snapshot = capture_lossless_git_repository_scoped(
+            &worktree(&fixture.repo),
+            RepositoryId::new("scoped").unwrap(),
+            &fixture.blob_store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .unwrap();
+        let output = fixture._root.path().join("rehydrated");
+        assert!(matches!(
+            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &worktree(&output)),
+            Err(GitError::PartialHistory { boundary: 1 })
+        ));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn a_shallow_clone_is_captured_at_its_checked_out_commit() {
+        let (fixture, head) = history_with_side_branch();
+        fs::write(fixture.repo.join(".git/shallow"), format!("{head}\n")).unwrap();
+        let snapshot = capture_lossless_git_repository_scoped(
+            &worktree(&fixture.repo),
+            RepositoryId::new("shallow").unwrap(),
+            &fixture.blob_store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .unwrap();
+        assert_eq!(snapshot.history_boundary.len(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn polyglot_repository_roundtrips_every_object_ref_and_head_exactly() {
         let fixture = Fixture::polyglot();
         let repository_id = RepositoryId::new("polyglot").unwrap();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             repository_id.clone(),
             &fixture.blob_store,
         )
@@ -2348,11 +2708,13 @@ mod tests {
 
         let output = fixture._root.path().join("rehydrated.git");
         let result =
-            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &output).unwrap();
+            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &worktree(&output))
+                .unwrap();
         assert_eq!(result.objects_written, snapshot.objects.len());
         assert_eq!(result.refs_written, snapshot.refs.refs.len());
         let recaptured =
-            capture_lossless_git_repository(&output, repository_id, &fixture.blob_store).unwrap();
+            capture_lossless_git_repository(&worktree(&output), repository_id, &fixture.blob_store)
+                .unwrap();
         assert_eq!(recaptured, snapshot);
         assert_raw_objects_match(&output, &snapshot, &fixture.blob_store);
 
@@ -2391,7 +2753,7 @@ mod tests {
             ["checkout", "--detach", &fixture.first_commit],
         );
         let detached = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("detached").unwrap(),
             &fixture.blob_store,
         )
@@ -2399,11 +2761,15 @@ mod tests {
         assert!(matches!(detached.head, WorkspaceHead::Detached { .. }));
         assert!(detached.refs.default_ref.is_none());
         let detached_output = fixture._root.path().join("detached.git");
-        rehydrate_lossless_git_repository(&detached, &fixture.blob_store, &detached_output)
-            .unwrap();
+        rehydrate_lossless_git_repository(
+            &detached,
+            &fixture.blob_store,
+            &worktree(&detached_output),
+        )
+        .unwrap();
         assert_eq!(
             capture_lossless_git_repository(
-                &detached_output,
+                &worktree(&detached_output),
                 RepositoryId::new("detached").unwrap(),
                 &fixture.blob_store,
             )
@@ -2422,10 +2788,11 @@ mod tests {
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let repository_id = RepositoryId::new("unborn").unwrap();
         let snapshot =
-            capture_lossless_git_repository(&source, repository_id, &blob_store).unwrap();
+            capture_lossless_git_repository(&worktree(&source), repository_id, &blob_store)
+                .unwrap();
 
         let output = root.path().join("rehydrated.git");
-        let error = rehydrate_lossless_git_repository(&snapshot, &blob_store, &output)
+        let error = rehydrate_lossless_git_repository(&snapshot, &blob_store, &worktree(&output))
             .expect_err("retained-capability publication must fail closed off unix");
         assert!(
             error.to_string().contains("unsupported on this platform"),
@@ -2444,7 +2811,8 @@ mod tests {
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let repository_id = RepositoryId::new("unborn").unwrap();
         let snapshot =
-            capture_lossless_git_repository(&source, repository_id.clone(), &blob_store).unwrap();
+            capture_lossless_git_repository(&worktree(&source), repository_id.clone(), &blob_store)
+                .unwrap();
 
         assert!(snapshot.objects.is_empty());
         assert!(snapshot.refs.refs.is_empty());
@@ -2458,9 +2826,10 @@ mod tests {
         ));
 
         let output = root.path().join("rehydrated.git");
-        rehydrate_lossless_git_repository(&snapshot, &blob_store, &output).unwrap();
+        rehydrate_lossless_git_repository(&snapshot, &blob_store, &worktree(&output)).unwrap();
         let recaptured =
-            capture_lossless_git_repository(&output, repository_id, &blob_store).unwrap();
+            capture_lossless_git_repository(&worktree(&output), repository_id, &blob_store)
+                .unwrap();
         assert_eq!(recaptured, snapshot);
     }
 
@@ -2468,7 +2837,7 @@ mod tests {
     fn tampered_descriptor_and_cas_body_fail_before_destination_publication() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("tamper").unwrap(),
             &fixture.blob_store,
         )
@@ -2481,7 +2850,7 @@ mod tests {
             rehydrate_lossless_git_repository(
                 &descriptor_tamper,
                 &fixture.blob_store,
-                &descriptor_output
+                &worktree(&descriptor_output)
             ),
             Err(GitError::InvalidSnapshot(_))
         ));
@@ -2491,7 +2860,11 @@ mod tests {
         fs::write(cas_path(&fixture.cas_root, &corrupt.body_hash), b"tampered").unwrap();
         let cas_output = fixture._root.path().join("cas.git");
         assert!(matches!(
-            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &cas_output),
+            rehydrate_lossless_git_repository(
+                &snapshot,
+                &fixture.blob_store,
+                &worktree(&cas_output)
+            ),
             Err(GitError::Blob(_))
         ));
         assert!(!cas_output.exists());
@@ -2501,7 +2874,7 @@ mod tests {
     fn a_shared_closure_is_byte_identical_to_a_rebuild() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("byte-identical").unwrap(),
             &fixture.blob_store,
         )
@@ -2539,7 +2912,7 @@ mod tests {
     fn a_warm_shared_closure_never_satisfies_rehydrations_cas_proof() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("warm-closure").unwrap(),
             &fixture.blob_store,
         )
@@ -2583,7 +2956,7 @@ mod tests {
         // exporting from bytes nobody re-read.
         let output = fixture._root.path().join("warm-closure.git");
         assert!(matches!(
-            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &output),
+            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &worktree(&output)),
             Err(GitError::Blob(kin_blobs::BlobError::NotFound { .. }))
         ));
         assert!(!output.exists());
@@ -2599,7 +2972,7 @@ mod tests {
     fn a_validated_closure_holds_every_non_blob_body_and_no_blob_body() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("resident-bytes").unwrap(),
             &fixture.blob_store,
         )
@@ -2645,7 +3018,7 @@ mod tests {
     fn a_body_request_for_an_undescribed_object_fails_rather_than_answering_absent() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("undescribed").unwrap(),
             &fixture.blob_store,
         )
@@ -2672,7 +3045,7 @@ mod tests {
     fn a_blob_body_is_re_read_from_the_cas_and_re_validated() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("blob-reread").unwrap(),
             &fixture.blob_store,
         )
@@ -2707,7 +3080,7 @@ mod tests {
     fn an_object_no_ref_reaches_is_refused_even_when_no_body_is_resident() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("unreachable-blob").unwrap(),
             &fixture.blob_store,
         )
@@ -2729,7 +3102,7 @@ mod tests {
         git_ok(&fixture.repo, ["add", "later.txt"]);
         git_ok(&fixture.repo, ["commit", "-m", "later"]);
         let later = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("unreachable-blob-later").unwrap(),
             &fixture.blob_store,
         )
@@ -2785,7 +3158,7 @@ mod tests {
         git_ok(&fixture.repo, ["add", "second.txt"]);
         git_ok(&fixture.repo, ["commit", "-m", "second"]);
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("lying-descriptor").unwrap(),
             &fixture.blob_store,
         )
@@ -2837,7 +3210,7 @@ mod tests {
     fn missing_cas_body_and_existing_destination_fail_closed() {
         let fixture = Fixture::simple();
         let snapshot = capture_lossless_git_repository(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             RepositoryId::new("missing-cas").unwrap(),
             &fixture.blob_store,
         )
@@ -2846,7 +3219,7 @@ mod tests {
         let existing = fixture._root.path().join("existing");
         fs::create_dir(&existing).unwrap();
         assert!(matches!(
-            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &existing),
+            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &worktree(&existing)),
             Err(GitError::DestinationExists(_))
         ));
 
@@ -2856,7 +3229,11 @@ mod tests {
             .unwrap();
         let missing_output = fixture._root.path().join("missing-cas.git");
         assert!(matches!(
-            rehydrate_lossless_git_repository(&snapshot, &fixture.blob_store, &missing_output),
+            rehydrate_lossless_git_repository(
+                &snapshot,
+                &fixture.blob_store,
+                &worktree(&missing_output)
+            ),
             Err(GitError::Blob(kin_blobs::BlobError::NotFound { .. }))
         ));
         assert!(!missing_output.exists());
@@ -2871,7 +3248,7 @@ mod tests {
         fs::remove_file(&object_path).unwrap();
         assert!(matches!(
             capture_lossless_git_repository(
-                &missing.repo,
+                &worktree(&missing.repo),
                 RepositoryId::new("missing").unwrap(),
                 &missing.blob_store,
             ),
@@ -2886,7 +3263,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             capture_lossless_git_repository(
-                &shallow.repo,
+                &worktree(&shallow.repo),
                 RepositoryId::new("shallow").unwrap(),
                 &shallow.blob_store,
             ),
@@ -2920,22 +3297,21 @@ mod tests {
         let root = tempdir().unwrap();
         let source = root.path().join("sha256-source");
         fs::create_dir(&source).unwrap();
-        git_ok(
-            &source,
-            ["init", "--object-format=sha256", "--initial-branch=main"],
-        );
-        configure_git(&source);
         write(
             &source,
             "compose.yaml",
             b"services:\n  api:\n    image: kin\n",
         );
         write(&source, "src/main.rs", b"fn main() {}\n");
-        git_ok(&source, ["add", "--all"]);
-        git_ok(&source, ["commit", "-m", "sha256 source"]);
+        let mut seed = FixtureGitBatch::new();
+        seed.git(["init", "--object-format=sha256", "--initial-branch=main"]);
+        configure_git_steps(&mut seed);
+        seed.git(["add", "--all"])
+            .git(["commit", "-m", "sha256 source"])
+            .run_in(&source);
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &source,
+            &worktree(&source),
             RepositoryId::new("sha256").unwrap(),
             &blob_store,
         )
@@ -2950,19 +3326,25 @@ mod tests {
 
         let output = root.path().join("sha256.git");
         assert!(matches!(
-            rehydrate_lossless_git_repository(&snapshot, &blob_store, &output),
+            rehydrate_lossless_git_repository(&snapshot, &blob_store, &worktree(&output)),
             Err(GitError::UnsupportedObjectFormat(format)) if format == "sha256"
         ));
         assert!(!output.exists());
     }
 
-    fn configure_git(repo: &Path) {
-        git_ok(repo, ["config", "user.name", "Kin Test"]);
-        git_ok(repo, ["config", "user.email", "kin@example.invalid"]);
-        git_ok(repo, ["config", "commit.gpgsign", "false"]);
-        git_ok(repo, ["config", "tag.gpgsign", "false"]);
-        git_ok(repo, ["config", "core.autocrlf", "false"]);
-        git_ok(repo, ["config", "core.filemode", "true"]);
+    fn configure_git_steps(batch: &mut FixtureGitBatch) {
+        batch
+            .git(["config", "user.name", "Kin Test"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "commit.gpgsign", "false"])
+            .git(["config", "tag.gpgsign", "false"])
+            .git(["config", "core.autocrlf", "false"])
+            .git(["config", "core.filemode", "true"]);
+    }
+
+    /// A batch's kept standard output as one trimmed line of text.
+    fn batch_text(stdout: Vec<u8>) -> String {
+        String::from_utf8(stdout).unwrap().trim().to_string()
     }
 
     fn write(repo: &Path, path: &str, body: &[u8]) {

@@ -14,6 +14,8 @@
 // long-sequence parity check is `#[ignore]`d (needs a GPU; serialize to one
 // workstream); run it with `-- --ignored` under the metal feature.
 
+#![cfg(feature = "engine")]
+
 use kin_infer::gpu::{CpuCompute, GpuCompute};
 
 #[test]

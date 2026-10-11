@@ -21,8 +21,53 @@ impl LanguageAdapter for JavaScriptAdapter {
         LanguageId::JavaScript
     }
 
+    fn declaration_lifecycle(
+        &self,
+    ) -> Option<&dyn crate::declaration_lifecycle::DeclarationLifecycle> {
+        Some(&super::ecmascript_edit::JAVASCRIPT_LIFECYCLE)
+    }
+
+    fn member_placement(&self) -> Option<&dyn crate::member_placement::MemberPlacement> {
+        Some(&super::ecmascript_edit::JAVASCRIPT_PLACEMENT)
+    }
+
+    fn unit_editor(&self) -> Option<&dyn crate::unit_editor::UnitEditor> {
+        Some(&super::ecmascript_edit::JAVASCRIPT_UNITS)
+    }
+
+    fn site_syntax(&self) -> Option<crate::site_syntax::SiteSyntax> {
+        Some(crate::site_syntax::ECMASCRIPT)
+    }
+
+    fn body_syntax(&self) -> Option<crate::body_syntax::BodySyntax> {
+        Some(crate::body_syntax::ECMASCRIPT)
+    }
+
+    fn name_syntax(&self) -> Option<crate::name_syntax::NameSyntax> {
+        Some(crate::name_syntax::ECMASCRIPT)
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["js", "jsx", "mjs", "cjs"]
+    }
+
+    fn project_manifest(&self) -> Option<crate::project_manifest::ProjectManifest> {
+        Some(crate::project_manifest::PACKAGE_JSON)
+    }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::ecmascript_declarations::ecmascript_declaration_census(tree, source))
+    }
+
+    fn import_specifier_root(
+        &self,
+        module_path: &str,
+    ) -> crate::import_origin::ImportSpecifierRoot {
+        crate::import_origin::ecmascript_specifier_root(module_path)
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
@@ -86,6 +131,19 @@ impl LanguageAdapter for JavaScriptAdapter {
             extract_js_tests_from_node(&child, source, &mut tests);
         }
 
+        // Definitions nested in function bodies, after the declaration walk so
+        // every entity that can hold one already exists.
+        let (module_name, is_package) = js_module_identity(&file_id.0, JS_SUFFIXES);
+        let nested_definitions = super::javascript_nested::extract_js_nested_definitions(
+            &root,
+            source,
+            file_id,
+            super::javascript_nested::JsDialect::JavaScript,
+            &module_name,
+            &mut entities,
+            &mut relations,
+        );
+
         // Emitted after the walk and BEFORE `owners.finish`, and both halves of
         // that are load-bearing.
         //
@@ -114,7 +172,6 @@ impl LanguageAdapter for JavaScriptAdapter {
         // reported the file as parsed, so a comment-only or unreadable file
         // read `javascript 4/4` on the doctor's parse-coverage row and the
         // parse-hole census could not name it.
-        let (module_name, is_package) = js_module_identity(&file_id.0, JS_SUFFIXES);
         let produced_surface =
             !entities.is_empty() || !imports.is_empty() || !derived_members.is_empty();
         if produced_surface && !module_name.is_empty() {
@@ -133,6 +190,14 @@ impl LanguageAdapter for JavaScriptAdapter {
                 declaration_line: None,
             });
         }
+
+        // Calls no declaration walk reached, above all the ones in the
+        // callbacks of file-scope code (`describe(() => { it(() => ...) })`),
+        // each charged to the innermost entity holding it. After the module
+        // is pushed, since file-scope code has no other owner, and before
+        // `owners.finish`, whose stand-in owners span a statement they do not
+        // own.
+        adopt_js_unowned_calls(&root, source, &entities, &mut relations);
 
         if !derived_members.is_empty() {
             let sites = derived_members
@@ -189,6 +254,15 @@ impl LanguageAdapter for JavaScriptAdapter {
 
         super::javascript_imported_receiver::annotate(root, source, &mut relations);
 
+        // Every reader above saw the spans it was written against. Module
+        // containment, below, names each child by its span, so it reads the
+        // widened ones.
+        super::ecmascript_extent::widen_to_statements(&root, file_id, &mut entities);
+
+        // The unit's module owns what is declared at its top.
+        let held = crate::module_contains::module_contains(&entities, &relations, file_id);
+        relations.extend(held);
+
         Ok(ParseOutput {
             entities,
             derived_members,
@@ -197,20 +271,10 @@ impl LanguageAdapter for JavaScriptAdapter {
             tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: Some(nested_definitions),
         })
     }
 }
-
-/// The share of a file's bytes the JavaScript grammar may leave unparsed before
-/// the file is treated as written in a dialect that grammar cannot read.
-///
-/// A file with a real syntax error loses a statement or two around the typo. A
-/// file whose whole annotation vocabulary the grammar lacks loses a large share
-/// of itself, because tree-sitter's error recovery swallows the declarations
-/// around every construct it cannot match. The two are far enough apart that
-/// the exact threshold is not delicate; it is set well above what a typo costs
-/// and well below what a missing dialect costs.
-const JS_GRAMMAR_MISMATCH_RATIO: f64 = 0.10;
 
 /// Parse a `.js`, `.jsx`, `.mjs` or `.cjs` file with the grammar that can read
 /// it.
@@ -231,28 +295,24 @@ const JS_GRAMMAR_MISMATCH_RATIO: f64 = 0.10;
 /// A clean JavaScript parse returns immediately, so a file with no Flow syntax
 /// pays nothing and its extraction is byte-for-byte what it was.
 ///
+/// Any error in the JavaScript parse offers the file to the other grammars, and
+/// the tree that leaves the fewest bytes unparsed is kept. The offer used to
+/// need a `@flow` pragma or a tenth of the file unparsed, and that left files
+/// the TSX grammar reads whole on the JavaScript tree: measured on React, 42 of
+/// the 174 `.js` files parsed around a syntax error parse whole with TSX, none
+/// carries the pragma, and two are tests whose JSX writes `class` as an
+/// attribute, which the JavaScript grammar cannot read, so its root is an ERROR
+/// node over 432 KB. The JavaScript tree stays a candidate and wins ties, so a
+/// file the other grammars read no better keeps it.
+///
 /// TypeScript does not accept every Flow annotation, so when the winning grammar
 /// still cannot read the file, [`repair_flow_constructs`] is given a turn.
 pub fn parse_javascript_family(source: &[u8]) -> Result<Tree> {
     let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source)?;
-    // `has_error` rather than a zero byte total, because the total exempts the
-    // root and a file whose only fault is an unlocalized top-level one would
-    // otherwise score zero and never be offered a second grammar.
     if !javascript.root_node().has_error() {
         return Ok(javascript);
     }
     let unparsed = unparsed_byte_total(&javascript);
-
-    // Two independent triggers, because neither alone is enough. The pragma is
-    // Flow's own declaration and catches a header-only file whose few
-    // annotations sit under the ratio. The ratio catches a Flow file that never
-    // wrote the pragma, which is most of a codebase once one `.flowconfig` at
-    // the root turns the checker on for every file under it.
-    let mismatched = declares_flow_pragma(source)
-        || unparsed as f64 >= source.len() as f64 * JS_GRAMMAR_MISMATCH_RATIO;
-    if !mismatched {
-        return Ok(javascript);
-    }
 
     // TSX first, and a tie keeps the tree already in hand. Flow files carry JSX
     // far more often than they carry a form only the non-JSX grammar accepts, so
@@ -387,8 +447,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Bytes covered by the outermost ERROR and MISSING nodes in `tree`, not
-/// counting the root.
+/// Bytes covered by the outermost ERROR and MISSING nodes in `tree`, with a
+/// root ERROR charged for what it could not place but never for its whole
+/// span.
 ///
 /// Outermost, which is why this does not reuse `collect_error_ranges`: that
 /// walker recurses through an ERROR node's own children, so a nested error is
@@ -396,22 +457,32 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// This total is compared between grammars to pick one, so it has to mean the
 /// same thing in each of them.
 ///
-/// The root is exempt, and that exemption is the whole measurement on the files
-/// this matters most for. Tree-sitter kinds the ROOT node ERROR whenever a file
-/// carries a top-level error it could not localize, however much of the file
-/// parsed: React's `ReactFiberHooks.js` has an ERROR root over 409 children, 400
-/// of which are clean import and declaration nodes. Counting the root's own span
-/// scores every such file as entirely unparsed under every grammar, which makes
-/// each of them look equally bad and leaves the file on the grammar that reads
-/// it worst.
-fn unparsed_byte_total(tree: &Tree) -> usize {
-    outermost_error_ranges(tree)
+/// Tree-sitter kinds the ROOT node ERROR whenever a file carries a top-level
+/// error it could not localize, however much of the file parsed: React's
+/// `ReactFiberHooks.js` has an ERROR root over 409 children, 400 of which are
+/// clean import and declaration nodes. Charging the root's own span would score
+/// every such file as entirely unparsed under every grammar, which makes each
+/// of them look equally bad and leaves the file on the grammar that reads it
+/// worst. So a root ERROR is charged what it holds that no rule placed: its
+/// error children, the bare tokens directly under it, and the errors inside its
+/// other children. And it is never free: a tree whose root is an ERROR scores
+/// at least one byte, so it never ties a tree that parsed whole. Exempting the
+/// root outright scored a JavaScript tree with an ERROR root and no other error
+/// as zero, which ended the search for a grammar before TSX was asked.
+pub(super) fn unparsed_byte_total(tree: &Tree) -> usize {
+    let total: usize = outermost_error_ranges(tree)
         .iter()
         .map(|(start, end)| end.saturating_sub(*start))
-        .sum()
+        .sum();
+    if tree.root_node().is_error() {
+        total.max(1)
+    } else {
+        total
+    }
 }
 
-/// The outermost ERROR and MISSING spans in `tree`, root exempt.
+/// The outermost ERROR and MISSING spans in `tree`, and under a root ERROR the
+/// bare tokens it holds directly, which no rule placed.
 ///
 /// The repair below reads the same set [`unparsed_byte_total`] sums, so the two
 /// share this walk rather than each keeping their own. A repair that looked at a
@@ -429,10 +500,15 @@ fn outermost_error_ranges(tree: &Tree) -> Vec<(usize, usize)> {
         }
     }
     let root = tree.root_node();
+    let root_error = root.is_error();
     let mut out = Vec::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        walk(&child, &mut out);
+        if root_error && !child.is_named() && !child.is_extra() {
+            out.push((child.start_byte(), child.end_byte()));
+        } else {
+            walk(&child, &mut out);
+        }
     }
     out
 }
@@ -1096,7 +1172,10 @@ fn top_level_declaration_count(tree: &Tree) -> usize {
 }
 
 /// Parse `source` with one grammar.
-fn parse_with(language: &tree_sitter_language::LanguageFn, source: &[u8]) -> Result<Tree> {
+pub(super) fn parse_with(
+    language: &tree_sitter_language::LanguageFn,
+    source: &[u8],
+) -> Result<Tree> {
     make_parser(language)?.parse(source, None).ok_or_else(|| {
         crate::error::ParseError::ParseFailed {
             file: String::new(),
@@ -1144,6 +1223,20 @@ impl JsOwners {
                 declaration_line: None,
             });
         }
+    }
+
+    /// Merge a lexical scope's deferred owners using the same name mapping
+    /// as its entities and relations. Defer synthesis until the whole file
+    /// is known, so an outer binding declared later is still recognized.
+    pub(super) fn extend_renamed(&mut self, other: Self, rename: impl Fn(&str) -> String) {
+        self.names
+            .extend(other.names.iter().map(|name| rename(name)));
+        self.synthesized
+            .extend(other.synthesized.into_iter().map(|mut entity| {
+                entity.name = rename(&entity.name);
+                entity.signature = format!("object {}", entity.name);
+                entity
+            }));
     }
 
     pub(super) fn finish(self, entities: &mut Vec<ExtractedEntity>) {
@@ -1540,7 +1633,9 @@ fn extract_js_node(
     definers: &std::collections::HashMap<String, JsPropertyDefiner>,
 ) {
     match node.kind() {
-        "function_declaration" | "function" => {
+        // A generator (`function* f()`) is a function like any other; its
+        // grammar kind differs only by the star.
+        "function_declaration" | "generator_function_declaration" | "function" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
@@ -1750,7 +1845,7 @@ fn extract_js_node(
     }
 }
 
-fn is_js_function_like_node(node: &tree_sitter::Node) -> bool {
+pub(super) fn is_js_function_like_node(node: &tree_sitter::Node) -> bool {
     matches!(
         node.kind(),
         "function_expression" | "function" | "arrow_function" | "generator_function"
@@ -2203,35 +2298,59 @@ pub(super) fn extract_js_object_methods(
         return;
     }
     for (property_name, function_node) in js_object_literal_methods(object, source) {
-        let qualified = format!("{owner}.{property_name}");
         owners.record(owner, object, source, file_id);
-        entities.push(ExtractedEntity {
-            kind: EntityKind::Method,
-            name: qualified.clone(),
-            signature: node_signature(&function_node, source),
-            visibility: Visibility::Public,
-            doc_summary: extract_preceding_comment(&function_node, source),
-            fingerprint: compute_fingerprint(&function_node, source),
-            span: span_from_node(&function_node, file_id),
-            declaration_line: None,
-        });
-        relations.push(ExtractedRelation {
-            site: None,
-            receiver: None,
-            call_shape: None,
-            kind: kin_model::RelationKind::Contains,
-            src_name: owner.to_string(),
-            dst_name: qualified.clone(),
-            import_source: None,
-        });
-        extract_calls_from_context(&function_node, source, &qualified, Some(owner), relations);
+        push_js_object_method(
+            owner,
+            &property_name,
+            &function_node,
+            source,
+            file_id,
+            entities,
+            relations,
+        );
     }
+}
+
+/// One function-valued property of an object literal owned by `owner`, as a
+/// `Method` entity, the `Contains` edge from its owner, and the calls its body
+/// makes. The owner is taken as already validated: a module-level binding by
+/// [`js_method_owner`], a nested one by the local-scope rule that named it.
+pub(super) fn push_js_object_method(
+    owner: &str,
+    property_name: &str,
+    function_node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let qualified = format!("{owner}.{property_name}");
+    entities.push(ExtractedEntity {
+        kind: EntityKind::Method,
+        name: qualified.clone(),
+        signature: node_signature(function_node, source),
+        visibility: Visibility::Public,
+        doc_summary: extract_preceding_comment(function_node, source),
+        fingerprint: compute_fingerprint(function_node, source),
+        span: span_from_node(function_node, file_id),
+        declaration_line: None,
+    });
+    relations.push(ExtractedRelation {
+        site: None,
+        receiver: None,
+        call_shape: None,
+        kind: kin_model::RelationKind::Contains,
+        src_name: owner.to_string(),
+        dst_name: qualified.clone(),
+        import_source: None,
+    });
+    extract_calls_from_context(function_node, source, &qualified, Some(owner), relations);
 }
 
 /// Extract a class entity, its `Extends` edge, and its members. Shared by
 /// `class Foo {}` and `const Foo = class {}`, which differ only in where the
 /// name comes from.
-fn extract_js_class_like(
+pub(super) fn extract_js_class_like(
     node: &tree_sitter::Node,
     name: &str,
     source: &[u8],
@@ -2285,25 +2404,31 @@ fn extract_js_class_like(
     let mut body_cursor = body.walk();
     for member in body.children(&mut body_cursor) {
         // `method_definition` covers methods, getters, setters and static
-        // members. `field_definition` is a method only when its value is a
-        // function (`handleClick = () => {}`, the React class-property form);
-        // a data field is not a callable and stays out of the graph. The
-        // grammar gives `field_definition` no `name`/`value` fields, so its
-        // parts are read positionally: the property first, the initializer last.
-        let name_node = match member.kind() {
-            "method_definition" => member.child_by_field_name("name"),
+        // members. `field_definition` is a method when its value is a
+        // function (`handleClick = () => {}`, the React class-property form)
+        // and a field otherwise (`balance = 0`, `#count`). The grammar gives
+        // `field_definition` no `name`/`value` fields, so its parts are read
+        // positionally: the property first, the initializer last.
+        let (name_node, kind) = match member.kind() {
+            "method_definition" => (member.child_by_field_name("name"), EntityKind::Method),
             "field_definition" => {
                 let mut field_cursor = member.walk();
                 let parts: Vec<tree_sitter::Node> =
                     member.named_children(&mut field_cursor).collect();
-                match parts.last() {
-                    Some(initializer) if is_js_function_like_node(initializer) => {
-                        parts.first().copied()
-                    }
-                    _ => None,
-                }
+                let callable = parts.len() > 1
+                    && parts
+                        .last()
+                        .is_some_and(|initializer| is_js_function_like_node(initializer));
+                (
+                    parts.first().copied(),
+                    if callable {
+                        EntityKind::Method
+                    } else {
+                        EntityKind::Field
+                    },
+                )
             }
-            _ => None,
+            _ => (None, EntityKind::Method),
         };
         let Some(method_name) = name_node
             .and_then(|n| n.utf8_text(source).ok())
@@ -2313,7 +2438,7 @@ fn extract_js_class_like(
         };
         let qualified = format!("{name}.{method_name}");
         entities.push(ExtractedEntity {
-            kind: EntityKind::Method,
+            kind,
             name: qualified.clone(),
             signature: node_signature(&member, source),
             visibility: Visibility::Public,
@@ -2332,7 +2457,9 @@ fn extract_js_class_like(
             import_source: None,
         });
         // Extract calls within method body
-        extract_calls_from_context(&member, source, &qualified, Some(name), relations);
+        if kind == EntityKind::Method {
+            extract_calls_from_context(&member, source, &qualified, Some(name), relations);
+        }
     }
 }
 
@@ -2370,7 +2497,7 @@ fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
     crate::adapter::declaration_signature(node, source)
 }
 
-fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+pub(super) fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let prev = node.prev_sibling()?;
     if prev.kind() == "comment" {
         let text = prev.utf8_text(source).ok()?;
@@ -2489,7 +2616,7 @@ pub(super) fn extract_calls_from_context(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
-            if let Some(function) = child.child_by_field_name("function") {
+            if let Some(function) = child.child_by_field_name("function").map(js_callee_node) {
                 let (callee_name, receiver) = match function.kind() {
                     "member_expression" => {
                         let property = function
@@ -2527,6 +2654,51 @@ pub(super) fn extract_calls_from_context(
         }
         extract_calls_from_context(&child, source, context_name, owner, relations);
     }
+}
+
+/// The expression a call's `function` field calls through.
+///
+/// TypeScript's grammar reads `await parseBody<T>(request)` as a call whose
+/// function is `await parseBody`: with type arguments between the name and
+/// the arguments, `await` binds to the name. Unparenthesized, an
+/// `await_expression` is a callee only in that reading (`(await f)()` is a
+/// `parenthesized_expression`), so its operand is the function called, and
+/// the call is the awaited value. An `instantiation_expression` (`f<T>`) calls
+/// the function it instantiates. Every other callee is itself.
+pub(crate) fn js_callee_node(function: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut callee = function;
+    while matches!(
+        callee.kind(),
+        "await_expression" | "instantiation_expression"
+    ) {
+        match callee.named_child(0) {
+            Some(inner) => callee = inner,
+            None => break,
+        }
+    }
+    callee
+}
+
+/// Charge every call the declaration walks left without a caller to the
+/// innermost admitted entity holding it; see [`crate::call_owner`].
+///
+/// The declaration walks start only at a declaration, so a call in file-scope
+/// code, including every call in a callback that code passes (a test file's
+/// `describe` and `it` bodies), reached no relation. Shared by the JavaScript
+/// and TypeScript walks, which run the same call walk.
+pub(super) fn adopt_js_unowned_calls(
+    root: &tree_sitter::Node,
+    source: &[u8],
+    entities: &[ExtractedEntity],
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let accounted = crate::call_owner::accounted_call_sites(relations);
+    let mut swept = Vec::new();
+    extract_calls_from_context(root, source, "", None, &mut swept);
+    // A file-scope `require(...)` loads a module, which the file's imports
+    // already carry, and no declaration in the repository could be its target.
+    swept.retain(|relation| relation.dst_name != "require" || relation.receiver.is_some());
+    crate::call_owner::adopt_unowned_calls(entities, &accounted, swept, relations);
 }
 
 /// Check if a callee name is valid (not a literal, not empty).
@@ -2618,6 +2790,11 @@ fn extract_js_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
             "export_clause" | "named_exports" => {
                 extract_js_export_specifiers(&child, source, &mut specifiers);
             }
+            "namespace_export" => {
+                if let Some(namespace) = namespace_export_name(&child, source) {
+                    specifiers.push(namespace);
+                }
+            }
             _ => {}
         }
     }
@@ -2641,6 +2818,35 @@ fn extract_js_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
         site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
+    })
+}
+
+/// The one name `export * as ns from './x'` binds.
+///
+/// The statement hands on a single binding, the module's namespace object,
+/// and none of the module's own exports. It is recorded the way a namespace
+/// import is (`local_name = ns`, `original_name = "*"`), so it can never be
+/// read as `export * from './x'`, whose specifier is the bare `*`. Reading it
+/// as that would make every export of `./x` look like an export of this file.
+pub(super) fn namespace_export_name(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<ImportedName> {
+    let name = node.named_child(0)?;
+    let text = name
+        .utf8_text(source)
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(ImportedName {
+        local_name: text,
+        original_name: Some("*".to_string()),
+        is_default: false,
+        site: Some(crate::adapter::site_from_node(&name)),
     })
 }
 
@@ -3300,11 +3506,11 @@ export function renderList(items: Array<string>): Node {
         assert!(named(&output, EntityKind::Class, "Box"));
     }
 
-    /// The second trigger, on a Flow file that never wrote the pragma. One
+    /// A Flow file that never wrote the pragma. One
     /// `.flowconfig` at a repo root turns Flow on for every file under it, so
     /// most Flow files carry no header of their own.
     #[test]
-    fn a_pragma_less_flow_file_is_caught_by_the_error_ratio() {
+    fn a_pragma_less_flow_file_reaches_the_typescript_grammars() {
         let source: Vec<u8> = FLOW_SOURCE
             .strip_prefix(b"/**\n * @flow strict-local\n */\n")
             .expect("fixture header")
@@ -3317,22 +3523,17 @@ export function renderList(items: Array<string>): Node {
         assert!(tree_is_typescript_family(&tree));
     }
 
-    /// The pragma's own contribution, isolated from the error ratio.
+    /// A lightly annotated Flow file, whose one Flow declaration leaves the
+    /// JavaScript parse at about 2% unparsed. It used to reach the TypeScript
+    /// grammars only through its pragma; any error now offers it to them.
     ///
-    /// The file is mostly plain JavaScript, so its one Flow declaration leaves
-    /// the JavaScript parse at about 2% unparsed, well under
-    /// [`JS_GRAMMAR_MISMATCH_RATIO`]. The ratio trigger cannot fire and the
-    /// pragma is the only thing that can route the file, which is what makes
-    /// deleting the pragma check fail HERE rather than nowhere.
-    ///
-    /// The generic function is the shape that makes this possible, and it took
-    /// finding: a `?Type` parameter, an `import type`, a `type` alias and an
-    /// `opaque type` all leave the JavaScript grammar's recovery local enough
-    /// that the declaration beside them survives, so a fixture built from any of
-    /// those passes with the pragma check deleted and proves nothing. `<T>` is
-    /// read as a comparison and takes the whole declaration down with it.
+    /// The generic function is the shape that makes this a test: a `?Type`
+    /// parameter, an `import type`, a `type` alias and an `opaque type` all
+    /// leave the JavaScript grammar's recovery local enough that the
+    /// declaration beside them survives. `<T>` is read as a comparison and
+    /// takes the whole declaration down with it.
     #[test]
-    fn the_pragma_alone_routes_a_lightly_annotated_flow_file() {
+    fn a_lightly_annotated_flow_file_reaches_the_typescript_grammars() {
         let plain: String = (0..40)
             .map(|i| format!("function plain{i}(a, b) {{\n  return a + b + {i};\n}}\n\n"))
             .collect();
@@ -3347,10 +3548,7 @@ export function renderList(items: Array<string>): Node {
             "the generic declaration must defeat the JavaScript grammar"
         );
         let ratio = unparsed_byte_total(&javascript) as f64 / source.len() as f64;
-        assert!(
-            ratio < JS_GRAMMAR_MISMATCH_RATIO,
-            "the ratio trigger must NOT fire here or this stops being the pragma's test: {ratio}"
-        );
+        assert!(ratio < 0.10, "a lightly annotated file: {ratio}");
         assert!(declares_flow_pragma(source));
 
         let output = extract_source("src/pick.js", source);
@@ -3408,18 +3606,69 @@ export function renderList(items: Array<string>): Node {
         assert!(!declares_flow_pragma(b"/* unterminated"));
     }
 
-    /// The root's exemption from the byte total, which is what lets a file whose
-    /// top-level error tree-sitter could not localize be compared at all.
+    /// A root ERROR is charged for what it could not place and never for its
+    /// whole span, which is what lets a file whose top-level error tree-sitter
+    /// could not localize be compared at all; and it is never free, so a tree
+    /// that parsed whole always beats it.
     #[test]
-    fn the_error_total_exempts_the_root() {
-        // `A => mixed` is a Flow function type no grammar here accepts, and it
-        // makes tree-sitter kind the whole root ERROR.
-        let source = b"type D = A => mixed;\nfunction good(a) { return a; }\n";
+    fn the_error_total_charges_a_root_error_for_what_it_holds_not_its_span() {
+        // React DevTools' `initialize`, whose Flow parameter and return types
+        // the JavaScript grammar cannot read; written twice, tree-sitter kinds
+        // the whole root ERROR.
+        let initialize = "export function initialize(\n  contentWindow: any,\n  {\n    bridge,\n    \
+                          store,\n  }: {\n    bridge?: FrontendBridge,\n    store?: Store,\n  } = {},\n\
+                          ): component(...props: Props) {\n  return null;\n}\n";
+        let text = format!("function good(a) {{ return a; }}\n{}", initialize.repeat(2));
+        let source = text.as_bytes();
         let tree = parse_with(&tree_sitter_javascript::LANGUAGE, source).unwrap();
-        assert!(tree.root_node().has_error());
+        assert!(tree.root_node().is_error());
+        let total = unparsed_byte_total(&tree);
         assert!(
-            unparsed_byte_total(&tree) < source.len(),
+            total < source.len(),
             "the root's own span must not be charged to the file"
+        );
+        assert!(total > 0, "a root ERROR must never score as a clean parse");
+    }
+
+    /// The shape of React's DOM component tests: JSX that writes `class` as an
+    /// attribute, which the JavaScript grammar cannot read, in a file with no
+    /// Flow pragma and far under a tenth of its bytes unparsed. TSX reads it
+    /// whole, so the file is read with TSX, and it stays a JavaScript file.
+    #[test]
+    fn a_javascript_file_any_grammar_reads_better_is_read_with_that_grammar() {
+        let plain: String = (0..40)
+            .map(|i| format!("function plain{i}(a, b) {{\n  return a + b + {i};\n}}\n\n"))
+            .collect();
+        let text = format!(
+            "{plain}describe('component', () => {{\n  it('warns', async () => {{\n    \
+             root.render(<div class=\"paladin\" />);\n  }});\n}});\n"
+        );
+        let source = text.as_bytes();
+        assert!(!declares_flow_pragma(source));
+        let javascript = parse_with(&tree_sitter_javascript::LANGUAGE, source).unwrap();
+        assert!(
+            javascript.root_node().has_error(),
+            "the JavaScript grammar must fail here"
+        );
+        assert!(
+            unparsed_byte_total(&javascript) * 10 < source.len(),
+            "under a tenth unparsed, the file the old trigger never offered"
+        );
+
+        let tree = JavaScriptAdapter.parse(source).unwrap();
+        assert!(!tree.root_node().has_error(), "TSX reads the whole file");
+        // Read with TSX, extracted by the walk that tree takes, and still the
+        // JavaScript adapter's file.
+        assert!(tree_is_typescript_family(&tree));
+        assert_eq!(JavaScriptAdapter.language_id(), LanguageId::JavaScript);
+        let output = extract_source("src/__tests__/component-test.js", source);
+        assert_eq!(
+            output
+                .entities
+                .iter()
+                .filter(|e| e.name.starts_with("plain"))
+                .count(),
+            40
         );
     }
 
@@ -4159,7 +4408,9 @@ const run = (a) => a + 1;
             .filter(|r| r.kind == kin_model::RelationKind::Contains)
             .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
             .collect();
-        assert_eq!(contains, vec![("View", "View.lookup")]);
+        // The method assigned outside the class stays the class's; the
+        // unit's module holds the class.
+        assert_eq!(contains, vec![("View", "View.lookup"), ("test", "View")]);
     }
 
     /// Every minted `app.<method>` name, sorted, for the assertions below.
@@ -4866,6 +5117,29 @@ exports.static = require('serve-static');
     }
 
     #[test]
+    fn parse_js_namespace_reexport_binds_one_name_not_a_star() {
+        // `export * as ns` hands on the namespace object under one name. It
+        // must never read as `export * from`, which hands on every export.
+        let adapter = JavaScriptAdapter;
+        let source = b"export * as dom from './dom';\nexport * from './shared';";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        assert_eq!(output.imports.len(), 2);
+        let namespace = &output.imports[0];
+        assert_eq!(namespace.module_path, "./dom");
+        assert_eq!(namespace.specifiers.len(), 1);
+        assert_eq!(namespace.specifiers[0].local_name, "dom");
+        assert_eq!(namespace.specifiers[0].original_name.as_deref(), Some("*"));
+        assert!(namespace.specifiers[0].site.is_some());
+        let star = &output.imports[1];
+        assert_eq!(star.module_path, "./shared");
+        assert_eq!(star.specifiers.len(), 1);
+        assert_eq!(star.specifiers[0].local_name, "*");
+    }
+
+    #[test]
     fn parse_js_class_expression_binding() {
         // `const Foo = class extends Bar {}` is a class declaration wearing a
         // binding; it must produce the same shape as `class Foo extends Bar {}`.
@@ -5072,7 +5346,11 @@ exports.static = require('serve-static');
             .filter(|r| r.kind == kin_model::RelationKind::Contains)
             .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
             .collect();
-        assert_eq!(contains, vec![("handlers", "handlers.onClick")]);
+        // The unit's module, `test`, holds what is declared at its top.
+        assert_eq!(
+            contains,
+            vec![("handlers", "handlers.onClick"), ("test", "handlers")]
+        );
     }
 
     #[test]

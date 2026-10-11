@@ -15,10 +15,11 @@ from a tree-sitter or linker edge once `kin` commits it to the graph through `ki
 
 ## What is Kin?
 
-Kin is a graph-native code repository for people and AI agents: your code as a graph of
-entities, relations, and intents, not a pile of files and diffs. AI agents and humans
-navigate it semantically, with provenance, review, and governance built in. It coexists
-with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with them:
+your code as a graph of entities, relations, and intents, not a pile of files and diffs.
+AI agents and humans navigate it semantically, with provenance, review, and governance
+built in. It coexists with Git and projects graph truth back to a normal filesystem, so
+any tool works unchanged.
 
 Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
@@ -116,25 +117,29 @@ cargo test
 ```
 
 That runs unit tests across `src/`, including a scripted JSON-RPC peer that requires
-`python3` on `PATH`, plus 5 integration tests in `tests/` that drive a real
+`python3` on `PATH`, plus 4 integration tests in `tests/` that drive a real
 `rust-analyzer`. The scripted peer exercises error propagation, graph-source authority
 and cancellation-safe document cleanup without an installed language server.
 
 Every integration test looks for `rust-analyzer` on `PATH` first and returns early when
-it is missing. The three in `tests/rust_analyzer_integration.rs` also need a Rust
-workspace to point the server at, either a sibling `kin` checkout or the parent
-workspace, and skip when neither is there. The two in `tests/daemon_repro.rs` and
-`tests/max_enrichment_probe.rs` write a throwaway crate into the temp directory
-themselves, so a missing `rust-analyzer` is their only skip condition.
+it is missing. The handshake test in `tests/rust_analyzer_integration.rs` also needs a
+Rust workspace to point the server at, either a sibling `kin` checkout or the parent
+workspace, and skips when neither is there. The other test in that file, and the ones
+in `tests/daemon_repro.rs` and `tests/max_enrichment_probe.rs`, write a throwaway crate
+into the temp directory themselves, so a missing `rust-analyzer` is their only skip
+condition.
 
 A skip prints `SKIP` to stderr and passes. Without `rust-analyzer`, the suite still
 exercises the framed JSON-RPC path through the scripted peer, but it has not verified
 a real language server. Read the output before reading the pass as that coverage.
 
-The ones that do run are slow by design, since a server has to index before it can
-answer. `daemon_repro` and `max_enrichment_probe` each wait 25 seconds for indexing and
-then wait again after `didOpen`, 10 and 5 seconds respectively. The two
-`rust_analyzer_integration` tests that issue queries wait 10 and 20 seconds.
+A server has to load its project before it can answer, so the tests that query one
+start it the way the daemon does and wait on its own signals rather than a fixed pause:
+`LspServer::launch_settled` returns once rust-analyzer reports the crate loaded,
+`wait_until_indexed` confirms it, and `wait_for_document` returns once it answers about
+the file just opened. Each wait is bounded at 60 seconds, and each test then asserts
+what a ready server answers. rust-analyzer loads a throwaway crate, standard library
+included, in about three seconds.
 
 ## Ecosystem
 

@@ -33,6 +33,35 @@ use crate::init_attempt::InitAttemptJournal;
 /// a user, so [`PhaseProgress::finish`] asserts the two agree.
 pub(crate) const GIT_ADMISSION_PHASES: usize = 16;
 
+/// The complete Git admission ladder's phases, in the order it enters them.
+///
+/// For a caller that reports a ladder's progress somewhere other than stderr,
+/// such as the background history derivation's progress record, and only has
+/// the step number a compact observer hands it.
+pub const COMPLETE_ADMISSION_PHASE_LABELS: [&str; GIT_ADMISSION_PHASES] = [
+    "check admission blockers",
+    "capture Git repository",
+    "build Git authority",
+    "plan semantic import",
+    "derive semantic history",
+    "apply admission policy",
+    "prove Git source",
+    "stage repository layout",
+    "copy Git objects",
+    "seal staged content",
+    "build bootstrap transaction",
+    "commit bootstrap transaction",
+    "re-prove Git source",
+    "publish repository",
+    "prove Git source after publication",
+    "seal published content",
+];
+
+/// Phases of a conversion that admits the checked-out commit alone: the Git
+/// ladder without the Git-authority phase, since such a store records no Git
+/// history to hold authority over.
+pub(crate) const CURRENT_COMMIT_ADMISSION_PHASES: usize = 15;
+
 /// Erase the current line and return to column zero. Only ever written to a
 /// terminal, so a redirected log never receives escape bytes.
 const ERASE_LINE: &str = "\x1b[2K\r";
@@ -402,12 +431,16 @@ impl Ladder {
         if self.is_tty {
             self.write(format_args!(
                 "{ERASE_LINE}  [{:>2}/{}] {}...",
-                self.index, self.total, self.label
+                self.index,
+                self.total,
+                shown(self.label)
             ));
         } else {
             self.writeln(format_args!(
                 "  [{:>2}/{}] {}...",
-                self.index, self.total, self.label
+                self.index,
+                self.total,
+                shown(self.label)
             ));
         }
     }
@@ -425,7 +458,7 @@ impl Ladder {
                 "{ERASE_LINE}  [{:>2}/{}] {} {} | {:.1}s",
                 self.index,
                 self.total,
-                self.label,
+                shown(self.label),
                 detail,
                 self.phase_started.elapsed().as_secs_f64()
             ));
@@ -434,7 +467,7 @@ impl Ladder {
                 "  [{:>2}/{}] {} {} | {:.1}s",
                 self.index,
                 self.total,
-                self.label,
+                shown(self.label),
                 detail,
                 self.phase_started.elapsed().as_secs_f64()
             ));
@@ -451,7 +484,10 @@ impl Ladder {
         let prefix = if self.is_tty { ERASE_LINE } else { "" };
         self.writeln(format_args!(
             "{prefix}  [{:>2}/{}] {} {:.1}s",
-            self.index, self.total, self.label, elapsed
+            self.index,
+            self.total,
+            shown(self.label),
+            elapsed
         ));
     }
 
@@ -497,9 +533,54 @@ impl Ladder {
     }
 }
 
+/// The words a person reads for a phase.
+///
+/// The phase labels are recorded in the interrupted-attempt journal and read
+/// back by `kin doctor`, so they stay as they are; only what the terminal
+/// prints changes.
+pub fn shown(label: &str) -> &str {
+    match label {
+        "check admission blockers" => "check that the repository can be imported",
+        "capture Git repository" => "read the Git repository",
+        "capture checked-out commit" => "read the checked-out commit",
+        "build Git authority" => "record Git history and branches",
+        "plan semantic import" => "plan the import",
+        "derive semantic history" => "build the code history",
+        "apply admission policy" => "apply the file rules",
+        "prove Git source" => "verify the Git data",
+        "stage repository layout" => "prepare the Kin store",
+        "copy Git objects" => "copy Git objects",
+        "seal staged content" => "lock in the prepared content",
+        "build bootstrap transaction" => "prepare the first save",
+        "commit bootstrap transaction" => "make the first save",
+        "re-prove Git source" => "verify the Git data again",
+        "publish repository" => "publish the store",
+        "prove Git source after publication" => "verify the Git data after publishing",
+        "seal published content" => "lock in the published content",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_ladder_phase_has_words_a_person_reads() {
+        for label in [
+            "check admission blockers",
+            "derive semantic history",
+            "apply admission policy",
+            "build bootstrap transaction",
+        ] {
+            let said = shown(label);
+            assert_ne!(said, label);
+            assert!(
+                !said.contains("admission") && !said.contains("bootstrap"),
+                "{said}"
+            );
+        }
+    }
 
     /// A phase whose body is one blocking call still advances.
     ///

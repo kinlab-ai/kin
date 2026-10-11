@@ -3,10 +3,17 @@
 
 //! Probe: what's the maximum relationship data RA can give us?
 
-use kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
+use std::time::Duration;
+
+use kin_lsp::adapters::rust_analyzer::{cargo_layout, launch_for, RustAnalyzerAdapter};
 use kin_lsp::adapters::LspAdapter;
 use kin_lsp::lifecycle::LspServer;
 use kin_lsp::protocol;
+
+/// How long rust-analyzer is given to load the probe crate, and then to answer
+/// about its one document. Loading takes about three seconds, most of it the
+/// standard library; the bound is for a loaded host.
+const READY_BUDGET: Duration = Duration::from_secs(60);
 
 fn has_rust_analyzer() -> bool {
     which::which("rust-analyzer").is_ok()
@@ -23,7 +30,7 @@ async fn probe_all_lsp_endpoints() {
         return;
     }
 
-    let workspace = std::env::temp_dir().join("lsp-max-probe");
+    let workspace = std::env::temp_dir().join(format!("lsp-max-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&workspace);
     std::fs::create_dir_all(workspace.join("src")).unwrap();
     std::fs::write(
@@ -48,18 +55,29 @@ fn main() {
 "#;
     std::fs::write(workspace.join("src/main.rs"), src).unwrap();
 
+    // Started the way the daemon starts it, which waits for rust-analyzer to
+    // report the crate loaded, and then waited on until it reports itself
+    // indexed. This was a fixed 25 s sleep after a bare start.
     let adapter = RustAnalyzerAdapter;
-    let server = LspServer::start(
-        adapter.server_command(),
-        &[],
-        &workspace,
-        adapter.initialization_options(&workspace),
-        None,
+    let server = tokio::time::timeout(
+        READY_BUDGET,
+        LspServer::launch_settled(
+            adapter.server_command(),
+            &[],
+            &workspace,
+            &launch_for(cargo_layout(&workspace)),
+            None,
+        ),
     )
     .await
+    .expect("rust-analyzer reports the probe crate loaded within the budget")
     .unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+    let indexed = server.wait_until_indexed(READY_BUDGET).await;
+    assert_eq!(
+        indexed,
+        kin_lsp::lifecycle::Indexed::Quiescent,
+        "rust-analyzer says when it has finished loading, and the wait ends on that"
+    );
 
     let uri = protocol::path_to_uri(&workspace.join("src/main.rs"));
     server
@@ -72,7 +90,12 @@ fn main() {
         )
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // Until rust-analyzer answers about the document it may not have read it.
+    // This was a fixed 5 s sleep.
+    server
+        .wait_for_document(&uri, READY_BUDGET)
+        .await
+        .expect("rust-analyzer answers about a document it was just handed");
 
     // === 1. documentSymbol ===
     eprintln!("\n=== documentSymbol ===");
@@ -234,4 +257,20 @@ fn main() {
 
     server.shutdown().await.ok();
     let _ = std::fs::remove_dir_all(&workspace);
+
+    // What a ready server answers for this file, whatever the exact counts: a
+    // server asked before it was ready answers every one of these with nothing.
+    assert!(
+        symbol_count > 0,
+        "a ready rust-analyzer lists the file's symbols"
+    );
+    assert!(token_count > 0, "a ready rust-analyzer tokenizes the file");
+    assert!(
+        total_refs > 0,
+        "a ready rust-analyzer finds the file's references"
+    );
+    assert!(
+        total_defs > 0,
+        "a ready rust-analyzer resolves the file's definitions"
+    );
 }

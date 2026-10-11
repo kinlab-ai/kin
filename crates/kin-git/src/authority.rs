@@ -16,6 +16,11 @@ use kin_model::{
 use crate::error::{GitError, Result};
 use crate::lossless::{GitObjectFormat, LosslessGitRepository};
 
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 struct CaptureCasBodyLoader<'a> {
     store: &'a BlobStore,
 }
@@ -125,7 +130,8 @@ mod tests {
         let store = BlobStore::new(root.path().join("capture-cas")).unwrap();
         let repository_id = RepositoryId::new("authority-fixture").unwrap();
         let snapshot =
-            capture_lossless_git_repository(&repository, repository_id.clone(), &store).unwrap();
+            capture_lossless_git_repository(&worktree(&repository), repository_id.clone(), &store)
+                .unwrap();
 
         let authority = build_git_external_authority(&snapshot, &store).unwrap();
 

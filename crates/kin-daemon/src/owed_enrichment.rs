@@ -42,6 +42,12 @@ pub(crate) struct OwedFile {
     /// its record id, when the sweep knew it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) context: Option<String>,
+    /// A retained positive Reference lacks a current decisive site answer.
+    /// Same-input automatic retries cannot resolve this permanent gap.
+    #[serde(default)]
+    pub(crate) reference_uncertainty: bool,
+    #[serde(default)]
+    pub(crate) reference_retryable: bool,
 }
 
 /// Every owed file, by repository path.
@@ -108,6 +114,7 @@ pub(crate) fn retry_after(owed: &OwedFile, blob: &str, now_unix_s: u64) -> Optio
 /// request or shutdown arrives.
 pub(crate) fn next_retry_delay(owed: &OwedFiles, now_unix_s: u64) -> Option<Duration> {
     owed.values()
+        .filter(|file| !file.reference_uncertainty || file.reference_retryable)
         .map(|file| {
             let due = file
                 .last_attempt_unix_s
@@ -128,11 +135,22 @@ pub(crate) fn defer_unattempted(
 ) {
     let due: Vec<_> = owed
         .iter()
-        .filter(|(_, entry)| retry_after(entry, &entry.blob, due_before_unix_s).is_none())
+        .filter(|(_, entry)| {
+            (!entry.reference_uncertainty || entry.reference_retryable)
+                && retry_after(entry, &entry.blob, due_before_unix_s).is_none()
+        })
         .map(|(file, entry)| (file.clone(), entry.blob.clone()))
         .collect();
     for (file, blob) in due {
-        record_failure(owed, &file, &blob, None, reason.to_owned(), now_unix_s);
+        if let Some(entry) = owed
+            .get_mut(&file)
+            .filter(|entry| entry.reference_uncertainty)
+        {
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.last_attempt_unix_s = now_unix_s;
+        } else {
+            record_failure(owed, &file, &blob, None, reason.to_owned(), now_unix_s);
+        }
     }
 }
 
@@ -169,8 +187,58 @@ pub(crate) fn record_failure(
             last_attempt_unix_s: now_unix_s,
             reason,
             context: context.map(str::to_string),
+            reference_uncertainty: false,
+            reference_retryable: false,
         },
     );
+}
+
+/// Hold a permanent Reference gap without scheduling the same inputs again.
+pub(crate) fn record_reference_uncertainty(
+    owed: &mut OwedFiles,
+    file: &str,
+    blob: &str,
+    context: &str,
+    reason: String,
+    retryable: bool,
+) {
+    record_failure(owed, file, blob, Some(context), reason, now_unix_s());
+    let entry = owed.get_mut(file).expect("recorded obligation");
+    entry.reference_uncertainty = true;
+    entry.reference_retryable = retryable;
+}
+
+/// How many passes over the same bytes under the same proof context leave a
+/// file's Reference sites without a decisive answer before the last of them
+/// records those sites as undecided and the file settles.
+///
+/// Two: the pass that first found the sites undecided, and one more that asks
+/// again and gets the same answers. A sweep asks that second time itself,
+/// before it ends (see [`crate::sweep_retry::SweepFiles::confirm_undecided`]),
+/// so a store does not stay owed waiting for someone to ask.
+pub(crate) const REFERENCE_SETTLE_AFTER_PASSES: u32 = 2;
+
+/// Whether a pass over `file` at `blob` under `context` settles its open
+/// Reference sites as undecided: earlier passes over exactly these inputs
+/// already left them without a decisive answer that a retry could change, and
+/// this pass is the last one the bound allows. New bytes or a new context are
+/// a new question and settle nothing.
+pub(crate) fn reference_settles(owed: &OwedFiles, file: &str, blob: &str, context: &str) -> bool {
+    owed.get(file).is_some_and(|entry| {
+        entry.reference_uncertainty
+            && !entry.reference_retryable
+            && entry.blob == blob
+            && entry.context.as_deref() == Some(context)
+            && entry.attempts.saturating_add(1) >= REFERENCE_SETTLE_AFTER_PASSES
+    })
+}
+
+pub(crate) fn reference_uncertain(owed: &OwedFiles, file: &str, blob: &str, context: &str) -> bool {
+    owed.get(file).is_some_and(|entry| {
+        entry.reference_uncertainty
+            && entry.blob == blob
+            && entry.context.as_deref() == Some(context)
+    })
 }
 
 /// Whether the attempt a sweep is making now at `file`, over `blob` under
@@ -186,7 +254,8 @@ pub(crate) fn attempts_exhausted(
     let (Some(previous), Some(blob)) = (owed.get(file), blob) else {
         return false;
     };
-    previous.blob == blob
+    !reference_uncertain(owed, file, blob, context)
+        && previous.blob == blob
         && previous.context.as_deref() == Some(context)
         && previous.attempts.saturating_add(1) >= SETTLE_AFTER_ATTEMPTS
 }
@@ -213,48 +282,112 @@ pub(crate) fn load(layout: &KinLayout) -> OwedFiles {
 /// Replace the record with `owed`, through a staged file and a rename, and
 /// remove it when nothing is owed.
 pub(crate) fn persist(layout: &KinLayout, owed: &OwedFiles) {
+    if let Err(error) = persist_checked(layout, owed) {
+        warn!(%error, "could not write the owed language-server enrichment record");
+    }
+}
+
+pub(crate) fn persist_checked(layout: &KinLayout, owed: &OwedFiles) -> std::io::Result<()> {
     let target = path(layout);
     if owed.is_empty() {
-        match std::fs::remove_file(&target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(%error, "could not clear the owed language-server enrichment record")
-            }
-        }
-        return;
+        return match std::fs::remove_file(&target) {
+            Ok(()) => crate::state::sync_directory_metadata(layout.root()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
     }
-    let bytes = match serde_json::to_vec(owed) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            warn!(%error, "could not encode the owed language-server enrichment record");
-            return;
-        }
-    };
-    // Staged, synced, renamed and the directory synced, the same way the
-    // daemon's other records are replaced, so a crash leaves the old record or
-    // the new one and the rename survives a power loss.
+    let bytes = serde_json::to_vec(owed).map_err(std::io::Error::other)?;
     let staged = target.with_extension(format!("json.staged-{}", std::process::id()));
     let replaced = std::fs::File::create(&staged)
         .and_then(|mut file| {
             use std::io::Write as _;
             file.write_all(&bytes)?;
-            file.sync_all()
+            kin_blobs::durable::sync_all(&file)
         })
         .and_then(|()| std::fs::rename(&staged, &target))
-        .and_then(|()| match target.parent() {
-            Some(parent) => crate::state::sync_directory_metadata(parent),
-            None => Ok(()),
-        });
-    if let Err(error) = replaced {
+        .and_then(|()| crate::state::sync_directory_metadata(layout.root()));
+    if replaced.is_err() {
         let _ = std::fs::remove_file(&staged);
-        warn!(%error, "could not write the owed language-server enrichment record");
     }
+    replaced
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_uncertainty_is_durable_and_only_new_inputs_reopen_it() {
+        let old: OwedFile = serde_json::from_str(
+            r#"{"blob":"old","attempts":1,"last_attempt_unix_s":1,"reason":"no answer"}"#,
+        )
+        .unwrap();
+        assert!(!old.reference_uncertainty && !old.reference_retryable);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().join(".kin"));
+        std::fs::create_dir_all(layout.root()).unwrap();
+        let mut owed = OwedFiles::new();
+        record_reference_uncertainty(
+            &mut owed,
+            "reference.py",
+            "body",
+            "context",
+            "positive Reference needs decisive proof".into(),
+            false,
+        );
+        persist(&layout, &owed);
+        assert_eq!(load(&layout), owed);
+        assert!(reference_uncertain(
+            &owed,
+            "reference.py",
+            "body",
+            "context"
+        ));
+        assert!(!reference_uncertain(
+            &owed,
+            "reference.py",
+            "new body",
+            "context"
+        ));
+        assert!(!reference_uncertain(
+            &owed,
+            "reference.py",
+            "body",
+            "new context"
+        ));
+        assert_eq!(next_retry_delay(&owed, u64::MAX), None);
+        assert!(!attempts_exhausted(
+            &owed,
+            "reference.py",
+            Some("body"),
+            "context"
+        ));
+        defer_unattempted(&mut owed, u64::MAX, "sweep stopped", 4);
+        assert!(owed["reference.py"].reference_uncertainty);
+        record_reference_uncertainty(
+            &mut owed,
+            "reference.py",
+            "body",
+            "context",
+            "resolver timed out".into(),
+            true,
+        );
+        assert_eq!(next_retry_delay(&owed, u64::MAX), Some(Duration::ZERO));
+        defer_unattempted(&mut owed, u64::MAX, "not queried", 7);
+        assert!(
+            owed["reference.py"].reference_uncertainty && owed["reference.py"].reference_retryable
+        );
+        assert_eq!(owed["reference.py"].context.as_deref(), Some("context"));
+        record_failure(
+            &mut owed,
+            "reference.py",
+            "new body",
+            Some("context"),
+            "timeout".into(),
+            5,
+        );
+        assert!(!owed["reference.py"].reference_uncertainty);
+    }
 
     #[test]
     fn uses_type_retries_escalate_only_for_the_same_inputs_and_stay_bounded() {

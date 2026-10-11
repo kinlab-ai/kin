@@ -841,16 +841,14 @@ fn status_reports_enrichment_absent_on_an_unenriched_repository() {
 #[test]
 fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     seed_repository(&repo);
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let init = runtime
+        .kin_command()
         .args(["init", ".", "--json"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .current_dir(&repo)
         .output()
         .expect("run production kin init route");
@@ -860,13 +858,13 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
+    let layout = runtime.layout_for(&repo);
     let init_payload: serde_json::Value =
         serde_json::from_slice(&init.stdout).expect("init emits JSON");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let status = runtime
+        .kin_command()
         .args(["status", "--json"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env_remove("KIN_DAEMON_URL")
         .current_dir(&repo)
         .output()
@@ -898,13 +896,11 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
         "durable_repository_authority"
     );
 
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let mut daemon = IsolatedDaemon::spawn(&repo, &runtime);
-    let port = daemon.wait_until_serving(&repo.join(".kin"));
-    let graph_status = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let port = daemon.wait_until_serving(layout.root());
+    let graph_status = runtime
+        .kin_command()
         .args(["graph", "status"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
         .current_dir(&repo)
         .output()
@@ -929,7 +925,7 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
 /// just converted reports the admission that conversion performed, rather than
 /// telling its owner that how far graph truth has fallen behind is unknown.
 ///
-/// `--no-enrich` is load-bearing rather than a speed-up: it is what keeps the
+/// `--defer-enrich` is load-bearing rather than a speed-up: it is what keeps the
 /// conversion the only thing that could have written the marker. The enrichment
 /// phase starts a daemon, whose ambient reconcile tick is one of the two writers
 /// that existed before this, so a marker read after it would be evidence about
@@ -941,16 +937,14 @@ fn init_status_and_graph_status_use_their_real_durable_and_live_routes() {
 #[test]
 fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     seed_repository(&repo);
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
-        .args(["init", ".", "--json", "--no-enrich"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let init = runtime
+        .kin_command()
+        .args(["init", ".", "--json", "--defer-enrich"])
         .env_remove("KIN_DAEMON_URL")
         .current_dir(&repo)
         .output()
@@ -961,12 +955,12 @@ fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
+    let layout = runtime.layout_for(&repo);
     assert!(
-        !repo.join(".kin/daemon.port").exists(),
+        !layout.root().join("daemon.port").exists(),
         "no daemon ran for this store, so the marker below can only be the conversion's"
     );
 
-    let layout = kin_core::KinLayout::discover(&repo).expect("the conversion published a store");
     let freshness = kin_core::last_admission::read(&layout);
     let recorded = match &freshness {
         kin_core::last_admission::LastAdmissionRead::Recorded(recorded) => recorded,
@@ -989,13 +983,11 @@ fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
 
     // The same fact through the shipped `kin graph status` route, which is where
     // a user meets it.
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let mut daemon = IsolatedDaemon::spawn(&repo, &runtime);
-    let port = daemon.wait_until_serving(&repo.join(".kin"));
-    let graph_status = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let port = daemon.wait_until_serving(layout.root());
+    let graph_status = runtime
+        .kin_command()
         .args(["graph", "status"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
         .current_dir(&repo)
         .output()

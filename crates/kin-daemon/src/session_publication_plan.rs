@@ -195,8 +195,12 @@ pub(crate) fn prepare(
     let staged = InMemoryGraph::from_snapshot_without_text_index(observed.clone())?;
     let vacated = retirement::VacatedPaths::from_deltas(&tree_deltas);
     let moves = retirement::session_artifact_moves(&tree_deltas);
-    let module_moves =
-        retirement::plan_session_module_relocations(&state.blobs, authority, &tree_deltas)?;
+    let module_moves = retirement::plan_session_module_relocations(
+        &state.blobs,
+        authority,
+        &observed.resolved_tree,
+        &tree_deltas,
+    )?;
     let retired = retirement::retire_semantics_on_vacated(&observed, &vacated)?;
     let mut initial = TransactionDelta {
         tree_deltas: tree_deltas.clone(),
@@ -440,6 +444,7 @@ pub(crate) fn prepare(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction.validate()?;
     let facet_invalidations = tree_deltas

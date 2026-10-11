@@ -241,7 +241,7 @@ fn a_commit_with_no_resolvable_identity_is_refused_with_its_remedy() {
 /// The runtime gives every child a fresh HOME and managed registry. Imported
 /// commit authors are history, not configuration for the person using Kin now.
 #[test]
-fn a_fresh_home_reports_missing_author_until_supported_local_configuration_admits() {
+fn a_fresh_home_reports_missing_author_until_supported_local_configuration_commits() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
@@ -285,7 +285,7 @@ fn a_fresh_home_reports_missing_author_until_supported_local_configuration_admit
         .as_str()
         .unwrap()
         .contains("user.email \"you@example.com\""));
-    let imported = require_kin(&runtime, &repo, &["init", ".", "--no-enrich"]);
+    let imported = require_kin(&runtime, &repo, &["init", ".", "--defer-enrich"]);
     let warning = String::from_utf8_lossy(&imported.stderr);
     assert!(warning.contains("Author not configured"), "{warning}");
     assert!(
@@ -298,7 +298,13 @@ fn a_fresh_home_reports_missing_author_until_supported_local_configuration_admit
     );
 
     fs::write(repo.join("lib.rs"), "pub fn shipped() -> u8 { 2 }\n").unwrap();
-    let refused = run_kin(&runtime, &repo, &["admit"]);
+    // An admission records the daemon as its actor and publishes no history,
+    // so it measures the working copy with no identity at all. A commit is
+    // what records a person, and it is what refuses.
+    let measured = require_kin(&runtime, &repo, &["admit"]);
+    let text = String::from_utf8_lossy(&measured.stdout);
+    assert!(text.contains("Admitted the complete exact tree"), "{text}");
+    let refused = run_kin(&runtime, &repo, &["commit", "-m", "ship it"]);
     assert!(!refused.status.success());
     let refusal = String::from_utf8_lossy(&refused.stderr);
     assert!(refusal.contains("no author identity"), "{refusal}");
@@ -312,9 +318,7 @@ fn a_fresh_home_reports_missing_author_until_supported_local_configuration_admit
     require_git(&repo, &["config", "user.name", "New Contributor"]);
     require_git(&repo, &["config", "user.email", "contributor@example.com"]);
     assert_eq!(read_author()["status"], "healthy");
-    let admitted = require_kin(&runtime, &repo, &["admit"]);
-    let text = String::from_utf8_lossy(&admitted.stdout);
-    assert!(text.contains("Admitted the complete exact tree"), "{text}");
+    require_kin(&runtime, &repo, &["commit", "-m", "ship it"]);
 }
 
 /// The Kin-specific setting outranks Git, so a repository can attribute its
@@ -327,7 +331,7 @@ fn a_kin_specific_author_outranks_the_git_identity() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     initialize(&runtime, &repo);
 
-    let config_path = repo.join(".kin/config.toml");
+    let config_path = runtime.layout_for(&repo).config_path();
     let config = fs::read_to_string(&config_path).expect("read kin config");
     fs::write(
         &config_path,

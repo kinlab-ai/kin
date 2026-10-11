@@ -71,7 +71,11 @@ pub fn recover_prepared_session_workspace<C>(
             projection: None,
             authority: None,
         };
-        owner.projection = Some(open_retained_with_custody(root, &mut owner.custody)?);
+        owner.projection = Some(open_retained_with_custody(
+            root,
+            authority,
+            &mut owner.custody,
+        )?);
         let projection = owner.projection.as_ref().expect("retained projection");
         let prepared = authority
             .load_prepared_session_publication(supplied.operation_id())
@@ -356,7 +360,7 @@ pub fn recover_repository_projection_before_hydration_with_session_finalizer(
 ) -> Result<()> {
     #[cfg(any(unix, windows))]
     {
-        let projection = open_retained(root)?;
+        let projection = open_retained_with_custody(root, authority, &mut None::<()>)?;
         let (roots, transactions) = {
             let selected = authority.read_authority();
             (
@@ -471,17 +475,14 @@ fn validate_original_receipt(
 }
 
 #[cfg(any(unix, windows))]
-fn open_retained(root: &Path) -> Result<ExactProjectionFreeze> {
-    open_retained_with_custody(root, &mut None::<()>)
-}
-
-#[cfg(any(unix, windows))]
 fn open_retained_with_custody<C>(
     root: &Path,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
     custody: &mut Option<C>,
 ) -> Result<ExactProjectionFreeze> {
-    let projection = ProjectionRoot::open_existing_with_custody(
+    let projection = ProjectionRoot::open_existing_with_authority_and_custody(
         root,
+        Some(authority),
         PROJECTION_LOCK_WAIT_DEADLINE,
         ExistingReconciliationDisposition::RetainPrepared,
         custody,

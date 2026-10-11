@@ -27,6 +27,10 @@ use kin_git::{
 use kin_index::derive_historical_semantic_deltas;
 use kin_model::{ChangeStore, RepositoryId};
 
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 #[test]
 #[ignore]
 fn a_real_repository_enriches_into_replayable_history() {
@@ -36,7 +40,7 @@ fn a_real_repository_enriches_into_replayable_history() {
     let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
 
     let snapshot = capture_lossless_git_repository(
-        Path::new(&repository),
+        &worktree(Path::new(&repository)),
         RepositoryId::new("real-repository-enrichment").unwrap(),
         &blob_store,
     )

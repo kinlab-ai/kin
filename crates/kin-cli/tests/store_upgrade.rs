@@ -246,7 +246,11 @@ fn find_references(runtime: &IsolatedDaemonRuntime, repo: &Path, name: &str) -> 
     let stderr_path = frames.with_extension("stderr");
     let mut child = runtime
         .kin_command()
-        .args(["mcp", "start", "--repo", repo_arg])
+        // The `full` profile, because this test reads what the agent profiles
+        // no longer serve: the codes behind the verdict, and the `call_sites`
+        // and `negative` blocks, which an agent profile's short answer drops
+        // whatever `answer_only` the call sends.
+        .args(["mcp", "start", "--repo", repo_arg, "--tool-profile", "full"])
         .env("KIN_MCP_REPO", repo_arg)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("KIN_EMBED_BACKEND", "cpu")
@@ -689,8 +693,11 @@ fn upgrading_a_published_store_keeps_every_native_record_and_certifies() {
                     checkpoint_log.expect("the checkpoint on main is in its log");
                 assert!(
                     message.starts_with(&format!(
-                        "Re-derive semantics under hydration semantics version {to} (was {PUBLISHED_VERSION})"
-                    )),
+                        "Update Kin's understanding of this code for Kin {}\n\nkin upgrade \
+                         recorded this change.",
+                        env!("CARGO_PKG_VERSION")
+                    )) && message.contains("because an earlier release of Kin derived it")
+                        && !message.contains("version"),
                     "{message}"
                 );
                 assert_eq!(author, "Kin Fixture <fixture@example.invalid>");
@@ -1038,6 +1045,7 @@ fn publish_tree_bytes_as_a_daemon_would(repo: &Path, file: &str, bytes: &[u8], l
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     let owing = kin_db::OwedDerivationUpdate::owe(workspace_id, vec![(path, body)], Vec::new());
     match lineage {
@@ -1784,6 +1792,7 @@ fn a_current_body_certificate_over_stale_declarations_pays_nothing() {
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     let verifier = kin_index::binding_history::RederivationBindingHistoryVerifier::default();
     manager
@@ -1961,6 +1970,7 @@ fn add_a_second_workspace(repo: &Path) -> kin_model::WorkspaceId {
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     manager
         .commit_repository_transaction(transaction)
@@ -2060,6 +2070,7 @@ fn publish_a_new_file_owing_its_parse(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     manager
         .commit_repository_transaction_owing(
@@ -2717,10 +2728,20 @@ fn a_second_upgrade_is_a_no_op_or_a_clean_requalification() {
     assert_eq!(first.binding_history_checked, Some(true));
 
     let store = tree_digest(&repo.join(".kin"));
+    let opens = kin_core::authority_opens();
     let again = upgrade_store(&layout, author.clone(), &UpgradeHooks::default(), &quiet)
         .expect("a second run succeeds");
     assert_eq!(again.state, UpgradeState::AlreadyCurrent);
     assert_eq!(again.binding_history_checked, Some(true));
+    // The no-op is decided from the hydration record and the authority
+    // envelope, without a whole-store open: that open is what made reporting
+    // "nothing to do" cost tens of seconds on a large store.
+    assert_eq!(
+        kin_core::authority_opens() - opens,
+        0,
+        "a second upgrade of an upgraded store opened the whole store to find nothing to do"
+    );
+    assert_eq!(again.authority_generation, Some(envelope_generation(&repo)));
     assert_same_store(
         &store,
         &tree_digest(&repo.join(".kin")),
@@ -2764,6 +2785,7 @@ fn a_second_upgrade_is_a_no_op_or_a_clean_requalification() {
                 merge_transaction_delta: None,
                 sealed_observation: None,
                 collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
             })
             .expect("an ordinary commit lands");
         let workspace = manager.read_authority().metadata().workspaces[0].workspace_id;
@@ -2779,9 +2801,17 @@ fn a_second_upgrade_is_a_no_op_or_a_clean_requalification() {
         );
     }
 
+    // The envelope now carries no witness, so the cheap read cannot answer
+    // and the full open decides: an unchecked lineage is never reported as a
+    // no-op.
+    let opens = kin_core::authority_opens();
     let requalified = upgrade_store(&layout, author.clone(), &UpgradeHooks::default(), &quiet)
         .expect("the re-qualification succeeds");
     assert_eq!(requalified.state, UpgradeState::Requalified);
+    assert!(
+        kin_core::authority_opens() > opens,
+        "a re-qualification must open the store it re-derives"
+    );
     assert_eq!(requalified.binding_history_checked, Some(true));
     // Every head already held this build's derivation and the workspace held
     // nothing to re-derive, so the one change is the commit the lineage starts
@@ -2817,9 +2847,93 @@ fn a_second_upgrade_is_a_no_op_or_a_clean_requalification() {
         "current"
     );
     // The lineage it started holds, so a third run has nothing to do.
+    let opens = kin_core::authority_opens();
     let third = upgrade_store(&layout, author, &UpgradeHooks::default(), &quiet)
         .expect("a third run succeeds");
     assert_eq!(third.state, UpgradeState::AlreadyCurrent);
+    assert_eq!(kin_core::authority_opens() - opens, 0);
+}
+
+/// The cheap no-op answers only for a store this build derived. A record
+/// naming another build's derivation identity, or none at all, is a gap the
+/// envelope never gets to answer: the full upgrade runs, re-derives, and
+/// records this build's identity, however checked the lineage in the envelope
+/// is.
+#[test]
+fn a_store_another_derivation_made_is_re_derived_even_with_a_checked_lineage() {
+    use kin_cli::commands::upgrade::{upgrade_store, UpgradeHooks, UpgradeState};
+
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("clean");
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let author = kin_model::AuthorId::new("Kin Fixture <fixture@example.invalid>");
+    let quiet = |_: &str| {};
+    let this_build = kin_core::hydration_semantics::binary_derivation().to_string();
+    let first = upgrade_store(&layout, author.clone(), &UpgradeHooks::default(), &quiet)
+        .expect("the published store upgrades");
+    assert_eq!(first.state, UpgradeState::Upgraded);
+    assert_eq!(first.binding_history_checked, Some(true));
+
+    let record_path = layout.kindb_hydration_semantics_path();
+    let rewrite = |edit: &dyn Fn(&mut Value)| {
+        let mut record = hydration_record(&repo);
+        edit(&mut record);
+        fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    };
+    let other = format!("sha256:{}", "0".repeat(64));
+    for (case, edit) in [
+        (
+            "another build's derivation identity",
+            Box::new(|record: &mut Value| {
+                record["upgrade"]["derivation"] = Value::String(other.clone())
+            }) as Box<dyn Fn(&mut Value)>,
+        ),
+        (
+            "no derivation identity",
+            Box::new(|record: &mut Value| {
+                record.as_object_mut().unwrap().remove("derivation");
+                record["upgrade"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("derivation");
+            }),
+        ),
+    ] {
+        rewrite(&*edit);
+        let envelope = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+            .unwrap()
+            .read_authority_metadata_read_only(Duration::from_secs(10))
+            .unwrap()
+            .expect("the envelope read answers this store");
+        assert!(
+            !envelope.metadata().binding_history.is_empty(),
+            "{case}: the envelope was meant to carry a checked lineage"
+        );
+        drop(envelope);
+        assert!(
+            kin_core::hydration_semantics::standing(&layout).is_gap(),
+            "{case}: the standing must read a gap"
+        );
+        let opens = kin_core::authority_opens();
+        let rederived = upgrade_store(&layout, author.clone(), &UpgradeHooks::default(), &quiet)
+            .expect("the re-derivation succeeds");
+        assert_eq!(rederived.state, UpgradeState::Upgraded, "{case}");
+        assert!(
+            kin_core::authority_opens() > opens,
+            "{case}: a re-derivation must open the store"
+        );
+        assert_eq!(
+            hydration_record(&repo)["upgrade"]["derivation"],
+            this_build.as_str(),
+            "{case}"
+        );
+        let opens = kin_core::authority_opens();
+        let settled = upgrade_store(&layout, author.clone(), &UpgradeHooks::default(), &quiet)
+            .expect("a run after the re-derivation succeeds");
+        assert_eq!(settled.state, UpgradeState::AlreadyCurrent, "{case}");
+        assert_eq!(kin_core::authority_opens() - opens, 0, "{case}");
+    }
 }
 
 /// The upgrade's claim follows first parents from its anchors, so a head that
@@ -2918,6 +3032,7 @@ fn a_head_an_earlier_change_builds_on_gets_a_fresh_anchor() {
                 merge_transaction_delta: None,
                 sealed_observation: None,
                 collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
             })
             .expect("a branch builds on main's anchor");
     }
@@ -2972,6 +3087,12 @@ fn remedy_in(output: &str) -> String {
 
 /// The fix `kin doctor --json` names for the hydration-semantics row.
 fn doctor_hydration_fix(runtime: &IsolatedDaemonRuntime, repo: &Path) -> Option<String> {
+    doctor_hydration_row(runtime, repo)["manual_fix"]
+        .as_str()
+        .map(str::to_string)
+}
+
+fn doctor_hydration_row(runtime: &IsolatedDaemonRuntime, repo: &Path) -> Value {
     let output = kin(runtime, repo, &["doctor", "--json"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
@@ -2980,14 +3101,13 @@ fn doctor_hydration_fix(runtime: &IsolatedDaemonRuntime, repo: &Path) -> Option<
             String::from_utf8_lossy(&output.stderr)
         )
     });
-    let row = report["checks"]
+    report["checks"]
         .as_array()
         .expect("doctor checks")
         .iter()
         .find(|check| check["id"] == "hydration_semantics")
         .unwrap_or_else(|| panic!("doctor has no hydration_semantics row: {report}"))
-        .clone();
-    row["manual_fix"].as_str().map(str::to_string)
+        .clone()
 }
 
 fn copy_tree(from: &Path, to: &Path) {
@@ -3116,6 +3236,7 @@ fn publish_scope_test_relations(repo: &Path, relations: &[kin_model::Relation]) 
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         })
         .unwrap();
 }
@@ -3546,6 +3667,7 @@ fn end_the_lineage_of_an_upgraded_store(repo: &Path) {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         })
         .expect("an ordinary commit lands");
     drop(manager);
@@ -3759,6 +3881,83 @@ fn a_daemon_start_writes_nothing_where_it_does_not_re_qualify() {
         &before,
         &tree_digest(&repo.join(".kin")),
         "a daemon's start changed a store whose lineage is checked",
+    );
+}
+
+/// A store `kin init` converts from Git is checked from its first generation,
+/// so the first daemon start re-qualifies nothing and writes nothing. The
+/// history here withdraws a local binding the transition verifier cannot
+/// account for, a module deleted while a caller still names it, which nearly
+/// every real repository's history holds somewhere. Before the bootstrap
+/// started its lineage itself, every such store was re-qualified by its first
+/// daemon start, the work `kin upgrade` does, on a store this build had just
+/// written.
+#[test]
+fn a_daemon_start_finds_a_store_init_just_converted_already_checked() {
+    use kin_cli::commands::upgrade::{requalify_at_daemon_start, DaemonStartRequalification};
+
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("converted");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(&repo)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    fs::write(
+        repo.join("caller.py"),
+        "from local import work\ndef run():\n    return work(value=1)\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("local.py"),
+        "def work(value):\n    return value\n",
+    )
+    .unwrap();
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Kin Fixture"]);
+    git(&["add", "--all"]);
+    git(&["commit", "-m", "a caller and the module it calls"]);
+    fs::remove_file(repo.join("local.py")).unwrap();
+    git(&["add", "--all"]);
+    git(&["commit", "-m", "delete the module the caller still names"]);
+
+    let initialized = kin_core::init_from_git(&repo).expect("kin init converts the repository");
+    let layout = initialized.layout.clone();
+    {
+        let (manager, _) = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+            .unwrap()
+            .open_manager_with_payload_stats()
+            .unwrap();
+        let lease = manager.read_authority();
+        assert!(
+            lease
+                .workspace_graph_snapshot(&initialized.workspace_id)
+                .unwrap()
+                .expect("the workspace has a committed graph")
+                .verified_binding_history
+                .is_some(),
+            "the store init wrote carries no checked binding history"
+        );
+    }
+    let before = tree_digest(layout.root());
+    let start = requalify_at_daemon_start(&layout, &|step: &str| {
+        panic!("a daemon start re-qualified a store init just wrote: {step}");
+    });
+    assert!(
+        matches!(start, DaemonStartRequalification::AlreadyChecked),
+        "{start:?}"
+    );
+    assert_same_store(
+        &before,
+        &tree_digest(layout.root()),
+        "a daemon's start changed a store init just wrote",
     );
 }
 
@@ -4076,4 +4275,181 @@ fn a_stop_during_startup_requalification_leaves_the_old_or_the_committed_authori
         "the next start must finish the re-qualification; its log:\n{}",
         daemon_log_tail(&repo)
     );
+}
+
+/// Every build inside one unreleased version shares its replay version, so the
+/// version alone would certify a store an earlier build of the same version
+/// derived. The record's derivation identity is what tells them apart: the
+/// same identity stays current, another build's is re-derived by `kin
+/// upgrade`, and a record from before identities is disclosed and upgradable
+/// rather than relabelled.
+#[test]
+fn the_derivation_identity_decides_currency_within_one_version() {
+    let root = tempdir().expect("temp root");
+    unpack(root.path());
+    let repo = root.path().join("clean");
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    let this_build = kin_core::hydration_semantics::binary_derivation().to_string();
+    let record_path = repo.join(".kin/kindb/hydration-semantics");
+    let rewrite = |edit: &dyn Fn(&mut Value)| {
+        let mut record = hydration_record(&repo);
+        edit(&mut record);
+        fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    };
+
+    let first = json(&runtime, &repo, &["upgrade", "--json"]);
+    assert_eq!(first["state"], "upgraded", "{first}");
+    assert_eq!(first["derivation"], this_build.as_str(), "{first}");
+    let record = hydration_record(&repo);
+    assert_eq!(record["upgrade"]["derivation"], this_build.as_str());
+
+    // The same identity: nothing to do.
+    let same = json(&runtime, &repo, &["upgrade", "--json"]);
+    assert_eq!(same["state"], "already_current", "{same}");
+    assert_eq!(same["from_derivation"], this_build.as_str(), "{same}");
+    assert_eq!(same["heads"], serde_json::json!([]));
+
+    // Another build of this version derived the served state.
+    let other = format!("sha256:{}", "0".repeat(64));
+    rewrite(&|record| record["upgrade"]["derivation"] = Value::String(other.clone()));
+    assert_eq!(
+        kin_core::hydration_semantics::standing(&kin_core::KinLayout::new(repo.join(".kin")))
+            .label(),
+        "other_build"
+    );
+    let status = kin_status(&runtime, &repo);
+    assert!(
+        status.contains("by a build of Kin whose derivation differs from this build's")
+            && !status.contains("hydration semantics version")
+            && status.contains("Remedy: run `kin upgrade`"),
+        "kin status must name the other build and the upgrade: {status}"
+    );
+    let doctor = doctor_hydration_row(&runtime, &repo);
+    assert_eq!(doctor["status"], "stale", "{doctor}");
+    let detail = doctor["detail"].as_str().expect("doctor derivation detail");
+    assert!(
+        detail.contains("derivation differs from this build's")
+            && !detail.contains("hydration semantics version"),
+        "{doctor}"
+    );
+    let rederived = succeed(&runtime, &repo, &["upgrade"]);
+    assert!(
+        rederived.contains("Upgraded this store for Kin")
+            && rederived.contains(
+                "re-derived the entities and relations it serves, because another build of Kin \
+                 derived it."
+            )
+            && !rederived.contains("version"),
+        "{rederived}"
+    );
+    let record = hydration_record(&repo);
+    assert_eq!(record["upgrade"]["derivation"], this_build.as_str());
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    assert!(!kin_core::hydration_semantics::standing(&layout).is_gap());
+
+    // A build whose linking code differed: the upgrade names that part of
+    // Kin in its report and in the change it records.
+    rewrite(&|record| {
+        record["upgrade"]["derivation"] = Value::String(other.clone());
+        record["upgrade"]["derivation_parts"]["kin-index"] = Value::String(other.clone());
+    });
+    let named = json(&runtime, &repo, &["upgrade", "--json"]);
+    assert_eq!(named["state"], "upgraded", "{named}");
+    assert_eq!(
+        named["changed"],
+        serde_json::json!(["kin-index"]),
+        "{named}"
+    );
+    assert_eq!(
+        named["reason"],
+        "how calls, imports and history are linked changed in Kin since the build that derived it",
+        "{named}"
+    );
+    assert!(!kin_core::hydration_semantics::standing(&layout).is_gap());
+
+    // A record from before identities: disclosed, upgradable, and never
+    // relabelled current by anything but the re-derivation.
+    rewrite(&|record| {
+        let object = record.as_object_mut().unwrap();
+        object.remove("derivation");
+        object["upgrade"]
+            .as_object_mut()
+            .unwrap()
+            .remove("derivation");
+    });
+    let status = kin_status(&runtime, &repo);
+    assert!(
+        status.contains("recorded no derivation identity")
+            && status.contains("Remedy: run `kin upgrade`"),
+        "{status}"
+    );
+    let legacy = json(&runtime, &repo, &["upgrade", "--json"]);
+    assert_eq!(legacy["state"], "upgraded", "{legacy}");
+    assert_eq!(legacy["from"], legacy["to"], "{legacy}");
+    assert!(legacy.get("from_derivation").is_none(), "{legacy}");
+    assert_eq!(legacy["warnings"], serde_json::json!([]));
+    assert!(!kin_core::hydration_semantics::standing(&layout).is_gap());
+    let settled = json(&runtime, &repo, &["upgrade", "--json"]);
+    assert_eq!(settled["state"], "already_current", "{settled}");
+}
+
+/// A release recorded by creation or upgrade is a refusal even when this
+/// binary's epoch and graph identity match. Refusal must precede store writes.
+#[test]
+fn a_newer_release_refuses_upgrade_without_changing_the_store() {
+    for from_upgrade in [false, true] {
+        let root = tempdir().unwrap();
+        unpack(root.path());
+        let repo = root.path().join("clean");
+        let runtime = IsolatedDaemonRuntime::new(&repo);
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+        let mut record = hydration_record(&repo);
+        record["created_under"] = kin_core::hydration_semantics::binary_version().into();
+        record["derivation"] = kin_core::hydration_semantics::binary_derivation().into();
+        if from_upgrade {
+            record["upgrade"] = serde_json::json!({
+                "under": kin_core::hydration_semantics::binary_version(),
+                "from": PUBLISHED_VERSION,
+                "at": "2026-10-08T00:00:00Z",
+                "anchors": [],
+                "derivation": kin_core::hydration_semantics::binary_derivation(),
+                "release_version": "9999.0.0"
+            });
+        } else {
+            record["release_version"] = "9999.0.0".into();
+        }
+        fs::write(
+            layout.kindb_hydration_semantics_path(),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let status = kin_status(&runtime, &repo);
+        assert!(
+            status.contains("9999.0.0") && status.contains("newer"),
+            "{status}"
+        );
+        assert!(!status.contains("hydration semantics version"), "{status}");
+        let doctor = doctor_hydration_row(&runtime, &repo);
+        assert_eq!(doctor["status"], "stale", "{doctor}");
+        assert!(
+            doctor["detail"].as_str().unwrap().contains("9999.0.0")
+                && doctor["manual_fix"].as_str().unwrap().contains("9999.0.0"),
+            "{doctor}"
+        );
+        let before = tree_digest(&repo.join(".kin/kindb"));
+        let output = kin(&runtime, &repo, &["upgrade", "--json"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("9999.0.0")
+                && error.contains("newer")
+                && error.contains("nothing was changed"),
+            "{error}"
+        );
+        assert_same_store(
+            &before,
+            &tree_digest(&repo.join(".kin/kindb")),
+            "newer release refusal changed authority",
+        );
+    }
 }

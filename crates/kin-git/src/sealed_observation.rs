@@ -33,6 +33,12 @@ use crate::admission_history::AdmittedSemanticGitImportPlan;
 use crate::error::{GitError, Result, UnsealedContentGap};
 use crate::semantic_import::SemanticGitImportPlan;
 
+#[cfg(test)]
+#[allow(dead_code)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 /// Upper bound on gaps carried in a failure. A gap is one distinct unsealed
 /// body, counted once no matter how many admitted entries reference it, so the
 /// reported total and the detail list count the same thing. Only the detail
@@ -53,7 +59,7 @@ const SHAPE_FOREIGN_GITLINK: u8 = 4;
 /// The observation deliberately cannot reach the filesystem. Implementations
 /// expose exactly one capability: resolve a content identity to bytes the
 /// repository already owns.
-pub trait SealedContentSource {
+pub trait SealedContentSource: Sync {
     /// Load one body by its content identity.
     ///
     /// `Err` denotes an absent or unreadable body. The caller turns that into a
@@ -378,30 +384,53 @@ pub fn seal_all_content_observation_observed(
     let total_bodies = identities.len();
     let mut failed = BTreeSet::<Hash256>::new();
     let mut reported_gaps = Vec::<UnsealedContentGap>::new();
-    for (proved, (identity, path)) in identities.iter().enumerate() {
-        match seal_body(content, *identity) {
-            Ok(body) => {
-                coverage.sealed_bodies += 1;
-                coverage.sealed_body_bytes += body.len() as u64;
-                if body.is_empty() {
-                    coverage.empty_bodies += 1;
+    // Each body is read and hashed on its own, so a run of them is proved in
+    // parallel and folded here in identity order, exactly as one body after
+    // another was; a run bounds how many bodies are held at once and how long
+    // the progress report waits.
+    let identities: Vec<(&Hash256, &RepoPath)> = identities.iter().collect();
+    let mut proved = 0usize;
+    for run in identities.chunks(SEAL_RUN_BODIES) {
+        let sealed: Vec<std::result::Result<(u64, bool, bool), String>> = {
+            use rayon::prelude::*;
+            run.par_iter()
+                .map(|(identity, _)| {
+                    seal_body(content, **identity).map(|body| {
+                        (
+                            body.len() as u64,
+                            body.is_empty(),
+                            std::str::from_utf8(&body).is_err(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        for ((identity, path), outcome) in run.iter().zip(sealed) {
+            match outcome {
+                Ok((len, empty, opaque)) => {
+                    coverage.sealed_bodies += 1;
+                    coverage.sealed_body_bytes += len;
+                    if empty {
+                        coverage.empty_bodies += 1;
+                    }
+                    if opaque {
+                        coverage.opaque_bodies += 1;
+                    }
                 }
-                if std::str::from_utf8(&body).is_err() {
-                    coverage.opaque_bodies += 1;
+                Err(detail) => {
+                    failed.insert(**identity);
+                    if reported_gaps.len() < MAX_REPORTED_GAPS {
+                        reported_gaps.push(UnsealedContentGap {
+                            path: path.as_bytes().to_vec(),
+                            expected: identity.to_string(),
+                            detail,
+                        });
+                    }
                 }
             }
-            Err(detail) => {
-                failed.insert(*identity);
-                if reported_gaps.len() < MAX_REPORTED_GAPS {
-                    reported_gaps.push(UnsealedContentGap {
-                        path: path.as_bytes().to_vec(),
-                        expected: identity.to_string(),
-                        detail,
-                    });
-                }
-            }
+            proved += 1;
+            observe(proved, total_bodies);
         }
-        observe(proved + 1, total_bodies);
     }
 
     // One gap per distinct unsealed body, so a report that lists every gap it
@@ -433,6 +462,9 @@ pub fn seal_all_content_observation_observed(
         fingerprint,
     })
 }
+
+/// How many bodies one parallel run of the seal proves before folding them.
+const SEAL_RUN_BODIES: usize = 1024;
 
 /// Read one body and prove it matches the identity the tree recorded.
 fn seal_body(
@@ -520,7 +552,7 @@ mod tests {
     use crate::admission_history::admit_semantic_git_import;
     use crate::lossless::capture_lossless_git_repository;
     use crate::semantic_import::plan_semantic_git_import;
-    use crate::test_support::fixture_git;
+    use crate::test_support::{fixture_git, FixtureGitBatch};
 
     /// A content source backed by a real store with selected bodies withheld,
     /// so the fail-closed path is exercised against the production seal rather
@@ -637,8 +669,6 @@ mod tests {
             let root = tempdir().unwrap();
             let repo = root.path().join("source");
             fs::create_dir(&repo).unwrap();
-            git_ok(&repo, ["init", "--initial-branch=main"]);
-            configure_git(&repo);
 
             write(&repo, "src/lib.rs", b"pub fn value() -> u8 { 7 }\n");
             write(&repo, "assets/raw.bin", &[0, 255, 1, 128, b'\n', 0, 42]);
@@ -649,30 +679,34 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(&executable, permissions).unwrap();
             symlink("src/lib.rs", repo.join("source-link")).unwrap();
-            git_ok(&repo, ["add", "--all"]);
+            let mut seed = FixtureGitBatch::new();
+            seed.git(["init", "--initial-branch=main"]);
+            configure_git_steps(&mut seed);
+            seed.git(["add", "--all"]).run_in(&repo);
 
             let non_utf8 = git_stdin_text(&repo, ["hash-object", "-w", "--stdin"], &[0xde, 0xad]);
             let mut index_entry = format!("100644 {non_utf8}\t").into_bytes();
             index_entry.extend_from_slice(b"odd-\xff.bin\0");
             git_stdin_ok(&repo, ["update-index", "-z", "--index-info"], &index_entry);
-            git_ok(
-                &repo,
-                [
+            // The first commit records the index, which already holds the
+            // first revision, so writing the second one beforehand changes
+            // nothing it commits and lets both commits share one launch.
+            write(&repo, "src/lib.rs", b"pub fn value() -> u8 { 8 }\n");
+            FixtureGitBatch::new()
+                .git([
                     "update-index",
                     "--add",
                     "--cacheinfo",
                     "160000,4242424242424242424242424242424242424242,vendor/sub",
-                ],
-            );
-            git_ok(&repo, ["commit", "-m", "exact tree with every shape"]);
-
-            write(&repo, "src/lib.rs", b"pub fn value() -> u8 { 8 }\n");
-            git_ok(&repo, ["add", "src/lib.rs"]);
-            git_ok(&repo, ["commit", "-m", "second revision"]);
+                ])
+                .git(["commit", "-m", "exact tree with every shape"])
+                .git(["add", "src/lib.rs"])
+                .git(["commit", "-m", "second revision"])
+                .run_in(&repo);
 
             let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
             let snapshot = capture_lossless_git_repository(
-                &repo,
+                &worktree(&repo),
                 RepositoryId::new("sealed-observation").unwrap(),
                 &blob_store,
             )
@@ -897,19 +931,11 @@ mod tests {
         fs::write(path, body).unwrap();
     }
 
-    fn configure_git(repo: &Path) {
-        git_ok(repo, ["config", "user.name", "Kin Test"]);
-        git_ok(repo, ["config", "user.email", "test@kin.invalid"]);
-        git_ok(repo, ["config", "commit.gpgsign", "false"]);
-    }
-
-    fn git_ok<const N: usize>(repo: &Path, args: [&str; N]) {
-        let output = git(repo, args, None);
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn configure_git_steps(batch: &mut FixtureGitBatch) {
+        batch
+            .git(["config", "user.name", "Kin Test"])
+            .git(["config", "user.email", "test@kin.invalid"])
+            .git(["config", "commit.gpgsign", "false"]);
     }
 
     fn git_stdin_ok<const N: usize>(repo: &Path, args: [&str; N], stdin: &[u8]) {

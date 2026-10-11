@@ -1,6 +1,6 @@
 {
   "name": "kin",
-  "description": "Kin keeps a living map of the software itself so humans and agents can understand what every change touches. Locate, search, context packs, data-flow tracing, and impact analysis without raw file search.",
+  "description": "Kin is a graph-native code repository for AI agents and the people who build with them. Its MCP server lets your agent look up callers, references, history and what a change might affect, from the same record you inspect with the kin CLI.",
   "version": "0.1.0",
   "author": {
     "name": "Firelock",

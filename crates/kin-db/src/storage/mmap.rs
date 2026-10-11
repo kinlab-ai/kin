@@ -171,7 +171,7 @@ fn write_new_bytes_and_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError
     file.write_all(bytes).map_err(|e| {
         KinDbError::StorageError(format!("failed to write {}: {e}", path.display()))
     })?;
-    file.sync_all().map_err(|e| {
+    kin_blobs::durable::sync_all(&file).map_err(|e| {
         KinDbError::StorageError(format!("failed to fsync {}: {e}", path.display()))
     })?;
     Ok(())
@@ -359,7 +359,7 @@ pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(
                 display_path.display()
             )));
         }
-        writable.sync_all().map_err(|error| {
+        kin_blobs::durable::sync_all(&writable).map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to durably flush parent directory {}: {error}",
                 display_path.display()
@@ -368,7 +368,7 @@ pub(crate) fn sync_directory_handle(dir: &File, display_path: &Path) -> Result<(
     }
     #[cfg(unix)]
     {
-        dir.sync_all().map_err(|error| {
+        kin_blobs::durable::sync_all(&dir).map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to fsync parent directory {}: {error}",
                 display_path.display()
@@ -689,8 +689,7 @@ pub(crate) fn read_regular_bounded(
             path.display()
         ))
     })?;
-    bytes.resize(capacity, 0);
-    file.read_exact(&mut bytes).map_err(|error| {
+    super::read_exact_into_reserved(&mut file, &mut bytes, capacity).map_err(|error| {
         KinDbError::StorageError(format!(
             "{role} {} changed length while reading {len} bytes: {error}",
             path.display()
@@ -1610,6 +1609,39 @@ pub(crate) fn open_regular_nofollow_at(
     Ok(file.into_std())
 }
 
+/// What the file beneath a retained directory capability currently carries,
+/// without retaining it. The capability-relative counterpart of
+/// [`path_expected_content`].
+fn capability_expected_content(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+) -> Result<ExpectedContent, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let mut file = open_regular_nofollow_at(directory, relative, display_root, role)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CONTENT_VERIFY_CHUNK_BYTES];
+    let mut byte_len: u64 = 0;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read {role} {}: {error}",
+                display.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        byte_len = byte_len.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ExpectedContent {
+        byte_len,
+        sha256: hasher.finalize().into(),
+    })
+}
+
 /// Capability-relative counterpart of [`read_regular_bounded`].
 /// Whether a regular file beneath a retained repository directory capability
 /// carries exactly `expected`, without retaining it.
@@ -1663,8 +1695,7 @@ pub(crate) fn read_regular_bounded_at(
             display.display()
         ))
     })?;
-    bytes.resize(capacity, 0);
-    file.read_exact(&mut bytes).map_err(|error| {
+    super::read_exact_into_reserved(&mut file, &mut bytes, capacity).map_err(|error| {
         KinDbError::StorageError(format!(
             "{role} {} changed length while reading {len} bytes: {error}",
             display.display()
@@ -1810,7 +1841,7 @@ fn capability_write_new_bytes_and_fsync(
     file.write_all(bytes).map_err(|error| {
         KinDbError::StorageError(format!("failed to write {}: {error}", display.display()))
     })?;
-    file.sync_all().map_err(|error| {
+    kin_blobs::durable::sync_all(&file.into_std()).map_err(|error| {
         KinDbError::StorageError(format!("failed to fsync {}: {error}", display.display()))
     })
 }
@@ -1975,6 +2006,83 @@ fn capability_load_recovery_marker_with_bytes(
         ))
     })?;
     Ok((marker, marker_bytes))
+}
+
+/// Drop a recovery candidate that was never renamed onto its destination.
+///
+/// The destination rename is the commit. While the deterministic candidate is
+/// still staged, the destination is the previous authority and the marker
+/// describes the candidate, not that file. Confirming refuses the open, and
+/// promoting would install a write that did not commit. A writable recovery
+/// removes the exact staged entries and leaves the destination byte for byte
+/// alone. No staged candidate is a no-op, so a rename that already committed
+/// (marker retained, candidate gone) stays with confirmation.
+///
+/// A candidate or marker that is no longer the one observed is restored, so a
+/// racing replacement is not unlinked.
+pub(crate) fn discard_unpromoted_recovery_candidate_at(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+) -> Result<(), KinDbError> {
+    let candidate_path = recovery_tmp_path(relative);
+    let candidate_display = capability_display_path(display_root, &candidate_path);
+    match directory.symlink_metadata(&candidate_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect recovery candidate {}: {error}",
+                candidate_display.display()
+            )))
+        }
+    }
+
+    let marker_path = recovery_marker_path(relative);
+    let marker_display = capability_display_path(display_root, &marker_path);
+    let marker_expected = match directory.symlink_metadata(&marker_path) {
+        Ok(_) => Some(capability_expected_content(
+            directory,
+            &marker_path,
+            display_root,
+            "recovery marker cleanup source",
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(KinDbError::StorageError(format!(
+                "failed to inspect recovery marker cleanup source {}: {error}",
+                marker_display.display()
+            )))
+        }
+    };
+    let candidate_expected = Some(capability_expected_content(
+        directory,
+        &candidate_path,
+        display_root,
+        "recovery candidate cleanup source",
+    )?);
+    let marker_claim = capability_claim_exact_path(
+        directory,
+        &marker_path,
+        display_root,
+        marker_expected,
+        "recovery marker cleanup source",
+    )?;
+    let candidate_claim = match capability_claim_exact_path(
+        directory,
+        &candidate_path,
+        display_root,
+        candidate_expected,
+        "recovery candidate cleanup source",
+    ) {
+        Ok(claim) => claim,
+        Err(error) => {
+            let _ = marker_claim.restore();
+            return Err(error);
+        }
+    };
+    candidate_claim.release()?;
+    marker_claim.release()
 }
 
 /// Capability-relative counterpart of [`confirm_installed_write`].
@@ -2147,8 +2255,8 @@ pub(crate) fn capability_stage_recovery_candidate_streamed_at(
     let finish = (|| {
         let (byte_len, sha256) = measured?;
         flushed?;
-        let file = file?;
-        file.sync_all().map_err(|error| {
+        let file = file?.into_std();
+        kin_blobs::durable::sync_all(&file).map_err(|error| {
             KinDbError::StorageError(format!("failed to fsync {}: {error}", display.display()))
         })?;
         Ok(ExpectedContent::streamed(byte_len, sha256))

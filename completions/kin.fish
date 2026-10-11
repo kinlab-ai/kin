@@ -13,7 +13,7 @@
 complete -c kin -f
 
 # Main subcommands
-complete -c kin -n __fish_use_subcommand -a init -d 'Initialize a new Kin repository'
+complete -c kin -n __fish_use_subcommand -a init -d 'Start Kin in a repository, new or existing'
 complete -c kin -n __fish_use_subcommand -a status -d 'Show working copy status'
 complete -c kin -n __fish_use_subcommand -a commit -d 'Create a semantic commit'
 complete -c kin -n __fish_use_subcommand -a log -d 'Show semantic change log'
@@ -40,7 +40,7 @@ complete -c kin -n __fish_use_subcommand -a auth -d 'Authenticate with KinLab'
 complete -c kin -n __fish_use_subcommand -a remote -d 'Manage remotes'
 complete -c kin -n __fish_use_subcommand -a push -d 'Push to remote'
 complete -c kin -n __fish_use_subcommand -a pull -d 'Pull changes from remote'
-complete -c kin -n __fish_use_subcommand -a clone -d 'Clone a repository'
+complete -c kin -n __fish_use_subcommand -a clone -d 'Clone a repository into Kin'
 complete -c kin -n __fish_use_subcommand -a import -d 'Import a repository into Kin'
 complete -c kin -n __fish_use_subcommand -a checkout -d 'Restore a file from a specific change'
 complete -c kin -n __fish_use_subcommand -a verify -d 'Verify test coverage'
@@ -71,7 +71,7 @@ complete -c kin -n __fish_use_subcommand -a overview -d 'Show codebase overview'
 complete -c kin -n __fish_use_subcommand -a completions -d 'Generate shell completions'
 complete -c kin -n __fish_use_subcommand -a update -d 'Update Kin to the latest release'
 complete -c kin -n __fish_use_subcommand -a registry -d 'Manage the global repository registry'
-complete -c kin -n __fish_use_subcommand -a setup -d 'First-time setup and health checks'
+complete -c kin -n __fish_use_subcommand -a setup -d 'Connect AI clients and add kin to your shell'
 
 # Completions subcommand
 complete -c kin -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish' -d 'Shell type'

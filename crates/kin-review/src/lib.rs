@@ -3,6 +3,7 @@
 
 pub mod assignments;
 pub mod change_shape;
+pub mod contract;
 pub mod diff;
 pub mod enrichment;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod format;
 pub mod gate;
 pub mod impact;
 pub mod inline;
+pub mod override_callers;
 pub mod ranked_impact;
 pub mod records;
 pub mod ref_graph;
@@ -25,6 +27,7 @@ pub use change_shape::{
     classify_change_shape, evidence_note, gate_action_for, BodyShape, Branch, ChangeShape,
     GateAction, Statement, StatementKind,
 };
+pub use contract::{signature_changed, tokens_unchanged, ContractChange};
 pub use diff::{
     compute_diff, diff_from_change, diff_from_changes, diff_from_entity_ids, diff_from_files,
     is_semantic_modification, EntityChange, EntityChangeKind, SemanticDiff,
@@ -42,6 +45,7 @@ pub use inline::{
     collect_inline_comments, group_by_file, InlineComment, InlineCommentKind,
     CONSUMER_FANOUT_THRESHOLD,
 };
+pub use override_callers::{OverrideCall, OverrideCaller, OverrideCallers};
 pub use ranked_impact::{
     inbound_impact_relations, is_impact_relation, rank_impact, rank_impact_at, CandidateLocation,
     ImpactBucket, PriorityScoreComponents, RankedImpactCandidate, RankedImpactReport,

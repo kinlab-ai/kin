@@ -27,6 +27,12 @@ pub trait LanguageAdapter: Send + Sync {
     /// File extensions this adapter matches (e.g. `["ts", "tsx"]`).
     fn file_extensions(&self) -> &[&str];
 
+    /// The manifest this language's projects declare their name in, when it
+    /// has one. See [`crate::project_manifest`].
+    fn project_manifest(&self) -> Option<crate::project_manifest::ProjectManifest> {
+        None
+    }
+
     /// Parse source code into a tree-sitter Tree.
     fn parse(&self, source: &[u8]) -> Result<Tree>;
 
@@ -39,6 +45,155 @@ pub trait LanguageAdapter: Send + Sync {
 
     /// Extract entities and relations from a parsed tree.
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput>;
+
+    /// What the unit at `file_id` takes from its project's manifests, read
+    /// before it is parsed. See [`crate::project_manifest::ProjectFiles`].
+    /// The default takes nothing, and the unit is named by its parse. A
+    /// manifest the unit's name depends on that cannot be read refuses it.
+    fn unit_context(
+        &self,
+        _file_id: &FilePathId,
+        _project: &dyn crate::project_manifest::ProjectFiles,
+    ) -> std::result::Result<
+        crate::project_manifest::UnitContext,
+        crate::project_manifest::UnreadableManifest,
+    > {
+        Ok(crate::project_manifest::UnitContext::default())
+    }
+
+    /// [`LanguageAdapter::extract`] for a unit whose project declared
+    /// `unit` about it ([`LanguageAdapter::unit_context`]). An adapter that
+    /// takes nothing from its project extracts exactly as `extract` does.
+    fn extract_in(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+        file_id: &FilePathId,
+        unit: &crate::project_manifest::UnitContext,
+    ) -> Result<ParseOutput> {
+        let _ = unit;
+        self.extract(tree, source, file_id)
+    }
+
+    /// Stable named members of a literal value, when this language can expose
+    /// them as child entities. Dynamic keys and ambiguous duplicate names stay
+    /// out; the caller chooses the containing declaration and entity kind.
+    fn literal_members<'tree>(
+        &self,
+        _literal: Node<'tree>,
+        _source: &[u8],
+    ) -> Vec<crate::literal_members::LiteralMember<'tree>> {
+        Vec::new()
+    }
+
+    /// Every declaration node this grammar shows in `tree`, whether or not
+    /// [`LanguageAdapter::extract`] admits it as an entity, with the scope it
+    /// sits in. See [`crate::declaration_census`] for what the comparison
+    /// against the admitted entities records.
+    ///
+    /// `None` means this adapter takes no census, which leaves the file's
+    /// declaration coverage unmeasured rather than complete.
+    fn declaration_census(
+        &self,
+        _tree: &Tree,
+        _source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        None
+    }
+
+    /// What `module_path`'s own syntax says about where its module lives. See
+    /// [`crate::import_origin`]. The default proves nothing external.
+    fn import_specifier_root(
+        &self,
+        _module_path: &str,
+    ) -> crate::import_origin::ImportSpecifierRoot {
+        crate::import_origin::ImportSpecifierRoot::Unknown
+    }
+
+    /// How this language writes the text around a call or use site, for a
+    /// reader that quotes a site from its caller's stored body. See
+    /// [`crate::site_syntax`]. The default states nothing, and such a reader
+    /// falls back to [`crate::site_syntax::SiteSyntax::UNSTATED`].
+    fn site_syntax(&self) -> Option<crate::site_syntax::SiteSyntax> {
+        None
+    }
+
+    /// How this language spells a declaration's name as Kin stores it and as
+    /// a person writes it, for a reader that looks a written name up in the
+    /// graph. See [`crate::name_syntax`]. The default states nothing, and such
+    /// a reader skips this language's written forms.
+    fn name_syntax(&self) -> Option<crate::name_syntax::NameSyntax> {
+        None
+    }
+
+    /// How this language writes the head of a declaration's body, for a
+    /// reader that wants a declaration's code past its documentation from the
+    /// body the graph holds. See [`crate::body_syntax`]. The default states
+    /// nothing, and such a reader leaves the body as it is.
+    fn body_syntax(&self) -> Option<crate::body_syntax::BodySyntax> {
+        None
+    }
+
+    /// How this language's top-level functions are created beside one
+    /// another and removed, for the planner that edits them at entity grain.
+    /// See [`crate::declaration_lifecycle`]. The default implements nothing,
+    /// and the planner refuses the lifecycle for such a language.
+    fn declaration_lifecycle(
+        &self,
+    ) -> Option<&dyn crate::declaration_lifecycle::DeclarationLifecycle> {
+        None
+    }
+
+    /// Where this language writes a declaration among a type's members or a
+    /// unit's declarations, for the planner that creates and removes methods
+    /// and types at entity grain. See [`crate::member_placement`]. The
+    /// default implements nothing, and the planner refuses member work for
+    /// such a language.
+    fn member_placement(&self) -> Option<&dyn crate::member_placement::MemberPlacement> {
+        None
+    }
+
+    /// How this language writes a whole source unit when a caller addresses
+    /// the unit rather than an entity in it. See [`crate::unit_editor`]. The
+    /// default implements nothing, and unit-addressed creation is refused for
+    /// such a language.
+    fn unit_editor(&self) -> Option<&dyn crate::unit_editor::UnitEditor> {
+        None
+    }
+
+    /// The lines of `source`, parsed to `root`, laid out as this language
+    /// refuses although its grammar reads every token, appended to `out` in
+    /// the language's own words: a block not indented under its header, a
+    /// statement indented unlike its neighbours. Read only for a language
+    /// whose indentation is syntax (see [`crate::syntax_reading`]). The
+    /// default finds none.
+    fn layout_problems(
+        &self,
+        root: &Node,
+        source: &[u8],
+        out: &mut Vec<crate::syntax_reading::SyntaxProblem>,
+    ) {
+        let _ = (root, source, out);
+    }
+
+    /// Whether `node`, a string or a piece of one, is a docstring: text this
+    /// language lays out with the code around it and reads with that layout
+    /// taken off, so moving its lines with the code changes nothing a reader
+    /// sees. The default reads no string as one.
+    fn is_docstring(&self, node: Node) -> bool {
+        let _ = node;
+        false
+    }
+
+    /// Whether an entity this adapter extracted, of `kind` and stored
+    /// `signature`, only declares a callable whose running body is another
+    /// entity's: a C prototype, a TypeScript ambient declaration, a Python
+    /// `@overload` stub. Name resolution prefers the definition over it. See
+    /// [`crate::declaration_only`]. The default declares nothing so.
+    fn declares_only(&self, kind: EntityKind, signature: &str) -> bool {
+        let _ = (kind, signature);
+        false
+    }
 }
 
 /// Compute a semantic fingerprint by hashing different aspects of a node.
@@ -396,8 +551,11 @@ pub fn file_module_surface_entity(
 ///
 /// With nothing declared the file's own stem answers, which is the coordinate
 /// Rust, Swift and an unnamespaced PHP file use. A Rust `mod.rs` is its
-/// directory's module and a Rust crate root is `crate`, because neither is
-/// named by its stem.
+/// directory's module. This is the rule from the path alone: a Rust crate
+/// root takes its crate's name from its Cargo manifest where the tree holds
+/// one ([`crate::project_manifest::UnitContext`]), and only a root no manifest
+/// governs is named here, by the directory of the crate its path lays out
+/// (see [`crate::languages::rust_crates::conventional_root_name`]).
 pub fn file_module_surface_name(declared: Option<&str>, file_id: &FilePathId) -> Option<String> {
     if let Some(declared) = declared {
         let leaf = declared
@@ -424,7 +582,10 @@ pub fn file_module_surface_name(declared: Option<&str>, file_id: &FilePathId) ->
             .map(|(dir, _)| dir.rsplit('/').next().unwrap_or(dir));
         return match stem {
             "mod" => parent.filter(|dir| !dir.is_empty()).map(str::to_string),
-            "lib" | "main" => Some("crate".to_string()),
+            "lib" | "main" => Some(
+                crate::languages::rust_crates::conventional_root_name(path)
+                    .unwrap_or_else(|| stem.to_string()),
+            ),
             _ => Some(stem.to_string()),
         };
     }

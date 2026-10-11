@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kin_core::registry::{KinRegistry, RegisteredRepo};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 pub const DEPS_SCHEMA: &str = "kin.deps.v1";
@@ -34,37 +34,155 @@ pub struct RepoDependencyView {
     /// `consumers` cannot be read as none either. A separate fact because the
     /// two directions are answered by different entries' records.
     pub consumers_predate_recording: bool,
+    pub finalized_at: String,
+    pub manifests_recorded_at: Option<String>,
+    pub refresh_gap: Option<String>,
+    pub refresh_command: String,
 }
 
-/// Show the cross-repo dependencies of the repository the caller is in.
-///
-/// The answer is projected from the dependency records ingestion wrote, not
-/// re-derived by parsing manifests at query time. A repo that carries no
-/// records reports that gap rather than having it filled in from whatever
-/// manifests happen to be on disk.
-///
-/// The default scope is one repository because that is the question a caller
-/// standing in a repository is asking. `--all` keeps the fleet-wide listing,
-/// which on a host with many registered repositories is thousands of lines and
-/// buries the caller's own repository in them.
-pub async fn run(all: bool, json: bool) -> Result<()> {
-    let registry =
-        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {}", e))?;
+/// A manifest refresh asks the daemon that already owns this repository's tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepsRequest {
+    pub repository_id: String,
+    pub registry_repo_ids: Vec<String>,
+}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepsResponse {
+    pub repository_id: String,
+    pub dependencies: Vec<kin_core::dependencies::RepoDependency>,
+    pub observed_at: String,
+}
+
+/// Read current held manifests without opening authority or scanning source.
+pub fn build_deps_response(
+    tree: &kin_model::ResolvedTree,
+    held: &kin_core::LocalRepositoryAuthorityBinding,
+    request: &DepsRequest,
+) -> Result<DepsResponse> {
+    anyhow::ensure!(
+        held.repository_id().as_str() == request.repository_id,
+        "dependency refresh repository identity does not match the pinned authority"
+    );
+    let content = kin_core::dependencies::HeldTree::new(tree, held).manifest_content()?;
+    Ok(DepsResponse {
+        repository_id: request.repository_id.clone(),
+        dependencies: kin_core::dependencies::manifest_dependencies(
+            &content,
+            &request.registry_repo_ids,
+        ),
+        observed_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Replace only manifest-derived edges for the exact registered location.
+/// Heuristic and inverse edges keep their admission-time provenance.
+fn record_manifest_refresh(
+    registry: &mut KinRegistry,
+    path: &std::path::Path,
+    response: &DepsResponse,
+) -> Result<()> {
+    let id = registered_id_for_path(registry, path)?;
+    anyhow::ensure!(
+        id == response.repository_id,
+        "dependency refresh came from a different repository"
+    );
+    anyhow::ensure!(
+        response
+            .dependencies
+            .iter()
+            .all(|dep| matches!(dep.source.as_str(), "cargo" | "npm" | "go")),
+        "manifest refresh contained a non-manifest dependency"
+    );
+    let row = registry
+        .repos
+        .iter_mut()
+        .find(|row| row.path == path && row.id == response.repository_id)
+        .expect("unique registered location was checked above");
+    row.dependencies
+        .retain(|dep| !matches!(dep.source.as_str(), "cargo" | "npm" | "go"));
+    row.dependencies
+        .extend(response.dependencies.iter().cloned());
+    row.dependencies
+        .sort_by(|a, b| (&a.name, &a.source).cmp(&(&b.name, &b.source)));
+    row.dependencies
+        .dedup_by(|a, b| a.name == b.name && a.source == b.source);
+    row.dependencies_manifest_recorded_at = Some(response.observed_at.clone());
+    Ok(())
+}
+
+/// A stale recorded answer is allowed only when serving cannot start, never
+/// when a compatible serving daemon refused the query or the store is invalid.
+fn dependency_daemon_resolution(
+    resolution: Result<Option<String>>,
+) -> Result<(Option<String>, Option<String>)> {
+    match resolution {
+        Ok(Some(url)) => Ok((Some(url), None)),
+        Ok(None) => Ok((
+            None,
+            Some("the repository daemon is disabled and is not running".to_string()),
+        )),
+        Err(error) => {
+            use crate::daemon_client::AutoStartError;
+            if matches!(
+                error.downcast_ref::<AutoStartError>(),
+                Some(AutoStartError::IncompatibleStore(_) | AutoStartError::BehaviorEnvIgnored(_))
+            ) {
+                return Err(error);
+            }
+            Ok((
+                None,
+                Some(format!("the repository daemon could not start: {error:#}")),
+            ))
+        }
+    }
+}
+
+/// Refresh the current repository's held manifests through its daemon. Fleet
+/// and inverse views remain recorded data; they never scan sibling checkouts.
+pub async fn run(all: bool, json: bool) -> Result<()> {
+    let mut registry =
+        KinRegistry::load().map_err(|e| anyhow::anyhow!("failed to load registry: {e}"))?;
     if all {
         return report_every_registered_repo(&registry, json);
     }
-
     let layout = crate::commands::require_repository_layout()?;
-    let repo_id = registered_id_for_path(&registry, layout.working_dir())?;
-    let view = repo_dependency_view(&registry, repo_id)?;
-
+    let repo_id = registered_id_for_path(&registry, layout.working_dir())?.to_owned();
+    let request = DepsRequest {
+        repository_id: repo_id.clone(),
+        registry_repo_ids: registry.repos.iter().map(|row| row.id.clone()).collect(),
+    };
+    let (url, refresh_gap) =
+        dependency_daemon_resolution(crate::daemon_client::resolve_daemon_url(&layout).await)?;
+    if let Some(url) = url {
+        let client = crate::daemon_client::DaemonClient::from_base_url(url)?;
+        // A serving daemon's refusal (including missing held content) is an
+        // error. It must never be disguised as a successful recorded answer.
+        let response = client
+            .dependencies(&request)
+            .await
+            .context("daemon dependency refresh failed")?;
+        registry = KinRegistry::update(|registry| -> Result<KinRegistry> {
+            record_manifest_refresh(registry, layout.working_dir(), &response)?;
+            Ok(KinRegistry {
+                repos: registry.repos.clone(),
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("record held dependencies: {error}"))??;
+    }
+    let selected = registry
+        .repos
+        .iter()
+        .find(|row| row.id == repo_id && row.path == layout.working_dir())
+        .context("the refreshed repository location is no longer registered")?;
+    let mut view = repo_dependency_view_for_row(&registry, selected);
+    view.refresh_gap = refresh_gap;
     if json {
         println!("{}", serde_json::to_string_pretty(&view)?);
-        return Ok(());
-    }
-    for line in render_repo_view_lines(&view) {
-        println!("{line}");
+    } else {
+        for line in render_repo_view_lines(&view) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -137,7 +255,6 @@ pub fn registered_id_for_path<'a>(
 /// no record for `repo_id`: an unregistered repository has no recorded edges at
 /// all, and printing "no dependencies" for it would read as a proved absence.
 pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<RepoDependencyView> {
-    let known_ids: HashSet<String> = registry.repos.iter().map(|r| r.id.clone()).collect();
     let selected = registry
         .repos
         .iter()
@@ -153,6 +270,15 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
             )
         })?;
 
+    Ok(repo_dependency_view_for_row(registry, selected))
+}
+
+fn repo_dependency_view_for_row(
+    registry: &KinRegistry,
+    selected: &RegisteredRepo,
+) -> RepoDependencyView {
+    let known_ids: HashSet<String> = registry.repos.iter().map(|r| r.id.clone()).collect();
+    let repo_id = selected.id.as_str();
     let depends_on = dependencies_for_repo(selected, &known_ids)
         .into_iter()
         .map(|(repo_id, dep_type)| DependencyEdge {
@@ -177,17 +303,21 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
     consumers.sort_by(|a, b| (&a.repo_id, &a.source).cmp(&(&b.repo_id, &b.source)));
     consumers.dedup();
 
-    Ok(RepoDependencyView {
+    RepoDependencyView {
         schema: DEPS_SCHEMA.to_string(),
         repo_id: repo_id.to_string(),
         depends_on,
         consumers,
+        finalized_at: selected.last_commit.clone(),
+        manifests_recorded_at: selected.dependencies_manifest_recorded_at.clone(),
+        refresh_gap: None,
+        refresh_command: "kin deps".to_string(),
         depends_on_predates_recording: selected.dependencies_recorded_by.is_none(),
         consumers_predate_recording: registry
             .repos
             .iter()
             .any(|other| other.id != repo_id && other.dependencies_recorded_by.is_none()),
-    })
+    }
 }
 
 /// Render one repository's neighbourhood, saying plainly that an empty
@@ -239,6 +369,18 @@ pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
              rather than none."
                 .to_string(),
         );
+    }
+    if let Some(reason) = &view.refresh_gap {
+        lines.push(format!(
+            "Recorded view: {reason}. Finalization: {}; held manifests: {}. Run `{}` to refresh.",
+            view.finalized_at,
+            view.manifests_recorded_at
+                .as_deref()
+                .unwrap_or("not recorded"),
+            view.refresh_command
+        ));
+    } else if let Some(recorded) = &view.manifests_recorded_at {
+        lines.push(format!("Held manifests recorded at {recorded}; source heuristics and consumers remain recorded views."));
     }
     lines.push("Use `kin deps --all` for every registered repository.".to_string());
     lines
@@ -450,6 +592,7 @@ mod tests {
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
             dependencies_recorded_by: None,
+            dependencies_manifest_recorded_at: None,
         }
     }
 
@@ -461,6 +604,7 @@ mod tests {
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
             dependencies_recorded_by: None,
+            dependencies_manifest_recorded_at: None,
         }
     }
 
@@ -672,6 +816,7 @@ mod tests {
                 last_commit: "2026-01-01T00:00:00Z".to_string(),
                 dependencies: Vec::new(),
                 dependencies_recorded_by: None,
+                dependencies_manifest_recorded_at: None,
             },
         ];
 
@@ -757,6 +902,7 @@ mod tests {
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies: Vec::new(),
             dependencies_recorded_by: Some("0.6.1".to_string()),
+            dependencies_manifest_recorded_at: None,
         };
 
         // Registered by a build that records dependencies. The zero is measured.
@@ -806,5 +952,209 @@ mod tests {
             mixed_view.consumers_predate_recording,
             "a sibling that predates recording leaves the inverse direction in doubt"
         );
+    }
+
+    #[test]
+    fn manifest_refresh_removes_old_edges_and_preserves_admission_provenance() {
+        let mut registry = registry_with_noise();
+        let row = &mut registry.repos[0];
+        row.dependencies
+            .push(dep("bin:kin-bench", "kin-bench", "subprocess"));
+        let original_finalized = row.last_commit.clone();
+        let path = row.path.clone();
+        let response = super::DepsResponse {
+            repository_id: "kin".to_string(),
+            dependencies: vec![dep("kin-core", "kin-core", "cargo")],
+            observed_at: "2026-10-08T16:00:00Z".to_string(),
+        };
+        super::record_manifest_refresh(&mut registry, &path, &response).unwrap();
+        let row = &registry.repos[0];
+        assert!(!row.dependencies.iter().any(|dep| dep.name == "kin-db"));
+        assert!(row.dependencies.iter().any(|dep| dep.name == "kin-core"));
+        assert!(row
+            .dependencies
+            .iter()
+            .any(|dep| dep.source == "subprocess"));
+        assert_eq!(row.last_commit, original_finalized);
+        assert_eq!(
+            row.dependencies_manifest_recorded_at.as_deref(),
+            Some(response.observed_at.as_str())
+        );
+        assert!(
+            row.dependencies_recorded_by.is_none(),
+            "a manifest-only read cannot certify the unrecorded heuristics"
+        );
+
+        let mut wrong = response.clone();
+        wrong.repository_id = "another-repository".to_string();
+        assert!(super::record_manifest_refresh(&mut registry, &path, &wrong).is_err());
+        wrong.repository_id = "kin".to_string();
+        wrong.dependencies = vec![dep("bad", "bad", "subprocess")];
+        assert!(super::record_manifest_refresh(&mut registry, &path, &wrong).is_err());
+    }
+
+    #[test]
+    fn refresh_and_report_select_the_exact_location_of_a_copied_repository() {
+        let mut registry = registry_with_noise();
+        let mut copy = registry.repos[0].clone();
+        copy.path = "/another/kin".into();
+        let copy_path = copy.path.clone();
+        registry.repos.push(copy);
+        let response = super::DepsResponse {
+            repository_id: "kin".into(),
+            dependencies: vec![],
+            observed_at: "2026-10-08T16:00:00Z".into(),
+        };
+        super::record_manifest_refresh(&mut registry, &copy_path, &response).unwrap();
+        assert!(registry.repos[0]
+            .dependencies
+            .iter()
+            .any(|dep| dep.source == "cargo"));
+        let row = registry
+            .repos
+            .iter()
+            .find(|row| row.path == copy_path)
+            .unwrap();
+        let view = super::repo_dependency_view_for_row(&registry, row);
+        assert!(!view.depends_on.iter().any(|dep| dep.source == "cargo"));
+        assert_eq!(
+            view.manifests_recorded_at.as_deref(),
+            Some(response.observed_at.as_str())
+        );
+    }
+
+    #[test]
+    fn dependency_daemon_fallback_does_not_hide_store_or_policy_refusals() {
+        use crate::daemon_client::AutoStartError;
+        let disabled = super::dependency_daemon_resolution(Ok(None)).unwrap();
+        assert!(disabled.0.is_none() && disabled.1.unwrap().contains("disabled"));
+        let unavailable =
+            super::dependency_daemon_resolution(Err(AutoStartError::BinaryNotFound.into()))
+                .unwrap();
+        assert!(unavailable.0.is_none() && unavailable.1.unwrap().contains("could not start"));
+        for refusal in [
+            AutoStartError::IncompatibleStore("upgrade needed".into()),
+            AutoStartError::BehaviorEnvIgnored("strict policy".into()),
+        ] {
+            assert!(super::dependency_daemon_resolution(Err(refusal.into())).is_err());
+        }
+        let mut view = repo_dependency_view(&registry_with_noise(), "kin").unwrap();
+        view.refresh_gap = Some("daemon disabled".to_owned());
+        let output = render_repo_view_lines(&view).join("\n");
+        assert!(
+            output.contains("Recorded view")
+                && output.contains("2026-01-01")
+                && output.contains("kin deps")
+        );
+    }
+
+    #[test]
+    fn dependency_refresh_uses_held_bytes_and_refuses_missing_or_wrong_authority() {
+        // The store lands in the private registry the test environment gives
+        // this process (scripts/test-env), which nextest and plain `cargo test`
+        // both apply. Changing KIN_HOME here would move nothing the test reads
+        // and would refuse to run beside the other tests in a shared process.
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::commands::test_subprocess::fixture_git(&repo)
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.email", "kin@example.invalid"]);
+        git(&["config", "user.name", "Kin"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname='sample'\nversion='0.1.0'\n[dependencies]\nkin-db={git='https://github.com/firelock-ai/kin-db.git'}\n",
+        )
+        .unwrap();
+        for (name, bytes) in [
+            ("invalid-utf8.bin", &[0xff][..]),
+            ("invalid-nul.txt", b"a\0b".as_slice()),
+            ("invalid-toml.txt", b"[".as_slice()),
+        ] {
+            std::fs::write(repo.join(name), bytes).unwrap();
+        }
+        git(&["add", "--all"]);
+        git(&["commit", "--signoff", "-m", "held dependency fixture"]);
+        let layout = kin_core::init_from_git(&repo).unwrap().layout;
+        let held = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
+        let authority =
+            crate::commands::repository_authority::ActiveRepositoryAuthority::open(&held).unwrap();
+        let tree = authority.workspace().unwrap().tree;
+        drop(authority);
+        // Contradict the admitted bytes. Neither query nor finalization follows disk.
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[dependencies]\nkin-cli={git='https://github.com/firelock-ai/kin-cli.git'}\n",
+        )
+        .unwrap();
+        let request = super::DepsRequest {
+            repository_id: held.repository_id().to_string(),
+            registry_repo_ids: vec![],
+        };
+        let response = super::build_deps_response(&tree, &held, &request).unwrap();
+        assert!(response.dependencies.iter().any(|dep| dep.name == "kin-db"));
+        assert!(!response
+            .dependencies
+            .iter()
+            .any(|dep| dep.name == "kin-cli"));
+        let admitted = kin_core::dependencies::HeldTree::new(&tree, &held)
+            .dependency_content()
+            .unwrap();
+        let deps = kin_core::dependencies::detect_dependencies(&admitted);
+        assert!(deps.iter().any(|dep| dep.name == "kin-db"));
+        assert!(!deps.iter().any(|dep| dep.name == "kin-cli"));
+        let mut wrong = request.clone();
+        wrong.repository_id = "other".into();
+        assert!(super::build_deps_response(&tree, &held, &wrong).is_err());
+        let mut artifacts: Vec<_> = tree.artifacts_by_path().cloned().collect();
+        let manifest = artifacts
+            .iter_mut()
+            .find(|entry| entry.path.as_utf8() == Some("Cargo.toml"))
+            .unwrap();
+        manifest.entry = kin_model::TreeEntry::blob(kin_model::Hash256([0x42; 32]), false);
+        let missing = kin_model::ResolvedTree::from_artifacts(artifacts.clone()).unwrap();
+        assert!(
+            super::build_deps_response(&missing, &held, &request).is_err(),
+            "missing CAS must never read the working manifest"
+        );
+        let manifest = artifacts
+            .iter_mut()
+            .find(|entry| entry.path.as_utf8() == Some("Cargo.toml"))
+            .unwrap();
+        manifest.entry = kin_model::TreeEntry::symlink(kin_model::Hash256([0x42; 32]));
+        let linked = kin_model::ResolvedTree::from_artifacts(artifacts.clone()).unwrap();
+        assert!(
+            super::build_deps_response(&linked, &held, &request).is_err(),
+            "a held link is not manifest text and cannot certify zero dependencies"
+        );
+        for name in ["invalid-utf8.bin", "invalid-nul.txt", "invalid-toml.txt"] {
+            let invalid_entry = artifacts
+                .iter()
+                .find(|entry| entry.path.as_utf8() == Some(name))
+                .unwrap()
+                .entry
+                .clone();
+            artifacts
+                .iter_mut()
+                .find(|entry| entry.path.as_utf8() == Some("Cargo.toml"))
+                .unwrap()
+                .entry = invalid_entry;
+            let invalid = kin_model::ResolvedTree::from_artifacts(artifacts.clone()).unwrap();
+            assert!(
+                super::build_deps_response(&invalid, &held, &request).is_err(),
+                "invalid held manifest {name} must not erase recorded edges"
+            );
+        }
     }
 }

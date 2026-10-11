@@ -23,24 +23,25 @@ kin_buildinfo::embed_update_build_identity!(
 );
 
 /// First-use guidance precedes the complete command index. The first line is
-/// the brand canon's plain category, shared with the terminal version display.
+/// the brand canon's definition, shared with the terminal version display.
 const ORIENTATION: &str = "\
-A new way to store and manage code for people and AI.
+A graph-native code repository for AI agents and the people who build with them.
 
 Start here:
-  kin init            admit an existing or new repository
-  kin clone <source>  admit a repository from elsewhere
-  kin status          workspace, refs, and semantic enrichment state
-  kin commit          publish an exact semantic and artifact change
-  kin log / kin diff  read the immutable change log and exact changes
+  kin setup           set up AI clients and your shell
+  kin init            start Kin in this repository
+  kin clone <source>  clone a repository into Kin
+  kin status          see changes and Kin's progress
+  kin commit          record your change
+  kin log / kin diff  read the history and what changed
 
 Ask the graph:
   kin locate / search / trace / impact / refs / context
 
 Use an editor or AI:
-  kin open code        open an editor in a session workspace
-  kin with codex       launch an assistant in a session workspace
-  kin mcp start --help  inspect MCP options and tool profiles";
+  kin open code         open an editor in a session workspace
+  kin with codex        start an assistant in a session workspace
+  kin mcp start --help  how AI clients connect to Kin";
 
 /// Clap groups arguments, but only has one heading for all subcommands. The
 /// root template uses the metadata-derived index without changing its parser.
@@ -68,6 +69,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Understand code",
         &[
+            "ask",
             "overview",
             "locate",
             "search",
@@ -108,6 +110,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Use editors and AI",
         &[
+            "ui",
             "open",
             "with",
             "shell",
@@ -161,6 +164,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
             "graph",
             "embed",
             "cache",
+            "store",
             "locate-debug",
             "bench",
             "support",
@@ -272,6 +276,30 @@ fn after_help() -> String {
     }
 }
 
+/// Help that does not fit the terminal it is going to, wrapped at words, or
+/// `None` when it fits or goes to a file or a pipe.
+///
+/// clap prints help as written, so a narrow terminal broke words in two
+/// ("ki / n to your shell"). The wrap keeps every command line's description
+/// column, hanging its continuation under it, and a flag's description under
+/// its own indent. Help that fits keeps clap's own styled rendering, and help
+/// a program reads is never rewrapped.
+fn help_fitted_to_terminal(err: &clap::Error) -> Option<String> {
+    let term = if err.use_stderr() {
+        console::Term::stderr()
+    } else {
+        console::Term::stdout()
+    };
+    if !term.is_term() {
+        return None;
+    }
+    let (_, columns) = term.size_checked()?;
+    let width = usize::from(columns);
+    let plain = err.render().to_string();
+    let overflows = plain.lines().any(|line| line.chars().count() > width);
+    (width > 0 && overflows).then(|| kin_cli::screen::hang_wrap(&plain, width))
+}
+
 #[derive(Parser)]
 #[command(
     name = "kin",
@@ -295,7 +323,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show which Git-replacement commands are ready on repository-v6
+    /// Show which Git commands Kin replaces, and how ready each one is
     Capabilities {
         /// Output the versioned capability inventory as JSON
         #[arg(long, default_value_t = false)]
@@ -304,23 +332,43 @@ enum Command {
         #[arg(long, default_value_t = false, conflicts_with = "json")]
         verbose: bool,
     },
-    /// Initialize a new Kin repository
+    /// Start Kin in a repository, new or existing
     Init {
         /// Directory to initialize (defaults to current directory)
         path: Option<String>,
         /// Output machine-readable JSON status instead of human text
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Skip the cross-file enrichment phase
+        /// Switch language-server enrichment off for this repository
         ///
         /// Conversion queries an installed language server for the reference,
-        /// override and type-use edges a single-file parse cannot derive. It is
-        /// the slowest phase and it needs a server, so a scripted conversion
-        /// that does not want it can say so. The sweep is resumable, so a
-        /// repository initialized with this flag is enriched by the next daemon
-        /// that starts on it rather than left thin forever.
+        /// override and type-use edges across units that parsing each unit on
+        /// its own cannot derive. It is the slowest phase and it needs a
+        /// server, so a conversion that does not want it can say so. This flag
+        /// records that enrichment is off for the repository: no daemon that
+        /// serves it runs a sweep, enriches a change or starts a language
+        /// server, whoever starts it. Import and call edges still come from
+        /// source. On a repository that already exists it records the same
+        /// setting and stops the daemon serving it, which started with
+        /// enrichment on. `kin daemon sweep --enable` turns enrichment on
+        /// later. To skip the sweep now and let the next daemon run it, use
+        /// `--defer-enrich`.
         #[arg(long = "no-enrich", default_value_t = false)]
         no_enrich: bool,
+        /// Skip the language-server sweep now; the next daemon start runs it
+        ///
+        /// Enrichment stays on for the repository. This command returns
+        /// without the language-server sweep, and the next daemon that starts
+        /// on the repository, which the first query after this one starts,
+        /// queues it and links references across entities in the background.
+        /// Queries during that sweep share the daemon with it. Use
+        /// `--no-enrich` to switch enrichment off instead.
+        #[arg(
+            long = "defer-enrich",
+            default_value_t = false,
+            conflicts_with = "no_enrich"
+        )]
+        defer_enrich: bool,
         /// Adopt an existing repository's identity instead of minting a new one
         ///
         /// Use this when the store being created has to publish into a
@@ -332,6 +380,20 @@ enum Command {
         /// identity, which is right for a repository nothing else holds.
         #[arg(long = "adopt-repository-id", value_name = "ID")]
         adopt_repository_id: Option<String>,
+        /// Keep the store in this directory instead of the central stores directory
+        ///
+        /// A new store normally lives in the central stores directory under the
+        /// Kin home (`~/.kin/stores`). With this flag it is created at DIR,
+        /// which must be outside the working tree and absent or empty. Either
+        /// way the working tree carries nothing: no pointer file and no ignore
+        /// rule, so the store never shows in its diff and a read-only checkout
+        /// can be served. Every later command, daemon, `kin mcp start` and
+        /// editor finds the store from the working tree through the store index
+        /// beside the registry. `KIN_STORE` sets the same thing from the
+        /// environment, and `KIN_STORE_LAYOUT=in-tree` keeps a new store in the
+        /// working tree as `.kin` instead.
+        #[arg(long, value_name = "DIR")]
+        store: Option<PathBuf>,
         /// Print the full record: every admission stage, the ids and the
         /// enrichment detail
         ///
@@ -339,8 +401,20 @@ enum Command {
         /// result. A pipe, CI and this flag keep the full record.
         #[arg(long, default_value_t = false, conflicts_with = "json")]
         verbose: bool,
+        /// How much Git history to admit: background, none or full
+        ///
+        /// `background` (the default) admits the checked-out commit first, so
+        /// the repository answers within seconds, and derives the full history
+        /// afterwards at low priority. `none` admits the checked-out commit
+        /// only and never derives history, for CI jobs, containers and agent
+        /// sandboxes; it also admits a shallow clone. `full` admits the whole
+        /// reachable history before the store is published. Over an existing
+        /// store, `--history full` derives and attaches its history now, and
+        /// `background` or `none` changes what it does next.
+        #[arg(long, value_name = "MODE", value_parser = parse_history_mode)]
+        history: Option<kin_core::history_state::HistoryMode>,
     },
-    /// Show coherent repository-v6 workspace status
+    /// Show your changes, your branch and Kin's progress
     Status {
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
@@ -554,6 +628,22 @@ enum Command {
         #[arg(long, default_value_t = false)]
         compact: bool,
     },
+    /// Print where entities are projected in the working copy, for editors
+    ///
+    /// Each ENTITY_ID is answered with the path its declaration is projected
+    /// to, relative to the repository root, and the declaration's 1-based
+    /// start and end, or with the reason the graph cannot place it. Up to 512
+    /// ids per call. Editors use this to put a cursor on an entity; to explore
+    /// a repository use `kin locate`, `kin refs` and `kin source`.
+    #[command(hide = true)]
+    Places {
+        /// Entity ids to place, bare or spelled `entity:<uuid>`
+        #[arg(required = true, value_name = "ENTITY_ID")]
+        entity_ids: Vec<String>,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Search entities in the graph
     Search {
         /// Search pattern (use '|' for OR, e.g. "save|load|persist")
@@ -592,6 +682,10 @@ enum Command {
         session: Option<String>,
     },
     /// Locate files relevant to an issue or problem description
+    ///
+    /// This command ranks problem text. For the MCP locate contract, including
+    /// exact graph file coordinates and mode selection, use `kin call locate`
+    /// with the JSON arguments shown by `kin describe locate`.
     Locate {
         /// Problem text (inline)
         text: Option<String>,
@@ -818,6 +912,21 @@ enum Command {
         /// Continue a frozen JSON reference answer with its next_cursor
         #[arg(long, requires = "json", conflicts_with_all = ["bulk_json", "all"])]
         cursor: Option<String>,
+        /// Return only overriding methods and inheritance coverage. Overrides
+        /// requires an exact entity UUID and does not accept --kind filters.
+        #[arg(long, requires = "json", value_parser = ["references", "overrides"], conflicts_with_all = ["bulk_json", "all"])]
+        view: Option<String>,
+    },
+    /// Open the local Kin workspace for repositories, entities and review
+    Ui {
+        /// Repository working directory (defaults to the current repository)
+        path: Option<std::path::PathBuf>,
+        /// Serve on this loopback port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the address without opening a browser
+        #[arg(long)]
+        no_open: bool,
     },
     /// Run semantic review on changes, or manage review state
     Review {
@@ -844,6 +953,19 @@ enum Command {
         /// Review mutation subcommand
         #[command(subcommand)]
         action: Option<ReviewAction>,
+    },
+    /// Derive a partial store's Git history into a stage and attach it
+    ///
+    /// The worker `kin init --history background` and the daemon start. A
+    /// person runs `kin init --history full` instead.
+    #[command(hide = true)]
+    DeriveHistory {
+        /// Repository whose store to derive (defaults to current directory)
+        path: Option<String>,
+        /// Run at background priority and attach only when no daemon serves
+        /// the store
+        #[arg(long, default_value_t = false)]
+        background: bool,
     },
     /// Publish a reserved hosted repository's first graph authority.
     ///
@@ -939,6 +1061,15 @@ enum Command {
         /// this repository does not define stays a leaf either way.
         #[arg(long = "include-type-edges", default_value_t = false)]
         include_type_edges: bool,
+        /// Hold the walk to a module path prefix, as a row's `module` field
+        /// spells it (`flask.sansio`). The walk follows no edge out of it, and
+        /// the reply's `scope` block says what it left out.
+        #[arg(long = "scope", value_name = "MODULE")]
+        scope: Option<String>,
+        /// What `--scope` restricts: `paths` (default) keeps the walk inside
+        /// it; `rows` walks everything and lists only the rows inside it.
+        #[arg(long = "scope-mode", value_name = "MODE")]
+        scope_mode: Option<String>,
     },
     /// Show this repository's recorded cross-repo dependencies
     Deps {
@@ -1065,6 +1196,40 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Ask a question about this repository in plain words
+    ///
+    /// Kin reads the question, runs the graph query that answers it (refs,
+    /// trace, impact, locate, source or context) and prints one reply: what it
+    /// ran and which words of the question it read that from, what the
+    /// question asked for that the query did not apply, then each answer,
+    /// verdict first. It is the reply an MCP client gets from the `ask` tool.
+    /// The question's words decide whether test code counts and which package
+    /// limits the answer; the options override them.
+    Ask {
+        /// The question, in plain words. Name the function, method or class
+        #[arg(required_unless_present = "hook", num_args = 1..)]
+        question: Vec<String>,
+        /// Answer an agent client's prompt hook instead: read the hook's JSON
+        /// on stdin and print the context the client adds before the model's
+        /// first turn, or nothing when the prompt asks nothing Kin routes
+        #[arg(long, value_parser = commands::ask::HOOK_CLIENTS, conflicts_with = "json")]
+        hook: Option<String>,
+        /// Count test code, whatever the question says
+        #[arg(long, conflicts_with = "no_tests")]
+        tests: bool,
+        /// Leave test code out, whatever the question says
+        #[arg(long)]
+        no_tests: bool,
+        /// Limit the answer to modules under this dotted prefix, as rows spell a module
+        #[arg(long)]
+        scope: Option<String>,
+        /// The most bytes the reply may take
+        #[arg(long)]
+        budget: Option<u64>,
+        /// Print one JSON object with the answer, its one verdict and every call Kin made
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a routed kin tool command's or any Kin tool's arguments
     ///
     /// Prints what the routed `kin` MCP tool's `describe` command answers: the
@@ -1086,6 +1251,8 @@ enum Command {
     /// JSON object of the tool's fields, which `kin describe <tool>` lists, and
     /// `-` reads that object from stdin. A tool that answers with an error
     /// exits 1, with the answer printed as usual.
+    /// `kin call locate` shares MCP locate's name, exact file-coordinate and
+    /// description modes; standalone `kin locate` ranks problem text.
     ///
     /// It answers as the agent-routed profile does, writes included. A
     /// read-only MCP profile limits what its one tool reaches, not what a shell
@@ -1164,7 +1331,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Clone a repository
+    /// Clone a repository into Kin
     Clone {
         /// Native Kin locator or Git repository URL
         url: String,
@@ -1226,7 +1393,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// List the languages Kin extracts semantics from
+    /// List the languages Kin understands
     Languages {
         /// Output machine-readable JSON
         #[arg(long, default_value_t = false)]
@@ -1270,6 +1437,11 @@ enum Command {
     Backup {
         #[command(subcommand)]
         action: BackupAction,
+    },
+    /// Show where a working tree's store lives, and list or prune stores
+    Store {
+        #[command(subcommand)]
+        action: StoreAction,
     },
     /// Manage change approvals
     Approvals {
@@ -1344,7 +1516,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Migrate an existing Git repository into graph-owned Kin truth
+    /// Move an existing Git repository into Kin, in place or to a new directory
     Migrate {
         /// Source repository path (defaults to current directory)
         source: Option<String>,
@@ -1535,7 +1707,7 @@ enum Command {
         expect_sha: Option<String>,
         /// Require the downloaded platform archive to match this exact SHA-256.
         /// Supply it only after external cryptographic attestation verification
-        /// pins firelock-ai/kin, release.yml, the release tag, and source commit.
+        /// pins kinlab-ai/kin, release.yml, the release tag, and source commit.
         #[arg(
             long,
             requires_all = ["expect_version", "expect_sha"],
@@ -1702,36 +1874,86 @@ enum Command {
         )]
         conversion_source: Option<String>,
     },
-    /// First-time setup and health checks for the Kin system
+    /// Set up this machine: connect AI clients and add kin to your shell
     Setup {
         #[command(subcommand)]
         action: Option<SetupAction>,
-        /// First-run intent: local, agent, editor, hosted, or advanced
+        /// What to set up: local, agent, editor, hosted, or advanced
+        ///
+        /// `local` sets up kin in your shell and connects no AI client.
+        /// `agent` also connects the AI clients installed here. `editor` and
+        /// `hosted` are local setup plus a pointer to the editor extension or
+        /// your KinLab sign-in. `advanced` lets you choose each step.
         #[arg(long, global = true, value_parser = ["local", "agent", "editor", "hosted", "advanced"])]
         intent: Option<String>,
-        /// Repository mode: native or compatibility
-        #[arg(long, global = true)]
+        /// Ignored: Kin has one repository format, so there is no mode to
+        /// choose. Still accepted, and said to be ignored, so a script that
+        /// passes it keeps running.
+        #[arg(long, global = true, hide = true)]
         mode: Option<String>,
         /// Shell to configure: zsh, bash, or powershell
         #[arg(long, global = true)]
         shell: Option<String>,
-        /// Auto-start kin-daemon when entering workspaces
+        /// Start the Kin daemon on its own when you enter a Kin repository
         #[arg(long, global = true)]
         auto_daemon: bool,
-        /// Run non-interactively using defaults or provided flags
+        /// Ask nothing: use the defaults and any flags given
         #[arg(long, global = true)]
         no_interactive: bool,
-        /// Skip the MCP round trip that proves each configured AI client can
-        /// actually call Kin (for a scripted install with no repository yet)
+        /// Skip the test call that proves each connected AI client can reach
+        /// Kin (for a scripted install outside a repository)
         #[arg(long, global = true)]
         skip_mcp_check: bool,
-        /// Install the missing language servers, without asking
+        /// Connect only these AI clients, by the ids `kin setup clients`
+        /// lists, leaving every other client as it is
         ///
-        /// Only for the languages the repository setup runs in uses, and for
-        /// every language outside one. An install can write outside Kin's
-        /// directory (npm global, or the active rustup toolchain), and the run
-        /// says so before it does, so it never runs unasked: an interactive
-        /// run asks first, and a scripted one needs this flag.
+        /// An empty list (`--clients ""`) runs the rest of setup and connects
+        /// none. To add kin to your shell and do nothing else, use
+        /// `--shell-only`.
+        #[arg(long, global = true, value_delimiter = ',', value_name = "ID,...")]
+        clients: Option<Vec<String>>,
+        /// Add kin to your shell and nothing else: connect no AI client
+        ///
+        /// Runs only setup's shell step: the shell hook, and the line that puts
+        /// Kin's bin directory on PATH in the profile your shell reads. It asks
+        /// nothing, connects no AI client, and leaves the daemon, the prompt
+        /// hook and language servers as they are. What it writes is recorded,
+        /// so `kin doctor` checks it and `kin setup uninstall` removes it.
+        /// Exits 1 when the profile cannot be written, after naming the lines
+        /// to add by hand.
+        #[arg(
+            long = "shell-only",
+            conflicts_with_all = [
+                "clients",
+                "prompt_hook",
+                "tool_profile",
+                "install_language_servers",
+                "resource_profile",
+                "embedding_model",
+                "embedding_provider",
+                "auto_daemon",
+                "check"
+            ]
+        )]
+        shell_only: bool,
+        /// With --shell-only: print the result as one JSON object
+        /// (`kin.setup-shell.v1`)
+        #[arg(long, requires = "shell_only")]
+        json: bool,
+        /// Add Kin's Claude Code prompt hook without asking, so Kin answers a
+        /// code question before the model's first turn. An interactive run
+        /// asks first; a scripted one writes into agent settings only with
+        /// this flag
+        #[arg(long = "prompt-hook", global = true)]
+        prompt_hook: bool,
+        /// Install missing language servers without asking
+        ///
+        /// Inside a repository, only the servers its languages need; outside
+        /// one, the servers for the languages Kin supports. An install can
+        /// write outside Kin's directory (npm's global packages, or the active
+        /// rustup toolchain), and the run says so before it does, so it never
+        /// runs unasked: an interactive run asks first, and a scripted one
+        /// needs this flag.
         #[arg(long = "install-language-servers", global = true)]
         install_language_servers: bool,
         /// Record this machine's resource profile without the advanced prompt
@@ -1741,24 +1963,27 @@ enum Command {
         /// actually has can exceed safe memory and GPU thresholds.
         #[arg(long = "resource-profile", global = true, value_parser = ["proof", "interactive", "throughput", "ci"])]
         resource_profile: Option<String>,
-        /// When the embedding model is fetched: later (recommended) or never
+        /// When to download the search model: later (recommended) or never
         ///
-        /// The wizard never downloads it. `later` records that `kin embed` and
-        /// `kin init`'s first embed pass may; `never` records that this machine
-        /// does not, which `kin doctor` then reports as a choice.
+        /// Setup itself never downloads it. `later` lets `kin embed` and
+        /// `kin init` download it the first time they need it; `never` records
+        /// that this machine does not, which `kin doctor` then reports as your
+        /// choice.
         #[arg(long = "embedding-model", global = true, value_parser = ["later", "never"])]
         embedding_model: Option<String>,
-        /// Where vectors are computed: local (recommended) or remote
+        /// Where optional embeddings come from: none (default), built-in, or
+        /// external
         ///
-        /// `remote` collects no credential. It prints the environment variables
-        /// an OpenAI-compatible endpoint needs and states that entity text is
-        /// sent to it.
-        #[arg(long = "embedding-provider", global = true, value_parser = ["local", "remote"])]
+        /// `local` is another name for `built-in`, and `remote` for `external`.
+        /// `external` collects no credential: it prints the environment
+        /// variables an OpenAI-compatible endpoint needs, and says that entity
+        /// text is sent to it.
+        #[arg(long = "embedding-provider", global = true, value_parser = ["none", "built-in", "external", "local", "remote"])]
         embedding_provider: Option<String>,
-        /// Do not add ~/.kin/bin to the shell profile
+        /// Leave your shell profile without the line that puts kin on PATH
         ///
-        /// Only asked about for an npm or npx install, which cannot make the
-        /// edit itself. Without the line a bare `kin` does not resolve.
+        /// Setup asks about this only for an npm or npx install, which cannot
+        /// add the line itself. Without it, a new terminal does not find kin.
         #[arg(long = "skip-path", global = true)]
         skip_path: bool,
         /// Tool profile to write into every AI client this run configures
@@ -1774,14 +1999,15 @@ enum Command {
             value_parser = ["agent-default", "agent-query", "agent-search", "agent-routed", "agent-routed-query"]
         )]
         tool_profile: Option<String>,
-        /// Print every step and check in full, as a pipe or a CI log sees it
+        /// Print every step and check in full
         ///
-        /// On a terminal setup prints a short summary: the questions it asked,
-        /// what it changed on this machine, the AI clients it connected and
-        /// what to run next. This prints the full record instead.
+        /// Setup prints a short summary: the questions it asked (or that a
+        /// run without a terminal took the defaults), what needs you, the AI
+        /// clients it connected and what to run next. This prints the full
+        /// record instead, every step and every health check.
         #[arg(long, default_value_t = false)]
         verbose: bool,
-        /// Skip the wizard and only run the first-run health check
+        /// Only run the health check, without the questions
         #[arg(long, default_value_t = false)]
         check: bool,
     },
@@ -1962,10 +2188,15 @@ enum BranchAction {
     /// hold identically moves across too.
     ///
     /// The switch refuses only where replaying the work would lose something:
-    /// a new file whose path the destination tracks with different content, or
+    /// a new member the destination already holds with different content, or
     /// an edit to a member the destination holds differently or does not hold
-    /// at all. It names every blocked path, and commit or `kin stash push`
-    /// clears the way.
+    /// at all. It names the entities every blocked change holds, and commit or
+    /// `kin stash push` clears the way.
+    ///
+    /// With --detach, NAME is any point in history kin admitted, such as
+    /// git:<sha> (whole or a unique prefix), a change id, or HEAD~3, and the
+    /// workspace moves there with a detached head by the same exact
+    /// transition, applying only what differs and parsing nothing.
     Switch {
         /// UTF-8 short branch name or fully-qualified refs/heads/... name
         #[arg(required_unless_present = "ref_hex", conflicts_with = "ref_hex")]
@@ -1973,6 +2204,77 @@ enum BranchAction {
         /// Canonical lowercase hex for a fully-qualified byte-exact branch ref
         #[arg(long, value_name = "LOWER_HEX")]
         ref_hex: Option<String>,
+        /// Detach at the admitted commit or change NAME instead of entering a branch
+        #[arg(long, default_value_t = false, conflicts_with = "ref_hex")]
+        detach: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreAction {
+    /// Print the store serving a directory, in the tree or kept outside it
+    ///
+    /// A new store lives in the central stores directory under the Kin home.
+    /// A store an earlier version created stays in the working tree as `.kin`,
+    /// and `kin init --store` or `KIN_STORE` can put one anywhere else.
+    /// `--json` also names the working tree and says whether the store is
+    /// external. Starts nothing.
+    Path {
+        /// Directory to ask about (defaults to the current directory)
+        path: Option<PathBuf>,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Make a copied or moved store, kept outside any tree, serve a working tree
+    ///
+    /// For a copy of a prepared store taken for one checkout, such as an APFS
+    /// clone, or a store a moved checkout left behind. The store's contents
+    /// are unchanged: the first daemon reconciles the tree, and `kin branch
+    /// switch --detach git:<sha>` moves the store to the commit the checkout
+    /// holds without parsing anything.
+    Attach {
+        /// The store directory to attach
+        store: PathBuf,
+        /// Working tree it serves (defaults to the current directory)
+        path: Option<PathBuf>,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List the stores kept outside their working trees, and how each stands
+    ///
+    /// Every store the store index names and every store in the central
+    /// stores directory: `serving` its tree, `detached` (its tree exists and
+    /// finds another store or none), `gone` (its tree was moved or deleted),
+    /// `unreachable` (its tree and the directory above it are missing, maybe
+    /// on a volume that is not mounted), or `reserved` (a location with no
+    /// store yet). Starts nothing.
+    List {
+        /// Also measure what each store occupies on disk
+        #[arg(long, default_value_t = false)]
+        size: bool,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Delete central stores whose working tree is gone
+    ///
+    /// Reports what it would remove unless `--yes` is given: a store holds the
+    /// native Kin history of its tree, which Git cannot rebuild. Only stores in
+    /// the central stores directory are deleted, never one a daemon is still
+    /// serving. A store whose tree is merely unreachable is kept unless
+    /// `--unreachable` is given.
+    Prune {
+        /// Delete the stores instead of only listing them
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Include stores whose tree and its parent directory are both missing
+        #[arg(long, default_value_t = false)]
+        unreachable: bool,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -2445,6 +2747,41 @@ enum ReviewAction {
         /// Review ID
         review_id: String,
     },
+    /// Walk a change step by step: connected entities in reading order,
+    /// each with its before and after text and what reaches it
+    Guide {
+        /// What to walk: a change ID, branch name or imported Git commit, or
+        /// a range as <base>..<head> (defaults to the current change)
+        change: Option<String>,
+        /// Walk the uncommitted work in the working tree
+        #[arg(long, default_value_t = false, conflicts_with_all = ["change", "base"])]
+        working: bool,
+        /// Walk everything the change reaches that this ref does not
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+        /// Output the walkthrough as machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Serve the guided review as a local page on this machine
+    Open {
+        /// What to open first: a change, or a range as <base>..<head>
+        /// (defaults to the current change)
+        change: Option<String>,
+        /// Open the uncommitted work in the working tree first
+        #[arg(long, default_value_t = false, conflicts_with_all = ["change", "base"])]
+        working: bool,
+        /// Open everything the change reaches that this ref does not
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+        /// Port to bind on 127.0.0.1. When the default is taken, the next
+        /// free port is used
+        #[arg(long)]
+        port: Option<u16>,
+        /// Serve the page without opening a browser
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2914,13 +3251,22 @@ enum SetupAction {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Show the install ledger and verify it against disk
+    /// List the AI clients Kin can connect, and which are installed and
+    /// connected
+    ///
+    /// The last column is the id `kin setup --clients` takes.
+    Clients {
+        /// Emit the list as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show what `kin setup` installed, and whether it is still in place
     Ledger {
         /// Emit the ledger + verification as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Remove exactly what `kin setup` recorded (ledger-verified)
+    /// Remove what `kin setup` installed, exactly as it recorded it
     Uninstall {
         /// Remove the complete managed install after ledger cleanup (Windows retains an inert authority sidecar)
         #[arg(long, default_value_t = false)]
@@ -2988,6 +3334,9 @@ enum RegistryAction {
 enum DaemonAction {
     /// Show the supervisor and every repo worker daemon, with stale-file detection
     Status {
+        /// The repository whose own daemon to describe, in either store
+        /// layout; the current directory when omitted
+        path: Option<std::path::PathBuf>,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -3033,6 +3382,17 @@ enum DaemonAction {
         /// Print the daemon's answer and a line per file, not one live line
         #[arg(long, default_value_t = false, conflicts_with = "json")]
         verbose: bool,
+        /// Turn language-server enrichment on for this repository, then sweep
+        ///
+        /// For a repository whose enrichment is off, as `kin init --no-enrich`
+        /// leaves it. Records that enrichment is on, so every daemon that
+        /// serves the repository enriches from now on, stops the daemon
+        /// serving it now if it was started with enrichment off, because a
+        /// daemon reads the setting when it starts, and then sweeps. When
+        /// something else keeps the daemon off, an environment switch or a
+        /// graph-only store, it names that and its way out instead.
+        #[arg(long, default_value_t = false)]
+        enable: bool,
     },
 }
 
@@ -3279,11 +3639,8 @@ fn version_lines(version: &str) -> Vec<String> {
         Some((number, rest)) => (number, rest.trim_end_matches(')')),
         None => (version, ""),
     };
-    let mut lines = vec![
-        String::new(),
-        format!("kin {number}"),
-        CATEGORY_LINE.to_string(),
-    ];
+    let mut lines = vec![String::new(), format!("kin {number}")];
+    lines.extend(CATEGORY_ROWS.iter().map(|row| (*row).to_string()));
     // The commit sha gets its own line, and the branch and build time the next.
     // Together they are seventy columns on a release build, whose branch reads
     // `detached`, and ninety when the branch name is long, which wraps at
@@ -3299,8 +3656,24 @@ fn version_lines(version: &str) -> Vec<String> {
     lines
 }
 
-/// The canon Category line, shared by `--help` and `--version`.
-const CATEGORY_LINE: &str = "A new way to store and manage code for people and AI.";
+/// The canon definition as one line, the line `--help` opens with.
+///
+/// Only tests read it. They hold the first line of [`ORIENTATION`] and the
+/// joined [`CATEGORY_ROWS`] to it, so help and version cannot drift apart.
+#[cfg(test)]
+const CATEGORY_LINE: &str =
+    "A graph-native code repository for AI agents and the people who build with them.";
+
+/// The canon definition as the `--version` block sets it, broken where the
+/// phrase breaks.
+///
+/// The definition is eighty columns on its own, and beside the mark it runs
+/// past eighty and wraps. Two rows keep every word of it inside the bound the
+/// version block holds for every other line.
+const CATEGORY_ROWS: [&str; 2] = [
+    "A graph-native code repository for AI agents",
+    "and the people who build with them.",
+];
 
 /// What `kin --version` prints.
 ///
@@ -3311,17 +3684,45 @@ const CATEGORY_LINE: &str = "A new way to store and manage code for people and A
 /// install script parse it. Four rows of art in that stream would break them
 /// all, so the decision is made once, here, by whether stdout is a terminal.
 fn rendered_version(version: &str, style: Option<kin_cli::mark::MarkStyle>) -> String {
+    let columns = console::Term::stdout()
+        .size_checked()
+        .map(|(_, columns)| usize::from(columns));
+    rendered_version_at(version, style, columns)
+}
+
+/// [`rendered_version`] at a known terminal width. A terminal too narrow for
+/// the definition beside the mark gets it rewrapped at words under the same
+/// column, rather than broken mid-word by the terminal.
+fn rendered_version_at(
+    version: &str,
+    style: Option<kin_cli::mark::MarkStyle>,
+    columns: Option<usize>,
+) -> String {
     match style {
-        Some(style) => kin_cli::mark::beside(
-            style,
-            &version_lines(version)
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        )
-        .join("\n"),
+        Some(style) => {
+            let mut lines = version_lines(version);
+            let room = columns.map(|columns| columns.saturating_sub(style.text_column() + 1));
+            if let Some(room) =
+                room.filter(|room| CATEGORY_ROWS.iter().any(|row| row.len() > *room))
+            {
+                let definition = CATEGORY_ROWS.join(" ");
+                let rewrapped: Vec<String> = kin_cli::screen::hang_wrap(&definition, room)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                lines.splice(2..2 + CATEGORY_ROWS.len(), rewrapped);
+            }
+            kin_cli::mark::beside(style, &lines.iter().map(String::as_str).collect::<Vec<_>>())
+                .join("\n")
+        }
         None => format!("kin {version}"),
     }
+}
+
+/// `--history` takes one of the three modes, by name.
+fn parse_history_mode(value: &str) -> Result<kin_core::history_state::HistoryMode, String> {
+    kin_core::history_state::HistoryMode::parse(value)
+        .ok_or_else(|| format!("`{value}` is not a history mode; use background, none or full"))
 }
 
 fn parse_cli_or_report_retired_command() -> Cli {
@@ -3351,6 +3752,20 @@ fn parse_cli_or_report_retired_command() -> Cli {
                 && std::env::args_os().len() == 1
             {
                 kin_cli::banner::print_once(std::io::stderr().is_terminal());
+            }
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                if let Some(help) = help_fitted_to_terminal(&err) {
+                    if err.use_stderr() {
+                        eprint!("{help}");
+                    } else {
+                        print!("{help}");
+                    }
+                    std::process::exit(err.exit_code());
+                }
             }
             if err.kind() == clap::error::ErrorKind::InvalidSubcommand {
                 let args: Vec<String> = std::env::args().skip(1).collect();
@@ -3396,6 +3811,11 @@ fn is_top_level_display_flag() -> bool {
 /// decides the status; this is the process boundary, so it is where the exit
 /// happens.
 fn main() {
+    // First, while the process is still single-threaded: nothing Kin creates
+    // may be group or world writable, whatever umask the login handed it.
+    // A 0002 umask (USERGROUPS_ENAB) otherwise made ~/.kin group writable and
+    // the registry refused it. See `kin_core::umask`.
+    kin_core::umask::withhold_shared_write();
     if let Err(error) = run() {
         std::process::exit(kin_cli::broken_pipe::exit_status(&error));
     }
@@ -3407,8 +3827,8 @@ fn run() -> Result<()> {
     // so on a stock Mac `kin init` died on the first real repository a person
     // tried. Silent either way, and it never lowers a limit an operator raised.
     kin_core::file_limit::raise_open_file_limit();
-    // Before anything can reach the embedder: a machine whose `kin setup`
-    // declined the embedding model download never fetches it from here.
+    // Before anything can reach the embedder: a machine where nobody asked for
+    // the embedding model, or whose `kin setup` declined it, never fetches it.
     kin_cli::embed_model::install_model_fetch_gate();
     // Select this process's resource profile before anything reads it: the GPU
     // kernel plan and the Metal submission depth are each resolved once per
@@ -3422,14 +3842,25 @@ fn run() -> Result<()> {
     // KIN_RESOURCE_PROFILE by construction and no behavior-env divergence is
     // reported for using the feature.
     kin_cli::resource_profile::apply_host_profile_at();
+    // A multi-repository UI must not export its launch directory's model,
+    // retrieval or resource settings into every repository daemon it opens.
+    // Consult the same parser metadata used for leading command paths, so a
+    // global option value named `ui` is not mistaken for the command.
+    let startup_args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let workspace_ui_requested = startup_args.iter().any(|arg| arg == "ui")
+        && typed_command_path(&startup_args).first() == Some(&"ui");
     // ...then let the repository's recorded profile take over from that default,
     // exactly as kin-daemon does, so the two agree by construction. Without this
     // the daemon runs under the repository's profile and this process does not,
     // and every command in such a repository reports a behavior-env divergence
     // whose remedy cannot clear it.
-    if !is_top_level_display_flag() {
+    if !is_top_level_display_flag() && !workspace_ui_requested {
         if let Ok(cwd) = std::env::current_dir() {
             kin_cli::resource_profile::apply_repository_profile_at(&cwd);
+            kin_cli::retrieval_arm::apply_repository_retrieval_at(&cwd);
         }
     }
     // Put Kin's own tool directories on PATH while this process is still
@@ -3443,6 +3874,41 @@ fn run() -> Result<()> {
     }
     kin_buildinfo::retain_update_build_identity(&KIN_UPDATE_BUILD_IDENTITY);
     let cli = parse_cli_or_report_retired_command();
+    if !is_top_level_display_flag() && !matches!(&cli.command, Command::Ui { .. }) {
+        let model_repository = match &cli.command {
+            Command::Mcp {
+                action: McpAction::Start { repo, .. },
+            } => repo
+                .clone()
+                .or_else(|| std::env::var_os("KIN_MCP_REPO").map(PathBuf::from))
+                .unwrap_or(std::env::current_dir()?),
+            _ => std::env::current_dir()?,
+        };
+        kin_core::models::apply_repository_models_at(&model_repository)?;
+        // Asking for an embedding pass opts this repository into the built-in
+        // slot when no provider was selected. An engine-free build keeps none.
+        #[cfg(feature = "embeddings")]
+        if matches!(cli.command, Command::Embed { .. }) && !kin_db::embed::embedding_slot_enabled()
+        {
+            if let Some(layout) = kin_core::KinLayout::discover(&model_repository) {
+                let path = layout.config_path();
+                let mut config = kin_core::KinConfig::load(&path)?;
+                config.models.0.insert(
+                    kin_core::models::ModelSlot::Embeddings,
+                    kin_core::models::ModelSlotConfig {
+                        provider: kin_core::models::ModelProvider::BuiltIn,
+                        ..Default::default()
+                    },
+                );
+                config.save(&path)?;
+                // SAFETY: no runtime or worker threads exist at this point.
+                unsafe {
+                    std::env::set_var("KIN_MODEL_EMBEDDINGS_PROVIDER", "built-in");
+                }
+                kin_cli::embed_model::note_built_in_selected_by_this_command();
+            }
+        }
+    }
     // The semantic-only guard runs once per tool call of a launched assistant
     // and adjudicates a payload on stdin. It touches no repository, so it
     // returns before the tracing subscriber, the environment audit, the pending
@@ -3530,12 +3996,22 @@ fn run() -> Result<()> {
                     path,
                     json,
                     no_enrich,
+                    defer_enrich,
                     adopt_repository_id,
+                    store,
                     verbose,
+                    history,
                 } => {
-                    let code =
-                        commands::init::run(path, json, no_enrich, adopt_repository_id, verbose)
-                            .await?;
+                    let code = commands::init::run(
+                        path,
+                        json,
+                        commands::init::InitEnrichment::from_flags(no_enrich, defer_enrich),
+                        adopt_repository_id,
+                        store,
+                        verbose,
+                        history,
+                    )
+                    .await?;
                     // A conversion whose store exists but whose enrichment a
                     // killed daemon left unattested reports that through the
                     // exit code, so a scripted or agent-driven setup can branch
@@ -3602,7 +4078,12 @@ fn run() -> Result<()> {
                         )?)
                         .await
                     }
-                    BranchAction::Switch { name, ref_hex } => {
+                    BranchAction::Switch {
+                        name: Some(target),
+                        detach: true,
+                        ..
+                    } => commands::branch::switch_detached(target).await,
+                    BranchAction::Switch { name, ref_hex, .. } => {
                         commands::branch::switch(commands::branch::parse_branch_ref(
                             name.as_deref(),
                             ref_hex.as_deref(),
@@ -3652,6 +4133,44 @@ fn run() -> Result<()> {
                 // The routed tool's answer is the output either way, and an
                 // error answer is the exit status, as `kin path` reports a
                 // missing route.
+                Command::Ask {
+                    hook: Some(client), ..
+                } => {
+                    let mut raw = String::new();
+                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw);
+                    if let Some(printed) = commands::ask::hook(&client, &raw).await {
+                        println!("{printed}");
+                    }
+                    Ok(())
+                }
+                Command::Ask {
+                    question,
+                    tests,
+                    no_tests,
+                    scope,
+                    budget,
+                    json,
+                    hook: None,
+                } => {
+                    let options = commands::ask::AskOptions {
+                        include_tests: if tests {
+                            Some(true)
+                        } else if no_tests {
+                            Some(false)
+                        } else {
+                            None
+                        },
+                        scope,
+                        budget,
+                        json,
+                    };
+                    let answer = commands::ask::run(&question.join(" "), &options).await?;
+                    println!("{}", commands::ask::printed(&answer, json));
+                    if answer.is_error {
+                        std::process::exit(1);
+                    }
+                    Ok(())
+                }
                 Command::Describe { command } => {
                     let answer = commands::routed_words::describe(command.as_deref());
                     println!("{}", answer.text);
@@ -3704,6 +4223,9 @@ fn run() -> Result<()> {
                         std::process::exit(code);
                     }
                     Ok(())
+                }
+                Command::Places { entity_ids, json } => {
+                    commands::places::run(entity_ids, json).await
                 }
                 Command::Trace {
                     entity,
@@ -4053,6 +4575,7 @@ fn run() -> Result<()> {
                     json,
                     max_chars,
                     cursor,
+                    view,
                 } => {
                     // Both requirements are clap's now, so a caller who names
                     // nothing to operate on gets a usage block and exit 2 like
@@ -4071,13 +4594,25 @@ fn run() -> Result<()> {
                             file.as_deref(),
                             entity_kind.as_deref(),
                         );
-                        if max_chars.is_some() || cursor.is_some() {
-                            commands::refs::run_page(entity, kind, cursor, max_chars).await
+                        if max_chars.is_some() || cursor.is_some() || view.is_some() {
+                            commands::refs::run_page_with_view(
+                                entity,
+                                kind,
+                                cursor,
+                                max_chars,
+                                view.as_deref(),
+                            )
+                            .await
                         } else {
                             commands::refs::run(entity, kind, all, json).await
                         }
                     }
                 }
+                Command::Ui {
+                    path,
+                    port,
+                    no_open,
+                } => commands::workspace_ui::run(path, port, !no_open).await,
                 Command::Review {
                     change,
                     json,
@@ -4168,6 +4703,32 @@ fn run() -> Result<()> {
                             ReviewAction::Show { review_id } => {
                                 commands::review::show_review(review_id).await
                             }
+                            ReviewAction::Guide {
+                                change,
+                                working,
+                                base,
+                                json,
+                            } => {
+                                commands::review::guide(
+                                    commands::review::GuideTarget::parse(change, working, base)?,
+                                    json,
+                                )
+                                .await
+                            }
+                            ReviewAction::Open {
+                                change,
+                                working,
+                                base,
+                                port,
+                                no_browser,
+                            } => {
+                                commands::review_ui::run(
+                                    commands::review::GuideTarget::parse(change, working, base)?,
+                                    port,
+                                    !no_browser,
+                                )
+                                .await
+                            }
                         }
                     } else if json {
                         commands::review::run_json(change, entities, files, changes).await
@@ -4191,6 +4752,13 @@ fn run() -> Result<()> {
                         kind.as_deref(),
                     );
                     commands::history::run(entity, reference, all_revisions).await
+                }
+                Command::DeriveHistory { path, background } => {
+                    let code = commands::history_derive::run_worker(path, background).await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::HostedPublication { action } => {
                     // The exit status carries the outcome a caller branches on,
@@ -4258,6 +4826,8 @@ fn run() -> Result<()> {
                     no_bodies,
                     max_response_chars,
                     include_type_edges,
+                    scope,
+                    scope_mode,
                 } => {
                     commands::trace_data_flow::run_seeded(
                         focal,
@@ -4269,6 +4839,8 @@ fn run() -> Result<()> {
                         include_type_edges.then_some(true),
                         target,
                         cursor,
+                        scope,
+                        scope_mode,
                     )
                     .await
                 }
@@ -4581,6 +5153,18 @@ fn run() -> Result<()> {
                     )
                     .await
                 }
+                Command::Store { action } => match action {
+                    StoreAction::Path { path, json } => commands::store::path(path, json),
+                    StoreAction::Attach { store, path, json } => {
+                        commands::store::attach(store, path, json)
+                    }
+                    StoreAction::List { size, json } => commands::store::list(json, size),
+                    StoreAction::Prune {
+                        yes,
+                        unreachable,
+                        json,
+                    } => commands::store::prune(yes, unreachable, json),
+                },
                 Command::Backup { action } => match action {
                     BackupAction::Create { tag, output } => {
                         commands::backup::create(tag, output).await
@@ -4929,7 +5513,9 @@ fn run() -> Result<()> {
                     None => commands::registry::list().await,
                 },
                 Command::Daemon { action } => match action {
-                    DaemonAction::Status { json } => commands::daemon::status(json).await,
+                    DaemonAction::Status { path, json } => {
+                        commands::daemon::status(json, path.as_deref()).await
+                    }
                     DaemonAction::Stop {
                         all,
                         machine,
@@ -4940,7 +5526,8 @@ fn run() -> Result<()> {
                         no_wait,
                         json,
                         verbose,
-                    } => commands::daemon::sweep(no_wait, json, verbose).await,
+                        enable,
+                    } => commands::daemon::sweep(no_wait, json, verbose, enable).await,
                 },
                 Command::Doctor {
                     fix,
@@ -5033,6 +5620,8 @@ fn run() -> Result<()> {
                     auto_daemon,
                     no_interactive,
                     skip_mcp_check,
+                    clients,
+                    prompt_hook,
                     install_language_servers,
                     resource_profile,
                     embedding_model,
@@ -5041,42 +5630,60 @@ fn run() -> Result<()> {
                     tool_profile,
                     verbose,
                     check,
-                } => match action {
-                    Some(SetupAction::Status { json, verbose }) => {
-                        commands::setup::status(json, verbose).await
+                    shell_only,
+                    json,
+                } => {
+                    if mode.is_some() {
+                        eprintln!(
+                            "kin setup: --mode is ignored. Kin has one repository format, so \
+                             there is no mode to choose; drop it from the command."
+                        );
                     }
-                    Some(SetupAction::Doctor { fix, json }) => {
-                        commands::setup::doctor(fix, install_language_servers, json).await
+                    match action {
+                        Some(_) if shell_only => Err(anyhow::anyhow!(
+                            "`kin setup --shell-only` runs on its own; drop the subcommand"
+                        )),
+                        None if shell_only => {
+                            commands::setup::run_shell_only(shell.as_deref(), skip_path, json)
+                        }
+                        Some(SetupAction::Clients { json }) => commands::setup::clients(json),
+                        Some(SetupAction::Status { json, verbose }) => {
+                            commands::setup::status(json, verbose).await
+                        }
+                        Some(SetupAction::Doctor { fix, json }) => {
+                            commands::setup::doctor(fix, install_language_servers, json).await
+                        }
+                        Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
+                        Some(SetupAction::Uninstall {
+                            all,
+                            dry_run,
+                            force,
+                            json,
+                        }) => commands::setup::uninstall(all, dry_run, force, json).await,
+                        // `kin setup --check` is shorthand for the first-run health
+                        // check without running the wizard.
+                        None if check => commands::setup::doctor(false, false, false).await,
+                        None => {
+                            commands::setup::run_wizard(commands::setup::WizardOptions {
+                                shell,
+                                auto_daemon,
+                                no_interactive,
+                                intent,
+                                skip_mcp_check,
+                                prompt_hook,
+                                install_language_servers,
+                                resource_profile,
+                                embedding_model,
+                                embedding_provider,
+                                skip_path,
+                                tool_profile,
+                                verbose,
+                                clients,
+                            })
+                            .await
+                        }
                     }
-                    Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
-                    Some(SetupAction::Uninstall {
-                        all,
-                        dry_run,
-                        force,
-                        json,
-                    }) => commands::setup::uninstall(all, dry_run, force, json).await,
-                    // `kin setup --check` is shorthand for the first-run health
-                    // check without running the wizard.
-                    None if check => commands::setup::doctor(false, false, false).await,
-                    None => {
-                        commands::setup::run_wizard(commands::setup::WizardOptions {
-                            mode,
-                            shell,
-                            auto_daemon,
-                            no_interactive,
-                            intent,
-                            skip_mcp_check,
-                            install_language_servers,
-                            resource_profile,
-                            embedding_model,
-                            embedding_provider,
-                            skip_path,
-                            tool_profile,
-                            verbose,
-                        })
-                        .await
-                    }
-                },
+                }
                 Command::Secret { action } => match action {
                     SecretAction::Set { name } => commands::secret::set(name).await,
                     SecretAction::List => commands::secret::list().await,
@@ -5223,13 +5830,69 @@ fn is_terminal_admission_record(metadata: &tracing::Metadata<'_>) -> bool {
 /// With no ladder open the line is printed plainly instead of dropped, so
 /// running an admission phase's instrumentation outside the ladder still says
 /// something, just without escapes or span paths.
-struct AdmissionProgressLayer;
+#[derive(Default)]
+struct AdmissionProgressLayer {
+    /// How many times each phase has opened in this process.
+    passes: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+}
 
 #[derive(Default)]
 struct AdmissionProgressFields {
     message: Option<String>,
+    /// Which replay is reporting. Three phases report through this one target,
+    /// so the phase, not the target, is what tells their counts apart.
+    phase: Option<String>,
+    /// What one unit of that phase is.
+    unit: Option<String>,
     validated: Option<u64>,
     total: Option<u64>,
+}
+
+/// The line one admission progress event puts on the phase line.
+///
+/// Every replay that reports here gets its own words. They used to share one,
+/// `N/T changes validated`, whatever the phase, unit or pass: a full-history
+/// first save checks every commit's tree and replays its history twice, all
+/// over the same number of commits, so the line ran `5376/5562 changes
+/// validated` and then fell back to `2048/5562 changes validated` under the
+/// same label, which reads as validation going backwards. Each phase and pass
+/// now has its own label, and each one's count only ever rises.
+///
+/// A phase that opens again in the same process says which pass it is on. The
+/// first save replays its history twice over the same changes, once to prove
+/// entity revisions and once to prove the transaction, and the second pass's
+/// count starts from zero.
+///
+/// `None` when the event carries nothing to say. A phase this does not know
+/// still gets its own unit, so an added phase never borrows another's words.
+fn admission_progress_line(fields: &AdmissionProgressFields, pass: u32) -> Option<String> {
+    let unit = fields.unit.as_deref().unwrap_or("changes");
+    let mut done = match fields.phase.as_deref() {
+        Some("history_replay") => "changes replayed".to_string(),
+        Some("git_projection_replay") => "commit trees checked".to_string(),
+        Some("external_object_admission") => "Git objects admitted".to_string(),
+        _ => format!("{unit} validated"),
+    };
+    if pass > 1 {
+        done.push_str(&format!(", pass {pass}"));
+    }
+    match (fields.validated, fields.total) {
+        (Some(validated), Some(total)) => Some(format!("{validated}/{total} {done}")),
+        // The phase's terminal records carry no total. A refusal says so; a
+        // finish is the count the phase line ends on, said the same way.
+        (Some(validated), None)
+            if fields
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("refused")) =>
+        {
+            Some(format!("refused after {validated} {done}"))
+        }
+        (Some(validated), None) => Some(format!("{validated} {done}")),
+        // The phase's opening record: nothing done yet, out of this many.
+        (None, Some(total)) => Some(format!("0/{total} {done}")),
+        (None, None) => fields.message.clone(),
+    }
 }
 
 impl tracing::field::Visit for AdmissionProgressFields {
@@ -5248,10 +5911,30 @@ impl tracing::field::Visit for AdmissionProgressFields {
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_string());
+        match field.name() {
+            "message" => self.message = Some(value.to_string()),
+            "phase" => self.phase = Some(value.to_string()),
+            "unit" => self.unit = Some(value.to_string()),
+            _ => {}
         }
     }
+}
+
+/// Which pass of its phase `fields` reports, counting the phase's opening
+/// records in `passes`. A phase's opening record is the one that carries a
+/// total and no count yet.
+fn pass_of(
+    passes: &mut std::collections::HashMap<String, u32>,
+    fields: &AdmissionProgressFields,
+) -> u32 {
+    let Some(phase) = fields.phase.as_deref() else {
+        return 1;
+    };
+    let opened = passes.entry(phase.to_string()).or_insert(0);
+    if fields.validated.is_none() && fields.total.is_some() {
+        *opened += 1;
+    }
+    (*opened).max(1)
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmissionProgressLayer {
@@ -5265,13 +5948,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdmissionProgressL
         }
         let mut fields = AdmissionProgressFields::default();
         event.record(&mut fields);
-        let detail = match (fields.validated, fields.total) {
-            (Some(validated), Some(total)) => format!("{validated}/{total} changes validated"),
-            (Some(validated), None) => format!("{validated} changes validated"),
-            _ => match fields.message {
-                Some(message) => message,
-                None => return,
-            },
+        let pass = match self.passes.lock() {
+            Ok(mut passes) => pass_of(&mut passes, &fields),
+            Err(_) => 1,
+        };
+        let Some(detail) = admission_progress_line(&fields, pass) else {
+            return;
         };
         if !kin_core::report_admission_progress(&detail) {
             eprintln!("  {detail}");
@@ -5373,7 +6055,7 @@ where
 {
     tracing_subscriber::registry()
         .with(profile_session.map(kin_cli::profile::ProfilingLayer::new))
-        .with(AdmissionProgressLayer.with_filter(EnvFilter::new(directives)))
+        .with(AdmissionProgressLayer::default().with_filter(EnvFilter::new(directives)))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(writer)
@@ -5803,6 +6485,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn locate_ranking_and_routed_coordinate_calls_have_distinct_cli_contracts() {
+        on_cli_test_stack(|| {
+            let ranked = Cli::try_parse_from(["kin", "locate", "src/main.rs"])
+                .expect("standalone locate accepts problem text");
+            assert!(
+                matches!(ranked.command, Command::Locate { text: Some(ref text), .. }
+                if text == "src/main.rs")
+            );
+            let arguments = r#"{"query":"src/main.rs"}"#;
+            let routed = Cli::try_parse_from(["kin", "call", "locate", arguments])
+                .expect("routed locate accepts the MCP JSON contract");
+            assert!(
+                matches!(routed.command, Command::Call { ref tool, arguments: Some(ref args), .. }
+                if tool == "locate" && args == arguments)
+            );
+            let cli = Cli::command();
+            let locate = cli.find_subcommand("locate").expect("locate help");
+            assert!(locate
+                .get_long_about()
+                .unwrap()
+                .to_string()
+                .contains("kin call locate"));
+        });
+    }
+
     /// A malformed directive is silently dropped by `EnvFilter`, which would
     /// disable progress reporting while every other test still passed. Parse the
     /// exact string the binary installs and require each target to survive.
@@ -6214,12 +6922,10 @@ mod tests {
         // The literal, not the constant. Comparing the constant against itself
         // is an assertion that cannot fail, and it would sit here looking like
         // one that could.
-        assert_eq!(
-            lines[2],
-            "A new way to store and manage code for people and AI."
-        );
-        assert_eq!(lines[3], "dca8e950e99f6a1cb9afe4359611e2da288004f2");
-        assert_eq!(lines[4], "detached 2026-09-06T08:24:29Z");
+        assert_eq!(lines[2], "A graph-native code repository for AI agents");
+        assert_eq!(lines[3], "and the people who build with them.");
+        assert_eq!(lines[4], "dca8e950e99f6a1cb9afe4359611e2da288004f2");
+        assert_eq!(lines[5], "detached 2026-09-06T08:24:29Z");
 
         // Both a release build, whose branch reads `detached`, and a working
         // branch with a long name. The second is not hypothetical: a build off
@@ -6247,21 +6953,84 @@ mod tests {
         }
     }
 
+    /// On a terminal too narrow for the definition beside the mark, the
+    /// definition is rewrapped at words under the text column, in both the
+    /// half-block and the painted-cell marks, and no word is split.
+    #[test]
+    fn the_version_definition_wraps_at_words_on_a_narrow_terminal() {
+        let version = "0.8.2 (0123456789abcdef0123456789abcdef01234567 main 2026-10-11T00:00:00Z)";
+        for style in [
+            kin_cli::mark::MarkStyle::new(
+                kin_cli::mark::Glyphs::Unicode,
+                kin_cli::mark::Paint::None,
+            ),
+            kin_cli::mark::MarkStyle::in_cells(
+                kin_cli::mark::Glyphs::Unicode,
+                kin_cli::mark::Paint::Indexed,
+            ),
+        ] {
+            let rendered = rendered_version_at(version, Some(style), Some(44));
+            let plain: Vec<String> = rendered
+                .lines()
+                .map(|line| console::strip_ansi_codes(line).into_owned())
+                .collect();
+            let column = style.text_column();
+            let definition: Vec<String> = plain
+                .iter()
+                .filter(|line| !line.contains("kin 0.8.2"))
+                .map(|line| {
+                    line.chars()
+                        .skip(column)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .filter(|text| {
+                    !text.is_empty()
+                        && text
+                            .chars()
+                            .all(|c| c.is_ascii_alphabetic() || " -.".contains(c))
+                })
+                .collect();
+            assert_eq!(
+                definition.join(" "),
+                CATEGORY_ROWS.join(" "),
+                "{style:?}: the definition reads whole: {plain:#?}"
+            );
+            for text in &definition {
+                assert!(
+                    column + text.len() < 44,
+                    "{style:?}: {text:?} overflows 44 columns"
+                );
+            }
+            let wide = rendered_version_at(version, Some(style), Some(100));
+            assert!(
+                wide.contains(CATEGORY_ROWS[0]),
+                "a wide terminal keeps the two rows"
+            );
+        }
+    }
+
     /// `--help` and `--version` lead with the same line.
     ///
-    /// The canon line is written twice, once inside [`ORIENTATION`] where a
-    /// clap attribute needs a `const`, and once as [`CATEGORY_LINE`] where
-    /// `--version` needs it. `concat!` takes literals rather than constants, so
-    /// the two cannot be built from one another without a dependency this crate
-    /// does not carry. This is what keeps them from drifting apart, which is
-    /// the failure a reader would meet as two different taglines on two
-    /// commands.
+    /// The canon line is written three times: inside [`ORIENTATION`] where a
+    /// clap attribute needs a `const`, as [`CATEGORY_LINE`], and as the two
+    /// [`CATEGORY_ROWS`] the `--version` block sets beside the mark. `concat!`
+    /// takes literals rather than constants, so they cannot be built from one
+    /// another without a dependency this crate does not carry. This is what
+    /// keeps them from drifting apart, which is the failure a reader would
+    /// meet as two different taglines on two commands.
     #[test]
     fn the_help_and_the_version_lead_with_the_same_line() {
         assert!(
-            ORIENTATION.starts_with(CATEGORY_LINE),
+            ORIENTATION.starts_with(&format!("{CATEGORY_LINE}\n")),
             "help opens with {:?} and --version with {CATEGORY_LINE:?}",
             ORIENTATION.lines().next().unwrap_or_default()
+        );
+        assert_eq!(
+            CATEGORY_ROWS.join(" "),
+            CATEGORY_LINE,
+            "the --version rows must read as the help's opening line"
         );
     }
 
@@ -6275,8 +7044,8 @@ mod tests {
     fn a_version_with_no_build_detail_still_splits() {
         let lines = version_lines("0.7.2");
         assert_eq!(lines[1], "kin 0.7.2");
-        assert_eq!(lines[3], "");
-        assert_eq!(lines.len(), 4, "an absent build detail adds no second line");
+        assert_eq!(lines[4], "");
+        assert_eq!(lines.len(), 5, "an absent build detail adds no second line");
     }
 
     /// With no terminal, `--version` is the exact line it has always been.
@@ -6296,6 +7065,113 @@ mod tests {
         );
         assert_eq!(rendered.lines().count(), 1);
         assert!(!rendered.contains('\u{1b}'), "no escapes reach a pipe");
+    }
+
+    /// Each replay that reports onto the phase line says its own count in its
+    /// own words, read from the event's `phase` and `unit`, and a phase that
+    /// opens again says which pass it is on. The first save of a 5,562-commit
+    /// history replays it twice, and both passes said `changes validated`, so
+    /// the line read as validation falling from `5376/5562` back to
+    /// `2048/5562`.
+    #[test]
+    fn each_replay_phase_and_pass_reports_its_own_count_in_its_own_words() {
+        use super::{admission_progress_line, pass_of, AdmissionProgressFields};
+        let fields = |phase: &str, unit: &str, validated: Option<u64>, total: Option<u64>| {
+            AdmissionProgressFields {
+                message: Some(format!("kindb: validating {phase}")),
+                phase: Some(phase.to_string()),
+                unit: Some(unit.to_string()),
+                validated,
+                total,
+            }
+        };
+        let event = |phase: &str, unit: &str, validated: Option<u64>, total: Option<u64>| {
+            admission_progress_line(&fields(phase, unit, validated, total), 1)
+                .expect("a replay event is worth a line")
+        };
+        assert_eq!(
+            event("history_replay", "changes", Some(5376), Some(5562)),
+            "5376/5562 changes replayed"
+        );
+        assert_eq!(
+            event(
+                "git_projection_replay",
+                "Git commits",
+                Some(1024),
+                Some(5562)
+            ),
+            "1024/5562 commit trees checked"
+        );
+        assert_eq!(
+            event(
+                "external_object_admission",
+                "Git objects",
+                Some(9),
+                Some(61)
+            ),
+            "9/61 Git objects admitted"
+        );
+        // The opening and closing records say the same thing in the same
+        // words, and never the raw `kindb:` message.
+        assert_eq!(
+            event("history_replay", "changes", None, Some(5562)),
+            "0/5562 changes replayed"
+        );
+        assert_eq!(
+            event("history_replay", "changes", Some(5562), None),
+            "5562 changes replayed"
+        );
+        let refused = admission_progress_line(
+            &AdmissionProgressFields {
+                message: Some("kindb: refused after validating 12 changes in 0s".to_string()),
+                ..fields("history_replay", "changes", Some(12), None)
+            },
+            1,
+        );
+        assert_eq!(
+            refused.as_deref(),
+            Some("refused after 12 changes replayed")
+        );
+        // A phase this does not know keeps its own unit.
+        assert_eq!(
+            event("some_new_replay", "widgets", Some(1), Some(2)),
+            "1/2 widgets validated"
+        );
+
+        // The first save's sequence, through the same pass counting the layer
+        // does: the trees, then the history twice over the same changes.
+        let mut passes = std::collections::HashMap::new();
+        let mut line = |phase: &str, unit: &str, validated: Option<u64>, total: Option<u64>| {
+            let event = fields(phase, unit, validated, total);
+            let pass = pass_of(&mut passes, &event);
+            admission_progress_line(&event, pass).expect("a replay event is worth a line")
+        };
+        let sequence = [
+            line("git_projection_replay", "Git commits", None, Some(5562)),
+            line(
+                "git_projection_replay",
+                "Git commits",
+                Some(4096),
+                Some(5562),
+            ),
+            line("history_replay", "changes", None, Some(5562)),
+            line("history_replay", "changes", Some(5376), Some(5562)),
+            line("history_replay", "changes", Some(5562), None),
+            line("history_replay", "changes", None, Some(5562)),
+            line("history_replay", "changes", Some(2048), Some(5562)),
+        ];
+        assert_eq!(
+            sequence,
+            [
+                "0/5562 commit trees checked",
+                "4096/5562 commit trees checked",
+                "0/5562 changes replayed",
+                "5376/5562 changes replayed",
+                "5562 changes replayed",
+                "0/5562 changes replayed, pass 2",
+                "2048/5562 changes replayed, pass 2",
+            ]
+        );
     }
 
     /// With no admission ladder open, a progress event is printed rather than
@@ -6512,6 +7388,71 @@ mod tests {
                 setup_status_page.command,
                 Command::Setup {
                     action: Some(SetupAction::Status { json: false, .. }),
+                    ..
+                }
+            ));
+        });
+    }
+
+    /// `--shell-only` is the spelling for the shell step alone, `--json` belongs
+    /// to it, and the client choice it replaces for that purpose keeps parsing.
+    #[test]
+    fn setup_shell_only_parses_beside_the_client_choice() {
+        on_cli_test_stack(|| {
+            let shell_only = Cli::try_parse_from(["kin", "setup", "--shell-only", "--json"])
+                .expect("kin setup --shell-only --json must parse");
+            assert!(matches!(
+                shell_only.command,
+                Command::Setup {
+                    action: None,
+                    shell_only: true,
+                    json: true,
+                    clients: None,
+                    ..
+                }
+            ));
+
+            // The app's scripted prefix still combines with it.
+            Cli::try_parse_from([
+                "kin",
+                "setup",
+                "--no-interactive",
+                "--intent",
+                "agent",
+                "--skip-mcp-check",
+                "--shell-only",
+            ])
+            .expect("the scripted setup prefix must combine with --shell-only");
+
+            for refused in [
+                vec!["kin", "setup", "--shell-only", "--clients", "cursor"],
+                vec!["kin", "setup", "--shell-only", "--prompt-hook"],
+                vec!["kin", "setup", "--json"],
+            ] {
+                assert!(
+                    Cli::try_parse_from(&refused).is_err(),
+                    "{refused:?} must be refused"
+                );
+            }
+
+            let no_clients = Cli::try_parse_from(["kin", "setup", "--clients", ""])
+                .expect("kin setup --clients \"\" must keep parsing");
+            assert!(matches!(
+                no_clients.command,
+                Command::Setup {
+                    shell_only: false,
+                    clients: Some(_),
+                    ..
+                }
+            ));
+
+            let clients = Cli::try_parse_from(["kin", "setup", "clients", "--json"])
+                .expect("kin setup clients --json must keep parsing");
+            assert!(matches!(
+                clients.command,
+                Command::Setup {
+                    action: Some(SetupAction::Clients { json: true }),
+                    json: false,
                     ..
                 }
             ));
@@ -6768,6 +7709,40 @@ mod tests {
                     .err()
                     .unwrap_or_else(|| panic!("{argv:?} must not parse"));
                 assert_eq!(error.exit_code(), 2, "{argv:?} must be a usage error");
+            }
+        });
+    }
+
+    #[test]
+    fn reference_override_view_is_explicit_and_requires_json() {
+        on_cli_test_stack(|| {
+            let cli = Cli::try_parse_from([
+                "kin",
+                "refs",
+                "00000000-0000-4000-8000-000000000001",
+                "--view",
+                "overrides",
+                "--json",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Command::Refs { json: true, view: Some(value), .. }
+                if value == "overrides")
+            );
+            for argv in [
+                vec!["kin", "refs", "method", "--view", "overrides"],
+                vec!["kin", "refs", "method", "--json", "--view", "subclasses"],
+                vec![
+                    "kin",
+                    "refs",
+                    "method",
+                    "--json",
+                    "--view",
+                    "overrides",
+                    "--all",
+                ],
+            ] {
+                assert!(Cli::try_parse_from(argv).is_err());
             }
         });
     }
@@ -7106,7 +8081,10 @@ mod tests {
             let mut command = Cli::command();
             let help = command.render_long_help().to_string();
             assert!(
-                help.starts_with("A new way to store and manage code for people and AI."),
+                help.starts_with(
+                    "A graph-native code repository for AI agents and the people who build \
+                     with them."
+                ),
                 "help opens with {:?}",
                 help.lines().next().unwrap_or_default()
             );

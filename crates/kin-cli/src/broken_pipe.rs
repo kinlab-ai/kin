@@ -264,7 +264,10 @@ fn redirect_to_dev_null(fd: libc::c_int) {
 /// Every other error is rendered the way std renders a `main` that returns
 /// `Err`, `Error: {err:?}`, through [`print_stderr`], so a refusal nobody
 /// reads any more still exits 1 rather than becoming a second broken-pipe
-/// panic.
+/// panic. One refusal exits with its own status instead: a command that would
+/// record an author and has none exits
+/// [`crate::commands::EXIT_AUTHOR_IDENTITY_REQUIRED`], so a script can tell
+/// "set an identity" from a failure.
 ///
 /// One class earns a second paragraph after that render. A command that ran out
 /// of open file descriptors reports a kernel refusal naming a descriptor and a
@@ -279,6 +282,12 @@ pub fn exit_status(error: &anyhow::Error) -> i32 {
     print_stderr(format_args!("Error: {error:?}\n"));
     if let Some(remedy) = crate::open_files::remedy(error) {
         print_stderr(format_args!("{remedy}"));
+    }
+    if error
+        .downcast_ref::<crate::commands::AuthorIdentityRequired>()
+        .is_some()
+    {
+        return crate::commands::EXIT_AUTHOR_IDENTITY_REQUIRED;
     }
     1
 }

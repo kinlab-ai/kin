@@ -233,7 +233,8 @@ fn fixture_premise_declaration_owns_no_incoming_edges_but_members_do() {
 /// The Rust extractor emits a `Contains` for both `impl` blocks, but the linker
 /// keys containment against a declaration in the same file, and `src/error.rs`
 /// declares none. So the cross-file edge is dropped and the declaration is left
-/// owning exactly one outgoing `Contains`, to its same-file member. Collecting
+/// owning outgoing `Contains` only to its same-file members (its field `code`
+/// and the method `msg`). Collecting
 /// members from edges alone would therefore lose `Error::chain`, which is the
 /// member this whole answer exists to surface.
 ///
@@ -256,7 +257,7 @@ fn fixture_premise_containment_reaches_only_the_same_file_member() {
         })
         .expect("Error declared in src/lib.rs");
 
-    let contained: Vec<String> = graph
+    let mut contained: Vec<String> = graph
         .get_all_relations_for_entity(&declaration.id)
         .unwrap()
         .into_iter()
@@ -268,11 +269,12 @@ fn fixture_premise_containment_reaches_only_the_same_file_member() {
         .filter_map(|id| graph.get_entity(&id).unwrap())
         .map(|entity| entity.name)
         .collect();
+    contained.sort();
 
     assert_eq!(
         contained,
-        vec!["Error::msg".to_string()],
-        "containment must reach the same-file member and not the cross-file one"
+        vec!["Error::code".to_string(), "Error::msg".to_string()],
+        "containment must reach the same-file members and not the cross-file one"
     );
 }
 

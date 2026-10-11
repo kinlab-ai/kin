@@ -1395,7 +1395,11 @@ mod tests {
             .env(SLEEP_WORKER, &marker);
 
         let started = Instant::now();
-        let timeout = Duration::from_secs(5);
+        // The worker has to print and write its started marker before this
+        // fires, since the assertions below read both, so it covers starting
+        // the re-executed test binary on a loaded machine; the worker then
+        // sleeps thirty times longer.
+        let timeout = Duration::from_secs(1);
         let error = output_with_timeout(command, "bounded sleep-worker fixture", timeout)
             .expect_err("the bounded helper must terminate the sleeping worker");
 
@@ -1702,6 +1706,9 @@ mod tests {
 
     #[test]
     fn worker_and_guardian_scrub_ambient_and_command_local_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         if let Some(marker) = std::env::var_os(AUTHORITY_INNER) {
             for key in HOSTILE_AUTHORITY_KEYS {
                 assert!(

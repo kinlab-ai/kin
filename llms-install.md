@@ -129,8 +129,9 @@ a non-empty non-Git directory rather than treating loose files as graph truth.
 
 Two things to tell the user before running it on a large repository. Time scales with
 history depth rather than checkout size, so it takes seconds on a small repository and
-minutes on one with thousands of commits. Disk scales the same way, and the store under
-`.kin/` can be several times the size of the Git object store it came from. `kin init`
+minutes on one with thousands of commits. Disk scales the same way, and the store, which
+lives in `~/.kin/stores` rather than in the repository, can be several times the size of
+the Git object store it came from. `kin init`
 prints a phase ladder to stderr while it runs, so a long run is never silent.
 
 ## Step 3: build the vector index
@@ -141,10 +142,10 @@ Admission derives the entities. It does not embed them.
 kin embed
 ```
 
-Embeddings are generated locally. Until this finishes, `semantic_locate` and `kin locate`
+Embeddings are generated locally. Until this finishes, `locate` by description and `kin locate`
 degrade honestly rather than failing: they rank over whatever is embedded so far and report
-their coverage. The structural tools, `semantic_search`, `find_references`,
-`graph_neighborhood`, `trace_data_flow`, and `impact_analysis`, do not depend on the vector
+their coverage. The structural tools, `locate` (mode `name`), `refs`,
+`neighbors`, `trace`, and `impact`, do not depend on the vector
 index and work as soon as step 2 finishes.
 
 `kin setup` defers this step by design and downloads nothing itself. It records that the
@@ -295,7 +296,7 @@ kin setup status
 ```
 
 Then the real one. From the client, with the repository from step 2 as the working
-directory, make one `semantic_locate` call with a plain-language description of something
+directory, make one `locate` call with a plain-language description of something
 the repository does. A successful install returns ranked results and a `_kin` envelope
 beside them. Read three fields on that envelope, all of which the response actually carries:
 
@@ -320,7 +321,7 @@ names which gate ruled.
 
 `kin setup status` prints a `Retrieval quality profile` line naming the profile serving
 queries and which retrieval levers are on. A stock install serves `accuracy-v2`, the
-measured-accuracy default: `semantic_locate` and `kin locate` both answer from the fused
+measured-accuracy default: `locate` by description and `kin locate` both answer from the fused
 multi-signal pipeline, entity fusion and the lexical parity floor are on, and the
 cross-encoder reranker stays off. `KIN_PROFILE` selects a different profile: `accuracy-v1`
 adds the budget-gated cross-encoder when its model is already cached, and `compat-v0` keeps
@@ -374,10 +375,10 @@ run `kin init .` again. Nothing from the failed attempt needs cleaning up first.
 the npx path, and network access for its first-run download. Otherwise, check that the
 absolute path in the client config still exists.
 
-**Every tool reports no repository.** The client's working directory has no `.kin/`. Run
+**Every tool reports no repository.** No Kin store serves the client's working directory. Run
 step 2 there, or set `KIN_MCP_AUTO_INIT=1`.
 
-**`semantic_locate` returns nothing while `semantic_search` works.** The vector index is
+**`locate` by description returns nothing while `locate` by name works.** The vector index is
 missing or incomplete. Run `kin embed`.
 
 **A result is empty and you want to conclude the code does not exist.** Read the `negative`

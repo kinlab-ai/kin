@@ -8,7 +8,7 @@
 //! projection, captures one repository-v6 generation, proves the graph-owned
 //! workspace projection against repository source CAS, builds and verifies a
 //! complete replacement Git repository off to the side, reopens the same
-//! authority roots, proves the workspace again, and only then detaches `.kin/`.
+//! authority roots, proves the workspace again, and only then detaches the store.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -35,6 +35,11 @@ pub async fn run(yes: bool) -> Result<()> {
     ensure_eject_platform()?;
     let cwd = std::env::current_dir()?;
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
+    // Before anything stops or moves: ejecting writes the store's history out
+    // as the repository's Git history, and a partial store would write one
+    // commit in place of all of them.
+    kin_core::history_state::require_complete_for(&layout, "kin eject")
+        .map_err(anyhow::Error::msg)?;
     ensure_real_directory(layout.root(), "Kin metadata")?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     refuse_live_vfs(&layout)?;
@@ -107,7 +112,7 @@ pub async fn run(yes: bool) -> Result<()> {
     config_proof.revalidate(&layout.config_path())?;
     // This consumes the projection freeze and owns every namespace mutation:
     // previous `.git` -> retained archive, exact staged `.git` -> retained
-    // working root, and `.kin` -> retained archive. On any reported failure it
+    // working root, and the actual store -> retained archive. On any reported failure it
     // rolls those moves back through the same retained capabilities.
     let eject_outcome = final_projection_freeze
         .replace_git_and_detach_verified_to_from_blobs(
@@ -121,9 +126,12 @@ pub async fn run(yes: bool) -> Result<()> {
         )
         .context("replace Git and detach Kin through the frozen namespace transaction")?;
     // Keep the authority writer lock alive until the exact projection guard
-    // has revalidated, installed Git, and moved the whole `.kin` namespace.
+    // has revalidated, installed Git, and moved the whole store namespace.
     drop(authority_freeze);
     drop(reopened);
+    // Discovery ignores an index entry whose store no longer exists. Leave
+    // that entry for normal registry cleanup rather than racing a concurrent
+    // attachment with a read-then-remove after this transaction has committed.
     println!(
         "Kin ejected at authority generation {}. The working directory is now an ordinary \
          Git repository.",
@@ -275,8 +283,12 @@ impl StagedGitRepository {
             .with_context(|| format!("create staged worktree {}", worktree.display()))?;
         let git_dir = worktree.join(".git");
         let mut source = RepositorySource::new(authority);
-        let result = kin_git::export_repository_to_git(&captured.plan, &mut source, &git_dir)
-            .context("build exact Git eject projection")?;
+        let result = kin_git::export_repository_to_git(
+            &captured.plan,
+            &mut source,
+            &kin_io::WorktreeRoot::new(&git_dir, &kin_io::Grant::ambient()),
+        )
+        .context("build exact Git eject projection")?;
 
         run_git(
             &worktree,
@@ -321,8 +333,11 @@ impl StagedGitRepository {
         // proof plus the index-vs-HEAD check above bind the replacement Git
         // repository without falsely treating those graph-only entries as
         // worktree deletions.
-        kin_git::sync_git_repository_for_authority_handoff(&git_dir)
-            .context("make the replacement Git repository durable before eject")?;
+        kin_git::sync_git_repository_for_authority_handoff(&kin_io::WorktreeRoot::new(
+            &git_dir,
+            &kin_io::Grant::ambient(),
+        ))
+        .context("make the replacement Git repository durable before eject")?;
 
         Ok(Self {
             _directory: directory,
@@ -347,8 +362,11 @@ impl StagedGitRepository {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("staged Git directory has no worktree parent"))?;
         install_git_coexistence_config(worktree, &self.git_dir, &proof.config.git)?;
-        kin_git::sync_git_repository_for_authority_handoff(&self.git_dir)
-            .context("make restored Git interoperability config durable before eject")
+        kin_git::sync_git_repository_for_authority_handoff(&kin_io::WorktreeRoot::new(
+            &self.git_dir,
+            &kin_io::Grant::ambient(),
+        ))
+        .context("make restored Git interoperability config durable before eject")
     }
 }
 
@@ -723,7 +741,7 @@ fn eject_env_name_starts_with(actual: &str, expected: &str) -> bool {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    rustix::fs::open(
+    let directory = rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
@@ -733,9 +751,9 @@ fn sync_directory(path: &Path) -> Result<()> {
     )
     .map(fs::File::from)
     .map_err(std::io::Error::from)
-    .with_context(|| format!("open directory {}", path.display()))?
-    .sync_all()
-    .with_context(|| format!("sync directory {}", path.display()))
+    .with_context(|| format!("open directory {}", path.display()))?;
+    kin_blobs::durable::sync_all(&directory)
+        .with_context(|| format!("sync directory {}", path.display()))
 }
 
 #[cfg(not(unix))]

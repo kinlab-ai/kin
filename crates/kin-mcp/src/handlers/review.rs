@@ -7,7 +7,7 @@ use super::repository_authority::RequestRepositoryAuthority;
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
 use kin_review::write::{PlannedReviewEvent, ReviewGroup, ReviewWrite};
-use kin_review::{ReviewRenderOptions, SemanticReview};
+use kin_review::SemanticReview;
 
 use crate::error::{McpError, Result};
 use crate::session::SessionRegistry;
@@ -62,14 +62,11 @@ impl<'store, G: GraphStore> AnalysisEscapeEvidence<'store, G> {
 }
 
 pub const SEMANTIC_DIFF_DESC: &str = "\
-Compute an entity-level diff — what declarations were added, removed, or changed — \
-rather than a line-by-line text diff. You can target it four ways (pick one): base/head \
-semantic change IDs, a set of entity_ids (current state vs. their history), file paths \
-(resolved to their entities), or a list of change_ids to combine. Reach for it when you \
-want to understand a change in terms of the code's structure — \"which functions/types \
-actually changed?\" — instead of reading raw hunks, which is far more meaningful for \
-review and impact reasoning. When you also want the downstream blast radius or a risk \
-summary alongside the diff, use impact_analysis or semantic_review.";
+Return structured entity and relation changes: added declarations, modified old/new \
+records, removed declarations and relation deltas. Select one scope: base/head semantic \
+change IDs, entity_ids (current state versus their history), or change_ids to combine. \
+The diff preserves semantic identities and signatures. Use impact_analysis or \
+semantic_review when you also need downstream effects or risk.";
 
 pub fn handle_semantic_diff<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -84,24 +81,18 @@ pub fn handle_semantic_diff<G: GraphStore>(
         return Ok(refusal);
     }
     let diff = resolve_diff(args, store)?;
-    let namer = |node: &kin_model::relation::GraphNodeId| kin_review::graph_node_name(store, node);
-    let formatted = kin_review::format_diff_with(&diff, &review_render_options(&namer));
-    text_answer(formatted, args, "semantic_diff")
-}
-
-/// The line a review or diff prints under relation changes it only counted,
-/// naming the call that returns every one of them.
-const RELATION_LIST_HINT: &str =
-    "Call semantic_review with format='json' to read every relation change.";
-
-/// How the review tools render text: relation endpoints named from the graph,
-/// and relation changes counted by origin and kind with the hint above.
-fn review_render_options<'a>(namer: &'a kin_review::NodeNamer<'a>) -> ReviewRenderOptions<'a> {
-    ReviewRenderOptions {
-        node_names: Some(namer),
-        relation_list_hint: Some(RELATION_LIST_HINT),
-        ..Default::default()
+    // Keep typed records until the public boundary has qualified and projected
+    // them. The operator's text formatter includes materialization metadata;
+    // sending that prose would make the public diagnostic guard discard the
+    // semantic result together with those coordinates.
+    let mut result = serde_json::json!({"diff": semantic_metadata_json(&diff)?});
+    // Private compatibility callers retain the migration notice. Public MCP
+    // selectors are refused before this handler runs.
+    if names_files(args) {
+        record_files_deprecation(&mut result, "semantic_diff");
     }
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
 }
 
 /// Whether the call named `files`, the file-path targeting these tools keep
@@ -118,24 +109,6 @@ fn record_files_deprecation(payload: &mut serde_json::Value, tool: &str) {
         "entity_ids",
         crate::budget::DEPRECATION_REMOVED_AFTER,
     );
-}
-
-/// A text answer, or, when the call named the deprecated `files` parameter, the
-/// object the envelope already wraps text in, `{ "message": <text> }`, with the
-/// deprecation beside the text. A text answer has no top level to carry a key,
-/// so this is the one shape in which a text caller sees the notice.
-fn text_answer(
-    text: String,
-    args: &HashMap<String, serde_json::Value>,
-    tool: &str,
-) -> Result<ToolCallResult> {
-    if !names_files(args) {
-        return Ok(ToolCallResult::text(text));
-    }
-    let mut result = serde_json::json!({ "message": text });
-    record_files_deprecation(&mut result, tool);
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
 }
 
 /// The refusal a change tool gives an `entity_ids` list naming a symbol
@@ -195,7 +168,18 @@ the change. Every entity reported with no consumers is also read in the top-leve
 `caller_arrival` block, the reading `find_references` publishes: when a file that can \
 reach it holds call sites that became no edge, the verdict is inconclusive and names that \
 file rather than certifying the zero. Check `safe_to_conclude_absent` before reading a \
-zero consumer count as safe to change.";
+zero consumer count as safe to change. Methods that override a changed method, directly \
+or through another override, are listed in `affected_overrides` and are not consumers. \
+A call to an override reaches no other edge, so its callers are listed in \
+`affected_override_callers`, each naming the override under `calls_override`, with \
+name-only matches in `override_caller_candidates`; for each changed method, \
+`implementation_family` states what a signature change obliges across those rows. \
+An entity that names a changed entity or an override without calling it, holding it as a \
+value, is listed in `affected_value_uses` with the line that names it as `code`, and a \
+caller row carries the call it makes as `code`. `include_tests: false` leaves test code out \
+of every list and counts what it left out under `tests_excluded`. \
+Rows are compact unless `compact: false`. An answer larger than `max_chars` is paged: \
+repeat the call with `cursor` set to `next_cursor` until it is null.";
 
 /// The field a serialized impact row carries beside `covering_tests`, and the
 /// one value it takes.
@@ -208,10 +192,17 @@ pub(crate) const COVERING_TESTS_BOUND_KEY: &str = "covering_tests_bound";
 /// See [`COVERING_TESTS_BOUND_KEY`].
 pub(crate) const COVERING_TESTS_BOUND: &str = "graph_observed_lower_bound";
 
-/// The blast-radius buckets of an [`kin_review::ImpactReport`] that serialize as
-/// arrays of raw entities, paired with their key in the response object.
-const IMPACT_ENTITY_BUCKETS: [&str; 4] = [
+/// The blast-radius buckets of an [`kin_review::ImpactReport`] that serve
+/// arrays of entity rows, paired with their key in the response object. The
+/// override-caller buckets serialize as a caller beside its calls and are
+/// served as entity rows by
+/// [`super::implementation_family::flatten_rows`] before anything here reads
+/// them.
+const IMPACT_ENTITY_BUCKETS: [&str; 7] = [
     "affected_callers",
+    "affected_overrides",
+    super::implementation_family::OVERRIDE_CALLERS_KEY,
+    super::implementation_family::OVERRIDE_CALLER_CANDIDATES_KEY,
     "affected_dependents",
     "affected_contract_consumers",
     "affected_tests",
@@ -229,11 +220,16 @@ fn annotate_impact_presentation_lines(
     result: &mut serde_json::Value,
     impact: &kin_review::ImpactReport,
 ) {
-    let buckets: [&Vec<kin_model::Entity>; 4] = [
-        &impact.affected_callers,
-        &impact.affected_dependents,
-        &impact.affected_contract_consumers,
-        &impact.affected_tests,
+    let [override_callers, override_caller_candidates] =
+        super::implementation_family::bucket_entities(impact);
+    let buckets: [Vec<&kin_model::Entity>; 7] = [
+        impact.affected_callers.iter().collect(),
+        impact.affected_overrides.iter().collect(),
+        override_callers,
+        override_caller_candidates,
+        impact.affected_dependents.iter().collect(),
+        impact.affected_contract_consumers.iter().collect(),
+        impact.affected_tests.iter().collect(),
     ];
     for (key, entities) in IMPACT_ENTITY_BUCKETS.iter().zip(buckets) {
         let Some(serde_json::Value::Array(rows)) = result.get_mut(*key) else {
@@ -275,6 +271,385 @@ fn annotate_impact_presentation_lines(
     }
 }
 
+/// Replace each blast-radius row, a whole serialized `Entity`, with the fields
+/// a reader acts on: its id, name, kind, role, signature, the file it is
+/// projected into and its presentation lines.
+///
+/// A raw row carried the fingerprint hashes, the span's byte offsets, the
+/// language, visibility, lineage and every metadata key the parser stamped on
+/// the entity, which is most of its bytes and none of the answer. An impact
+/// reply on a method with five affected units came back cut, with no cursor,
+/// because those bytes filled the budget first. `compact: false` keeps the
+/// raw rows for a caller that wants them.
+///
+/// An override row also names the edge that found it, the same way
+/// `find_references` names it under `overridden_by`: its resolution, and the
+/// method it overrides when that is not the changed entity itself.
+fn compact_impact_rows<G: GraphStore>(
+    store: &G,
+    result: &mut serde_json::Value,
+    impact: &kin_review::ImpactReport,
+) -> Result<()> {
+    // Keyed by the id as the row serializes it, which is how the row is found.
+    let mut override_edges: HashMap<String, serde_json::Value> = HashMap::new();
+    if !impact.affected_overrides.is_empty() {
+        for changed in &impact.changed_ids {
+            for row in super::overrides::collect_overriders(store, changed)?.rows {
+                override_edges
+                    .entry(row.entity.id.to_string())
+                    .or_insert_with(|| {
+                        let mut edge = serde_json::json!({"resolution": row.resolution.as_str()});
+                        if let Some(base) = &row.overrides {
+                            edge["overrides"] = serde_json::json!(base);
+                        }
+                        if row.implements {
+                            edge["relation"] = serde_json::json!("implements");
+                        }
+                        edge
+                    });
+            }
+        }
+    }
+    // The dotted module each row is declared in, read once per file from
+    // the graph's module records: what places a row in its package without a
+    // second call, as a reference row's `module` does. Never a file path.
+    // With it, whether the row's name is one its source unit declares more
+    // than once, so the row is written with its id.
+    let mut modules: HashMap<String, Option<String>> = HashMap::new();
+    let mut module_of = |id: Option<&str>| -> Option<(String, bool)> {
+        let id = kin_model::ids::EntityId(uuid::Uuid::parse_str(id?).ok()?);
+        let entity = store.get_entity(&id).ok().flatten()?;
+        let file = entity.file_origin.as_ref()?.0.clone();
+        let shared = crate::semantic_owners::name_is_shared(store, &entity);
+        if let Some(known) = modules.get(&file) {
+            return known.clone().map(|module| (module, shared));
+        }
+        let named = crate::semantic_owners::entity_module(store, &entity);
+        modules.insert(file, named.clone());
+        named.map(|module| (module, shared))
+    };
+    for key in IMPACT_ENTITY_BUCKETS {
+        let Some(serde_json::Value::Array(rows)) = result.get_mut(key) else {
+            continue;
+        };
+        for row in rows.iter_mut() {
+            let Some(object) = row.as_object() else {
+                continue;
+            };
+            let field = |name: &str| object.get(name).cloned().unwrap_or(serde_json::Value::Null);
+            let mut compact = serde_json::json!({
+                "id": field("id"),
+                "name": field("name"),
+                "kind": field("kind"),
+                "role": field("role"),
+                "signature": field("signature"),
+                "projection": { "path": field("file_origin") },
+                "start_line": field("start_line"),
+                "end_line": field("end_line"),
+            });
+            if let Some((module, shared)) =
+                module_of(object.get("id").and_then(serde_json::Value::as_str))
+            {
+                compact["module"] = serde_json::json!(module);
+                if shared {
+                    compact[crate::semantic_owners::NAME_SHARED_KEY] = serde_json::json!(true);
+                }
+            }
+            if key == "affected_overrides" {
+                let edge = object
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| override_edges.get(id));
+                if let Some(edge) = edge {
+                    for (name, value) in edge.as_object().into_iter().flatten() {
+                        compact[name] = value.clone();
+                    }
+                }
+            }
+            // An override caller keeps the override it calls and how firmly,
+            // which is what the row answers.
+            if super::implementation_family::OVERRIDE_CALLER_BUCKETS.contains(&key) {
+                for label in super::implementation_family::OVERRIDE_CALLER_LABELS {
+                    if let Some(value) = object.get(label) {
+                        compact[label] = value.clone();
+                    }
+                }
+            }
+            *row = compact;
+        }
+    }
+    Ok(())
+}
+
+/// Where a compact impact reply says how many rows each of its row lists
+/// holds in all, by the list's key.
+pub const IMPACT_ROW_TOTALS_KEY: &str = "affected_row_totals";
+
+/// Where an impact reply asked to leave test code out says how many affected
+/// entities it left out for that, under `entities`.
+pub const IMPACT_TESTS_EXCLUDED_KEY: &str = "tests_excluded";
+
+/// Present, and true, on an impact reply whose caller asked for the lists of
+/// what depends on the callers. Those lists answer what else a change could
+/// reach, which a reader asking what must change with an entity did not ask
+/// for, so a plain reply counts them unless this says they were asked for.
+/// The machine reply holds them either way.
+pub const IMPACT_DEPENDENTS_ASKED_KEY: &str = "dependents_asked";
+
+/// The argument that asks for [`IMPACT_DEPENDENTS_ASKED_KEY`].
+pub const IMPACT_DEPENDENTS_ARGUMENT: &str = "dependents";
+
+/// Where an impact reply confined to a module path says so: the path as the
+/// graph spells it under `module`, and under `outside` how many affected
+/// entities sat outside it and are in no list.
+pub const IMPACT_ROW_SCOPE_KEY: &str = "row_scope";
+
+/// Keep, in every row list of `result`, the rows whose entity `within`
+/// lists, and return how many distinct entities that left out. A row whose
+/// entity cannot be placed is kept, so nothing is dropped unseen.
+fn confine_impact_rows<G: GraphStore>(
+    store: &G,
+    result: &mut serde_json::Value,
+    within: &crate::trace_scope::RowScope,
+) -> usize {
+    let mut outside: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut placed: HashMap<String, bool> = HashMap::new();
+    for key in IMPACT_ENTITY_BUCKETS.into_iter().chain([
+        IMPACT_VALUE_USES_KEY,
+        crate::impact_sections::SAME_NAME_KEY,
+        crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY,
+    ]) {
+        let Some(serde_json::Value::Array(rows)) = result.get_mut(key) else {
+            continue;
+        };
+        rows.retain(|row| {
+            let Some(id) = row.get("id").and_then(serde_json::Value::as_str) else {
+                return true;
+            };
+            let listed = *placed
+                .entry(id.to_string())
+                .or_insert_with(|| within.lists_id(store, id));
+            if !listed {
+                outside.insert(id.to_string());
+            }
+            listed
+        });
+    }
+    outside.len()
+}
+
+/// The entities that hold a changed entity, or a method that overrides one,
+/// as a value: each names it without calling it, by a `References` edge, the
+/// rows `find_references` serves as references. A change to a signature
+/// reaches them as it reaches a caller, since whatever is handed the value
+/// calls it with the old one. Each row carries the line that names it as
+/// `code`, and `uses` when what it names is an override.
+pub const IMPACT_VALUE_USES_KEY: &str = "affected_value_uses";
+
+/// How many [`IMPACT_VALUE_USES_KEY`] rows the store held past
+/// [`IMPACT_VALUE_USES_MAX`].
+pub const IMPACT_VALUE_USES_WITHHELD_KEY: &str = "affected_value_uses_withheld";
+
+/// How many value-use rows one answer lists; the rest are counted.
+pub const IMPACT_VALUE_USES_MAX: usize = 50;
+
+/// How many rows of one list are quoted with the line that makes them a row.
+/// Each quote reads its holder's body once; a list past this keeps its rows
+/// and leaves the later ones unquoted.
+const IMPACT_CODE_ROWS_MAX: usize = 60;
+
+/// The line of `holder` on which it names one of `targets` by a relation of
+/// one of `kinds`, quoted from the holder's own text: the first such line in
+/// the holder. `None` when the edge records no site in the holder's file or
+/// its text cannot be read.
+fn site_code<G: GraphStore, T: super::external_symbols::SiteText + ?Sized>(
+    store: &G,
+    quoter: &crate::trace_reach::LineQuoter<'_, T>,
+    holder: &kin_model::Entity,
+    targets: &[kin_model::EntityId],
+    kinds: &[kin_model::relation::RelationKind],
+) -> Option<String> {
+    let line = store
+        .get_relations(&holder.id, kinds)
+        .ok()?
+        .iter()
+        .filter(|relation| {
+            relation.src == kin_model::GraphNodeId::Entity(holder.id)
+                && targets
+                    .iter()
+                    .any(|target| relation.dst == kin_model::GraphNodeId::Entity(*target))
+        })
+        .flat_map(|relation| relation_reference_lines(relation, holder.file_origin.as_ref()).lines)
+        .min()?;
+    quoter.line(holder, line)
+}
+
+/// Put on each caller row the call it makes, as `code`: the line of the
+/// caller that calls a changed entity, or the override the row names. A
+/// reader then sees what a change to the signature has to rewrite without
+/// reading the caller.
+fn attach_call_code<G: GraphStore, T: super::external_symbols::SiteText + ?Sized>(
+    store: &G,
+    result: &mut serde_json::Value,
+    changed: &[kin_model::EntityId],
+    text: &T,
+) {
+    use kin_model::relation::RelationKind;
+    let quoter = crate::trace_reach::LineQuoter::new(text);
+    let entity_of = |id: Option<&serde_json::Value>| {
+        let id = uuid::Uuid::parse_str(id?.as_str()?).ok()?;
+        store.get_entity(&kin_model::EntityId(id)).ok().flatten()
+    };
+    let lists = ["affected_callers"]
+        .into_iter()
+        .chain(super::implementation_family::OVERRIDE_CALLER_BUCKETS);
+    for key in lists {
+        let Some(serde_json::Value::Array(rows)) = result.get_mut(key) else {
+            continue;
+        };
+        for row in rows.iter_mut().take(IMPACT_CODE_ROWS_MAX) {
+            let Some(holder) = entity_of(row.get("id")) else {
+                continue;
+            };
+            // An override caller's call is the one to the override it names.
+            let named = entity_of(row.get("calls_override_id")).map(|named| vec![named.id]);
+            let targets = named.as_deref().unwrap_or(changed);
+            if let Some(code) = site_code(store, &quoter, &holder, targets, &[RelationKind::Calls])
+            {
+                row["code"] = serde_json::json!(code);
+            }
+        }
+    }
+}
+
+/// The rows of [`IMPACT_VALUE_USES_KEY`], and how many more the store held
+/// past [`IMPACT_VALUE_USES_MAX`]: every entity with a `References` edge to
+/// one of `changed` or of `overrides`, each once, in the order the targets
+/// are given and then by name. An entity already listed as a caller is left
+/// to that row, and a target is never a use of itself.
+fn value_use_rows<G: GraphStore, T: super::external_symbols::SiteText + ?Sized>(
+    store: &G,
+    changed: &[kin_model::Entity],
+    overrides: &[kin_model::Entity],
+    listed: &std::collections::HashSet<kin_model::EntityId>,
+    text: &T,
+) -> (Vec<serde_json::Value>, usize) {
+    use kin_model::relation::RelationKind;
+    let quoter = crate::trace_reach::LineQuoter::new(text);
+    let targets: std::collections::HashSet<kin_model::EntityId> = changed
+        .iter()
+        .chain(overrides)
+        .map(|entity| entity.id)
+        .collect();
+    let mut seen = listed.clone();
+    let mut rows = Vec::new();
+    let mut withheld = 0usize;
+    for (target, is_override) in changed
+        .iter()
+        .map(|entity| (entity, false))
+        .chain(overrides.iter().map(|entity| (entity, true)))
+    {
+        // Every relation of the target, both ways: the ones that end on it
+        // are its referrers.
+        let Ok(relations) = store.get_all_relations_for_entity(&target.id) else {
+            continue;
+        };
+        let mut holders: Vec<kin_model::Entity> = relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == RelationKind::References
+                    && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+            })
+            .filter_map(|relation| match relation.src {
+                kin_model::GraphNodeId::Entity(holder) => Some(holder),
+                _ => None,
+            })
+            .filter(|holder| !targets.contains(holder) && seen.insert(*holder))
+            .filter_map(|holder| store.get_entity(&holder).ok().flatten())
+            .collect();
+        holders.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        for holder in holders {
+            if rows.len() >= IMPACT_VALUE_USES_MAX {
+                withheld += 1;
+                continue;
+            }
+            let mut row = serde_json::json!({
+                "id": holder.id.to_string(),
+                "name": holder.name,
+                "kind": holder.kind,
+                "role": holder.role,
+            });
+            if let Some(module) = crate::semantic_owners::entity_module(store, &holder) {
+                row["module"] = serde_json::json!(module);
+            }
+            crate::semantic_owners::mark_shared_name(store, &holder, &mut row);
+            if is_override || changed.len() > 1 {
+                row["uses"] = serde_json::json!(target.name);
+            }
+            if let Some(code) = site_code(
+                store,
+                &quoter,
+                &holder,
+                &[target.id],
+                &[RelationKind::References],
+            ) {
+                row["code"] = serde_json::json!(code);
+            }
+            rows.push(row);
+        }
+    }
+    (rows, withheld)
+}
+
+/// How many rows each row list of `result` holds before any page cuts one,
+/// so a reader of one page can tell a whole list from the first part of one.
+fn impact_row_totals(result: &serde_json::Value) -> serde_json::Value {
+    let mut totals = serde_json::Map::new();
+    for key in IMPACT_ENTITY_BUCKETS
+        .into_iter()
+        .chain([IMPACT_VALUE_USES_KEY])
+    {
+        if let Some(serde_json::Value::Array(rows)) = result.get(key) {
+            totals.insert(key.to_string(), serde_json::json!(rows.len()));
+        }
+    }
+    serde_json::Value::Object(totals)
+}
+
+/// Take every row whose entity's stored role is Test out of the row lists of
+/// `result`, and return how many distinct entities that was. A reader who
+/// asked for no test code is answered about the rest: the rows are gone
+/// rather than marked, and the count says what the answer leaves out.
+fn exclude_test_rows(result: &mut serde_json::Value) -> usize {
+    let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unnamed = 0usize;
+    for key in IMPACT_ENTITY_BUCKETS.into_iter().chain([
+        IMPACT_VALUE_USES_KEY,
+        crate::impact_sections::SAME_NAME_KEY,
+        crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY,
+    ]) {
+        let Some(serde_json::Value::Array(rows)) = result.get_mut(key) else {
+            continue;
+        };
+        rows.retain(|row| {
+            let test = row
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|role| role.eq_ignore_ascii_case("test"));
+            if test {
+                match row.get("id").and_then(serde_json::Value::as_str) {
+                    Some(id) => {
+                        excluded.insert(id.to_string());
+                    }
+                    None => unnamed += 1,
+                }
+            }
+            !test
+        });
+    }
+    excluded.len() + unnamed
+}
+
 pub async fn handle_impact_analysis<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -311,18 +686,51 @@ pub async fn handle_impact_analysis_with_source<G: GraphStore>(
         return Ok(refusal);
     }
     let include_traffic = get_optional_bool(args, "include_traffic", true);
+    let include_tests = get_optional_bool(args, "include_tests", true);
+    // A scope lists the affected entities inside one module path. Resolved
+    // before the analysis runs, so one that names no module path is refused
+    // rather than answered as though nothing in it were affected.
+    let within = crate::trace_scope::RowScope::from_arguments(store, args)
+        .map_err(McpError::InvalidParams)?;
     let depth = get_optional_u64(args, "depth", 3) as u32;
     let diff = resolve_diff(args, store)?;
 
     let impact = {
         let source = AnalysisEscapeEvidence::new(store, repository_authority, source_scope);
         let evidence = |targets: &[kin_model::Entity], at| source.observe(targets, at);
-        kin_review::impact::analyze_impact_with_source(store, &diff, Some(&evidence))
-            .map_err(|e| McpError::Review(e.to_string()))?
+        // A caller with no ledger reads the way the store-wide status reads
+        // it: unproven for want of a resolver on this host, not owed work.
+        let no_resolver = crate::call_sites::host_no_resolver();
+        kin_review::impact::analyze_impact_with_sources(
+            store,
+            &diff,
+            kin_review::enrichment::ObservationSources {
+                escape_evidence: Some(&evidence),
+                no_resolver: Some(&no_resolver),
+            },
+        )
+        .map_err(|e| McpError::Review(e.to_string()))?
     };
 
     let mut result = semantic_metadata_json(&impact)?;
+    super::implementation_family::flatten_rows(&mut result, &impact);
     annotate_impact_presentation_lines(&mut result, &impact);
+    let compact = crate::budget::ResponseBudget::from_arguments(args).compact;
+    if compact {
+        compact_impact_rows(store, &mut result, &impact)?;
+    }
+    // A class the parser saw and did not admit, whose bases name a changed
+    // method's owner, could override it with no entity to carry the edge.
+    // Named beside `affected_overrides`, the way `find_references` names it.
+    let mut not_admitted = Vec::new();
+    for id in &impact.changed_ids {
+        if let Some(entity) = store.get_entity(id).map_err(McpError::graph)? {
+            not_admitted.extend(super::overrides::unadmitted_overriders(store, &entity)?);
+        }
+    }
+    if !not_admitted.is_empty() {
+        result["overrides_not_admitted"] = serde_json::json!(not_admitted);
+    }
     if names_files(args) {
         record_files_deprecation(&mut result, "impact_analysis");
     }
@@ -420,6 +828,19 @@ pub async fn handle_impact_analysis_with_source<G: GraphStore>(
     // became no edge, which is how a live export came back `consumer_count: 0`
     // under a certified verdict. The negative gate reads this block before it
     // certifies any of those zeros, the way it reads `find_references`'s own.
+    //
+    // The arrival is read over the same store-wide reading of each changed
+    // entity's possible callers that `find_references` reads its own over, so
+    // the two answers about one focal read its family the same way.
+    let held = HeldSourceAuthority::new(store, repository_authority);
+    let (mut scans, changed) = direct_scans(
+        store,
+        &impact.changed_ids,
+        &held,
+        source_scope,
+        include_tests,
+        within.as_ref(),
+    )?;
     let without_consumers: Vec<kin_model::EntityId> = impact
         .entity_impacts
         .iter()
@@ -427,14 +848,184 @@ pub async fn handle_impact_analysis_with_source<G: GraphStore>(
         .map(|row| row.entity_id)
         .collect();
     result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
-        crate::caller_arrival::observe_impact_arrival(store, &without_consumers);
+        crate::caller_arrival::observe_impact_arrival_with(store, &without_consumers, &scans.scans);
+
+    // A changed method's signature is its whole family's: each override, and
+    // the callers of every member. Each entry says what changing it obliges
+    // and where those rows are, and the callers of the method itself are
+    // labelled proven or not beside the callers of its overrides.
+    let families = super::implementation_family::read(store, &changed, &impact, &scans.scans)?;
+    families.label_direct_callers(&mut result);
+    families.attach(&mut result);
+
+    // Each caller row shows the call it makes, and the places that hold a
+    // changed entity or an override as a value are listed beside the callers:
+    // a change reaches them the same way, and no call edge names them.
+    {
+        let text = super::external_symbols::CalleeText::with_read_limit_at(
+            &held,
+            crate::call_sites::SCAN_TEXT_READS_MAX,
+            source_scope,
+        );
+        attach_call_code(store, &mut result, &impact.changed_ids, &text);
+        let listed: std::collections::HashSet<kin_model::EntityId> = impact
+            .affected_callers
+            .iter()
+            .map(|caller| caller.id)
+            .collect();
+        let (uses, withheld) =
+            value_use_rows(store, &changed, &impact.affected_overrides, &listed, &text);
+        if !uses.is_empty() {
+            result[IMPACT_VALUE_USES_KEY] = serde_json::json!(uses);
+            if withheld > 0 {
+                result[IMPACT_VALUE_USES_WITHHELD_KEY] = serde_json::json!(withheld);
+            }
+        }
+    }
+
+    // A JavaScript or TypeScript function swapped in by module, such as a
+    // renderer's host config, has siblings no edge links to it. They are
+    // named beside the overrides as name matches, and never graded.
+    let (same_name, withheld) = crate::impact_sections::same_name_implementations(
+        store,
+        &changed,
+        &impact.affected_overrides,
+    );
+    if !same_name.is_empty() {
+        result[crate::impact_sections::SAME_NAME_KEY] = serde_json::json!(same_name);
+        result[crate::impact_sections::SAME_NAME_NOTE_KEY] =
+            serde_json::json!(crate::impact_sections::SAME_NAME_NOTE);
+        if withheld > 0 {
+            result[crate::impact_sections::SAME_NAME_WITHHELD_KEY] = serde_json::json!(withheld);
+        }
+        // The siblings no row can name: a variable bound to a function, or
+        // a re-export, of the same name.
+        let not_held = crate::impact_sections::same_name_not_held(store, &changed);
+        if not_held > 0 {
+            result[crate::impact_sections::SAME_NAME_NOT_HELD_KEY] = serde_json::json!(not_held);
+        }
+    }
+
+    // A Go interface method is implemented by every type whose method set
+    // satisfies its interface, and no edge records that, so the overrides
+    // above never hold them. They are listed beside the overrides, and a walk
+    // that failed is said in the direct section's reading rather than read as
+    // one no method implements.
+    let implementations = crate::impact_sections::interface_implementation_rows(
+        store,
+        &changed,
+        &impact.affected_overrides,
+    );
+    scans.implementations_unread = implementations.unread;
+    if !implementations.rows.is_empty() {
+        result[crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY] =
+            serde_json::json!(implementations.rows);
+        result[crate::impact_sections::INTERFACE_IMPLEMENTATIONS_NOTE_KEY] =
+            serde_json::json!(crate::impact_sections::INTERFACE_IMPLEMENTATIONS_NOTE);
+    }
+
+    // Confined to a module path, the lists hold what sits inside it, and
+    // what they left out is counted once.
+    if let Some(within) = &within {
+        let outside = confine_impact_rows(store, &mut result, within);
+        result[IMPACT_ROW_SCOPE_KEY] =
+            serde_json::json!({ "module": within.module(), "outside": outside });
+    }
+    // Test code a caller asked to leave out is in no list and in no reading
+    // of the direct callers above; what the lists left out is counted once.
+    if !include_tests {
+        let entities = exclude_test_rows(&mut result);
+        result[IMPACT_TESTS_EXCLUDED_KEY] = serde_json::json!({ "entities": entities });
+    }
+    if compact {
+        result[IMPACT_ROW_TOTALS_KEY] = impact_row_totals(&result);
+    }
+    if get_optional_bool(args, IMPACT_DEPENDENTS_ARGUMENT, false) {
+        result[IMPACT_DEPENDENTS_ASKED_KEY] = serde_json::json!(true);
+    }
+
+    // Two questions, two verdicts: what must change with the changed
+    // entities, read off their call sites the way `find_references` reads
+    // them, and what else the change could reach, read off the wider walk.
+    // The envelope grades each section from what is named here.
+    let sections = crate::impact_sections::sections_json(&result, scans.call_sites_block());
+    result[crate::impact_sections::SECTIONS_KEY] = sections;
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
 
+/// The store-wide reading of every caller that could call each changed
+/// entity, taken the way `find_references` takes one for its focal: the
+/// census of whether it escapes as a value at `source_scope`, then every
+/// possible caller read through the one site-state reading, with each
+/// caller's exact text read within [`crate::call_sites::SCAN_TEXT_READS_MAX`].
+/// With `include_tests` false, code whose stored role is Test is in neither
+/// the census nor the reading, as a reference answer that leaves tests out
+/// reads it, and under `within` a caller outside that module path holds no
+/// site in the reading. Also the changed entities the store holds, in the
+/// answer's order.
+fn direct_scans<G: GraphStore>(
+    store: &G,
+    changed_ids: &[kin_model::EntityId],
+    held: &HeldSourceAuthority<'_, G>,
+    source_scope: EntitySourceScope,
+    include_tests: bool,
+    within: Option<&crate::trace_scope::RowScope>,
+) -> Result<(crate::impact_sections::DirectScans, Vec<kin_model::Entity>)> {
+    use crate::impact_sections::{DirectScans, DIRECT_SCAN_FOCALS_MAX};
+    let mut scans = DirectScans {
+        changed: changed_ids.len(),
+        ..DirectScans::default()
+    };
+    let mut changed = Vec::with_capacity(changed_ids.len());
+    for id in changed_ids {
+        match store.get_entity(id).map_err(McpError::graph)? {
+            Some(entity) => changed.push(entity),
+            None => scans.missing += 1,
+        }
+    }
+    let read = &changed[..changed.len().min(DIRECT_SCAN_FOCALS_MAX)];
+    scans.unscanned = changed.len() - read.len();
+    let focals: Vec<(&kin_model::Entity, Vec<String>)> = read
+        .iter()
+        .map(|focal| (focal, kin_model::focal_call_names(focal)))
+        .collect();
+    let mut escapes = if focals.is_empty() {
+        Vec::new()
+    } else {
+        held.escape_evidence_batch_scoped(source_scope, &focals, include_tests)
+    };
+    if escapes.len() != focals.len() {
+        // A census that does not answer for every focal answers for none.
+        escapes = focals
+            .iter()
+            .map(|_| crate::call_sites::NO_CENSUS)
+            .collect();
+    }
+    for ((focal, _), escape) in focals.iter().zip(escapes) {
+        let text = super::external_symbols::CalleeText::with_read_limit_at(
+            held,
+            crate::call_sites::SCAN_TEXT_READS_MAX,
+            source_scope,
+        );
+        match crate::call_sites::scan_focal_scoped(store, focal, &text, escape, include_tests) {
+            Ok(mut scan) => {
+                // The reading speaks of the callers the question is about.
+                if let Some(within) = within {
+                    scan.confine(|caller| within.lists(caller));
+                }
+                scans.scans.insert(focal.id, std::sync::Arc::new(scan));
+                scans.focals.push((*focal).clone());
+            }
+            Err(_) => scans.unreadable.push(focal.name.clone()),
+        }
+    }
+    Ok((scans, changed))
+}
+
 /// The cross-file reference classes an impact verdict is read off, matching what
-/// [`crate::negative::absence_cross_file_classes`] declares `impact_analysis`
+/// [`crate::negative::absence_cross_unit_classes`] declares `impact_analysis`
 /// depends on. Declaring one set and observing another is how a gate comes to
 /// judge a class the answer never measured.
 ///
@@ -449,15 +1040,12 @@ pub const IMPACT_REFERENCE_KINDS: [kin_model::relation::RelationKind; 3] = [
 ];
 
 pub const SEMANTIC_REVIEW_DESC: &str = "\
-Produce a complete semantic review of a change in one call: the entity-level diff, the \
-downstream impact, and an overall risk assessment, combined into a single report. \
-Target it four ways (one at a time): base/head change IDs, entity_ids, file paths, or a \
-list of change_ids. Choose format='text' for a human-readable summary or format='json' \
-for structured output suited to editor/CI integrations, and optionally fold in active \
-agent traffic on the reviewed entities. Reach for it when you want the whole \"what \
-changed, what it touches, how risky is it\" picture at once — it saves you from running \
-semantic_diff and impact_analysis separately and stitching them together yourself. Use \
-the narrower tools when you only need one of those facets.";
+Return one structured semantic report containing entity and relation changes, downstream \
+impact, risk and inline findings. Select one scope: base/head semantic change IDs, \
+entity_ids, or change_ids. Both formats retain the complete structured report. The \
+default format='text' adds a concise semantic prose message; format='json' omits that \
+message. Optionally include active agent traffic on the reviewed entities. Use \
+semantic_diff or impact_analysis when you need only that part of the report.";
 
 pub fn handle_semantic_review<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -489,7 +1077,17 @@ pub fn handle_semantic_review_with_source<G: GraphStore>(
         return Ok(refusal);
     }
     let include_traffic = get_optional_bool(args, "include_traffic", true);
-    let format = get_optional_string_param(args, "format").unwrap_or_else(|| "text".into());
+    let format = match args.get("format") {
+        None => "text",
+        Some(serde_json::Value::String(format)) if matches!(format.as_str(), "text" | "json") => {
+            format.as_str()
+        }
+        Some(_) => {
+            return Err(McpError::InvalidParams(
+                "semantic_review format must be text or json".into(),
+            ))
+        }
+    };
     let diff = resolve_diff(args, store)?;
 
     let source = AnalysisEscapeEvidence::new(store, repository_authority, source_scope);
@@ -497,59 +1095,25 @@ pub fn handle_semantic_review_with_source<G: GraphStore>(
     let review = SemanticReview::review_from_diff_with_source(diff, store, Some(&evidence))
         .map_err(|e| McpError::Review(e.to_string()))?;
 
-    let namer = |node: &kin_model::relation::GraphNodeId| kin_review::graph_node_name(store, node);
-    let formatted = kin_review::format_review_with(&review, &review_render_options(&namer));
-
-    if format.eq_ignore_ascii_case("json") {
-        let mut result = semantic_metadata_json(&review)?;
-        // `semantic_review format=json` carries the same impact buckets
-        // `impact_analysis` returns, so it gets the same 1-based presentation
-        // lines. Annotating one and not the other left two agent surfaces
-        // reporting the same entity's position under two conventions.
-        if let Some(impact) = result.get_mut("impact") {
-            annotate_impact_presentation_lines(impact, &review.impact);
-        }
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert(
-                "summary".into(),
-                serde_json::json!(format!("Risk: {:?}", review.risk.overall_risk)),
-            );
-            obj.insert("formatted".into(), serde_json::json!(formatted));
-            if include_traffic {
-                let traffic = collect_review_traffic_lines(&review, sessions);
-                if !traffic.is_empty() {
-                    obj.insert("active_traffic".into(), serde_json::json!(traffic));
-                }
-            }
-        }
-        if names_files(args) {
-            record_files_deprecation(&mut result, "semantic_review");
-        }
-        let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-        return Ok(ToolCallResult::text(json));
+    // Both formats carry the same typed evidence through qualification. Prose
+    // is composed from semantic counts, never parsed out of operator output.
+    let mut result = semantic_metadata_json(&review)?;
+    if let Some(impact) = result.get_mut("impact") {
+        annotate_impact_presentation_lines(impact, &review.impact);
     }
-
-    let text = if include_traffic {
-        // Collect traffic for all entities in the diff.
-        let traffic_lines = collect_review_traffic_lines(&review, sessions);
-        if traffic_lines.is_empty() {
-            formatted
-        } else {
-            format!(
-                "{}\n\n--- Active Traffic ---\n{}",
-                formatted,
-                traffic_lines.join("\n")
-            )
+    result["summary"] = serde_json::json!(format!("Risk: {:?}", review.risk.overall_risk));
+    if format == "text" {
+        result["message"] = serde_json::json!(format!(
+            "Semantic review: {} entity changes and {} relationship changes. Risk: {:?}. Read the structured diff, impact, risk and inline findings with their verdicts and coverage limits.",
+            review.diff.entity_changes.len(), review.diff.relation_changes.len(), review.risk.overall_risk,
+        ));
+    }
+    if include_traffic {
+        let traffic = collect_review_traffic_lines(&review, sessions);
+        if !traffic.is_empty() {
+            result["active_traffic"] = serde_json::json!(traffic);
         }
-    } else {
-        formatted
-    };
-    // Preserve the observation for the canonical verdict in text mode too.
-    // The finalizer already wraps plain text as a message object.
-    let mut result = serde_json::json!({
-        "message": text,
-        "enrichment": review.impact.enrichment,
-    });
+    }
     if names_files(args) {
         record_files_deprecation(&mut result, "semantic_review");
     }
@@ -1875,6 +2439,85 @@ mod tests {
     use super::super::tests::with_empty_test_repository;
     use super::*;
 
+    #[test]
+    fn semantic_diff_public_records_preserve_identities_code_and_relation_deltas() {
+        use kin_model::change::{EntityDelta, RelationDelta};
+        use kin_model::graph::ChangeStore;
+        use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let mut entity = entity_spanning("file", "private/implementation.rs", 8, 12);
+        let body = "const RESOURCE: &str = \"./literal.rs\";";
+        entity
+            .metadata
+            .extra
+            .insert("source".into(), serde_json::json!(body));
+        let target = entity_spanning("helper", "private/target.rs", 1, 3);
+        let relation = Relation {
+            id: kin_model::RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(entity.id),
+            dst: GraphNodeId::Entity(target.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let mut change = history_change(
+            None,
+            vec![
+                EntityDelta::Added {
+                    new: entity.clone(),
+                },
+                EntityDelta::Added { new: target },
+            ],
+            "semantic diff",
+            0,
+        );
+        change.relation_deltas.push(RelationDelta::Added {
+            new: relation.clone(),
+        });
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        store.create_change(&change).unwrap();
+        let args = HashMap::from([(
+            "change_ids".into(),
+            serde_json::json!([change.id.to_string()]),
+        )]);
+        let result = handle_semantic_diff(&args, &store).unwrap();
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let raw: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            text.contains("private/implementation.rs"),
+            "private qualification inputs remain available"
+        );
+        let mut public = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut public, "semantic_diff");
+        let public: serde_json::Value =
+            serde_json::from_str(public["content"][0]["text"].as_str().unwrap()).unwrap();
+        let rows = public["diff"]["entity_changes"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = rows
+            .iter()
+            .find(|row| row["entity_id"] == entity.id.to_string())
+            .unwrap();
+        let added = &row["kind"]["Added"];
+        assert_eq!(added["id"], entity.id.to_string());
+        assert_eq!(added["name"], "file");
+        assert_eq!(added["signature"], entity.signature);
+        assert_eq!(added["metadata"]["source"], body);
+        assert!(added.get("file_origin").is_none());
+        assert!(added.get("span").is_none());
+        assert!(!public.to_string().contains("private/"));
+        assert_eq!(
+            public["diff"]["relation_changes"],
+            raw["diff"]["relation_changes"]
+        );
+        assert_eq!(
+            public["diff"]["relation_changes"][0]["kind"]["Added"]["id"],
+            relation.id.to_string()
+        );
+    }
+
     /// Impact rows must locate an affected caller where an editor would.
     ///
     /// `ImpactReport` holds raw entities, so serializing it exposed only the
@@ -1933,6 +2576,9 @@ mod tests {
             affected_dependents: vec![],
             affected_contract_consumers: vec![],
             affected_tests: vec![],
+            affected_overrides: vec![],
+            affected_override_callers: vec![],
+            override_caller_candidates: vec![],
             affected_work_items: vec![],
             affected_annotations: vec![],
             changed_ids: vec![],
@@ -1998,9 +2644,9 @@ mod tests {
     /// back certified here, `safe_to_conclude_absent: true`, while
     /// `find_references` refused the same absence on the same graph.
     ///
-    /// The control is the same store with the test file's one parsed call site
-    /// accounted for, which must still certify, so the gate cannot pass by
-    /// refusing every zero.
+    /// The control accounts for the test file's one parsed call site. That
+    /// clears the arrival gap, while this graph-only fixture still cannot
+    /// certify non-call consumers without a mention census.
     #[tokio::test]
     async fn a_zero_consumer_count_a_caller_may_not_have_reached_is_not_certified() {
         use kin_model::graph::EntityStore as _;
@@ -2207,20 +2853,30 @@ mod tests {
             "the one verdict names the limiting factor: {verdict}"
         );
 
-        let (certified, _) = impact_verdict(1).await;
+        let (accounted, _) = impact_verdict(1).await;
         assert_eq!(
-            certified[crate::caller_arrival::CALLER_ARRIVAL_KEY]["state"],
+            accounted[crate::caller_arrival::CALLER_ARRIVAL_KEY]["state"],
             "accounted",
-            "{certified}"
+            "{accounted}"
         );
         assert_eq!(
-            certified["negative"]["safe_to_conclude_absent"],
-            serde_json::json!(true),
-            "every call site the importing file parsed became an edge, so the zero is \
-             whole and the gate must let it certify: {}",
-            certified["negative"]
+            accounted["negative"]["safe_to_conclude_absent"],
+            serde_json::json!(false),
+            "accounting for calls alone cannot certify a zero covering non-call consumers: {}",
+            accounted["negative"]
         );
-        assert_eq!(certified["_kin"]["verdict"]["state"], "certified");
+        let reason = accounted["negative"]["trust_reason"]
+            .as_str()
+            .expect("the remaining gap is named");
+        assert!(
+            reason.contains("reference_completion_unmeasured"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "accounted callers clear their own gap: {reason}"
+        );
+        assert_eq!(accounted["_kin"]["verdict"]["state"], "inconclusive");
     }
 
     /// A review scope spelled in none of the documented forms is refused. Dropping
@@ -2254,31 +2910,77 @@ mod tests {
         );
     }
 
-    /// A text tool answers in text until the caller names the deprecated `files`,
-    /// and then in the object the envelope wraps text in, with the notice beside it.
     #[test]
-    fn a_text_answer_carries_the_files_deprecation_only_when_files_was_named() {
-        fn text_of(result: &ToolCallResult) -> String {
-            let crate::types::ContentBlock::Text { text } = &result.content[0];
-            text.clone()
+    fn semantic_review_formats_preserve_the_same_public_evidence() {
+        use kin_model::graph::EntityStore;
+        let store = kin_db::InMemoryGraph::new();
+        let entity = entity_spanning("file", "private/review.rs", 5, 10);
+        store.upsert_entity(&entity).unwrap();
+        let sessions = SessionRegistry::empty_for_test();
+        let mut args = HashMap::from([
+            ("entity_ids".into(), serde_json::json!([entity.id])),
+            ("include_traffic".into(), serde_json::json!(false)),
+        ]);
+        let mut expected = None;
+        for mode in [None, Some("text"), Some("json")] {
+            if let Some(mode) = mode {
+                args.insert("format".into(), serde_json::json!(mode));
+            }
+            let result = handle_semantic_review(&args, &store, &sessions).unwrap();
+            assert_ne!(result.is_error, Some(true));
+            let mut public = serde_json::to_value(result).unwrap();
+            crate::semantic_surface::present_result(&mut public, "semantic_review");
+            let mut public: serde_json::Value =
+                serde_json::from_str(public["content"][0]["text"].as_str().unwrap()).unwrap();
+            let row = &public["diff"]["entity_changes"][0]["kind"]["Added"];
+            assert_eq!(row["id"], entity.id.to_string());
+            assert_eq!(row["name"], "file");
+            assert_eq!(row["signature"], entity.signature);
+            for field in ["diff", "impact", "risk", "inline_comments"] {
+                assert!(public.get(field).is_some(), "{mode:?}: {public}");
+            }
+            assert!(!public.to_string().contains("private/review.rs"));
+            assert!(public.get("formatted").is_none());
+            let message = public.as_object_mut().unwrap().remove("message");
+            if mode == Some("json") {
+                assert!(message.is_none());
+            } else {
+                assert!(message
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Semantic review: 1 entity changes and 0 relationship changes."));
+            }
+            if let Some(expected) = &expected {
+                assert_eq!(&public, expected, "format must not alter semantic evidence");
+            } else {
+                expected = Some(public);
+            }
         }
-
-        let by_id = HashMap::from([("entity_ids".to_string(), serde_json::json!(["x"]))]);
-        let answer = text_answer("the diff".to_string(), &by_id, "semantic_diff").unwrap();
+        for invalid in [
+            serde_json::json!("yaml"),
+            serde_json::json!(null),
+            serde_json::json!(7),
+        ] {
+            args.insert("format".into(), invalid);
+            assert!(matches!(
+                handle_semantic_review(&args, &store, &sessions),
+                Err(McpError::InvalidParams(_))
+            ));
+        }
+        let registry = crate::tools::tool_definitions();
+        let definition = registry
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_review")
+            .unwrap();
         assert_eq!(
-            text_of(&answer),
-            "the diff",
-            "no deprecated parameter, plain text"
+            definition.input_schema["properties"]["format"]["enum"],
+            serde_json::json!(["text", "json"])
         );
-
-        let by_file = HashMap::from([("files".to_string(), serde_json::json!(["src/a.rs"]))]);
-        let answer = text_answer("the diff".to_string(), &by_file, "semantic_diff").unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&text_of(&answer)).expect("a files call answers in JSON");
-        assert_eq!(value["message"], "the diff");
-        assert_eq!(value["deprecations"][0]["tool"], "semantic_diff");
-        assert_eq!(value["deprecations"][0]["parameter"], "files");
-        assert_eq!(value["deprecations"][0]["replacement"], "entity_ids");
+        assert!(definition
+            .description
+            .contains("Both formats retain the complete structured report"));
     }
 
     /// One entity per span, built here rather than borrowed, so the nesting this
@@ -2321,6 +3023,521 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// An impact answer on a method names its overrides in their own bucket,
+    /// and every blast-radius row is compact: the fields a reader acts on,
+    /// not the entity's fingerprint, span offsets and parser metadata.
+    #[tokio::test]
+    async fn impact_names_overrides_and_serves_compact_rows() {
+        use kin_model::{EntityStore, GraphNodeId, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let mut base = entity_spanning("SessionInterface.open_session", "src/sessions.py", 10, 12);
+        let mut secure = entity_spanning(
+            "SecureCookieSessionInterface.open_session",
+            "src/sessions.py",
+            40,
+            44,
+        );
+        let mut deeper = entity_spanning("Deeper.open_session", "tests/test_deeper.py", 3, 4);
+        for method in [&mut base, &mut secure, &mut deeper] {
+            method.kind = kin_model::EntityKind::Method;
+        }
+        let caller = entity_spanning("AppContext._get_session", "src/ctx.py", 5, 9);
+        for entity in [&base, &secure, &deeper, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        let edge = |kind, src: &kin_model::Entity, dst: &kin_model::Entity| kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        };
+        for relation in [
+            edge(RelationKind::Overrides, &secure, &base),
+            edge(RelationKind::Overrides, &deeper, &secure),
+            edge(RelationKind::Calls, &caller, &base),
+        ] {
+            store.upsert_relation(&relation).unwrap();
+        }
+        let sessions = SessionRegistry::empty_for_test();
+        let mut args = HashMap::from([
+            (
+                "entity_ids".into(),
+                serde_json::json!([base.id.to_string()]),
+            ),
+            ("include_traffic".into(), serde_json::json!(false)),
+        ]);
+        let result = handle_impact_analysis(&args, &store, &sessions)
+            .await
+            .unwrap();
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let impact: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        let overrides = impact["affected_overrides"].as_array().unwrap();
+        let names: Vec<_> = overrides.iter().map(|row| row["name"].clone()).collect();
+        assert_eq!(
+            names,
+            [
+                serde_json::json!("SecureCookieSessionInterface.open_session"),
+                serde_json::json!("Deeper.open_session"),
+            ],
+            "{impact}"
+        );
+        assert_eq!(overrides[0]["resolution"], "type_resolved");
+        assert!(overrides[0].get("overrides").is_none());
+        assert_eq!(
+            overrides[1]["overrides"],
+            "SecureCookieSessionInterface.open_session"
+        );
+        assert_eq!(overrides[0]["projection"]["path"], "src/sessions.py");
+        assert_eq!(overrides[0]["start_line"], 41);
+
+        let callers = impact["affected_callers"].as_array().unwrap();
+        assert_eq!(callers[0]["name"], "AppContext._get_session");
+        for row in callers.iter().chain(overrides) {
+            for bulk in [
+                "fingerprint",
+                "metadata",
+                "span",
+                "language",
+                "lineage_parent",
+            ] {
+                assert!(row.get(bulk).is_none(), "{bulk} on a compact row: {row}");
+            }
+        }
+        // Neither override is also filed as two-hop reach.
+        assert!(!impact["affected_dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("open_session"))));
+
+        // `compact: false` serves the raw entity rows.
+        args.insert("compact".into(), serde_json::json!(false));
+        let result = handle_impact_analysis(&args, &store, &sessions)
+            .await
+            .unwrap();
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let raw: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(raw["affected_overrides"][0].get("fingerprint").is_some());
+    }
+
+    /// Asked to leave test code out, an impact answer holds no test entity
+    /// in any list, counts the affected entities it left out for that, and
+    /// counts each list as it now stands. Asked for the dependents, it says
+    /// they were asked for. Neither is said by an answer nobody asked.
+    #[tokio::test]
+    async fn impact_leaves_test_code_out_when_asked_and_counts_it() {
+        use kin_model::{EntityStore, GraphNodeId, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let mut base = entity_spanning("SessionInterface.open_session", "src/sessions.py", 10, 12);
+        let mut secure = entity_spanning(
+            "SecureCookieSessionInterface.open_session",
+            "src/sessions.py",
+            40,
+            44,
+        );
+        let mut fake = entity_spanning("FakeInterface.open_session", "tests/test_ctx.py", 3, 4);
+        for method in [&mut base, &mut secure, &mut fake] {
+            method.kind = kin_model::EntityKind::Method;
+        }
+        let caller = entity_spanning("AppContext._get_session", "src/ctx.py", 5, 9);
+        let mut test_caller = entity_spanning("test_get_session", "tests/test_ctx.py", 20, 24);
+        // Two places hand the method on as a value without calling it.
+        let holder = entity_spanning("Flask.register_interface", "src/app.py", 30, 33);
+        let mut test_holder = entity_spanning("test_register", "tests/test_ctx.py", 40, 44);
+        fake.role = kin_model::EntityRole::Test;
+        test_caller.role = kin_model::EntityRole::Test;
+        test_holder.role = kin_model::EntityRole::Test;
+        for entity in [
+            &base,
+            &secure,
+            &fake,
+            &caller,
+            &test_caller,
+            &holder,
+            &test_holder,
+        ] {
+            store.upsert_entity(entity).unwrap();
+        }
+        let edge = |kind, src: &kin_model::Entity, dst: &kin_model::Entity| kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        };
+        for relation in [
+            edge(RelationKind::Overrides, &secure, &base),
+            edge(RelationKind::Overrides, &fake, &base),
+            edge(RelationKind::Calls, &caller, &base),
+            edge(RelationKind::Calls, &test_caller, &base),
+            edge(RelationKind::References, &holder, &base),
+            edge(RelationKind::References, &test_holder, &secure),
+        ] {
+            store.upsert_relation(&relation).unwrap();
+        }
+        let sessions = SessionRegistry::empty_for_test();
+        let mut args = HashMap::from([
+            (
+                "entity_ids".into(),
+                serde_json::json!([base.id.to_string()]),
+            ),
+            ("include_traffic".into(), serde_json::json!(false)),
+        ]);
+        let asked = |args: HashMap<String, serde_json::Value>| {
+            let (store, sessions) = (&store, &sessions);
+            async move {
+                let result = handle_impact_analysis(&args, store, sessions)
+                    .await
+                    .unwrap();
+                let crate::types::ContentBlock::Text { text } = &result.content[0];
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            }
+        };
+        let names = |impact: &serde_json::Value, list: &str| -> Vec<String> {
+            let mut names: Vec<String> = impact[list]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        };
+
+        let whole = asked(args.clone()).await;
+        assert_eq!(
+            names(&whole, "affected_callers"),
+            ["AppContext._get_session", "test_get_session"],
+            "{whole}"
+        );
+        assert_eq!(names(&whole, "affected_overrides").len(), 2, "{whole}");
+        // A holder of the method, and one of an override, which says which.
+        assert_eq!(
+            names(&whole, IMPACT_VALUE_USES_KEY),
+            ["Flask.register_interface", "test_register"],
+            "{whole}"
+        );
+        let uses = whole[IMPACT_VALUE_USES_KEY].as_array().unwrap();
+        assert!(uses[0].get("uses").is_none(), "{whole}");
+        assert_eq!(
+            uses[1]["uses"], "SecureCookieSessionInterface.open_session",
+            "{whole}"
+        );
+        assert_eq!(whole[IMPACT_ROW_TOTALS_KEY][IMPACT_VALUE_USES_KEY], 2);
+        assert_eq!(
+            whole[crate::impact_sections::SECTIONS_KEY][crate::impact_sections::DIRECT]["rows"],
+            serde_json::json!([
+                "affected_callers",
+                IMPACT_VALUE_USES_KEY,
+                "affected_overrides"
+            ]),
+            "{whole}"
+        );
+        assert_eq!(whole[IMPACT_ROW_TOTALS_KEY]["affected_callers"], 2);
+        assert!(whole.get(IMPACT_TESTS_EXCLUDED_KEY).is_none(), "{whole}");
+        assert!(whole.get(IMPACT_DEPENDENTS_ASKED_KEY).is_none(), "{whole}");
+
+        args.insert("include_tests".into(), serde_json::json!(false));
+        args.insert(IMPACT_DEPENDENTS_ARGUMENT.into(), serde_json::json!(true));
+        let lean = asked(args.clone()).await;
+        assert_eq!(
+            names(&lean, "affected_callers"),
+            ["AppContext._get_session"],
+            "{lean}"
+        );
+        assert_eq!(
+            names(&lean, "affected_overrides"),
+            ["SecureCookieSessionInterface.open_session"],
+            "{lean}"
+        );
+        assert_eq!(
+            names(&lean, IMPACT_VALUE_USES_KEY),
+            ["Flask.register_interface"],
+            "{lean}"
+        );
+        assert_eq!(lean[IMPACT_TESTS_EXCLUDED_KEY]["entities"], 3, "{lean}");
+        assert_eq!(lean[IMPACT_ROW_TOTALS_KEY]["affected_callers"], 1, "{lean}");
+        assert_eq!(
+            lean[IMPACT_ROW_TOTALS_KEY]["affected_overrides"], 1,
+            "{lean}"
+        );
+        assert_eq!(lean[IMPACT_DEPENDENTS_ASKED_KEY], true, "{lean}");
+        for list in IMPACT_ENTITY_BUCKETS
+            .into_iter()
+            .chain([IMPACT_VALUE_USES_KEY])
+        {
+            for row in lean[list].as_array().into_iter().flatten() {
+                assert_ne!(row["role"], "test", "{list}: {row}");
+            }
+        }
+    }
+
+    /// Confined to a module path, an impact answer lists the affected
+    /// entities inside it and counts the ones outside, and refuses a scope
+    /// that names no module path rather than answering that nothing in it
+    /// is affected.
+    #[tokio::test]
+    async fn impact_confined_to_a_module_path_lists_what_sits_inside_and_counts_the_rest() {
+        use kin_model::{EntityStore, GraphNodeId, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let module = |name: &str, file: &str| {
+            let mut module = entity_spanning(name, file, 0, 400);
+            module.kind = kin_model::EntityKind::Module;
+            module.language = kin_model::LanguageId::Python;
+            module.span.as_mut().unwrap().end_byte = 10_000;
+            module
+        };
+        let declared = |name: &str, file: &str, line: u32| {
+            let mut entity = entity_spanning(name, file, line, line + 2);
+            entity.language = kin_model::LanguageId::Python;
+            entity
+        };
+        let base = declared("open_session", "flask/sessions.py", 10);
+        let inside = declared("get_session", "flask/ctx.py", 5);
+        let outside = declared("make_session", "examples/tutorial/app.py", 5);
+        for entity in [
+            &module("flask", "flask/__init__.py"),
+            &module("sessions", "flask/sessions.py"),
+            &module("ctx", "flask/ctx.py"),
+            &module("app", "examples/tutorial/app.py"),
+            &base,
+            &inside,
+            &outside,
+        ] {
+            store.upsert_entity(entity).unwrap();
+        }
+        for caller in [&inside, &outside] {
+            store
+                .upsert_relation(&kin_model::Relation {
+                    id: kin_model::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(caller.id),
+                    dst: GraphNodeId::Entity(base.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: vec![],
+                })
+                .unwrap();
+        }
+        let sessions = SessionRegistry::empty_for_test();
+        let asked = |scope: Option<&'static str>| {
+            let (store, sessions) = (&store, &sessions);
+            let id = base.id.to_string();
+            async move {
+                let mut args = HashMap::from([
+                    ("entity_ids".to_string(), serde_json::json!([id])),
+                    ("include_traffic".to_string(), serde_json::json!(false)),
+                ]);
+                if let Some(scope) = scope {
+                    args.insert("scope".to_string(), serde_json::json!(scope));
+                }
+                handle_impact_analysis(&args, store, sessions).await
+            }
+        };
+        let read = |result: ToolCallResult| -> serde_json::Value {
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            serde_json::from_str(text).unwrap()
+        };
+        let callers = |impact: &serde_json::Value| -> Vec<String> {
+            let mut names: Vec<String> = impact["affected_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let whole = read(asked(None).await.unwrap());
+        assert_eq!(callers(&whole), ["get_session", "make_session"], "{whole}");
+        assert!(whole.get(IMPACT_ROW_SCOPE_KEY).is_none(), "{whole}");
+
+        let scoped = read(asked(Some("flask")).await.unwrap());
+        assert_eq!(callers(&scoped), ["get_session"], "{scoped}");
+        assert_eq!(
+            scoped[IMPACT_ROW_SCOPE_KEY],
+            serde_json::json!({"module": "flask", "outside": 1}),
+            "{scoped}"
+        );
+        assert_eq!(scoped[IMPACT_ROW_TOTALS_KEY]["affected_callers"], 1);
+        for list in IMPACT_ENTITY_BUCKETS {
+            for row in scoped[list].as_array().into_iter().flatten() {
+                assert_ne!(row["name"], "make_session", "{list}: {scoped}");
+            }
+        }
+
+        let refused = asked(Some("django")).await.unwrap_err().to_string();
+        assert!(
+            refused.contains("scope 'django' names no module path"),
+            "{refused}"
+        );
+    }
+
+    /// A text reader holding the bodies a fixture wrote, the way the
+    /// daemon's reader holds the repository's.
+    #[derive(Default)]
+    struct Bodies(HashMap<kin_model::EntityId, String>);
+
+    impl crate::handlers::external_symbols::SiteText for Bodies {
+        fn quote(
+            &self,
+            caller: &kin_model::Entity,
+            site: &kin_model::SourceSpan,
+        ) -> std::result::Result<String, &'static str> {
+            let body = self.0.get(&caller.id).ok_or("caller_text_not_held")?;
+            let start = caller.span.as_ref().map_or(0, |span| span.start_byte);
+            crate::handlers::external_symbols::quote_site(caller, site, body, start)
+        }
+    }
+
+    /// A caller row shows the call it makes, read from the caller's own
+    /// text at the line its edge records. The places that hold the changed
+    /// method or an override as a value, which no call edge names, are rows
+    /// of their own with the line that hands it on: each entity once, a
+    /// caller left to its caller row.
+    #[test]
+    fn impact_quotes_each_call_and_lists_the_places_that_hold_the_method_as_a_value() {
+        use kin_model::{EntityStore, GraphNodeId, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let mut bodies = Bodies::default();
+        // An entity whose text is `body`, starting on 0-based `line`.
+        let mut written = |name: &str, file: &str, line: u32, body: &str| {
+            let mut entity = entity_spanning(name, file, line, line + 1);
+            entity.kind = kin_model::EntityKind::Method;
+            entity.span.as_mut().unwrap().end_byte = body.len();
+            bodies.0.insert(entity.id, body.to_string());
+            store.upsert_entity(&entity).unwrap();
+            entity
+        };
+        let base = written(
+            "JSONProvider.dumps",
+            "src/json/provider.py",
+            10,
+            "def dumps(self, obj):\n    raise NotImplementedError\n",
+        );
+        let default = written(
+            "DefaultJSONProvider.dumps",
+            "src/json/provider.py",
+            40,
+            "def dumps(self, obj):\n    return json.dumps(obj)\n",
+        );
+        let caller = written(
+            "JSONProvider.response",
+            "src/json/provider.py",
+            20,
+            "def response(self, obj):\n    filter = self.dumps\n    return self.dumps(obj)\n",
+        );
+        let jinja = written(
+            "Flask.create_jinja_environment",
+            "src/app.py",
+            100,
+            "def create_jinja_environment(self):\n    rv = Environment()\n    \
+             rv.policies[\"json.dumps_function\"] = self.json.dumps\n    return rv\n",
+        );
+        let tag = written(
+            "TaggedJSONSerializer.register",
+            "src/json/tag.py",
+            7,
+            "def register(self):\n    self.default = DefaultJSONProvider.dumps\n",
+        );
+        // An edge whose site is `offset` lines into the entity that holds it.
+        let edge = |kind, src: &kin_model::Entity, dst: &kin_model::Entity, offset: u32| {
+            let span = src.span.as_ref().unwrap();
+            store
+                .upsert_relation(&kin_model::Relation {
+                    id: kin_model::RelationId::new(),
+                    kind,
+                    src: GraphNodeId::Entity(src.id),
+                    dst: GraphNodeId::Entity(dst.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: vec![kin_model::relation::RelationEvidence {
+                        source_span: Some(kin_model::SourceSpan {
+                            start_line: span.start_line + offset,
+                            end_line: span.start_line + offset,
+                            ..span.clone()
+                        }),
+                        ..Default::default()
+                    }],
+                })
+                .unwrap();
+        };
+        edge(RelationKind::Overrides, &default, &base, 0);
+        edge(RelationKind::Calls, &caller, &base, 2);
+        // The caller also holds it as a value: its caller row stands for it.
+        edge(RelationKind::References, &caller, &base, 1);
+        edge(RelationKind::References, &jinja, &base, 2);
+        edge(RelationKind::References, &tag, &default, 1);
+
+        let mut result = serde_json::json!({
+            "affected_callers": [{"id": caller.id.to_string(), "name": caller.name}],
+        });
+        attach_call_code(&store, &mut result, &[base.id], &bodies);
+        assert_eq!(
+            result["affected_callers"][0]["code"], "return self.dumps(obj)",
+            "{result}"
+        );
+
+        let listed = std::collections::HashSet::from([caller.id]);
+        let (rows, withheld) = value_use_rows(
+            &store,
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&default),
+            &listed,
+            &bodies,
+        );
+        assert_eq!(withheld, 0);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    row["name"].as_str().unwrap(),
+                    row["code"].as_str().unwrap(),
+                    row.get("uses").and_then(serde_json::Value::as_str),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "Flask.create_jinja_environment",
+                    "rv.policies[\"json.dumps_function\"] = self.json.dumps",
+                    None
+                ),
+                (
+                    "TaggedJSONSerializer.register",
+                    "self.default = DefaultJSONProvider.dumps",
+                    Some("DefaultJSONProvider.dumps")
+                ),
+            ],
+            "{rows:?}"
+        );
+        // A text that cannot be read leaves the rows without a quote.
+        let (rows, _) = value_use_rows(
+            &store,
+            std::slice::from_ref(&base),
+            &[],
+            &listed,
+            &crate::call_sites::NoSiteText,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("code").is_none(), "{rows:?}");
     }
 
     #[tokio::test]
@@ -2396,34 +3613,48 @@ mod tests {
         )
         .unwrap();
         let review_text = handle_semantic_review(&args, &store, &sessions).unwrap();
-        for (answer, pointer) in [
-            (impact, "/enrichment"),
-            (parse(review_json, "semantic_review"), "/impact/enrichment"),
-            (parse(review_text, "semantic_review"), "/enrichment"),
+        // The impact answer's own verdict is its direct section's. The
+        // unrelated entity's owed enrichment bounds the dependents section,
+        // under that section's verdict, and both states ride the answer's.
+        assert_eq!(impact["_kin"]["verdict"]["scope"], "direct", "{impact}");
+        assert_eq!(
+            impact["_kin"]["verdict"]["inputs"]["enrichment"],
+            "not_applicable"
+        );
+        assert_eq!(
+            impact["_kin"]["verdict"]["sections"]["dependents"]["state"],
+            "inconclusive"
+        );
+        assert!(
+            impact["_kin"]["verdict"]["sections"]["dependents"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .contains("enrichment_incomplete"),
+            "{impact}"
+        );
+        for (answer, pointer, verdict) in [
+            (impact, "/enrichment", "/sections/dependents/verdict"),
+            (
+                parse(review_json, "semantic_review"),
+                "/impact/enrichment",
+                "/_kin/verdict",
+            ),
+            (
+                parse(review_text, "semantic_review"),
+                "/impact/enrichment",
+                "/_kin/verdict",
+            ),
         ] {
             let observation = answer
                 .pointer(pointer)
                 .expect("the structured observation survives finalization");
             assert_eq!(observation["status"], "bounded", "{answer}");
-            if let Some(formatted) = answer
-                .get("message")
-                .or_else(|| answer.get("formatted"))
-                .and_then(serde_json::Value::as_str)
-            {
-                assert_eq!(formatted.matches("not settled:").count(), 1, "{formatted}");
-                assert!(
-                    formatted.find("--- Summary ---").unwrap()
-                        < formatted.find("not settled:").unwrap()
-                );
-                assert!(
-                    formatted.contains("unrelated_pending (path: src/unrelated.rs)"),
-                    "{formatted}"
-                );
-                assert!(
-                    !formatted.contains(&unrelated.id.to_string()),
-                    "{formatted}"
-                );
+            if let Some(message) = answer.get("message").and_then(serde_json::Value::as_str) {
+                assert!(message.starts_with("Semantic review:"), "{message}");
+                assert!(message.contains("coverage limits"), "{message}");
+                assert!(!message.contains("src/unrelated.rs"), "{message}");
             }
+            assert!(answer.get("formatted").is_none());
             assert_eq!(observation["total_pending_entities"], 1);
             assert_eq!(
                 observation["pending_entities"][0]["entity_id"],
@@ -2436,15 +3667,10 @@ mod tests {
             assert!(observation["pending_entities"][0]["projection"]
                 .get("line")
                 .is_none());
-            assert_eq!(
-                answer["_kin"]["verdict"]["state"], "inconclusive",
-                "{answer}"
-            );
-            assert_eq!(
-                answer["_kin"]["verdict"]["inputs"]["enrichment"],
-                "inconclusive"
-            );
-            assert!(answer["_kin"]["verdict"]["limiting_factor"]
+            let verdict = answer.pointer(verdict).expect("a verdict");
+            assert_eq!(verdict["state"], "inconclusive", "{answer}");
+            assert_eq!(verdict["inputs"]["enrichment"], "inconclusive");
+            assert!(verdict["limiting_factor"]
                 .as_str()
                 .unwrap()
                 .contains("enrichment_incomplete"));

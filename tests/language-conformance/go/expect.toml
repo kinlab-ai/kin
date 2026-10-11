@@ -1,0 +1,183 @@
+# Language conformance fixture: Go. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "go"
+
+[sources]
+module = "ledger/ledger.go"
+helper = "helper/helper.go"
+test = "ledger/ledger_test.go"
+forms = "forms/forms.go"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "pass"
+expect = [
+  "Function clamp",
+  "Function Total",
+  "Class Account",
+  "Field Account.balance",
+  "Method Account.Deposit",
+  "Method Account.validate",
+  "helper/helper.go: Function Scale",
+]
+
+[module_name]
+status = "pass"
+name = "ledger"
+
+[module_contains]
+status = "pass"
+top_level = ["clamp", "Total", "Account"]
+
+[declaration_extent]
+status = "pass"
+starts = { Total = "// Total sums", Account = "// Account is", "Account.Deposit" = "// Deposit adds" }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "partial"
+gaps = ["admitted"]
+enclosing = "Total"
+name = "double"
+
+[call_same_file]
+status = "pass"
+from = "Total"
+to = "clamp"
+
+[call_receiver]
+status = "pass"
+from = "Account.Deposit"
+to = "Account.validate"
+
+[imports]
+status = "pass"
+module_path = "example.com/shop/helper"
+
+[tests_detected]
+status = "pass"
+name = "TestTotal"
+runner = "go"
+
+[refuse_unparseable]
+status = "pass"
+find = "func clamp(value int) int {"
+replace = "func clamp(value int int {"
+line = 5
+
+[placement_three_forms]
+status = "pass"
+entity = "Account.validate"
+
+[create_remove_spacing]
+status = "pass"
+anchor = "clamp"
+code = '''
+func clampAll(values []int) []int {
+	return values
+}'''
+entity = "clampAll"
+documented = "Total"
+doc = "// Total sums the values"
+
+[form_generator]
+status = "pass"
+expect = ["Function CountUp"]
+
+[form_async]
+status = "n/a"
+reason = "Go has no async functions; a goroutine runs an ordinary one."
+
+[form_bound_lambda]
+status = "pass"
+expect = ["Function|StaticVar|Constant Square"]
+
+[form_default_export]
+status = "n/a"
+reason = "Go has no default export."
+
+[form_overload]
+status = "n/a"
+reason = "Go has no overloads."
+
+[form_nested_type]
+status = "n/a"
+reason = "Go declares no type inside a type."
+
+[form_decorated]
+status = "n/a"
+reason = "Go has no decorators or annotations; a struct tag is field metadata."
+
+[form_field]
+status = "pass"
+expect = ["Field Point.X", "Field Point.Y"]
+
+[body_edit_keeps_entities]
+status = "pass"
+entity = "Total"
+find = "\tresult := 0\n"
+replace = "\tresult := 0\n\tvar stats struct{ count int }\n\tstats.count = len(values)\n"
+
+[route_source]
+status = "pass"
+entity = "Total"
+starts = "// Total sums"
+
+[route_locate]
+status = "pass"
+query = "Total"
+entity = "Total"
+
+[route_refs]
+status = "pass"
+entity = "clamp"
+caller = "Total"
+
+[route_impact]
+status = "pass"
+in = "helper"
+entity = "Scale"
+affected = "Total"
+
+[route_context]
+status = "pass"
+entity = "Account"
+mentions = ["Account.Deposit", "Account.validate"]
+
+[route_update]
+status = "pass"
+entity = "clamp"
+find = "0"
+replace = "1"
+
+[route_patch]
+status = "pass"
+entity = "Account.validate"
+old_text = "> 0"
+new_text = ">= 0"
+
+[route_body_edit]
+status = "pass"
+entity = "Total"
+find = "\tresult := 0\n"
+replace = "\tresult := 0\n\tvar stats struct{ count int }\n\tstats.count = len(values)\n"
+
+[route_create_sibling]
+status = "pass"
+anchor = "clamp"
+code = "func clampAll(values []int) []int {\n\treturn values\n}"
+entity = "clampAll"
+
+[route_remove]
+status = "pass"
+entity = "clamp"
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

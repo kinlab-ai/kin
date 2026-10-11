@@ -12,10 +12,13 @@ operational / safety / correctness variables live in `env_registry.rs`; this
 file only covers the auto-extractable tuning knobs.
 
 Run from anywhere:  python3 scripts/gen_env_registry.py
+Check without writing:  python3 scripts/gen_env_registry.py --check
 """
 
+import argparse
 import os
 import re
+import sys
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +40,31 @@ BOUND_KNOBS = {
     "KIN_LOCATE_PHASE_SOURCE_TEXT_SECS",
     "KIN_LOCATE_PHASE_SCORING_SECS",
 }
+# Retrieval-arm knobs read through the typed helpers but registered by hand
+# with a real description in env_registry.rs, so the generator must not emit a
+# second, auto-described entry for them.
+HAND_CURATED = {
+    "KIN_LOCATE_SCORER_THRESHOLD",
+    "KIN_LOCATE_SCORER_TOP_K",
+    "KIN_LOCATE_CARD_LIMIT",
+    "KIN_LOCATE_ENTITY_FIRST",
+    "KIN_LOCATE_CARD_EXPAND_FROM",
+    "KIN_LOCATE_CARD_EXPAND_PER_HIT",
+    "KIN_LOCATE_CARD_POOL",
+    "KIN_LOCATE_CARD_NEIGHBOURS",
+}
+# Every knob env_registry.rs already declares by hand. A knob registered there
+# with a real description must not also get an auto-described entry here, and
+# reading the list from the source keeps a newly hand-registered knob from
+# being emitted twice when nobody remembers to add it to HAND_CURATED.
+HAND_REGISTRY = os.path.join(CRATES, "kin-core", "src", "env_registry.rs")
+
+
+def hand_registered():
+    with open(HAND_REGISTRY, encoding="utf-8") as fh:
+        return set(re.findall(r'EnvVarSpec \{ name: "(KIN_[A-Z0-9_]+)"', fh.read()))
+
+
 KIND_MAP = {
     "f32": "NonNegF32",
     "usize": "Usize",
@@ -127,10 +155,13 @@ def kind_from_fn(fn):
 
 
 def walk_rs():
-    for base, _dirs, files in os.walk(CRATES):
+    # Sorted, so the first read site that names a knob's default is the same
+    # on every filesystem and the check below grades the same output anywhere.
+    for base, dirs, files in os.walk(CRATES):
+        dirs.sort()
         if os.sep + "tests" + os.sep in base + os.sep:
             continue
-        for name in files:
+        for name in sorted(files):
             if name.endswith(".rs") and not name.endswith("_test.rs"):
                 yield os.path.join(base, name)
 
@@ -197,15 +228,17 @@ def rs_str(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def main():
+def render():
+    """The registry source and its rows, from the read sites as they are now."""
     catalog = build_catalog()
+    by_hand = hand_registered()
     rows = []
     for name in sorted(catalog):
         e = catalog[name]
         if not name.startswith(("KIN_LOCATE_", "KIN_RANK_", "KIN_SEMLOC_")):
             continue
-        if name in BOUND_KNOBS:
-            continue  # bound knobs are hand-curated in env_registry.rs
+        if name in BOUND_KNOBS or name in HAND_CURATED or name in by_hand:
+            continue  # hand-curated in env_registry.rs
         if not e["kind"]:
             continue  # direct-read vars are hand-curated in env_registry.rs
         kind = KIND_MAP.get(e["kind"])
@@ -235,11 +268,50 @@ def main():
         )
     out.append("];")
     out.append("")
+    return "\n".join(out) + "\n", rows
+
+
+def knob_names(text):
+    return set(re.findall(r'EnvVarSpec \{ name: "(KIN_[A-Z0-9_]+)"', text))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 when the committed registry differs from what the read sites produce",
+    )
+    args = parser.parse_args(argv)
+    text, rows = render()
+    relative = os.path.relpath(OUT, ROOT)
+    if args.check:
+        try:
+            with open(OUT, encoding="utf-8") as fh:
+                committed = fh.read()
+        except OSError as error:
+            print(f"{relative} cannot be read: {error}", file=sys.stderr)
+            return 1
+        if committed == text:
+            print(f"{relative} is current: {len(rows)} knobs")
+            return 0
+        added = sorted(knob_names(text) - knob_names(committed))
+        removed = sorted(knob_names(committed) - knob_names(text))
+        print(f"{relative} is stale against the knob read sites.", file=sys.stderr)
+        for name in added:
+            print(f"  missing: {name}", file=sys.stderr)
+        for name in removed:
+            print(f"  no longer read: {name}", file=sys.stderr)
+        if not added and not removed:
+            print("  a knob's kind, default or summary changed", file=sys.stderr)
+        print("Run python3 scripts/gen_env_registry.py and commit the result.", file=sys.stderr)
+        return 1
     with open(OUT, "w") as fh:
-        fh.write("\n".join(out) + "\n")
-    print(f"wrote {os.path.relpath(OUT, ROOT)} with {len(rows)} knobs")
+        fh.write(text)
+    print(f"wrote {relative} with {len(rows)} knobs")
     print("kinds:", dict(Counter(r[1] for r in rows)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

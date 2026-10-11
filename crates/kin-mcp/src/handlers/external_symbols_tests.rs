@@ -656,6 +656,7 @@ fn trace_data_flow_reaches_an_external_call_as_a_leaf_step() {
     assert_eq!(external["relation_kind"], "Calls", "{external:#}");
     assert_eq!(external["parent_step"], 0, "{external:#}");
     assert!(external["entity_file"].is_null(), "{external:#}");
+    assert!(external["entity_module"].is_null(), "{external:#}");
     assert!(external["start_line"].is_null(), "{external:#}");
     assert_eq!(
         external["reference_lines"],

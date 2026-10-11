@@ -1,0 +1,190 @@
+# Language conformance fixture: C#. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "csharp"
+
+[sources]
+module = "src/Ledger.cs"
+helper = "src/Helper.cs"
+test = "tests/LedgerTests.cs"
+forms = "src/Forms.cs"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "partial"
+gaps = ["Field Shop.Account.balance", "unexpected Constant Shop.Account.balance"]
+note = "Fields are emitted as Constant; re-kinding them to field waits until member resolution learns the field kind, with the linker dialect work, since doing it first would cost these members their references."
+expect = [
+  "Module Shop",
+  "Class Shop.Ledger",
+  "Method Shop.Ledger.Clamp",
+  "Method Shop.Ledger.Total",
+  "Class Shop.Account",
+  "Field Shop.Account.balance",
+  "Method Shop.Account.Deposit",
+  "Method Shop.Account.Validate",
+  "src/Helper.cs: Method Shop.Util.Helper.Scale",
+]
+
+[module_name]
+status = "refused"
+reason = "The adapter mints no module entity."
+name = "Shop"
+
+[module_contains]
+status = "refused"
+reason = "The adapter mints no module entity."
+top_level = ["Shop.Ledger", "Shop.Account"]
+
+[declaration_extent]
+status = "pass"
+starts = { "Shop.Ledger.Total" = "/// <summary>Sum the values" }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "fail"
+gaps = ["accounted", "admitted"]
+enclosing = "Shop.Ledger.Total"
+name = "Double"
+
+[call_same_file]
+status = "pass"
+from = "Shop.Ledger.Total"
+to = "Shop.Ledger.Clamp"
+
+[call_receiver]
+status = "pass"
+from = "Shop.Account.Deposit"
+to = "Shop.Account.Validate"
+
+[imports]
+status = "pass"
+module_path = "Shop.Util"
+
+[tests_detected]
+status = "pass"
+name = "TestTotal"
+runner = "xunit"
+
+[refuse_unparseable]
+status = "pass"
+find = "static int Clamp(int value) => System.Math.Max(value, 0);"
+replace = "static int Clamp(int value => System.Math.Max(value, 0);"
+line = 7
+
+[placement_three_forms]
+status = "pass"
+entity = "Shop.Account.Validate"
+
+[create_remove_spacing]
+status = "pass"
+anchor = "Shop.Ledger.Clamp"
+code = "static int ClampTwice(int value) => Clamp(Clamp(value));"
+entity = "Shop.Ledger.ClampTwice"
+documented = "Shop.Ledger.Total"
+doc = "/// <summary>Sum the values"
+
+[form_generator]
+status = "pass"
+expect = ["Method Shop.Forms.CountUp"]
+
+[form_async]
+status = "pass"
+expect = ["Method Shop.Forms.FetchAsync"]
+
+[form_bound_lambda]
+status = "pass"
+expect = ["Field|Constant|StaticVar Shop.Forms.Square"]
+
+[form_default_export]
+status = "n/a"
+reason = "C# has no default export."
+
+[form_overload]
+status = "pass"
+expect = ["Method Shop.Forms.Parse"]
+
+[form_nested_type]
+status = "pass"
+expect = ["Class Shop.Forms.Inner", "Method Shop.Forms.Inner.Ping"]
+
+[form_decorated]
+status = "pass"
+expect = ["Method Shop.Forms.GetCount"]
+
+[form_field]
+status = "partial"
+note = "Fields are emitted as Constant; re-kinding them to field waits until member resolution learns the field kind, with the linker dialect work, since doing it first would cost these members their references."
+gaps = ["Field Shop.Forms.Label", "Field Shop.Forms.count"]
+expect = ["Field Shop.Forms.count", "Field Shop.Forms.Label"]
+
+[body_edit_keeps_entities]
+status = "pass"
+entity = "Shop.Ledger.Total"
+find = "        var result = 0;\n"
+replace = "        var result = 0;\n        var stats = new Stats();\n        stats.Count = values.Length;\n"
+
+[route_source]
+status = "pass"
+entity = "Shop.Ledger.Total"
+starts = "/// <summary>Sum the values"
+
+[route_locate]
+status = "pass"
+query = "Total"
+entity = "Shop.Ledger.Total"
+
+[route_refs]
+status = "pass"
+entity = "Shop.Ledger.Clamp"
+caller = "Shop.Ledger.Total"
+
+[route_impact]
+status = "pass"
+in = "helper"
+entity = "Shop.Util.Helper.Scale"
+affected = "Shop.Ledger.Total"
+
+[route_context]
+status = "pass"
+entity = "Shop.Account"
+mentions = ["Shop.Account.Deposit", "Shop.Account.Validate"]
+
+[route_update]
+status = "pass"
+entity = "Shop.Ledger.Clamp"
+find = "0"
+replace = "1"
+
+[route_patch]
+status = "pass"
+entity = "Shop.Account.Validate"
+old_text = "> 0"
+new_text = ">= 0"
+
+[route_body_edit]
+status = "pass"
+entity = "Shop.Ledger.Total"
+find = "        var result = 0;\n"
+replace = "        var result = 0;\n        var stats = new Stats();\n        stats.Count = values.Length;\n"
+
+[route_create_sibling]
+status = "refused"
+reason = "Nothing was written: entity lifecycle requires a top-level leaf function, or in TypeScript, JavaScript, Python, Go or Rust a method or a class."
+anchor = "Shop.Ledger.Clamp"
+code = "static int ClampTwice(int value) => Clamp(Clamp(value));"
+entity = "Shop.Ledger.ClampTwice"
+
+[route_remove]
+status = "refused"
+reason = "Nothing was written: entity lifecycle requires a top-level leaf function, or in TypeScript, JavaScript, Python, Go or Rust a method or a class."
+entity = "Shop.Ledger.Clamp"
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

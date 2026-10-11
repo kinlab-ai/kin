@@ -95,7 +95,7 @@ const runtimeFiles = [
 
 const readme = `# Kin ${version} (${target})
 
-Kin is a graph-native code repository for people and AI agents. It answers questions
+Kin is a graph-native code repository for AI agents and the people who build with them. It answers questions
 about a repository from a graph rather than from raw file search.
 
 This archive carries these runtime files:

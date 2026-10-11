@@ -189,16 +189,9 @@ impl SemanticReview {
         let in_range =
             |id: &SemanticChangeId| at_head.ancestry_contains(id) && !base_ancestry.contains(id);
         let mut review = Self::create_review_scoped(base, head, store, &at_head, in_range)?;
-        let removes_an_entity = review
-            .diff
-            .entity_changes
-            .iter()
-            .any(|change| matches!(change.kind, EntityChangeKind::Removed { .. }));
-        if removes_an_entity {
+        if Self::removes_an_entity(&review) {
             let at_base = GraphAtRef::materialize(store, base)?;
-            crate::shadow::overlay_removed_entity_impact_from_base(&mut review, &at_base)?;
-            review.risk = risk::assess_risk(&review.diff, &review.impact);
-            review.inline_comments = inline::collect_inline_comments(&review.diff, &review.impact);
+            Self::read_removals_at_base(&mut review, &at_base)?;
         }
         let entity_risk = risk::entity_risk_levels(&review.diff, &review.impact);
         Ok(RangeReview {
@@ -206,6 +199,32 @@ impl SemanticReview {
             changes_in_range,
             entity_risk,
         })
+    }
+
+    /// Whether the review removes an entity, so its impact needs the base side.
+    pub fn removes_an_entity(review: &Review) -> bool {
+        review
+            .diff
+            .entity_changes
+            .iter()
+            .any(|change| matches!(change.kind, EntityChangeKind::Removed { .. }))
+    }
+
+    /// Read what a removed entity's removal breaks where the entity still
+    /// existed, and assess the review again with it.
+    ///
+    /// Impact read at the head cannot see it: the entity and the relations
+    /// into it are gone there, so the callers and tests it leaves broken would
+    /// go unreported and the risk would read low. `at_base` is the state the
+    /// review reads "before" at.
+    pub fn read_removals_at_base<G: GraphStore>(
+        review: &mut Review,
+        at_base: &GraphAtRef<'_, G>,
+    ) -> Result<(), ReviewError> {
+        crate::shadow::overlay_removed_entity_impact_from_base(review, at_base)?;
+        review.risk = risk::assess_risk(&review.diff, &review.impact);
+        review.inline_comments = inline::collect_inline_comments(&review.diff, &review.impact);
+        Ok(())
     }
 
     /// Create a review from a pre-computed diff (useful when you already

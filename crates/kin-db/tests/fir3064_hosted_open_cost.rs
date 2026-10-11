@@ -221,6 +221,7 @@ fn publish(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     drop(lease);
     manager

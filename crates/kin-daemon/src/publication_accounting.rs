@@ -146,19 +146,13 @@ fn classified(
     )
 }
 
-fn requested(operations: Option<&Value>) -> Value {
-    let Some(operations) = operations else {
-        return json!({"status":"unavailable", "reason":"legacy publication does not retain requested target identities"});
-    };
-    let Ok(operations) = kin_mcp::session::parse_staged_operations(operations) else {
-        // An already-published historical request may use a retired syntax.
-        // Reporting cannot turn a valid publication into an unapplied failure.
-        return json!({"status":"unavailable", "reason":"historical request target syntax is not understood"});
-    };
-    let sample = operations
-        .iter()
-        .take(ID_SAMPLE_LIMIT)
-        .map(|operation| {
+/// The bound request has already passed admission. Tickets contribute only
+/// their semantic entity identity here, never refreshed source authority.
+fn requested_operation(operation: &Value) -> Option<Value> {
+    let verb = operation.get("verb")?.as_str()?;
+    let target = match kin_mcp::session::parse_staged_operations(&json!([operation])) {
+        Ok(mut operations) => {
+            let operation = operations.pop()?;
             use kin_mcp::McpMutationPayload as Payload;
             let target = match &operation.payload {
                 Some(Payload::EntitySourceBase(base)) => json!({"entity_id":base.entity_id}),
@@ -167,6 +161,9 @@ fn requested(operations: Option<&Value>) -> Value {
                 }
                 Some(Payload::EntityRemove(remove)) => {
                     json!({"entity_id":remove.source_base.entity_id})
+                }
+                Some(Payload::EntityContent(content)) => {
+                    json!({"entity_id":content.source_base.entity_id})
                 }
                 Some(Payload::EntityCreate(create)) => match create.anchor() {
                     Some((source_base, _)) => json!({"anchor_entity_id":source_base.entity_id}),
@@ -179,7 +176,7 @@ fn requested(operations: Option<&Value>) -> Value {
                 Some(Payload::Relation { from, to, kind }) => {
                     json!({"from_entity_id":from, "to_entity_id":to, "relationship_kind":kind})
                 }
-                None if kin_mcp::session::is_target_body_update(operation) => {
+                None if kin_mcp::session::is_target_body_update(&operation) => {
                     match uuid::Uuid::parse_str(&operation.target) {
                         Ok(id) => json!({"entity_id":id}),
                         Err(_) => json!({"identity_status":"not_recorded_in_request"}),
@@ -188,10 +185,55 @@ fn requested(operations: Option<&Value>) -> Value {
                 None => json!({"identity_status":"historical_payload"}),
                 Some(Payload::Blob(_)) => json!({"identity_status":"historical_payload"}),
             };
-            json!({"verb":operation.verb.chars().take(32).collect::<String>(), "target":target})
-        })
+            target
+        }
+        Err(_) => {
+            let payload = operation.get("payload")?.as_object()?;
+            if payload.len() != 1 {
+                return None;
+            }
+            let (kind, value) = payload.iter().next()?;
+            let (base, anchor) = match kind.as_str() {
+                "EntitySourceBase" => (value, false),
+                "EntitySourcePatch" | "EntityRemove" => (value.get("source_base")?, false),
+                "EntityCreate" => (value.get("source_base")?, true),
+                _ => return None,
+            };
+            if !kin_mcp::source_ticket::is_ticket(base) {
+                return None;
+            }
+            let ticket = kin_mcp::source_ticket::parse(base["ticket"].as_str()?).ok()?;
+            if anchor {
+                json!({"anchor_entity_id":ticket.entity_id})
+            } else {
+                json!({"entity_id":ticket.entity_id})
+            }
+        }
+    };
+    Some(json!({"verb":verb.chars().take(32).collect::<String>(), "target":target}))
+}
+
+fn requested(operations: Option<&Value>) -> Value {
+    let Some(operations) = operations else {
+        return json!({"status":"unavailable", "reason":"legacy publication does not retain requested target identities"});
+    };
+    let projected = operations.as_array().and_then(|operations| {
+        operations
+            .iter()
+            .map(requested_operation)
+            .collect::<Option<Vec<_>>>()
+    });
+    let Some(projected) = projected else {
+        // An already-published historical request may use a retired syntax.
+        // Reporting cannot turn a valid publication into an unapplied failure.
+        return json!({"status":"unavailable", "reason":"historical request target syntax is not understood"});
+    };
+    let count = projected.len();
+    let sample = projected
+        .into_iter()
+        .take(ID_SAMPLE_LIMIT)
         .collect::<Vec<_>>();
-    json!({"status":"verified_request", "operation_count":operations.len(), "sample_operations":sample, "omitted_operations":operations.len().saturating_sub(ID_SAMPLE_LIMIT)})
+    json!({"status":"verified_request", "operation_count":count, "sample_operations":sample, "omitted_operations":count.saturating_sub(ID_SAMPLE_LIMIT)})
 }
 
 /// `operations` is supplied only after the keyed request's complete hash agrees

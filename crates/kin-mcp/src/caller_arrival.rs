@@ -134,8 +134,8 @@ const EVIDENCE_ROW_CAP: usize = 10;
 /// read.
 pub const ARRIVAL_READING_SCOPE: &str = "this reading counts a call site as arrived when the \
      graph holds any call edge from it, including a call the linker bound to a same-named \
-     definition in the caller's own file, and it reads only the files that hold an import edge \
-     into the focal's file, so a caller that reaches the focal without one is not read";
+     definition in the caller's own module, and it reads only the modules that hold an import \
+     edge into the focal's module, so a caller that reaches the focal without one is not read";
 
 /// How completely this reading could account for the ways a caller reaches the
 /// focal.
@@ -237,6 +237,9 @@ pub enum CountSource {
     /// against the call edges its entities hold.
     #[default]
     ParseVersusEdges,
+    /// Test callers were excluded, but the remaining ownership cannot be
+    /// separated from the file-wide parse count using current ledgers.
+    RoleScopeUnmeasured,
 }
 
 /// A caller in the focal's family that no current ledger describes.
@@ -284,6 +287,12 @@ pub struct CallerArrival {
     /// that could call the focal, and its block, with a row for each such
     /// site, is the `call_sites` block the answer serves.
     pub scan: Option<std::sync::Arc<crate::call_sites::FocalScan>>,
+    /// Unsettled sites in family files counted from site ledgers that the
+    /// store-wide reading kept and its `call_sites` block reports, listed by
+    /// caller and line or counted as value calls. Accounted for there, so they
+    /// do not make a file unaccounted here, and the same site is not reported
+    /// twice.
+    pub listed_in_call_sites: u64,
 }
 
 impl CallerArrival {
@@ -300,6 +309,7 @@ impl CallerArrival {
             owed_outside: Some(Vec::new()),
             owed_callers_cannot_name_focal: 0,
             scan: None,
+            listed_in_call_sites: 0,
         }
     }
 
@@ -370,8 +380,19 @@ impl CallerArrival {
             // named up to the cap when there are any.
             "owed_caller_count": self.owed_callers.len(),
         });
+        let role_scope_unmeasured = self
+            .unaccounted
+            .iter()
+            .filter(|file| file.count_source == CountSource::RoleScopeUnmeasured)
+            .count();
+        if role_scope_unmeasured > 0 {
+            block["role_scope_unmeasured_file_count"] = json!(role_scope_unmeasured);
+        }
         if self.owed_callers_cannot_name_focal > 0 {
             block["owed_callers_cannot_name_focal"] = json!(self.owed_callers_cannot_name_focal);
+        }
+        if self.listed_in_call_sites > 0 {
+            block["listed_in_call_sites"] = json!(self.listed_in_call_sites);
         }
         match &self.owed_outside {
             Some(files) if !files.is_empty() => {
@@ -401,7 +422,7 @@ impl CallerArrival {
         match self.state {
             ArrivalState::Accounted => None,
             ArrivalState::Unmeasured => Some(format!(
-                "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: this answer could not establish which files \
+                "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: this answer could not establish which modules \
                  can reach the focal ({}), so an empty reference list is not evidence that nothing \
                  calls it",
                 self.unmeasured_reason.as_deref().unwrap_or("no reason recorded")
@@ -424,8 +445,13 @@ impl CallerArrival {
                                 file.file,
                                 file.parsed_call_sites.unwrap_or(0)
                             ),
+                            (None, _) if file.count_source == CountSource::RoleScopeUnmeasured => format!(
+                                "{} (current caller ledgers do not establish a complete role-scoped \
+                             inventory, so the module-wide parse count cannot account for its non-test call sites)",
+                                file.file
+                            ),
                             (None, _) => format!(
-                                "{} (the store holds no parse-side call count for this file, so \
+                                "{} (the store holds no parse-side call count for this module, so \
                              its call sites could not be accounted for)",
                                 file.file
                             ),
@@ -446,11 +472,19 @@ impl CallerArrival {
                 } else {
                     String::new()
                 };
+                let unknown_arrivals = if self
+                    .unaccounted
+                    .iter()
+                    .any(|file| file.count_source == CountSource::RoleScopeUnmeasured)
+                {
+                    "hold call sites whose arrival this reading could not account for"
+                } else {
+                    "hold call sites the linker recorded no edge for"
+                };
                 Some(format!(
-                    "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: {} of {} file(s) that import the \
-                     focal's file hold call sites the linker recorded no edge for, so a caller of \
-                     this focal may be among them and this list is a floor rather than the whole \
-                     set: {}{tail}",
+                    "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: {} of {} module(s) that import the \
+                     focal's module {unknown_arrivals}, so a caller of this focal may be among them \
+                     and this list is a floor rather than the whole set: {}{tail}",
                     self.unaccounted.len(),
                     self.family_files,
                     named.join(", ")
@@ -571,6 +605,11 @@ struct LedgerCount {
     settled: u64,
     /// Of those, the unsettled sites that cannot be a call to the focal.
     ruled_out: u64,
+    /// Of those, the unsettled sites a store-wide reading of the focal kept,
+    /// which its `call_sites` block lists by caller and line or counts as
+    /// value calls. They are accounted for there, so they are not a shortfall
+    /// here.
+    listed: u64,
     /// The rest, by the state each reads as.
     unsettled: std::collections::BTreeMap<&'static str, u64>,
 }
@@ -600,6 +639,8 @@ fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
     entities: &[Entity],
     could_name: &dyn Fn(&Entity) -> bool,
     could_call: &dyn Fn(&Entity, &kin_model::CallSite) -> bool,
+    listed_elsewhere: bool,
+    complete_role_inventory: bool,
     tally: &mut kin_model::CallSiteTally,
     owed: &mut Vec<OwedCaller>,
     cannot_name: &mut u64,
@@ -635,6 +676,8 @@ fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
                     let kind = reading.site_kind(site);
                     if kind.is_settled() {
                         count.settled += 1;
+                    } else if could_call(entity, site) && listed_elsewhere {
+                        count.listed += 1;
                     } else if could_call(entity, site) {
                         *count.unsettled.entry(kind.wire()).or_insert(0) += 1;
                     } else {
@@ -657,7 +700,7 @@ fn ledger_count<F: kin_model::CallSiteFacts + ?Sized>(
             }
         }
     }
-    (!owed_here && ledgered > 0).then_some(count)
+    (!owed_here && (ledgered > 0 || complete_role_inventory)).then_some(count)
 }
 
 /// What one file's resolved side came to, or why it could not be taken.
@@ -842,12 +885,14 @@ pub fn observe_file_call_sites<G: GraphStore>(
     file: &FilePathId,
 ) -> Result<Option<UnaccountedFile>, String> {
     let Some((entities, parsed)) = file_entities(store, file) else {
-        return Err("the entity index could not be read for the focal's own file".to_string());
+        return Err("the entity index could not be read for the focal's own module".to_string());
     };
     let (sites, spanless) = match resolved_call_sites(store, file, &entities) {
         ResolvedSites::Counted { sites, spanless } => (sites, spanless),
         ResolvedSites::Unreadable => {
-            return Err("the relation index could not be read for the focal's own file".to_string())
+            return Err(
+                "the relation index could not be read for the focal's own module".to_string(),
+            )
         }
     };
     // The same three branches [`file_shortfall`] states, on the focal's own file.
@@ -904,7 +949,28 @@ pub fn observe_caller_arrival_with<G: GraphStore>(
     focal: &Entity,
     scan: Option<std::sync::Arc<crate::call_sites::FocalScan>>,
 ) -> CallerArrival {
-    let mut arrival = observe_family(store, focal, scan.as_deref());
+    observe_caller_arrival_with_scope(store, focal, scan, true)
+}
+
+/// [`observe_caller_arrival_with`] restricted to the requested caller roles.
+/// Import discovery remains all-role because an importer can share its file
+/// with callers of other roles. File-wide fallback counts never certify a
+/// subset from which test callers were removed.
+pub fn observe_caller_arrival_with_scope<G: GraphStore>(
+    store: &G,
+    focal: &Entity,
+    scan: Option<std::sync::Arc<crate::call_sites::FocalScan>>,
+    include_tests: bool,
+) -> CallerArrival {
+    if scan
+        .as_ref()
+        .is_some_and(|scan| scan.include_tests != include_tests)
+    {
+        return CallerArrival::unmeasured(
+            "the caller scan and arrival reading select different caller roles",
+        );
+    }
+    let mut arrival = observe_family(store, focal, scan.as_deref(), include_tests);
     arrival.scan = scan;
     arrival
 }
@@ -913,18 +979,19 @@ fn observe_family<G: GraphStore>(
     store: &G,
     focal: &Entity,
     scan: Option<&crate::call_sites::FocalScan>,
+    include_tests: bool,
 ) -> CallerArrival {
     let names = kin_model::focal_call_names(focal);
     let could_call = |entity: &Entity, site: &kin_model::CallSite| {
         scan.is_none_or(|scan| scan.keeps(entity.id, site))
     };
     let Some(focal_file) = focal.file_origin.clone() else {
-        return CallerArrival::unmeasured("the focal entity carries no file of origin");
+        return CallerArrival::unmeasured("the focal entity carries no module of origin");
     };
 
     let Some((focal_file_entities, _)) = file_entities(store, &focal_file) else {
         return CallerArrival::unmeasured(
-            "the entity index could not be read for the focal's file",
+            "the entity index could not be read for the focal's module",
         );
     };
     let focal_owned: HashSet<EntityId> =
@@ -951,7 +1018,7 @@ fn observe_family<G: GraphStore>(
     for entity in &focal_file_entities {
         let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
             return CallerArrival::unmeasured(
-                "the relation index could not be read for the focal's file",
+                "the relation index could not be read for the focal's module",
             );
         };
         for relation in relations {
@@ -1015,17 +1082,19 @@ fn observe_family<G: GraphStore>(
                 owed_callers: Vec::new(),
                 call_sites: Some(kin_model::CallSiteTally::default()),
                 owed_callers_cannot_name_focal: 0,
-                owed_outside: crate::call_sites::owed_outside(
+                owed_outside: crate::call_sites::owed_outside_scoped(
                     store,
                     focal.language,
                     &std::collections::HashSet::from([focal_file.0.clone()]),
                     &names,
+                    include_tests,
                 ),
                 scan: None,
+                listed_in_call_sites: 0,
             };
         }
         return CallerArrival::unmeasured(
-            "this language links no imports across files in this graph, so the set of files that \
+            "this language links no imports between modules in this graph, so the set of modules that \
              can reach the focal could not be established",
         );
     }
@@ -1038,7 +1107,7 @@ fn observe_family<G: GraphStore>(
     // declines instead: it is the honest word for a set that was not examined.
     if family_files.len() > FAMILY_FILE_CAP {
         return CallerArrival::unmeasured(format!(
-            "{} files import the focal's file, above the {FAMILY_FILE_CAP} this reading examines, \
+            "{} modules import the focal's module, above the {FAMILY_FILE_CAP} this reading examines, \
              so their call sites were not accounted for",
             family_files.len()
         ));
@@ -1056,12 +1125,27 @@ fn observe_family<G: GraphStore>(
     let mut owed_callers_cannot_name_focal = 0u64;
     let could_name = |entity: &Entity| crate::call_sites::could_name_focal(entity, &names);
     let mut files_from_site_ledgers = 0usize;
+    let mut listed_in_call_sites = 0u64;
     for file in &family_files {
         let Some((entities, parsed)) = file_entities(store, file) else {
             return CallerArrival::unmeasured(
-                "the entity index could not be read for a file in the focal's family",
+                "the entity index could not be read for a module in the focal's family",
             );
         };
+        let tests_excluded = !include_tests
+            && entities
+                .iter()
+                .any(|entity| !crate::call_sites::caller_in_scope(entity, false));
+        // File parse counts have no role partition. Before a filtered ledger
+        // count can settle this file, prove every expression has a current
+        // owner, including excluded callers. Unowned or stale regions remain
+        // unknown rather than being attributed to tests by subtraction.
+        let complete_role_inventory =
+            tests_excluded && crate::call_sites::file_attributes_every_call(store, &facts, &file.0);
+        let entities: Vec<Entity> = entities
+            .into_iter()
+            .filter(|entity| crate::call_sites::caller_in_scope(entity, include_tests))
+            .collect();
         let owed_before = owed_callers.len();
         if let Some(count) = ledger_count(
             &facts,
@@ -1069,12 +1153,17 @@ fn observe_family<G: GraphStore>(
             &entities,
             &could_name,
             &could_call,
+            scan.is_some(),
+            complete_role_inventory,
             &mut tally,
             &mut owed_callers,
             &mut owed_callers_cannot_name_focal,
-        ) {
+        )
+        .filter(|_| !tests_excluded || complete_role_inventory)
+        {
             family_measured += 1;
             files_from_site_ledgers += 1;
+            listed_in_call_sites += count.listed;
             let unsettled: u64 = count.unsettled.values().sum();
             if unsettled > 0 {
                 unaccounted.push(UnaccountedFile {
@@ -1093,6 +1182,23 @@ fn observe_family<G: GraphStore>(
             continue;
         }
         let owed_here = (owed_callers.len() - owed_before) as u64;
+        if tests_excluded {
+            let resolved_call_edges =
+                match resolved_call_sites(store, file, &entities) {
+                    ResolvedSites::Counted { sites, spanless } => sites + spanless,
+                    ResolvedSites::Unreadable => return CallerArrival::unmeasured(
+                        "the relation index could not be read for a module in the focal's family",
+                    ),
+                };
+            unaccounted.push(UnaccountedFile {
+                file: file.0.clone(),
+                resolved_call_edges,
+                count_source: CountSource::RoleScopeUnmeasured,
+                owed_callers: owed_here,
+                ..UnaccountedFile::default()
+            });
+            continue;
+        }
         if parsed.is_some() {
             family_measured += 1;
         }
@@ -1100,7 +1206,7 @@ fn observe_family<G: GraphStore>(
             ResolvedSites::Counted { sites, spanless } => (sites, spanless),
             ResolvedSites::Unreadable => {
                 return CallerArrival::unmeasured(
-                    "the relation index could not be read for a file in the focal's family",
+                    "the relation index could not be read for a module in the focal's family",
                 )
             }
         };
@@ -1156,7 +1262,7 @@ fn observe_family<G: GraphStore>(
         owed_callers,
         call_sites: Some(tally),
         owed_callers_cannot_name_focal,
-        owed_outside: crate::call_sites::owed_outside(
+        owed_outside: crate::call_sites::owed_outside_scoped(
             store,
             focal.language,
             &family_files
@@ -1165,8 +1271,10 @@ fn observe_family<G: GraphStore>(
                 .chain(std::iter::once(focal_file.0.clone()))
                 .collect(),
             &names,
+            include_tests,
         ),
         scan: None,
+        listed_in_call_sites,
     }
 }
 
@@ -1203,6 +1311,13 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
                                         format!("{path} ({missing} unsettled, exact)")
                                     }
                                     Some(missing) => format!("{path} ({missing} unaccounted)"),
+                                    None if file
+                                        .get("count_source")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("role_scope_unmeasured") =>
+                                    {
+                                        format!("{path} (role-scoped call inventory unmeasured)")
+                                    }
                                     None => format!("{path} (no parse-side count in store)"),
                                 },
                             )
@@ -1229,11 +1344,28 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
             } else {
                 String::new()
             };
+            let role_scope_unmeasured = block
+                .get("role_scope_unmeasured_file_count")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0)
+                || block
+                    .get("unaccounted_files")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|files| {
+                        files.iter().any(|file| {
+                            file.get("count_source").and_then(serde_json::Value::as_str)
+                                == Some("role_scope_unmeasured")
+                        })
+                    });
+            let unknown_arrivals = if role_scope_unmeasured {
+                "hold call sites whose arrival this reading could not account for"
+            } else {
+                "hold call sites the linker recorded no edge for"
+            };
             Some(format!(
-                "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: of the {family} file(s) that import the \
-                 focal's file, {unaccounted} hold call sites the linker recorded no edge for, so a \
-                 caller of this focal may be among them and an empty reference list here is a \
-                 floor rather than proof of disuse: {}{tail}",
+                "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: of the {family} module(s) that import the \
+                 focal's module, {unaccounted} {unknown_arrivals}, so a caller of this focal may be \
+                 among them and an empty reference list here is a floor rather than proof of disuse: {}{tail}",
                 files.join(", ")
             ))
         }
@@ -1243,7 +1375,7 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("no reason recorded");
             Some(format!(
-                "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: this answer could not establish which files \
+                "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: this answer could not establish which modules \
                  can reach the focal ({reason}), so an empty reference list is not evidence that \
                  nothing calls it"
             ))
@@ -1294,7 +1426,7 @@ pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static
             return Some((
                 UNMEASURED_ARRIVAL_LIMITING_FACTOR,
                 format!(
-                    "the set of files that can reach it could not be established ({})",
+                    "the set of modules that can reach it could not be established ({})",
                     arrival
                         .unmeasured_reason
                         .as_deref()
@@ -1336,7 +1468,7 @@ pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static
                 return Some((
                     UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
                     format!(
-                        "{} of the {} file(s) that can reach it hold call sites the linker \
+                        "{} of the {} module(s) that can reach it hold call sites the linker \
                          recorded no edge for, so a caller may be among them: {}",
                         measured.len(),
                         arrival.family_files,
@@ -1348,7 +1480,7 @@ pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static
             return Some((
                 UNMEASURED_ARRIVAL_LIMITING_FACTOR,
                 format!(
-                    "the store holds no parse-side call count for {uncounted} of the {} file(s) \
+                    "the store holds no parse-side call count for {uncounted} of the {} module(s) \
                      that can reach it, so the calls made there could not be accounted for",
                     arrival.family_files
                 ),
@@ -1367,14 +1499,14 @@ pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static
             Some(missing) => Some((
                 UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
                 format!(
-                    "{missing} of the {} call sites the parser read in that same file became no \
+                    "{missing} of the {} call sites the parser read in that same module became no \
                      edge, so a caller sitting beside it may be among them",
                     row.parsed_call_sites.unwrap_or(0)
                 ),
             )),
             None => Some((
                 UNMEASURED_ARRIVAL_LIMITING_FACTOR,
-                "the store holds no parse-side call count for that file itself, so a call to it \
+                "the store holds no parse-side call count for that module itself, so a call to it \
                  from beside it could not be accounted for"
                     .to_string(),
             )),
@@ -1460,6 +1592,23 @@ pub fn observe_impact_arrival<G: GraphStore>(
     store: &G,
     entities_without_consumers: &[EntityId],
 ) -> serde_json::Value {
+    observe_impact_arrival_with(
+        store,
+        entities_without_consumers,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// [`observe_impact_arrival`] over `scans`, the store-wide reading of every
+/// caller that could call each changed entity, when the answer took one: the
+/// reading `find_references` takes its arrival over, so an impact answer and
+/// a reference answer about one focal read its family the same way (see
+/// [`observe_caller_arrival_with`]).
+pub fn observe_impact_arrival_with<G: GraphStore>(
+    store: &G,
+    entities_without_consumers: &[EntityId],
+    scans: &std::collections::HashMap<EntityId, std::sync::Arc<crate::call_sites::FocalScan>>,
+) -> serde_json::Value {
     let mut by_focal: std::collections::HashMap<
         (FilePathId, kin_model::LanguageId, String),
         CallerArrival,
@@ -1472,12 +1621,22 @@ pub fn observe_impact_arrival<G: GraphStore>(
     for id in entities_without_consumers {
         let (name, file, arrival) = match store.get_entity(id) {
             Ok(Some(entity)) => {
+                // Read over the caller roles its scan read: a scan that left
+                // test code out is a reading of the rest, never a mismatch.
+                let scan = scans.get(&entity.id).cloned();
+                let include_tests = scan.as_ref().is_none_or(|scan| scan.include_tests);
+                let observe = || {
+                    observe_caller_arrival_with_scope(store, &entity, scan.clone(), include_tests)
+                };
                 let arrival = match entity.file_origin.clone() {
+                    // A reading taken over a scan is the focal's own, so it is
+                    // never shared with another entity of the same name.
+                    Some(_) if scans.contains_key(&entity.id) => observe(),
                     Some(file) => by_focal
                         .entry((file, entity.language, entity.name.clone()))
-                        .or_insert_with(|| observe_caller_arrival(store, &entity))
+                        .or_insert_with(observe)
                         .clone(),
-                    None => observe_caller_arrival(store, &entity),
+                    None => observe(),
                 };
                 if let Some(files) = &arrival.owed_outside {
                     for file in files {
@@ -1499,7 +1658,7 @@ pub fn observe_impact_arrival<G: GraphStore>(
                 None,
                 None,
                 CallerArrival::unmeasured(
-                    "the changed entity is not in the graph, so the files that can reach it could \
+                    "the changed entity is not in the graph, so the modules that can reach it could \
                      not be established",
                 ),
             ),
@@ -1624,11 +1783,11 @@ pub fn arrival_certification_clause(tool: &str, payload: &serde_json::Value) -> 
     let read = match tool {
         "find_references" | "get_context_pack" => format!(
             "the {CALLER_ARRIVAL_KEY} reading found every call site accounted for in the {} \
-             file(s) that import the focal's file",
+             module(s) that import the focal's module",
             count("family_files")
         ),
         "impact_analysis" => format!(
-            "the {CALLER_ARRIVAL_KEY} reading found every call site accounted for in the files \
+            "the {CALLER_ARRIVAL_KEY} reading found every call site accounted for in the modules \
              that import each of the {} entities reported with no consumers",
             count("entities_examined")
         ),
@@ -1788,7 +1947,7 @@ pub fn impact_arrival_gaps(payload: &serde_json::Value) -> Vec<String> {
             }
         });
         gaps.push(format!(
-            "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: {} can be reached from files that hold call \
+            "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: {} can be reached from modules that hold call \
              sites the linker recorded no edge for, so a consumer may be among them and a zero \
              consumer count there is a floor rather than proof of disuse: {}",
             subject(unaccounted),
@@ -1805,7 +1964,7 @@ pub fn impact_arrival_gaps(payload: &serde_json::Value) -> Vec<String> {
                 .to_string()
         });
         gaps.push(format!(
-            "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: for {} the files that can reach {} could not \
+            "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: for {} the modules that can reach {} could not \
              be established, so a zero consumer count there is not evidence that nothing uses {}: \
              {}",
             subject(unmeasured),
@@ -2349,7 +2508,7 @@ mod tests {
         assert!(gap.starts_with(UNRESOLVED_ARRIVAL_LIMITING_FACTOR), "{gap}");
         assert!(
             gap.contains(&format!(
-                "of the {importers} file(s) that import the focal's file, {importers} hold"
+                "of the {importers} module(s) that import the focal's module, {importers} hold"
             )),
             "the clause counts every unaccounted file: {gap}"
         );
@@ -2469,6 +2628,7 @@ mod tests {
             owed_outside: Some(Vec::new()),
             owed_callers_cannot_name_focal: 0,
             scan: None,
+            listed_in_call_sites: 0,
         };
         vec![
             ("one shortfall file", build(vec![one.clone()])),
@@ -2999,7 +3159,7 @@ mod tests {
             .expect("a family file with no parse count cannot license a delete");
         assert_eq!(factor, UNMEASURED_ARRIVAL_LIMITING_FACTOR);
         assert!(
-            reason.contains("no parse-side call count for 1 of the 1 file(s)"),
+            reason.contains("no parse-side call count for 1 of the 1 module(s)"),
             "the reason states what is missing rather than naming a cause it cannot know: \
              {reason}"
         );
@@ -3037,7 +3197,7 @@ mod tests {
         );
         assert_eq!(factor, UNRESOLVED_ARRIVAL_LIMITING_FACTOR);
         assert!(
-            reason.contains("2 of the 2 call sites the parser read in that same file"),
+            reason.contains("2 of the 2 call sites the parser read in that same module"),
             "{reason}"
         );
     }
@@ -3052,7 +3212,7 @@ mod tests {
             absence_gap(&store, &focal).expect("an uncounted focal file cannot license a delete");
         assert_eq!(factor, UNMEASURED_ARRIVAL_LIMITING_FACTOR);
         assert!(
-            reason.contains("no parse-side call count for that file itself"),
+            reason.contains("no parse-side call count for that module itself"),
             "{reason}"
         );
     }
@@ -3245,7 +3405,7 @@ mod tests {
                 "{block}"
             );
             let gap = owed_outside_gap(&json!({ CALLER_ARRIVAL_KEY: block })).unwrap();
-            assert!(gap.contains("3 caller(s) in 1 file(s)"), "{gap}");
+            assert!(gap.contains("3 caller(s) in 1 module(s)"), "{gap}");
         }
     }
 
@@ -3344,11 +3504,16 @@ mod tests {
             "the rows do not repeat it: {impact}"
         );
         for limit in [
-            "a same-named definition in the caller's own file",
-            "an import edge into the focal's file",
+            "a same-named definition in the caller's own module",
+            "an import edge into the focal's module",
         ] {
             assert!(ARRIVAL_READING_SCOPE.contains(limit), "{limit}");
         }
+        assert_eq!(
+            crate::semantic_surface::diagnostic(ARRIVAL_READING_SCOPE),
+            ARRIVAL_READING_SCOPE,
+            "the scope reaches an agent as written"
+        );
     }
 
     /// A certified absence recites the reading and its scope only where the

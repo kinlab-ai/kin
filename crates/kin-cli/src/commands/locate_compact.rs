@@ -26,7 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::locate::{EmbeddingState, LocateEntity, LocateResult, SemanticCoverage};
+use super::locate::{
+    DegradationSeverity, EmbeddingState, LocateEntity, LocateResult, SemanticCoverage,
+};
 
 /// Which shape a locate surface serializes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,6 +118,16 @@ pub struct CompactEntity {
     /// package's first.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub collapsed_rows: usize,
+    /// The calibrated probability the candidate scorer gave this row, on a
+    /// retrieval arm that runs one. Absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer_probability: Option<f32>,
+    /// Carried from [`super::locate::LocateEntity::proven_callers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proven_callers: Option<u64>,
+    /// Carried from [`super::locate::LocateEntity::hops_from_root`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hops_from_root: Option<u64>,
 }
 
 /// The one-object answer to "how much of the semantic signal was behind this
@@ -146,21 +158,28 @@ pub struct CompactKinEnvelope {
     /// (`vector_index`, `cross_encoder`, ...). The full payload carries the
     /// reason, detail and remediation for each; this carries the fact, so a thin
     /// result is attributable at a glance and `--surface full` has the rest.
+    ///
+    /// Policy notes are not listed: a filter the caller chose or a limit every
+    /// query applies is not a capability that failed to run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
 }
 
 /// One degradation a query reported, reduced to the pair every verdict reader
-/// keys on.
+/// keys on, and its severity when it is only a note.
 ///
 /// `kin-mcp` names a degraded run `component:reason`, and that label is what its
-/// verdict, its absence gate and its `degraded_signals` read. The detail and
-/// remediation prose are the bulk of a full entry, so they stay on the full
-/// surface.
+/// verdict, its absence gate and its `degraded_signals` read. `severity` is
+/// what tells that reader a policy note from a real degradation, so it rides
+/// with the pair; it is omitted for a refusing entry, which reads refusing
+/// exactly as it did before the field existed. The detail and remediation
+/// prose are the bulk of a full entry, so they stay on the full surface.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct CompactDegradation {
     pub component: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "DegradationSeverity::is_refusing")]
+    pub severity: DegradationSeverity,
 }
 
 /// The projected surface.
@@ -225,6 +244,14 @@ pub struct CompactLocate {
     /// `_kin.degraded` instead, beside the envelope that surface has.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradations: Vec<CompactDegradation>,
+    /// The retrieval arm that produced this answer, when it is not the
+    /// default, so every answer a measurement reads names its arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_arm: Option<String>,
+    /// What the candidate scorer did, on an arm that runs one. Top level,
+    /// where `kin-mcp` reads it to lift into `_kin.verdict.scorer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<crate::commands::locate::scorer::ScorerReport>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -261,8 +288,15 @@ fn ranked_by_clause(state: EmbeddingState) -> &'static str {
         EmbeddingState::Unknown => {
             "lexical and graph signals; embedding coverage could not be read"
         }
+        EmbeddingState::NotUsed => NO_VECTORS_CLAUSE,
     }
 }
+
+/// How an answer that read no search vector was ranked. One clause for every
+/// such answer, whether an operator named the cards arm or the setup has no
+/// vectors to use, because in both the setup is what left vectors out and
+/// nothing is missing from the answer on their account.
+pub const NO_VECTORS_CLAUSE: &str = "entity cards and the graph; this setup uses no search vectors";
 
 /// Build the envelope from the coverage the query actually reported.
 ///
@@ -291,6 +325,7 @@ fn degraded_components(result: &LocateResult) -> Vec<String> {
     let mut components: Vec<String> = result
         .degradations
         .iter()
+        .filter(|d| d.severity().is_refusing())
         .map(|d| d.component.clone())
         .collect();
     components.sort();
@@ -328,6 +363,11 @@ fn project_entity(entity: &LocateEntity) -> CompactEntity {
         score: round_score(entity.score),
         matched: entity.match_kind.map(|kind| kind.as_str().to_string()),
         collapsed_rows: entity.collapsed_rows,
+        scorer_probability: entity
+            .scorer_probability
+            .map(|probability| (probability * 1000.0).round() / 1000.0),
+        proven_callers: entity.proven_callers,
+        hops_from_root: entity.hops_from_root,
     }
 }
 
@@ -339,10 +379,67 @@ fn project_common(result: &LocateResult) -> CompactLocate {
         total_ranked: result.total_ranked,
         next_cursor: result.next_cursor.clone(),
         all_fallback: result.all_fallback,
-        ranked_by: ranked_by_clause(observed_state(result)).to_string(),
+        ranked_by: ranked_by_for(result),
         kin: None,
         semantic_coverage: None,
         degradations: Vec::new(),
+        retrieval_arm: result.retrieval_arm.clone(),
+        scorer: result.scorer.clone(),
+    }
+}
+
+/// The ranked-by clause for this answer's own arm. An arm that reads no
+/// embedding says so whatever the store holds: the embedding state describes
+/// the store, and naming vector signals it never read would be a false account
+/// of how these rows were ranked.
+fn ranked_by_for(result: &LocateResult) -> String {
+    let signals = signals_ranked_by(result);
+    match scorer_clause(result) {
+        Some(clause) => format!("{signals}; {clause}"),
+        None => signals,
+    }
+}
+
+/// What a model that reordered the leading rows adds to the clause: which
+/// model, how many rows it read, and that its order is a judgment. Absent when
+/// no model scored, including when one was asked to and could not run.
+fn scorer_clause(result: &LocateResult) -> Option<String> {
+    let scorer = result.scorer.as_ref()?;
+    if scorer.unavailable.is_some() {
+        return None;
+    }
+    scorer.top_probability?;
+    let model = scorer.model.as_deref()?;
+    let model = model.rsplit(['/', '\\']).next().unwrap_or(model);
+    Some(format!(
+        "then a small model ({model}) reordered the first {} {} by relevance to the query, which \
+         is its judgment, not proof",
+        scorer.scored,
+        if scorer.scored == 1 { "row" } else { "rows" }
+    ))
+}
+
+/// The signals that ranked the candidates, before any scorer.
+fn signals_ranked_by(result: &LocateResult) -> String {
+    let arm = result
+        .retrieval_arm
+        .as_deref()
+        .and_then(|name| {
+            crate::retrieval_arm::RetrievalArm::parse(name, crate::retrieval_arm::DEFAULT_SCORER)
+                .ok()
+        })
+        .unwrap_or_default();
+    let vectors_left_out = result.degradations.iter().any(|entry| {
+        entry.component == "vector_index" && entry.reason == "query_producer_mismatch"
+    });
+    if arm.uses_embeddings() && vectors_left_out {
+        "lexical and graph signals only; the store's vectors were built by a different runtime \
+         than this query's and were left out"
+            .to_string()
+    } else if arm.uses_embeddings() {
+        ranked_by_clause(observed_state(result)).to_string()
+    } else {
+        NO_VECTORS_CLAUSE.to_string()
     }
 }
 
@@ -355,6 +452,7 @@ fn project_degradations(result: &LocateResult) -> Vec<CompactDegradation> {
         .map(|degradation| CompactDegradation {
             component: degradation.component.clone(),
             reason: degradation.reason.clone(),
+            severity: degradation.severity(),
         })
         .collect()
 }
@@ -432,6 +530,9 @@ mod tests {
             matched_queries: Vec::new(),
             collapsed_rows: 0,
             name_tier: None,
+            scorer_probability: None,
+            proven_callers: None,
+            hops_from_root: None,
         }
     }
 
@@ -711,6 +812,30 @@ mod tests {
         assert!(clean.get("degradations").is_none(), "{clean}");
     }
 
+    /// A policy note stays visible on the MCP projection and says it is a note,
+    /// so the verdict reader can tell it from a lost capability. The CLI
+    /// envelope's `degraded` list names only capabilities that did not run.
+    #[test]
+    fn policy_notes_keep_their_severity_on_the_compact_surface() {
+        let mut result = fixture(2, 2);
+        result.degradations.push(
+            crate::commands::locate::RetrievalPolicyNote::TestsWithheldByFilter
+                .degradation("48 test-role paths withheld", "pass include_tests: true"),
+        );
+
+        let mcp = serde_json::to_value(project_for_mcp(&result)).unwrap();
+        assert_eq!(
+            mcp["degradations"],
+            serde_json::json!([
+                {"component": "vector_index", "reason": "empty"},
+                {"component": "graph_role_filter", "reason": "tests_withheld", "severity": "note"},
+            ]),
+            "{mcp}"
+        );
+        let cli = serde_json::to_value(project(&result)).unwrap();
+        assert_eq!(cli["_kin"]["degraded"], serde_json::json!(["vector_index"]));
+    }
+
     /// Each state gets its own clause. A partial store and an unembedded one
     /// must not read the same, which is the confusion the demo run produced.
     #[test]
@@ -720,6 +845,7 @@ mod tests {
             EmbeddingState::Partial,
             EmbeddingState::Absent,
             EmbeddingState::Unknown,
+            EmbeddingState::NotUsed,
         ]
         .into_iter()
         .map(ranked_by_clause)
@@ -819,5 +945,85 @@ mod tests {
         assert_eq!(LocateSurface::Full.as_str(), "full");
         assert_eq!(LocateSurface::Compact.as_str(), "compact");
         assert_eq!(LocateSurface::default(), LocateSurface::Full);
+    }
+
+    /// Vectors the pipeline left out because the query was embedded by a
+    /// different runtime are not named as a ranking signal, whatever the
+    /// store's embedding state reads.
+    #[test]
+    fn left_out_vectors_are_not_named_as_a_ranking_signal() {
+        let mut result = LocateResult {
+            semantic_coverage: Some(SemanticCoverage {
+                supported: true,
+                indexed: 3,
+                total: 3,
+                pending: 0,
+                complete: true,
+                embedding_state: EmbeddingState::Present,
+                limited_by: Vec::new(),
+                read_at: None,
+                note: None,
+                graph_bodies: None,
+            }),
+            ..LocateResult::default()
+        };
+        assert!(project(&result).ranked_by.starts_with("vector"));
+        result.degradations.push(RetrievalDegradation {
+            component: "vector_index".to_string(),
+            reason: "query_producer_mismatch".to_string(),
+            detail: String::new(),
+            remediation: String::new(),
+        });
+        let ranked_by = project(&result).ranked_by;
+        assert!(
+            ranked_by.starts_with("lexical and graph signals only"),
+            "{ranked_by}"
+        );
+        assert!(ranked_by.contains("left out"), "{ranked_by}");
+    }
+
+    /// A model that reordered the rows is named in the clause as a judgment;
+    /// one that could not run, and the control, add nothing.
+    #[test]
+    fn the_ranked_by_clause_names_the_model_that_reordered_the_rows() {
+        use crate::commands::locate::scorer::ScorerReport;
+        let report =
+            |model: Option<&str>, top: Option<f32>, unavailable: Option<&str>| ScorerReport {
+                name: "decision-engine".to_string(),
+                scored: 40,
+                threshold: 0.5,
+                top_probability: top,
+                abstained: false,
+                unavailable: unavailable.map(str::to_string),
+                model: model.map(str::to_string),
+                model_revision: None,
+                device: None,
+                observed: None,
+            };
+        let mut result = LocateResult {
+            retrieval_arm: Some("cards+decision-engine".to_string()),
+            scorer: Some(report(Some("Qwen/Qwen3-Reranker-0.6B"), Some(0.9), None)),
+            ..LocateResult::default()
+        };
+        let ranked_by = project(&result).ranked_by;
+        assert!(
+            ranked_by.starts_with(NO_VECTORS_CLAUSE) || ranked_by.starts_with("entity cards"),
+            "{ranked_by}"
+        );
+        assert!(
+            ranked_by.contains("small model (Qwen3-Reranker-0.6B)"),
+            "{ranked_by}"
+        );
+        assert!(ranked_by.contains("first 40 rows") && ranked_by.contains("not proof"));
+        assert!(!ranked_by.contains('\n'));
+
+        result.scorer = Some(report(
+            Some("jaredpalmer/kev-0.8b"),
+            None,
+            Some("model_unsupported"),
+        ));
+        assert!(!project(&result).ranked_by.contains("small model"));
+        result.scorer = Some(report(None, None, None));
+        assert!(!project(&result).ranked_by.contains("small model"));
     }
 }

@@ -1115,8 +1115,6 @@ _kin_vfs_chpwd
 // ---------------------------------------------------------------------------
 
 pub struct WizardOptions {
-    /// Deprecated — Kin is always native mode now. Kept for CLI compat.
-    pub mode: Option<String>,
     pub shell: Option<String>,
     pub auto_daemon: bool,
     pub no_interactive: bool,
@@ -1130,6 +1128,10 @@ pub struct WizardOptions {
     /// there is nothing for a tool call to answer about. The skip is printed
     /// per client rather than silently dropping the section.
     pub skip_mcp_check: bool,
+    /// Install Kin's Claude Code prompt hook without asking. An interactive run
+    /// asks, recommending it; a scripted run writes into a person's agent
+    /// settings only when this says so.
+    pub prompt_hook: bool,
     /// Install the language servers Kin enriches with, without asking.
     ///
     /// Needed because the install is a network download into a shared prefix.
@@ -1146,7 +1148,7 @@ pub struct WizardOptions {
     /// When the embedding model is fetched: `later` (the recommendation) or
     /// `never`. The wizard never downloads it either way.
     pub embedding_model: Option<String>,
-    /// Where vectors are computed: `local` (the recommendation) or `remote`.
+    /// Optional embedding provider: `none` (the default), `built-in`, or `external`.
     ///
     /// `remote` collects no credentials. It prints the environment variables an
     /// OpenAI-compatible provider needs and the egress that choosing one means,
@@ -1164,6 +1166,12 @@ pub struct WizardOptions {
     pub tool_profile: Option<String>,
     /// Print the full record on a terminal instead of the short summary.
     pub verbose: bool,
+    /// Connect only these AI clients, by the ids `kin setup clients` lists.
+    /// Every other client is left exactly as it is, and the choice is
+    /// recorded, so a client that connects once a repository exists (Codex
+    /// CLI, Grok CLI) connects then only if it was chosen. `None` connects
+    /// every client setup detects, as before.
+    pub clients: Option<Vec<String>>,
 }
 
 /// First-run intent — what the user wants out of Kin. Each intent maps to a
@@ -1241,6 +1249,9 @@ struct SetupPlan {
     /// [`detect_ai_assistants`]). Empty unless `configure_mcp` is true.
     mcp_assistant_indices: Vec<usize>,
     inject_discovery_reminders: bool,
+    /// Whether to add Kin's prompt hook to Claude Code's user settings, so Kin
+    /// answers a code question before the model's first turn.
+    install_prompt_hook: bool,
     /// Whether to launch each configured client's own entry and call one real
     /// tool through it. False when `--skip-mcp-check` was passed or a person
     /// declined; the skip is printed with its reason either way.
@@ -1763,9 +1774,10 @@ fn kin_mcp_entry(target_id: &str) -> Result<serde_json::Value> {
 /// never called a Kin tool. Claude Code defers every tool schema behind its own
 /// tool search and the Grok CLI never sends schemas to its model at all, so a
 /// list's size costs them nothing per request; they keep the named
-/// `agent-default` belt, which also carries Kin's write tools. The routed
-/// profile carries none, because the approved command set has none; an eager
-/// client edits with its own file tools.
+/// `agent-default` belt. Both carry Kin's writes: the routed profile through
+/// its `mutate`, `transaction` and `exec` commands, the named one as tools.
+/// Measured on 2026-09-28, `agent-routed` is 1,765 bytes of `tools/list` and
+/// `agent-default` 14,619, of which 11,701 are what a client hands its model.
 pub(crate) fn setup_tool_profile(target_id: &str) -> &'static str {
     match target_id {
         "cursor"
@@ -2090,6 +2102,58 @@ struct AiAssistant {
     name: &'static str,
     detected: bool,
     install_hint: &'static str,
+}
+
+/// The id a person or a program names each client by, in
+/// `detect_ai_assistants()` order.
+const CLIENT_IDS: [&str; 8] = [
+    "claude-code",
+    "cursor",
+    "codex",
+    "gemini-cli",
+    "windsurf",
+    "antigravity",
+    "lm-studio",
+    "grok",
+];
+
+fn client_id(idx: usize) -> Option<&'static str> {
+    CLIENT_IDS.get(idx).copied()
+}
+
+/// The chosen client ids, normalized, or an error naming one Kin does not know.
+fn normalized_client_choice(chosen: &[String]) -> Result<Vec<String>> {
+    let chosen: Vec<String> = chosen
+        .iter()
+        .map(|id| id.trim().to_ascii_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if let Some(unknown) = chosen.iter().find(|id| !CLIENT_IDS.contains(&id.as_str())) {
+        anyhow::bail!(
+            "unknown AI client `{unknown}`; choose from {}",
+            CLIENT_IDS.join(", ")
+        );
+    }
+    Ok(chosen)
+}
+
+/// The detected clients with every client outside `chosen` treated as absent,
+/// so the plan neither configures it nor reminds anyone about it. `None`
+/// keeps every detected client.
+fn choose_assistants(
+    mut assistants: Vec<AiAssistant>,
+    chosen: Option<&[String]>,
+) -> Result<Vec<AiAssistant>> {
+    let Some(chosen) = chosen else {
+        return Ok(assistants);
+    };
+    let chosen = normalized_client_choice(chosen)?;
+    for (idx, assistant) in assistants.iter_mut().enumerate() {
+        if !client_id(idx).is_some_and(|id| chosen.iter().any(|c| c == id)) {
+            assistant.detected = false;
+        }
+    }
+    Ok(assistants)
 }
 
 // Assistant index constants — keep in sync with detect_ai_assistants() order.
@@ -2902,6 +2966,20 @@ rewrite this block for this client's Kin tool profile; edit outside it. -->";
 /// The last line of the block Kin owns.
 const DISCOVERY_BLOCK_END: &str = "<!-- /kin-managed:discovery -->";
 
+/// What every discovery block says about reading an answer: the same three
+/// plain verdicts the server's own instructions name, and what to do with each.
+///
+/// The verdict words are quoted rather than set in backticks, because a
+/// backticked lowercase word in this block is read as a tool it names.
+const VERDICT_STEP: &str =
+    "Every answer opens with `_kin.verdict` and `_kin.meaning`. \"complete\": use \
+it\nas is, without checking it again. \"complete except the sites listed below\": check a\n\
+site in left_to_check only if its reason could apply. Lookups of a name built at\n\
+run time, counted in `_kin.searched`, are a blind spot of every tool that reads\n\
+code, not a site to check. \"partial\": there may be more, and `_kin.meaning`\n\
+says why. Kin's complete answers were checked against every file Kin holds, so\n\
+re-reading source to confirm the listed rows only costs time.\n";
+
 /// The steps the block gives, worded for what a profile serves: the same
 /// procedure the server's own instructions carry, so an instruction file and
 /// the server never send an agent to different tools.
@@ -2911,7 +2989,7 @@ const DISCOVERY_BLOCK_END: &str = "<!-- /kin-managed:discovery -->";
 /// answer. The block keeps `kin graph source`, the spelling it was first
 /// written with, although `kin source` now runs in both places as well. A
 /// profile that can write gets the edit step, and a read-only profile never
-/// names a tool it does not serve. `describe`, `call`, `session` and `mutate`
+/// names a tool it does not serve. `describe`, `call` and `mutate`
 /// are named as the `kin` tool's commands, which is what the block teaches; in a
 /// shell `kin describe` and `kin call` answer the same, and the write commands
 /// are the tool's alone.
@@ -2922,61 +3000,63 @@ fn discovery_steps(profile: &str) -> String {
                 (
                     "every other Kin tool",
                     "3. To change code: `kin graph source` on the entity id for its source base,\n\
-                     then the `kin` tool's `session` command once and its `mutate` command on\n\
-                     that entity id\n",
+                     then the `kin` tool's `mutate` command on that entity id\n",
                 )
             } else {
                 (
                     "every other read-only Kin tool",
-                    "3. `kin graph source`: one entity's code, when `kin context` withheld its body\n",
+                    "3. `kin graph source`: one entity's code, when `kin context` left its body out\n",
                 )
             };
             format!(
                 "In a Kin repository, use Kin's one MCP tool, `kin`, instead of grep or file\n\
                  reads. Call it with a command and that command's args:\n\
                  \n\
-                 1. `kin locate` or `kin search`: find code by what it does, or by name\n\
+                 1. `kin locate`: find code by name, or by what it does\n\
                  2. `kin context`: an entity's exact code with its callers and callees; `kin refs`\n\
                  for every reference\n\
                  {third}\
                  \n\
                  The shell is for building and running tests.\n\
                  The `kin` tool's `describe` command lists {rest}, and its `call` command\n\
-                 runs any of them. Read `_kin.verdict` first; inconclusive means the counts\n\
-                 are a lower bound.\n"
+                 runs any of them.\n\
+                 \n\
+                 {VERDICT_STEP}"
             )
         }
         "agent-search" => {
             "In a Kin repository, use Kin's MCP tools instead of grep or file reads:\n\
              \n\
-             1. `semantic_locate`: find code by what it does\n\
-             2. `get_context_pack` and `trace_data_flow`: an entity's exact code with its\n\
-             neighbourhood, and its call chain\n\
-             3. `kin_tool_call` with tool `get_entity_source`: one entity's code, when the pack\n\
-             withheld its body\n\
+             1. `locate`: find code by name, or by what it does\n\
+             2. `context` and `trace`: an entity's exact code with its neighbourhood, and its\n\
+             call chain\n\
+             3. `kin_tool_call` with tool `source`: one entity's code, when `context` left its\n\
+             body out\n\
              \n\
              The shell is for building and running tests. `kin_tool_search` finds every other\n\
-             read-only Kin tool, and `kin_tool_call` runs it. Read `_kin.verdict` first;\n\
-             inconclusive means the counts are a lower bound.\n"
-                .to_string()
+             read-only Kin tool, and `kin_tool_call` runs it.\n\
+             \n"
+            .to_string()
+                + VERDICT_STEP
         }
         _ => {
             let third = if profile.ends_with("-query") {
-                "3. `get_entity_source`: one entity's code, when the pack withheld its body\n"
+                "3. `source`: one entity's code, when `context` left its body out\n"
             } else {
-                "3. To change code: `get_entity_source` on the entity id for its source base,\n\
-                 `kin_session_start` once, then `kin_mutate` that entity by id\n"
+                "3. To change code: `source` on the entity id for its source base, then\n\
+                 `mutate` that entity by id\n"
             };
             format!(
                 "In a Kin repository, use Kin's MCP tools instead of grep or file reads:\n\
                  \n\
-                 1. `semantic_locate` or `semantic_search`: find code by what it does, or by name\n\
-                 2. `get_context_pack` and `find_references`: an entity's exact code with its\n\
-                 neighbourhood, and every reference to it\n\
+                 1. `locate`: find code by name, or by what it does\n\
+                 2. `context` and `refs`: an entity's exact code with its neighbourhood, and every\n\
+                 reference to it\n\
                  {third}\
                  \n\
-                 The shell is for building and running tests. Read `_kin.verdict` first;\n\
-                 inconclusive means the counts are a lower bound.\n"
+                 The shell is for building and running tests.\n\
+                 \n\
+                 {VERDICT_STEP}"
             )
         }
     }
@@ -3171,7 +3251,7 @@ fn written_profile_line(choice: &ProfileChoice) -> String {
 /// `registered_clients`, and only true in the words of the tools that client
 /// holds, so the block is worded for its profile. Writing it for an
 /// unregistered client aims the agent at tools that are not wired, and naming
-/// `semantic_locate` to a client served one routed tool aims it at a tool that
+/// `locate` to a client served one routed tool aims it at a tool that
 /// is not listed.
 ///
 /// `home` is taken by argument rather than resolved here so this is exercisable
@@ -3448,6 +3528,82 @@ pub(crate) fn discovery_block_findings() -> Vec<DiscoveryBlockFinding> {
 }
 
 /// Record the blocks written, with their exact text, in the install ledger.
+/// Write Kin's prompt hook into Claude Code's user settings under `home`,
+/// beside every hook already there. Returns the settings path, what changed
+/// and the entry, for the install ledger. Settings that do not parse are left
+/// untouched and refused.
+fn install_claude_prompt_hook(
+    home: &Path,
+    launcher: &str,
+) -> Result<(
+    PathBuf,
+    crate::commands::setup_hooks::PromptHookWrite,
+    serde_json::Value,
+)> {
+    let path = crate::commands::setup_hooks::claude_settings_path(home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let lock = ConfigLock::acquire(&path)?;
+    let original = lock.original_bytes(&path)?;
+    let root = original
+        .as_deref()
+        .filter(|bytes| !bytes.iter().all(u8::is_ascii_whitespace))
+        .map(serde_json::from_slice::<serde_json::Value>)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "{} is not valid JSON, so Kin leaves it untouched",
+                path.display()
+            )
+        })?;
+    let command = crate::commands::setup_hooks::prompt_hook_command(launcher);
+    let (root, write) = crate::commands::setup_hooks::with_prompt_hook(root, &command)
+        .with_context(|| format!("Kin leaves {} untouched", path.display()))?;
+    if write != crate::commands::setup_hooks::PromptHookWrite::Unchanged {
+        let mut bytes = serde_json::to_vec_pretty(&root).context("serialize Claude settings")?;
+        bytes.push(b'\n');
+        lock.write_guarded(&path, &bytes, original.as_deref())?;
+    }
+    Ok((
+        path,
+        write,
+        crate::commands::setup_hooks::prompt_hook_entry(&command),
+    ))
+}
+
+/// Add Kin's prompt hook to Claude Code's user settings, say what changed,
+/// and record the entry in the install ledger.
+fn install_prompt_hook_for_claude() {
+    use crate::commands::setup_hooks::{PromptHookWrite, CLAUDE_TARGET};
+    use crate::commands::setup_ledger::{ledger_path, LedgerEntry, SetupLedger};
+    let installed = resolve_mcp_launcher()
+        .and_then(|launcher| install_claude_prompt_hook(&home_dir()?, &launcher.command));
+    match installed {
+        Ok((path, write, entry)) => {
+            let said = match write {
+                PromptHookWrite::Added => "added to",
+                PromptHookWrite::Replaced => "updated in",
+                PromptHookWrite::Unchanged => "already in",
+            };
+            say!(
+                "  {} `kin ask --hook claude` {said} {}; Kin answers a code question there \
+                 before the model's first turn.",
+                style("✓").green(),
+                path.display()
+            );
+            if let Ok(ledger) = ledger_path() {
+                let _ = SetupLedger::update(&ledger, |ledger| {
+                    ledger.record(LedgerEntry::prompt_hook(CLAUDE_TARGET, path, &entry));
+                    Ok(())
+                });
+            }
+        }
+        Err(error) => say!("  {} not installed: {error:#}", style("✗").red()),
+    }
+}
+
 fn record_discovery_reminders(written: &[WrittenReminder]) {
     use crate::commands::setup_ledger::{ledger_path, ArtifactKind, LedgerEntry, SetupLedger};
     let Ok(path) = ledger_path() else {
@@ -3509,6 +3665,37 @@ fn record_client_consent(kin_home: &Path, consent: bool) -> Result<()> {
     )
 }
 
+const CLIENT_CHOICE_KEY: &str = "chosen";
+
+/// Records which clients setup was asked to connect: the ids, or `all` when
+/// setup connected every client it detected.
+fn record_client_choice(kin_home: &Path, chosen: Option<&[String]>) -> Result<()> {
+    let value = match chosen {
+        Some(chosen) => normalized_client_choice(chosen)?.join(","),
+        None => "all".to_string(),
+    };
+    crate::commands::projection::record_setup_value(
+        kin_home,
+        CLIENT_CONSENT_TABLE,
+        CLIENT_CHOICE_KEY,
+        &value,
+    )
+}
+
+/// Whether the recorded choice includes the client at `idx`. No record, or
+/// `all`, includes every client.
+fn client_was_chosen(kin_home: &Path, idx: usize) -> bool {
+    let Some(recorded) = crate::commands::projection::recorded_setup_value(
+        kin_home,
+        CLIENT_CONSENT_TABLE,
+        CLIENT_CHOICE_KEY,
+    ) else {
+        return true;
+    };
+    recorded == "all"
+        || client_id(idx).is_some_and(|id| recorded.split(',').any(|chosen| chosen.trim() == id))
+}
+
 fn recorded_client_consent(kin_home: &Path) -> Option<bool> {
     match crate::commands::projection::recorded_setup_value(
         kin_home,
@@ -3564,6 +3751,9 @@ pub(crate) fn connect_waiting_clients(repo_root: &Path, quiet: bool) -> Vec<Clie
         let Some(assistant) = assistants.get(idx) else {
             continue;
         };
+        if !client_was_chosen(&kin_home, idx) {
+            continue;
+        }
         if !assistant.detected
             || mcp_config_path_for_index(idx).is_some_and(|path| has_kin_mcp_config(&path))
         {
@@ -3837,8 +4027,8 @@ fn install_shell_hook(shell_name: &str, allow_path: bool) -> Result<(PathBuf, St
     let shell_dir = kin_home.join("shell");
     let lib_dir = kin_home.join("lib");
 
-    fs::create_dir_all(&shell_dir).context("failed to create ~/.kin/shell/")?;
-    fs::create_dir_all(&lib_dir).context("failed to create ~/.kin/lib/")?;
+    kin_core::registry::create_kin_dir_all(&shell_dir).context("failed to create ~/.kin/shell/")?;
+    kin_core::registry::create_kin_dir_all(&lib_dir).context("failed to create ~/.kin/lib/")?;
 
     let hook_file = shell_dir.join(hook_filename(shell_name));
     fs::write(&hook_file, hook_content(shell_name))
@@ -4132,8 +4322,12 @@ fn plan_rc_update(
         // export anyway left the user's rc pointing at a directory this install
         // never created, which nobody reading that rc later can tell from an
         // install that went missing.
+        // Named per profile: a shell that reads two of them would otherwise
+        // print the same line twice.
         skipped.push(format!(
-            "  Skipped the PATH line: {} does not exist, and this install put nothing there",
+            "  Skipped the PATH line in {}: {} does not exist, and this install put nothing \
+             there",
+            rc_path.display(),
             bin_dir.display()
         ));
     } else {
@@ -4176,7 +4370,7 @@ pub(crate) fn reinstall_shell_hook() -> Result<PathBuf> {
 /// locally and the caller directs the user to reinstall.
 pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
     let lib_dir = kin_dir()?.join("lib");
-    fs::create_dir_all(&lib_dir).context("failed to create ~/.kin/lib/")?;
+    kin_core::registry::create_kin_dir_all(&lib_dir).context("failed to create ~/.kin/lib/")?;
     let dest = lib_dir.join(shim_filename());
 
     // `find_shim` only returns non-empty candidates, so a truncated shim is
@@ -4841,7 +5035,7 @@ fn ensure_workspace_mcp_git_excluded(repo_root: &Path) -> Result<Option<PathBuf>
 
 fn canonical_initialized_repo(path: &Path) -> Option<PathBuf> {
     let canonical = path.canonicalize().ok()?;
-    canonical.join(".kin").is_dir().then_some(canonical)
+    kin_core::layout::store_exists_for(&canonical).then_some(canonical)
 }
 
 fn allowed_static_mcp_target_paths(id: &str) -> Result<Vec<PathBuf>> {
@@ -5658,8 +5852,8 @@ fn maybe_inject_private_directory_stage(
             )?;
             let mut sentinel = fs::File::from(sentinel);
             sentinel.write_all(b"raced winner must survive")?;
-            sentinel.sync_all()?;
-            winner.sync_all()?;
+            kin_blobs::durable::sync_all(&sentinel)?;
+            kin_blobs::durable::sync_all(&winner)?;
             let identity = ConfigFileIdentity::from_metadata(&winner.metadata()?);
             INJECTED_PRIVATE_DIRECTORY_WINNER_IDENTITY.with(|configured| {
                 *configured.borrow_mut() = Some(identity);
@@ -5785,11 +5979,11 @@ fn maybe_inject_config_authority_drift(phase: &'static str) -> Result<()> {
             file.set_len(0)?;
             file.rewind()?;
             file.write_all(&bytes)?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
         }
         Some((_, InjectedConfigObjectDrift::Mode(file, mode))) => {
             rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(mode as _))?;
-            file.sync_all()?;
+            kin_blobs::durable::sync_all(&file)?;
         }
         None => {}
     }
@@ -5983,9 +6177,15 @@ impl ConfigTransactionAuthority {
         let kin_home = kin_dir()?;
         #[cfg(test)]
         let kin_home = config_transaction_test_kin_home(subject_path);
+        // One message rather than a context chain: client and ledger writers
+        // print this error with `{}`, which shows only the outermost context,
+        // and the cause (a group-writable Kin home and its exact repair) is
+        // the part a person needs.
         #[cfg(unix)]
-        let kin_home_authority = create_config_directory_all_durable(&kin_home, true)
-            .with_context(|| format!("failed to create {}", kin_home.display()))?;
+        let kin_home_authority =
+            create_config_directory_all_durable(&kin_home, true).map_err(|error| {
+                anyhow::anyhow!("failed to open or create {}: {error:#}", kin_home.display())
+            })?;
         #[cfg(unix)]
         let kin_home = kin_home_authority.path.clone();
         #[cfg(not(unix))]
@@ -6813,7 +7013,7 @@ fn validate_private_unix_directory(
     if newly_created {
         rustix::fs::fchmod(directory, rustix::fs::Mode::from_raw_mode(0o700))?;
         clear_product_owned_unix_acl(directory)?;
-        directory.sync_all()?;
+        kin_blobs::durable::sync_all(&directory)?;
     }
     let stat = rustix::fs::fstat(directory)?;
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
@@ -7235,7 +7435,7 @@ fn validate_kin_home_namespace(authority: &DurableConfigDirectory) -> Result<()>
     if authority.final_created {
         rustix::fs::fchmod(&authority.file, rustix::fs::Mode::from_raw_mode(0o700))?;
         clear_product_owned_unix_acl(&authority.file)?;
-        authority.file.sync_all()?;
+        kin_blobs::durable::sync_all(&authority.file)?;
     }
     let stat = rustix::fs::fstat(&authority.file)?;
     let metadata = unix_config_metadata(&authority.file)?;
@@ -7294,7 +7494,7 @@ fn validate_private_unix_file(
     if newly_created {
         rustix::fs::fchmod(file, rustix::fs::Mode::from_raw_mode(0o600))?;
         clear_product_owned_unix_acl(file)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
     }
     let metadata = validate_regular_config_file(path, file, true)?;
     let extended = unix_config_metadata(file)?;
@@ -7381,7 +7581,7 @@ fn apply_unix_config_metadata(
                 .context("failed to preserve managed config inode flags");
         }
     }
-    destination.sync_all()?;
+    kin_blobs::durable::sync_all(&destination)?;
     let actual = unix_config_metadata(destination)?;
     if actual != expected.metadata {
         anyhow::bail!(
@@ -7418,7 +7618,7 @@ fn sanitize_owned_unix_stage_for_cleanup(stage: &fs::File) -> Result<()> {
     }
     clear_product_owned_unix_acl(stage)?;
     rustix::fs::fchmod(stage, rustix::fs::Mode::from_raw_mode(0o600))?;
-    stage.sync_all()?;
+    kin_blobs::durable::sync_all(&stage)?;
     Ok(())
 }
 
@@ -7632,8 +7832,7 @@ fn sync_config_transaction_wal(
     if config_transaction_sync_injected(point) {
         anyhow::bail!("injected managed config WAL {point:?} sync failure");
     }
-    lock_file
-        .sync_all()
+    kin_blobs::durable::sync_all(&lock_file)
         .with_context(|| format!("failed to sync managed config recovery {point:?}"))
 }
 
@@ -8128,8 +8327,7 @@ fn write_config_transaction(lock_file: &fs::File, record: &ConfigTransactionReco
         lock_file
             .set_len(wal.committed_len as u64)
             .context("failed to discard uncommitted managed config recovery WAL suffix")?;
-        lock_file
-            .sync_all()
+        kin_blobs::durable::sync_all(&lock_file)
             .context("failed to sync repaired managed config recovery WAL tail")?;
     }
     let envelope = ConfigTransactionEnvelope {
@@ -8193,8 +8391,7 @@ fn retire_resolved_config_transaction_wal(lock_file: &fs::File) -> Result<()> {
             lock_file
                 .set_len(0)
                 .context("failed to retire resolved managed config recovery journal")?;
-            lock_file
-                .sync_all()
+            kin_blobs::durable::sync_all(&lock_file)
                 .context("failed to sync retired managed config recovery journal")
         }
         _ => Ok(()),
@@ -8315,6 +8512,16 @@ fn create_config_directory_all_durable(
         let grants_extended_private_access = false;
         #[cfg(not(target_os = "macos"))]
         let grants_extended_private_access = extended.grants_extended_private_access();
+        if let Some(mode) = kin_core::registry::shared_write_directory_mode(&display)
+            .filter(|_| stat.st_mode as u32 & 0o1000 == 0)
+        {
+            anyhow::bail!(
+                "{} is group or world writable (mode {mode:04o}), so another user could \
+                 replace Kin's files inside it. Remove that access with `{}`, then retry",
+                display.display(),
+                kin_core::registry::remove_shared_write_command(&display)
+            );
+        }
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
             || (stat.st_mode as u32 & 0o022 != 0 && stat.st_mode as u32 & 0o1000 == 0)
             || grants_extended_private_access
@@ -9639,8 +9846,7 @@ fn finish_windows_disposition(file: fs::File, path: &Path, label: &str) -> Resul
     // Exact rename/disposition handles are opened with WRITE_THROUGH. Flush
     // the delete-pending file object, close every owned handle, and prove the
     // transaction-owned pathname is absent before terminalizing the WAL.
-    let sync = file
-        .sync_all()
+    let sync = kin_blobs::durable::sync_all(&file)
         .with_context(|| format!("failed to flush disposed exact {label}"));
     drop(file);
     sync?;
@@ -10881,7 +11087,7 @@ fn finish_windows_removal_rollback(
         private,
         true,
     )?;
-    quarantined.file.sync_all()?;
+    kin_blobs::durable::sync_all(&quarantined.file)?;
     parent.revalidate_visible()?;
     record.phase = ConfigTransactionPhase::RollbackApplied;
     write_config_transaction(lock_file, record)?;
@@ -11277,7 +11483,7 @@ impl ConfigLock {
         validate_private_unix_file(&lock_path, &file, sidecar_created)?;
         #[cfg(windows)]
         let _ = sidecar_created;
-        file.sync_all()
+        kin_blobs::durable::sync_all(&file)
             .context("failed to sync durable managed config sidecar")?;
         #[cfg(unix)]
         {
@@ -11810,7 +12016,7 @@ impl ConfigLock {
             #[cfg(not(windows))]
             {
                 staged.write_all(bytes)?;
-                staged.sync_all()?;
+                kin_blobs::durable::sync_all(&staged)?;
             }
             #[cfg(windows)]
             {
@@ -11818,7 +12024,7 @@ impl ConfigLock {
                     .as_mut()
                     .context("Windows staging handle disappeared before write")?;
                 staged_file.write_all(bytes)?;
-                staged_file.sync_all()?;
+                kin_blobs::durable::sync_all(&staged_file)?;
             }
             self.revalidate_lock()?;
 
@@ -11862,7 +12068,7 @@ impl ConfigLock {
                 } else {
                     rustix::fs::fchmod(&staged, rustix::fs::Mode::from_raw_mode(final_mode as _))?;
                     clear_product_owned_unix_acl(&staged)?;
-                    staged.sync_all()?;
+                    kin_blobs::durable::sync_all(&staged)?;
                 }
                 let observed = observe_open_config_file(&temp, &mut staged, private)?;
                 if observed.bytes != bytes {
@@ -12470,10 +12676,11 @@ impl ConfigLock {
                         .context("Windows staging handle disappeared before validation")?,
                     private,
                 )?;
-                staged
-                    .as_ref()
-                    .context("Windows staging handle disappeared before flush")?
-                    .sync_all()?;
+                kin_blobs::durable::sync_all(
+                    staged
+                        .as_ref()
+                        .context("Windows staging handle disappeared before flush")?,
+                )?;
                 let installed = observe_open_config_file_with_full_sacl(
                     &self.path,
                     staged
@@ -14035,9 +14242,9 @@ fn bin_path_needs_asking(opts: &WizardOptions, shell_name: &str) -> Option<Strin
 ///
 /// The wizard never downloads it. That is deliberate: setup is the moment Kin
 /// promises a working CLI, and a several-hundred-megabyte fetch is the one real
-/// cost in the whole install. `kin init`'s first embed pass and `kin embed`
-/// both start it, and this question only records which of those a person wants
-/// to happen.
+/// cost in the whole install. A yes here lets the first embed pass that needs
+/// the model fetch it, `kin init`'s included; with no yes nothing fetches it
+/// until `kin embed` asks.
 fn ask_embedding_model(
     opts: &WizardOptions,
     interactive: bool,
@@ -14064,8 +14271,13 @@ fn ask_embedding_model(
         return;
     }
     if let Some(reason) = fetch.no_fetch_reason.as_deref() {
-        say!("  {} {}: {reason}", style("→").cyan(), fetch.model_id);
-        if !declined_here {
+        // `fetch.declined` with no decline recorded here is a machine nobody has
+        // asked yet, which is exactly what this question settles, so its reason
+        // would only restate the question.
+        if declined_here || !fetch.declined {
+            say!("  {} {}: {reason}", style("→").cyan(), fetch.model_id);
+        }
+        if !declined_here && !fetch.declined {
             return;
         }
     }
@@ -14104,19 +14316,23 @@ fn ask_embedding_model(
             crate::embed_model::MODEL_FETCH_DEFERRED
         }
         None => {
+            // A yes is what lets the model download, so a run nobody answered
+            // records none: the machine stays unasked, and downloads nothing.
             if !interactive {
                 skipped.push(SkippedDecision {
                     decision: "Embedding model",
-                    value: "fetched later, on demand (recommended)".to_string(),
-                    give_back: "kin embed starts the fetch; kin setup --embedding-model never \
-                                records that this machine does not fetch it"
+                    value: "not downloaded until someone asks".to_string(),
+                    give_back: "kin embed starts the fetch; kin setup --embedding-model later \
+                                lets the first embed pass fetch it, and never records that this \
+                                machine does not"
                         .to_string(),
                 });
+                return;
             }
             let options = [
                 (
-                    "Later, whenever I ask for it",
-                    "nothing downloads now; `kin embed` starts it",
+                    "When it's first needed",
+                    "nothing downloads now; the first embed pass or `kin embed` fetches it",
                 ),
                 (
                     "Not on this machine",
@@ -14149,90 +14365,108 @@ fn ask_embedding_model(
         );
     } else {
         say!(
-            "  {} Recorded. `kin embed` starts the fetch when you want it, and `kin init`'s first \
-             embed pass starts it too. An air-gapped host stays fine.",
+            "  {} Recorded. The first embed pass that needs the model fetches it, `kin init`'s \
+             included, and `kin embed` starts it now. An air-gapped host stays fine.",
             style("→").cyan()
         );
     }
 }
 
-/// Ask where vectors are computed. Always asked, on every intent.
+/// Ask whether to enable optional embeddings and where their model runs.
 ///
-/// Asked rather than inferred from whether huggingface.co answers, because the
-/// consequence is a privacy one and a person is owed it in the moment. No
-/// credential is collected: an API key is the one answer a scripted run cannot
-/// give, so choosing a remote provider prints exactly what to set instead of
-/// half-configuring it.
+/// The default is graph and lexical retrieval with no embedding model. Setup
+/// explains explicit providers without collecting credentials or configuring
+/// an endpoint on the user's behalf.
 fn ask_embedding_provider(
     opts: &WizardOptions,
     interactive: bool,
     skipped: &mut Vec<SkippedDecision>,
 ) {
     say!();
-    say!("Where vectors are computed");
+    say!("Optional embeddings");
     say!(
-        "  Local embedding runs in this process on your hardware. A remote OpenAI-compatible \
-         provider sends entity text to the endpoint you configure, because that is what remote \
-         embedding is."
+        "  Graph and lexical retrieval work without a model. An external provider receives \
+         selected entity text at the endpoint you configure."
     );
 
     let requested = opts
         .embedding_provider
         .as_deref()
         .map(|value| value.trim().to_ascii_lowercase());
-    let remote = match requested.as_deref() {
-        Some("remote") | Some("openai") | Some("lmstudio") => true,
-        Some("local") => false,
+    let provider = match requested.as_deref() {
+        Some("remote" | "external" | "openai" | "lmstudio") => "external",
+        Some("local" | "built-in") => "built-in",
+        Some("none") => "none",
         Some(other) => {
             say!(
-                "  {} unrecognized --embedding-provider '{other}'; keeping local",
+                "  {} unrecognized --embedding-provider '{other}'; keeping embeddings off",
                 style("!").yellow()
             );
-            false
+            "none"
         }
         None => {
             if !interactive {
                 skipped.push(SkippedDecision {
                     decision: "Embedding provider",
-                    value: "local (recommended)".to_string(),
-                    give_back: "set KIN_EMBED_PROVIDER and the endpoint variables to use a remote \
-                                provider"
-                        .to_string(),
+                    value: "none (recommended)".to_string(),
+                    give_back:
+                        "set KIN_MODEL_EMBEDDINGS_PROVIDER and its model settings to enable \
+                                optional embeddings"
+                            .to_string(),
                 });
             }
-            let options = [
+            let mut options = vec![
                 (
-                    "Local, on this machine",
-                    "nothing derived from your source leaves the machine",
+                    "No embedding model",
+                    "graph and lexical retrieval need no model or download",
                 ),
                 (
-                    "A remote OpenAI-compatible API",
-                    "entity text is sent to the endpoint you configure",
+                    "An external OpenAI-compatible API",
+                    "selected entity text is sent to the endpoint you configure",
                 ),
             ];
-            prompt_choice(&options, interactive) == 1
+            if cfg!(feature = "embeddings") {
+                options.push((
+                    "A built-in model on this machine",
+                    "the model runs locally and its first use may need a download",
+                ));
+            }
+            match prompt_choice(&options, interactive) {
+                1 => "external",
+                2 => "built-in",
+                _ => "none",
+            }
         }
     };
 
-    if !remote {
-        say!(
-            "  {} Local. Nothing selects a remote provider on its own.",
-            style("✓").green()
-        );
-        return;
+    match provider {
+        "none" => {
+            say!(
+                "  {} Embeddings stay off unless a model provider is explicitly configured.",
+                style("✓").green()
+            );
+        }
+        "built-in" => {
+            if cfg!(feature = "embeddings") {
+                say!("  Set KIN_MODEL_EMBEDDINGS_PROVIDER=built-in to enable local embedding.");
+            } else {
+                say!(
+                    "  Built-in embedding requires a build with optional local inference enabled."
+                );
+            }
+        }
+        _ => {
+            say!(
+                "  {} External embedding sends selected entity text to your endpoint. Set:",
+                style("→").cyan()
+            );
+            say!("      KIN_MODEL_EMBEDDINGS_PROVIDER=external");
+            say!("      KIN_MODEL_EMBEDDINGS_BASE_URL=<endpoint>");
+            say!("      KIN_MODEL_EMBEDDINGS_MODEL=<served model>");
+            say!("      KIN_MODEL_EMBEDDINGS_API_KEY_ENV=<credential environment variable name>");
+        }
     }
-    say!(
-        "  {} Remote embedding sends entity text off this machine. Set these to use it:",
-        style("!").yellow()
-    );
-    say!("      KIN_EMBED_PROVIDER=openai   (or lmstudio, openai-compatible)");
-    say!("      KIN_EMBED_OPENAI_BASE_URL=<endpoint>");
-    say!("      KIN_EMBED_OPENAI_API_KEY=<key>");
-    say!("      KIN_EMBED_MODEL_ID=<model>  (optional; changing it re-embeds everything)");
-    say!(
-        "    Setup collects no credential, so nothing is written here. `kin resources inspect` \
-         reports the provider in effect."
-    );
+    say!("  Setup writes no provider or credential here. `kin resources inspect` reports the configuration in effect.");
 }
 
 /// Ask whether to prove each configured client's entry with one real tool call.
@@ -14331,9 +14565,11 @@ fn exit_cancelled() -> ! {
 
 pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let interactive = !opts.no_interactive && is_tty();
-    // A person at a terminal gets the short form. `--verbose`, a pipe and a CI
-    // log get the full record below, which scripts and checks read.
-    if crate::screen::short_form(opts.verbose) && short::fits(&opts) {
+    // Every run that fits it gets the short form: a person at a terminal, and
+    // a pipe, a CI log or an installer with no terminal, which get the same
+    // plain summary without the live line. `--verbose` prints the full record
+    // below, which scripts and checks that need every step read.
+    if !opts.verbose && short::fits(&opts) {
         return short::run(opts, interactive).await;
     }
 
@@ -14342,7 +14578,14 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     if !crate::banner::print_once(interactive) {
         say!();
     }
-    say!("Welcome to Kin setup. Let's get you to value in a few questions.");
+    if interactive {
+        say!("Welcome to Kin setup. A few questions, then Kin is ready on this machine.");
+    } else {
+        say!(
+            "Welcome to Kin setup. This run asks nothing: it takes the defaults and lists \
+             each one with what changes it."
+        );
+    }
     say!();
 
     // Every question the run answered without asking, collected as it goes so a
@@ -14355,7 +14598,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     // answer sits inside.
     let hardware = hardware_check(&opts, &mut skipped);
 
-    let assistants = detect_ai_assistants();
+    let assistants = choose_assistants(detect_ai_assistants(), opts.clients.as_deref())?;
     // Take one snapshot for setup's editor-intent rendering. The health check
     // owns detection; reusing its probe here prevents the plan and follow-up
     // from being rendered from competing setup-only guesses.
@@ -14444,10 +14687,48 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     );
 
     // Last, so it is the line the run ends on and the status a script reads.
+    if let Some(error) = registry_authority_error(&report) {
+        return Err(error);
+    }
     match failed_clients_error(&applied.failed_clients) {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// The error setup ends with when the local registry is not safe to use.
+///
+/// Setup cannot finish an install whose registry Kin refuses: every later
+/// `kin init` would warn that it could not register the repository, and
+/// `kin doctor` would stay misconfigured. The checklist row already says what
+/// is wrong; this makes the exit status say it too, with the same remedy.
+fn registry_authority_error(
+    report: &crate::commands::health::HealthReport,
+) -> Option<anyhow::Error> {
+    use crate::commands::health::HealthStatus;
+
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "registry_authority")?;
+    if !matches!(check.status, HealthStatus::Misconfigured) {
+        return None;
+    }
+    let detail = check.detail.trim_end().trim_end_matches('.');
+    // A permission-drift detail already carries its remedy; say it once.
+    let fix = check
+        .manual_fix
+        .as_deref()
+        .filter(|_| !detail.contains("kin doctor --fix"));
+    Some(match fix {
+        Some(fix) => anyhow::anyhow!(
+            "kin setup cannot use the local registry: {detail}. To fix it, {fix}, then run \
+             `kin setup` again."
+        ),
+        None => anyhow::anyhow!(
+            "kin setup cannot use the local registry: {detail}. Then run `kin setup` again."
+        ),
+    })
 }
 
 /// Offer the missing language servers during first-run setup.
@@ -14738,6 +15019,7 @@ fn build_plan(
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            install_prompt_hook: false,
             verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: false,
@@ -14749,6 +15031,7 @@ fn build_plan(
             configure_mcp: true,
             mcp_assistant_indices: all_detected,
             inject_discovery_reminders: true,
+            install_prompt_hook: false,
             verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: false,
@@ -14760,6 +15043,7 @@ fn build_plan(
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            install_prompt_hook: false,
             verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: true,
@@ -14771,6 +15055,7 @@ fn build_plan(
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            install_prompt_hook: false,
             verify_mcp_round_trip: false,
             auto_daemon: true,
             show_editor_hint: false,
@@ -14797,6 +15082,9 @@ fn build_plan(
     };
     let add_bin_to_path =
         plan.add_bin_to_path && ask_bin_path(opts, interactive, shell_name, skipped);
+    let install_prompt_hook = plan.configure_mcp
+        && plan.mcp_assistant_indices.contains(&IDX_CLAUDE_CODE)
+        && ask_prompt_hook(opts, interactive, skipped);
 
     if !interactive && plan.auto_daemon && !opts.auto_daemon {
         skipped.push(SkippedDecision {
@@ -14823,8 +15111,37 @@ fn build_plan(
         auto_daemon: plan.auto_daemon || opts.auto_daemon,
         add_bin_to_path,
         verify_mcp_round_trip,
+        install_prompt_hook,
         ..plan
     })
+}
+
+/// Whether to add Kin's prompt hook to Claude Code's settings. It writes into
+/// a person's own agent settings, so it is their call: an interactive run asks
+/// and recommends it, and a scripted run installs it only with
+/// `--prompt-hook`.
+fn ask_prompt_hook(
+    opts: &WizardOptions,
+    interactive: bool,
+    skipped: &mut Vec<SkippedDecision>,
+) -> bool {
+    if opts.prompt_hook {
+        return true;
+    }
+    if interactive {
+        return prompt_yn(
+            "Let Kin answer code questions before Claude Code's first turn? This adds a prompt \
+             hook to ~/.claude/settings.json that runs `kin ask --hook claude` (recommended).",
+            true,
+            true,
+        );
+    }
+    skipped.push(SkippedDecision {
+        decision: "Claude Code prompt hook",
+        value: "not installed".to_string(),
+        give_back: "kin setup --prompt-hook installs it; an interactive kin setup asks".to_string(),
+    });
+    false
 }
 
 /// Granular toggles for the Advanced intent. Non-interactive Advanced reuses the
@@ -14894,6 +15211,7 @@ fn build_advanced_plan(
         configure_mcp,
         mcp_assistant_indices,
         inject_discovery_reminders: configure_mcp,
+        install_prompt_hook: false,
         verify_mcp_round_trip: false,
         auto_daemon,
         show_editor_hint: false,
@@ -15108,6 +15426,21 @@ async fn apply_plan(
         say!();
     }
 
+    // The prompt hook joins Claude Code's settings only when this run wrote
+    // Claude Code's MCP entry, since the hook's answers come from that server.
+    if plan.install_prompt_hook {
+        say!("Claude Code prompt hook:");
+        if registered_clients.contains(&IDX_CLAUDE_CODE) {
+            install_prompt_hook_for_claude();
+        } else {
+            say!(
+                "  {} not installed: Claude Code's MCP entry was not written this run.",
+                style("→").cyan()
+            );
+        }
+        say!();
+    }
+
     // Shell integration comes after the clients on purpose, and its failure
     // is reported rather than returned. It is the one step here that edits a
     // file the user may keep read-only, such as dotfiles Nix home-manager
@@ -15220,6 +15553,115 @@ fn apply_shell_integration(shell_name: &str, allow_path: bool) -> ShellIntegrati
                 by_hand: pending_shell_profile_additions(shell_name, allow_path),
             }
         }
+    }
+}
+
+/// The shells `kin setup --shell` names.
+const SETUP_SHELLS: [&str; 4] = ["zsh", "bash", "fish", "powershell"];
+
+/// The plan `kin setup --shell-only` applies: the shell step, and nothing
+/// that reaches an AI client, the daemon or a language server.
+fn shell_only_plan(allow_path: bool) -> SetupPlan {
+    SetupPlan {
+        install_shell_hook: true,
+        add_bin_to_path: allow_path,
+        configure_mcp: false,
+        mcp_assistant_indices: Vec::new(),
+        inject_discovery_reminders: false,
+        install_prompt_hook: false,
+        verify_mcp_round_trip: false,
+        auto_daemon: false,
+        show_editor_hint: false,
+        show_hosted_hint: false,
+    }
+}
+
+/// `kin setup --shell-only --json`: what the shell step did, under the same
+/// schema-tagged shape as setup's other reports.
+fn shell_only_report(shell_name: &str, outcome: &ShellIntegration) -> serde_json::Value {
+    let (status, reason, by_hand) = match outcome {
+        ShellIntegration::NotWritten { reason, by_hand } => {
+            ("not_written", Some(reason.as_str()), by_hand.as_slice())
+        }
+        ShellIntegration::Installed | ShellIntegration::NotPlanned => ("installed", None, &[][..]),
+    };
+    let add_by_hand: Vec<serde_json::Value> = by_hand
+        .iter()
+        .map(|(profile, lines)| {
+            serde_json::json!({
+                "profile": profile.display().to_string(),
+                "lines": lines,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema": "kin.setup-shell.v1",
+        "shell": shell_name,
+        "status": status,
+        // Always empty: this run connects no AI client, and says so rather
+        // than leaving a reader to infer it from a missing key.
+        "clients_connected": [],
+        "reason": reason,
+        "add_by_hand": add_by_hand,
+        "next": (status == "installed").then_some("Open a new terminal so it finds kin."),
+    })
+}
+
+/// `kin setup --shell-only`: add kin to the shell, the same step a full setup
+/// takes, and connect no AI client.
+///
+/// Nothing is asked and nothing else changes: no client entry, prompt hook,
+/// daemon setting or language server. The shell hook and the PATH line are
+/// recorded in the install ledger, as a full setup records them, so
+/// `kin doctor` checks them and `kin setup uninstall` removes them. Exits 1
+/// when the profile could not be written, after saying what to add by hand.
+pub fn run_shell_only(shell: Option<&str>, skip_path: bool, json: bool) -> Result<()> {
+    let shell_name = match shell {
+        Some(name) => SETUP_SHELLS
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(name.trim()))
+            .with_context(|| {
+                format!(
+                    "unknown shell `{name}`; choose from {}",
+                    SETUP_SHELLS.join(", ")
+                )
+            })?,
+        None => detect_shell(),
+    };
+    let allow_path = !skip_path;
+    let outcome = {
+        // The step's own lines are the human record; a JSON reader gets the
+        // report alone on stdout.
+        let _quiet = json.then(ShortFormScope::enter);
+        let outcome = apply_shell_integration(shell_name, allow_path);
+        record_setup_ledger(&shell_only_plan(allow_path), shell_name, &[]);
+        outcome
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shell_only_report(shell_name, &outcome))?
+        );
+    } else {
+        say!();
+        say!("No AI client was connected. `kin setup` connects them when you want it to.");
+        match &outcome {
+            ShellIntegration::NotWritten { reason, by_hand } => {
+                for line in shell_integration_by_hand_lines(reason, by_hand) {
+                    say!("{line}");
+                }
+            }
+            ShellIntegration::Installed | ShellIntegration::NotPlanned => {
+                say!("Open a new terminal so it finds kin.");
+            }
+        }
+    }
+    match outcome {
+        ShellIntegration::NotWritten { reason, .. } => {
+            anyhow::bail!("kin was not added to the {shell_name} profile: {reason}")
+        }
+        ShellIntegration::Installed | ShellIntegration::NotPlanned => Ok(()),
     }
 }
 
@@ -15434,8 +15876,11 @@ fn record_setup_ledger(plan: &SetupPlan, shell_name: &str, written_reminders: &[
         Ok(())
     });
     if let Err(e) = update {
+        // `{e:#}` keeps the cause: the outer context alone said only that a
+        // directory could not be created when the directory existed and its
+        // mode was the problem.
         say!(
-            "  {} could not write install ledger: {e}",
+            "  {} could not write install ledger: {e:#}",
             style("!").yellow()
         );
     }
@@ -16018,30 +16463,28 @@ fn print_human_report(report: &crate::commands::health::HealthReport, title: Opt
             HealthStatus::Pending => style("…").yellow(),
             HealthStatus::Unsupported => style("→").cyan(),
         };
-        match detail_layout(&check.detail, width) {
+        let label = crate::plain_words::doctor_label(&check.label);
+        let detail = crate::plain_words::line(&check.detail);
+        match detail_layout(&detail, width) {
             DetailLayout::Beside => say!(
                 "  {mark} {:<26} {:<14} {}",
-                check.label,
+                label,
                 status_label(&check.status),
-                check.detail
+                detail
             ),
             DetailLayout::Below(lines) => {
-                say!(
-                    "  {mark} {:<26} {}",
-                    check.label,
-                    status_label(&check.status)
-                );
+                say!("  {mark} {:<26} {}", label, status_label(&check.status));
                 for line in lines {
                     say!("{}{line}", " ".repeat(DETAIL_CONTINUATION_INDENT));
                 }
             }
         }
         if let Some(note) = &check.platform_note {
-            print_labelled_line("note: ", note, width);
+            print_labelled_line("note: ", &crate::plain_words::line(note), width);
         }
         if !matches!(check.status, HealthStatus::Healthy) {
             if let Some(fix) = &check.manual_fix {
-                print_labelled_line("fix:  ", fix, width);
+                print_labelled_line("fix:  ", &crate::plain_words::line(fix), width);
             }
         }
     }
@@ -16093,7 +16536,9 @@ struct CompactAttention {
     priority: u8,
     status: crate::screen::Status,
     reason: &'static str,
-    action: &'static str,
+    /// The command or step that moves the row forward, one per line, or empty
+    /// when the full diagnosis the report ends on is the only next step.
+    action: String,
     count: usize,
 }
 
@@ -16138,9 +16583,9 @@ fn compact_attention(check: &crate::commands::health::HealthCheck) -> CompactAtt
             HealthStatus::Unsupported => "Not applicable",
         },
         action: if check.fixable {
-            "kin doctor --fix"
+            "kin doctor --fix".to_string()
         } else {
-            "See full diagnosis"
+            String::new()
         },
         count: 1,
     };
@@ -16157,14 +16602,14 @@ fn compact_attention(check: &crate::commands::health::HealthCheck) -> CompactAtt
         row.label = "AI instructions".to_string();
         if matches!(check.status, HealthStatus::Misconfigured) {
             row.reason = "Tool profile mismatch";
-            row.action = "kin setup";
+            row.action = "kin setup".to_string();
         }
     } else {
         match (check.id.as_str(), &check.status) {
             ("suspended_sweep", HealthStatus::Degraded) => {
                 row.label = "Enrichment".to_string();
                 row.reason = "Sweeps suspended";
-                row.action = "kin daemon sweep";
+                row.action = "kin daemon sweep".to_string();
             }
             ("host_memory_pressure", HealthStatus::Degraded) => {
                 row.label = "Memory refusal".to_string();
@@ -16184,7 +16629,12 @@ fn compact_attention(check: &crate::commands::health::HealthCheck) -> CompactAtt
             }
             ("memory_floor", HealthStatus::Degraded) => {
                 row.label = "Memory capacity".to_string();
-                row.reason = "Below the measured host floor";
+                row.reason = "Less than Kin has been measured on";
+                row.action = "Convert one repository at a time".to_string();
+            }
+            ("commit_author", HealthStatus::Missing) => {
+                row.reason = "Not set; commits are blocked";
+                row.action = crate::commands::compact_author_commands();
             }
             ("commit_memory_headroom", _) => {
                 row.label = "Commit headroom".to_string();
@@ -16202,11 +16652,11 @@ fn compact_attention(check: &crate::commands::health::HealthCheck) -> CompactAtt
                 } else {
                     "Coverage needs review"
                 };
-                row.action = "kin graph status";
+                row.action = "kin graph status".to_string();
             }
             ("background_work", _) => {
                 row.reason = "Background work needs review";
-                row.action = "kin status --json";
+                row.action = "kin status --json".to_string();
             }
             ("hydration_semantics", HealthStatus::Stale) => {
                 row.label = "Replay semantics".to_string();
@@ -16214,7 +16664,7 @@ fn compact_attention(check: &crate::commands::health::HealthCheck) -> CompactAtt
             }
             ("embedding_model", HealthStatus::Pending | HealthStatus::Missing) => {
                 row.reason = "Model download outstanding";
-                row.action = "Review model access with --verbose";
+                row.action = "Review model access with --verbose".to_string();
             }
             _ => {}
         }
@@ -16287,8 +16737,17 @@ fn short_report_lines(
                 lines.push(format!("    {line}"));
             }
         }
-        for line in screen::wrap(&format!("Next: {}", row.action), edge.saturating_sub(4)) {
-            lines.push(format!("    {}", style.faint(&line)));
+        // A row whose only next step is the full diagnosis says nothing more:
+        // the report ends on the command that prints it. Separate commands
+        // stay on separate lines, so each one copies as it is.
+        const LEAD: &str = "Next: ";
+        const UNDER: &str = "      ";
+        for (index, step) in row.action.lines().enumerate() {
+            let wrapped = screen::wrap(step, edge.saturating_sub(4 + LEAD.len()));
+            for (part, line) in wrapped.iter().enumerate() {
+                let lead = if index == 0 && part == 0 { LEAD } else { UNDER };
+                lines.push(format!("    {}", style.faint(&format!("{lead}{line}"))));
+            }
         }
     }
     let remaining: usize = groups.iter().skip(MAX_GROUPS).map(|row| row.count).sum();
@@ -16314,8 +16773,15 @@ fn short_report_lines(
         screen::INDENT,
         style.glyph(glyph),
         style.bold(&format!(
-            "{} passed, {} need attention, {} not applicable.",
-            summary.passed, summary.attention, summary.skipped
+            "{} passed, {} {} attention, {} not applicable.",
+            summary.passed,
+            summary.attention,
+            if summary.attention == 1 {
+                "needs"
+            } else {
+                "need"
+            },
+            summary.skipped
         ))
     ));
     lines.push(format!(
@@ -17287,11 +17753,12 @@ pub async fn doctor_with(
     });
     if registry_needs_fix {
         match kin_core::registry::repair_registry_authority_permissions() {
-            Ok(paths) => {
-                for path in paths {
+            Ok(repairs) => {
+                for repair in repairs {
                     applied.push(format!(
-                        "repaired registry authority permissions to 0600 ({})",
-                        path.display()
+                        "repaired registry authority permissions to {:04o} ({})",
+                        repair.mode,
+                        repair.path.display()
                     ));
                 }
             }
@@ -17512,7 +17979,7 @@ pub async fn doctor_with(
     // Ensure the config directory scaffold exists (idempotent).
     if let Ok(kin_home) = kin_dir() {
         let config_dir = kin_home.join("config");
-        if !config_dir.exists() && fs::create_dir_all(&config_dir).is_ok() {
+        if !config_dir.exists() && kin_core::registry::create_kin_dir_all(&config_dir).is_ok() {
             applied.push(format!("created config dir ({})", config_dir.display()));
         }
     }
@@ -17627,10 +18094,10 @@ fn cleanup_stale_daemons() -> Result<usize> {
     let registry = kin_core::registry::KinRegistry::load()
         .map_err(|e| anyhow::anyhow!("failed to load registry: {e}"))?;
     for repo in &registry.repos {
-        let kin_root = repo.path.join(".kin");
-        if !kin_root.exists() {
+        let Some(layout) = kin_core::layout::locate_store(&repo.path) else {
             continue;
-        }
+        };
+        let kin_root = layout.root().to_path_buf();
         // daemon_is_up() cleans stale files as a side effect
         let _ = crate::daemon_client::daemon_is_up(&kin_root);
         // Also check for orphaned port files without a PID file
@@ -17648,6 +18115,93 @@ fn cleanup_stale_daemons() -> Result<usize> {
 // ---------------------------------------------------------------------------
 // `kin setup ledger` and `kin setup uninstall`
 // ---------------------------------------------------------------------------
+
+/// `kin setup clients`: every AI client Kin can connect, whether it is
+/// installed here, whether Kin is connected to it, and the id `--clients`
+/// takes. Reads only; changes nothing.
+pub fn clients(json: bool) -> Result<()> {
+    let rows: Vec<serde_json::Value> = detect_ai_assistants()
+        .iter()
+        .enumerate()
+        .map(|(idx, assistant)| {
+            serde_json::json!({
+                "id": client_id(idx),
+                "name": assistant.name,
+                "detected": assistant.detected,
+                "connected": mcp_config_path_for_index(idx)
+                    .is_some_and(|path| has_kin_mcp_config(&path)),
+                // These clients' Kin entry names a repository, so they connect
+                // when `kin init` admits one rather than during setup.
+                "connects_with_repository": matches!(idx, IDX_CODEX | IDX_GROK),
+                "install_hint": assistant.install_hint,
+            })
+        })
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "kin.setup-clients.v1",
+                "clients": rows,
+            }))?
+        );
+        return Ok(());
+    }
+    let rows: Vec<ClientRow<'_>> = rows
+        .iter()
+        .map(|row| ClientRow {
+            name: row["name"].as_str().unwrap_or_default(),
+            id: row["id"].as_str().unwrap_or_default(),
+            detected: row["detected"].as_bool().unwrap_or(false),
+            connected: row["connected"].as_bool().unwrap_or(false),
+        })
+        .collect();
+    for line in client_lines(crate::screen::Style::for_stdout(), &rows) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// One row of `kin setup clients`.
+struct ClientRow<'a> {
+    name: &'a str,
+    id: &'a str,
+    detected: bool,
+    connected: bool,
+}
+
+/// `kin setup clients` for a person: a header naming the columns, a row per
+/// client, and the command that connects one when any is installed and not
+/// yet connected.
+fn client_lines(style: crate::screen::Style, rows: &[ClientRow<'_>]) -> Vec<String> {
+    let mut lines = vec![style.faint(&format!(
+        "{:<20} {:<26} {}",
+        "AI client", "Status", "Id for --clients"
+    ))];
+    for row in rows {
+        let state = match (row.detected, row.connected) {
+            (_, true) => "connected",
+            (true, false) => "installed, not connected",
+            (false, false) => "not installed",
+        };
+        lines.push(format!("{:<20} {:<26} {}", row.name, state, row.id));
+    }
+    let waiting: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.detected && !row.connected)
+        .map(|row| row.id)
+        .collect();
+    if let Some(first) = waiting.first() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Connect one: kin setup --clients {first}   (separate several ids with commas)"
+        ));
+    } else if !rows.iter().any(|row| row.detected) {
+        lines.push(String::new());
+        lines.push("None of these is installed here. Install one, then run kin setup.".to_string());
+    }
+    lines
+}
 
 /// Show the install ledger and each entry's verification state against disk.
 pub fn ledger_status(json: bool) -> Result<()> {
@@ -18715,7 +19269,7 @@ try {
                 )
             })?;
         marker.write_all(b"kin-uninstall-incomplete-v1\n")?;
-        marker.sync_all()?;
+        kin_blobs::durable::sync_all(&marker)?;
         Ok(())
     })();
     if let Err(error) = marker_result {
@@ -19043,6 +19597,56 @@ mod tests {
     use crate::commands::health::{HealthCheck, HealthReport, HealthStatus, HealthVerdict};
     use kin_model::LanguageId;
 
+    /// `kin setup clients` names its columns, so the bare id at the end of a
+    /// row reads as what `--clients` takes, and it ends on the command that
+    /// connects an installed client.
+    #[test]
+    fn the_client_list_names_its_columns_and_how_to_connect_one() {
+        use super::{client_lines, ClientRow};
+        let row = |name, id, detected, connected| ClientRow {
+            name,
+            id,
+            detected,
+            connected,
+        };
+        let lines = client_lines(
+            crate::screen::Style::plain(),
+            &[
+                row("Claude Code", "claude-code", true, true),
+                row("Cursor", "cursor", true, false),
+                row("Windsurf", "windsurf", false, false),
+            ],
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "AI client            Status                     Id for --clients",
+                "Claude Code          connected                  claude-code",
+                "Cursor               installed, not connected   cursor",
+                "Windsurf             not installed              windsurf",
+                "",
+                "Connect one: kin setup --clients cursor   (separate several ids with commas)",
+            ]
+        );
+        let none = client_lines(
+            crate::screen::Style::plain(),
+            &[row("Windsurf", "windsurf", false, false)],
+        );
+        assert_eq!(
+            none.last().map(String::as_str),
+            Some("None of these is installed here. Install one, then run kin setup.")
+        );
+        let done = client_lines(
+            crate::screen::Style::plain(),
+            &[row("Cursor", "cursor", true, true)],
+        );
+        assert_eq!(
+            done.len(),
+            2,
+            "nothing to connect adds no next step: {done:#?}"
+        );
+    }
+
     /// A new terminal that resolves this very binary is fine; a different one,
     /// such as an older `kin` in `/usr/local/bin`, is named; nothing on the
     /// PATH is missing; and an alias says nothing about which binary runs.
@@ -19087,6 +19691,59 @@ mod tests {
         assert_eq!(recorded_client_consent(home.path()), Some(true));
         record_client_consent(home.path(), false).unwrap();
         assert_eq!(recorded_client_consent(home.path()), Some(false));
+    }
+
+    fn every_client_detected() -> Vec<AiAssistant> {
+        detect_ai_assistants()
+            .into_iter()
+            .map(|assistant| AiAssistant {
+                detected: true,
+                ..assistant
+            })
+            .collect()
+    }
+
+    /// Choosing clients leaves the rest undetected for the plan, and an id
+    /// Kin does not know is refused with the ones it does.
+    #[test]
+    fn chosen_clients_are_the_only_ones_setup_sees() {
+        assert_eq!(CLIENT_IDS.len(), every_client_detected().len());
+        let everyone = choose_assistants(every_client_detected(), None).unwrap();
+        assert!(everyone.iter().all(|assistant| assistant.detected));
+        let chosen = choose_assistants(
+            every_client_detected(),
+            Some(&[" Claude-Code".to_string(), "grok".to_string()]),
+        )
+        .unwrap();
+        let seen: Vec<&str> = chosen
+            .iter()
+            .filter(|assistant| assistant.detected)
+            .map(|assistant| assistant.name)
+            .collect();
+        assert_eq!(seen, ["Claude Code", "Grok CLI"]);
+        let error = choose_assistants(every_client_detected(), Some(&["zed".to_string()]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("unknown AI client `zed`"), "{error}");
+        assert!(error.contains("claude-code, cursor, codex"), "{error}");
+    }
+
+    /// The recorded choice decides which waiting clients a repository later
+    /// connects; no record, or `all`, keeps every one.
+    #[test]
+    fn the_client_choice_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(client_was_chosen(home.path(), IDX_CODEX));
+        record_client_choice(
+            home.path(),
+            Some(&["claude-code".to_string(), "codex".to_string()]),
+        )
+        .unwrap();
+        assert!(client_was_chosen(home.path(), IDX_CODEX));
+        assert!(!client_was_chosen(home.path(), IDX_GROK));
+        record_client_choice(home.path(), None).unwrap();
+        assert!(client_was_chosen(home.path(), IDX_GROK));
     }
 
     /// A row's detail stays on its row while it fits, and moves under it when
@@ -19381,6 +20038,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn post_install_refresh_without_a_daemon_needs_no_restart() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let _endpoint = EnvVarGuard::unset("KIN_DAEMON_URL");
         let _kin_dir = EnvVarGuard::unset("KIN_DIR");
@@ -19502,12 +20162,62 @@ mod tests {
         assert!(text.contains("Configuration needs repair"), "{text}");
         assert!(text.contains("Not ready yet"), "{text}");
         assert!(text.contains("Future check"), "{text}");
-        assert!(text.contains("Next: See full diagnosis"), "{text}");
+        assert!(
+            !text.contains("See full diagnosis"),
+            "a row with no step of its own points at nothing: {text}"
+        );
         assert!(
             text.contains("0 passed, 4 need attention, 0 not applicable."),
             "{text}"
         );
         assert!(text.contains("kin doctor --verbose"), "{text}");
+    }
+
+    /// The two rows a new Mac most often shows each carry a step a person can
+    /// take: the author's two commands, one per line so each copies whole, and
+    /// what to do on a machine with less memory than Kin was measured on.
+    #[test]
+    fn short_report_gives_the_author_and_memory_rows_a_step_to_take() {
+        let report = HealthReport::from_checks(
+            "macos".to_string(),
+            vec![
+                check("commit_author", "Author", HealthStatus::Missing),
+                check("memory_floor", "Memory floor", HealthStatus::Degraded),
+            ],
+        );
+        let lines =
+            super::short_report_lines(&report, "Kin doctor", 80, crate::screen::Style::plain());
+        let text = lines.join("\n");
+        assert!(text.contains("Not set; commits are blocked"), "{text}");
+        let name = lines
+            .iter()
+            .position(|line| line.contains("Next: git config --global user.name"))
+            .unwrap_or_else(|| panic!("no author command: {text}"));
+        assert_eq!(
+            lines[name + 1],
+            "          git config --global user.email \"you@example.com\"",
+            "the second command sits under the first: {text}"
+        );
+        assert!(
+            text.contains("Less than Kin has been measured on"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Next: Convert one repository at a time"),
+            "{text}"
+        );
+        assert!(!text.contains("See full diagnosis"), "{text}");
+        let one = HealthReport::from_checks(
+            "macos".to_string(),
+            vec![check(
+                "memory_floor",
+                "Memory floor",
+                HealthStatus::Degraded,
+            )],
+        );
+        let text = super::short_report_lines(&one, "Kin doctor", 80, crate::screen::Style::plain())
+            .join("\n");
+        assert!(text.contains("0 passed, 1 needs attention"), "{text}");
     }
 
     #[test]
@@ -20134,12 +20844,12 @@ mod tests {
 
     fn opts() -> WizardOptions {
         WizardOptions {
-            mode: None,
             shell: Some("zsh".to_string()),
             auto_daemon: false,
             no_interactive: true,
             intent: None,
             skip_mcp_check: false,
+            prompt_hook: false,
             install_language_servers: false,
             resource_profile: None,
             embedding_model: None,
@@ -20147,6 +20857,7 @@ mod tests {
             skip_path: false,
             tool_profile: None,
             verbose: false,
+            clients: None,
         }
     }
 
@@ -20664,6 +21375,9 @@ wait
     #[test]
     #[serial]
     fn find_shim_checks_managed_kin_home_lib() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let kin_home = tmp.path().join("kin-home");
         let shim = kin_home.join("lib").join(shim_filename());
@@ -20683,6 +21397,9 @@ wait
     #[test]
     #[serial]
     fn the_shell_repair_neither_invents_a_bin_directory_nor_points_at_one() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let archive_home = tmp.path().join("archive-home");
         let managed_home = tmp.path().join("managed-home");
@@ -20746,6 +21463,9 @@ wait
     #[serial]
     #[cfg(unix)]
     fn a_bash_login_shell_finds_kin_after_setup() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         if !Path::new("/bin/bash").is_file() {
@@ -20876,6 +21596,9 @@ wait
     #[test]
     #[serial]
     fn an_existing_bash_login_file_keeps_its_own_semantics() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
@@ -20928,6 +21651,9 @@ wait
     #[test]
     #[serial]
     fn a_second_bash_setup_run_appends_nothing() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
@@ -20959,6 +21685,9 @@ wait
     #[test]
     #[serial]
     fn the_ledger_records_both_files_the_bash_path_line_lands_in() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -20979,6 +21708,7 @@ wait
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            install_prompt_hook: false,
             verify_mcp_round_trip: false,
             auto_daemon: false,
             show_editor_hint: false,
@@ -21014,6 +21744,9 @@ wait
     #[test]
     #[serial]
     fn a_declined_path_line_is_neither_written_nor_recorded() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -21050,6 +21783,7 @@ wait
             configure_mcp: false,
             mcp_assistant_indices: Vec::new(),
             inject_discovery_reminders: false,
+            install_prompt_hook: false,
             verify_mcp_round_trip: false,
             auto_daemon: false,
             show_editor_hint: false,
@@ -21389,6 +22123,9 @@ wait
     #[test]
     #[serial]
     fn configuring_a_repo_bound_client_with_no_repository_defers() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -22592,6 +23329,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     #[test]
     #[serial]
     fn kin_dir_honors_kin_home_before_kin_dir() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let mut home = EnvVarGuard::unset("KIN_HOME").without("KIN_DIR");
         let fallback = PathBuf::from("/tmp/kin-dir-only");
         let preferred = PathBuf::from("/tmp/kin-home-preferred");
@@ -22960,6 +23700,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     #[test]
     #[serial]
     fn zsh_writes_its_path_line_where_a_non_interactive_shell_reads_it() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -23062,6 +23805,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     #[test]
     #[serial]
     fn a_home_read_answers_from_the_environment_at_the_time_of_the_call() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("first");
         let second = tmp.path().join("second");
@@ -23146,6 +23892,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     #[test]
     #[serial]
     fn a_shell_that_reads_one_file_still_gets_one_plan() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         // Both arms, because the file's existence is the thing the runner
         // differs on: a home that already carries the fish rc, and one that does
         // not. Neither may change the count, and both must stay inside the home
@@ -23188,6 +23937,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     #[test]
     #[serial]
     fn bash_writes_its_path_line_where_a_login_shell_reads_it() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -23230,6 +23982,9 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     #[test]
     #[serial]
     fn the_bash_login_file_follows_bash_own_resolution_order() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -24494,6 +25249,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn install_shell_hook_adds_path_and_hook_blocks_idempotently() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
@@ -24582,6 +25340,83 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     }
 
     #[test]
+    fn installing_writes_the_users_settings_once_and_refuses_unparseable_ones() {
+        let home = tempfile::tempdir().unwrap();
+        let (path, write, entry) =
+            install_claude_prompt_hook(home.path(), "/home/me/.kin/bin/kin").unwrap();
+        assert_eq!(write, crate::commands::setup_hooks::PromptHookWrite::Added);
+        assert_eq!(path, home.path().join(".claude").join("settings.json"));
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            crate::commands::setup_hooks::current_prompt_hook(&written),
+            Some(entry)
+        );
+        let (_, write, _) =
+            install_claude_prompt_hook(home.path(), "/home/me/.kin/bin/kin").unwrap();
+        assert_eq!(
+            write,
+            crate::commands::setup_hooks::PromptHookWrite::Unchanged
+        );
+
+        std::fs::write(&path, "{ not json").unwrap();
+        let refused = install_claude_prompt_hook(home.path(), "/home/me/.kin/bin/kin").unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("leaves it untouched"),
+            "{refused:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn a_scripted_run_installs_the_prompt_hook_only_when_the_flag_asks() {
+        let mut skipped = Vec::new();
+        assert!(!ask_prompt_hook(&opts(), false, &mut skipped));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].decision, "Claude Code prompt hook");
+        assert!(skipped[0].give_back.contains("--prompt-hook"));
+
+        let mut flagged = opts();
+        flagged.prompt_hook = true;
+        let mut skipped = Vec::new();
+        assert!(ask_prompt_hook(&flagged, false, &mut skipped));
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_hook_is_planned_only_with_claude_codes_mcp_entry() {
+        let assistants = detect_ai_assistants();
+        let mut flagged = opts();
+        flagged.prompt_hook = true;
+        let plan = build_plan(
+            SetupIntent::AgentOnly,
+            &flagged,
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.install_prompt_hook,
+            plan.configure_mcp && plan.mcp_assistant_indices.contains(&IDX_CLAUDE_CODE)
+        );
+        let plan = build_plan(
+            SetupIntent::LocalOnly,
+            &flagged,
+            &assistants,
+            "zsh",
+            false,
+            &no_hardware_question(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!plan.configure_mcp);
+        assert!(!plan.install_prompt_hook);
+    }
+
+    #[test]
     fn intent_flag_overrides_default() {
         let mut o = opts();
         o.intent = Some("local".to_string());
@@ -24649,6 +25484,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn editor_followup_acknowledges_an_installed_extension() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let extension = home
@@ -24861,6 +25699,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn merge_mcp_config_refuses_to_overwrite_corrupt_json() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let path = dir.path().join("config.json");
@@ -24888,6 +25729,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn merge_mcp_config_merges_into_valid_existing_file() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let path = dir.path().join("config.json");
@@ -24968,6 +25812,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn setup_writes_the_routed_profile_for_eager_clients_and_the_named_one_for_claude_code() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         for (id, profile) in [
             ("claude", "agent-default"),
             ("grok", "agent-default"),
@@ -25014,6 +25861,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn claude_writer_uses_fallback_only_while_primary_is_absent() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -25266,9 +26116,11 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                 "{profile}: {block}"
             );
         }
-        assert!(
-            !names_missing_from_profile(&discovery_block("agent-default"), "agent-routed")
-                .is_empty()
+        // The named block's verbs are the routed commands' words too, so it reads
+        // on `agent-routed`; its writes are what the read-only surface lacks.
+        assert_eq!(
+            names_missing_from_profile(&discovery_block("agent-default"), "agent-routed-query"),
+            vec!["mutate".to_string()]
         );
         assert!(
             !names_missing_from_profile(&discovery_block("agent-routed"), "agent-default")
@@ -25278,14 +26130,19 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         // names its block adds over the read-only surface are those writes.
         assert_eq!(
             names_missing_from_profile(&discovery_block("agent-routed"), "agent-routed-query"),
-            vec!["session".to_string(), "mutate".to_string()],
-            "the routed block names the read-only surface plus the two write commands"
+            vec!["mutate".to_string()],
+            "the routed block names the read-only surface plus its write command; a write \
+             opens its own session"
         );
-        assert_eq!(
-            names_missing_from_profile(KIN_DISCOVERY_REMINDER, "agent-routed"),
-            vec!["semantic_locate", "get_context_pack", "trace_data_flow"]
-        );
-        assert!(names_missing_from_profile(KIN_DISCOVERY_REMINDER, "agent-default").is_empty());
+        // The block an earlier Kin appended names the tools the verbs replaced,
+        // which no profile lists now, so doctor reads it as stale on both.
+        for profile in ["agent-routed", "agent-default"] {
+            assert_eq!(
+                names_missing_from_profile(KIN_DISCOVERY_REMINDER, profile),
+                vec!["semantic_locate", "get_context_pack", "trace_data_flow"],
+                "{profile}"
+            );
+        }
     }
 
     /// The routed block spells every command so it runs both through the
@@ -25424,6 +26281,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn setup_and_update_keep_chosen_profiles_and_move_the_ones_kin_chose() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let profile_of = |path: &Path| -> (String, bool) {
@@ -25553,6 +26413,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn every_client_setup_supports_is_told_only_what_its_profile_serves() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -25617,7 +26480,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         }
         // Claude Code is told the named tools; Codex, which sends every tool
         // with every request, the routed commands.
-        assert!(blocks[0].snippet.contains("`semantic_locate`"));
+        assert!(blocks[0].snippet.contains("`locate`"));
         assert!(blocks[1].snippet.contains("`kin locate`"));
         let findings = discovery_block_findings();
         assert_eq!(findings.len(), 2);
@@ -25664,6 +26527,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn update_rewrites_the_block_for_the_profile_its_client_carries_now() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use crate::commands::setup_ledger::{ledger_path, ArtifactKind, SetupLedger};
 
         let dir = tempfile::tempdir().unwrap();
@@ -25805,6 +26671,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn non_managed_install_setup_health_and_doctor_repair_converge() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -25862,6 +26731,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn setup_registers_the_managed_launcher_when_it_exists() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -25895,6 +26767,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn setup_registers_kin_with_lm_studio_beside_its_other_servers() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -25941,6 +26816,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn setup_warns_when_the_registered_launcher_is_unmanaged() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -25990,6 +26868,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn grok_gets_a_repository_bound_mcp_table_beside_its_other_servers() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
@@ -26032,6 +26913,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn merge_mcp_config_toml_refuses_to_overwrite_corrupt_toml() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
@@ -26061,6 +26945,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn merge_mcp_config_toml_preserves_existing_codex_config() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
@@ -26109,6 +26996,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn merge_mcp_config_toml_creates_missing_file_and_is_idempotent() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
@@ -26144,6 +27034,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn codex_merge_preserves_table_env_cwd_and_user_policy() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let repo = dir.path().join("repo");
@@ -26175,6 +27068,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn structurally_incompatible_configs_fail_closed_byte_for_byte() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let _kin_home = EnvVarGuard::set("KIN_HOME", dir.path().join("kin-home"));
         let json = dir.path().join("config.json");
@@ -26195,6 +27091,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn canonical_aliases_cannot_self_deadlock_or_cross_client_authority() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let client = home.join(".cursor");
@@ -27246,7 +28145,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             unsafe { libc::fchflags(file.as_raw_fd(), libc::UF_NODUMP) },
             0
         );
-        file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&file).unwrap();
         let before = observe_open_config_file(&config, &mut file, false).unwrap();
         drop(file);
 
@@ -27599,7 +28498,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let cleanup =
             ConfigTransactionAuthority::acquire(&cleanup_identity, &original_sidecar).unwrap();
         cleanup.file.set_len(0).unwrap();
-        cleanup.file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&cleanup.file).unwrap();
     }
 
     #[test]
@@ -27656,7 +28555,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             Some(record)
         );
         reacquired.file.set_len(0).unwrap();
-        reacquired.file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&reacquired.file).unwrap();
     }
 
     // Falsify the (device, inode) key. Genuine inode recycling cannot be forced
@@ -27721,7 +28620,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             "the first config lost the interrupted transaction it still owns"
         );
         reacquired.file.set_len(0).unwrap();
-        reacquired.file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&reacquired.file).unwrap();
     }
 
     #[test]
@@ -27963,7 +28862,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let mut bytes = wal_test_pair(&first, 1);
         bytes.extend_from_slice(b"{\"torn\":true}\n");
         (&file).write_all(&bytes).unwrap();
-        file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&file).unwrap();
 
         write_config_transaction(&file, &second).unwrap();
         let parsed = read_config_transaction(&file).unwrap().unwrap();
@@ -28374,7 +29273,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         .unwrap();
         let mut stage = fs::File::from(fd);
         stage.write_all(b"secret crash residue").unwrap();
-        stage.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&stage).unwrap();
         fs::write(lock.transaction.vault_path.join(unknown_name), b"unknown").unwrap();
         sync_config_parent(&lock.transaction.vault).unwrap();
         let vault = lock.transaction.vault_path.clone();
@@ -28391,6 +29290,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn static_mcp_ids_are_bound_to_their_exact_client_paths() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -28445,6 +29347,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn a_grok_entry_is_repaired_as_toml_and_keeps_its_repository() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -28497,6 +29402,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn stale_codex_binding_is_refused_before_repair_or_marker_clear() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -28546,6 +29454,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn finalizer_recaptures_and_repairs_target_added_after_manifest_capture() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let kin_home = dir.path().join("kin-home");
@@ -28646,6 +29557,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn antigravity_setup_on_a_git_free_repository_writes_the_binding() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -28694,6 +29608,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn antigravity_first_setup_captures_and_repairs_global_and_workspace_bindings() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -28783,6 +29700,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn a_binding_setup_wrote_reads_exact_from_another_repository() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use crate::commands::health::{evaluate_antigravity_binding, HealthStatus};
 
         struct CurrentDirGuard(PathBuf);
@@ -28901,6 +29821,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn enclosing_workspace_config_is_never_captured_from_a_scoped_fixture() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         struct CurrentDirGuard(PathBuf);
         impl Drop for CurrentDirGuard {
             fn drop(&mut self) {
@@ -28970,6 +29893,9 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
     #[test]
     #[serial]
     fn antigravity_global_remerge_preserves_existing_cwd_and_policy() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let kin_home = dir.path().join("kin-home");
         let repo = dir.path().join("repo");

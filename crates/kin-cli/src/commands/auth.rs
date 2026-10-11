@@ -198,7 +198,7 @@ fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
             .mode(0o600)
             .open(path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
         // An existing file keeps the mode it had, so set it too rather than
         // trusting the create-time mode alone.
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;

@@ -1,0 +1,238 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/admission.rs",
+    "src/binding_debt.rs",
+    "src/call_site_reading.rs",
+    "src/canonical_ser.rs",
+    "src/change.rs",
+    "src/derivation.rs",
+    "src/entity.rs",
+    "src/error.rs",
+    "src/external.rs",
+    "src/external_reference.rs",
+    "src/git_authority.rs",
+    "src/graph.rs",
+    "src/identity.rs",
+    "src/ids.rs",
+    "src/language_profile.rs",
+    "src/layout.rs",
+    "src/lib.rs",
+    "src/metadata_map.rs",
+    "src/parser_occurrence.rs",
+    "src/refs.rs",
+    "src/relation.rs",
+    "src/relation_identity.rs",
+    "src/repository.rs",
+    "src/resolution.rs",
+    "src/retrieval.rs",
+    "src/scope.rs",
+    "src/temporal.rs",
+    "src/test_paths.rs",
+    "src/timestamp.rs",
+    "src/value_escape.rs",
+]
+
+[[excluded]]
+reason = "tests: alloc_probe is declared #[cfg(test)] in lib.rs, and the owner tests are include!d inside repository.rs's #[cfg(test)] module"
+files = [
+    "src/alloc_probe.rs",
+    "src/enrichment_proof_owner_tests.rs",
+]
+
+[[excluded]]
+reason = "merge and collaboration authority: merge state, conflict objects, durable merge-transaction records and replicated collaboration deltas that repository transactions carry; no parser, linker, history replay or Git import path reads them"
+files = [
+    "src/branch.rs",
+    "src/collaboration.rs",
+    "src/conflict.rs",
+    "src/merge.rs",
+]
+
+[[excluded]]
+reason = "proof and binding records beside the graph: the raw-object proof of a native snapshot taken from Git and the sealed-observation binding a repository transaction names; they prove what was captured, and no parser, linker, history replay or Git import path reads them to build a change or its graph"
+files = [
+    "src/git_snapshot_proof.rs",
+    "src/sealed_observation.rs",
+]
+
+[[excluded]]
+reason = "language-server enrichment: proof inputs recorded in enrichment marks (kept or dropped beside the graph, never an entity or relation) and the SCIP view of external references that kin-lsp publishes; derivation builds neither"
+files = [
+    "src/enrichment_proof.rs",
+    "src/external_symbol.rs",
+]
+
+[[excluded]]
+reason = "serving and coordination surfaces: context packs, agent sessions and intents, federation addressing for hosted coordination, the daemon-to-VFS workspace-tree wire contract and graph counts; derivation writes none of them"
+files = [
+    "src/context.rs",
+    "src/federation.rs",
+    "src/session.rs",
+    "src/stats.rs",
+    "src/workspace_tree.rs",
+]
+
+[[excluded]]
+reason = "records people, tests and reviews add (work items and annotations, test cases and runs, actors and approvals, reviews, contracts, specs, test evidence); derivation creates none, leaves a change's risk_summary, spec_link and evidence empty, and never builds the Test, Work or VerificationRun node variants whose ids are defined here"
+files = [
+    "src/contract.rs",
+    "src/evidence.rs",
+    "src/provenance.rs",
+    "src/review.rs",
+    "src/spec.rs",
+    "src/verification.rs",
+    "src/work.rs",
+]
+
+[[excluded]]
+reason = "projection and reconcile presets and projection descriptors, read by kin-projection's materializing engine, kin-reconcile and the daemon, never by kin-index's derivation or kin-projection's build_layout"
+files = [
+    "src/preset.rs",
+    "src/projection.rs",
+]
+
+
+[[excluded_items]]
+file = "src/call_site_reading.rs"
+reason = "how an answer states a call site's standing (settled, owed, unverified) and quotes it, read from stored ledgers and records; nothing at ingest calls it"
+items = [
+    "fn balanced_group",
+    "fn builds_a_string",
+    "fn callee_part",
+    "fn calling_languages",
+    "fn ends_word",
+    "fn focal_call_names",
+    "fn holds_dynamic_access",
+    "fn in_a_file_without_calls",
+    "fn member_dispatch_decorators",
+    "fn member_dispatches_by_construction",
+    "fn member_may_dispatch_without_its_name",
+    "fn reach_is_named",
+    "fn read_caller_sites",
+    "fn scope_caller_sites",
+    "fn site_could_call",
+    "fn site_could_call_at",
+    "fn site_state_reason",
+    "fn site_text",
+    "fn spells_identifier",
+    "fn spells_word",
+    "fn starts_word",
+    "fn static_from_import_names",
+    "fn unplaceable_access",
+    "impl CallSiteTally / fn is_settled",
+    "impl CallSiteTally / fn share",
+    "impl CallSiteTally / fn to_json",
+    "impl CallSiteTally / fn unsettled_sites",
+    "impl CallerSites / fn is_known",
+    "impl CallerSites / fn retain_sites",
+    "impl FocalEscape / fn call_names",
+    "impl FocalEscape / fn contained",
+    "impl FocalEscape / fn judged_dynamic_access",
+    "impl FocalEscape / fn may_escape",
+    "impl FocalEscape / fn may_escape_unlisted",
+    "impl FocalEscape / fn summary_json",
+    "impl SiteStateKind / fn is_settled",
+    "impl SiteStateKind / fn is_uncounted",
+]
+
+[[excluded_items]]
+file = "src/change.rs"
+reason = "builds an entity's history page for a reader"
+items = [
+    "impl EntityHistoryEntry / fn for_entity",
+]
+
+[[excluded_items]]
+file = "src/derivation.rs"
+reason = "what a reader may be served of a module's or class's own code, and the refusal for a whole-file read; read when an entity's source is served, never at ingest"
+items = [
+    "fn module_code_syntax",
+    "fn require_guarded_source",
+    "fn require_independent_source",
+    "fn require_targeted_source",
+    "fn serves_module_code",
+    "fn whole_file_refusal_tail",
+]
+
+[[excluded_items]]
+file = "src/graph.rs"
+reason = "reads, searches and maintains what is stored (the text index, vectors and embeddings, recall, counts, impact and neighbourhood queries, entity history pages and warnings); answering calls them, deriving never does"
+items = [
+    "impl ChangeStore for&G / fn get_entity_history_page",
+    "impl EntityStore for&G / fn expand_neighborhood",
+    "impl EntityStore for&G / fn find_dead_code",
+    "impl EntityStore for&G / fn get_dependency_neighborhood",
+    "impl EntityStore for&G / fn get_downstream_impact",
+    "impl EntityStore for&G / fn text_search",
+    "impl VerificationStore for&G / fn get_mock_hints_for_test",
+    "impl VerificationStore for&G / fn list_runs_for_test",
+    "trait ChangeStore / fn get_entity_history_at",
+    "trait ChangeStore / fn get_entity_history_page",
+    "trait EntityStore / fn expand_neighborhood",
+    "trait EntityStore / fn find_dead_code",
+    "trait EntityStore / fn get_dependency_neighborhood",
+    "trait EntityStore / fn get_downstream_impact",
+    "trait EntityStore / fn text_search",
+    "trait VerificationStore / fn get_mock_hints_for_test",
+    "trait VerificationStore / fn list_runs_for_test",
+]
+
+[[excluded_items]]
+file = "src/repository.rs"
+reason = "predicates merge, session and status code ask about a workspace's state; they write nothing derivation reads"
+items = [
+    "impl RootBundle / fn has_same_replicated_truth",
+    "impl WorkspaceSemanticOverlay / fn is_language_server_enrichment_only",
+    "impl WorkspaceSemanticOverlay / fn is_language_server_enrichment_only_at",
+    "impl WorkspaceSnapshotBinding / fn is_dirty",
+    "impl WorkspaceState / fn holds_uncommitted_work",
+    "impl WorkspaceState / fn is_dirty",
+]
+
+[[excluded_items]]
+file = "src/value_escape.rs"
+reason = "reads a stored escape record back when answering; the parser writes the record without them"
+items = [
+    "fn record_value_lists_mentions",
+    "fn spells_word",
+    "impl EscapeResidue / fn unsettled_count",
+    "impl FileEscapeRecord / fn records_mentions",
+    "impl MentionResidue / fn is_untaken",
+    "impl MentionResidue / fn unmeasured",
+    "impl ReflectiveSite / fn key_admits",
+    "impl ReflectiveSite / fn key_has_literals",
+    "impl ReflectiveSite / fn names_key",
+    "impl ValueOccurrence / fn residue_kind",
+]
+
+
+[[excluded_items]]
+file = "src/test_paths.rs"
+reason = "the wider nonproduction filter is read by traversal when answering impact and dead-code queries; ingestion uses the separate test-role predicates"
+items = [
+    "fn is_nonproduction_path",
+]
+
+[dependencies]
+kin-blobs = { decides = ["graph"] }
+kin-vector = { reason = "vector index, a separate product; only a marker-trait impl so RetrievalKey can key it" }
+serde = { reason = "serialization derive with a fixed data model; a release changes no derived value" }
+serde_json = { reason = "JSON, a fixed specification; metadata records are read and compared as values" }
+sha2 = { reason = "SHA-256, a fixed specification" }
+sha1 = { reason = "SHA-1 for Git object ids, fixed by Git's object format" }
+hex = { reason = "hex encoding, a fixed specification" }
+gix-hash = { reason = "Git hash kinds and hex object-id parsing, fixed by Git's object format" }
+gix-object = { decides = ["graph"] }
+uuid = { reason = "UUIDs per RFC 9562; name-based ids are fully specified" }
+chrono = { reason = "date and time types with fixed formats; a release changes no derived value" }
+thiserror = { reason = "error type derive; no derived value" }
+schemars = { reason = "JSON Schema generation for documentation and schema export; no derived value" }

@@ -32,22 +32,24 @@
 //!   * bare call (`target()`), with and without an import binding
 //!   * module-attribute call (`module.func()`) — narrowed to `func`
 //!   * method call on an instance (`obj.method()`) — narrowed to `method`
-//!   * nesting recursion: calls inside nested `def`s and inside class methods
-//!     attribute to the innermost *enclosing function entity* (nested `def`s
-//!     produce no entity of their own, so their calls roll up to the method or
-//!     top-level function that encloses them).
+//!   * nesting: a `def` nested in a function or method is an entity of its
+//!     own, named `outer.<locals>.inner`, and owns the calls in its body.
 
 use kin_model::{EntityKind, FilePathId, RelationKind};
 use kin_parser::{
-    is_call_extraction_incomplete_marker, ExtractedRelation, LanguageAdapter, ParseOutput,
-    PythonAdapter,
+    is_call_extraction_incomplete_marker, is_scoped_call_extraction_incomplete_marker,
+    ExtractedRelation, LanguageAdapter, ParseOutput, PythonAdapter,
 };
 
 fn extract(source: &str) -> ParseOutput {
+    extract_at("test/calls.py", source)
+}
+
+fn extract_at(path: &str, source: &str) -> ParseOutput {
     let adapter = PythonAdapter;
     let bytes = source.as_bytes();
     let tree = adapter.parse(bytes).expect("parse should succeed");
-    let file_id = FilePathId::new("test/calls.py");
+    let file_id = FilePathId::new(path);
     adapter
         .extract(&tree, bytes, &file_id)
         .expect("extract should succeed")
@@ -180,15 +182,23 @@ fn dynamic_callee_emits_one_incomplete_extraction_marker() {
     );
 }
 
+/// A module-scope call is the module's call, the way a module-scope read is
+/// the module's reference. It used to reach no relation, which is why it had
+/// to withhold a full coverage claim; now it is represented, so the file's
+/// coverage stands on it like any other named call.
 #[test]
-fn module_scope_call_emits_incomplete_extraction_marker() {
+fn module_scope_call_is_the_modules_call() {
     let output = extract("def target(ext, args):\n    return ext, args\n\ntarget(ext=1, args=2)\n");
+    let hits = calls_named(&output, "target");
+    assert_eq!(hits.len(), 1, "got {:?}", calls(&output));
+    assert_eq!(hits[0].src_name, "calls", "the module entity is the caller");
+    assert_eq!(hits[0].site.as_ref().map(|site| site.start_line), Some(3));
     assert!(
-        output
+        !output
             .relations
             .iter()
             .any(is_call_extraction_incomplete_marker),
-        "an unowned module-scope call must prevent a full call-coverage claim"
+        "a module-scope call the graph carries leaves nothing unrepresented"
     );
 }
 
@@ -197,8 +207,8 @@ fn module_scope_call_emits_incomplete_extraction_marker() {
 #[test]
 fn module_attribute_call_narrows_to_leaf_name() {
     // `mathlib.compute()` narrows to the leaf `compute`. The dotted form must
-    // never survive, and because narrowing drops the `mathlib` binding the leaf
-    // name is not an imported name, so it carries no import_source.
+    // never survive. Its receiver, rather than the bare leaf, carries the
+    // namespace import claim whose exact source witness the linker checks.
     let output = extract("import mathlib\n\ndef caller():\n    mathlib.compute()\n");
     let hits = calls_named(&output, "compute");
     assert_eq!(
@@ -208,10 +218,8 @@ fn module_attribute_call_narrows_to_leaf_name() {
         calls(&output)
     );
     assert_eq!(hits[0].src_name, "caller");
-    assert!(
-        hits[0].import_source.is_none(),
-        "leaf name is not the imported binding `mathlib`, so no import_source"
-    );
+    assert_eq!(hits[0].receiver.as_deref(), Some("mathlib"));
+    assert_eq!(hits[0].import_source.as_deref(), Some("mathlib"));
     assert!(
         !calls(&output).iter().any(|r| r.dst_name.contains('.')),
         "dotted form must not appear as a Calls dst_name, got {:?}",
@@ -265,74 +273,79 @@ fn method_call_on_instance_narrows_to_leaf_name() {
 // ---- nesting recursion ----
 
 #[test]
-fn nested_def_calls_attribute_to_innermost_enclosing_function() {
-    // `inner` is a nested def and gets no entity of its own, so the innermost
-    // enclosing *entity* for both `leaf()` and `inner()` is `outer`.
+fn nested_def_owns_its_calls_and_the_outer_call_names_it() {
+    // `inner` is a definition nested in `outer`'s body. It is an entity of its
+    // own named the way CPython's `__qualname__` names it, the call written in
+    // its body is its call, and `outer`'s call to it names that entity.
     let output = extract("def outer():\n    def inner():\n        leaf()\n    inner()\n");
 
     assert!(has_entity(&output, EntityKind::Function, "outer"));
     assert!(
+        has_entity(&output, EntityKind::Function, "outer.<locals>.inner"),
+        "a nested def is admitted under its qualified name, got {:?}",
+        output.entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    assert!(
         !has_entity(&output, EntityKind::Function, "inner"),
-        "a nested def must not produce its own function entity"
+        "a nested def must not take a module-level name"
     );
 
+    let leaf = calls_named(&output, "leaf");
     assert!(
-        calls_named(&output, "leaf")
-            .iter()
-            .all(|r| r.src_name == "outer"),
-        "call inside the nested def must attribute to the enclosing entity `outer`, got {:?}",
+        !leaf.is_empty() && leaf.iter().all(|r| r.src_name == "outer.<locals>.inner"),
+        "the call inside the nested def belongs to the nested def, got {:?}",
         calls(&output)
     );
     assert!(
-        !calls_named(&output, "leaf").is_empty(),
-        "the call inside the nested def must not be dropped, got {:?}",
-        calls(&output)
-    );
-    assert!(
-        calls_named(&output, "inner")
+        calls_named(&output, "outer.<locals>.inner")
             .iter()
             .any(|r| r.src_name == "outer"),
-        "the call to the nested def itself attributes to `outer`, got {:?}",
-        calls(&output)
-    );
-    assert!(
-        !calls(&output).iter().any(|r| r.src_name == "inner"),
-        "no call may attribute to the entity-less nested def `inner`, got {:?}",
+        "the call to the nested def names its entity, got {:?}",
         calls(&output)
     );
 }
 
 #[test]
-fn class_method_nested_def_calls_attribute_to_method_entity() {
-    // A class method that wraps a nested def: both the method's own call and the
-    // call inside the nested def roll up to the method entity `Holder.method`.
+fn class_method_nested_def_owns_its_calls() {
+    // A method that wraps a nested def: the nested def is `Holder.method`'s
+    // local, its body's call is its own, and `self` inside it still names
+    // `Holder`, because a closure in a method sees the method's `self`.
     let output = extract(
-        "class Holder:\n    def method(self):\n        def nested():\n            deep()\n        nested()\n",
+        "class Holder:\n    def method(self):\n        def nested():\n            deep()\n            self.helper()\n        nested()\n",
     );
 
     assert!(has_entity(&output, EntityKind::Method, "Holder.method"));
     assert!(
-        !has_entity(&output, EntityKind::Function, "nested"),
-        "a nested def inside a method must not produce its own entity"
+        has_entity(
+            &output,
+            EntityKind::Function,
+            "Holder.method.<locals>.nested"
+        ),
+        "a def nested in a method is `Class.method.<locals>.name`, got {:?}",
+        output.entities.iter().map(|e| &e.name).collect::<Vec<_>>()
     );
 
+    let deep = calls_named(&output, "deep");
     assert!(
-        calls_named(&output, "deep")
+        !deep.is_empty()
+            && deep
+                .iter()
+                .all(|r| r.src_name == "Holder.method.<locals>.nested"),
+        "the call inside the nested def belongs to it, got {:?}",
+        calls(&output)
+    );
+    assert!(
+        calls_named(&output, "Holder.helper")
             .iter()
-            .all(|r| r.src_name == "Holder.method"),
-        "call inside the method's nested def attributes to `Holder.method`, got {:?}",
+            .any(|r| r.src_name == "Holder.method.<locals>.nested"),
+        "`self.helper()` in a closure still names the method's class, got {:?}",
         calls(&output)
     );
     assert!(
-        !calls_named(&output, "deep").is_empty(),
-        "the deeply-nested call must not be dropped, got {:?}",
-        calls(&output)
-    );
-    assert!(
-        calls_named(&output, "nested")
+        calls_named(&output, "Holder.method.<locals>.nested")
             .iter()
             .any(|r| r.src_name == "Holder.method"),
-        "the method's call to its nested def attributes to `Holder.method`, got {:?}",
+        "the method's call to its nested def names the nested entity, got {:?}",
         calls(&output)
     );
 }
@@ -424,4 +437,226 @@ fn fixture_calls_are_all_leaf_names() {
             .any(|r| r.src_name == "home" && r.dst_name == "route"),
         "expected home -> route (from the @app.route decorator)"
     );
+}
+
+// ---- scoping: a bare name resolves the way Python binds it ----
+
+/// The callers in `output` that record a resolution gap for a call whose
+/// callee they could name, with that name.
+fn named_gaps(output: &ParseOutput) -> Vec<(String, String)> {
+    output
+        .relations
+        .iter()
+        .filter(|relation| is_scoped_call_extraction_incomplete_marker(relation))
+        .filter_map(|relation| Some((relation.src_name.clone(), relation.receiver.clone()?)))
+        .collect()
+}
+
+fn callers_of<'a>(output: &'a ParseOutput, name: &str) -> Vec<&'a str> {
+    calls_named(output, name)
+        .into_iter()
+        .map(|relation| relation.src_name.as_str())
+        .collect()
+}
+
+const SCOPING_FIXTURE: &str = "\
+def helper():
+    return 1
+
+
+def with_param(helper):
+    return helper()
+
+
+def with_local():
+    helper = make()
+    return helper()
+
+
+def with_loop(fns):
+    for helper in fns:
+        helper()
+
+
+def with_context(manager):
+    with manager as helper:
+        return helper()
+
+
+def with_except(run):
+    try:
+        run()
+    except Exception as helper:
+        return helper()
+
+
+def enclosing():
+    helper = make()
+
+    def inner():
+        return helper()
+
+    return inner()
+
+
+def with_nonlocal():
+    helper = make()
+
+    def inner():
+        nonlocal helper
+        return helper()
+
+    return inner()
+
+
+def with_global():
+    global helper
+    return helper()
+
+
+def plain():
+    return helper()
+
+
+def make():
+    return len
+";
+
+/// A parameter, a local assignment, a loop, `with` or `except` target, and an
+/// enclosing function's local all hide the module's `def helper` from a call
+/// written in that scope. Each such call reached the module-level function at
+/// parser certainty, so a function its callers only shadow read as called
+/// from every one of them. The call is kept as a named gap instead.
+#[test]
+fn a_call_through_a_local_binding_names_no_module_level_declaration() {
+    let output = extract(SCOPING_FIXTURE);
+    let mut callers = callers_of(&output, "helper");
+    callers.sort_unstable();
+    assert_eq!(
+        callers,
+        vec!["plain", "with_global"],
+        "only a call the module scope binds reaches the module's helper"
+    );
+    let gaps = named_gaps(&output);
+    for caller in [
+        "with_param",
+        "with_local",
+        "with_loop",
+        "with_context",
+        "with_except",
+        "enclosing.<locals>.inner",
+        "with_nonlocal.<locals>.inner",
+    ] {
+        assert!(
+            gaps.contains(&(caller.to_string(), "helper".to_string())),
+            "{caller} calls a local value and records it as a named gap, got {gaps:?}"
+        );
+    }
+}
+
+/// A plain `from module import name` in a function body binds the name there,
+/// so the call carries that module rather than reading as a call to the
+/// module-level declaration of the same name, and the file's own import of
+/// the name from elsewhere does not overwrite it.
+#[test]
+fn a_function_local_import_carries_its_module() {
+    let output = extract(
+        "from .elsewhere import helper\n\ndef helper_user():\n    from .other import helper\n\n    return helper()\n\ndef top_level_user():\n    return helper()\n",
+    );
+    let local = calls_named(&output, "helper")
+        .into_iter()
+        .find(|relation| relation.src_name == "helper_user")
+        .expect("the locally imported call is kept");
+    assert_eq!(local.import_source.as_deref(), Some(".other"));
+    let top = calls_named(&output, "helper")
+        .into_iter()
+        .find(|relation| relation.src_name == "top_level_user")
+        .expect("the module-scope import still binds its call");
+    assert_eq!(top.import_source.as_deref(), Some(".elsewhere"));
+}
+
+/// An aliased local import and `import module` bind a value this parse does
+/// not follow, so their calls are gaps too.
+#[test]
+fn an_aliased_local_import_is_a_local_value() {
+    let output = extract(
+        "def helper():\n    return 1\n\ndef user():\n    from .other import tool as helper\n\n    return helper()\n",
+    );
+    assert!(
+        callers_of(&output, "helper").is_empty(),
+        "{:?}",
+        calls(&output)
+    );
+    assert!(named_gaps(&output).contains(&("user".to_string(), "helper".to_string())));
+}
+
+/// A decorator is evaluated in the scope around its definition, so a bare
+/// decorator an enclosing function receives as a parameter is that value, not
+/// a module-level function sharing its name.
+#[test]
+fn a_decorator_bound_by_an_enclosing_parameter_is_a_gap() {
+    let output = extract(
+        "def deco(fn):\n    return fn\n\ndef outer(deco):\n    @deco\n    def inner():\n        return 1\n\n    return inner\n\n@deco\ndef top():\n    return 2\n",
+    );
+    assert_eq!(
+        callers_of(&output, "deco"),
+        vec!["top"],
+        "{:?}",
+        calls(&output)
+    );
+    assert!(
+        named_gaps(&output).contains(&("outer.<locals>.inner".to_string(), "deco".to_string())),
+        "{:?}",
+        named_gaps(&output)
+    );
+}
+
+/// `rich/repr.py` calls `repr(arg[0])`. The file's Module entity is named
+/// `repr`, but a module binds no name for itself, so the name is the builtin:
+/// the parser keeps the call bare for the linker's builtin gate, and a value
+/// read of `repr` is no reference to anything the file declares.
+#[test]
+fn a_builtin_named_like_its_module_is_not_a_reference_to_the_module() {
+    let output = extract_at(
+        "rich/repr.py",
+        "def auto(cls):\n    def auto_repr(self):\n        out = []\n        append = out.append\n        for arg in self.__rich_repr__():\n            append(repr(arg[0]))\n        return out\n    return auto_repr\n\ndef reprs(items):\n    return list(map(repr, items))\n",
+    );
+    assert!(
+        output
+            .entities
+            .iter()
+            .any(|entity| entity.kind == EntityKind::Module && entity.name == "repr"),
+        "the file's module entity is named for the file"
+    );
+    let repr_calls = calls_named(&output, "repr");
+    assert_eq!(repr_calls.len(), 1, "{:?}", calls(&output));
+    assert_eq!(repr_calls[0].src_name, "auto.<locals>.auto_repr");
+    assert_eq!(repr_calls[0].import_source, None);
+    assert!(
+        !output.relations.iter().any(
+            |relation| relation.kind == RelationKind::References && relation.dst_name == "repr"
+        ),
+        "a read of the builtin is not a reference to the module: {:?}",
+        output.relations
+    );
+    assert!(
+        named_gaps(&output)
+            .contains(&("auto.<locals>.auto_repr".to_string(), "append".to_string())),
+        "the locally bound `append` is a named gap, got {:?}",
+        named_gaps(&output)
+    );
+}
+
+#[test]
+fn a_module_constructor_call_is_already_owned_by_its_constant() {
+    let output = extract("from fastapi import FastAPI\napp = FastAPI()\n");
+    let hits = calls_named(&output, "FastAPI");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the shared census must not lose or duplicate the RHS call"
+    );
+    assert_eq!(hits[0].src_name, "app");
+    assert_eq!(hits[0].import_source.as_deref(), Some("fastapi"));
+    assert!(has_entity(&output, EntityKind::Constant, "app"));
 }

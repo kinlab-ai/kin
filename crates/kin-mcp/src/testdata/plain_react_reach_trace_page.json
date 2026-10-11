@@ -1,0 +1,746 @@
+{
+ "_kin": {
+  "completeness": {
+   "bound": "at_least",
+   "counted": {
+    "exact": false
+   },
+   "limits": [
+    "trace_page_partial"
+   ],
+   "status": "partial"
+  },
+  "envelope_version": 2,
+  "graph_as_of": {
+   "generation": 4
+  },
+  "page": {
+   "byte_offset": 0,
+   "compacted": [
+    {
+     "path": "source_derivation",
+     "same_as": "_kin.source_derivation"
+    },
+    {
+     "path": "negative.advice",
+     "restates": [
+      "negative.subject",
+      "negative.trust_reason"
+     ]
+    }
+   ],
+   "complete": false,
+   "field_offset": 0,
+   "has_more": true,
+   "next_byte": 0,
+   "next_field": 0,
+   "next_record": 55,
+   "record_offset": 0,
+   "total_candidates": 0,
+   "total_records": 101,
+   "total_steps": 14,
+   "version": 1
+  },
+  "response": {
+   "bounded": true,
+   "chars_after_budget": 24569,
+   "compact": true,
+   "max_chars": 24576
+  },
+  "runtime": "repo-daemon",
+  "verdict": {
+   "absence_claim": "not_applicable",
+   "limiting_factor": "local_binding_outstanding",
+   "safe_to_conclude_absent": false,
+   "state": "inconclusive"
+  }
+ },
+ "chain": [],
+ "negative": {
+  "interpretation": "qualified_answer",
+  "safe_to_conclude_absent": false,
+  "subject": "trace_page"
+ },
+ "next_cursor": "eyJ2IjoxLCJzbmFwc2hvdCI6ImZkM2Q0YWU5LWRjMGUtNDE1OC05YTI3LTdlMGQyZmFjNWU1NCIsInJlY29yZCI6NTUsImZpZWxkIjowLCJieXRlIjowfQ",
+ "reach": {
+  "frontier": [
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-reconciler/src/__tests__/ReactBatching-test.internal.js",
+    "in": "d46ccd11-6c19-4062-a0d8-4bb45b1efa8f",
+    "in_name": "ReactBatching-test.internal",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "packages/react-server/src/__tests__/ReactFlightServer-test.js",
+    "in": "9551dc46-1fb9-474e-b0f0-36532d30dc37",
+    "in_name": "ReactFlightServer-test",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "its body spells `advanceTimers` at a call Kin could not tie to a name, and no resolver proved where the call goes"
+   },
+   {
+    "code": null,
+    "file": "compiler/apps/playground/__tests__/e2e/page.spec.ts",
+    "in": "ed5a513d-5d54-4f2b-abc6-3d9f57f5eb06",
+    "in_name": "page.spec",
+    "kind": "unresolved_call",
+    "line": null,
+    "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+    "to_name": "advanceTimers",
+    "why": "it could call `advanceTimers` but its text was not read, and no resolver proved where the call goes"
+   }
+  ],
+  "members": [
+   {
+    "code": "advanceTimers(currentTime);",
+    "distance": 1,
+    "file": "packages/scheduler/src/forks/Scheduler.js",
+    "id": "621a2519-b352-4515-ae7b-f5dcf0f4c692",
+    "kind": "Function",
+    "line": 130,
+    "name": "handleTimeout",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "7056c29b-ead3-48bd-b615-d2605f13c448"
+   },
+   {
+    "code": "advanceTimers(currentTime);",
+    "distance": 1,
+    "file": "packages/scheduler/src/forks/Scheduler.js",
+    "id": "121c6219-7c2c-4b2a-bc70-a5176d5a6e7b",
+    "kind": "Function",
+    "line": 195,
+    "name": "workLoop",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "7056c29b-ead3-48bd-b615-d2605f13c448"
+   },
+   {
+    "code": "return workLoop(initialTime);",
+    "distance": 2,
+    "file": "packages/scheduler/src/forks/Scheduler.js",
+    "id": "da3e6990-e0e5-4bc7-94e2-cc61d4ecfe49",
+    "kind": "Function",
+    "line": 165,
+    "name": "flushWork",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "121c6219-7c2c-4b2a-bc70-a5176d5a6e7b"
+   },
+   {
+    "code": "hasMoreWork = flushWork(currentTime);",
+    "distance": 3,
+    "file": "packages/scheduler/src/forks/Scheduler.js",
+    "id": "fc14cfd1-dbe4-416f-853e-f498b5a683ec",
+    "kind": "Function",
+    "line": 517,
+    "name": "performWorkUntilDeadline",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "da3e6990-e0e5-4bc7-94e2-cc61d4ecfe49"
+   }
+  ]
+ },
+ "readings": [
+  {
+   "key": "reach",
+   "value": {
+    "also_imported_by": 0,
+    "also_referenced_total": 2,
+    "blind_spots": {
+     "calls_through_values": 29183,
+     "unkeyed_lookups": 873,
+     "why": "counted, not listed: lookups by a name built at run time, and calls through a value that spell no member's name; any reader that does not run the program shares them, and where each member is held as a value is listed under also_referenced_by"
+    },
+    "bounds": [],
+    "frontier_total": 172165,
+    "frontier_withheld": [
+     {
+      "rows": 30590,
+      "to": "7056c29b-ead3-48bd-b615-d2605f13c448",
+      "to_name": "advanceTimers"
+     },
+     {
+      "rows": 30601,
+      "to": "121c6219-7c2c-4b2a-bc70-a5176d5a6e7b",
+      "to_name": "workLoop"
+     },
+     {
+      "rows": 40156,
+      "to": "621a2519-b352-4515-ae7b-f5dcf0f4c692",
+      "to_name": "handleTimeout"
+     },
+     {
+      "rows": 30601,
+      "to": "da3e6990-e0e5-4bc7-94e2-cc61d4ecfe49",
+      "to_name": "flushWork"
+     },
+     {
+      "rows": 40157,
+      "to": "fc14cfd1-dbe4-416f-853e-f498b5a683ec",
+      "to_name": "performWorkUntilDeadline"
+     }
+    ],
+    "members_total": 4,
+    "policy": {
+     "bounds": {
+      "frontier_reads_max": 24,
+      "members_max": 2000
+     },
+     "counted_only": [
+      "Imports",
+      "unkeyed_lookup",
+      "call_through_value"
+     ],
+     "follows": [
+      "Calls:type_resolved",
+      "Calls:import_scoped",
+      "Calls:name_only",
+      "call_site:name_unique",
+      "ledger:callback",
+      "ledger:dispatch"
+     ],
+     "not_followed": "calls made later through a member held as a value, and calls resolved to a method a member overrides",
+     "reported_apart": [
+      "References",
+      "UsesType",
+      "Instantiates",
+      "value_use"
+     ]
+    },
+    "question": "which entities can end up calling the focal",
+    "settled_by_membership": 0,
+    "state": "open",
+    "statement": "Every entity that reaches advanceTimers through a followed call is in members (4). 172165 places could still add callers; each is in frontier with its code and why. 2 more entities refer to them without calling them; see also_referenced_by.",
+    "witness_paths": "follow via from any member to the focal; each row's line and code are the call it makes to its via",
+    "frontier_withheld_note": "Each entry counts places that could add callers to the member it names, of the same kinds as the frontier rows, that are not listed one by one. They are already counted in frontier_total."
+   }
+  }
+ ],
+ "total_steps": 0
+}

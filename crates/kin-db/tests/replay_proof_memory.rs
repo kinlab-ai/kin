@@ -387,6 +387,7 @@ fn commit_one_bootstrap_with_a_workspace() {
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     drop(lease);
 

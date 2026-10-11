@@ -846,12 +846,17 @@ fn prepared_adoption_keeps_dependent_import_cache_current_for_the_next_target_ed
     live.adopt_admitted_source_batch(adoption);
     let target = function(&repo, "b.py", "work").id;
     assert!(calls_ids(&repo, caller, target));
-    repo.admit("b.py", "def work():\n    return 44\n");
-    let hash = repo.blobs.write(b"def work():\n    return 44\n").unwrap();
+    // A declaration change needs dependent nomination. A body-only edit
+    // intentionally leaves the import binding surface unaffected.
+    repo.admit("b.py", "def work(value=0):\n    return 44\n");
+    let hash = repo
+        .blobs
+        .write(b"def work(value=0):\n    return 44\n")
+        .unwrap();
     let indexed = kin_index::IndexPipeline::new()
         .index_file_content_with_tests(
             &FilePathId::new("b.py"),
-            b"def work():\n    return 44\n",
+            b"def work(value=0):\n    return 44\n",
             hash,
         )
         .unwrap()
@@ -1242,7 +1247,9 @@ fn prepared_moved_artifact_retires_old_cache_and_projection_before_future_caller
         .get_content(&FilePathId::new("old.py"))
         .is_none());
     let current = repo.graph.get_entity(&target).unwrap().unwrap();
-    let body = b"def work():\n    return 44".to_vec();
+    // Exercise a real exported declaration change, so later reconciliation
+    // must nominate the dependent through the adopted module cache.
+    let body = b"def work(value=0):\n    return 44".to_vec();
     let authored = kin_index::IndexPipeline::new()
         .index_file_content_with_tests(
             &FilePathId::new("new.py"),
@@ -1252,6 +1259,7 @@ fn prepared_moved_artifact_retires_old_cache_and_projection_before_future_caller
         .unwrap()
         .indexed_file;
     let mut updated = current.clone();
+    updated.signature = "def work(value=0)".to_owned();
     updated.fingerprint = authored
         .entities
         .iter()
@@ -1271,7 +1279,7 @@ fn prepared_moved_artifact_retires_old_cache_and_projection_before_future_caller
     )
     .unwrap();
     let actual = std::fs::read(repo.root.path().join("new.py")).unwrap();
-    assert_eq!(actual, b"def work():\n    return 44\n");
+    assert_eq!(actual, b"def work(value=0):\n    return 44\n");
     assert!(!repo.root.path().join("old.py").exists());
     repo.admit("new.py", std::str::from_utf8(&actual).unwrap());
     let indexed = kin_index::IndexPipeline::new()

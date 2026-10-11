@@ -123,9 +123,9 @@ pub struct SpineNode {
     pub entity_name: String,
     /// Neighbors the cap dropped at this node.
     pub dropped: usize,
-    /// How many of them lived outside this node's own file, or `None` when no
-    /// clip record says.
-    pub dropped_crossing_file: Option<usize>,
+    /// How many of them lived outside this node's own source unit, or `None`
+    /// when no clip record says.
+    pub dropped_crossing_unit: Option<usize>,
     /// The cap that clipped this node, so the remediation names the value the
     /// caller would raise.
     pub limit_per_step: usize,
@@ -138,7 +138,7 @@ pub struct SpineNode {
 /// One producer for both walks and for the response-budget pass, which
 /// restates the disclosure after it cuts the chain further, so the three word
 /// one fact one way. The widest node is the first with the most dropped
-/// neighbors. How many of the dropped neighbors crossed a file is stated only
+/// neighbors. How many of the dropped neighbors crossed a unit is stated only
 /// when every node's count is known, so the number always covers the same
 /// nodes as the total beside it.
 pub fn spine_clipped_disclosure(nodes: &[SpineNode]) -> Option<(String, String)> {
@@ -151,11 +151,11 @@ pub fn spine_clipped_disclosure(nodes: &[SpineNode]) -> Option<(String, String)>
     let dropped: usize = nodes.iter().map(|node| node.dropped).sum();
     let crossing = nodes
         .iter()
-        .map(|node| node.dropped_crossing_file)
+        .map(|node| node.dropped_crossing_unit)
         .sum::<Option<usize>>()
         .filter(|crossing| *crossing > 0)
         .map(|crossing| {
-            format!(", {crossing} of which lived outside the file of the node that offered them")
+            format!(", {crossing} of which lived outside the module of the node that offered them")
         })
         .unwrap_or_default();
     let detail = format!(
@@ -387,7 +387,7 @@ mod tests {
             entity_id: format!("{name}-id"),
             entity_name: name.to_string(),
             dropped,
-            dropped_crossing_file: crossing,
+            dropped_crossing_unit: crossing,
             limit_per_step: 3,
         }
     }

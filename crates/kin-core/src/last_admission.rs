@@ -151,11 +151,12 @@ pub fn humanize_age(seconds: u64) -> String {
 /// can state honestly. A read error must not be able to present as freshness.
 pub fn read(layout: &KinLayout) -> LastAdmissionRead {
     let path = layout.kindb_last_admission_path();
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LastAdmissionRead::Absent
-        }
+    let raw = match crate::store_records::read(layout.root(), &path) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) => return LastAdmissionRead::Unreadable(error.to_string()),
+        },
+        Ok(None) => return LastAdmissionRead::Absent,
         Err(error) => return LastAdmissionRead::Unreadable(error.to_string()),
     };
     match serde_json::from_str::<LastAdmission>(&raw) {
@@ -206,47 +207,9 @@ pub fn record(layout: &KinLayout, tracked_artifacts: u64) {
 /// unreadable forever. This mirrors how the durable authority head marker beside
 /// it is published.
 pub fn write(layout: &KinLayout, recorded: &LastAdmission) -> std::io::Result<()> {
-    use std::io::Write;
-
     let path = layout.kindb_last_admission_path();
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("last-admission path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-    let staged = path.with_extension(format!("tmp-{}", std::process::id()));
     let body = serde_json::to_vec(recorded).map_err(std::io::Error::other)?;
-    {
-        let mut file = std::fs::File::create(&staged)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = std::fs::rename(&staged, &path) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error);
-    }
-    sync_directory_metadata(parent)?;
-    Ok(())
-}
-
-/// Sync the containing directory so the rename that published the marker is
-/// itself durable.
-///
-/// A rename is only as durable as the directory entry recording it. Syncing the
-/// staged file alone leaves a window where a crash loses the publication even
-/// though the bytes reached the platter, which is exactly the restart this
-/// record exists to survive. This is the step that makes the atomic publish
-/// above mirror the authority head marker beside it rather than merely resemble
-/// it.
-#[cfg(unix)]
-fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(path).and_then(|directory| directory.sync_all())
-}
-
-/// Non-unix platforms expose no portable directory handle to sync, so the
-/// rename's own ordering guarantees are all there is.
-#[cfg(not(unix))]
-fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
+    crate::store_records::write(layout.root(), &path, &body)
 }
 
 #[cfg(test)]

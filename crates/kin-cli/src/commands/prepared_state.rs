@@ -12,6 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const REPOSITORY_ID_KEY: &str = "repository_id";
 /// Manifest field naming that store's authority generation.
 const AUTHORITY_GENERATION_KEY: &str = "authority_generation";
+/// Manifest field naming how much of its Git history that store admitted.
+///
+/// Stamped from the store, like the two fields above, and never part of the
+/// cache key: a prepared state is always a complete store, because a partial
+/// one is refused at publish and again at materialize, so every key computed
+/// before this field existed still names what it named.
+const HISTORY_STATE_KEY: &str = "history_state";
 
 const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v2";
 const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v2";
@@ -66,7 +73,7 @@ struct MaterializeResult {
 
 pub async fn publish(target: PathBuf, json: bool) -> Result<()> {
     let repo_path = std::env::current_dir()?;
-    let kin_dir = repo_path.join(".kin");
+    let kin_dir = kin_core::layout::store_root_for(&repo_path);
     if !kin_dir.exists() {
         // The condition is this exact directory rather than a discovery: a
         // prepared state is published from the repository root it was built
@@ -75,6 +82,13 @@ pub async fn publish(target: PathBuf, json: bool) -> Result<()> {
         return Err(crate::commands::not_a_kin_repository());
     }
 
+    // A prepared state is reused as a complete store. One that holds only its
+    // checked-out commit would hand every reuse a snapshot as its history.
+    kin_core::history_state::require_complete_for(
+        &kin_core::KinLayout::new(kin_dir.clone()),
+        "kin prepared-state publish",
+    )
+    .map_err(anyhow::Error::msg)?;
     let mut manifest = expected_manifest(&repo_path)?;
     stamp_repository_authority_identity(&mut manifest, &kin_dir)?;
     if prepared_state_expects_vectors(&manifest) {
@@ -276,6 +290,14 @@ fn stamp_repository_authority_identity(manifest: &mut Value, kin_dir: &Path) -> 
         AUTHORITY_GENERATION_KEY.to_string(),
         Value::from(authority.generation),
     );
+    object.insert(
+        HISTORY_STATE_KEY.to_string(),
+        Value::String(
+            kin_core::history_state::standing_at(kin_dir)
+                .code()
+                .to_string(),
+        ),
+    );
     Ok(())
 }
 
@@ -285,6 +307,24 @@ fn stamp_repository_authority_identity(manifest: &mut Value, kin_dir: &Path) -> 
 /// projection of the generation, so comparing paths would accept a payload from
 /// a different store that happens to sit at the same generation.
 fn require_matching_repository_authority_identity(kin_dir: &Path, manifest: &Value) -> Result<()> {
+    // The payload's own record decides, whatever the manifest says: a payload
+    // whose history is partial is never reused as a complete store. A manifest
+    // that stamps a state must also agree with the payload.
+    let history = kin_core::history_state::standing_at(kin_dir);
+    if !history.is_complete() {
+        bail!(
+            "prepared state holds partial history: {}",
+            history.sentence().unwrap_or_default()
+        );
+    }
+    if let Some(declared) = manifest.get(HISTORY_STATE_KEY).and_then(Value::as_str) {
+        if declared != history.code() {
+            bail!(
+                "history state mismatch: manifest declares {declared}, prepared state carries {}",
+                history.code()
+            );
+        }
+    }
     let authority = open_prepared_repository_authority(kin_dir)?;
     let declared_repository = manifest
         .get(REPOSITORY_ID_KEY)
@@ -434,16 +474,22 @@ fn publish_prepared_state_from_kin_dir(
 }
 
 fn materialize_prepared_state(source_dir: &Path, repo_path: &Path) -> Result<()> {
-    let kin_dir = repo_path.join(".kin");
+    let kin_dir = kin_core::layout::reserve_store_root(repo_path)?;
     remove_path_if_exists(&kin_dir)?;
-    copy_dir_recursive(&source_dir.join(".kin"), &kin_dir)
+    copy_dir_recursive(&source_dir.join(".kin"), &kin_dir)?;
+    // The prepared copy may come from a store kept outside some other tree;
+    // it now serves this one.
+    kin_core::layout::stage_store_placement(&kin_dir, &kin_dir, repo_path)?;
+    Ok(())
 }
 
 fn write_embedded_prepared_manifest(kin_dir: &Path, manifest: &Value) -> Result<()> {
-    let manifest_path = kin_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(EMBEDDED_PREPARED_MANIFEST);
+    // Inside the store itself, wherever the store lives.
+    let manifest_path = kin_dir.join(
+        Path::new(EMBEDDED_PREPARED_MANIFEST)
+            .strip_prefix(".kin")
+            .expect("the embedded manifest path is under .kin"),
+    );
     if let Some(parent) = manifest_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -545,7 +591,10 @@ mod tests {
         vector_enabled: bool,
         with_vectors: bool,
     ) -> Value {
-        let initialized = kin_core::init(dir).expect("initialize prepared repository");
+        // Prepare from the store the default init actually returned, then use
+        // the product publisher to construct the archive's fixed .kin payload.
+        let source = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(source.path()).expect("initialize prepared repository");
         let layout = initialized.layout;
         let kindb = layout.kindb_dir();
         fs::create_dir_all(layout.text_index_dir()).unwrap();
@@ -572,17 +621,8 @@ mod tests {
                 .entry(*key)
                 .or_insert(json!("stub"));
         }
-        fs::write(
-            dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        fs::create_dir_all(dir.join(".kin/bench")).unwrap();
-        fs::write(
-            dir.join(EMBEDDED_PREPARED_MANIFEST),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
+        publish_prepared_state_from_kin_dir(layout.root(), dir, &manifest)
+            .expect("publish the complete prepared store payload");
         manifest
     }
 

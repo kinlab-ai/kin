@@ -418,6 +418,10 @@ pub struct AuthorityFrame {
     /// a frame that moves it is one an older reader refuses at the header.
     #[serde(default)]
     pub owed_derivations: OwedDerivationPatch,
+    /// Immutable Git commit/tree evidence added by this successor. Appended
+    /// after the ledger; an empty list preserves every earlier frame byte.
+    #[serde(default)]
+    pub git_snapshot_proofs: Vec<kin_model::GitSnapshotProof>,
 }
 
 impl Serialize for AuthorityFrame {
@@ -425,14 +429,18 @@ impl Serialize for AuthorityFrame {
         use serde::ser::SerializeStruct;
         // Positional: a trailing field is written only when it, or one after
         // it, is, so every earlier position stays filled.
-        let ledger = !self.owed_derivations.is_unchanged();
+        let proofs = !self.git_snapshot_proofs.is_empty();
+        let ledger = !self.owed_derivations.is_unchanged() || proofs;
         let capability = self.schema_version
             >= super::binding_history::BINDING_HISTORY_AUTHORITY_SCHEMA
             || ledger;
         let collaboration = capability || !self.collaboration.is_empty();
         let mut out = serializer.serialize_struct(
             "AuthorityFrame",
-            12 + usize::from(collaboration) + usize::from(capability) + usize::from(ledger),
+            12 + usize::from(collaboration)
+                + usize::from(capability)
+                + usize::from(ledger)
+                + usize::from(proofs),
         )?;
         out.serialize_field("schema_version", &self.schema_version)?;
         out.serialize_field("repository_id", &self.repository_id)?;
@@ -455,6 +463,9 @@ impl Serialize for AuthorityFrame {
         if ledger {
             out.serialize_field("owed_derivations", &self.owed_derivations)?;
         }
+        if proofs {
+            out.serialize_field("git_snapshot_proofs", &self.git_snapshot_proofs)?;
+        }
         out.end()
     }
 }
@@ -468,7 +479,7 @@ impl AuthorityFrame {
     /// Version 3 appends [`CollaborationPatch`]. A frame is written at the
     /// version its contents need ([`Self::wire_version`]), so only a frame
     /// that carries collaboration is a version 3 frame.
-    pub const CURRENT_VERSION: u32 = Self::CONTEXT_VALIDATIONS_VERSION;
+    pub const CURRENT_VERSION: u32 = Self::GIT_SNAPSHOT_PROOFS_VERSION;
 
     /// The version a schema5 frame whose owed derivation ledger did not move
     /// is written at, binding-history capability included.
@@ -506,6 +517,9 @@ impl AuthorityFrame {
     /// The layout is unchanged, but older readers must refuse before replay.
     pub const CONTEXT_VALIDATIONS_VERSION: u32 = 9;
 
+    /// A successor adding immutable Git snapshot evidence.
+    pub const GIT_SNAPSHOT_PROOFS_VERSION: u32 = 10;
+
     /// The oldest frame format version this binary reads, and the version a
     /// frame that carries no collaboration is still written at.
     ///
@@ -522,7 +536,8 @@ impl AuthorityFrame {
     /// The version these exact contents are written at.
     ///
     /// Derived from the contents, as a snapshot's version is: a frame that
-    /// carries a context validation uses version9, one that carries a call-site
+    /// adds a Git snapshot proof uses version10, one that carries a context
+    /// validation uses version9, one that carries a call-site
     /// ledger uses version8, one that carries any other
     /// resolution record uses version7, one that carries enrichment marks uses
     /// version6, and one that moves the owed derivation ledger uses version5,
@@ -532,6 +547,9 @@ impl AuthorityFrame {
     /// capability. In legacy schemas, collaboration uses version3 and a frame
     /// without it keeps the version2 body byte for byte.
     pub fn wire_version(&self) -> u32 {
+        if !self.git_snapshot_proofs.is_empty() {
+            return Self::GIT_SNAPSHOT_PROOFS_VERSION;
+        }
         if self.carries_context_validations() {
             return Self::CONTEXT_VALIDATIONS_VERSION;
         }
@@ -754,7 +772,7 @@ impl AuthorityFrame {
         if frame.wire_version() != declared {
             return Err(KinDbError::StorageError(format!(
                 "authority frame declares version {declared} but its contents are written at \
-                 version {}; context validations require version9, call-site ledgers \
+                 version {}; Git snapshot proofs require version10, context validations require version9, call-site ledgers \
                  require version8, other resolution records \
                  require version7, enrichment marks require version6, a moved owed derivation \
                  ledger requires version5, schema5 requires version4, while legacy frames use \
@@ -815,6 +833,28 @@ impl AuthorityFrame {
             |workspace| workspace.workspace_id,
             "frame workspaces",
         )?;
+        require_sorted_unique_by(
+            &self.git_snapshot_proofs,
+            |proof| proof.snapshot_change_id,
+            "frame Git snapshot proofs",
+        )?;
+        for proof in &self.git_snapshot_proofs {
+            proof
+                .validate_for_repository(&self.repository_id)
+                .map_err(|error| {
+                    KinDbError::StorageError(format!("invalid frame Git snapshot proof: {error}"))
+                })?;
+            if !self.changes.iter().any(|change| {
+                change.id == proof.snapshot_change_id
+                    && matches!(change.origin, kin_model::ChangeOrigin::Native)
+                    && change.parents.is_empty()
+            }) {
+                return Err(KinDbError::StorageError(format!(
+                    "frame Git snapshot proof {} must accompany its new Native root change",
+                    proof.snapshot_change_id
+                )));
+            }
+        }
         self.collaboration.validate_shape()?;
         Ok(())
     }
@@ -980,6 +1020,10 @@ impl AuthorityFrame {
                 &base.owed_derivations,
                 &successor.owed_derivations,
             ),
+            git_snapshot_proofs: snapshot_proof_additions(
+                &base.git_snapshot_proofs,
+                &successor.git_snapshot_proofs,
+            )?,
         };
         frame.validate_shape()?;
         Ok(frame)
@@ -1069,6 +1113,7 @@ impl AuthorityFrame {
         &self,
         mut envelope: PersistedRepositoryAuthority,
     ) -> Result<PersistedRepositoryAuthority, KinDbError> {
+        self.validate_shape()?;
         let generation = self.generation();
         if envelope.repository_id != self.repository_id {
             return Err(KinDbError::StorageError(format!(
@@ -1107,6 +1152,13 @@ impl AuthorityFrame {
             &self.aliases,
             |alias| alias.oid,
             "external alias",
+            generation,
+        )?;
+        merge_absent(
+            &mut envelope.git_snapshot_proofs,
+            &self.git_snapshot_proofs,
+            |proof| proof.snapshot_change_id,
+            "Git snapshot proof",
             generation,
         )?;
         self.git_external_authority
@@ -1667,6 +1719,37 @@ pub fn journal_sha256(
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn snapshot_proof_additions(
+    base: &[kin_model::GitSnapshotProof],
+    successor: &[kin_model::GitSnapshotProof],
+) -> Result<Vec<kin_model::GitSnapshotProof>, KinDbError> {
+    require_sorted_unique_by(
+        base,
+        |proof| proof.snapshot_change_id,
+        "base Git snapshot proofs",
+    )?;
+    require_sorted_unique_by(
+        successor,
+        |proof| proof.snapshot_change_id,
+        "successor Git snapshot proofs",
+    )?;
+    let successor_by_id: BTreeMap<_, _> = successor
+        .iter()
+        .map(|proof| (proof.snapshot_change_id, proof))
+        .collect();
+    for held in base {
+        if successor_by_id.get(&held.snapshot_change_id).copied() != Some(held) {
+            return Err(KinDbError::StorageError(format!(
+                "authority frame removes or changes held Git snapshot proof {}",
+                held.snapshot_change_id
+            )));
+        }
+    }
+    Ok(absent_from_base(base, successor, |proof| {
+        proof.snapshot_change_id
+    }))
+}
+
 fn decode_digest(hex_digest: &str, label: &str) -> Result<[u8; 32], KinDbError> {
     let bytes = hex::decode(hex_digest).map_err(|error| {
         KinDbError::StorageError(format!("{label} digest {hex_digest} is not hex: {error}"))
@@ -1793,6 +1876,215 @@ impl CollaborationPatch {
 mod tests {
     use super::*;
 
+    fn snapshot_wire_fixture() -> (PersistedRepositoryAuthority, AuthorityFrame) {
+        use kin_model::{AuthorId, Hash256, OperationId, Timestamp};
+        let mut base = PersistedRepositoryAuthority::empty(
+            RepositoryId::new("snapshot-proof-wire").unwrap(),
+            &GraphSnapshot::empty(),
+        )
+        .unwrap();
+        base.schema_version = super::super::repository::MIN_REPOSITORY_AUTHORITY_SCHEMA_VERSION;
+        let mut roots_after = base.roots.clone();
+        roots_after.generation += 1;
+        let operation = RepositoryOperationRecord {
+            operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(1)),
+            repository_id: base.repository_id.clone(),
+            transaction_hash: Hash256::from_bytes([1; 32]),
+            actor: AuthorId::new("snapshot-proof-wire"),
+            committed_at: Timestamp(
+                chrono::DateTime::parse_from_rfc3339("2026-10-07T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            git_authority_delta: None,
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            roots_before: base.roots.clone(),
+            roots_after,
+            merge_transaction_delta: None,
+        };
+        let frame = AuthorityFrame {
+            schema_version: base.schema_version,
+            repository_id: base.repository_id.clone(),
+            operation,
+            changes: Vec::new(),
+            admission_policies: Vec::new(),
+            external_objects: Vec::new(),
+            aliases: Vec::new(),
+            git_external_authority: GitExternalAuthorityPatch::Unchanged,
+            ref_state: base.ref_state.clone(),
+            workspaces: Vec::new(),
+            local_overlays: Vec::new(),
+            merge_transactions: Vec::new(),
+            collaboration: CollaborationPatch::default(),
+            binding_history: Vec::new(),
+            owed_derivations: OwedDerivationPatch::Unchanged,
+            git_snapshot_proofs: Vec::new(),
+        };
+        (base, frame)
+    }
+
+    fn snapshot_wire_proof(
+        repository_id: RepositoryId,
+        identity: u8,
+    ) -> kin_model::GitSnapshotProof {
+        use kin_model::{
+            ExternalObjectId, ExternalObjectKind, GitObjectId, Hash256, SemanticChangeId,
+        };
+        let source_commit = GitObjectId::sha1([identity; 20]);
+        kin_model::GitSnapshotProof {
+            repository_id,
+            snapshot_change_id: SemanticChangeId::from_hash(Hash256::from_bytes([identity; 32])),
+            source_commit,
+            objects: vec![ExternalObjectId::new(
+                ExternalObjectKind::Commit,
+                source_commit,
+            )],
+        }
+    }
+
+    fn add_snapshot_wire_proof(frame: &mut AuthorityFrame) {
+        let proof = snapshot_wire_proof(frame.repository_id.clone(), 2);
+        frame.changes.push(SemanticChange {
+            id: proof.snapshot_change_id,
+            origin: kin_model::ChangeOrigin::Native,
+            parents: Vec::new(),
+            timestamp: frame.operation.committed_at.clone(),
+            author: frame.operation.actor.clone(),
+            message: "snapshot proof wire shape only".into(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            resolution_record_deltas: Vec::new(),
+        });
+        frame.git_snapshot_proofs.push(proof);
+    }
+
+    /// The complete raw Git closure is covered at admission. This fixture
+    /// deliberately exercises only the frame codec and envelope replay.
+    #[test]
+    fn snapshot_proof_frame_round_trips_with_all_positional_placeholders() {
+        let (base, mut frame) = snapshot_wire_fixture();
+        let legacy = frame.to_bytes().unwrap();
+        assert_eq!(legacy, LegacyFrameV2::from_frame(&frame).to_bytes());
+        assert!(AuthorityFrame::from_bytes(&legacy)
+            .unwrap()
+            .git_snapshot_proofs
+            .is_empty());
+        add_snapshot_wire_proof(&mut frame);
+        let bytes = frame.to_bytes().unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 10);
+        let body = AuthorityFrame::verify_frame_bytes(&bytes).unwrap();
+        assert_eq!(
+            &body[..3],
+            &[0xdc, 0, 16],
+            "all sixteen positions are present"
+        );
+        let decoded = AuthorityFrame::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, frame);
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+        let successor = decoded.apply_to_envelope(base).unwrap();
+        assert_eq!(successor.git_snapshot_proofs, frame.git_snapshot_proofs);
+        assert_eq!(successor.roots, frame.operation.roots_after);
+        assert_eq!(successor.operation_log, vec![frame.operation.clone()]);
+        // A subsequent no-proof frame still uses its old rung, while replay
+        // retains the proof already held in the predecessor envelope.
+        let (_, mut later) = snapshot_wire_fixture();
+        later.operation.operation_id = kin_model::OperationId::from_uuid(uuid::Uuid::from_u128(2));
+        later.operation.roots_before = successor.roots.clone();
+        later.operation.roots_after = successor.roots.clone();
+        later.operation.roots_after.generation += 1;
+        assert_eq!(later.wire_version(), AuthorityFrame::MIN_SUPPORTED_VERSION);
+        let later = AuthorityFrame::from_bytes(&later.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            later
+                .apply_to_envelope(successor)
+                .unwrap()
+                .git_snapshot_proofs,
+            frame.git_snapshot_proofs
+        );
+        assert!(AuthorityFrame::check_readable_version(10, 9).is_err());
+        let mut disguised = bytes;
+        disguised[4..8].copy_from_slice(&9u32.to_le_bytes());
+        assert!(AuthorityFrame::from_bytes(&disguised)
+            .unwrap_err()
+            .to_string()
+            .contains("Git snapshot proofs require version10"));
+        frame.git_snapshot_proofs.clear();
+        frame.changes.clear();
+        assert_eq!(frame.to_bytes().unwrap(), legacy);
+    }
+
+    #[test]
+    fn snapshot_proof_frame_refuses_duplicate_rebind_and_detached_evidence() {
+        let (mut base, mut frame) = snapshot_wire_fixture();
+        add_snapshot_wire_proof(&mut frame);
+        base.git_snapshot_proofs = frame.git_snapshot_proofs.clone();
+        assert!(frame
+            .apply_to_envelope(base.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("re-adds Git snapshot proof"));
+        base.git_snapshot_proofs[0]
+            .objects
+            .push(kin_model::ExternalObjectId::new(
+                kin_model::ExternalObjectKind::Blob,
+                kin_model::GitObjectId::sha1([8; 20]),
+            ));
+        assert!(frame.apply_to_envelope(base).is_err());
+        frame.changes.clear();
+        // `to_bytes` is a codec, not an admission path. A hostile frame can
+        // carry a valid checksum, so exercise the decoder and direct replay
+        // checks that refuse its detached proof. The writer's encode_proven
+        // path also decodes its exact bytes before yielding a ProvenFrame.
+        let detached = frame.to_bytes().unwrap();
+        AuthorityFrame::verify_frame_bytes(&detached)
+            .expect("exercise a checksum-valid malformed frame");
+        assert!(AuthorityFrame::from_bytes(&detached)
+            .unwrap_err()
+            .to_string()
+            .contains("new Native root"));
+        assert!(frame
+            .apply_to_envelope(snapshot_wire_fixture().0)
+            .unwrap_err()
+            .to_string()
+            .contains("new Native root"));
+    }
+
+    #[test]
+    fn snapshot_proof_set_additions_preserve_old_bindings_at_any_sort_position() {
+        let repository = RepositoryId::new("snapshot-proof-wire").unwrap();
+        let earlier = snapshot_wire_proof(repository.clone(), 1);
+        let held = snapshot_wire_proof(repository.clone(), 2);
+        let later = snapshot_wire_proof(repository, 3);
+        let successor = vec![earlier.clone(), held.clone(), later.clone()];
+        assert_eq!(
+            snapshot_proof_additions(std::slice::from_ref(&held), &successor).unwrap(),
+            vec![earlier, later]
+        );
+        assert!(snapshot_proof_additions(std::slice::from_ref(&held), &[]).is_err());
+        let mut rebound = held.clone();
+        rebound.objects.push(kin_model::ExternalObjectId::new(
+            kin_model::ExternalObjectKind::Blob,
+            kin_model::GitObjectId::sha1([8; 20]),
+        ));
+        assert!(snapshot_proof_additions(std::slice::from_ref(&held), &[rebound]).is_err());
+        assert!(snapshot_proof_additions(&[], &[held.clone(), held.clone()]).is_err());
+        assert!(
+            snapshot_proof_additions(std::slice::from_ref(&held), std::slice::from_ref(&held))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// The exhaustiveness guard. The patch names exactly the collections the
     /// collaboration model has, in its fold order, and its own fields are
     /// those names. A collection the model gains without a patch field goes
@@ -1853,11 +2145,11 @@ mod tests {
     fn frame_versions_outside_the_supported_range_refuse_by_name() {
         let body = b"never decoded";
         for (version, needle) in [
-            (1, "this kin-db reads versions 2 to 9"),
+            (1, "this kin-db reads versions 2 to 10"),
             (
                 AuthorityFrame::CURRENT_VERSION + 1,
                 "a newer kin-db wrote it, so open this store with a kin built on a kin-db that \
-                 reads frame version 10",
+                 reads frame version 11",
             ),
         ] {
             let mut bytes = frame_bytes_from(body);

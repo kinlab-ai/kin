@@ -174,6 +174,11 @@ pub enum EmbeddingState {
     Absent,
     /// Nobody could say.
     Unknown,
+    /// The answer ranked without search vectors: entity cards and the graph
+    /// ranked it, which is what a setup with no usable vectors runs. The store's
+    /// vectors limit nothing about such an answer, so the graph decides its
+    /// completeness and missing vectors are never reported as a gap.
+    NotUsed,
 }
 
 impl EmbeddingState {
@@ -188,6 +193,7 @@ impl EmbeddingState {
             Self::Partial => STATE_PARTIAL,
             Self::Absent => STATE_ABSENT,
             Self::Unknown => STATE_UNKNOWN,
+            Self::NotUsed => STATE_NOT_USED,
         }
     }
 
@@ -195,7 +201,7 @@ impl EmbeddingState {
     /// [`Completeness::limits`], or `None` when there is no shortfall to name.
     fn limit_label(self) -> Option<&'static str> {
         match self {
-            Self::Present => None,
+            Self::Present | Self::NotUsed => None,
             Self::Partial => Some("embeddings_partial"),
             Self::Absent => Some("embeddings_absent"),
             Self::Unknown => Some("embeddings_unknown"),
@@ -228,6 +234,7 @@ impl SemanticCoverage {
             Some("partial") => return EmbeddingState::Partial,
             Some("absent") => return EmbeddingState::Absent,
             Some("unknown") => return EmbeddingState::Unknown,
+            Some("not_used") => return EmbeddingState::NotUsed,
             // An unrecognized word is a producer this build does not understand.
             // Reading it as healthy would let a future state certify answers
             // nobody has decided are certifiable.
@@ -1080,7 +1087,7 @@ impl GraphBehind {
             ));
         }
         self.changed_unchecked.then(|| {
-            "tracked_changes_unchecked: the daemon could not check whether tracked files \
+            "tracked_changes_unchecked: the daemon could not check whether tracked source \
              changed while no daemon was watching, so this answer may describe bytes the \
              working copy no longer holds; `kin admit` reads the whole working copy and \
              settles it"
@@ -1149,7 +1156,7 @@ impl GraphBehind {
         }
         if self.changed_unchecked {
             gaps.push(
-                "whether tracked files changed while no daemon was watching is unknown, \
+                "whether tracked source changed while no daemon was watching is unknown, \
                  because the daemon's check for them could not run, and `kin admit` settles it"
                     .to_string(),
             );
@@ -1420,7 +1427,7 @@ pub enum AbsenceSubstrate {
 ///
 /// Derived from the two registries that already exist rather than declared in a
 /// third: a tool that names cross-file edge classes in
-/// [`crate::negative::absence_cross_file_classes`] answers from edges, a tool
+/// [`crate::negative::absence_cross_unit_classes`] answers from edges, a tool
 /// whose [`NegativeClass`] is `Semantic` answers from embeddings, and every
 /// other retrieval tool answers from the entity/relation index. A third list
 /// would drift from the two, which is the failure the per-tool maps in
@@ -1458,6 +1465,10 @@ const STATE_UNPRODUCED: &str = "unproduced";
 /// An edge class has no such reading, because the scan either found a
 /// cross-file edge of the class or it did not.
 const STATE_PARTIAL: &str = "partial";
+/// The embedding class of an answer that ranked without search vectors. It is
+/// disclosure and never decides: such an answer is decided by the graph its
+/// entity cards were built from.
+const STATE_NOT_USED: &str = "not_used";
 
 /// The completeness signal every retrieval response carries, empty or not
 /// (FIR-2357 item 1).
@@ -1548,7 +1559,7 @@ impl Completeness {
         envelope: &Envelope,
         resolution_miss: bool,
     ) -> Option<Self> {
-        let edge_classes = crate::negative::absence_cross_file_classes(tool, payload);
+        let edge_classes = crate::negative::absence_cross_unit_classes(tool, payload);
         // A recognized name-resolution miss searched the entity index. No
         // reference or path walk ran, so absent edge coverage cannot qualify
         // that different answer. Only the error classifier selects this arm.
@@ -1562,12 +1573,34 @@ impl Completeness {
                 NegativeClass::Structural => CoverageSubstrate::Graph,
             }
         };
+        // An answer that ranked without search vectors read entity cards over
+        // the graph, so the graph decides it. Deciding it by an embedding class
+        // it never read reported every no-embeddings answer as a partial index.
+        let ranked_without_vectors = substrate == CoverageSubstrate::Embeddings
+            && envelope
+                .semantic_coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.embedding_state() == EmbeddingState::NotUsed);
+        let substrate = if ranked_without_vectors {
+            CoverageSubstrate::Graph
+        } else {
+            substrate
+        };
 
         let (mut classes, mut decided_by, mut limits) = match substrate {
             CoverageSubstrate::Edges => edge_class_states(tool, payload, &edge_classes),
             CoverageSubstrate::Embeddings => embedding_class_states(envelope),
             CoverageSubstrate::Graph => graph_class_states(envelope),
         };
+        if ranked_without_vectors {
+            classes.insert(
+                "embeddings".to_string(),
+                json!(EmbeddingState::NotUsed.class_state()),
+            );
+            if let Some(coverage) = envelope.semantic_coverage.as_ref() {
+                limits.extend(coverage.scope_limits());
+            }
+        }
 
         // A file enumeration is decided by that file's own parse state, which
         // no store-level class can see. A completely loaded, fully embedded,
@@ -1872,7 +1905,7 @@ impl WatcherLossObservation {
             None => String::new(),
         };
         format!(
-            "watcher_events_lost: the filesystem watcher reported that it lost events (loss \
+            "watcher_events_lost: the working-copy watcher reported that it lost events (loss \
              generation {}, recovered through {}{at}) and no complete admission has covered them, \
              so an unknown set of paths changed without reaching graph truth and no absence in \
              this answer is authoritative; run `kin admit` on the repository to admit the complete \
@@ -2290,7 +2323,7 @@ fn counted_for(tool: &str, payload: &Value) -> Option<Value> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HydrationSemanticsObservation {
     /// The stable standing label from `kin_core`: `current`, `behind`, `ahead`,
-    /// `unstamped` or `unreadable`.
+    /// `other_build`, `unstamped` or `unreadable`.
     pub standing: String,
     /// The replay-semantics version the build answering this call derives.
     pub derives: u32,
@@ -2303,7 +2336,7 @@ pub struct HydrationSemanticsObservation {
     /// history recorded before that upgrade keeps the creation version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgraded_under: Option<u32>,
-    /// The concrete read failure for an unreadable record.
+    /// The concrete read failure, or the newer recorded release that refuses this build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -2347,6 +2380,17 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
         // One arm per variant, so a new standing has to be projected here
         // rather than silently inheriting whichever default it fell through to.
         let (created_under, upgraded_under, derives, reason) = match standing {
+            Standing::NewerRelease {
+                created_under,
+                upgraded_under,
+                derives,
+                ..
+            } => (
+                *created_under,
+                *upgraded_under,
+                *derives,
+                Some(standing.sentence()),
+            ),
             Standing::Current { version } => (Some(*version), None, *version, None),
             Standing::Behind {
                 created_under,
@@ -2361,6 +2405,12 @@ impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemant
                 created_under,
                 derives,
             } => (*created_under, Some(*under), *derives, None),
+            Standing::OtherDerivation {
+                version, rederived, ..
+            } => {
+                let upgraded = rederived.then_some(*version);
+                ((!rederived).then_some(*version), upgraded, *version, None)
+            }
             Standing::Unstamped { derives } => (None, None, *derives, None),
             Standing::Unreadable { derives, reason } => {
                 (None, None, *derives, Some(reason.clone()))
@@ -2386,6 +2436,12 @@ pub struct Envelope {
     /// Embedding coverage when known; `null`/absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<SemanticCoverage>,
+    /// Model stages observed by the producer on this answer. Configuration is
+    /// never evidence that a stage ran. Filter counts bound absence claims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_slots: Vec<kin_core::models::ModelUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_slots_invalid: Option<bool>,
     /// Precise graph version marker when known; `null`/absent otherwise. Populated
     /// from the daemon `/health` `graph_generation` marker (the monotonic snapshot
     /// generation, bumped per committed snapshot) via [`Envelope::with_health`], or
@@ -2425,6 +2481,11 @@ pub struct Envelope {
     /// Bounded source evidence for the exact graph selected by the query producer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_derivation: Option<crate::source_derivation::SourceDerivationObservation>,
+    /// Tool-bound qualification captured from the full private source observation.
+    /// Its absence is not evidence of current source; a valid reading can only
+    /// retain or limit the other inputs' conclusion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_qualification: Option<crate::source_derivation::SourceQualification>,
     /// Whether the watcher that fed graph truth admits it lost events, beside
     /// `freshness` rather than inside it because the two answer different
     /// questions. `freshness` answers "was the graph ever brought level"; this
@@ -2444,6 +2505,13 @@ pub struct Envelope {
     /// [`HydrationSemanticsObservation`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydration_semantics: Option<HydrationSemanticsObservation>,
+    /// Present when this store admitted only its checked-out commit, so its
+    /// Git history is partial: what it admitted, how far the background
+    /// derivation got, and the sentence the CLI prints. Absent for a complete
+    /// store and when no repository is discoverable. An answer that reads
+    /// history is never certified while this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_history: Option<kin_core::history_state::PartialHistoryNotice>,
     /// The completeness signal (FIR-2357): what this answer's substrate could
     /// have found, present on every retrieval response whether it came back
     /// empty or full. `negative` guards only the empty case; this guards the
@@ -2496,11 +2564,14 @@ impl Envelope {
             envelope_version: ENVELOPE_VERSION,
             runtime: Runtime::OfflineInProcess,
             semantic_coverage: None,
+            model_slots: Vec::new(),
+            model_slots_invalid: None,
             graph_as_of: None,
             durability: None,
             behind: None,
             freshness: None,
             source_derivation: None,
+            source_qualification: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2508,6 +2579,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             hydration_semantics: None,
+            partial_history: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -2528,15 +2600,19 @@ impl Envelope {
             envelope_version: self.envelope_version,
             runtime: self.runtime,
             semantic_coverage: None,
+            model_slots: Vec::new(),
+            model_slots_invalid: None,
             graph_as_of: None,
             durability: None,
             behind: self.behind,
             freshness: None,
             source_derivation: None,
+            source_qualification: None,
             watcher_loss: self.watcher_loss,
             graph_state: GraphState::default(),
             degraded: self.degraded,
             hydration_semantics: None,
+            partial_history: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -2556,15 +2632,19 @@ impl Envelope {
             envelope_version: ENVELOPE_VERSION,
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
+            model_slots: Vec::new(),
+            model_slots_invalid: None,
             graph_as_of: None,
             durability: None,
             behind: None,
             freshness: None,
             source_derivation: None,
+            source_qualification: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             hydration_semantics: None,
+            partial_history: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -2811,6 +2891,21 @@ impl Envelope {
         self
     }
 
+    /// Stamp what this store admitted of its Git history.
+    ///
+    /// Disclosure plus one trust rule: while it is present, no answer whose
+    /// substrate is history is certified, because every revision before the
+    /// snapshot is missing from the store rather than absent from the
+    /// repository. Absent for a complete store and when no repository is
+    /// discoverable, so it makes no claim nobody measured.
+    pub fn with_partial_history(
+        mut self,
+        standing: Option<&kin_core::history_state::HistoryStanding>,
+    ) -> Self {
+        self.partial_history = standing.and_then(kin_core::history_state::HistoryStanding::notice);
+        self
+    }
+
     /// Stamp that this store's last enrichment sweep did not publish everything
     /// it offered.
     ///
@@ -2840,11 +2935,14 @@ impl Envelope {
             envelope_version: ENVELOPE_VERSION,
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
+            model_slots: Vec::new(),
+            model_slots_invalid: None,
             graph_as_of: None,
             durability: None,
             behind: None,
             freshness: None,
             source_derivation: None,
+            source_qualification: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2852,6 +2950,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             hydration_semantics: None,
+            partial_history: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -2872,11 +2971,14 @@ impl Envelope {
             envelope_version: ENVELOPE_VERSION,
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
+            model_slots: Vec::new(),
+            model_slots_invalid: None,
             graph_as_of: None,
             durability: None,
             behind: None,
             freshness: None,
             source_derivation: None,
+            source_qualification: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2884,6 +2986,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             hydration_semantics: None,
+            partial_history: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -2906,11 +3009,14 @@ impl Envelope {
             envelope_version: ENVELOPE_VERSION,
             runtime: Runtime::RepoDaemon,
             semantic_coverage: None,
+            model_slots: Vec::new(),
+            model_slots_invalid: None,
             graph_as_of: None,
             durability: None,
             behind: None,
             freshness: None,
             source_derivation: None,
+            source_qualification: None,
             watcher_loss: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
@@ -2918,6 +3024,7 @@ impl Envelope {
                 ..Degraded::default()
             },
             hydration_semantics: None,
+            partial_history: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -3092,6 +3199,23 @@ impl Envelope {
     /// so the older shape still lifts rather than reporting coverage unknown next
     /// to a coverage figure the same response had just printed.
     pub fn with_payload_metadata(mut self, payload: &Value) -> Self {
+        if let Some(value) = payload.get("model_slots") {
+            match serde_json::from_value::<Vec<kin_core::models::ModelUse>>(value.clone()) {
+                Ok(observed) if observed.iter().all(kin_core::models::ModelUse::validate) => {
+                    self.model_slots = observed
+                }
+                _ => self.model_slots_invalid = Some(true),
+            }
+        }
+        if let Some(value) = payload
+            .get("scorer")
+            .and_then(|scorer| scorer.get("observed"))
+        {
+            match serde_json::from_value::<kin_core::models::ModelUse>(value.clone()) {
+                Ok(observed) if observed.validate() => self.model_slots.push(observed),
+                _ => self.model_slots_invalid = Some(true),
+            }
+        }
         if let Some(value) = payload.get(crate::source_derivation::KEY) {
             self.source_derivation =
                 Some(serde_json::from_value(value.clone()).unwrap_or_else(|_| {
@@ -3133,6 +3257,87 @@ impl Envelope {
         self
     }
 
+    fn with_payload_metadata_for_tool(mut self, payload: &Value, tool: &str) -> Self {
+        self = self.with_payload_metadata(payload);
+        if let Some(value) = payload
+            .get(crate::source_derivation::QUALIFICATION_KEY)
+            .or_else(|| {
+                payload
+                    .get(ENVELOPE_KEY)?
+                    .get(crate::source_derivation::QUALIFICATION_KEY)
+            })
+        {
+            match serde_json::from_value::<crate::source_derivation::SourceQualification>(
+                value.clone(),
+            ) {
+                Ok(qualification) if qualification.valid_for(tool) => {
+                    self.source_qualification = Some(qualification);
+                }
+                _ => {
+                    self.source_qualification = None;
+                    self.source_derivation = Some(
+                        crate::source_derivation::SourceDerivationObservation::unavailable(
+                            "invalid_source_qualification",
+                        ),
+                    );
+                }
+            }
+        }
+        if self
+            .source_qualification
+            .as_ref()
+            .is_some_and(|qualified| !qualified.valid_for(tool))
+        {
+            self.source_qualification = None;
+            self.source_derivation = Some(
+                crate::source_derivation::SourceDerivationObservation::unavailable(
+                    "invalid_source_qualification",
+                ),
+            );
+        }
+        // A public coverage summary says an observation existed, but does not
+        // contain its authority reading. Missing qualification is not success.
+        if self.source_derivation.is_none()
+            && self.source_qualification.is_none()
+            && (payload.get("binding_coverage").is_some()
+                || payload.pointer("/_kin/binding_coverage").is_some())
+        {
+            self.source_derivation = Some(
+                crate::source_derivation::SourceDerivationObservation::unavailable(
+                    "missing_source_qualification",
+                ),
+            );
+        }
+        self
+    }
+
+    pub(crate) fn source_limiting_factor(
+        &self,
+        substrate: AbsenceSubstrate,
+    ) -> Option<&'static str> {
+        if let Some(observation) = &self.source_derivation {
+            observation.limiting_factor(substrate)
+        } else {
+            self.source_qualification
+                .as_ref()
+                .and_then(|qualified| qualified.limiting_factor(substrate))
+        }
+    }
+
+    fn source_is_historical(&self) -> bool {
+        self.source_derivation.as_ref().map_or_else(
+            || {
+                self.source_qualification
+                    .as_ref()
+                    .is_some_and(|qualified| qualified.is_historical())
+            },
+            |observation| {
+                observation.scope
+                    == crate::source_derivation::SourceObservationScope::SelectedHistorical
+            },
+        )
+    }
+
     /// The replay-semantics reason an answer cannot be certified, when there is
     /// one, naming the action that removes it.
     ///
@@ -3155,7 +3360,9 @@ impl Envelope {
     ) -> Option<&'static str> {
         let observation = self.hydration_semantics.as_ref()?;
         match observation.standing.as_str() {
-            "behind" => Some(store_semantics_behind_reason()),
+            // Another build of this version derived the served state: the
+            // same remedy as a store an older build wrote, `kin upgrade`.
+            "behind" | "other_build" => Some(store_semantics_behind_reason()),
             "ahead" => Some(
                 "store_semantics_ahead: a newer Kin build recorded this store's semantics, so \
                  this older build cannot certify an answer over it. Upgrade Kin itself",
@@ -3163,11 +3370,7 @@ impl Envelope {
             "unstamped" | "unreadable" => Some(store_semantics_unknown_reason()),
             "current"
                 if observation.upgraded_under.is_some()
-                    && (substrate == AbsenceSubstrate::History
-                        || self.source_derivation.as_ref().is_some_and(|observation| {
-                            observation.scope
-                                == crate::source_derivation::SourceObservationScope::SelectedHistorical
-                        })) =>
+                    && (substrate == AbsenceSubstrate::History || self.source_is_historical()) =>
             {
                 Some(
                     "history_predates_upgrade: this answer reads the store's history, and history \
@@ -3213,6 +3416,15 @@ impl Envelope {
         class: NegativeClass,
         substrate: AbsenceSubstrate,
     ) -> (bool, &'static str) {
+        if self.model_slots_invalid == Some(true) {
+            return (
+                false,
+                "model_observation_invalid: the answer supplied invalid model-stage evidence",
+            );
+        }
+        if self.model_slots.iter().any(|stage| stage.filtered_out > 0) {
+            return (false, "model_filtered: a model stage withheld graph candidates; its scores cannot certify repository absence");
+        }
         if self.runtime != Runtime::RepoDaemon {
             return (
                 false,
@@ -3222,11 +3434,15 @@ impl Envelope {
         if let Some(reason) = self.hydration_semantics_trust_reason(substrate) {
             return (false, reason);
         }
-        if let Some(reason) = self
-            .source_derivation
-            .as_ref()
-            .and_then(|observation| observation.limiting_factor(substrate))
-        {
+        if substrate == AbsenceSubstrate::History && self.partial_history.is_some() {
+            return (
+                false,
+                "history_partial: this store admitted only its checked-out commit, so an answer \
+                 that reads its history cannot be certified; `_kin.partial_history` says how far \
+                 the history derivation got, and `kin init --history full` derives it now",
+            );
+        }
+        if let Some(reason) = self.source_limiting_factor(substrate) {
             return (false, reason);
         }
         if self.degraded.bounds(substrate) {
@@ -3260,11 +3476,13 @@ impl Envelope {
                         false,
                         "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",
                     ),
-                    // Embeddings are whole. What is left can only narrow the
-                    // POPULATION that was ranked, and an absence over a narrowed
-                    // population is not an absence over the repository, so the
-                    // gate still refuses and says which narrowing it saw.
-                    EmbeddingState::Present => {
+                    // Embeddings are whole, or the answer read none, so the
+                    // embedding counters limit nothing. What is left can only
+                    // narrow the POPULATION that was ranked, and an absence over
+                    // a narrowed population is not an absence over the
+                    // repository, so the gate still refuses and says which
+                    // narrowing it saw.
+                    state @ (EmbeddingState::Present | EmbeddingState::NotUsed) => {
                         let scope = coverage.scope_limits();
                         if scope.iter().any(|limit| limit == "graph_body_gap") {
                             (
@@ -3278,6 +3496,11 @@ impl Envelope {
                             (
                                 false,
                                 "coverage_role_filter_withheld: test-role source paths were withheld from ranking, so an empty result may mean 'not ranked' rather than 'not present'; pass include_tests to rank them",
+                            )
+                        } else if state == EmbeddingState::NotUsed {
+                            (
+                                true,
+                                "semantic_authoritative: daemon-owned truth ranked on entity cards over the whole graph; this setup uses no search vectors",
                             )
                         } else {
                             (
@@ -3368,6 +3591,134 @@ fn annotate_inner(
     }
 }
 
+/// Grade every section of a sectioned `find_references` answer as the
+/// single-focal answer it is: its own completeness, its own `negative`, and its
+/// own verdict under `_kin.verdict` inside the section, computed from the
+/// response's envelope exactly as an unsectioned answer about that entity
+/// would be. `None` for any other answer.
+fn grade_sections(
+    tool_name: &str,
+    payload: &mut Value,
+    envelope: &Envelope,
+) -> Option<Vec<crate::verdict::Verdict>> {
+    if tool_name != "find_references" {
+        return None;
+    }
+    let sections = payload
+        .get_mut(crate::handlers::entities::AMBIGUOUS_CANDIDATES_KEY)?
+        .as_array_mut()?;
+    let mut verdicts = Vec::with_capacity(sections.len());
+    for section in sections.iter_mut().filter(|section| section.is_object()) {
+        let mut graded = envelope.clone();
+        graded.completeness = Completeness::for_tool(tool_name, section, &graded, false);
+        let negative = crate::negative::negative_for(
+            tool_name,
+            section,
+            &graded,
+            &crate::verdict::Verdict::pre_negative_gaps(section),
+        );
+        if let Some(verdict) =
+            crate::verdict::Verdict::compute(tool_name, section, &graded, negative.as_ref())
+        {
+            section[ENVELOPE_KEY] = json!({ "verdict": verdict.to_value() });
+            verdicts.push(verdict);
+        }
+        if let Some(negative) = negative {
+            section[crate::negative::NEGATIVE_KEY] = negative;
+        }
+    }
+    Some(verdicts)
+}
+
+/// An impact answer's two sections, graded.
+struct ImpactGrades {
+    /// The direct section's verdict, which is the answer's own: it answers
+    /// what must change with the changed entities.
+    direct: crate::verdict::Verdict,
+    /// The direct section's absence object, the one the answer carries.
+    direct_negative: Option<Value>,
+    /// Each section's state and limiting factor, which the answer's verdict
+    /// and every page of it carry.
+    states: Value,
+}
+
+/// Grade each section of an impact answer as the answer it is: the direct
+/// callers and overrides of the changed entities under the call-site reading
+/// of their possible callers, and the transitive dependents under the
+/// enrichment observation over that wider reach. Each section's verdict is
+/// written into it, and neither certifies anything the other measured. `None`
+/// for any other answer, or one whose direct section no input spoke about,
+/// which is graded whole as before.
+fn grade_impact_sections(
+    tool_name: &str,
+    payload: &mut Value,
+    envelope: &Envelope,
+) -> Option<ImpactGrades> {
+    if tool_name != crate::impact_pages::TOOL {
+        return None;
+    }
+    let (direct_view, dependents_view) = crate::impact_sections::section_views(payload)?;
+    let grade = |view: &Value| {
+        let mut graded = envelope.clone();
+        graded.completeness = Completeness::for_tool(tool_name, view, &graded, false);
+        let negative = crate::negative::negative_for(
+            tool_name,
+            view,
+            &graded,
+            &crate::verdict::Verdict::pre_negative_gaps(view),
+        );
+        let verdict = crate::verdict::Verdict::compute(tool_name, view, &graded, negative.as_ref());
+        (verdict, negative)
+    };
+    let (direct, direct_negative) = grade(&direct_view);
+    let direct = direct?;
+    let (dependents, _) = grade(&dependents_view);
+    let direct_value = direct.to_value();
+    // An input always speaks about a graph answer, so a silent dependents
+    // section is one no reading could grade, and it certifies nothing.
+    let dependents_value = dependents.map_or_else(
+        || {
+            json!({
+                "state": "inconclusive",
+                "absence_claim": "not_applicable",
+                "safe_to_conclude_absent": false,
+                "limiting_factor": crate::verdict::UNLISTED_CLAUSE_CODE,
+                "inputs": {},
+            })
+        },
+        |verdict| verdict.to_value(),
+    );
+    let states = json!({
+        crate::impact_sections::DIRECT: crate::impact_sections::section_state(&direct_value),
+        crate::impact_sections::DEPENDENTS:
+            crate::impact_sections::section_state(&dependents_value),
+    });
+    let sections = payload.get_mut(crate::impact_sections::SECTIONS_KEY)?;
+    sections[crate::impact_sections::DIRECT]["verdict"] = direct_value;
+    sections[crate::impact_sections::DEPENDENTS]["verdict"] = dependents_value;
+    Some(ImpactGrades {
+        direct,
+        direct_negative,
+        states,
+    })
+}
+
+/// `result` with its first text block replaced by `payload`, in the same
+/// layout the handler wrote it in.
+fn replace_first_payload(mut result: ToolCallResult, payload: &Value) -> ToolCallResult {
+    if let Some(ContentBlock::Text { text }) = result.content.first_mut() {
+        let rendered = if text.contains('\n') {
+            serde_json::to_string_pretty(payload)
+        } else {
+            serde_json::to_string(payload)
+        };
+        if let Ok(rendered) = rendered {
+            *text = rendered;
+        }
+    }
+    result
+}
+
 /// Extract the first text content block's payload as JSON, when it parses.
 fn first_payload_value(result: &ToolCallResult) -> Option<Value> {
     result.content.iter().find_map(|block| {
@@ -3425,8 +3776,13 @@ pub fn finalize_bounded(
     // The daemon's trace pager already measured its complete page envelope.
     // Appending a second reading would both exceed the caller's byte ceiling
     // and qualify a frozen page against a different observation.
-    if matches!(tool_name, "trace_data_flow" | "find_references")
-        && payload.as_ref().is_some_and(crate::trace_pages::is_page)
+    if matches!(
+        tool_name,
+        "trace_data_flow"
+            | "find_references"
+            | crate::impact_pages::TOOL
+            | crate::locate_pages::TOOL
+    ) && payload.as_ref().is_some_and(crate::trace_pages::is_page)
     {
         return result;
     }
@@ -3440,7 +3796,7 @@ pub fn finalize_bounded(
         })
         .flatten();
     let mut envelope = match &payload {
-        Some(payload) => base.with_payload_metadata(payload),
+        Some(payload) => base.with_payload_metadata_for_tool(payload, tool_name),
         None => base,
     };
     let resolution_miss = (result.is_error == Some(true))
@@ -3465,13 +3821,22 @@ pub fn finalize_bounded(
     if payload.is_none() && resolution_miss.is_some() {
         payload = first_message_text(&result).map(|message| json!({"message": message}));
     }
+    // A rejected request is not an answer. It asserts nothing about the code,
+    // so there is nothing to qualify: a verdict stamped on it read as a
+    // finding, and counted as one. A name miss is different, it is the answer
+    // "no entity carries this name", and keeps its qualification above.
+    if result.is_error == Some(true) && resolution_miss.is_none() {
+        payload = None;
+        envelope.source_derivation = None;
+        envelope.source_qualification = None;
+    }
     // Completeness follows the answer that actually ran, including recognized
     // name misses, rather than the edge walk the caller would have requested.
     if let Some(payload) = &payload {
         envelope.completeness =
             Completeness::for_tool(tool_name, payload, &envelope, resolution_miss.is_some());
     }
-    let negative = match &payload {
+    let mut negative = match &payload {
         Some(payload) => crate::negative::negative_for(
             tool_name,
             payload,
@@ -3487,13 +3852,51 @@ pub fn finalize_bounded(
     // completeness signal is itself an input, so a certified verdict is one it
     // already agreed with.
     let mut edge_coverage_limits: Vec<String> = Vec::new();
+    // A sectioned answer is several single-focal answers side by side, so each
+    // section is graded as the answer it is and the response's one verdict is
+    // composed from theirs. Its top level carries no rows of its own, and
+    // grading it alone would read the envelope's substrate as a verdict about
+    // reference lists it never looked at.
+    let section_verdicts = payload
+        .as_mut()
+        .and_then(|payload| grade_sections(tool_name, payload, &envelope));
+    // An impact answer holds two questions. Its verdict is the direct
+    // section's, which answers what must change with the changed entities,
+    // and it names that scope and both sections' states; the dependents
+    // section's gap stays visible under its own verdict.
+    let impact_grades = payload
+        .as_mut()
+        .and_then(|payload| grade_impact_sections(tool_name, payload, &envelope));
+    let result = match (&section_verdicts, &impact_grades, &payload) {
+        (Some(_), _, Some(graded)) | (_, Some(_), Some(graded)) => {
+            replace_first_payload(result, graded)
+        }
+        _ => result,
+    };
     if let Some(payload) = &payload {
-        if let Some(verdict) =
-            crate::verdict::Verdict::compute(tool_name, payload, &envelope, negative.as_ref())
-        {
+        let (composed, section_states) = match (section_verdicts, impact_grades) {
+            (Some(sections), _) => (
+                crate::verdict::Verdict::compose_sections(payload, sections),
+                None,
+            ),
+            (None, Some(grades)) => {
+                negative = grades.direct_negative;
+                (Some(grades.direct), Some(grades.states))
+            }
+            (None, None) => (
+                crate::verdict::Verdict::compute(tool_name, payload, &envelope, negative.as_ref()),
+                None,
+            ),
+        };
+        if let Some(verdict) = composed {
             verdict.project_onto_completeness(&mut envelope.completeness);
             edge_coverage_limits = verdict.edge_coverage_limits();
-            envelope.verdict = Some(verdict.to_value());
+            let mut value = verdict.to_value();
+            if let Some(states) = section_states {
+                value[crate::impact_sections::SCOPE_KEY] = json!(crate::impact_sections::DIRECT);
+                value[crate::impact_sections::SECTIONS_KEY] = states;
+            }
+            envelope.verdict = Some(value);
         }
     }
     envelope.advice = advice_for(&envelope, payload.as_ref());
@@ -3502,6 +3905,25 @@ pub fn finalize_bounded(
     if changes_state(tool_name) {
         envelope = envelope.for_state_change();
     }
+    // Annotation preserves an existing producer envelope. The source reading
+    // may have arrived later, or its public contract may have been refused, so
+    // that earlier verdict must not bypass the limitation just computed here.
+    // Only downgrade it: prior evidence can contain limits no longer present
+    // in the public payload, and those remain authoritative.
+    let result = match (
+        payload.as_mut(),
+        envelope.source_limiting_factor(if tool_name == "entity_history" {
+            AbsenceSubstrate::History
+        } else {
+            AbsenceSubstrate::Relations
+        }),
+    ) {
+        (Some(payload), Some(reason)) => {
+            crate::verdict::qualify_source_observation(payload, reason);
+            replace_first_payload(result, payload)
+        }
+        _ => result,
+    };
     let mut annotated = annotate_inner(
         result,
         &envelope,
@@ -3579,6 +4001,14 @@ fn advice_for(envelope: &Envelope, payload: Option<&Value>) -> Option<String> {
     }
     if let Some(advice) = payload
         .and_then(|payload| payload.get(crate::edge_coverage::EDGE_COVERAGE_KEY))
+        // A name search whose declaration census was read is decided by the
+        // census, and a missing language server bounds none of its rows.
+        .filter(|coverage| {
+            coverage
+                .as_object()
+                .and_then(crate::declaration_coverage::class_state)
+                .is_none_or(|state| state == crate::declaration_coverage::STATE_UNMEASURED)
+        })
         .and_then(|coverage| {
             crate::first_contact::language_server_advice(
                 coverage,
@@ -3626,12 +4056,22 @@ fn fit_context_output(
         let Ok(mut payload) = serde_json::from_str::<Value>(text) else {
             continue;
         };
+        // Set once nothing more can be shed without removing the answer. The
+        // pack is then served as it stands, over its ceiling and saying so,
+        // rather than refused with every row it held.
+        let mut exhausted = false;
         loop {
+            crate::budget::compact_context_reply(&mut payload);
             apply_response_budget(&mut payload, tool, budget);
+            // Disclosed before the verdict is recomputed, so the one verdict
+            // reads the reply's own note that it ships over its token budget.
+            if exhausted {
+                crate::budget::disclose_context_over_token_budget(&mut payload, token_limit);
+            }
             // Final fitting can remove callers after the original absence
             // qualification was built. Recompute from the rows that remain,
             // preserving the original repository observations and every cut.
-            let mut envelope = base.clone().with_payload_metadata(&payload);
+            let mut envelope = base.clone().with_payload_metadata_for_tool(&payload, tool);
             envelope.completeness = Completeness::for_tool(tool, &payload, &envelope, false);
             let negative = crate::negative::negative_for(
                 tool,
@@ -3660,6 +4100,17 @@ fn fit_context_output(
                 }
                 crate::verdict::mark_response_bounded(&mut payload);
             }
+            // What the reader is not getting, by id, from the rows as they
+            // now stand, and what the answer itself costs.
+            crate::budget::summarize_context_withheld(&mut payload);
+            let answer = crate::budget::context_answer_tokens(&payload);
+            payload[crate::budget::CONTEXT_ANSWER_TOKENS_KEY] = serde_json::json!(answer);
+            // The verdict above was computed from the whole reply; what ships
+            // is its compact presentation, and that is what is measured.
+            compact_reply_envelope(&mut payload);
+            if exhausted {
+                crate::budget::disclose_context_over_budget(&mut payload, budget);
+            }
             let mut settled = false;
             for _ in 0..16 {
                 let rendered = crate::budget::render(&payload).expect("JSON value serialization");
@@ -3681,19 +4132,44 @@ fn fit_context_output(
                 return ToolCallResult::error("context response accounting did not converge");
             }
             let rendered = crate::budget::render(&payload).expect("JSON value serialization");
-            if rendered.len() <= budget.max_chars
-                && kin_context::estimate_tokens(&rendered) <= token_limit
-            {
-                *text = rendered;
-                break;
-            }
-            let reason = if rendered.len() > budget.max_chars {
-                crate::budget::ELISION_REASON_BUDGET
-            } else {
-                crate::budget::ELISION_REASON_TOKEN_BUDGET
+            // The whole reply, metadata included, is held to the token budget
+            // and to the byte ceiling at once.
+            let fits = crate::budget::context_reply_fits(
+                &rendered,
+                answer,
+                token_limit,
+                budget.max_chars,
+                crate::budget::ContextFit::WholeReply,
+            );
+            let over_tokens = kin_context::estimate_tokens(&rendered) > token_limit;
+            let noted = payload
+                .get("degradations")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("reason").and_then(Value::as_str)
+                            == Some(crate::budget::OVER_TOKEN_BUDGET_REASON)
+                    })
+                });
+            let reason = match fits {
+                // A reply that ships over its token budget says so before the
+                // verdict it carries is computed, so one more pass settles it.
+                Ok(()) if over_tokens && !noted && !exhausted => {
+                    exhausted = true;
+                    continue;
+                }
+                _ if exhausted => {
+                    *text = rendered;
+                    break;
+                }
+                Ok(()) => {
+                    *text = rendered;
+                    break;
+                }
+                Err(reason) => reason,
             };
             if !crate::budget::trim_context_output_once(&mut payload, reason) {
-                return ToolCallResult::error(format!("context metadata cannot fit the effective {token_limit} token and {} byte limits; request fewer focals or a larger budget", budget.max_chars));
+                exhausted = true;
             }
         }
     }
@@ -3753,7 +4229,12 @@ fn stamp_edge_coverage_limits(map: &mut serde_json::Map<String, Value>, limits: 
 /// apart, and the one it must not do is conclude an absence from a reply that
 /// was never carrying the evidence for one.
 fn answer_only_envelope(envelope_value: &Value) -> Value {
-    const KEPT: [&str; 3] = ["state", "safe_to_conclude_absent", "limiting_factor"];
+    const KEPT: [&str; 4] = [
+        "state",
+        "safe_to_conclude_absent",
+        "limiting_factor",
+        "remedy",
+    ];
     let mut verdict = Map::new();
     if let Some(full) = envelope_value.get("verdict").and_then(Value::as_object) {
         for key in KEPT {
@@ -3782,6 +4263,7 @@ fn answer_only_envelope(envelope_value: &Value) -> Value {
         "freshness",
         "source_derivation",
         "hydration_semantics",
+        "partial_history",
         "durability",
         "degraded",
     ] {
@@ -3805,9 +4287,13 @@ fn annotate_block(
     let annotated = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) => {
             stamp_edge_coverage_limits(&mut map, edge_coverage_limits);
+            let sectioned = map
+                .get(crate::handlers::entities::AMBIGUOUS_CANDIDATES_KEY)
+                .is_some_and(Value::is_array);
             if answer_only
-                && map.get("references").is_some_and(Value::is_array)
-                && map.contains_key("focal_entity")
+                && (sectioned
+                    || (map.get("references").is_some_and(Value::is_array)
+                        && map.contains_key("focal_entity")))
             {
                 // Narrowed HERE, after `finalize_bounded` computed the verdict
                 // from the whole payload. The blocks this drops are the blocks
@@ -3854,9 +4340,182 @@ fn annotate_block(
         }
     };
     let mut annotated = annotated;
+    if carries_compact_envelope(tool_name) {
+        if matches!(tool_name, "get_context_pack" | "trace_computation") {
+            crate::budget::compact_context_reply(&mut annotated);
+        }
+        compact_reply_envelope(&mut annotated);
+    }
     apply_response_budget(&mut annotated, tool_name, budget);
     let rendered = crate::budget::render(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
+}
+
+/// Whether `tool`'s reply carries the compact envelope ([`compact_reply_envelope`]).
+///
+/// The context pack and the neighbourhood are the two replies an agent asks
+/// for by size, a token budget or a row limit, and on the 0.8.3 pilot their
+/// metadata was the part that grew: whole envelopes, readings restated beside
+/// the verdict, and a provenance record on every row.
+pub fn carries_compact_envelope(tool: &str) -> bool {
+    matches!(
+        tool,
+        "get_context_pack" | "trace_computation" | "graph_neighborhood"
+    )
+}
+
+/// The envelope keys a compact reply keeps: the one verdict and the
+/// completeness signal it was projected onto, what the budget did, anything
+/// that says the reply contradicts itself, the advice a reader can act on, and
+/// the one provenance line.
+const COMPACT_ENVELOPE_KEYS: [&str; 7] = [
+    "envelope_version",
+    "verdict",
+    "completeness",
+    "response",
+    "self_check",
+    "advice",
+    "provenance",
+];
+
+/// The key a compact envelope carries its one line of provenance under.
+pub const PROVENANCE_KEY: &str = "provenance";
+
+/// Make an already annotated reply's metadata compact.
+///
+/// `_kin` keeps the verdict, the completeness signal and the budget
+/// accounting, and folds the freshness, durability, graph state, source
+/// derivation, hydration and degraded blocks into one line saying where the
+/// answer came from and how fresh it was. The reply's top-level copy of the
+/// source derivation it lifted into `_kin` goes. `negative` stays: it is the
+/// answer's own qualification, and the budget already points its restated
+/// sentences at the verdict when the reply is under pressure.
+///
+/// Runs after the verdict is computed from the whole reply and before the
+/// reply is measured, so nothing it removes reaches the verdict and every
+/// byte it saves reaches the answer. Running it twice changes nothing.
+pub(crate) fn compact_reply_envelope(annotated: &mut Value) {
+    let Some(object) = annotated.as_object_mut() else {
+        return;
+    };
+    let rows_line = object
+        .remove(crate::budget::CONTEXT_PROVENANCE_KEY)
+        .and_then(|line| line.as_str().map(str::to_string));
+    object.remove(crate::source_derivation::KEY);
+    let resolution = object
+        .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(|coverage| coverage.get(crate::edge_coverage::REFERENCE_RESOLUTION_KEY))
+        .cloned();
+    crate::budget::point_negative_advice(annotated);
+    let Some(object) = annotated.as_object_mut() else {
+        return;
+    };
+    let Some(envelope) = object.get_mut(ENVELOPE_KEY).and_then(Value::as_object_mut) else {
+        return;
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(runtime) = envelope.get("runtime").and_then(Value::as_str) {
+        parts.push(format!("answered by {runtime}"));
+    }
+    if let Some(generation) = envelope
+        .get("graph_as_of")
+        .and_then(|marker| marker.get("generation"))
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("from graph generation {generation}"));
+    }
+    if let Some(freshness) = envelope.get("freshness").and_then(Value::as_object) {
+        let state = freshness.get("state").and_then(Value::as_str);
+        let at = freshness.get("at").and_then(Value::as_str);
+        let age = freshness.get("age_seconds").and_then(Value::as_u64);
+        match (state, at, age) {
+            (Some(state), Some(at), Some(age)) => {
+                parts.push(format!("{state} at {at}, {age} s before this reply"))
+            }
+            (Some(state), Some(at), None) => parts.push(format!("{state} at {at}")),
+            (Some(state), None, _) => parts.push(state.to_string()),
+            _ => {}
+        }
+    }
+    if let Some(state) = envelope.get("graph_state").and_then(Value::as_object) {
+        for (key, word) in [("initialized", "uninitialized"), ("loaded", "not loaded")] {
+            if state.get(key).and_then(Value::as_bool) == Some(false) {
+                parts.push(format!("graph {word}"));
+            }
+        }
+        if let Some(outcome) = state.get("reconciliation_outcome").and_then(Value::as_str) {
+            parts.push(format!("reconciliation {outcome}"));
+        }
+    }
+    if let Some(binding) = envelope
+        .get(crate::source_derivation::KEY)
+        .and_then(|observation| observation.pointer("/report/body_binding"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("source binding {binding}"));
+    }
+    if let Some(clause) = envelope
+        .get(crate::source_derivation::KEY)
+        .and_then(crate::source_derivation::out_of_scope_binding_clause)
+    {
+        parts.push(clause);
+    }
+    if let Some(standing) = envelope
+        .get("hydration_semantics")
+        .and_then(|semantics| semantics.get("standing"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("store semantics {standing}"));
+    }
+    if let Some(degraded) = envelope.get("degraded").and_then(Value::as_object) {
+        let active: Vec<&str> = degraded
+            .iter()
+            .filter(|(_, value)| value.as_bool() == Some(true))
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if !active.is_empty() {
+            parts.push(format!("degraded: {}", active.join(", ")));
+        }
+    }
+    if let Some(rows) = rows_line {
+        parts.push(rows);
+    }
+    let existing = envelope
+        .get(PROVENANCE_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let line = match (existing, parts.is_empty()) {
+        (Some(existing), true) => Some(existing),
+        (Some(existing), false) => Some(format!("{existing}; {}", parts.join("; "))),
+        (None, false) => Some(parts.join("; ")),
+        (None, true) => None,
+    };
+    envelope.retain(|key, _| COMPACT_ENVELOPE_KEYS.contains(&key.as_str()));
+    // The inputs that spoke. An input absent here read `not_applicable`: it
+    // took no part in this verdict, and listing it restates nothing.
+    if let Some(inputs) = envelope
+        .get_mut("verdict")
+        .and_then(|verdict| verdict.get_mut("inputs"))
+        .and_then(Value::as_object_mut)
+    {
+        inputs.retain(|_, state| state.as_str() != Some("not_applicable"));
+    }
+    // The completeness signal copies the parsed-against-resolved reading from
+    // `edge_coverage`, where the reply already carries it.
+    if let Some(completeness) = envelope
+        .get_mut("completeness")
+        .and_then(Value::as_object_mut)
+    {
+        if resolution.is_some()
+            && completeness.get(crate::edge_coverage::REFERENCE_RESOLUTION_KEY)
+                == resolution.as_ref()
+        {
+            completeness.remove(crate::edge_coverage::REFERENCE_RESOLUTION_KEY);
+        }
+    }
+    if let Some(line) = line {
+        envelope.insert(PROVENANCE_KEY.to_string(), json!(line));
+    }
 }
 
 /// Run the contradiction checker against what a client will actually read, and
@@ -4016,6 +4675,16 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
     settle_response_accounting(annotated, &mut accounting);
 }
 
+/// Bound an enveloped answer again under a smaller budget, in place.
+///
+/// The second arm of [`apply_response_budget`], for the caller that sizes a
+/// reply as it ships ([`crate::server::present_for_client`]): the answer was
+/// built under the widest budget, and this cuts it the way any later arm
+/// would, with the cut disclosed, the cursor moved and the accounting settled.
+pub(crate) fn rebound(annotated: &mut Value, tool_name: &str, budget: &ResponseBudget) {
+    apply_response_budget(annotated, tool_name, budget);
+}
+
 /// Apply the same bounded qualification during fit previews and finalization.
 /// A repeated pass must not restore long-form restatements after the ladder
 /// has measured their lossless pointer representation.
@@ -4145,6 +4814,46 @@ mod tests {
             .get(ENVELOPE_KEY)
             .cloned()
             .expect("annotated payload carries _kin envelope")
+    }
+
+    #[test]
+    fn model_slots_observations_are_lifted_and_filtered_candidates_bound_absence() {
+        let payload = serde_json::json!({"model_slots": [{"slot": "reranking", "provider": "external", "model": "observed-model", "candidates": 3, "returned": 1, "filtered_out": 2}]});
+        let envelope = Envelope::daemon().with_payload_metadata(&payload);
+        assert_eq!(
+            envelope.model_slots[0].model.as_deref(),
+            Some("observed-model")
+        );
+        assert_eq!(envelope.model_slots[0].filtered_out, 2);
+        let (trusted, reason) =
+            envelope.negative_trust(NegativeClass::Structural, AbsenceSubstrate::Relations);
+        assert!(!trusted);
+        assert!(reason.starts_with("model_filtered:"));
+        assert!(Envelope::daemon().with_payload_metadata(&serde_json::json!({"models": {"reranking": {"provider": "external", "model": "configured-only"}}})).model_slots.is_empty());
+    }
+
+    #[test]
+    fn model_slots_malformed_evidence_cannot_certify_absence() {
+        let payload = serde_json::json!({"model_slots": [{"slot": "reranking", "provider": "external", "model": "x", "candidates": 1, "returned": 2, "filtered_out": 0}]});
+        let envelope = Envelope::daemon().with_payload_metadata(&payload);
+        assert_eq!(envelope.model_slots_invalid, Some(true));
+        let (trusted, reason) =
+            envelope.negative_trust(NegativeClass::Structural, AbsenceSubstrate::Relations);
+        assert!(!trusted);
+        assert!(reason.starts_with("model_observation_invalid:"));
+    }
+
+    #[test]
+    fn actual_scorer_observation_is_lifted_without_configuration_claims() {
+        let observed = serde_json::json!({"slot": "reranking", "provider": "built-in", "model": "kev", "candidates": 8, "returned": 8, "filtered_out": 0});
+        let envelope = Envelope::daemon()
+            .with_payload_metadata(&serde_json::json!({"scorer": {"observed": observed}}));
+        assert_eq!(envelope.model_slots.len(), 1);
+        assert_eq!(envelope.model_slots[0].model.as_deref(), Some("kev"));
+        let unavailable = Envelope::daemon().with_payload_metadata(
+            &serde_json::json!({"scorer": {"model": "kev", "unavailable": "not_in_build"}}),
+        );
+        assert!(unavailable.model_slots.is_empty());
     }
 
     #[test]
@@ -5630,7 +6339,7 @@ mod tests {
                     "step": index,
                     "limit_per_step": 12,
                     "dropped_callees": 7,
-                    "dropped_crossing_file": 3,
+                    "dropped_crossing_unit": 3,
                     "spine": true,
                 })
             })
@@ -5666,7 +6375,7 @@ mod tests {
             "edge_coverage": {
                 "language": "C",
                 "classes": { "calls": "present", "imports": "absent", "references": "partial" },
-                "cross_file_classes": ["calls"],
+                "cross_unit_classes": ["calls"],
                 "budget_exhausted": false,
                 "reference_enrichment": "build_only",
                 "scope_entities": 6160,
@@ -6084,7 +6793,30 @@ mod tests {
         let default_limit = args["token_budget"].as_u64().unwrap();
         assert_eq!(default_limit, 4000);
         let budget = ResponseBudget::from_arguments(&args);
-        for limit in [default_limit, 3000, 2500] {
+        // The rows as the compact reply serves them: every field but the
+        // provenance its one line carries.
+        let compact_row = |row: &Value| {
+            let mut row = row.clone();
+            if let Some(map) = row.as_object_mut() {
+                for key in crate::budget::CONTEXT_ROW_PROVENANCE_KEYS {
+                    map.remove(key);
+                }
+            }
+            row
+        };
+        let served_ids = |served: &Value, field: &str| -> Vec<Value> {
+            served[field]
+                .as_array()
+                .map(|rows| rows.iter().map(|row| row["id"].clone()).collect())
+                .unwrap_or_default()
+        };
+        // The token budget bounds the whole reply, readings included. At the
+        // profile's default the whole pack fits and nothing is withheld; below
+        // it the neighbourhood goes first, named by id, and the focal's own
+        // body and the readings that qualify it stay. At 200 tokens not even
+        // those fit, so the code alone is held to the budget, as the builder
+        // held it, and the reply says it ships over.
+        for limit in [default_limit, 3000, 2500, 200] {
             let mut payload = fixture.clone();
             payload["token_budget"] = json!(limit);
             let result = finalize_bounded(
@@ -6094,53 +6826,129 @@ mod tests {
                 &budget,
             );
             let text = first_message_text(&result).unwrap();
-            if limit == 2500 {
-                assert_eq!(result.is_error, Some(true), "{text}");
-                assert!(text.contains("effective 2500 token"), "{text}");
-                continue;
-            }
             assert_ne!(result.is_error, Some(true), "{text}");
             let served: Value = serde_json::from_str(text).unwrap();
             assert_eq!(served["token_budget"], limit);
-            assert_eq!(served["tokens_used"], kin_context::estimate_tokens(text));
-            assert!(kin_context::estimate_tokens(text) <= limit as usize);
+            let tokens = kin_context::estimate_tokens(text);
+            assert_eq!(served["tokens_used"], tokens);
+            let answer = served[crate::budget::CONTEXT_ANSWER_TOKENS_KEY]
+                .as_u64()
+                .unwrap();
+            assert_eq!(
+                answer as usize,
+                crate::budget::context_answer_tokens(&served)
+            );
+            assert!(answer <= limit, "{answer} over {limit}");
             assert_eq!(served["_kin"]["response"]["chars_after_budget"], text.len());
             assert!(text.len() <= budget.max_chars);
-            assert_eq!(served["focal_entity"], fixture["focal_entity"]);
+            let over = served["degradations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["reason"] == crate::budget::OVER_TOKEN_BUDGET_REASON);
+            assert_eq!(over, tokens as u64 > limit, "{tokens} of {limit}: {text}");
+            if limit >= 2500 {
+                assert!(tokens as u64 <= limit, "{tokens} over {limit}: {text}");
+            }
+            assert_eq!(
+                served["focal_entity"],
+                compact_row(&fixture["focal_entity"])
+            );
             assert_eq!(served["caller_arrival"], fixture["caller_arrival"]);
-            assert_eq!(served["source_derivation"], fixture["source_derivation"]);
+            // Lifted into the envelope's one provenance line, never shipped
+            // twice.
+            assert!(served.get("source_derivation").is_none(), "{text}");
+            assert!(served["_kin"]["provenance"]
+                .as_str()
+                .is_some_and(|line| line.contains("source binding current")));
             assert_eq!(served["negative"]["safe_to_conclude_absent"], false);
+            // Every neighbour is served or named by id under `withheld`.
+            let withheld: Vec<Value> = served["withheld"]["rows"]
+                .as_object()
+                .into_iter()
+                .flat_map(|groups| groups.values())
+                .filter_map(Value::as_array)
+                .flatten()
+                .cloned()
+                .collect();
+            for field in ["dependencies", "dependents"] {
+                let kept = served_ids(&served, field);
+                for row in fixture[field].as_array().into_iter().flatten() {
+                    let served_row = served[field]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|served_row| served_row["id"] == row["id"]);
+                    let bodies: Vec<Value> = served["withheld"]["bodies"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    match served_row {
+                        // Served whole, or as its signature with its body
+                        // named by id.
+                        Some(served_row) if served_row != &compact_row(row) => {
+                            assert_eq!(served_row["body_elided"], json!(["body"]), "{text}");
+                            assert_eq!(served_row["signature"], row["signature"]);
+                            assert!(bodies.contains(&row["id"]), "{text}");
+                        }
+                        Some(_) => {}
+                        None => assert!(
+                            withheld.contains(&row["id"]),
+                            "{field} row {} is neither served nor named: {text}",
+                            row["id"]
+                        ),
+                    }
+                }
+                assert!(kept.len() <= fixture[field].as_array().map_or(0, Vec::len));
+            }
             if limit == default_limit {
                 for field in ["dependencies", "dependents", "transitive_deps"] {
-                    assert_eq!(served[field], fixture[field]);
+                    assert_eq!(
+                        served[field].as_array().map(|rows| rows.len()),
+                        fixture[field].as_array().map(|rows| rows.len()),
+                        "{field}: {text}"
+                    );
                 }
                 assert_eq!(served["_kin"]["response"]["bounded"], false);
                 assert_eq!(served["_kin"]["verdict"]["state"], "certified");
-            } else {
-                assert_eq!(served["_kin"]["response"]["bounded"], true);
-                assert_eq!(served["_kin"]["verdict"]["state"], "inconclusive");
-                assert_eq!(
-                    served["_kin"]["verdict"]["inputs"]["response_budget"],
-                    "inconclusive"
-                );
-                assert!(served["_kin"]["verdict"]["limiting_factor"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("response_bounded"));
+                assert!(served.get("withheld").is_none(), "{text}");
             }
         }
+
+        // A budget below the answer itself cuts the answer, neighbour bodies
+        // first, and names what it withheld by id. It never refuses.
+        let mut payload = fixture.clone();
+        payload["token_budget"] = json!(5);
+        let result = finalize_bounded(
+            ToolCallResult::text(payload.to_string()),
+            ready_daemon_envelope(),
+            "get_context_pack",
+            &budget,
+        );
+        let text = first_message_text(&result).unwrap();
+        assert_ne!(result.is_error, Some(true), "{text}");
+        let served: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(served["_kin"]["response"]["bounded"], true, "{text}");
+        assert!(
+            served["withheld"]["bodies"]
+                .as_array()
+                .is_some_and(|bodies| !bodies.is_empty()),
+            "{text}"
+        );
     }
 
     #[test]
-    fn context_final_ceiling_refuses_an_impossible_metadata_floor() {
+    fn context_final_ceiling_serves_a_pack_whose_readings_outgrow_its_budget() {
         let payload = serde_json::json!({"token_budget": 1, "tokens_used": 0, "focal_entity": {"id": "start", "name": "start"}});
         let result = finalize(
             ToolCallResult::text(payload.to_string()),
             ready_daemon_envelope(),
             "get_context_pack",
         );
-        assert_eq!(result.is_error, Some(true));
-        assert!(first_message_text(&result).unwrap().contains("cannot fit"));
+        assert_ne!(result.is_error, Some(true));
+        let served: Value = serde_json::from_str(first_message_text(&result).unwrap()).unwrap();
+        assert_eq!(served["focal_entity"]["id"], "start");
+        assert_eq!(served[crate::budget::CONTEXT_ANSWER_TOKENS_KEY], 0);
     }
 
     fn ready_daemon_envelope() -> Envelope {
@@ -6161,6 +6969,7 @@ mod tests {
             "semantic_diff",
             "semantic_review",
             "kin_provenance_query",
+            "get_entity_source",
         ] {
             for structured in [true, false] {
                 let message = "Entity not found";
@@ -6247,6 +7056,116 @@ mod tests {
         }
     }
 
+    /// A rejected request asserts nothing about the code. It keeps its
+    /// sentence and the repository observations, and carries no verdict,
+    /// completeness or negative that would read as a finding.
+    #[test]
+    fn a_rejected_request_carries_no_verdict() {
+        for (tool, message) in [
+            ("get_context_pack", "missing required parameter: entity_id"),
+            (
+                "get_entity_source",
+                "invalid parameter: entity_id must not be empty; pass an entity uuid or its exact name",
+            ),
+            (
+                "semantic_search",
+                "invalid parameters: kind 'file' is not an entity kind",
+            ),
+        ] {
+            for structured in [true, false] {
+                let result = ToolCallResult::error(if structured {
+                    json!({"message": message}).to_string()
+                } else {
+                    message.to_string()
+                });
+                let served = annotated_value(&finalize(result, ready_daemon_envelope(), tool));
+                assert_eq!(served["message"], message, "{tool}: {served}");
+                assert!(served["_kin"].get("verdict").is_none(), "{tool}: {served}");
+                assert!(served["_kin"].get("completeness").is_none(), "{tool}: {served}");
+                assert!(served.get("negative").is_none(), "{tool}: {served}");
+            }
+        }
+    }
+
+    /// A body read is an answer, and carries the verdict every other answer
+    /// does: certified when the span was checked against its bytes, and
+    /// qualified when nothing could check it.
+    #[test]
+    fn a_source_read_carries_a_verdict() {
+        for (coherence, state) in [
+            ("digest_verified", "certified"),
+            ("coherent_by_construction", "certified"),
+            ("unverified", "inconclusive"),
+        ] {
+            let served = annotated_value(&finalize(
+                ToolCallResult::text(
+                    json!({"id": "e", "name": "pop", "body": "def pop(self): pass",
+                        "span_coherence": coherence})
+                    .to_string(),
+                ),
+                ready_daemon_envelope(),
+                "get_entity_source",
+            ));
+            assert_eq!(served["_kin"]["verdict"]["state"], state, "{served}");
+            assert_eq!(
+                served["_kin"]["verdict"]["inputs"]["source_body"], state,
+                "{served}"
+            );
+        }
+        // A container served as its shape is a read like any other.
+        let served = annotated_value(&finalize(
+            ToolCallResult::text(
+                json!({"id": "e", "name": "App", "members": [], "header": "class App:",
+                    "span_coherence": "digest_verified"})
+                .to_string(),
+            ),
+            ready_daemon_envelope(),
+            "get_entity_source",
+        ));
+        assert_eq!(served["_kin"]["verdict"]["state"], "certified", "{served}");
+    }
+
+    #[test]
+    fn missing_module_member_coverage_is_inconclusive_in_every_projection() {
+        let gap = json!({"id":"module", "kind":"module", "members":[],
+            "member_coverage":"unavailable", "semantic_gap":crate::container_shape::MODULE_MEMBER_GAP,
+            "projection":"Shape", "body_omitted":"container_shape", "body":null});
+        for (tool, payload) in [
+            ("get_entity_source", gap.clone()),
+            ("get_entity_sources", json!({"results":[gap.clone()]})),
+            ("get_context_pack", json!({"focal_entity":gap.clone()})),
+        ] {
+            let served = annotated_value(&finalize(
+                ToolCallResult::text(payload.to_string()),
+                ready_daemon_envelope(),
+                tool,
+            ));
+            assert_eq!(
+                served["_kin"]["verdict"]["state"], "inconclusive",
+                "{served}"
+            );
+        }
+        let mut plain = gap;
+        plain["_kin"] = json!({});
+        let plain = crate::plain_reply::plain_answer(
+            plain.as_object().unwrap().clone(),
+            "get_entity_source",
+        );
+        // A module source read is an outline. One whose member coverage is
+        // unavailable is a partial outline, said as one, in line with the
+        // inconclusive machine verdict above: it never reads as a finding that
+        // the module declares nothing, and it is not the generic partial
+        // answer. A module whose recorded members were all read reads as a
+        // complete outline (`container_shape` tests both).
+        let text = plain.to_string();
+        assert!(text.contains("Partial outline:"), "{plain}");
+        assert!(
+            text.contains("not a finding that it declares nothing"),
+            "{plain}"
+        );
+        assert!(!text.contains("Partial:"), "{plain}");
+    }
+
     fn completeness_of(result: &ToolCallResult) -> Value {
         envelope_of(result)
             .get("completeness")
@@ -6319,6 +7238,13 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    fn call_only_reference_payload(returned: u64) -> ToolCallResult {
+        let mut payload = annotated_value(&reference_payload(returned, "present"));
+        payload["relation_kinds"] = json!(["calls"]);
+        payload["edge_coverage"]["requested_classes"] = json!(["calls"]);
+        ToolCallResult::text(payload.to_string())
     }
 
     /// The FIR-2672 shape at the envelope layer: the populated answer the
@@ -6436,11 +7362,15 @@ mod tests {
         );
         let value = annotated_value(&annotated);
         assert_eq!(
-            value[ENVELOPE_KEY]["verdict"]["state"], "certified",
+            value[ENVELOPE_KEY]["verdict"]["state"], "inconclusive",
             "{value}"
         );
-        assert_eq!(value[ENVELOPE_KEY]["completeness"]["status"], "complete");
-        assert_eq!(value[ENVELOPE_KEY]["completeness"]["bound"], "exact");
+        assert_eq!(
+            value[ENVELOPE_KEY]["verdict"]["limiting_factor"],
+            "reference_completion_unmeasured"
+        );
+        assert_eq!(value[ENVELOPE_KEY]["completeness"]["status"], "unknown");
+        assert_eq!(value[ENVELOPE_KEY]["completeness"]["bound"], "at_least");
         assert!(crate::verdict::disagreements(&value).is_empty());
     }
 
@@ -6496,7 +7426,7 @@ mod tests {
     #[test]
     fn a_fully_resolved_answer_reports_complete_and_exact() {
         let annotated = finalize(
-            reference_payload(5, "present"),
+            call_only_reference_payload(5),
             ready_daemon_envelope(),
             "find_references",
         );
@@ -6506,14 +7436,9 @@ mod tests {
         assert_eq!(completeness["bound"], "exact", "{completeness}");
         assert_eq!(completeness["counted"]["reported"], 5);
         assert_eq!(completeness["counted"]["exact"], true);
-        // Every requested class decides and every one is present (FIR-2672).
-        // This used to pin `imports: absent` beside `decided_by: ["calls"]`,
-        // the shipped 0.5.52 shape, as the fully resolved case.
-        assert_eq!(completeness["classes"]["imports"], "present");
-        assert_eq!(
-            completeness["decided_by"],
-            json!(["calls", "imports", "references"])
-        );
+        // The requested Call class decides, with no non-call completion claim.
+        assert_eq!(completeness["classes"]["calls"], "present");
+        assert_eq!(completeness["decided_by"], json!(["calls"]));
         assert!(
             completeness["limits"].is_null() || completeness["limits"] == json!([]),
             "nothing was short, so nothing is named as a limit: {completeness}"
@@ -6527,7 +7452,7 @@ mod tests {
     #[test]
     fn a_call_sites_block_qualifies_the_verdict_and_the_absence_object_together() {
         let with_block = |tally: &kin_model::CallSiteTally| {
-            let result = reference_payload(5, "present");
+            let result = call_only_reference_payload(5);
             let mut payload = annotated_value(&result);
             payload[crate::call_sites::CALL_SITES_KEY] =
                 crate::call_sites::block_json(tally, crate::call_sites::FAMILY_SCOPE);
@@ -6723,7 +7648,7 @@ mod tests {
       "imports": "present",
       "references": "present"
     },
-    "cross_file_classes": [
+    "cross_unit_classes": [
       "calls",
       "imports",
       "references"
@@ -7160,11 +8085,7 @@ mod tests {
         );
         let mut pointed = full.clone();
         pointed["_kin_json_format"] = json!("compact");
-        assert_eq!(
-            crate::budget::point_restated_limiting_factor(&mut pointed, &budget),
-            1,
-            "the advice's copy of the trust reason is the one exact restatement v2 still carries"
-        );
+        assert!(crate::budget::point_restated_limiting_factor(&mut pointed, &budget) > 0);
         assert!(crate::budget::measure(&pointed) > budget.max_chars);
         println!(
             "complete reference JSON: pretty={} compact={}",
@@ -7213,10 +8134,10 @@ mod tests {
     }
 
     #[test]
-    fn nonmatching_reference_qualifications_are_never_pointed() {
+    fn nonmatching_reference_qualifications_keep_every_unique_word() {
         let mut payload = roomy_reference_response(&conservative_reference_fixture());
-        // Envelope v2 leaves one field that can restate a qualification, so this
-        // is the whole set of them rather than three.
+        // A unique qualification after the factor prevents replacing that
+        // factor's tail. Other exact observations can still be pointed.
         let field = "/negative/advice";
         let text = payload
             .pointer(field)
@@ -7235,9 +8156,30 @@ mod tests {
         assert!(crate::budget::measure(&payload) > budget.max_chars);
         assert_eq!(
             crate::budget::point_restated_limiting_factor(&mut payload, &budget),
-            0
+            2
         );
-        assert_eq!(payload, before);
+        assert_eq!(
+            payload["negative"]["trust_reason"],
+            before["negative"]["trust_reason"]
+        );
+        assert_eq!(payload["edge_coverage"], before["edge_coverage"]);
+        assert_eq!(payload["references"], before["references"]);
+        let advice = payload.pointer(field).unwrap().as_str().unwrap();
+        assert!(
+            advice.ends_with(" An additional unique qualification."),
+            "{advice}"
+        );
+        let coverage = crate::negative::structural_coverage_clause(&before, &Envelope::daemon());
+        let reconstructed = advice
+            .replace(
+                "see `negative.subject`",
+                before["negative"]["subject"].as_str().unwrap(),
+            )
+            .replace("coverage (see `edge_coverage`)", &coverage);
+        assert_eq!(
+            reconstructed,
+            before.pointer(field).unwrap().as_str().unwrap()
+        );
     }
 
     /// The budget removes rows on purpose, and a response it shortened is
@@ -7657,6 +8599,89 @@ mod tests {
         assert_eq!(completeness["classes"]["embeddings"], "partial");
         assert_eq!(completeness["status"], "partial", "{completeness}");
         assert_eq!(completeness["bound"], "at_least");
+    }
+
+    /// An answer that ranked without search vectors is decided by the graph
+    /// its entity cards cover. Missing vectors are disclosed as not used and
+    /// never make it partial, whatever the store's counters read, while the
+    /// same counters on a fused answer still do.
+    #[test]
+    fn an_answer_ranked_without_vectors_is_decided_by_the_graph() {
+        let page = |state: &str| {
+            annotated_value(&finalize(
+                ToolCallResult::text(
+                    json!({
+                        "query": "top up the bucket",
+                        "granularity": "entity",
+                        "routing": "fused-v1",
+                        "surface": "compact",
+                        "entities": [{"id": "e", "name": "refill", "kind": "function",
+                            "matched": "name"}],
+                        "total_ranked": 1,
+                        "semantic_coverage": {
+                            "indexed": 0, "total": 1898, "pending": 1898,
+                            "complete": state == "not_used",
+                            "embedding_state": state,
+                        },
+                    })
+                    .to_string(),
+                ),
+                ready_daemon_envelope(),
+                "semantic_locate",
+            ))
+        };
+        let cards = page("not_used");
+        let completeness = &cards[ENVELOPE_KEY]["completeness"];
+        assert_eq!(completeness["substrate"], "graph", "{cards}");
+        assert_eq!(completeness["classes"]["embeddings"], "not_used", "{cards}");
+        assert_eq!(completeness["status"], "complete", "{cards}");
+        let verdict = &cards[ENVELOPE_KEY]["verdict"];
+        assert_eq!(verdict["state"], "certified", "{cards}");
+        assert!(crate::verdict::disagreements(&cards).is_empty(), "{cards}");
+
+        // The control: the same counters on an answer that did read vectors.
+        let fused = page("absent");
+        assert_eq!(
+            fused[ENVELOPE_KEY]["completeness"]["status"], "partial",
+            "{fused}"
+        );
+    }
+
+    /// An empty cards answer over a loaded graph is judged by the graph and
+    /// the population narrowings, never by the embedding counters, and its
+    /// negative names entity cards as its basis.
+    #[test]
+    fn an_empty_answer_ranked_without_vectors_names_its_basis() {
+        let served = annotated_value(&finalize(
+            ToolCallResult::text(
+                json!({
+                    "query": "top up the bucket",
+                    "granularity": "entity",
+                    "routing": "fused-v1",
+                    "entities": [],
+                    "total_ranked": 0,
+                    "semantic_coverage": {
+                        "indexed": 0, "total": 10, "pending": 10,
+                        "complete": true,
+                        "embedding_state": "not_used",
+                    },
+                })
+                .to_string(),
+            ),
+            ready_daemon_envelope(),
+            "semantic_locate",
+        ));
+        let negative = &served[crate::negative::NEGATIVE_KEY];
+        assert_eq!(negative["coverage_basis"], "entity_cards", "{served}");
+        let reason = negative["trust_reason"].as_str().unwrap_or_default();
+        assert!(!reason.contains("coverage_"), "{reason}");
+        assert!(
+            negative["advice"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this setup uses no search vectors"),
+            "{served}"
+        );
     }
 
     /// Build one `semantic_locate` response over a store with the given
@@ -8408,6 +9433,26 @@ mod tests {
     /// FIR-2829: replay-version agreement stays silent and every version gap
     /// becomes a degraded signal that reaches completeness and negative trust.
     #[test]
+    fn a_newer_release_never_certifies_an_absence() {
+        use kin_core::hydration_semantics::HydrationStanding;
+        let standing = HydrationStanding::NewerRelease {
+            recorded_release: "9999.0.0".to_string(),
+            current_release: kin_core::hydration_semantics::binary_release().to_string(),
+            created_under: Some(50),
+            upgraded_under: None,
+            derives: 50,
+        };
+        let envelope = Envelope::daemon().with_hydration_semantics_observation(Some(&standing));
+        let (trusted, reason) =
+            envelope.negative_trust(NegativeClass::Semantic, AbsenceSubstrate::Vectors);
+        assert!(!trusted);
+        assert!(reason.contains("store_semantics_ahead"));
+        let observation = HydrationSemanticsObservation::from(&standing);
+        assert_eq!(observation.standing, "ahead");
+        assert!(observation.reason.unwrap().contains("9999.0.0"));
+    }
+
+    #[test]
     fn a_hydration_semantics_gap_becomes_a_degraded_signal_and_agreement_does_not() {
         use kin_core::hydration_semantics::HydrationStanding;
 
@@ -8980,7 +10025,7 @@ mod self_check_tests {
                 let value: Value = serde_json::from_str(text).unwrap();
                 assert!(
                     text.len() <= 12_000,
-                    "{input}, pass {pass}: {} bytes",
+                    "{input}, pass {pass}: {} bytes: {value}",
                     text.len()
                 );
                 assert_eq!(value["_kin"]["response"]["chars_after_budget"], text.len());

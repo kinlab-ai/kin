@@ -144,14 +144,38 @@ fn install_hint(language: LanguageId) -> &'static str {
     }
 }
 
-/// Start a server against `root` and wait for it to finish indexing.
+/// Start a server against `root` and wait until it is ready to answer, by the
+/// same path the daemon takes: `launch_settled`, then `wait_until_indexed`.
+///
+/// An unindexed server answers prepareCallHierarchy with an empty list, and an
+/// empty list is exactly what a real miss looks like, so the wait is on the
+/// server's own signal rather than a fixed pause. A server that loads its
+/// project per document (tsserver, behind typescript-language-server) has
+/// nothing to index before a document is open and is ready at once; it is
+/// waited on per document in [`open_documents`]. This used to poll
+/// `workspace/symbol` here instead, which tsserver fails until a document is
+/// open, so every TypeScript and JavaScript proof spent its whole index budget
+/// before it opened one.
 async fn start_server(
     command: &str,
     args: &[String],
     root: &Path,
     language: LanguageId,
 ) -> kin_lsp::lifecycle::LspServer {
-    let (_, _, launch) = lsp_adapter_for(language, root).expect("adapter must exist");
+    let (_, _, mut launch) = lsp_adapter_for(language, root).expect("adapter must exist");
+    // typescript-language-server creates `$TMPDIR/typescript-language-server<uid>`
+    // with a check and then a mkdir, so two of them starting at once under a
+    // fresh TMPDIR race, and the loser exits with EEXIST before it answers
+    // `initialize`. nextest hands every test in a run the same fresh TMPDIR and
+    // these tests start their servers together, so each server gets its own.
+    let server_tmp = tempfile::Builder::new()
+        .prefix("language-server-tmp-")
+        .tempdir()
+        .expect("a TMPDIR for the language server")
+        .keep();
+    launch
+        .env
+        .push(("TMPDIR".to_string(), server_tmp.display().to_string()));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let grammars = kin_lsp::TypeScriptGrammars {
         typescript: kin_grammar_typescript::LANGUAGE_TYPESCRIPT,
@@ -167,28 +191,19 @@ async fn start_server(
     .await
     .unwrap_or_else(|error| panic!("could not start `{command}` against the fixture: {error}"));
 
-    // Poll the same way the daemon does rather than sleeping a fixed amount:
-    // an unindexed server answers prepareCallHierarchy with an empty list, and
-    // an empty list is exactly what a real miss looks like.
-    let deadline = tokio::time::Instant::now() + INDEX_BUDGET;
-    loop {
-        if server
-            .client
-            .request("workspace/symbol", serde_json::json!({ "query": "" }))
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    // A server still indexing when the budget runs out is used as it is, as
+    // the daemon uses it; the assertions after this decide.
+    let started = tokio::time::Instant::now();
+    let indexed = server.wait_until_indexed(INDEX_BUDGET).await;
+    eprintln!(
+        "`{command}` readiness: {indexed:?} after {:?}",
+        started.elapsed()
+    );
     server
 }
 
-/// Open every fixture file, the way the daemon does before it enriches.
+/// Open every fixture file, the way the daemon does before it enriches, and
+/// wait until the server has taken each one in.
 ///
 /// `enrich_entity_calls` goes straight to `prepareCallHierarchy`, so a server
 /// that was never told about the documents answers with an empty list, which is
@@ -196,12 +211,23 @@ async fn start_server(
 /// exactly that way, which is the behaviour these assertions were written to
 /// catch, so the harness performs the open rather than the assertions being
 /// loosened to tolerate it.
+///
+/// A server processes didOpen asynchronously and answers queries about a
+/// document it has not read yet with an empty result. So each document is
+/// waited on until the server answers a request about it
+/// ([`kin_lsp::lifecycle::LspServer::wait_for_document`]), which a server that
+/// loads its project per document does only once that project has loaded.
+/// The daemon waits that way for such a server on every document, for pyright
+/// and rust-analyzer on the first, and gives gopls a fixed five-second pause
+/// after its first; the wait on the answer is the signal that pause stands in
+/// for, so it is used for every server here.
 async fn open_documents(
     server: &kin_lsp::lifecycle::LspServer,
     root: &Path,
     files: &[&str],
     language_id: &str,
 ) {
+    let mut uris = Vec::with_capacity(files.len());
     for file in files {
         let path = root.join(file);
         let text = std::fs::read_to_string(&path).expect("fixture file must exist");
@@ -220,11 +246,16 @@ async fn open_documents(
                 }),
             )
             .await;
+        uris.push(uri);
     }
-    // The daemon waits after the first open per language for the same reason:
-    // a server processes didOpen asynchronously and answers queries about a
-    // document it has not read yet with an empty result.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    for uri in &uris {
+        if let Err(error) = server.wait_for_document(uri, INDEX_BUDGET).await {
+            panic!(
+                "the language server did not answer about {uri} within {INDEX_BUDGET:?} of \
+                 opening it: {error}"
+            );
+        }
+    }
 }
 
 /// One entity in the fixture's index. `name_line`/`name_col` are where the
@@ -251,6 +282,7 @@ fn entity_refs(fixtures: &[Fixture]) -> Vec<EntityRef> {
             name_line: fixture.name_line,
             name_col: fixture.name_col,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         })
         .collect()
@@ -646,6 +678,25 @@ async fn pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_overrid
     std::fs::write(root.join("pyrightconfig.json"), "{\"include\": [\".\"]}\n").unwrap();
 
     let server = start_server(&command, &args, root, LanguageId::Python).await;
+    // Everything below asks the call hierarchy. A server that does not offer
+    // it cannot make this proof, and is skipped loudly as a missing server is,
+    // never read as a pass.
+    if !server.has_call_hierarchy() {
+        let provisioned = std::env::var_os("KIN_CI_LANGUAGE_SERVERS_INSTALLED").is_some();
+        let why =
+            format!("`{command}` does not advertise callHierarchyProvider, which pyright offers");
+        assert!(
+            !provisioned,
+            "{TEST}: KIN_CI_LANGUAGE_SERVERS_INSTALLED is set, so this runner was provisioned \
+             for the Python proof, yet {why}. The proof would have passed without asking."
+        );
+        eprintln!(
+            "SKIP {TEST}: {why}, so the one-hop and two-hop answers cannot be compared on this \
+             host. {}",
+            install_hint(LanguageId::Python)
+        );
+        return;
+    }
     open_documents(
         &server,
         root,
@@ -683,12 +734,20 @@ async fn pyright_resolves_the_one_hop_to_the_base_and_the_two_hop_to_the_overrid
                 }),
             )
             .await
-            .unwrap_or(serde_json::json!(null));
+            .unwrap_or_else(|error| {
+                panic!("{label}: prepareCallHierarchy at {file}:{line}:{col} errored: {error}")
+            });
+        // An empty answer here used to skip the case and pass, so a server
+        // that resolved nothing proved nothing and the test stayed green. The
+        // server has answered about every opened document by now, so an empty
+        // answer is a failure to find the method this line declares.
         let item = prepared.get(0).cloned().unwrap_or(serde_json::json!(null));
-        if item.is_null() {
-            eprintln!("{label}: prepareCallHierarchy found nothing at {file}:{line}");
-            continue;
-        }
+        assert!(
+            !item.is_null(),
+            "{label}: prepareCallHierarchy found no call hierarchy item at {file}:{line}:{col}, \
+             where the method under test is declared; it answered {prepared}. Without it neither \
+             `.send` call is resolved, and the difference this test exists to show is unchecked."
+        );
         let out = server
             .client
             .request(
@@ -1411,6 +1470,155 @@ fn proven_at(
             }
         })
         .collect()
+}
+
+/// A JavaScript workspace package that no `node_modules` links, the way
+/// React's `react` and `shared` are only packages under `packages/`, resolves
+/// to its own source as Node would resolve it: the package's entry is the
+/// JavaScript file its manifest names, `name/sub` is `sub` inside the package,
+/// and a package with no manifest entry still resolves its subpaths. Before
+/// the workspace map looked for JavaScript, all three imports below resolved
+/// nowhere, so every value they returned was `any` and no call through them
+/// had a definition.
+#[tokio::test(flavor = "multi_thread")]
+async fn javascript_resolves_workspace_packages_that_no_node_modules_links() {
+    const TEST: &str = "javascript_resolves_workspace_packages_that_no_node_modules_links";
+    let Some((command, args)) = server_command_or_skip(LanguageId::JavaScript, TEST) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let app = "import {useStore} from 'hooks';\n\
+               import assign from 'shared/assign';\n\
+               import {useStore as again} from 'hooks/src/Hooks';\n\
+               \n\
+               export function App(context) {\n\
+               \x20 useStore(context);\n\
+               \x20 assign(context);\n\
+               \x20 again(context);\n\
+               }\n";
+    for (path, text) in [
+        (
+            "package.json",
+            "{\"private\": true, \"workspaces\": [\"packages/*\"]}\n",
+        ),
+        (
+            "packages/hooks/package.json",
+            "{\"name\": \"hooks\", \"main\": \"index.js\"}\n",
+        ),
+        (
+            "packages/hooks/index.js",
+            "export {useStore} from './src/Hooks';\n",
+        ),
+        (
+            "packages/hooks/src/Hooks.js",
+            "export function useStore(context) {\n  return context.current;\n}\n",
+        ),
+        (
+            "packages/shared/package.json",
+            "{\"name\": \"shared\", \"private\": true}\n",
+        ),
+        (
+            "packages/shared/assign.js",
+            "export default function assign(target) {\n  return target;\n}\n",
+        ),
+        (
+            "packages/app/package.json",
+            "{\"name\": \"app\", \"private\": true}\n",
+        ),
+        ("packages/app/src/App.js", app),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let use_store = EntityId::new();
+    let assign = EntityId::new();
+    let caller = EntityId::new();
+    let refs = vec![
+        EntityRef {
+            id: use_store,
+            name: "useStore".into(),
+            file_path: "packages/hooks/src/Hooks.js".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            name_line: 0,
+            name_col: 16,
+            declares_name: true,
+            declares_only: false,
+            kind: kin_model::EntityKind::Function,
+        },
+        EntityRef {
+            id: assign,
+            name: "assign".into(),
+            file_path: "packages/shared/assign.js".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            name_line: 0,
+            name_col: 24,
+            declares_name: true,
+            declares_only: false,
+            kind: kin_model::EntityKind::Function,
+        },
+        EntityRef {
+            id: caller,
+            name: "App".into(),
+            file_path: "packages/app/src/App.js".into(),
+            start_line: 4,
+            start_col: 0,
+            end_line: 8,
+            name_line: 4,
+            name_col: 16,
+            declares_name: true,
+            declares_only: false,
+            kind: kin_model::EntityKind::Function,
+        },
+    ];
+    let index = EntityIndex::new(refs, root);
+    let server = start_server(&command, &args, root, LanguageId::JavaScript).await;
+    open_documents(&server, root, &["packages/app/src/App.js"], "javascript").await;
+    wait_for_definition(&server, root, "packages/app/src/App.js", (5, 2), "Hooks.js").await;
+    let documents = |path: &str| (path == "packages/app/src/App.js").then(|| app.to_string());
+    let pass = kin_lsp::file_enrichment::enrich_file_definitions(
+        &server,
+        &root.join("packages/app/src/App.js"),
+        app,
+        &index,
+        root,
+        Some(&documents),
+    )
+    .await
+    .expect("the definitions pass answers");
+    server.shutdown().await.unwrap();
+    for (token, line, target, what) in [
+        (
+            "useStore",
+            5,
+            use_store,
+            "the package entry `hooks` -> index.js",
+        ),
+        (
+            "assign",
+            6,
+            assign,
+            "`shared/assign` inside a package with no entry",
+        ),
+        (
+            "again",
+            7,
+            use_store,
+            "`hooks/src/Hooks`, not `hooks/src/src/Hooks`",
+        ),
+    ] {
+        assert_eq!(
+            proven_at(&pass, app, caller, token, line),
+            vec![GraphNodeId::Entity(target)],
+            "{what}: {:?}",
+            pass.unproven_sites
+        );
+    }
 }
 
 /// TypeScript proves a call through a receiver of one type, and not one

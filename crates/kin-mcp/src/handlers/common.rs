@@ -14,7 +14,7 @@ use kin_model::ids::{
 };
 use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
-use kin_model::ArtifactId;
+use kin_model::{ArtifactId, BlockStyle};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static GRAPH_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -442,6 +442,10 @@ pub const TRACE_MAX_MAX_RESPONSE_CHARS: usize = crate::budget::RESPONSE_MAX_MAX_
 /// over its ceiling again, by the length of the explanation. Reserving the room
 /// first is what makes the bound hold for the payload that actually ships.
 pub const TRACE_DISCLOSURE_RESERVE_CHARS: usize = crate::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS;
+
+/// Bodies one trace reads to quote the call site on each of its steps: one
+/// per holder, and a chain holds at most a few hundred steps.
+pub const TRACE_STEP_CODE_READS_MAX: usize = 400;
 
 /// The budget a trace request asks for, clamped to what this tool will serve.
 pub fn trace_response_budget(requested: Option<usize>) -> usize {
@@ -1031,12 +1035,19 @@ pub fn clamp_source_body(body: &str, max_lines: usize, max_bytes: usize) -> Stri
 
 #[derive(Debug, Clone)]
 pub struct ReferenceRow {
+    /// The caller's structural identity from the same selected graph, frozen
+    /// independently of its reference resolution and retained across row splits.
+    pub recorded_owners: crate::semantic_owners::RecordedOwners,
     /// Graph entity id of the referencing (caller) entity, when it is a
     /// graph-owned local entity. Lets an agent drill a reference straight to the
     /// caller's body (`get_entity_source`/`get_context_pack`) without re-resolving
     /// the caller by name. That is the keystone of the no-filesystem reference→body
     /// chain. `None` for federated spine xrefs (no local entity).
     pub entity_id: Option<String>,
+    /// Authority of a federated caller. Its UUID belongs to this repository,
+    /// not to the local graph selected by a targeted read.
+    pub repo_id: Option<String>,
+    pub foreign_entity_id: Option<String>,
     pub name: String,
     pub kind: Option<String>,
     /// The file this caller is projected into. Served only under
@@ -1172,6 +1183,19 @@ pub struct ReferenceEdge {
     /// Why this edge's lines cannot license a site total, and `None` when they
     /// can.
     pub site_contract_gap: Option<ReferenceLinesPartial>,
+    /// The receiver chain this edge was bound through, when the linker bound
+    /// it from the caller's value-origin facts: one step per link, each naming
+    /// the entity that declares it (see [`kin_index::receiver_origin`]).
+    pub origin_steps: Option<std::sync::Arc<Vec<kin_index::receiver_origin::OriginStep>>>,
+    /// The same chain as the row serves it, with the code each step quotes,
+    /// once the collector that read the caller has served it (see
+    /// [`crate::receiver_binding::served_steps`]).
+    pub receiver_binding: Option<std::sync::Arc<Vec<serde_json::Value>>>,
+    /// Where the caller binds each receiver this edge's sites are made
+    /// through, for a proven edge no receiver chain bound, when the caller's
+    /// value-origin facts record the line (see
+    /// [`crate::receiver_binding::bound_in_caller`]).
+    pub receiver_bound: Option<std::sync::Arc<Vec<serde_json::Value>>>,
 }
 
 impl ReferenceEdge {
@@ -1193,6 +1217,10 @@ impl ReferenceEdge {
             spans: tally.spans,
             outside_caller_file: tally.outside_caller_file,
             site_contract_gap: edge_site_contract_gap(rel),
+            origin_steps: kin_index::receiver_origin::receiver_origin_steps(rel)
+                .map(std::sync::Arc::new),
+            receiver_binding: None,
+            receiver_bound: None,
         }
     }
 
@@ -1359,6 +1387,10 @@ pub struct ReferenceSite {
     /// not be. A call's argument list is left out, so the text names what is
     /// called, as a call-site row's `callee` does.
     pub callee: std::result::Result<String, &'static str>,
+    /// The expression the site sits in as written, cut from the same body:
+    /// the receiver and callee through the argument list, on one line (see
+    /// [`crate::site_expression::read_expression`]), or why it could not be.
+    pub expr: std::result::Result<crate::site_expression::SiteExpression, &'static str>,
 }
 
 impl ReferenceSite {
@@ -1368,11 +1400,14 @@ impl ReferenceSite {
         Self {
             line_in_entity: None,
             callee: Err("site_not_addressed"),
+            expr: Err("site_not_addressed"),
         }
     }
 
     /// The site as a row serves it: `line_in_entity` and `callee`, and
-    /// `callee_unavailable` naming why when `callee` is null.
+    /// `callee_unavailable` naming why when `callee` is null, then `expr` and
+    /// `receiver`, or `expr_unavailable` naming why there is no `expr` when
+    /// `callee_unavailable` does not already name that reason.
     pub fn to_json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "line_in_entity": self.line_in_entity,
@@ -1380,6 +1415,13 @@ impl ReferenceSite {
         });
         if let Err(reason) = &self.callee {
             value["callee_unavailable"] = serde_json::json!(reason);
+        }
+        match (&self.expr, &self.callee) {
+            (Err(reason), Err(callee_reason)) if reason == callee_reason => {}
+            (expr, _) => crate::site_expression::put_expression(
+                &mut value,
+                expr.as_ref().map_err(|reason| *reason),
+            ),
         }
         value
     }
@@ -1407,14 +1449,17 @@ pub fn served_reference_sites(row: &ReferenceRow) -> Vec<&ReferenceSite> {
 /// and the parser's call expression for one call, is served once, from the
 /// span that starts first and, of those, reaches furthest. A call's argument
 /// list is cut from its text, so the site reads as the call-site ledger reads
-/// the same call. Nothing here reads a file: the text comes from the body the
-/// caller's graph record resolves to.
+/// the same call. Its `expr` is the whole expression around the span, read
+/// from the caller's body once for all its sites. Nothing here reads a file:
+/// the text comes from the body the caller's graph record resolves to.
 pub fn address_reference_sites<T: super::external_symbols::SiteText + ?Sized>(
     caller: &Entity,
     lines: &[u32],
     spans: &[(RelationKind, SourceSpan)],
     text: &T,
 ) -> std::collections::BTreeMap<u32, ReferenceSite> {
+    let mut body: Option<std::result::Result<String, &'static str>> = None;
+    let syntax = crate::site_expression::syntax_of(caller);
     let mut chosen: std::collections::BTreeMap<u32, &(RelationKind, SourceSpan)> =
         std::collections::BTreeMap::new();
     for entry in spans {
@@ -1463,11 +1508,36 @@ pub fn address_reference_sites<T: super::external_symbols::SiteText + ?Sized>(
                     }
                 }),
             };
+            let expr = match (&callee, caller.span.as_ref()) {
+                (Err("site_outside_caller" | "caller_has_no_span"), _) | (_, None) => Err(callee
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .unwrap_or("caller_has_no_span")),
+                (_, Some(caller_span)) => {
+                    match body
+                        .get_or_insert_with(|| crate::site_expression::whole_text(text, caller))
+                    {
+                        Ok(body) => {
+                            let start = span.start_byte - caller_span.start_byte;
+                            crate::site_expression::read_expression(
+                                body,
+                                start,
+                                start + (span.end_byte - span.start_byte),
+                                &syntax,
+                            )
+                            .ok_or("site_outside_caller")
+                        }
+                        Err(reason) => Err(*reason),
+                    }
+                }
+            };
             (
                 line,
                 ReferenceSite {
                     line_in_entity,
                     callee,
+                    expr,
                 },
             )
         })
@@ -1774,7 +1844,30 @@ pub fn collect_graph_reference_rows_at<G: GraphStore>(
         repository_authority,
         ReferenceBodies::Project,
         source_scope,
+        None,
     )
+}
+
+/// Project only the selected caller's persisted reference evidence.
+pub fn collect_graph_reference_row_for_caller_at<G: GraphStore>(
+    store: &G,
+    entity_id: &EntityId,
+    caller: EntityId,
+    relation_kinds: &[RelationKind],
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+) -> Result<Option<ReferenceRow>> {
+    Ok(collect_reference_rows(
+        store,
+        entity_id,
+        relation_kinds,
+        repository_authority,
+        ReferenceBodies::Project,
+        source_scope,
+        Some(caller),
+    )?
+    .into_iter()
+    .next())
 }
 
 /// The same rows as [`collect_graph_reference_rows`], without the bodies.
@@ -1799,6 +1892,7 @@ pub fn collect_graph_reference_members<G: GraphStore>(
         repository_authority,
         ReferenceBodies::Omit,
         EntitySourceScope::WorkspaceHead,
+        None,
     )
 }
 
@@ -1916,6 +2010,7 @@ pub fn collect_interface_dispatch_candidates<G: GraphStore>(
             repository_authority,
             ReferenceBodies::Project,
             source_scope,
+            None,
         )?;
         for row in rows {
             let Some(caller) = row
@@ -2140,7 +2235,63 @@ enum ReferenceBodies {
 /// A caller's exact body as a reference answer holds it while it addresses
 /// the caller's sites: the resolved bytes and the span of the body inside
 /// them, or why the body could not be read.
-type CallerBody = std::result::Result<(Arc<Vec<u8>>, SourceSpan), &'static str>;
+pub(crate) type CallerBody = std::result::Result<(Arc<Vec<u8>>, SourceSpan), &'static str>;
+
+/// A site read can be missing coordinates, blocked by the request allowance,
+/// or unable to resolve graph authority. Those are different gaps, and none
+/// proves the caller has no implementation or that the site cannot call X.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallerSourceGap {
+    NoCoordinates,
+    NoSpan,
+    NoOrigin,
+    NoIndependentSource,
+    AbsentAtGeneration,
+    SourceAllowance,
+    GraphAuthority,
+    GraphStore,
+    ReadFailed,
+    Unavailable,
+}
+
+impl CallerSourceGap {
+    fn code(self) -> &'static str {
+        match self {
+            Self::NoCoordinates => "caller_has_no_source_coordinates",
+            Self::NoSpan => "caller_has_no_span",
+            Self::NoOrigin => "caller_has_no_file_origin",
+            Self::NoIndependentSource => "caller_independent_source_unavailable",
+            Self::AbsentAtGeneration => "caller_absent_at_generation",
+            Self::SourceAllowance => "caller_source_budget_exhausted",
+            Self::GraphAuthority => "caller_graph_authority_unavailable",
+            Self::GraphStore => "caller_graph_store_read_failed",
+            Self::ReadFailed => "caller_source_read_failed",
+            Self::Unavailable => "caller_source_unavailable",
+        }
+    }
+
+    fn structural(entity: &Entity) -> Self {
+        match (entity.span.is_some(), entity.file_origin.is_some()) {
+            (false, false) => Self::NoCoordinates,
+            (false, true) => Self::NoSpan,
+            (true, false) => Self::NoOrigin,
+            (true, true) if !matches!(kin_model::entity_derivation(entity), Ok(None)) => {
+                Self::NoIndependentSource
+            }
+            _ => Self::Unavailable,
+        }
+    }
+
+    fn from_error(error: &McpError) -> Self {
+        match error {
+            McpError::WorkspaceAbsent(_) => Self::AbsentAtGeneration,
+            McpError::SourceBudgetExhausted(_) => Self::SourceAllowance,
+            McpError::GraphStore(_) => Self::GraphStore,
+            error if error.is_graph_authority_gap() => Self::GraphAuthority,
+            _ => Self::ReadFailed,
+        }
+    }
+}
 
 /// What a reference row reads of its caller: the snippet the row may carry,
 /// and the exact body its sites are cut from, from one resolution of the
@@ -2160,7 +2311,9 @@ fn reference_row_source<G: GraphStore>(
                 Err(error) => return Err(error),
             };
             let Some((source, bytes, span)) = resolved else {
-                return Ok(Some((None, Err("caller_source_unavailable"))));
+                // A whole file's module surface has no body a row may carry,
+                // but the lines its sites sit on are the row's evidence.
+                return Ok(module_site_source(held, entity, source_scope)?.map(|body| (None, body)));
             };
             let snippet = excerpt_resolved_source(
                 entity,
@@ -2181,7 +2334,7 @@ fn reference_row_source<G: GraphStore>(
 /// The text at `site`, cut from the caller's resolved body, or why it cannot
 /// be: the one cut every reference surface makes, so `find_references` and
 /// `kin refs` quote a site identically.
-fn quote_caller_body(
+pub(crate) fn quote_caller_body(
     caller: &Entity,
     site: &SourceSpan,
     body: Option<&CallerBody>,
@@ -2256,7 +2409,12 @@ impl<G: GraphStore> super::external_symbols::SiteText for HeldCallerText<'_, '_,
             let prior = LAST_READ_SOURCE.with(|cell| cell.get());
             let body = match resolve_entity_source_authority(self.held, caller, self.scope) {
                 Ok(Some((_, bytes, span))) => Ok((bytes, span)),
-                Ok(None) | Err(_) => Err("caller_source_unavailable"),
+                // The sites of a whole file's module surface are quoted from
+                // its text, which is never served.
+                Ok(None) => module_site_source(self.held, caller, self.scope)
+                    .map(|body| body.unwrap_or(Err(CallerSourceGap::AbsentAtGeneration.code())))
+                    .unwrap_or_else(|error| Err(CallerSourceGap::from_error(&error).code())),
+                Err(error) => Err(CallerSourceGap::from_error(&error).code()),
             };
             LAST_READ_SOURCE.with(|cell| cell.set(prior));
             body
@@ -2352,7 +2510,7 @@ pub fn disclose_withheld_source_reads(
         "reason": HOSTED_SOURCE_READ_CAP_REASON,
         "detail": format!(
             "{withheld} body read(s) refused at this request's hosted source allowance: the \
-             allowance was spent, or the file is larger than its per-blob ceiling; those rows \
+             allowance was spent, or the source is larger than its per-blob ceiling; those rows \
              carry a signature and say what they withheld"
         ),
         "remediation": "ask for a narrower pack, or read the withheld body directly where a \
@@ -2374,6 +2532,7 @@ fn collect_reference_rows<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
     bodies: ReferenceBodies,
     source_scope: EntitySourceScope,
+    only_caller: Option<EntityId>,
 ) -> Result<Vec<ReferenceRow>> {
     let allowed: std::collections::HashSet<_> = relation_kinds.iter().copied().collect();
     let mut grouped: HashMap<EntityId, ReferenceRow> = HashMap::new();
@@ -2406,6 +2565,9 @@ fn collect_reference_rows<G: GraphStore>(
         let Some(source_entity_id) = rel.src.as_entity() else {
             continue;
         };
+        if only_caller.is_some_and(|caller| caller != source_entity_id) {
+            continue;
+        }
         if rel.dst != GraphNodeId::Entity(*entity_id) || !allowed.contains(&rel.kind) {
             continue;
         }
@@ -2452,6 +2614,9 @@ fn collect_reference_rows<G: GraphStore>(
         let entry = grouped
             .entry(source_entity_id)
             .or_insert_with(|| ReferenceRow {
+                recorded_owners: crate::semantic_owners::RecordedOwners::observe(store, &entity),
+                repo_id: None,
+                foreign_entity_id: None,
                 entity_id: Some(source_entity_id.to_string()),
                 name: entity.name.clone(),
                 kind: Some(format!("{:?}", entity.kind)),
@@ -2537,6 +2702,9 @@ fn collect_reference_rows<G: GraphStore>(
             let Some(source_entity_id) = rel.src.as_entity() else {
                 continue;
             };
+            if only_caller.is_some_and(|caller| caller != source_entity_id) {
+                continue;
+            }
             // A base calling itself, or the focal calling its own base, is not
             // another entity reaching the focal.
             if source_entity_id == base_id || source_entity_id == *entity_id {
@@ -2575,6 +2743,11 @@ fn collect_reference_rows<G: GraphStore>(
             let entry = grouped
                 .entry(source_entity_id)
                 .or_insert_with(|| ReferenceRow {
+                    recorded_owners: crate::semantic_owners::RecordedOwners::observe(
+                        store, &entity,
+                    ),
+                    repo_id: None,
+                    foreign_entity_id: None,
                     entity_id: Some(source_entity_id.to_string()),
                     name: entity.name.clone(),
                     kind: Some(format!("{:?}", entity.kind)),
@@ -2657,9 +2830,99 @@ fn collect_reference_rows<G: GraphStore>(
                 );
             }
         }
+        if let Some(caller) = callers.get(&source_entity_id) {
+            serve_receiver_bindings(store, caller, &mut row, &text, bodies);
+        }
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Serve the receiver chain each edge of `row` was bound through, with the
+/// code its steps quote: the call as the row's site shows it, the binding
+/// from the caller's own body when the answer read it, and every other step
+/// from its entity's signature.
+///
+/// A proven edge no chain bound, such as one a language server resolved,
+/// serves instead where the caller binds the receivers its sites are made
+/// through, when the caller's value-origin facts record those lines.
+fn serve_receiver_bindings<G: GraphStore, T: super::external_symbols::SiteText + ?Sized>(
+    store: &G,
+    caller: &Entity,
+    row: &mut ReferenceRow,
+    text: &T,
+    bodies: ReferenceBodies,
+) {
+    let unchained = |edge: &ReferenceEdge| {
+        edge.origin_steps.is_none() && edge.resolution.is_proven() && !edge.receiver_name_guess
+    };
+    let facts = row
+        .edges
+        .iter()
+        .any(unchained)
+        .then(|| kin_parser::value_origins::read_value_origins(caller))
+        .flatten()
+        .filter(|facts| !facts.binding_lines.is_empty());
+    if facts.is_none() && row.edges.iter().all(|edge| edge.origin_steps.is_none()) {
+        return;
+    }
+    let body = (bodies == ReferenceBodies::Project)
+        .then(|| crate::site_expression::whole_text(text, caller).ok())
+        .flatten();
+    if let Some(facts) = &facts {
+        let sites = &row.site_addresses;
+        for edge in row.edges.iter_mut().filter(|edge| unchained(edge)) {
+            let receivers = edge
+                .lines
+                .iter()
+                .filter_map(|line| sites.get(line))
+                .filter_map(|site| site.expr.as_ref().ok()?.receiver.as_deref());
+            let bound = crate::receiver_binding::bound_in_caller(facts, body.as_deref(), receivers);
+            if !bound.is_empty() {
+                edge.receiver_bound = Some(std::sync::Arc::new(bound));
+            }
+        }
+    }
+    let mut served: Vec<(
+        std::sync::Arc<Vec<kin_index::receiver_origin::OriginStep>>,
+        std::sync::Arc<Vec<serde_json::Value>>,
+    )> = Vec::new();
+    for edge in &mut row.edges {
+        let Some(steps) = edge.origin_steps.clone() else {
+            continue;
+        };
+        if let Some((_, value)) = served.iter().find(|(held, _)| held == &steps) {
+            edge.receiver_binding = Some(value.clone());
+            continue;
+        }
+        // The call the chain starts at: a site made through the chain's own
+        // receiver, else the row's first site.
+        let receiver = steps.first().map(|step| step.name.as_str());
+        let site = row
+            .site_addresses
+            .values()
+            .find(|site| {
+                site.expr
+                    .as_ref()
+                    .ok()
+                    .and_then(|expr| expr.receiver.as_deref())
+                    == receiver
+            })
+            .or_else(|| row.site_addresses.values().next());
+        let call = crate::receiver_binding::CallAt {
+            line_in_entity: site.and_then(|site| site.line_in_entity),
+            code: site.and_then(|site| site.expr.as_ref().ok().map(|expr| expr.expr.as_str())),
+        };
+        let value = std::sync::Arc::new(crate::receiver_binding::served_steps(
+            store,
+            caller,
+            body.as_deref(),
+            call,
+            &steps,
+        ));
+        edge.receiver_binding = Some(value.clone());
+        served.push((steps, value));
+    }
 }
 
 /// The base methods `entity_id` provably overrides.
@@ -2736,11 +2999,16 @@ pub fn reference_edges(
     rel: &kin_model::Relation,
     caller_file: Option<&kin_model::FilePathId>,
 ) -> Vec<ReferenceEdge> {
+    let origin_steps =
+        kin_index::receiver_origin::receiver_origin_steps(rel).map(std::sync::Arc::new);
     kin_index::occurrence::groups(rel)
         .into_iter()
         .map(|group| {
             let tally = span_reference_lines(group.sites.iter(), caller_file);
             ReferenceEdge {
+                origin_steps: origin_steps.clone(),
+                receiver_binding: None,
+                receiver_bound: None,
                 kind: rel.kind,
                 resolution: group.resolution,
                 receiver_name_guess: group.receiver_name_guess,
@@ -3244,13 +3512,22 @@ pub fn span_source_coherence(
         Some(recorded) if recorded.as_bytes() == artifact_blob.as_bytes() => {
             Ok(SpanCoherence::DigestVerified)
         }
-        Some(recorded) => Err(graph_source_gap(format!(
-            "entity {} span was derived from source {recorded} but path '{artifact_path}' now \
-             holds {artifact_blob} in the workspace tree, so the recorded span does not describe \
-             these bytes; the graph has admitted the new source and not yet re-derived this \
-             entity's span",
-            entity.id
-        ))),
+        Some(recorded) => {
+            // The path is an operator coordinate: the error reaches agents,
+            // and naming it withheld the whole reason from them.
+            tracing::debug!(
+                entity = %entity.id,
+                artifact_path,
+                "entity span predates the source its unit holds now"
+            );
+            Err(graph_source_gap(format!(
+                "entity {} span was derived from source {recorded} but its source unit now holds \
+                 {artifact_blob} in the workspace tree, so the recorded span does not describe \
+                 these bytes; the graph has admitted the new source and not yet re-derived this \
+                 entity's span",
+                entity.id
+            )))
+        }
         None => Ok(SpanCoherence::Unverified),
     }
 }
@@ -3306,11 +3583,30 @@ pub struct HeldSourceAuthority<'store, G: GraphStore> {
     head_sample: std::sync::OnceLock<std::result::Result<Arc<AuthorityHeadReadSample>, String>>,
     graph_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::graph::ResolvedGraphState>>>,
     tree_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::ResolvedTree>>>,
+    /// The tree deltas of each first-parent chain a state replay of this
+    /// session read. A head read binds each entity to the tree at the change
+    /// that introduced it, an ancestor of the head the state was replayed at,
+    /// so that tree is a fold over deltas already held and the chain is not
+    /// read from the store a second time. Measured on a 9-member callers walk
+    /// of React: four trees, each decoding the whole chain again, were half
+    /// the walk.
+    tree_histories: Mutex<Vec<Arc<kin_model::graph::TreeHistory>>>,
+    /// Source blobs this session read, by digest, within
+    /// [`SESSION_BLOB_BYTES_MAX`]. Every entity of a file is sliced from the
+    /// same blob, and a walk quotes many entities of few files.
+    blobs: Mutex<(HashMap<Hash256, Arc<Vec<u8>>>, usize)>,
     /// Replays this session actually performed, as opposed to served from its
     /// memo. The bound a query path has to hold is on this number, not on
     /// elapsed time, so it is observable.
     replays: AtomicU64,
+    /// Source blobs this session read from its authority, as opposed to
+    /// served from its memo.
+    blob_reads: AtomicU64,
 }
+
+/// Bytes of source blobs one session keeps to serve again. A blob past the
+/// bound is read each time it is asked for, as every blob was before.
+const SESSION_BLOB_BYTES_MAX: usize = 64 * 1024 * 1024;
 
 impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
     /// Hold authority for one request against one store snapshot.
@@ -3332,8 +3628,17 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
             head_sample: std::sync::OnceLock::new(),
             graph_at: Mutex::new(HashMap::new()),
             tree_at: Mutex::new(HashMap::new()),
+            tree_histories: Mutex::new(Vec::new()),
+            blobs: Mutex::new((HashMap::new(), 0)),
             replays: AtomicU64::new(0),
+            blob_reads: AtomicU64::new(0),
         }
+    }
+
+    /// Source blobs this session read from its authority. A path that quotes
+    /// many entities of one file holds this at the number of files.
+    pub fn blob_reads_performed(&self) -> u64 {
+        self.blob_reads.load(Ordering::SeqCst)
     }
 
     /// Whole-history replays this session performed. A query path that derives
@@ -3363,10 +3668,52 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
         authority: &ActiveRepositoryAuthority,
         digest: Hash256,
     ) -> Result<Arc<Vec<u8>>> {
-        match self.source.as_ref() {
+        // A blob is named by the digest of its bytes, and the session reads
+        // one authority for its whole life, so the bytes it read once are the
+        // bytes a second read would return.
+        if let Some(held) = self
+            .blobs
+            .lock()
+            .expect("held source authority memo is never poisoned")
+            .0
+            .get(&digest)
+        {
+            return Ok(Arc::clone(held));
+        }
+        let bytes = match self.source.as_ref() {
             Some(source) => source.load_source_blob(authority, digest),
             None => authority.load_source_blob(digest).map(Arc::new),
+        }?;
+        self.blob_reads.fetch_add(1, Ordering::SeqCst);
+        let mut blobs = self
+            .blobs
+            .lock()
+            .expect("held source authority memo is never poisoned");
+        let (held, held_bytes) = &mut *blobs;
+        if *held_bytes + bytes.len() <= SESSION_BLOB_BYTES_MAX && !held.contains_key(&digest) {
+            *held_bytes += bytes.len();
+            held.insert(digest, Arc::clone(&bytes));
         }
+        Ok(bytes)
+    }
+
+    /// The held bytes of the source unit whose content digest is `digest`,
+    /// for a reader that checks text no parse could structure. `None` when
+    /// this request has no authority to read from or the read fails; never a
+    /// file read.
+    pub(crate) fn unit_text(&self, digest: Hash256) -> Option<Arc<Vec<u8>>> {
+        self.source.as_ref()?;
+        let authority = self.authority().ok()?;
+        self.load_source_blob(authority, digest).ok()
+    }
+
+    /// The exact content the repository holds under `digest`, read through
+    /// this request's authority and kept for the request like any source
+    /// blob. For an artifact Kin does not parse, whose content is read by the
+    /// digest its tree entry names ([`crate::artifact_entity`]).
+    pub(crate) fn tree_content(&self, digest: Hash256) -> Result<Arc<Vec<u8>>> {
+        let authority = self.authority()?;
+        self.load_source_blob(authority, digest)
     }
 
     fn authority(&self) -> Result<&ActiveRepositoryAuthority> {
@@ -3412,9 +3759,13 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
         // session shared across threads must not serialize on it. Losing the
         // race costs one redundant replay and cannot produce a different answer,
         // because the store is fixed for the session's life.
-        let resolved = Arc::new(self.store.resolve_graph_at(change)?);
+        let (resolved, history) = self.store.resolve_graph_with_tree_history_at(change)?;
         self.replays.fetch_add(1, Ordering::SeqCst);
-        Ok(self.memo_fill(&self.graph_at, *change, resolved))
+        self.tree_histories
+            .lock()
+            .expect("held source authority memo is never poisoned")
+            .push(Arc::new(history));
+        Ok(self.memo_fill(&self.graph_at, *change, Arc::new(resolved)))
     }
 
     /// The repository tree at `change`, replayed at most once per session.
@@ -3424,6 +3775,18 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
     ) -> std::result::Result<Arc<kin_model::ResolvedTree>, <G as ChangeStore>::Error> {
         if let Some(tree) = self.memo_hit(&self.tree_at, change) {
             return Ok(tree);
+        }
+        // A change on a chain this session already read is replayed from the
+        // tree deltas it kept: the same fold over the same deltas, with no
+        // read of the store. A fold that fails is left to the store's own
+        // replay below, which reports the failure the way it always has.
+        let histories: Vec<Arc<kin_model::graph::TreeHistory>> = self
+            .tree_histories
+            .lock()
+            .expect("held source authority memo is never poisoned")
+            .clone();
+        if let Some(Ok(tree)) = histories.iter().find_map(|history| history.tree_at(change)) {
+            return Ok(self.memo_fill(&self.tree_at, *change, Arc::new(tree)));
         }
         let resolved = Arc::new(self.store.resolve_tree_at(change)?);
         self.replays.fetch_add(1, Ordering::SeqCst);
@@ -3456,13 +3819,128 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
     }
 }
 
+/// What a source read is for.
+///
+/// Every read but one takes an entity's own source, which a whole file's
+/// module surface does not have: Kin does not return or edit whole files. The
+/// one exception is quoting a site inside such a surface, an import or a call
+/// at the top level of a file, where the line the site sits on is the evidence
+/// a reference row stands on. That read serves the site's line and never the
+/// surface's text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceRead {
+    Entity,
+    SitesOnly,
+    /// A module's own code ([`crate::module_code`]). The caller serves only
+    /// the bytes no entity of the module owns. A module with no code yet has
+    /// an empty span, which this read admits and no other does.
+    ModuleCode,
+}
+
 fn resolve_entity_source_authority<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     scope: EntitySourceScope,
 ) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
+    resolve_source_authority(held, entity, scope, SourceRead::Entity)
+}
+
+/// The module surface `module` names, resolved for its own code: the same
+/// authority, artifact binding and digest check an entity read makes, without
+/// the whole-file refusal. The caller serves only the code no entity of the
+/// module owns ([`crate::module_code`]), never the bytes resolved here.
+pub(crate) fn resolve_module_code_authority<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    module: &Entity,
+    scope: EntitySourceScope,
+) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
+    if !kin_model::serves_module_code(module) {
+        return Ok(None);
+    }
+    resolve_source_authority(held, module, scope, SourceRead::ModuleCode)
+}
+
+/// The class `class` names, resolved for its own code: the authority, artifact
+/// binding and digest check of an entity read. The caller serves only the
+/// code no member of the class owns ([`crate::module_code`]).
+pub(crate) fn resolve_class_code_authority<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    class: &Entity,
+    scope: EntitySourceScope,
+) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
+    resolve_source_authority(held, class, scope, SourceRead::Entity)
+}
+
+/// The recorded text of the module surface `module` names, read through the
+/// held source authority, so a declaration at its top level can be quoted by
+/// its own line. `None` when the text cannot be read; never a guess. The
+/// caller keeps the text to itself and serves only what it reads off a line.
+pub(crate) fn module_surface_text<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    module: &Entity,
+    scope: EntitySourceScope,
+) -> Option<Arc<Vec<u8>>> {
+    match module_site_source(held, module, scope) {
+        Ok(Some(Ok((bytes, _)))) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// The resolved text a site inside a whole file's module surface is quoted
+/// from, or why there is none. Every check an entity read makes still holds
+/// except the whole-file refusal, and the caller keeps the text to itself.
+fn module_site_source<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    scope: EntitySourceScope,
+) -> Result<Option<CallerBody>> {
+    if !kin_model::is_module_container(entity) {
+        return Ok(Some(Err(CallerSourceGap::structural(entity).code())));
+    }
+    match resolve_source_authority(held, entity, scope, SourceRead::SitesOnly) {
+        Ok(Some((_, bytes, span))) => Ok(Some(Ok((bytes, span)))),
+        Ok(None) => Ok(Some(Err(CallerSourceGap::structural(entity).code()))),
+        Err(error) if is_absent_at_generation(&error) => Ok(None),
+        Err(error) => Ok(Some(Err(CallerSourceGap::from_error(&error).code()))),
+    }
+}
+
+/// Resolve a module only for site quotation, charging its body against the
+/// same byte limit as other callers. Absence and authority failures stay gaps.
+pub(crate) fn bounded_module_site_body<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    scope: EntitySourceScope,
+    max_bytes: usize,
+) -> CallerBody {
+    let body = module_site_source(held, entity, scope)
+        .map(|body| body.unwrap_or(Err(CallerSourceGap::AbsentAtGeneration.code())))
+        .unwrap_or_else(|error| Err(CallerSourceGap::from_error(&error).code()))?;
+    if body.1.end_byte.saturating_sub(body.1.start_byte) > max_bytes {
+        return Err(CallerSourceGap::Unavailable.code());
+    }
+    Ok(body)
+}
+
+fn resolve_source_authority<G: GraphStore>(
+    held: &HeldSourceAuthority<'_, G>,
+    entity: &Entity,
+    scope: EntitySourceScope,
+    read: SourceRead,
+) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
-    if kin_model::require_independent_source(entity).is_err() {
+    let readable = match read {
+        SourceRead::Entity => kin_model::require_targeted_source(entity).is_ok(),
+        SourceRead::SitesOnly => {
+            kin_model::is_module_container(entity)
+                && matches!(kin_model::entity_derivation(entity), Ok(None))
+        }
+        SourceRead::ModuleCode => {
+            kin_model::serves_module_code(entity)
+                && matches!(kin_model::entity_derivation(entity), Ok(None))
+        }
+    };
+    if !readable {
         return Ok(None);
     }
 
@@ -3679,6 +4157,12 @@ fn resolve_entity_source_authority<G: GraphStore>(
         }
     };
 
+    if read == SourceRead::Entity
+        && kin_model::require_targeted_source(source_entity.as_ref().unwrap_or(entity)).is_err()
+    {
+        return Ok(None);
+    }
+
     let TreeEntry::Blob { hash, .. } = current_artifact.entry else {
         return Err(graph_source_gap(format!(
             "entity {} resolves to non-source tree entry {:?} for artifact {:?}",
@@ -3722,7 +4206,11 @@ fn resolve_entity_source_authority<G: GraphStore>(
                 entity.id, current_artifact.artifact_id
             )),
         })?;
-    if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
+    let empty = span.start_byte == span.end_byte;
+    if span.start_byte > span.end_byte
+        || (empty && read != SourceRead::ModuleCode)
+        || span.end_byte > bytes.len()
+    {
         return Err(graph_source_gap(format!(
             "entity {} span {}..{} is invalid for artifact {:?} ({} bytes)",
             entity.id,
@@ -3732,8 +4220,13 @@ fn resolve_entity_source_authority<G: GraphStore>(
             bytes.len()
         )));
     }
-    kin_parser::validate_module_source_span(source_entity.as_ref().unwrap_or(entity), &bytes)
-        .map_err(|error| graph_source_gap(error.to_string()))?;
+    // An entity read proves a module's own declaration span by parsing the
+    // file again. A sites-only read never serves the surface, only a site's
+    // line cut from bytes the digest check above already bound it to.
+    if read == SourceRead::Entity {
+        kin_parser::validate_module_source_span(source_entity.as_ref().unwrap_or(entity), &bytes)
+            .map_err(|error| graph_source_gap(error.to_string()))?;
+    }
     LAST_READ_SOURCE.with(|f| f.set("graph"));
     Ok(Some((
         ExactEntitySource {
@@ -3820,6 +4313,9 @@ fn excerpt_resolved_source(
     Ok(Some(source))
 }
 
+const DERIVED_MEMBER_BODY_GAP: &str = "derived_member_body_unavailable: this candidate has no independent body and is not independently editable. Use generator_read with the returned entity_id to inspect its shared generator; changes may affect sibling members.";
+const MODULE_BODY_GAP: &str = "module_body_unavailable: this container has no independently readable or editable body; inspect its recorded member relationships and target the member entity you need. Missing member coverage is a semantic gap";
+
 /// Candidate metadata is useful context but never priced as an independent body.
 pub fn derived_member_fields(entity: &Entity) -> Option<serde_json::Value> {
     match kin_model::entity_derivation(entity) {
@@ -3827,7 +4323,7 @@ pub fn derived_member_fields(entity: &Entity) -> Option<serde_json::Value> {
         Ok(Some(derivation)) => Some(serde_json::json!({
             "derivation":derivation, "independently_editable":false, "definition_status":"derived_candidate",
             "body":null,"source_base":null,"generator_read":{"tool":"get_entity_source","entity_id":entity.id},
-            "body_unavailable":kin_model::require_independent_source(entity).unwrap_err()
+            "body_unavailable":DERIVED_MEMBER_BODY_GAP
         })),
         Err(reason) => Some(
             serde_json::json!({"definition_status":"untrusted_derivation", "independently_editable":false,
@@ -3854,6 +4350,11 @@ pub fn derived_generator_source_at<G: GraphStore>(
     max_bytes: usize,
     scope: EntitySourceScope,
 ) -> Result<serde_json::Value> {
+    if kin_model::is_module_container(entity) {
+        return Err(McpError::Context(
+            kin_model::require_targeted_source(entity).unwrap_err(),
+        ));
+    }
     let derivation = kin_model::entity_derivation(entity)
         .map_err(McpError::Context)?
         .ok_or_else(|| McpError::Context("entity has no generator evidence".into()))?;
@@ -3890,6 +4391,11 @@ pub fn derived_generator_source_at<G: GraphStore>(
                         entity.id
                     ))
                 })?;
+            if kin_model::is_module_container(&revision.entity) {
+                return Err(McpError::Context(
+                    kin_model::require_targeted_source(&revision.entity).unwrap_err(),
+                ));
+            }
             if revision.entity.name != entity.name
                 || kin_model::entity_derivation(&revision.entity).map_err(McpError::Context)?
                     != Some(derivation.clone())
@@ -3969,7 +4475,7 @@ pub fn derived_generator_source_at<G: GraphStore>(
         )
     }) {
         return Err(McpError::Context(
-            "generator lacks matching graph artifact provenance; re-admit the file".into(),
+            "generator_source_unavailable: matching graph provenance for this candidate's shared generator is missing; generator source cannot be served until that provenance is restored".into(),
         ));
     }
     let body = bytes
@@ -4001,23 +4507,37 @@ impl<G: GraphStore> HeldSourceAuthority<'_, G> {
     /// the workspace head, the store's entities, ledgers and relations over
     /// the held workspace tree; at a committed change, the graph replayed
     /// there through this authority's memo. One batch census
-    /// ([`kin_db::focal_escape_evidence_batch`]) reads each file once, by its
-    /// blob identity through this authority, which verifies each digest.
-    /// Exact file bytes are an internal boundary of the census: nothing it
-    /// reads reaches a payload.
+    /// ([`kin_db::focal_escape_evidence_batch`]) reads each file's
+    /// parse-time value-escape record once, from its entities, and never its
+    /// bytes.
     pub(crate) fn escape_evidence_batch(
         &self,
         scope: EntitySourceScope,
         focals: &[(&Entity, Vec<String>)],
     ) -> Vec<kin_model::FocalEscape> {
+        self.escape_evidence_batch_scoped(scope, focals, true)
+    }
+
+    /// The same held census with caller-role exclusions applied to individually
+    /// owned occurrences. The file inventory and alias domain remain intact.
+    pub(crate) fn escape_evidence_batch_scoped(
+        &self,
+        scope: EntitySourceScope,
+        focals: &[(&Entity, Vec<String>)],
+        include_tests: bool,
+    ) -> Vec<kin_model::FocalEscape> {
         match scope {
-            EntitySourceScope::WorkspaceHead => {
-                kin_db::focal_escape_evidence_batch(&HeadCensus { held: self }, focals)
-            }
+            EntitySourceScope::WorkspaceHead => kin_db::focal_escape_evidence_batch_scoped(
+                &HeadCensus { held: self },
+                focals,
+                include_tests,
+            ),
             EntitySourceScope::At(change) => match self.graph_at(&change) {
-                Ok(state) => {
-                    kin_db::focal_escape_evidence_batch(&StateCensus::new(self, &state), focals)
-                }
+                Ok(state) => kin_db::focal_escape_evidence_batch_scoped(
+                    &StateCensus::new(&state),
+                    focals,
+                    include_tests,
+                ),
                 Err(_) => vec![
                     kin_model::FocalEscape::Unknown {
                         reason: "the graph at the selected change could not be replayed",
@@ -4029,33 +4549,12 @@ impl<G: GraphStore> HeldSourceAuthority<'_, G> {
     }
 }
 
-/// The exact bytes of a census file, read by its blob identity through the
-/// held authority, which verifies the digest.
-fn census_file_bytes<G: GraphStore>(
-    held: &HeldSourceAuthority<'_, G>,
-    file: &kin_db::call_site_escape::CensusFile,
-    max_bytes: usize,
-) -> Option<Vec<u8>> {
-    if file.len.is_some_and(|len| len > max_bytes) {
-        return None;
-    }
-    let authority = held.authority().ok()?;
-    let bytes = match held.source.as_ref() {
-        Some(source) => source.load_source_blob_bounded(authority, file.blob, max_bytes as u64),
-        None => authority
-            .load_source_blob_bounded(file.blob, max_bytes as u64)
-            .map(Arc::new),
-    }
-    .ok()?;
-    (bytes.len() <= max_bytes).then(|| bytes.as_ref().clone())
-}
-
-/// The census files of `tree` in `languages`, each with the length `len_of`
-/// gives it.
+/// The census files of `tree` in `languages`, each with whether the graph
+/// records its parse as `parsed_of` says.
 fn census_files_of(
     tree: &kin_model::ResolvedTree,
     languages: &[kin_model::LanguageId],
-    len_of: &dyn Fn(&kin_model::FilePathId) -> Option<usize>,
+    parsed_of: &dyn Fn(&kin_model::FilePathId) -> Option<bool>,
 ) -> Option<Vec<kin_db::call_site_escape::CensusFile>> {
     let mut files = Vec::new();
     for artifact in tree.artifacts() {
@@ -4074,12 +4573,12 @@ fn census_files_of(
             .filter(|language| languages.contains(language));
         let Some(language) = language else { continue };
         let path = kin_model::FilePathId::new(artifact.path.as_utf8()?);
-        let len = len_of(&path);
+        let parsed = parsed_of(&path);
         files.push(kin_db::call_site_escape::CensusFile {
             path,
             language,
             blob: hash,
-            len,
+            parsed,
         });
     }
     Some(files)
@@ -4102,17 +4601,8 @@ impl<G: GraphStore> kin_db::call_site_escape::EscapeCensusGraph for HeadCensus<'
             store
                 .get_file_layout(path)
                 .ok()
-                .flatten()
-                .and_then(|layout| layout_len(&layout))
+                .map(|layout| layout.is_some())
         })
-    }
-
-    fn file_bytes(
-        &self,
-        file: &kin_db::call_site_escape::CensusFile,
-        max_bytes: usize,
-    ) -> Option<Vec<u8>> {
-        census_file_bytes(self.held, file, max_bytes)
     }
 
     fn entities_in(&self, path: &kin_model::FilePathId) -> Option<Vec<Entity>> {
@@ -4125,31 +4615,159 @@ impl<G: GraphStore> kin_db::call_site_escape::EscapeCensusGraph for HeadCensus<'
             .ok()
     }
 
-    fn call_site_ledger(&self, caller: EntityId) -> Option<kin_model::CallSiteLedger> {
-        self.held
-            .store
-            .lookup_resolution_record(&kin_model::ResolutionRecordId::call_sites(caller))
-            .ok()
-            .flatten()
-            .and_then(|record| record.as_call_sites().cloned())
-    }
-
-    fn context_validation(
-        &self,
-        language: kin_model::LanguageId,
-    ) -> Option<kin_model::ContextValidation> {
-        self.held
-            .store
-            .lookup_resolution_record(&kin_model::ResolutionRecordId::context_validation(language))
-            .ok()
-            .flatten()
-            .and_then(|record| record.as_context_validation().cloned())
-    }
-
     fn import_evidence_into(&self, target: EntityId) -> Option<Vec<kin_model::RelationEvidence>> {
         let relations = self.held.store.get_all_relations_for_entity(&target).ok()?;
         Some(imports_into(relations.iter(), target))
     }
+
+    fn uses_into(&self, target: EntityId) -> Option<Vec<kin_db::StoredUse>> {
+        let store = self.held.store;
+        let relations = store.get_all_relations_for_entity(&target).ok()?;
+        uses_into(relations.iter(), target, |source| {
+            store
+                .get_entity(&source)
+                .map(|entity| entity.and_then(|entity| entity.span))
+        })
+    }
+
+    fn outside_member_reads(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+    ) -> Vec<kin_db::call_site_escape::OutsideMemberRead> {
+        let store = self.held.store;
+        outside_member_reads(
+            file,
+            |path| store.artifact_id_at_path(path),
+            |id| match store.lookup_relation_by_id(id) {
+                Ok(kin_model::graph::RelationLookup::Present(relation)) => Some(relation),
+                _ => None,
+            },
+        )
+    }
+
+    fn typed_member_reads(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+    ) -> Vec<kin_db::call_site_escape::TypedMemberRead> {
+        let store = self.held.store;
+        typed_member_reads(
+            file,
+            |path| store.artifact_id_at_path(path),
+            |id| match store.lookup_relation_by_id(id) {
+                Ok(kin_model::graph::RelationLookup::Present(relation)) => Some(relation),
+                _ => None,
+            },
+        )
+    }
+
+    fn imports_written_in(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+    ) -> Vec<kin_db::call_site_escape::WrittenImport> {
+        let store = self.held.store;
+        // An import is an edge out of an entity of the importing file.
+        let mut relations: Vec<kin_model::Relation> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entity in self.entities_in(&file.path).unwrap_or_default() {
+            for relation in store
+                .get_all_relations_for_entity(&entity.id)
+                .unwrap_or_default()
+            {
+                if relation.src.as_entity() == Some(entity.id) && seen.insert(relation.id) {
+                    relations.push(relation);
+                }
+            }
+        }
+        kin_index::written_imports(relations.iter(), &file.path.0, |id| {
+            store
+                .get_entity(&id)
+                .ok()
+                .flatten()
+                .map(|entity| entity.kind)
+        })
+    }
+}
+
+/// The coverage certificate the graph holds for a census file, with the
+/// artifact it belongs to.
+fn coverage_certificate_of(
+    file: &kin_db::call_site_escape::CensusFile,
+    artifact_at: impl Fn(&RepoPath) -> Option<ArtifactId>,
+    relation: impl Fn(&kin_model::RelationId) -> Option<kin_model::Relation>,
+) -> Option<(kin_model::Relation, ArtifactId)> {
+    let artifact = RepoPath::from_utf8(file.path.0.clone())
+        .ok()
+        .and_then(|path| artifact_at(&path))?;
+    let certificate = relation(&kin_index::parse_coverage_relation_id(artifact))?;
+    Some((certificate, artifact))
+}
+
+/// The member reads a file's coverage certificate records with the class
+/// their receiver is typed as, when the certificate was minted from the body
+/// the census holds for the file.
+fn typed_member_reads(
+    file: &kin_db::call_site_escape::CensusFile,
+    artifact_at: impl Fn(&RepoPath) -> Option<ArtifactId>,
+    relation: impl Fn(&kin_model::RelationId) -> Option<kin_model::Relation>,
+) -> Vec<kin_db::call_site_escape::TypedMemberRead> {
+    let Some((certificate, artifact)) = coverage_certificate_of(file, artifact_at, relation) else {
+        return Vec::new();
+    };
+    kin_index::receiver_typed_reads_of(&certificate, &file.path.0, artifact, file.blob)
+        .into_iter()
+        .map(|read| kin_db::call_site_escape::TypedMemberRead {
+            line: read.line,
+            member: read.member,
+            receiver: read.receiver,
+            class: read.class,
+        })
+        .collect()
+}
+
+/// The member reads a file's coverage certificate records as proved to read
+/// no declaration of the repository, when the certificate was minted from
+/// the body the census holds for the file.
+fn outside_member_reads(
+    file: &kin_db::call_site_escape::CensusFile,
+    artifact_at: impl Fn(&RepoPath) -> Option<ArtifactId>,
+    relation: impl Fn(&kin_model::RelationId) -> Option<kin_model::Relation>,
+) -> Vec<kin_db::call_site_escape::OutsideMemberRead> {
+    let Some((certificate, artifact)) = coverage_certificate_of(file, artifact_at, relation) else {
+        return Vec::new();
+    };
+    kin_index::receiver_outside_reads_of(&certificate, &file.path.0, artifact, file.blob)
+        .into_iter()
+        .map(|read| kin_db::call_site_escape::OutsideMemberRead {
+            line: read.line,
+            member: read.member,
+            receiver: read.receiver,
+            owner: read.owner,
+        })
+        .collect()
+}
+
+/// Every `Calls`, `Imports` and `References` edge among `relations` that
+/// lands on `target`, each with its source entity's span as `span_of` reads
+/// it, or `None` when one cannot be read.
+fn uses_into<'r, E>(
+    relations: impl Iterator<Item = &'r kin_model::Relation>,
+    target: EntityId,
+    span_of: impl Fn(EntityId) -> std::result::Result<Option<kin_model::SourceSpan>, E>,
+) -> Option<Vec<kin_db::StoredUse>> {
+    let mut uses = Vec::new();
+    for relation in relations {
+        if !kin_db::StoredUse::KINDS.contains(&relation.kind)
+            || relation.dst.as_entity() != Some(target)
+        {
+            continue;
+        }
+        let source = match relation.src.as_entity() {
+            Some(source) => span_of(source).ok()?,
+            None => None,
+        };
+        uses.extend(kin_db::StoredUse::of(relation, target, source));
+    }
+    Some(uses)
 }
 
 /// The evidence of every `Imports` edge among `relations` that lands on
@@ -4166,33 +4784,15 @@ fn imports_into<'r>(
         .collect()
 }
 
-/// The length a file's layout records: the end of its last region.
-fn layout_len(layout: &kin_model::layout::FileLayout) -> Option<usize> {
-    layout
-        .regions
-        .iter()
-        .map(|region| match region {
-            kin_model::layout::SourceRegion::EntityRef { byte_range, .. }
-            | kin_model::layout::SourceRegion::Trivia { byte_range } => byte_range.end,
-        })
-        .chain(std::iter::once(layout.imports.byte_range.end))
-        .max()
-}
-
 /// A committed generation for the census: the replayed state's tree,
-/// entities, relations and resolution records, with file bytes read through
-/// the held authority.
-struct StateCensus<'h, 'store, G: GraphStore> {
-    held: &'h HeldSourceAuthority<'store, G>,
+/// entities and relations.
+struct StateCensus<'h> {
     state: &'h kin_model::graph::ResolvedGraphState,
     by_file: HashMap<String, Vec<Entity>>,
 }
 
-impl<'h, 'store, G: GraphStore> StateCensus<'h, 'store, G> {
-    fn new(
-        held: &'h HeldSourceAuthority<'store, G>,
-        state: &'h kin_model::graph::ResolvedGraphState,
-    ) -> Self {
+impl<'h> StateCensus<'h> {
+    fn new(state: &'h kin_model::graph::ResolvedGraphState) -> Self {
         let mut by_file: HashMap<String, Vec<Entity>> = HashMap::new();
         for entity in state.entities.values() {
             if let Some(file) = entity.file_origin.as_ref() {
@@ -4202,15 +4802,11 @@ impl<'h, 'store, G: GraphStore> StateCensus<'h, 'store, G> {
                     .push(entity.clone());
             }
         }
-        Self {
-            held,
-            state,
-            by_file,
-        }
+        Self { state, by_file }
     }
 }
 
-impl<G: GraphStore> kin_db::call_site_escape::EscapeCensusGraph for StateCensus<'_, '_, G> {
+impl kin_db::call_site_escape::EscapeCensusGraph for StateCensus<'_> {
     fn census_files(
         &self,
         languages: &[kin_model::LanguageId],
@@ -4218,37 +4814,54 @@ impl<G: GraphStore> kin_db::call_site_escape::EscapeCensusGraph for StateCensus<
         census_files_of(&self.state.tree, languages, &|_| None)
     }
 
-    fn file_bytes(
-        &self,
-        file: &kin_db::call_site_escape::CensusFile,
-        max_bytes: usize,
-    ) -> Option<Vec<u8>> {
-        census_file_bytes(self.held, file, max_bytes)
-    }
-
     fn entities_in(&self, path: &kin_model::FilePathId) -> Option<Vec<Entity>> {
         Some(self.by_file.get(&path.0).cloned().unwrap_or_default())
     }
 
-    fn call_site_ledger(&self, caller: EntityId) -> Option<kin_model::CallSiteLedger> {
-        self.state
-            .resolution_records
-            .get(&kin_model::ResolutionRecordId::call_sites(caller))
-            .and_then(|record| record.as_call_sites().cloned())
-    }
-
-    fn context_validation(
-        &self,
-        language: kin_model::LanguageId,
-    ) -> Option<kin_model::ContextValidation> {
-        self.state
-            .resolution_records
-            .get(&kin_model::ResolutionRecordId::context_validation(language))
-            .and_then(|record| record.as_context_validation().cloned())
-    }
-
     fn import_evidence_into(&self, target: EntityId) -> Option<Vec<kin_model::RelationEvidence>> {
         Some(imports_into(self.state.relations.values(), target))
+    }
+
+    fn uses_into(&self, target: EntityId) -> Option<Vec<kin_db::StoredUse>> {
+        uses_into(self.state.relations.values(), target, |source| {
+            Ok::<_, std::convert::Infallible>(
+                self.state
+                    .entities
+                    .get(&source)
+                    .and_then(|entity| entity.span.clone()),
+            )
+        })
+    }
+
+    fn outside_member_reads(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+    ) -> Vec<kin_db::call_site_escape::OutsideMemberRead> {
+        outside_member_reads(
+            file,
+            |path| self.state.tree.artifact_id_at_path(path),
+            |id| self.state.relations.get(id).cloned(),
+        )
+    }
+
+    fn typed_member_reads(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+    ) -> Vec<kin_db::call_site_escape::TypedMemberRead> {
+        typed_member_reads(
+            file,
+            |path| self.state.tree.artifact_id_at_path(path),
+            |id| self.state.relations.get(id).cloned(),
+        )
+    }
+
+    fn imports_written_in(
+        &self,
+        file: &kin_db::call_site_escape::CensusFile,
+    ) -> Vec<kin_db::call_site_escape::WrittenImport> {
+        kin_index::written_imports(self.state.relations.values(), &file.path.0, |id| {
+            self.state.entities.get(&id).map(|entity| entity.kind)
+        })
     }
 }
 
@@ -4301,6 +4914,12 @@ impl<G: GraphStore> kin_context::ContextProjectionProvider for ContextSourceProv
         entity: &Entity,
         limits: kin_context::ProjectionLimits,
     ) -> kin_context::Result<kin_context::BodyCandidate> {
+        if let Some(fields) = crate::container_shape::module_inventory(self.held.store(), entity) {
+            self.fields.borrow_mut().insert(entity.id, fields);
+            return Ok(kin_context::BodyCandidate::Unavailable {
+                reason: crate::container_shape::CONTAINER_SHAPE_REASON.to_string(),
+            });
+        }
         if let Some(fields) = derived_member_fields(entity) {
             self.fields
                 .borrow_mut()
@@ -4353,6 +4972,18 @@ impl<G: GraphStore> kin_context::ContextProjectionProvider for ContextSourceProv
         let body_text = std::str::from_utf8(body).map_err(|error| {
             kin_context::ContextError::Other(format!("source span is not valid UTF-8: {error}"))
         })?;
+        // A container is served as its shape: its header and its members by
+        // id. Its whole body is its members' bodies, each readable on its own.
+        if let Some(shape) =
+            crate::container_shape::shape_fields(self.held.store(), entity, body_text)
+        {
+            if let Some(fields) = self.fields.borrow_mut().get_mut(&entity.id) {
+                fields.extend(shape);
+            }
+            return Ok(kin_context::BodyCandidate::Unavailable {
+                reason: crate::container_shape::CONTAINER_SHAPE_REASON.to_string(),
+            });
+        }
         if body.len() > limits.max_candidate_bytes.min(limits.max_retained_bytes) {
             if let Some(fields) = self.fields.borrow_mut().get_mut(&entity.id) {
                 fields.insert("body_bytes".into(), serde_json::json!(body.len()));
@@ -4381,15 +5012,56 @@ pub fn attach_context_projection(
     body_expected: bool,
 ) {
     row["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
+    let shaped = report.downgrades.get(&entry.entity_id).map(String::as_str)
+        == Some(crate::container_shape::CONTAINER_SHAPE_REASON);
     if let Some(metadata) = fields.borrow().get(&entry.entity_id) {
         if let Some(object) = row.as_object_mut() {
-            object.extend(metadata.clone());
+            for (key, value) in metadata {
+                // A container's shape is served only where its body was: a
+                // route or neighbour row naming the same class is its
+                // signature, never a second copy of its member list.
+                if shaped
+                    && !body_expected
+                    && crate::container_shape::SHAPE_KEYS.contains(&key.as_str())
+                {
+                    continue;
+                }
+                object.insert(key.clone(), value.clone());
+            }
         }
     }
     if report.full_bodies.contains(&entry.entity_id) {
         row["body"] = serde_json::json!(entry.content);
         row["body_complete"] = serde_json::json!(true);
+    } else if shaped {
+        // Served as its shape where a body was expected: the header and
+        // members merged above are the content, and nothing is missing.
+        // Elsewhere the row is the signature it was admitted as.
+        if let Some(object) = row.as_object_mut() {
+            object.remove("body");
+            object.remove("body_complete");
+        }
+        if body_expected {
+            row["projection"] = serde_json::json!(crate::container_shape::SHAPE_PROJECTION);
+        }
     } else if let Some(reason) = report.downgrades.get(&entry.entity_id) {
+        // The context builder can refuse aggregate module source before it
+        // calls this request's provider. Keep that policy refusal useful on
+        // the semantic surface without forwarding its storage diagnostics.
+        let reason = if !report.budget_withheld.contains(&entry.entity_id)
+            && row
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind.to_ascii_lowercase().as_str(),
+                        "module" | "package" | "file"
+                    )
+                }) {
+            MODULE_BODY_GAP
+        } else {
+            reason
+        };
         downgrade_context_body(row, reason);
         row["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
         if report.budget_withheld.contains(&entry.entity_id) {
@@ -4435,6 +5107,12 @@ pub fn attach_context_body<G: GraphStore>(
     row: &mut serde_json::Value,
     budget: &mut ContextBodyBudget,
 ) -> Result<()> {
+    if let Some(fields) = crate::container_shape::module_inventory(held.store(), entity) {
+        row["body"] = serde_json::Value::Null;
+        row["body_complete"] = serde_json::json!(false);
+        row.as_object_mut().expect("context row").extend(fields);
+        return Ok(());
+    }
     if let Some(fields) = derived_member_fields(entity) {
         if let Some(row) = row.as_object_mut() {
             row.extend(fields.as_object().expect("object").clone());
@@ -4488,6 +5166,14 @@ pub fn downgrade_context_body(row: &mut serde_json::Value, reason: &str) {
     row["body_unavailable"] = serde_json::json!(reason);
 }
 
+/// The refusal a read of a whole file's module surface answers with, or `None`
+/// for any other entity: the entity by name and id, what it is, and the calls
+/// that read the code in it instead (see [`kin_model::whole_file_refusal_tail`]).
+pub fn whole_file_source_refusal(entity: &Entity) -> Option<String> {
+    kin_model::whole_file_refusal_tail(entity)
+        .map(|tail| format!("{} ({}) {tail}", entity.name, entity.id))
+}
+
 /// Explain, in agent-actionable terms, why an entity has no graph-owned body.
 ///
 /// Reached only when the projection returned no body without erroring, which is
@@ -4496,7 +5182,13 @@ pub fn downgrade_context_body(row: &mut serde_json::Value, reason: &str) {
 /// names the missing coordinate so an agent stops asking for the body instead of
 /// retrying, and never mistakes absence for an empty implementation.
 pub fn entity_body_gap_reason(entity: &Entity) -> String {
-    if let Err(reason) = kin_model::require_independent_source(entity) {
+    if kin_model::is_module_container(entity) {
+        return MODULE_BODY_GAP.into();
+    }
+    if matches!(kin_model::entity_derivation(entity), Ok(Some(_))) {
+        return DERIVED_MEMBER_BODY_GAP.into();
+    }
+    if let Err(reason) = kin_model::require_targeted_source(entity) {
         return reason;
     }
     let missing = match (entity.file_origin.is_some(), entity.span.is_some()) {
@@ -4640,21 +5332,14 @@ pub fn expand_entity_source_excerpt(
     max_chars: usize,
 ) -> Option<String> {
     let start_idx = line_index_for_byte(content.as_bytes(), start_byte);
-    match entity.language {
-        LanguageId::Python => expand_python_block_excerpt(content, start_idx, max_lines, max_chars),
-        LanguageId::JavaScript
-        | LanguageId::TypeScript
-        | LanguageId::Rust
-        | LanguageId::Go
-        | LanguageId::Java
-        | LanguageId::C
-        | LanguageId::Cpp
-        | LanguageId::CSharp
-        | LanguageId::Php
-        | LanguageId::Swift
-        | LanguageId::Kotlin
-        | LanguageId::Hcl => expand_brace_block_excerpt(content, start_idx, max_lines, max_chars),
-        LanguageId::Ruby => expand_ruby_block_excerpt(content, start_idx, max_lines, max_chars),
+    match entity.language.profile().block_style {
+        BlockStyle::Indentation => {
+            expand_indented_block_excerpt(content, start_idx, max_lines, max_chars)
+        }
+        BlockStyle::Braces => expand_brace_block_excerpt(content, start_idx, max_lines, max_chars),
+        BlockStyle::EndKeyword => {
+            expand_end_keyword_block_excerpt(content, start_idx, max_lines, max_chars)
+        }
     }
 }
 
@@ -4665,7 +5350,7 @@ pub fn line_index_for_byte(bytes: &[u8], byte: usize) -> usize {
         .count()
 }
 
-pub fn expand_python_block_excerpt(
+pub fn expand_indented_block_excerpt(
     content: &str,
     start_idx: usize,
     max_lines: usize,
@@ -4744,7 +5429,7 @@ pub fn expand_brace_block_excerpt(
     None
 }
 
-pub fn expand_ruby_block_excerpt(
+pub fn expand_end_keyword_block_excerpt(
     content: &str,
     start_idx: usize,
     max_lines: usize,
@@ -4848,8 +5533,10 @@ pub fn semantic_metadata_json<T: serde::Serialize>(value: &T) -> Result<serde_js
                     {
                         for key in [
                             "embedding_body_preview",
+                            kin_index::pipeline::OWN_CODE_KEY,
                             "file_import_context",
                             "file_surface_context",
+                            kin_model::VALUE_ESCAPE_RECORD_KEY,
                         ] {
                             metadata.remove(key);
                         }
@@ -4878,6 +5565,10 @@ pub fn entity_response_json<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<serde_json::Value> {
     let mut value = semantic_metadata_json(entity)?;
+    if let Some(fields) = crate::container_shape::module_inventory(store, entity) {
+        value.as_object_mut().expect("entity object").extend(fields);
+        return Ok(value);
+    }
     if let Some(fields) = derived_member_fields(entity) {
         value
             .as_object_mut()
@@ -5055,7 +5746,7 @@ pub fn parse_capabilities(
 
 /// Shared by the served schema and invalid-kind errors. Keep aliases and the
 /// role-based `test` filter visible without a case-sensitive schema enum.
-pub const SEMANTIC_SEARCH_KIND_GUIDANCE: &str = "Accepted kinds (case-insensitive): function (fn), method, command (cmd, subcommand), class, interface, trait (traitdef), type_alias, module, package, test, schema, api_endpoint, event_contract, enum (enumdef), constant. `test` filters the test role. Omit kind to search all declaration kinds. Files are not declarations. Select a semantic entity by name or kind; missing parsed coverage is a graph gap, not a file-read fallback.";
+pub const SEMANTIC_SEARCH_KIND_GUIDANCE: &str = "Accepted kinds (case-insensitive): function (fn), method, command (cmd, subcommand), class, interface, trait (traitdef), type_alias, module, package, test, schema, api_endpoint, event_contract, enum (enumdef), constant. `test` filters the test role. Omit kind to search all declaration kinds. Select a semantic entity by name or kind; missing parsed coverage is a graph gap.";
 
 pub fn build_semantic_search_request(
     args: &HashMap<String, serde_json::Value>,
@@ -5078,7 +5769,7 @@ pub fn build_semantic_search_request(
     if let Some(kind) = kind_str {
         if kind_filter.is_none() && !kind.eq_ignore_ascii_case("test") {
             return Err(McpError::InvalidParams(format!(
-                "unsupported semantic_search kind {kind:?}. {SEMANTIC_SEARCH_KIND_GUIDANCE}"
+                "unsupported semantic_search kind. {SEMANTIC_SEARCH_KIND_GUIDANCE}"
             )));
         }
     }
@@ -6048,6 +6739,17 @@ mod census_source_bounds_tests {
                 0,
                 target_body,
             );
+            // The file's value-escape record, as its adapter wrote it: the
+            // callback call is a call, and nothing uses `target` as a value.
+            let mut target = target;
+            target.metadata.extra.insert(
+                "blob_hash".into(),
+                serde_json::json!(source_hash.to_string()),
+            );
+            target.metadata.extra.insert(
+                kin_model::VALUE_ESCAPE_RECORD_KEY.into(),
+                kin_model::FileEscapeRecord::new(kin_model::ModuleScope::Closed).to_metadata(),
+            );
             let mut caller = spanned_entity(
                 "consumer",
                 "app.ts",
@@ -6169,13 +6871,7 @@ mod census_source_bounds_tests {
             let source = RequestRepositoryAuthority::already_open(binding, active);
             let held = HeldSourceAuthority::new(&graph, Some(&source));
             let names = kin_model::focal_call_names(&target);
-            let direct =
-                kin_db::focal_escape_evidence(&graph, &target, &names, &|file, max_bytes| {
-                    manager
-                        .load_source_blob_bounded(file.blob, max_bytes as u64)
-                        .ok()
-                        .flatten()
-                });
+            let direct = kin_db::focal_escape_evidence(&graph, &target, &names);
             let head = held
                 .escape_evidence_batch(
                     EntitySourceScope::WorkspaceHead,
@@ -6221,71 +6917,551 @@ mod census_source_bounds_tests {
             }
         }
     }
+}
 
-    #[test]
-    fn census_cas_reads_preserve_unknown_lengths_and_shared_bounds() {
+#[cfg(test)]
+mod module_site_source_tests {
+    use super::*;
+    use crate::handlers::external_symbols::SiteText;
+    use kin_model::{ChangeStore, EntityStore};
+    use serde_json::json;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        graph: kin_db::InMemoryGraph,
+        authority: RequestRepositoryAuthority,
+        module: Entity,
+        member: Entity,
+        site: SourceSpan,
+    }
+
+    fn fixture() -> Fixture {
         let directory = tempfile::tempdir().unwrap();
-        let repository_id = kin_model::RepositoryId::new("census-bounds").unwrap();
+        let repository_id = kin_model::RepositoryId::new("module-site-source").unwrap();
         let workspace_id = kin_model::WorkspaceId::new();
         let backend = Arc::new(kin_db::LocalFileBackend::new(directory.path()));
         let manager = Arc::new(
             kin_db::RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&backend))
                 .unwrap(),
         );
-        let hashes = kin_blobs::BlobStore::new(directory.path().join("fixture-hashes")).unwrap();
-        let first = b"selected historical source";
-        let second = b"different admitted source";
-        let first_hash = Hash256::from_bytes(*hashes.write(first).unwrap().as_bytes());
-        let second_hash = Hash256::from_bytes(*hashes.write(second).unwrap().as_bytes());
-        manager.save_source_blob(first_hash, first).unwrap();
-        manager.save_source_blob(second_hash, second).unwrap();
-        let active = Arc::new(ActiveRepositoryAuthority::from_shared(
-            manager,
+        let member_body = "def work():\n    return target(7)\n";
+        let content =
+            format!("from helpers import target\nif enabled:\n    target(42)\n{member_body}");
+        let hash = Hash256::from_bytes(kin_blobs::digest_bytes(content.as_bytes()));
+        manager.save_source_blob(hash, content.as_bytes()).unwrap();
+        let mut module = crate::call_sites::fixture::spanned_entity(
+            "app",
+            "app.py",
+            kin_model::LanguageId::Python,
+            0,
+            &content,
+        );
+        module.kind = EntityKind::Module;
+        module.signature = "module app.py".into();
+        module
+            .metadata
+            .extra
+            .insert("blob_hash".into(), json!(hash.to_string()));
+        let mut member = crate::call_sites::fixture::spanned_entity(
+            "work",
+            "app.py",
+            kin_model::LanguageId::Python,
+            content.find("def work").unwrap(),
+            member_body,
+        );
+        member
+            .metadata
+            .extra
+            .insert("blob_hash".into(), json!(hash.to_string()));
+        let relation = kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: RelationKind::Contains,
+            src: kin_model::GraphNodeId::Entity(module.id),
+            dst: kin_model::GraphNodeId::Entity(member.id),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let policy = kin_model::SharedAdmissionPolicy::empty(0);
+        let mut change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            parents: Vec::new(),
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("source-test"),
+            message: "admit semantic module source fixture".into(),
+            entity_deltas: vec![
+                kin_model::EntityDelta::Added {
+                    new: module.clone(),
+                },
+                kin_model::EntityDelta::Added {
+                    new: member.clone(),
+                },
+            ],
+            relation_deltas: vec![kin_model::RelationDelta::Added { new: relation }],
+            tree_deltas: vec![kin_model::TreeDelta::Added {
+                artifact_id: kin_model::ArtifactId::new(),
+                new: kin_model::LocatedEntry::new(
+                    RepoPath::from_utf8("app.py").unwrap(),
+                    TreeEntry::blob(hash, false),
+                ),
+            }],
+            admission_policy_delta: Some(kin_model::AdmissionPolicyDelta::initialize(
+                policy.clone(),
+            )),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            external_reference_deltas: Vec::new(),
+            resolution_record_deltas: Vec::new(),
+        };
+        change.id = kin_model::compute_semantic_change_id(&change).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: change.entity_deltas.clone(),
+                relation_deltas: change.relation_deltas.clone(),
+                tree_deltas: change.tree_deltas.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        graph.create_change(&change).unwrap();
+        kin_core::initialize_repository_authority(
+            &manager,
             repository_id.clone(),
             workspace_id,
-        ));
+            kin_model::AdmissionCase::Sensitive,
+            kin_model::RefName::branch(b"main").unwrap(),
+            policy,
+            Some(change),
+        )
+        .unwrap();
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_parts(
-            repository_id,
+            repository_id.clone(),
             workspace_id,
             backend,
         );
-        let source = RequestRepositoryAuthority::already_open(binding, active)
-            .with_hosted_source_projection_budget(
-                64,
-                first.len() as u64 + second.len() as u64 - 1,
-                8,
-            );
-        let graph = kin_db::InMemoryGraph::new();
-        let held = HeldSourceAuthority::new(&graph, Some(&source));
-        let file = kin_db::call_site_escape::CensusFile {
-            path: kin_model::FilePathId::new("selected.py"),
-            language: kin_model::LanguageId::Python,
-            blob: first_hash,
-            // Committed graphs need no layout length to read a small exact CAS body.
-            len: None,
-        };
-        assert!(census_file_bytes(&held, &file, first.len() - 1).is_none());
+        let active = Arc::new(ActiveRepositoryAuthority::from_shared(
+            manager,
+            repository_id,
+            workspace_id,
+        ));
+        let site_at = content.find("target(42)").unwrap();
+        Fixture {
+            _directory: directory,
+            graph,
+            authority: RequestRepositoryAuthority::already_open(binding, active),
+            module,
+            member,
+            site: SourceSpan {
+                file: kin_model::FilePathId::new("app.py"),
+                start_byte: site_at,
+                end_byte: site_at + "target(42)".len(),
+                start_line: 2,
+                start_col: 4,
+                end_line: 2,
+                end_col: 14,
+            },
+        }
+    }
+
+    #[test]
+    fn callee_text_reads_a_member_with_one_body_allowed() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        let span = f.member.span.as_ref().unwrap();
         assert_eq!(
-            census_file_bytes(&held, &file, first.len()).unwrap(),
-            first.to_vec()
+            text.quote(&f.member, span).unwrap(),
+            "def work():\n    return target(7)\n"
         );
+        assert_eq!(
+            text.quote(&f.member, span).unwrap(),
+            "def work():\n    return target(7)\n"
+        );
+    }
+
+    #[test]
+    fn callee_text_refused_module_does_not_spend_a_body_read() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        assert_eq!(
+            text.quote(&f.module, f.module.span.as_ref().unwrap()),
+            Err("caller_source_unavailable")
+        );
+        assert_eq!(
+            text.quote(&f.member, f.member.span.as_ref().unwrap()).unwrap(),
+            "def work():\n    return target(7)\n",
+            "A structurally refused module performed no body read; the readable caller still has its allowance"
+        );
+        assert!(read_entity_source_exact(&held, &f.module, 1_000_000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn callee_text_failed_source_reads_still_spend_the_allowance() {
+        let f = fixture();
+        let missing = crate::call_sites::fixture::spanned_entity(
+            "missing",
+            "missing.py",
+            kin_model::LanguageId::Python,
+            0,
+            "def missing():\n    target()\n",
+        );
+        f.graph.upsert_entity(&missing).unwrap();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        for _ in 0..2 {
+            assert_eq!(
+                text.quote(&missing, missing.span.as_ref().unwrap()),
+                Err("caller_source_unavailable")
+            );
+        }
+        assert_eq!(
+            text.quote(&f.member, f.member.span.as_ref().unwrap()),
+            Err("callee_text_read_limit")
+        );
+        let empty = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 0);
+        assert_eq!(
+            empty.quote(&f.member, f.member.span.as_ref().unwrap()),
+            Err("callee_text_read_limit")
+        );
+    }
+
+    /// A site is readable without making its structural container a body.
+    /// The site consumes the same allowance as every other authority read.
+    #[test]
+    fn callee_text_module_site_is_bounded_without_serving_the_module_body() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        assert_eq!(
+            text.quote(&f.module, f.module.span.as_ref().unwrap()),
+            Err("caller_source_unavailable")
+        );
+        assert_eq!(
+            text.quote(&f.module, &f.site),
+            Ok("target(42)".to_string()),
+            "the existing module site authority can quote this exact recorded site"
+        );
+        assert_eq!(text.quote(&f.module, &f.site), Ok("target(42)".to_string()));
+        assert_eq!(
+            text.quote(&f.member, f.member.span.as_ref().unwrap()),
+            Err("callee_text_read_limit"),
+            "a module site read cannot create a second unbounded allowance"
+        );
+        assert_eq!(
+            text.quote(&f.module, f.module.span.as_ref().unwrap()),
+            Err("caller_source_unavailable")
+        );
+        let empty = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 0);
+        assert_eq!(
+            empty.quote(&f.module, &f.site),
+            Err("callee_text_read_limit")
+        );
+        assert!(read_entity_source_exact(&held, &f.module, 1_000_000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn callee_text_module_invalid_sites_and_derivation_do_not_spend_reads() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        let mut outside = f.site.clone();
+        outside.file = kin_model::FilePathId::new("other.py");
+        assert_eq!(text.quote(&f.module, &outside), Err("site_outside_caller"));
+        outside = f.site.clone();
+        outside.end_byte = f.module.span.as_ref().unwrap().end_byte + 1;
+        assert_eq!(text.quote(&f.module, &outside), Err("site_outside_caller"));
+        let mut empty = f.site.clone();
+        empty.end_byte = empty.start_byte;
+        assert_eq!(
+            text.quote(&f.module, &empty),
+            Err("caller_source_unavailable")
+        );
+        let mut derived = f.module.clone();
+        derived.metadata.extra.insert(
+            kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+            json!({"invalid":true}),
+        );
+        assert_eq!(
+            text.quote(&derived, &f.site),
+            Err("caller_source_unavailable")
+        );
+        assert_eq!(text.quote(&f.module, &f.site), Ok("target(42)".into()));
+    }
+
+    #[test]
+    fn callee_text_module_authority_failure_is_cached_and_charged() {
+        let f = fixture();
+        let mut stale = f.module.clone();
+        stale.metadata.extra.insert(
+            "blob_hash".into(),
+            json!(Hash256::from_bytes([17; 32]).to_string()),
+        );
+        f.graph.upsert_entity(&stale).unwrap();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        for _ in 0..2 {
+            assert_eq!(
+                text.quote(&stale, &f.site),
+                Err("caller_graph_authority_unavailable")
+            );
+        }
+        assert_eq!(
+            text.quote(&f.member, f.member.span.as_ref().unwrap()),
+            Err("callee_text_read_limit")
+        );
+    }
+
+    #[test]
+    fn callee_text_module_absence_is_a_gap_and_spends_a_read() {
+        let f = fixture();
+        let mut absent = f.module.clone();
+        let file = kin_model::FilePathId::new("absent.py");
+        absent.file_origin = Some(file.clone());
+        absent.span.as_mut().unwrap().file = file.clone();
+        f.graph.upsert_entity(&absent).unwrap();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = crate::handlers::external_symbols::CalleeText::with_read_limit(&held, 1);
+        let mut site = f.site.clone();
+        site.file = file;
+        for _ in 0..2 {
+            assert_eq!(
+                text.quote(&absent, &site),
+                Err("caller_absent_at_generation")
+            );
+        }
+        assert_eq!(
+            text.quote(&f.member, f.member.span.as_ref().unwrap()),
+            Err("callee_text_read_limit")
+        );
+    }
+
+    #[test]
+    fn module_site_body_obeys_the_caller_byte_limit() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let length = f.module.span.as_ref().unwrap().end_byte;
+        assert!(matches!(
+            bounded_module_site_body(
+                &held,
+                &f.module,
+                EntitySourceScope::WorkspaceHead,
+                length - 1
+            ),
+            Err("caller_source_unavailable")
+        ));
+        let body =
+            bounded_module_site_body(&held, &f.module, EntitySourceScope::WorkspaceHead, length);
+        assert_eq!(
+            quote_caller_body(&f.module, &f.site, Some(&body)),
+            Ok("target(42)".into())
+        );
+    }
+
+    #[test]
+    fn module_sites_and_recorded_members_are_readable_without_serving_the_module_body() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let text = HeldCallerText::new(&held, EntitySourceScope::WorkspaceHead);
+        assert_eq!(text.quote(&f.module, &f.site).unwrap(), "target(42)");
+        let member = read_entity_source_exact(&held, &f.member, 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.body, "def work():\n    return target(7)\n");
+        assert_eq!(member.span_coherence, SpanCoherence::DigestVerified);
+        assert!(read_entity_source_exact(&held, &f.module, 1_000_000)
+            .unwrap()
+            .is_none());
+        let inventory = crate::container_shape::module_source_reply(&f.graph, &f.module).unwrap();
+        assert!(inventory["body"].is_null());
+        assert!(inventory["source_base"].is_null());
+        assert_eq!(
+            inventory["source_base_unavailable"],
+            "module_inventory_only"
+        );
+        assert_eq!(inventory["members"][0]["id"], json!(f.member.id));
+        assert_eq!(inventory["member_coverage_scope"], "recorded_contains");
+        assert!(!inventory.to_string().contains("target(42)"));
+        let mut outside = f.site.clone();
+        outside.file = kin_model::FilePathId::new("other.py");
+        assert_eq!(text.quote(&f.module, &outside), Err("site_outside_caller"));
+    }
+
+    /// `source` on a module whose own code Kin serves: the code outside its
+    /// entities, a base that binds the module's whole span, and no line of a
+    /// member's body. A span that cannot be proven falls back to the member
+    /// inventory and says why.
+    #[test]
+    fn module_code_reply_serves_own_code_with_a_base_and_no_member_body() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let reply =
+            crate::module_code::source_reply(&held, &f.module, EntitySourceScope::WorkspaceHead)
+                .unwrap();
+        let body = reply["body"].as_str().unwrap();
+        let own = "from helpers import target\nif enabled:\n    target(42)\n";
+        assert!(body.starts_with(own), "{body}");
+        let marker = &body[own.len()..];
+        assert_eq!(
+            marker,
+            format!(
+                "# kin:entity function work #{}",
+                &f.member.id.to_string()[..8]
+            )
+        );
+        assert!(!body.contains("return target(7)"), "{body}");
+        assert_eq!(reply["module_code"]["entities"], 1, "{reply}");
+        assert!(reply.get("artifact_entry").is_none(), "{reply}");
+        // The base records the served text, not the module's span: its
+        // length and its digest are what a patch is checked against.
+        let base = &reply["source_base"];
+        assert_eq!(base["entity_id"], json!(f.module.id), "{reply}");
+        assert_eq!(base["start_byte"], 0);
+        assert_eq!(base["end_byte"], body.len());
+        assert_eq!(
+            base["body_hash"],
+            json!(kin_blobs::digest(body.as_bytes()).to_string())
+        );
+        assert_ne!(body.len(), f.module.span.as_ref().unwrap().end_byte);
+        assert!(crate::module_code::is_module_code_reply(
+            reply.as_object().unwrap()
+        ));
+
+        // A module span derived from other bytes serves no code and no base.
+        let mut stale = f.module.clone();
+        stale.metadata.extra.insert(
+            "blob_hash".into(),
+            json!(Hash256::from_bytes([17; 32]).to_string()),
+        );
+        f.graph.upsert_entity(&stale).unwrap();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let fallback =
+            crate::module_code::source_reply(&held, &stale, EntitySourceScope::WorkspaceHead)
+                .unwrap();
+        assert!(fallback["body"].is_null(), "{fallback}");
+        assert!(fallback["source_base"].is_null(), "{fallback}");
         assert!(
-            census_file_bytes(&held, &file, first.len() - 1).is_none(),
-            "a cached blob still respects the census allowance"
+            fallback["source_base_unavailable"]
+                .as_str()
+                .unwrap()
+                .starts_with(crate::module_code::MODULE_CODE_UNAVAILABLE),
+            "{fallback}"
         );
-        let other = kin_db::call_site_escape::CensusFile {
-            blob: second_hash,
-            ..file.clone()
-        };
+        assert_eq!(fallback["members"][0]["id"], json!(f.member.id));
+        assert!(!fallback.to_string().contains("target(42)"));
+    }
+
+    #[test]
+    fn module_site_reads_keep_authority_gaps_and_absence_distinct() {
+        let f = fixture();
+        let held = HeldSourceAuthority::new(&f.graph, Some(&f.authority));
+        let mut stale = f.module.clone();
+        stale.metadata.extra.insert(
+            "blob_hash".into(),
+            json!(Hash256::from_bytes([17; 32]).to_string()),
+        );
+        f.graph.upsert_entity(&stale).unwrap();
+        let reader = HeldCallerText::new(&held, EntitySourceScope::WorkspaceHead);
+        assert_eq!(
+            reader.quote(&stale, &f.site),
+            Err("caller_graph_authority_unavailable")
+        );
+        let original_error = resolve_source_authority(
+            &held,
+            &stale,
+            EntitySourceScope::WorkspaceHead,
+            SourceRead::SitesOnly,
+        )
+        .unwrap_err();
+        assert!(original_error.is_graph_authority_gap());
+        assert!(original_error.to_string().contains("not yet re-derived"));
+
+        let mut absent = f.module.clone();
+        absent.file_origin = Some(kin_model::FilePathId::new("absent.py"));
+        absent.span.as_mut().unwrap().file = kin_model::FilePathId::new("absent.py");
+        f.graph.upsert_entity(&absent).unwrap();
         assert!(
-            census_file_bytes(&held, &other, 64).is_none(),
-            "local reads share the aggregate request allowance"
+            module_site_source(&held, &absent, EntitySourceScope::WorkspaceHead)
+                .unwrap()
+                .is_none()
         );
-        let malformed_length = kin_db::call_site_escape::CensusFile {
-            len: Some(65),
-            ..file
-        };
-        assert!(census_file_bytes(&held, &malformed_length, 64).is_none());
+        let reader = HeldCallerText::new(&held, EntitySourceScope::WorkspaceHead);
+        assert_eq!(
+            reader.quote(&absent, &f.site),
+            Err("caller_absent_at_generation")
+        );
+    }
+
+    #[test]
+    fn structural_module_site_gaps_are_not_reported_as_empty_code() {
+        let graph = kin_db::InMemoryGraph::new();
+        let held = HeldSourceAuthority::new(&graph, None);
+        let mut module = crate::call_sites::fixture::spanned_entity(
+            "app",
+            "app.py",
+            kin_model::LanguageId::Python,
+            0,
+            "target()",
+        );
+        module.kind = EntityKind::Module;
+        for (span, origin, expected) in [
+            (false, false, "caller_has_no_source_coordinates"),
+            (false, true, "caller_has_no_span"),
+            (true, false, "caller_has_no_file_origin"),
+        ] {
+            let mut candidate = module.clone();
+            if !span {
+                candidate.span = None;
+            }
+            if !origin {
+                candidate.file_origin = None;
+            }
+            let body = module_site_source(&held, &candidate, EntitySourceScope::WorkspaceHead)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(body, Err(reason) if reason == expected));
+        }
+        let body = module_site_source(&held, &module, EntitySourceScope::WorkspaceHead)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(body, Err("caller_graph_authority_unavailable")));
+    }
+
+    #[test]
+    fn source_allowance_and_store_failures_keep_different_diagnostic_codes() {
+        for (error, expected) in [
+            (
+                McpError::SourceBudgetExhausted("reads used".into()),
+                "caller_source_budget_exhausted",
+            ),
+            (
+                McpError::GraphStore("read failed".into()),
+                "caller_graph_store_read_failed",
+            ),
+            (
+                graph_source_gap("span proof unavailable"),
+                "caller_graph_authority_unavailable",
+            ),
+            (
+                McpError::WorkspaceAbsent("current tree lacks path".into()),
+                "caller_absent_at_generation",
+            ),
+            (
+                McpError::Context("unclassified read failure".into()),
+                "caller_source_read_failed",
+            ),
+        ] {
+            assert_eq!(CallerSourceGap::from_error(&error).code(), expected);
+        }
     }
 }
 
@@ -6382,6 +7558,7 @@ mod reference_site_tests {
             Some(&ReferenceSite {
                 line_in_entity: None,
                 callee: Err("site_outside_caller"),
+                expr: Err("site_outside_caller"),
             }),
             "a site above the caller keeps no line: {sites:?}"
         );
@@ -6390,6 +7567,10 @@ mod reference_site_tests {
             Some(&ReferenceSite {
                 line_in_entity: Some(1),
                 callee: Ok("target".to_string()),
+                expr: Ok(crate::site_expression::SiteExpression {
+                    expr: "target(1)".to_string(),
+                    receiver: None,
+                }),
             }),
         );
         assert_eq!(
@@ -6397,6 +7578,10 @@ mod reference_site_tests {
             Some(&ReferenceSite {
                 line_in_entity: Some(2),
                 callee: Ok("mod.target".to_string()),
+                expr: Ok(crate::site_expression::SiteExpression {
+                    expr: "mod.target(2)".to_string(),
+                    receiver: Some("mod".to_string()),
+                }),
             }),
         );
         assert_eq!(sites.len(), 3, "one site per line: {sites:?}");
@@ -6415,8 +7600,32 @@ mod reference_site_tests {
                 "line_in_entity": 1,
                 "callee": null,
                 "callee_unavailable": "caller_source_unavailable",
-            })
+            }),
+            "a site whose body cannot be read says so once and guesses nothing"
         );
+        assert_eq!(unread[&3].expr, Err("caller_source_unavailable"));
+    }
+
+    /// A language server's range covers only the callee token. The site's
+    /// `expr` still reads the whole call from the caller's body: its receiver
+    /// before the token and its argument list after it.
+    #[test]
+    fn a_site_ranged_on_its_callee_token_reads_the_whole_call() {
+        let caller = caller();
+        let spans = vec![(RelationKind::Calls, span("target", 2, 3))];
+        let sites = address_reference_sites(&caller, &[4], &spans, &Body);
+        assert_eq!(
+            sites[&4].to_json(),
+            serde_json::json!({
+                "line_in_entity": 2,
+                "callee": "target",
+                "expr": "target(3)",
+            }),
+        );
+        let spans = vec![(RelationKind::Calls, span("target", 1, 3))];
+        let sites = address_reference_sites(&caller, &[4], &spans, &Body);
+        assert_eq!(sites[&4].to_json()["expr"], "mod.target(2)");
+        assert_eq!(sites[&4].to_json()["receiver"], "mod");
     }
 
     /// A caller counted for its proven sites and held for the rest is served as
@@ -6437,12 +7646,22 @@ mod reference_site_tests {
             spans: Vec::new(),
             outside_caller_file: 0,
             site_contract_gap: None,
+            origin_steps: None,
+            receiver_binding: None,
+            receiver_bound: None,
         };
         let site = |line: u32| ReferenceSite {
             line_in_entity: Some(line - 600),
             callee: Ok(format!("call{line}")),
+            expr: Ok(crate::site_expression::SiteExpression {
+                expr: format!("call{line}()"),
+                receiver: None,
+            }),
         };
         let row = ReferenceRow {
+            recorded_owners: crate::semantic_owners::RecordedOwners::unavailable(),
+            repo_id: None,
+            foreign_entity_id: None,
             entity_id: Some("caller".into()),
             name: "NewCreateContext".into(),
             kind: Some("Function".into()),
@@ -6475,6 +7694,144 @@ mod reference_site_tests {
         };
         assert_eq!(served(&counted.unwrap()), vec![site(678), site(723)]);
         assert_eq!(served(&held.unwrap()), vec![site(649), site(697)]);
+    }
+
+    /// A call a language server resolved carries no receiver chain. When the
+    /// caller's value-origin facts record where the caller binds the call's
+    /// receiver, the proven edge serves that line; a held edge and a receiver
+    /// the facts record no line for serve nothing.
+    #[test]
+    fn an_unchained_proven_edge_serves_where_its_caller_binds_the_receiver() {
+        use super::{serve_receiver_bindings, ReferenceBodies, ReferenceEdge, ReferenceRow};
+        use kin_index::RelationResolution;
+        use kin_parser::value_origins::{ScopeFacts, ValueOrigin, VALUE_ORIGINS_KEY};
+
+        const FILE: &str = "src/check.js";
+        const BOUND: &str = "function check(id) {\n  \
+                             const store = openStore();\n  \
+                             const ok = store.contains(id);\n  \
+                             return ok && other.contains(id);\n}\n";
+        struct Text;
+        impl SiteText for Text {
+            fn quote(&self, caller: &Entity, site: &SourceSpan) -> Result<String, &'static str> {
+                quote_site(caller, site, BOUND, 0)
+            }
+        }
+        let at = |text: &str, line: u32| {
+            let start = BOUND.find(text).unwrap();
+            SourceSpan {
+                file: FilePathId::new(FILE),
+                start_byte: start,
+                end_byte: start + text.len(),
+                start_line: line,
+                start_col: 0,
+                end_line: line,
+                end_col: 0,
+            }
+        };
+        let mut caller = crate::call_sites::fixture::spanned_entity(
+            "check",
+            FILE,
+            kin_model::LanguageId::JavaScript,
+            0,
+            "",
+        );
+        caller.span = Some(SourceSpan {
+            file: FilePathId::new(FILE),
+            start_byte: 0,
+            end_byte: BOUND.len(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 4,
+            end_col: 0,
+        });
+        let facts = ScopeFacts {
+            version: kin_parser::value_origins::VALUE_ORIGINS_VERSION,
+            bindings: [(
+                "store".to_string(),
+                ValueOrigin::Call {
+                    callee: "openStore".into(),
+                },
+            )]
+            .into(),
+            binding_lines: [("store".to_string(), 1)].into(),
+            ..Default::default()
+        };
+        caller.metadata.extra.insert(
+            VALUE_ORIGINS_KEY.into(),
+            serde_json::to_value(&facts).unwrap(),
+        );
+        let spans = vec![
+            (RelationKind::Calls, at("contains", 2)),
+            (RelationKind::Calls, at("other.contains", 3)),
+        ];
+        let edge = |resolution, guess, lines: &[u32]| ReferenceEdge {
+            kind: RelationKind::Calls,
+            resolution,
+            receiver_name_guess: guess,
+            via_override_of: None,
+            lines: lines.to_vec(),
+            spans: Vec::new(),
+            outside_caller_file: 0,
+            site_contract_gap: None,
+            origin_steps: None,
+            receiver_binding: None,
+            receiver_bound: None,
+        };
+        let mut row = ReferenceRow {
+            recorded_owners: crate::semantic_owners::RecordedOwners::unavailable(),
+            repo_id: None,
+            foreign_entity_id: None,
+            entity_id: Some(caller.id.to_string()),
+            name: "check".into(),
+            kind: Some("Function".into()),
+            file_path: Some(FILE.into()),
+            reference_lines: vec![3, 4],
+            site_addresses: address_reference_sites(&caller, &[3, 4], &spans, &Text),
+            reference_lines_partial: None,
+            reference_lines_absent: None,
+            signature: None,
+            snippet: None,
+            relation_kinds: vec![RelationKind::Calls],
+            resolution: Some(RelationResolution::TypeResolved),
+            via_override_of: None,
+            receiver_name_guess: false,
+            role: None,
+            edges: vec![
+                edge(RelationResolution::TypeResolved, false, &[3, 4]),
+                edge(RelationResolution::NameOnly, true, &[3]),
+            ],
+        };
+        assert_eq!(
+            row.site_addresses[&3]
+                .expr
+                .as_ref()
+                .map(|expr| expr.receiver.as_deref()),
+            Ok(Some("store")),
+            "{:?}",
+            row.site_addresses
+        );
+        let graph = kin_db::InMemoryGraph::new();
+        serve_receiver_bindings(&graph, &caller, &mut row, &Text, ReferenceBodies::Project);
+        assert_eq!(
+            row.edges[0].receiver_bound.as_deref(),
+            Some(&vec![serde_json::json!({
+                "name": "store",
+                "line_in_entity": 1,
+                "code": "const store = openStore();",
+            })]),
+        );
+        assert!(row.edges[0].receiver_binding.is_none());
+        assert!(
+            row.edges[1].receiver_bound.is_none(),
+            "a held edge proves nothing"
+        );
+
+        // A caller whose facts record no line serves nothing.
+        caller.metadata.extra.remove(VALUE_ORIGINS_KEY);
+        row.edges[0].receiver_bound = None;
+        serve_receiver_bindings(&graph, &caller, &mut row, &Text, ReferenceBodies::Project);
+        assert!(row.edges[0].receiver_bound.is_none());
     }
 
     #[test]

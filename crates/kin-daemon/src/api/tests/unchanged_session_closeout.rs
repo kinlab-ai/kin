@@ -240,7 +240,7 @@ async fn kin_with_closes_a_session_whose_only_change_landed_through_kin_mutate()
         serde_json::json!({
             "session_id": session,
             "request_id": "closeout-guarded-edit",
-            "operations": [source_base_operation(&source)],
+            "operations": [ticketed_source_operation(source_base_operation(&source))],
             "summary": "Change the value through Kin rather than the projection"
         }),
         &session,

@@ -64,7 +64,7 @@ export function artifactName(platform = process.platform, arch = process.arch) {
 
 /** Download URL of a file attached to the v<version> GitHub release. */
 export function releaseDownloadUrl(version, file) {
-  return `https://github.com/firelock-ai/kin/releases/download/v${version}/${file}`;
+  return `https://github.com/kinlab-ai/kin/releases/download/v${version}/${file}`;
 }
 
 /**
@@ -227,6 +227,75 @@ function installFile(src, dest, mode) {
 }
 
 /**
+ * Create a directory under KIN_HOME, and every missing ancestor, at 0755.
+ *
+ * mkdirSync asks for 0777 and leaves the rest to the process umask. Under the
+ * 0002 umask that distributions with USERGROUPS_ENAB give every login, that
+ * made KIN_HOME group writable, and Kin then refused the directory its
+ * registry lives in. No umask can add group or world write to 0755, and a
+ * stricter one still narrows it. Node applies the mode to every directory a
+ * recursive call creates; a directory that already exists keeps its mode.
+ */
+function mkdirKinDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+}
+
+/** `value` as one POSIX shell word, quoted only when it needs to be. */
+function shellWord(value) {
+  return /^[A-Za-z0-9/._\-+,:@%=]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Initialize the local registry authority with the downloaded kin before any
+ * installed binary is replaced, the step scripts/install.sh takes, so both
+ * install lanes end with the same registry. The downloaded binary owns the
+ * contract. Unsafe existing state is never repaired here unless
+ * KIN_REGISTRY_REPAIR asks for it, and a refusal leaves the previous install
+ * untouched. Windows reports the Unix ownership and mode contract as not
+ * applicable, and a host cannot run another platform's binary, so both skip.
+ */
+function initializeRegistryAuthority(kinSrc, env, platform, spawnImpl = spawnSync) {
+  if (platform === 'win32' || process.platform === 'win32') return;
+  fs.chmodSync(kinSrc, 0o755);
+  const childEnv = mergeEnvironment(process.env, env);
+  const args = ['registry', 'authority'];
+  if (isTruthyEnv(environmentValue(childEnv, 'KIN_REGISTRY_REPAIR'))) args.push('--fix');
+  args.push('--initialize');
+  const result = spawnImpl(kinSrc, args, { env: childEnv, encoding: 'utf8' });
+  if (result.status === 0) return;
+
+  const lines = [];
+  const report = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+  if (report) lines.push(report);
+  if (result.error) lines.push(`kin: could not run the downloaded kin: ${result.error.message}`);
+  lines.push('kin: unsafe local registry authority blocks installation.');
+  lines.push('kin: no installed binary or registry authority file was replaced.');
+  const home = kinHome(env);
+  let shared = null;
+  try {
+    const stat = fs.lstatSync(home);
+    const owned = typeof process.getuid !== 'function' || stat.uid === process.getuid();
+    if (stat.isDirectory() && owned && (stat.mode & 0o022) !== 0) {
+      shared = (stat.mode & 0o7777).toString(8).padStart(4, '0');
+    }
+  } catch {
+    // No Kin home to name: the report above is the whole story.
+  }
+  if (shared) {
+    lines.push(
+      `kin: ${home} can be written by its group or by other users (mode ${shared}), and Kin ` +
+        'keeps its registry only in a directory no other user can write.',
+    );
+    lines.push('kin: remove that access, then run the command again:');
+    lines.push(`kin:     chmod go-w ${shellWord(home)}`);
+    lines.push('kin: or run it with KIN_REGISTRY_REPAIR=1 to have Kin remove it.');
+  } else {
+    lines.push('kin: inspect the paths above. For permission-only drift, run again with KIN_REGISTRY_REPAIR=1.');
+  }
+  throw new Error(lines.join('\n'));
+}
+
+/**
  * Copy a directory tree, refusing anything that is not a directory or a regular
  * file. Written out rather than delegating to fs.cpSync so a symlink inside an
  * extracted archive stops the copy instead of being reproduced under $KIN_HOME,
@@ -238,7 +307,7 @@ function copyTree(src, dest) {
     throw new Error(`refusing to copy symlink from the release archive: ${src}`);
   }
   if (stat.isDirectory()) {
-    fs.mkdirSync(dest, { recursive: true });
+    mkdirKinDir(dest);
     for (const entry of fs.readdirSync(src)) {
       copyTree(path.join(src, entry), path.join(dest, entry));
     }
@@ -320,7 +389,7 @@ function preflightNotifierBundle(root, platform) {
 
 function installNotifierBundleSource(src, env) {
   const libDir = path.join(kinHome(env), 'lib');
-  fs.mkdirSync(libDir, { recursive: true });
+  mkdirKinDir(libDir);
   const dest = path.join(libDir, 'KinNotifier.app');
   // Build the incoming tree beside the live one and swap, rather than removing
   // the live one and copying into the gap it leaves. copyTree refuses a symlink
@@ -593,7 +662,8 @@ export async function provision(version, opts = {}) {
 
     const binDir = path.join(kinHome(env), 'bin');
     const libDir = path.join(kinHome(env), 'lib');
-    fs.mkdirSync(binDir, { recursive: true });
+    mkdirKinDir(binDir);
+    initializeRegistryAuthority(kinSrc, env, platform, opts.spawnImpl);
 
     installFile(kinSrc, path.join(binDir, binaryName('kin', platform)), 0o755);
     installFile(daemonSrc, path.join(binDir, binaryName('kin-daemon', platform)), 0o755);
@@ -605,7 +675,7 @@ export async function provision(version, opts = {}) {
     for (const lib of ['libkin_vfs_shim.so', 'libkin_vfs_shim.dylib']) {
       const libSrc = path.join(root, lib);
       if (fs.existsSync(libSrc)) {
-        fs.mkdirSync(libDir, { recursive: true });
+        mkdirKinDir(libDir);
         installFile(libSrc, path.join(libDir, lib), 0o644);
       }
     }

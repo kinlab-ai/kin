@@ -110,7 +110,7 @@ workflow succeeds,
 [`publish-release-installers.yml`](../../.github/workflows/publish-release-installers.yml)
 revalidates the completed run, exact tag and peeled commit, published Latest
 release, and both installer hashes. It then uses one short-lived GitHub App
-token scoped only to `firelock-ai/homebrew-kin` and `firelock-ai/kin-infra` to
+token scoped only to `kinlab-ai/homebrew-kin` and `kinlab-ai/kin-infra` to
 request both downstream updates. The callback waits for each exact correlated
 workflow run, verifies the public formula version, URLs, and all four release
 checksums, then verifies installer byte parity. It has no cloud credential. The
@@ -121,8 +121,8 @@ public bytes, and restores the previous generations if proof fails.
 The callback runs in the `release-followups` GitHub environment, admitted only
 from protected `main`. That environment holds `KIN_RELEASE_APP_ID` and
 `KIN_RELEASE_APP_PRIVATE_KEY`. The GitHub App must be installed only on
-`firelock-ai/homebrew-kin` and
-`firelock-ai/kin-infra` with repository Contents write permission, which is the
+`kinlab-ai/homebrew-kin` and
+`kinlab-ai/kin-infra` with repository Contents write permission, which is the
 minimum permission required to create a repository dispatch, plus Actions read
 permission so the callback can wait for and verify both exact downstream runs.
 The downstream `installer` environment and its dedicated WIF identity remain a
@@ -158,7 +158,9 @@ Kin's release trust rests on three layers that are verified independently:
    install proof verifies the signer workflow, source tag, source commit, and
    hosted-runner provenance. The convenience installers do not yet perform
    this verification themselves, so users who need the additional supply-chain
-   check should run `gh attestation verify <archive> --repo firelock-ai/kin`.
+   check should run `gh attestation verify <archive> --repo kinlab-ai/kin`.
+   Releases through 0.8.1 were built before the repository moved from
+   `firelock-ai/kin` and verify with `--repo firelock-ai/kin`.
 3. **Apple code-signing and notarization** of the macOS binaries. This is an
    OS-level authenticity and integrity check enforced by macOS Gatekeeper, and
    it applies only to the macOS artifacts.
@@ -295,7 +297,7 @@ An unattended mutating `kin update` requires the complete
 version and peeled tag commit select one release, but they do not authenticate
 the platform archive bytes. External automation must first verify the exact
 platform archive with `gh attestation verify` against
-`firelock-ai/kin/.github/workflows/release.yml` and the expected tagged source
+`kinlab-ai/kin/.github/workflows/release.yml` and the expected tagged source
 commit, require the verified attestation's `sourceRepositoryDigest` to equal
 that commit, then hash those verified downloaded bytes and supply that SHA-256
 through `--expect-archive-sha256`.
@@ -349,7 +351,7 @@ spctl --assess --type execute --verbose ./kin
   The installer itself performs the checksum verification; users who want the
   separate authorship/provenance check can run `gh attestation verify`.
 - **npm and Homebrew distribution** are downstream of the GitHub release. Both
-  public npm packages trust only `firelock-ai/kin`'s `release.yml` in the
+  public npm packages trust only `kinlab-ai/kin`'s `release.yml` in the
   protected `release` environment, and that identity may run `npm publish`
   only through short-lived OIDC. Traditional npm tokens remain disabled. Each
   publish helper packs the reviewed tag tree, records the expected SRI and
