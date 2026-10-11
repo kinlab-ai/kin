@@ -23,6 +23,11 @@ pub struct HistoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryResponse {
     pub lines: Vec<String>,
+    /// Present when the store's Git history is partial, so every revision
+    /// before its snapshot is missing from this answer. Its sentence is also
+    /// the answer's last line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_history: Option<kin_core::history_state::PartialHistoryNotice>,
 }
 
 /// Twelve hex characters, matching the width Kin already uses when it echoes a
@@ -40,18 +45,6 @@ fn calendar_date(timestamp: &str) -> String {
         .next()
         .filter(|date| date.len() == 10)
         .unwrap_or(timestamp)
-        .to_string()
-}
-
-/// Drop the `<email>` from a git-style author. The name identifies the person;
-/// the address just eats the column and then gets ellipsized anyway.
-fn author_name(author: &str) -> String {
-    author
-        .split('<')
-        .next()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(author)
         .to_string()
 }
 
@@ -198,7 +191,7 @@ pub fn execute_history_request_with(
             let (when, who, subject) = match change.as_ref() {
                 Some(entry) => (
                     calendar_date(&entry.timestamp.to_string()),
-                    author_name(&entry.author.to_string()),
+                    entry.author.name().into_owned(),
                     ref_lookup::subject_line(&entry.message),
                 ),
                 None => ("?".to_string(), "?".to_string(), "unknown".to_string()),
@@ -218,7 +211,10 @@ pub fn execute_history_request_with(
     let closing = ref_lookup::closing_notes(&lines, head.authority_open);
     lines.extend(closing);
 
-    Ok(HistoryResponse { lines })
+    Ok(HistoryResponse {
+        lines,
+        partial_history: None,
+    })
 }
 
 #[cfg(test)]
@@ -229,7 +225,7 @@ mod tests {
         RevisionRow {
             id: "0123456789ab".to_string(),
             when: "2026-07-31".to_string(),
-            who: author_name(who),
+            who: kin_model::AuthorId::new(who).name().into_owned(),
             subject: subject.to_string(),
         }
     }

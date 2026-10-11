@@ -4,10 +4,9 @@
 pub mod absence_qualifier;
 pub mod admit;
 pub mod agent;
-pub mod agent_exec;
-pub mod agent_exec_go;
 pub mod allow;
 pub mod approvals;
+pub mod ask;
 pub mod assistant;
 pub mod assistant_adapter;
 pub mod audit;
@@ -31,6 +30,7 @@ pub mod conflicts;
 pub mod context;
 pub mod contextbench_locate;
 pub mod daemon;
+pub mod daemon_activity;
 pub mod dead_code;
 pub mod declaration_neighbors;
 pub mod deps;
@@ -47,6 +47,7 @@ pub mod graph_owed;
 pub mod graph_viz;
 pub mod health;
 pub mod history;
+pub mod history_derive;
 pub mod hosted_publication;
 pub mod impact;
 pub mod init;
@@ -70,6 +71,8 @@ pub mod notify;
 pub mod overview;
 pub mod path;
 pub mod pipeline;
+pub mod places;
+pub(crate) mod prepared_reuse;
 pub mod prepared_state;
 pub mod projection;
 pub mod publish;
@@ -88,6 +91,8 @@ pub mod repository_authority;
 pub mod resolve;
 pub mod resources;
 pub mod review;
+pub mod review_guide;
+pub mod review_ui;
 pub mod rollback;
 pub mod routed_words;
 pub mod scope;
@@ -99,11 +104,14 @@ pub mod session_run;
 pub mod session_workspace;
 pub mod setup;
 pub mod setup_hardware;
+pub mod setup_hooks;
 pub mod setup_ledger;
 pub mod setup_verify;
 pub mod spec;
 pub mod stash;
 pub mod status;
+pub(crate) mod status_reading;
+pub mod store;
 pub mod store_footprint;
 pub mod support;
 pub mod tag;
@@ -118,7 +126,11 @@ pub mod update;
 pub mod upgrade;
 pub mod verify;
 pub mod work;
+mod workspace_conflicts;
+mod workspace_explore;
+mod workspace_graph;
 pub mod workspace_tip;
+pub mod workspace_ui;
 pub mod write_back;
 pub mod xref;
 
@@ -161,10 +173,79 @@ pub(crate) fn answering_repository_note(
 }
 
 /// Discover the Kin repository containing `start`, refusing the same way.
+///
+/// When no store serves it and `start` is in a Git checkout, the stores this
+/// process can see may say why. A checkout that moved away from its store,
+/// leaving exactly one behind with nothing serving it, takes that store back
+/// and the command goes on, with one line saying so. A copy of a checkout that
+/// keeps its store, a move whose store is unreachable or still served, and a
+/// move that left several stores each get one sentence naming what to run.
 pub(crate) fn require_repository_layout_at(
     start: &std::path::Path,
 ) -> anyhow::Result<kin_core::KinLayout> {
-    kin_core::KinLayout::discover(start).ok_or_else(not_a_kin_repository)
+    if let Some(layout) = kin_core::KinLayout::discover(start) {
+        return Ok(layout);
+    }
+    use kin_core::layout::{StoreMiss, StoreStanding};
+    let Some((checkout, miss)) = kin_core::layout::explain_store_miss(start) else {
+        return Err(not_a_kin_repository());
+    };
+    match miss {
+        StoreMiss::Moved(known)
+            if known.standing == StoreStanding::Gone
+                && !kin_core::layout::store_daemon_is_running(&known.store) =>
+        {
+            let layout = store::attach_store(&known.store, &checkout).map_err(|error| {
+                anyhow::anyhow!(
+                    "this checkout's Kin store is at {}, left behind when it moved from {}, \
+                         and taking it back failed: {error:#}; run `kin store attach {}` here",
+                    known.store.display(),
+                    known.working_dir.display(),
+                    known.store.display()
+                )
+            })?;
+            eprintln!(
+                "kin: this checkout moved from {}, so its Kin store at {} serves it here now",
+                known.working_dir.display(),
+                layout.root().display()
+            );
+            Ok(layout)
+        }
+        StoreMiss::Moved(known) => Err(anyhow::anyhow!(
+            "this checkout's Kin store is at {}, left behind when it moved from {}; run \
+             `kin store attach {}` here to take it back",
+            known.store.display(),
+            known.working_dir.display(),
+            known.store.display()
+        )),
+        StoreMiss::Ambiguous(candidates) => Err(anyhow::anyhow!(
+            "{} Kin stores were built from this repository's history and the checkouts they \
+             served are gone:\n{}\nRun `kin store attach <store>` here to continue one of them, \
+             or `kin init` to start a new store",
+            candidates.len(),
+            left_behind_listing(&candidates)
+        )),
+        StoreMiss::CopyOf(known) => Err(anyhow::anyhow!(
+            "this is a copy of {}, whose Kin store stays with it; run `kin init` here to give \
+             this copy its own store",
+            known.working_dir.display()
+        )),
+    }
+}
+
+/// Stores a move left behind, one per line with the checkout each served.
+pub(crate) fn left_behind_listing(stores: &[kin_core::layout::KnownStore]) -> String {
+    stores
+        .iter()
+        .map(|known| {
+            format!(
+                "  {} (served {})",
+                known.store.display(),
+                known.working_dir.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Who this invocation is allowed to attribute new authority to, or a refusal.
@@ -180,10 +261,22 @@ pub(crate) fn require_commit_author() -> anyhow::Result<kin_model::AuthorId> {
 }
 
 /// The same refusal for a caller that already holds the repository layout.
+///
+/// The refusal leads with [`AuthorIdentityRequired`], which names exactly what
+/// is missing, and carries the resolver's own message, which says how to set
+/// it, as its cause.
 pub(crate) fn require_commit_author_for(
     layout: &kin_core::KinLayout,
 ) -> anyhow::Result<kin_model::AuthorId> {
-    let identity = kin_core::resolve_commit_identity(layout)?;
+    let identity = kin_core::resolve_commit_identity(layout).map_err(|error| {
+        let lead = match kin_core::git_identity_gap(layout) {
+            Some(gap) => format!("this change needs an author, and none is configured: {gap}"),
+            None => {
+                "this change needs an author, and the configured one cannot be used".to_string()
+            }
+        };
+        anyhow::Error::new(error).context(AuthorIdentityRequired(lead))
+    })?;
     tracing::debug!(
         author = %identity.author,
         source = identity.source.id(),
@@ -192,8 +285,31 @@ pub(crate) fn require_commit_author_for(
     Ok(kin_model::AuthorId::new(identity.author))
 }
 
-pub(crate) const COMPACT_AUTHOR_CONSEQUENCE: &str =
-    "Author not set; admission and commits are blocked.";
+/// The exit status of a command refused because it would record an author and
+/// has none it may use.
+///
+/// Kept apart from 1 for the reason
+/// [`crate::commands::status::EXIT_WORKING_COPY_UNMEASURED`] is: a script has to
+/// be able to tell "set an identity, then retry" from a failure. Only commands
+/// that record an author exit with it; reads never need one.
+pub const EXIT_AUTHOR_IDENTITY_REQUIRED: i32 = 10;
+
+/// A command that records an author found none it may use.
+///
+/// Raised as the context of the resolver's refusal, so its sentence is the
+/// first line a reader sees and the resolver's remedy follows as the cause, and
+/// so [`crate::broken_pipe::exit_status`] can give the refusal
+/// [`EXIT_AUTHOR_IDENTITY_REQUIRED`].
+#[derive(Debug)]
+pub struct AuthorIdentityRequired(String);
+
+impl std::fmt::Display for AuthorIdentityRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+pub(crate) const COMPACT_AUTHOR_CONSEQUENCE: &str = "Author not set; commits are blocked.";
 
 /// Only the generic unresolved case can use generic setup advice. A misplaced
 /// Kin setting shares its first sentence but carries a different repair.

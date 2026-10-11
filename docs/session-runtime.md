@@ -57,7 +57,8 @@ authority when it and this page disagree. So is the code.
 ## The execution contract
 
 1. **Materialize.** The repo daemon materializes graph-owned truth into
-   `.kin/runs/session-<id>/`. This is a real directory containing real files,
+   `runs/session-<id>/` inside the repository's store (`.kin/runs/` for an
+   in-tree store). This is a real directory containing real files,
    so any tool works unchanged. Every session launcher materializes the whole
    repository: a scoped session, one that holds only selected artifacts, is
    refused until its selected set can be authenticated outside the editable
@@ -200,15 +201,14 @@ through reconcile:
 Code starts with every built-in tool removed, Bash, Read, Edit and Write
 included, and with Kin's MCP server as the only one loaded; a hook refuses any
 other tool call. The agent reads and changes code through Kin's tools, by
-entity, and its changes commit to repository authority through `kin_mutate`,
+entity, and its changes commit to repository authority through `mutate`,
 not through the workspace. The workspace therefore stays unchanged, and its
 closeout publishes nothing (see
 [Reconcile against newer authority](#reconcile-against-newer-authority)).
-It builds, tests and runs the project with `kin_session_exec` (see
-[Agent toolchain runs](#agent-toolchain-runs)), which the `agent-default`
-profile it is served carries, in a session workspace of its own. A person can
-also verify outside the session with `kin exec -- <command>`. `--semantic-only`
-is enforced for Claude only: Codex
+The agent surface runs no programs (see
+[Agent toolchain runs](#agent-toolchain-runs)), so a person builds, tests and
+runs the project outside the session with `kin exec -- <command>`.
+`--semantic-only` is enforced for Claude only: Codex
 and Gemini refuse the flag rather than launch with guidance they cannot
 enforce.
 
@@ -219,15 +219,16 @@ enforce.
    to exactly that daemon. No cwd guessing, no stale global config. A session
    launch does not set it, so a session relies on the next step.
 2. Otherwise it discovers the repository by walking up from the working
-   directory. Because agents launched with `kin with` start inside
-   `.kin/runs/session-<id>`, the walk lands on the same repository's `.kin/`.
+   directory. Because agents launched with `kin with` start inside the
+   store's `runs/session-<id>`, the walk reaches the store directory, which the
+   repository's own working tree finds, and binds that repository.
 3. When `KIN_SESSION_ID` is set, each forwarded tool call that names no session
    of its own carries it as the `X-Kin-Session` header, so the daemon can serve
    session-scoped graph state where it applies and the live HEAD graph
    otherwise.
 
-Semantic answers stay graph-backed throughout: `semantic_locate`,
-`get_context_pack`, `trace_data_flow`, and the other MCP tools are answered by
+Semantic answers stay graph-backed throughout: `locate`,
+`context`, `trace`, and the other MCP tools are answered by
 the daemon's graph authority, never by grepping the materialized workspace.
 The workspace is an execution surface, not a search authority: for semantic
 work, ask Kin, and do not read or search the workspace's files instead.
@@ -253,40 +254,13 @@ one script argument, so quote the complete script:
 
 ## Agent toolchain runs
 
-An agent that reaches Kin only through MCP runs the project's toolchain with
-`kin_session_exec`, served by name on `agent-default` and as the `exec` command
-on `agent-routed`. It is the same session workspace with a narrower contract:
-
-- **What runs.** Only the project's toolchain entry points, run directly with
-  no shell, in a workspace materialized from the session's current graph head.
-  The defaults follow the languages detected from the workspace's names, and
-  the repository can add commands under `[execution.agent]` in
-  `.kin/config.toml`. Shells, command runners, inline code, file utilities,
-  toolchain flags that hand a build to another program, and paths outside the
-  workspace are refused before anything runs, whatever that configuration
-  says. A call may set plain application variables, such as `TASKS_FILE`; one
-  that changes how a program is found, loaded, built or fetched, such as
-  `PATH`, `LD_*`, `GOFLAGS` or a proxy, is refused.
-- **What comes back.** A command that succeeds is reconciled under the agent
-  write-back policy: the manifests and lockfiles of the toolchain that ran,
-  `go.mod` and `go.sum` for a `go` command, are admitted and recorded as one
-  change attributed to the session. The change is recorded only while the
-  workspace still holds exactly the tree that admission published, so another
-  writer's content is never attributed to the session. Source code the command
-  created, changed or removed is refused and reported, because an agent writes
-  code through entity operations; every other file, an application's own data
-  files included, is refused; build outputs are never admitted. A command that
-  fails or times out keeps nothing it wrote, and the workspace is removed
-  either way.
-- **What the answer says.** The exit code, the elapsed time, stdout and stderr
-  bounded with a disclosure of what was cut, what was admitted and withheld,
-  and `ran_on`: the committed head, tree and workspace generation the
-  workspace was materialized from, read from its base record before the
-  command started.
-
-The command still runs the project's own code, which can do whatever that code
-does. What the contract governs is what an agent can run directly and what
-comes back into the graph.
+Kin's MCP surface does not run programs. Running the project's toolchain is not
+semantic work on entities and relationships, so no profile serves a toolchain
+run, by name or as a routed command, and a call to the retired `exec` or
+`kin_session_exec` is refused before anything runs. Build, test and run the
+project with `kin exec -- <command>`, which runs it in a fresh session
+workspace and reconciles what it wrote (see
+[The execution contract](#the-execution-contract)).
 
 ## Daemon environment boundary
 
@@ -462,7 +436,7 @@ When a workspace is materialized, Kin records the exact repository authority
 it started from. Reconcile admits only the edits the workspace itself made
 relative to that base, and only onto that same authority. The repository can
 move on while a workspace is open, through another writer or through the
-session's own Kin changes, such as a `--semantic-only` agent's `kin_mutate`:
+session's own Kin changes, such as a `--semantic-only` agent's `mutate`:
 
 - **An unchanged workspace closes without publishing anything.** Kin first
   proves, from the repository's recorded operation history, that the base the

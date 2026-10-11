@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::debug;
 
 use kin_blobs::BlobStore;
 use kin_model::{
     Entity, EntityRole, FileLayout, FilePathId, GraphStore, Hash256, LanguageId, OpaqueArtifact,
-    ParseCompleteness, ParseState, Relation, RelationId, RelationOrigin, StructuredArtifact,
+    ParseCompleteness, ParseState, Relation, RelationOrigin, StructuredArtifact,
 };
+use kin_parser::project_manifest::{NoProjectFiles, ProjectFiles, UnitContext};
 use kin_parser::{
-    attach_file_context_metadata, attach_file_reference_parse_counts, parse_shallow_file,
-    AdapterRegistry, ShallowFile,
+    attach_file_context_metadata, attach_file_nested_definition_record,
+    attach_file_reference_parse_counts, parse_shallow_file, AdapterRegistry, ShallowFile,
 };
 use kin_projection::build_layout;
 
@@ -27,8 +29,132 @@ use crate::fingerprint::{
 };
 use crate::linker::UnresolvedRelation;
 
+/// Every declaration a unit holds keeps an identity of its own before anything
+/// reads the identities: the graph holds entities by identity, so two that
+/// share one would leave the graph holding fewer declarations than the parse
+/// of the same bytes, and every reopen would refuse the unit's layout.
+fn separate_unit_identities(entities: &mut [Entity], file_id: &FilePathId) {
+    let separated = kin_parser::separate_shared_identities(entities, file_id);
+    if separated > 0 {
+        debug!(
+            path = %file_id,
+            separated,
+            "declarations in this unit derived a shared identity; each later one took the \
+             identity of its occurrence"
+        );
+    }
+}
+
+/// A complete C body as the partial-refresh proofs read it: its syntax tree,
+/// and, once some proof asks, every declaration extracted from it.
+struct PartialCSource {
+    tree: Tree,
+    /// Extracted on first use, since a proof whose function contexts already
+    /// disagree never needs the declarations. `None` when extraction failed.
+    entities: OnceLock<Option<Vec<Entity>>>,
+}
+
+impl PartialCSource {
+    /// Every declaration in the body, each built with its own source bytes.
+    ///
+    /// `source` and `file` are the inputs the body is remembered under, so an
+    /// extraction here is the one a fresh parse of them would produce.
+    fn entities(&self, source: &[u8], file: &FilePathId) -> Option<&[Entity]> {
+        use kin_parser::adapter::LanguageAdapter;
+        self.entities
+            .get_or_init(|| {
+                let parsed = kin_parser::languages::CAdapter
+                    .extract(&self.tree, source, file)
+                    .ok()?;
+                Some(
+                    parsed
+                        .entities
+                        .into_iter()
+                        .map(|entity| {
+                            entity.into_entity_with_source(LanguageId::C, file, Some(source))
+                        })
+                        .collect(),
+                )
+            })
+            .as_deref()
+    }
+}
+
+/// How many C bodies the partial-refresh proofs remember.
+///
+/// A proof compares one earlier body with one current body, so two per file
+/// being refreshed is the working set. A few files' worth covers a commit that
+/// checks several partially parsed files without holding many syntax trees.
+const REMEMBERED_PARTIAL_C_SOURCES: usize = 8;
+
+type RememberedPartialCSource = (FilePathId, kin_blobs::Hash256, Option<Arc<PartialCSource>>);
+
+/// C bodies the partial-refresh proofs parsed recently, keyed by the file they
+/// were extracted as and the digest of their exact bytes, oldest first.
+///
+/// A proof over one incomplete file checks every held declaration, and every
+/// relation of each, against the same two bodies. Each of those checks used to
+/// parse and extract both whole bodies again, so a commit over one partially
+/// parsed C file spent most of its time re-parsing it. Parsing and extraction
+/// are pure functions of the bytes and the file, so a remembered body is the
+/// one a fresh parse would produce, and the proofs answer exactly as before.
+static PARTIAL_C_SOURCES: Mutex<VecDeque<RememberedPartialCSource>> = Mutex::new(VecDeque::new());
+
+#[cfg(test)]
+thread_local! {
+    /// Parse every body afresh on this thread, so a test can hold the
+    /// remembered answers against uncached ones.
+    static FORGET_PARTIAL_C_SOURCES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The parsed C body `source`, as extracted for `file`, or `None` when it does
+/// not parse. Remembered per exact bytes and file.
+fn partial_c_source(file: &FilePathId, source: &[u8]) -> Option<Arc<PartialCSource>> {
+    #[cfg(test)]
+    if FORGET_PARTIAL_C_SOURCES.with(std::cell::Cell::get) {
+        return parse_partial_c_source(source).map(Arc::new);
+    }
+    let digest = kin_blobs::digest(source);
+    let remembered = |sources: &VecDeque<RememberedPartialCSource>| {
+        sources
+            .iter()
+            .find(|(held, hash, _)| hash == &digest && held == file)
+            .map(|(_, _, parsed)| parsed.clone())
+    };
+    if let Some(parsed) = remembered(
+        &PARTIAL_C_SOURCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ) {
+        return parsed;
+    }
+    // Parsed outside the lock, so one slow body does not hold up the others.
+    let parsed = parse_partial_c_source(source).map(Arc::new);
+    let mut sources = PARTIAL_C_SOURCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(raced) = remembered(&sources) {
+        return raced;
+    }
+    if sources.len() >= REMEMBERED_PARTIAL_C_SOURCES {
+        sources.pop_front();
+    }
+    sources.push_back((file.clone(), digest, parsed.clone()));
+    parsed
+}
+
+fn parse_partial_c_source(source: &[u8]) -> Option<PartialCSource> {
+    use kin_parser::adapter::LanguageAdapter;
+    let tree = kin_parser::languages::CAdapter.parse(source).ok()?;
+    Some(PartialCSource {
+        tree,
+        entities: OnceLock::new(),
+    })
+}
+
 /// Result of indexing a single file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexedFile {
     pub file_id: FilePathId,
     pub language: LanguageId,
@@ -143,7 +269,6 @@ impl IndexPipeline {
         old_source: &[u8],
         source: &[u8],
     ) -> bool {
-        use kin_parser::adapter::LanguageAdapter;
         if old.language != LanguageId::C
             || new.language != LanguageId::C
             || old.kind != kin_model::EntityKind::Function
@@ -171,18 +296,20 @@ impl IndexPipeline {
         if !digest_matches(old, old_source) || !digest_matches(new, source) {
             return false;
         }
-        let adapter = kin_parser::languages::CAdapter;
-        let (Ok(before), Ok(after)) = (adapter.parse(old_source), adapter.parse(source)) else {
+        let (Some(before), Some(after)) = (
+            partial_c_source(&was.file, old_source),
+            partial_c_source(&was.file, source),
+        ) else {
             return false;
         };
         let before_context = kin_parser::languages::c_lang::partial_function_context(
-            &before,
+            &before.tree,
             old_source,
             was.start_byte,
             was.end_byte,
         );
         let after_context = kin_parser::languages::c_lang::partial_function_context(
-            &after,
+            &after.tree,
             source,
             now.start_byte,
             now.end_byte,
@@ -192,23 +319,18 @@ impl IndexPipeline {
         }
         // Old graph identity must actually describe its claimed source, rather
         // than a stale span coincidentally landing on another declaration.
-        for (tree, bytes, entity) in [(&before, old_source, old), (&after, source, new)] {
-            let Ok(parsed) = adapter.extract(tree, bytes, &was.file) else {
+        for (parsed, bytes, entity) in [(&before, old_source, old), (&after, source, new)] {
+            let Some(entities) = parsed.entities(bytes, &was.file) else {
                 return false;
             };
-            let matches: Vec<_> = parsed
-                .entities
-                .into_iter()
+            let matches: Vec<_> = entities
+                .iter()
                 .filter(|e| e.name == entity.name && e.kind == entity.kind)
                 .collect();
             if matches.len() != 1 {
                 return false;
             }
-            let verified = matches.into_iter().next().unwrap().into_entity_with_source(
-                LanguageId::C,
-                &was.file,
-                Some(bytes),
-            );
+            let verified = matches[0];
             if verified.span != entity.span
                 || verified.signature != entity.signature
                 || verified.fingerprint.behavior_hash != entity.fingerprint.behavior_hash
@@ -258,7 +380,6 @@ impl IndexPipeline {
         file_entities: &[Entity],
         current: bool,
     ) -> Option<Relation> {
-        use kin_parser::adapter::LanguageAdapter;
         let was = old.span.as_ref()?;
         let now = new.span.as_ref()?;
         if !relation
@@ -280,33 +401,15 @@ impl IndexPipeline {
         {
             return None;
         }
-        let adapter = kin_parser::languages::CAdapter;
-        let before = adapter.parse(old_source).ok()?;
-        let after = adapter.parse(source).ok()?;
+        let before = partial_c_source(&was.file, old_source)?;
+        let after = partial_c_source(&was.file, source)?;
         let old_sites =
-            kin_parser::languages::c_lang::partial_call_sites(&before, old_source, was)?;
-        let new_sites = kin_parser::languages::c_lang::partial_call_sites(&after, source, now)?;
-        let before_entities: Vec<_> = adapter
-            .extract(&before, old_source, &was.file)
-            .ok()?
-            .entities
-            .into_iter()
-            .map(|entity| {
-                entity.into_entity_with_source(LanguageId::C, &was.file, Some(old_source))
-            })
-            .collect();
-        let after_entities: Vec<_> = adapter
-            .extract(&after, source, &was.file)
-            .ok()?
-            .entities
-            .into_iter()
-            .map(|entity| entity.into_entity_with_source(LanguageId::C, &was.file, Some(source)))
-            .collect();
-        for entities in [
-            file_entities,
-            before_entities.as_slice(),
-            after_entities.as_slice(),
-        ] {
+            kin_parser::languages::c_lang::partial_call_sites(&before.tree, old_source, was)?;
+        let new_sites =
+            kin_parser::languages::c_lang::partial_call_sites(&after.tree, source, now)?;
+        let before_entities = before.entities(old_source, &was.file)?;
+        let after_entities = after.entities(source, &was.file)?;
+        for entities in [file_entities, before_entities, after_entities] {
             let matched: Vec<_> = entities
                 .iter()
                 .filter(|entity| entity.name == target.name && entity.kind == target.kind)
@@ -316,8 +419,8 @@ impl IndexPipeline {
             }
         }
         for (tree, bytes, entities) in [
-            (&before, old_source, &before_entities),
-            (&after, source, &after_entities),
+            (&before.tree, old_source, before_entities),
+            (&after.tree, source, after_entities),
         ] {
             let declaration = entities
                 .iter()
@@ -452,15 +555,67 @@ impl IndexPipeline {
         self.index_file_content_with_tests(&file_id, &source, blob_hash)
     }
 
-    /// Index source content already loaded from blob storage.
+    /// Index source content already loaded from blob storage, in a tree whose
+    /// project manifests are not known, so every unit is named from its path.
     ///
-    /// This is used by historical/ref-scoped views that need to rebuild an
-    /// entity graph from stored blobs without materializing files to disk.
+    /// A caller indexing a unit of a tree it holds passes that tree's
+    /// manifests to [`IndexPipeline::index_file_content_in`] instead: a Rust
+    /// crate root takes its crate's name from them.
     pub fn index_file_content_with_tests(
         &self,
         file_id: &FilePathId,
         source: &[u8],
         blob_hash: kin_blobs::Hash256,
+    ) -> Result<IndexedFileWithTests> {
+        self.index_file_content_in(file_id, source, blob_hash, &NoProjectFiles)
+    }
+
+    /// What the unit at `file_id` takes from the manifests `project` holds,
+    /// read by the adapter its extension names. A unit no adapter parses takes
+    /// nothing. Read without the unit's bytes, so a caller can ask whether a
+    /// parse it holds is still the one its project would give: the languages
+    /// that share an extension and are told apart by content, C and C++ in a
+    /// `.h`, take nothing from a project. A manifest the unit's name depends
+    /// on that the tree holds and `project` cannot read refuses it.
+    pub fn unit_context(
+        &self,
+        file_id: &FilePathId,
+        project: &dyn ProjectFiles,
+    ) -> Result<UnitContext> {
+        match Path::new(&file_id.0)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| self.registry.get_by_extension(extension))
+        {
+            Some(adapter) => Ok(adapter.unit_context(file_id, project)?),
+            None => Ok(UnitContext::default()),
+        }
+    }
+
+    /// Index source content already loaded from blob storage, as a unit of
+    /// the tree whose project manifests `project` holds.
+    ///
+    /// This is used by historical/ref-scoped views that need to rebuild an
+    /// entity graph from stored blobs without materializing files to disk.
+    pub fn index_file_content_in(
+        &self,
+        file_id: &FilePathId,
+        source: &[u8],
+        blob_hash: kin_blobs::Hash256,
+        project: &dyn ProjectFiles,
+    ) -> Result<IndexedFileWithTests> {
+        let unit = self.unit_context(file_id, project)?;
+        self.index_file_content_with_unit(file_id, source, blob_hash, &unit)
+    }
+
+    /// Index source content as a unit whose project declared `unit` about it
+    /// ([`IndexPipeline::unit_context`]).
+    pub fn index_file_content_with_unit(
+        &self,
+        file_id: &FilePathId,
+        source: &[u8],
+        blob_hash: kin_blobs::Hash256,
+        unit: &UnitContext,
     ) -> Result<IndexedFileWithTests> {
         let actual = kin_blobs::digest(source);
         if actual != blob_hash {
@@ -470,6 +625,8 @@ impl IndexPipeline {
                 actual,
             });
         }
+        #[cfg(any(test, feature = "test-support"))]
+        crate::shared_index::count_parse(&file_id.0);
         let path = Path::new(&file_id.0);
         let ext = path
             .extension()
@@ -483,7 +640,8 @@ impl IndexPipeline {
         let language = adapter.language_id();
 
         let tree = adapter.parse(source)?;
-        let output = adapter.extract(&tree, source, file_id)?;
+        let mut output = adapter.extract_in(&tree, source, file_id, unit)?;
+        kin_parser::file_evidence::attach_file_evidence(adapter, &tree, source, &mut output);
         let kin_parser::ParseOutput {
             entities: extracted_entities,
             derived_members,
@@ -492,6 +650,7 @@ impl IndexPipeline {
             tests,
             parse_state,
             parsed_call_sites,
+            nested_definitions,
         } = output;
 
         let role = classify_file_role(&file_id.0);
@@ -524,7 +683,25 @@ impl IndexPipeline {
             role,
             blob_hash,
         );
+        // How the file uses names as values, for the escape census. A file
+        // whose record holds something always carries an entity for it.
+        let escape_census = kin_parser::value_escape::census_file(&tree, source, language);
+        if entities.is_empty()
+            && escape_census
+                .as_ref()
+                .is_some_and(|census| !census.record.is_empty())
+        {
+            if let Some(surface) =
+                kin_parser::value_escape::module_surface(language, file_id, &tree, source)
+            {
+                let mut surface = surface.into_entity_with_source(language, file_id, Some(source));
+                surface.role = role;
+                entities.push(surface);
+            }
+        }
+        separate_unit_identities(&mut entities, file_id);
         attach_span_source_digest(&mut entities, blob_hash);
+        attach_own_code(&mut entities, source);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
             &mut entities,
@@ -532,6 +709,7 @@ impl IndexPipeline {
             &imports,
             parsed_call_sites,
         );
+        attach_file_nested_definition_record(&mut entities, nested_definitions.as_ref());
         attach_equivalence_class(&mut entities, &tree, source, language);
         kin_parser::binding_callability::attach_binding_callability(
             &tree,
@@ -539,6 +717,14 @@ impl IndexPipeline {
             language,
             &mut entities,
         );
+        kin_parser::value_origins::attach_value_origins(
+            &tree,
+            source,
+            language,
+            &file_id.0,
+            &mut entities,
+        );
+        kin_parser::value_escape::attach(escape_census.as_ref(), &mut entities);
         if language == LanguageId::Go {
             kin_parser::attach_go_package_metadata(&tree, source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
@@ -600,8 +786,14 @@ impl IndexPipeline {
         )
         .entered();
         let file_id = FilePathId::new(path.display().to_string());
-        let (indexed, tree) =
-            self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)?;
+        let (indexed, tree) = self.index_file_hint_with_id(
+            path,
+            blob_store,
+            &file_id,
+            old_tree,
+            edit_hint,
+            &NoProjectFiles,
+        )?;
         Ok((indexed.indexed_file, tree))
     }
 
@@ -621,6 +813,7 @@ impl IndexPipeline {
         file_id: &FilePathId,
         old_tree: Option<&tree_sitter::Tree>,
         edit_hint: Option<&kin_parser::EditHint>,
+        project: &dyn ProjectFiles,
     ) -> Result<(IndexedFileWithTests, tree_sitter::Tree)> {
         let ext = path
             .extension()
@@ -659,7 +852,9 @@ impl IndexPipeline {
             }
             _ => adapter.parse(&source)?,
         };
-        let output = adapter.extract(&tree, &source, file_id)?;
+        let unit = self.unit_context(file_id, project)?;
+        let mut output = adapter.extract_in(&tree, &source, file_id, &unit)?;
+        kin_parser::file_evidence::attach_file_evidence(adapter, &tree, &source, &mut output);
         let kin_parser::ParseOutput {
             entities: extracted_entities,
             derived_members,
@@ -668,6 +863,7 @@ impl IndexPipeline {
             tests,
             parse_state,
             parsed_call_sites,
+            nested_definitions,
         } = output;
 
         // Convert extracted entities to model entities.
@@ -701,7 +897,25 @@ impl IndexPipeline {
             role,
             blob_hash,
         );
+        // How the file uses names as values, for the escape census. A file
+        // whose record holds something always carries an entity for it.
+        let escape_census = kin_parser::value_escape::census_file(&tree, &source, language);
+        if entities.is_empty()
+            && escape_census
+                .as_ref()
+                .is_some_and(|census| !census.record.is_empty())
+        {
+            if let Some(surface) =
+                kin_parser::value_escape::module_surface(language, file_id, &tree, &source)
+            {
+                let mut surface = surface.into_entity_with_source(language, file_id, Some(&source));
+                surface.role = role;
+                entities.push(surface);
+            }
+        }
+        separate_unit_identities(&mut entities, file_id);
         attach_span_source_digest(&mut entities, blob_hash);
+        attach_own_code(&mut entities, &source);
         attach_file_context_metadata(&mut entities, file_id, &imports);
         attach_file_reference_parse_counts(
             &mut entities,
@@ -709,6 +923,7 @@ impl IndexPipeline {
             &imports,
             parsed_call_sites,
         );
+        attach_file_nested_definition_record(&mut entities, nested_definitions.as_ref());
         attach_equivalence_class(&mut entities, &tree, &source, language);
         kin_parser::binding_callability::attach_binding_callability(
             &tree,
@@ -716,6 +931,14 @@ impl IndexPipeline {
             language,
             &mut entities,
         );
+        kin_parser::value_origins::attach_value_origins(
+            &tree,
+            &source,
+            language,
+            &file_id.0,
+            &mut entities,
+        );
+        kin_parser::value_escape::attach(escape_census.as_ref(), &mut entities);
         if language == LanguageId::Go {
             kin_parser::attach_go_package_metadata(&tree, &source, &mut entities);
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);
@@ -775,7 +998,14 @@ impl IndexPipeline {
         )
         .entered();
         let file_id = FilePathId::new(path.display().to_string());
-        self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)
+        self.index_file_hint_with_id(
+            path,
+            blob_store,
+            &file_id,
+            old_tree,
+            edit_hint,
+            &NoProjectFiles,
+        )
     }
 
     /// Index a file with hint, normalizing its `FilePathId` relative to the given root.
@@ -792,9 +1022,30 @@ impl IndexPipeline {
         old_tree: Option<&tree_sitter::Tree>,
         edit_hint: Option<&kin_parser::EditHint>,
     ) -> Result<(IndexedFile, tree_sitter::Tree)> {
+        self.index_file_relative_with_hint_in(
+            path,
+            blob_store,
+            root,
+            old_tree,
+            edit_hint,
+            &NoProjectFiles,
+        )
+    }
+
+    /// [`IndexPipeline::index_file_relative_with_hint`] for a unit of the tree
+    /// whose project manifests `project` holds.
+    pub fn index_file_relative_with_hint_in(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        root: &Path,
+        old_tree: Option<&tree_sitter::Tree>,
+        edit_hint: Option<&kin_parser::EditHint>,
+        project: &dyn ProjectFiles,
+    ) -> Result<(IndexedFile, tree_sitter::Tree)> {
         let file_id = normalize_file_path_id(path, root);
         let (indexed, tree) =
-            self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)?;
+            self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint, project)?;
         Ok((indexed.indexed_file, tree))
     }
 
@@ -809,7 +1060,14 @@ impl IndexPipeline {
         edit_hint: Option<&kin_parser::EditHint>,
     ) -> Result<(IndexedFileWithTests, tree_sitter::Tree)> {
         let file_id = normalize_file_path_id(path, root);
-        self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)
+        self.index_file_hint_with_id(
+            path,
+            blob_store,
+            &file_id,
+            old_tree,
+            edit_hint,
+            &NoProjectFiles,
+        )
     }
 
     /// Index a file, deriving all identity from the root-relative path.
@@ -826,6 +1084,18 @@ impl IndexPipeline {
         blob_store: &BlobStore,
         root: &Path,
     ) -> Result<IndexedFile> {
+        self.index_file_relative_in(path, blob_store, root, &NoProjectFiles)
+    }
+
+    /// [`IndexPipeline::index_file_relative`] for a unit of the tree whose
+    /// project manifests `project` holds.
+    pub fn index_file_relative_in(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        root: &Path,
+        project: &dyn ProjectFiles,
+    ) -> Result<IndexedFile> {
         let _span = tracing::info_span!(
             "kin.index.index_file_relative",
             path = %path.display(),
@@ -833,17 +1103,19 @@ impl IndexPipeline {
         )
         .entered();
         Ok(self
-            .index_file_relative_with_tests(path, blob_store, root)?
+            .index_file_relative_with_tests(path, blob_store, root, project)?
             .indexed_file)
     }
 
     /// Index a file, deriving identity from the root-relative path and retaining
-    /// parser-emitted tests.
+    /// parser-emitted tests, as a unit of the tree whose project manifests
+    /// `project` holds.
     pub fn index_file_relative_with_tests(
         &self,
         path: &Path,
         blob_store: &BlobStore,
         root: &Path,
+        project: &dyn ProjectFiles,
     ) -> Result<IndexedFileWithTests> {
         let _span = tracing::info_span!(
             "kin.index.index_file_relative_with_tests",
@@ -856,7 +1128,7 @@ impl IndexPipeline {
         let blob_hash = blob_store.write(&source)?;
         debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
         let file_id = normalize_file_path_id(path, root);
-        self.index_file_content_with_tests(&file_id, &source, blob_hash)
+        self.index_file_content_in(&file_id, &source, blob_hash, project)
     }
 
     /// Enrich exact bytes that have already been admitted into repository tree
@@ -871,12 +1143,24 @@ impl IndexPipeline {
         content: &[u8],
         blob_hash: kin_blobs::Hash256,
     ) -> Result<IndexedAny> {
+        self.index_any_content_in(file_id, content, blob_hash, &NoProjectFiles)
+    }
+
+    /// [`IndexPipeline::index_any_content`] for a unit of the tree whose
+    /// project manifests `project` holds.
+    pub fn index_any_content_in(
+        &self,
+        file_id: &FilePathId,
+        content: &[u8],
+        blob_hash: kin_blobs::Hash256,
+        project: &dyn ProjectFiles,
+    ) -> Result<IndexedAny> {
         let path = Path::new(&file_id.0);
         let classification = FileClassifier::classify_with_content(path, content);
 
         match classification {
             FileClassification::EntitySource => Ok(IndexedAny::EntitySource(
-                self.index_file_content_with_tests(file_id, content, blob_hash)?
+                self.index_file_content_in(file_id, content, blob_hash, project)?
                     .indexed_file,
             )),
             FileClassification::StructuredArtifact(kind) => {
@@ -1022,6 +1306,78 @@ pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
     FilePathId::new(normalized)
 }
 
+/// Where a container entity's own code is written: the text of its span with
+/// the spans of the entities inside it taken out, whitespace collapsed. A
+/// class's own code is its class-level statements (a `default_config` dict,
+/// its attributes), a module's is its module-level code. What its members say
+/// belongs to the members, which carry their own bodies.
+pub const OWN_CODE_KEY: &str = "own_code";
+
+/// The kinds whose span holds other entities, whose own code is recorded.
+fn holds_members(kind: kin_model::EntityKind) -> bool {
+    use kin_model::EntityKind;
+    matches!(
+        kind,
+        EntityKind::Class
+            | EntityKind::Interface
+            | EntityKind::TraitDef
+            | EntityKind::EnumDef
+            | EntityKind::Module
+            | EntityKind::Package
+            | EntityKind::File
+    )
+}
+
+/// Record each container's own code under [`OWN_CODE_KEY`]. Language
+/// neutral: it reads spans alone.
+fn attach_own_code(entities: &mut [Entity], source: &[u8]) {
+    let spans: Vec<(usize, usize)> = entities
+        .iter()
+        .filter_map(|entity| entity.span.as_ref())
+        .map(|span| (span.start_byte, span.end_byte))
+        .filter(|(start, end)| start < end && *end <= source.len())
+        .collect();
+    for entity in entities.iter_mut() {
+        if !holds_members(entity.kind) {
+            continue;
+        }
+        let Some((start, end)) = entity
+            .span
+            .as_ref()
+            .map(|span| (span.start_byte, span.end_byte))
+            .filter(|(start, end)| start < end && *end <= source.len())
+        else {
+            continue;
+        };
+        let mut inner: Vec<(usize, usize)> = spans
+            .iter()
+            .copied()
+            .filter(|&(s, e)| start <= s && e <= end && (s, e) != (start, end))
+            .collect();
+        inner.sort_unstable();
+        let mut own = String::new();
+        let mut at = start;
+        for (s, e) in inner {
+            if s > at {
+                own.push_str(&String::from_utf8_lossy(&source[at..s]));
+                own.push(' ');
+            }
+            at = at.max(e);
+        }
+        if at < end {
+            own.push_str(&String::from_utf8_lossy(&source[at..end]));
+        }
+        let collapsed = own.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        entity
+            .metadata
+            .extra
+            .insert(OWN_CODE_KEY.into(), serde_json::Value::String(collapsed));
+    }
+}
+
 /// Bind parser-derived spans to the complete source blob, including trivia.
 fn attach_span_source_digest(entities: &mut [Entity], blob_hash: kin_blobs::Hash256) {
     let digest = blob_hash.to_string();
@@ -1069,18 +1425,6 @@ fn attach_equivalence_class(
 /// entity metadata.
 pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 
-/// Whether a single path component names a test directory: one of its
-/// `[_-.]`-delimited words is an exact test keyword. Word-level matching (never a
-/// raw substring) keeps a testing tool's shipped product package — `_pytest`,
-/// `pytest`, `contest`, `latest` — out of the test role, while still catching
-/// compound test dirs such as `unit_tests`, `acceptance_test`, and `__tests__`.
-fn is_test_dir_component(component: &str) -> bool {
-    const TEST_DIR_WORDS: [&str; 5] = ["test", "tests", "testing", "spec", "specs"];
-    component
-        .split(['_', '-', '.'])
-        .any(|word| TEST_DIR_WORDS.contains(&word))
-}
-
 /// Classify a file path into an [`EntityRole`] based on directory and filename patterns.
 ///
 /// Entities from the same file share the same role. The classifier checks path
@@ -1088,79 +1432,17 @@ fn is_test_dir_component(component: &str) -> bool {
 /// markers) and falls back to `Source` for everything else.
 ///
 /// Test-directory detection matches whole path components (via
-/// [`is_test_dir_component`]) rather than raw substrings, so a testing tool's own
+/// [`kin_model::test_paths::is_test_dir_component`]) rather than raw substrings, so a testing tool's own
 /// product package — e.g. pytest's `_pytest/` — classifies as source and keeps its
 /// signature/breaking changes on the contract surface. A repo's actual test tree
 /// (`tests/`, `__tests__/`, or any `test_*`/`*_test` file) still resolves to the
 /// test role.
-/// Whether a filename names a test by one of the conventions the ecosystems in
-/// this registry actually use.
-///
-/// This was eight literal extensions, which classified `Foo.test.tsx`,
-/// `FooTest.java`, `foo_spec.rb` and every other colocated framework test as
-/// production source. A React repository with colocated tests read 100% Source,
-/// and two linker gates that filter on `role != Test` then removed nothing,
-/// because nothing was Test (FIR-1940).
-///
-/// The rule is delimited rather than a bare suffix, and the delimiter is what
-/// makes it safe to widen. `latest.java` ends with the letters `test.java`, and
-/// a lowercased `ends_with` would call it a test; `release.rs` under a `latest/`
-/// directory is the same hazard one level up. So a marker counts only when a
-/// delimiter or a case boundary separates it from the rest of the stem:
-///
-/// - `test_foo.py`, delimited by the underscore that follows.
-/// - `foo_test.go`, `foo_spec.rb`, delimited by the underscore before.
-/// - `foo.test.tsx`, `foo.spec.js`, delimited by the dot before, which covers
-///   every extension the JS and TS adapters claim rather than four of them.
-/// - `FooTest.java`, `FooTests.cs`, `FooSpec.kt`, `FooTests.swift`, delimited by
-///   the capital. This is the one case that reads the ORIGINAL spelling: the
-///   lowercased form cannot tell `FooTest` from `latest`.
-///
-/// `original` is the filename as written; `lower` is the same string lowercased,
-/// passed in because the caller already has it.
-fn is_test_file_name(original: &str, lower: &str) -> bool {
-    let stem_lower = lower.rsplit_once('.').map_or(lower, |(stem, _)| stem);
-    if stem_lower.starts_with("test_")
-        || stem_lower.ends_with("_test")
-        || stem_lower.ends_with("_spec")
-        || stem_lower.ends_with(".test")
-        || stem_lower.ends_with(".spec")
-    {
-        return true;
-    }
-    // The capital is the delimiter. Matching on the original spelling is what
-    // separates `FooTest` from `latest`, and lowercasing first is what made the
-    // widened rule unsafe in the first place.
-    let stem = original.rsplit_once('.').map_or(original, |(stem, _)| stem);
-    for marker in ["Test", "Tests", "Spec", "Specs"] {
-        if stem.len() > marker.len() && stem.ends_with(marker) {
-            return true;
-        }
-    }
-    false
-}
-
 pub fn classify_file_role(path: &str) -> EntityRole {
-    let lower = path.to_ascii_lowercase();
-    let components: Vec<&str> = lower.split('/').filter(|c| !c.is_empty()).collect();
-    let file_name = components.last().copied().unwrap_or("");
-    let dir_len = components.len().saturating_sub(1);
-
-    // Test paths. A directory is a test tree only when one of its words is an
-    // exact test keyword (component match, never a substring), so `_pytest/` and
-    // peers are not swept in. Test *files* are recognized by filename convention
-    // regardless of the directory they live in.
-    let in_test_dir = components
-        .iter()
-        .take(dir_len)
-        .any(|c| is_test_dir_component(c));
-    // The ORIGINAL spelling, taken from `path` rather than from `lower`, because
-    // the capital in `FooTest` is a delimiter and lowercasing destroys it.
-    let original_file_name = path.rsplit('/').next().unwrap_or("");
-    let is_test_file = is_test_file_name(original_file_name, file_name);
-    if in_test_dir || is_test_file {
+    if kin_model::test_paths::is_test_path(path) {
         return EntityRole::Test;
     }
+
+    let lower = path.to_ascii_lowercase();
 
     // Vendored paths (copied dependencies)
     if lower.starts_with("vendor/")
@@ -1311,27 +1593,57 @@ fn resolve_relations(
         .any(kin_parser::is_call_extraction_incomplete_marker);
 
     for rel in extracted {
-        if kin_parser::is_call_extraction_incomplete_marker(rel) {
+        if kin_parser::is_reserved_parser_record(rel) {
             continue;
         }
-        let src = source_index.resolve(rel);
-        let dst = same_file
-            .get(rel.dst_name.as_str())
-            .copied()
-            .filter(|_| !crate::linker::requires_rust_import_authority(rel, &file_id.0))
-            .filter(|_| {
-                // Receiver-shaped fields and unproven local method calls must
-                // reach the linker instead of capturing a bare free symbol.
-                //
-                // Python records the receiver of every attribute call whose
-                // owner the parser could not pin, so `settings.get(...)` and
-                // `@app.post(...)` arrive as the leaf `get` or `post` with a
-                // receiver. Such a call reaches a member of the receiver's
-                // type, never a module-level function that shares the leaf, and
-                // the linker already refuses that same-file match. Binding it
-                // here instead stamped it parser-certain.
-                !(crate::linker::is_go_selector_reference(rel, src.map(|entity| entity.language))
-                    || (src.is_some_and(|s| {
+        let lexical_contains = crate::relation_source::is_lexical_contains(rel);
+        let contains_pair = lexical_contains
+            .then(|| source_index.resolve_lexical_contains(rel))
+            .flatten();
+        let src = if lexical_contains {
+            contains_pair.map(|(parent, _)| parent)
+        } else {
+            source_index.resolve(rel)
+        };
+        let dst = if lexical_contains {
+            contains_pair.map(|(_, child)| child)
+        } else {
+            same_file
+                .get(rel.dst_name.as_str())
+                .copied()
+                .filter(|_| !crate::linker::requires_rust_import_authority(rel, &file_id.0))
+                .filter(|slot| {
+                    crate::linker::same_file_slot_binds(
+                        rel.kind,
+                        Some(&slot.kind),
+                        Some(&slot.language),
+                    )
+                })
+                // A Python name the file imports is bound twice, and which binding
+                // a call reads depends on an order this resolver does not model, so
+                // the linker settles it: through the import, with the file's own
+                // declaration kept only as a candidate. Binding it here stamped the
+                // same-file declaration parser-certain, including for a name a
+                // function body imports from another module.
+                .filter(|slot| {
+                    !(slot.language == kin_model::LanguageId::Python
+                        && crate::linker::carries_non_rust_import(rel, &file_id.0))
+                })
+                .filter(|_| {
+                    // Receiver-shaped fields and unproven local method calls must
+                    // reach the linker instead of capturing a bare free symbol.
+                    //
+                    // Python records the receiver of every attribute call whose
+                    // owner the parser could not pin, so `settings.get(...)` and
+                    // `@app.post(...)` arrive as the leaf `get` or `post` with a
+                    // receiver. Such a call reaches a member of the receiver's
+                    // type, never a module-level function that shares the leaf, and
+                    // the linker already refuses that same-file match. Binding it
+                    // here instead stamped it parser-certain.
+                    !(crate::linker::is_go_selector_reference(
+                        rel,
+                        src.map(|entity| entity.language),
+                    ) || (src.is_some_and(|s| {
                         matches!(
                             s.language,
                             kin_model::LanguageId::Go | kin_model::LanguageId::Python
@@ -1339,17 +1651,16 @@ fn resolve_relations(
                     }) && rel.kind == kin_model::RelationKind::Calls
                         && rel.receiver.is_some()
                         && !rel.dst_name.contains('.')))
-            });
+                })
+        };
 
         match (src, dst) {
             (Some(s), Some(d)) => {
-                // Same-file relation: fully resolved
+                // Same-file relation. A daemon start re-derives this edge from
+                // the extracted relation through the linker, then compares it
+                // with the committed one, so both paths mint this id.
                 let mut relation = Relation {
-                    id: RelationId::from_content(
-                        &s.id.0.to_string(),
-                        &d.id.0.to_string(),
-                        &format!("{:?}", rel.kind),
-                    ),
+                    id: crate::linker::stable_relation_id(&s.id, &d.id, &rel.kind),
                     kind: rel.kind,
                     src: kin_model::GraphNodeId::Entity(s.id),
                     dst: kin_model::GraphNodeId::Entity(d.id),
@@ -1403,6 +1714,114 @@ fn resolve_relations(
 
 #[cfg(test)]
 mod tests {
+
+    /// A container's own code is its span with its members' spans taken out:
+    /// Flask's class-level `default_config` belongs to its field, a method's body is
+    /// the method's, and the module's own code is what no entity in it spans.
+    #[test]
+    fn a_container_records_its_own_code_and_not_its_members() {
+        let source = b"import os\n\nclass Flask:\n    \"\"\"The app.\"\"\"\n\n    default_config = {\n        \"SESSION_REFRESH_EACH_REQUEST\": True,\n    }\n\n    def run(self):\n        return serve_forever()\n\nDEBUG_MODULE_FLAG = os.environ.get(\"X\")\n";
+        let indexed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("src/flask/app.py"),
+                source,
+                kin_blobs::digest(source),
+            )
+            .unwrap()
+            .indexed_file;
+        let own = |name: &str| {
+            indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .and_then(|entity| entity.metadata.extra.get(OWN_CODE_KEY))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        let class = own("Flask").expect("the class records its own code");
+        assert!(!class.contains("SESSION_REFRESH_EACH_REQUEST"), "{class}");
+        assert!(!class.contains("serve_forever"), "{class}");
+        let key = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Flask.default_config.SESSION_REFRESH_EACH_REQUEST")
+            .unwrap();
+        let span = key.span.as_ref().unwrap();
+        assert_eq!(
+            &source[span.start_byte..span.end_byte],
+            b"\"SESSION_REFRESH_EACH_REQUEST\": True"
+        );
+        assert_eq!(own("Flask.run"), None, "a method records no own code");
+        let module = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.kind == kin_model::EntityKind::Module)
+            .and_then(|entity| entity.metadata.extra.get(OWN_CODE_KEY))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(module.contains("import os"), "{module}");
+        assert!(!module.contains("default_config"), "{module}");
+    }
+    #[test]
+    fn container_own_code_keeps_middle_evidence_beyond_the_old_window() {
+        let padding = "padding café ".repeat(1_000);
+        let source = format!(
+            "register(\"{padding}module_center_beacon{padding}\")\n\n\
+             class Settings:\n    register(\
+             {{\"padding_head\": \"{padding}\", \
+             \"class_center_beacon\": True, \
+             \"padding_tail\": \"{padding}\"}})\n\n\
+             \x20\x20\x20\x20def run(self):\n        return member_only_beacon()\n"
+        );
+        let indexed = IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new("settings.py"),
+                source.as_bytes(),
+                kin_blobs::digest(source.as_bytes()),
+            )
+            .unwrap()
+            .indexed_file;
+        for (kind, present, absent) in [
+            (
+                kin_model::EntityKind::Class,
+                "class_center_beacon",
+                "module_center_beacon",
+            ),
+            (
+                kin_model::EntityKind::Module,
+                "module_center_beacon",
+                "class_center_beacon",
+            ),
+        ] {
+            let entity = indexed
+                .entities
+                .iter()
+                .find(|entity| entity.kind == kind)
+                .unwrap();
+            let own = entity
+                .metadata
+                .extra
+                .get(OWN_CODE_KEY)
+                .and_then(|value| value.as_str())
+                .unwrap();
+            assert!(
+                own.chars().count() > 16_000,
+                "{kind:?} retained only a window"
+            );
+            assert!(own.contains(present), "{kind:?} lost its middle evidence");
+            assert!(own.contains("café"), "{kind:?} lost Unicode source text");
+            assert!(
+                !own.contains(absent),
+                "{kind:?} inherited another entity's evidence"
+            );
+            assert!(
+                !own.contains("member_only_beacon"),
+                "{kind:?} inherited a member body"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1880,6 +2299,40 @@ mod tests {
             EntityRole::Test
         );
         assert_eq!(classify_file_role("testing/conftest.py"), EntityRole::Test);
+    }
+
+    /// A package a repository ships for other people's tests is product
+    /// source: React's `react-test-renderer` host config, its `test-utils`,
+    /// a `testing-library`. Only a directory whose last word names tests is
+    /// a test tree, and a test file inside such a package is still a test by
+    /// its own name or directory.
+    #[test]
+    fn classify_a_package_shipped_for_tests_as_source() {
+        for path in [
+            "packages/react-test-renderer/src/ReactFiberConfigTestHost.js",
+            "packages/react-test-renderer/index.js",
+            "packages/react-dom/test-utils.js",
+            "packages/react-dom/src/test-utils/ReactTestUtils.js",
+            "packages/internal-test-utils/consoleMock.js",
+            "src/testing-library/render.ts",
+        ] {
+            assert_eq!(
+                classify_file_role(path),
+                EntityRole::Source,
+                "{path} ships for tests and is not one"
+            );
+        }
+        for path in [
+            "packages/react-test-renderer/src/__tests__/ReactTestRenderer-test.js",
+            "packages/react-test-renderer/src/ReactTestRenderer.test.js",
+            "packages/react-test-renderer/tests/render.js",
+            "packages/react-dom/src/test-utils/unit_tests/helper.js",
+            "e2e-tests/login.ts",
+            "src/test/java/com/example/Foo.java",
+            "pkg/integration-test/flow.go",
+        ] {
+            assert_eq!(classify_file_role(path), EntityRole::Test, "{path}");
+        }
     }
 
     #[test]
@@ -2490,8 +2943,8 @@ mod tests {
         );
     }
 
-    /// A function whose `@overload` stubs sit above it, calling itself by
-    /// name, binds that call to the implementation: the definition Python
+    /// A function whose `@overload` stubs sit above it, called by name from
+    /// its own nested closure, binds that call to the implementation: the definition Python
     /// keeps under the name, and the one both linkers bind. Binding the first
     /// stub instead gave every live re-derivation of the file an edge a fresh
     /// import never made.
@@ -2550,6 +3003,14 @@ def caller(value):
             .find(|entity| entity.name == "caller")
             .unwrap()
             .id;
+        // The recursive call is written in the implementation's nested
+        // `wrapper`, which is an entity of its own and owns it.
+        let wrapper = indexed
+            .entities
+            .iter()
+            .find(|entity| entity.name == "stream.<locals>.wrapper")
+            .expect("the nested closure is admitted")
+            .id;
         let calls_to_group = |src: kin_model::EntityId| -> Vec<kin_model::EntityId> {
             indexed
                 .relations
@@ -2562,7 +3023,254 @@ def caller(value):
                 .filter(|dst| *dst == module || group.iter().any(|entity| entity.id == *dst))
                 .collect()
         };
-        assert_eq!(calls_to_group(implementation), vec![implementation]);
+        assert_eq!(calls_to_group(wrapper), vec![implementation]);
+        assert!(calls_to_group(implementation).is_empty());
         assert_eq!(calls_to_group(caller), vec![implementation]);
+    }
+
+    /// Every answer the partial-refresh proofs give over a pair of C bodies,
+    /// in a fixed order: each held declaration against each namesake in the
+    /// current body, with each of its calls rebased and verified.
+    type PartialProofAnswers = Vec<(
+        kin_model::EntityId,
+        kin_model::EntityId,
+        bool,
+        Vec<(Option<Relation>, bool)>,
+    )>;
+
+    fn partial_proof_answers(
+        pipeline: &IndexPipeline,
+        old: &IndexedFile,
+        old_source: &[u8],
+        new: &IndexedFile,
+        source: &[u8],
+    ) -> PartialProofAnswers {
+        let mut answers = Vec::new();
+        for held in &old.entities {
+            for candidate in new
+                .entities
+                .iter()
+                .filter(|entity| entity.name == held.name && entity.kind == held.kind)
+            {
+                let refresh =
+                    pipeline.supports_partial_refresh(held, candidate, old_source, source);
+                let calls = old
+                    .relations
+                    .iter()
+                    .filter(|relation| relation.src.as_entity() == Some(held.id))
+                    .map(|relation| {
+                        (
+                            pipeline.rebase_partial_relation(
+                                held,
+                                candidate,
+                                old_source,
+                                source,
+                                relation,
+                                &old.entities,
+                            ),
+                            pipeline.verifies_partial_relation(
+                                held,
+                                candidate,
+                                old_source,
+                                source,
+                                relation,
+                                &old.entities,
+                            ),
+                        )
+                    })
+                    .collect();
+                answers.push((held.id, candidate.id, refresh, calls));
+            }
+        }
+        answers
+    }
+
+    /// A small C file the partial-refresh proofs can read: a global, two
+    /// complete functions and a torn declaration after them, so the parse is
+    /// incomplete while both function bodies stay clean. `factor` is an edit
+    /// inside the caller's body that leaves its call alone, which the proofs
+    /// can follow; `limit` is the global's value, declaration context no proof
+    /// may cross.
+    fn partial_c_file(factor: u32, limit: u32) -> String {
+        format!(
+            "int limit = {limit};\n\nstatic int helper(int value) {{\n    return value + 1;\n}}\n\n\
+             int caller(int value) {{\n    int total = helper(value);\n    \
+             return total * {factor};\n}}\n\nint torn(int value {{\n"
+        )
+    }
+
+    /// The partial-refresh proofs remember parsed C bodies by file and exact
+    /// bytes. Remembered or not, every proof has to answer exactly what a
+    /// fresh parse of the same two bodies answers: for a first reading, for a
+    /// remembered one, for a different current body under the same path, and
+    /// for a body read again after enough others pushed it out.
+    #[test]
+    fn remembered_partial_c_bodies_answer_every_proof_as_a_fresh_parse() {
+        let pipeline = IndexPipeline::new();
+        let file = FilePathId::new("partial.c");
+        let index = |source: &str| {
+            pipeline
+                .index_file_content_with_tests(
+                    &file,
+                    source.as_bytes(),
+                    kin_blobs::digest(source.as_bytes()),
+                )
+                .unwrap()
+                .indexed_file
+        };
+        let before = partial_c_file(2, 1);
+        let old = index(&before);
+        assert!(
+            matches!(old.parse_state, ParseState::Incomplete { .. }),
+            "the fixture must parse incompletely, or no partial proof applies"
+        );
+        let forget = |on: bool| FORGET_PARTIAL_C_SOURCES.with(|forget| forget.set(on));
+        let answers = |current: &str, new: &IndexedFile| {
+            partial_proof_answers(&pipeline, &old, before.as_bytes(), new, current.as_bytes())
+        };
+
+        let mut refreshed = 0;
+        let mut refused = 0;
+        let mut rebased = 0;
+        let mut first = None;
+        for (factor, limit) in [(3, 1), (4, 2)] {
+            let current = partial_c_file(factor, limit);
+            let new = index(&current);
+            forget(true);
+            let fresh = answers(&current, &new);
+            forget(false);
+            assert_eq!(
+                answers(&current, &new),
+                fresh,
+                "a first remembered reading answered differently from a fresh parse"
+            );
+            assert_eq!(
+                answers(&current, &new),
+                fresh,
+                "a remembered body answered differently from a fresh parse"
+            );
+            refreshed += fresh.iter().filter(|answer| answer.2).count();
+            refused += fresh.iter().filter(|answer| !answer.2).count();
+            rebased += fresh
+                .iter()
+                .flat_map(|answer| &answer.3)
+                .filter(|(relation, _)| relation.is_some())
+                .count();
+            first.get_or_insert((current, new, fresh));
+        }
+        assert!(
+            refreshed > 0,
+            "no declaration refreshed, so only refusals were compared"
+        );
+        assert!(
+            refused > 0,
+            "no declaration was refused, so only acceptances were compared"
+        );
+        assert!(
+            rebased > 0,
+            "no call was rebased, so the relation proofs were never compared"
+        );
+
+        // Push the first bodies out of what is remembered, then ask again.
+        for n in 0..=REMEMBERED_PARTIAL_C_SOURCES {
+            let other = format!("{before}/* {n} */\n");
+            assert!(partial_c_source(&file, other.as_bytes()).is_some());
+        }
+        let (current, new, fresh) = first.unwrap();
+        assert_eq!(
+            answers(&current, &new),
+            fresh,
+            "a body parsed again after being forgotten answered differently"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unit_context_tests {
+    use super::*;
+    use kin_parser::project_manifest::NoProjectFiles;
+    use std::sync::Arc;
+
+    /// A tree's manifests, by path.
+    struct Manifests(&'static [(&'static str, &'static str)]);
+
+    impl ProjectFiles for Manifests {
+        fn manifest(
+            &self,
+            path: &str,
+        ) -> std::result::Result<Option<Arc<str>>, kin_parser::project_manifest::UnreadableManifest>
+        {
+            Ok(self
+                .0
+                .iter()
+                .find(|(at, _)| *at == path)
+                .map(|(_, text)| Arc::from(*text)))
+        }
+    }
+
+    const OAUTH: Manifests = Manifests(&[(
+        "examples/oauth/Cargo.toml",
+        "[package]\nname = \"example-oauth\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )]);
+
+    fn surface(indexed: &IndexedFile) -> Entity {
+        indexed
+            .entities
+            .iter()
+            .find(|entity| kin_model::is_file_module_surface(entity))
+            .cloned()
+            .expect("the crate root has a module of its own")
+    }
+
+    /// A crate root indexed in a tree whose manifest names its crate carries
+    /// that crate's name, and the identity derived from it, and still owns
+    /// its top-level declarations. With the manifests unknown it keeps the
+    /// name its path gives.
+    #[test]
+    fn a_crate_root_takes_its_crate_name_from_the_tree_it_is_indexed_in() {
+        let file = FilePathId::new("examples/oauth/src/main.rs");
+        let source = b"use std::io;\n\nfn main() {\n    run();\n}\n\nfn run() {}\n";
+        let digest = kin_blobs::digest(source);
+        let pipeline = IndexPipeline::new();
+        let named = pipeline
+            .index_file_content_in(&file, source, digest, &OAUTH)
+            .unwrap()
+            .indexed_file;
+        let unnamed = pipeline
+            .index_file_content_with_tests(&file, source, digest)
+            .unwrap()
+            .indexed_file;
+        assert_eq!(surface(&named).name, "example_oauth");
+        assert_eq!(surface(&unnamed).name, "oauth");
+        assert_ne!(surface(&named).id, surface(&unnamed).id);
+        let held: Vec<&str> = named
+            .relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == kin_model::RelationKind::Contains
+                    && relation.src == kin_model::GraphNodeId::Entity(surface(&named).id)
+            })
+            .filter_map(|relation| relation.dst.as_entity())
+            .filter_map(|id| named.entities.iter().find(|entity| entity.id == id))
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert!(held.contains(&"main") && held.contains(&"run"), "{held:?}");
+    }
+
+    /// A kept parse answers only for the project declarations it was parsed
+    /// under, so the same bytes at the same path in two trees whose
+    /// manifests disagree are two parses.
+    #[test]
+    fn the_shared_index_keeps_a_parse_under_its_project_declarations() {
+        let file = FilePathId::new("examples/oauth/src/main.rs");
+        let source = b"fn main() {}\n\nfn kept_under_its_project() {}\n";
+        let digest = kin_blobs::digest(source);
+        let named = crate::shared_index::index_source(&file, source, digest, &OAUTH).unwrap();
+        let unnamed =
+            crate::shared_index::index_source(&file, source, digest, &NoProjectFiles).unwrap();
+        let again = crate::shared_index::index_source(&file, source, digest, &OAUTH).unwrap();
+        assert_eq!(surface(&named).name, "example_oauth");
+        assert_eq!(surface(&unnamed).name, "oauth");
+        assert_eq!(surface(&again).id, surface(&named).id);
     }
 }

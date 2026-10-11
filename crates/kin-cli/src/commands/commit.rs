@@ -692,7 +692,12 @@ mod tests {
     /// request resolves. Falsify by moving the `tail.poll()` loop out of the
     /// select and running it only after `work` completes; the phases then all
     /// arrive after `request-finished` and the position check fails.
-    #[tokio::test]
+    ///
+    /// The poll ticker and the slow commit both run on tokio's paused clock,
+    /// which advances to the next timer whenever the test is idle. The order
+    /// of ticks and phases is the same as in real time, without spending the
+    /// commit's 1.6 s of sleeps.
+    #[tokio::test(start_paused = true)]
     async fn commit_phases_reach_the_caller_while_the_request_is_still_outstanding() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("daemon.log");

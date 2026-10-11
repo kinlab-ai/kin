@@ -15,14 +15,17 @@ doctest = false
 [features]
 # Scoped runtime observers for dependent crates' test-only process controls.
 test-support = []
-default = ["vector", "embeddings"]
+default = ["vector", "external-embeddings"]
 vector = ["dep:kin-vector"]
+# HTTP embedding clients carry no tokenizer, weights or inference engine.
+external-embeddings = ["dep:reqwest"]
 embeddings = [
     "dep:ndarray",
     "dep:safetensors",
     "dep:hf-hub",
     "dep:tokenizers",
     "dep:kin-infer",
+    "kin-infer/engine",
     "dep:reqwest",
 ]
 metal = ["embeddings", "kin-infer/metal"]
@@ -40,6 +43,7 @@ kin-model = { workspace = true }
 kin-infer = { workspace = true, optional = true }
 kin-vector = { workspace = true, optional = true }
 kin-search = { workspace = true }
+kin-blobs = { workspace = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"

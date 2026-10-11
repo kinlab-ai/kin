@@ -28,10 +28,14 @@ kin-daemon-spawn = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }
 kin-git = { workspace = true }
+kin-io = { workspace = true }
 kin-index = { path = "../kin-index" }
 kin-parser = { workspace = true }
+# The one home of the declaration-versus-definition rule, `carries_body`.
+kin-ranking = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -60,6 +64,9 @@ windows-sys = { version = "0.61", features = [
 # Stable access to the `BY_HANDLE_FILE_INFORMATION` identity pair; the `std`
 # accessors for it remain unstable (`windows_by_handle`).
 winapi-util = "0.1"
+
+[build-dependencies]
+kin-derivation-inputs = { workspace = true }
 
 [dev-dependencies]
 kin-git = { workspace = true, features = ["test-support"] }

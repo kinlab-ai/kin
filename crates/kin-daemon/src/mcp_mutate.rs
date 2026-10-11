@@ -398,7 +398,7 @@ pub(crate) fn ensure_unbound(state: &DaemonState, transaction_id: &str) -> Resul
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    kin_blobs::durable::sync_all(&std::fs::File::open(path)?)
 }
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> std::io::Result<()> {
@@ -466,7 +466,7 @@ fn persist(state: &DaemonState, binding: &RequestBinding, completed: bool) -> Re
         owns_tmp = true;
         output.write_all(&bytes).map_err(recovery)?;
         fault(state, phase + 2)?;
-        output.sync_all().map_err(recovery)?;
+        kin_blobs::durable::sync_all(&output).map_err(recovery)?;
         fault(state, phase + 3)?;
         std::fs::rename(&tmp, &file).map_err(recovery)?;
         owns_tmp = false;
@@ -751,7 +751,7 @@ fn refuse_unpublished(
             // the mirror, including on replay, without rewriting saved bytes.
             fault(state, 22)?;
             std::fs::File::open(path(state, &key(&binding.identity)))
-                .and_then(|file| file.sync_all())
+                .and_then(|file| kin_blobs::durable::sync_all(&file))
                 .map_err(recovery)?;
             fault(state, 23)?;
             sync_directory(&directory(state)).map_err(recovery)?;
@@ -778,12 +778,31 @@ fn refuse_unpublished(
 
 async fn execute(state: Arc<DaemonState>, request: PreparedRequest) -> kin_mcp::ToolCallResult {
     let _coordination = state.coordination_gate.lock().await;
-    execute_locked(&state, request).unwrap_or_else(kin_mcp::ToolCallResult::error)
+    execute_locked(&state, request)
+        .await
+        .unwrap_or_else(kin_mcp::ToolCallResult::error)
 }
 
-fn execute_locked(
+fn retained_operation_refusal(
+    state: &DaemonState,
+    operations: &Value,
+) -> Result<Option<String>, String> {
+    if let Some(refusal) = kin_mcp::handlers::external_symbols::external_relation_refusal(
+        state.graph.as_ref(),
+        operations,
+        TOOL,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(refusal));
+    }
+    let parsed = kin_mcp::session::parse_staged_operations(operations)?;
+    Ok(kin_mcp::session::validate_semantic_operations(&parsed).err())
+}
+
+async fn execute_locked(
     state: &Arc<DaemonState>,
-    request: PreparedRequest,
+    mut request: PreparedRequest,
 ) -> Result<kin_mcp::ToolCallResult, String> {
     if !state
         .is_initialized
@@ -836,27 +855,28 @@ fn execute_locked(
         if binding.terminal_refusal.is_some() {
             return refuse_unpublished(state, binding, None);
         }
+        // An interrupted retirement may not have installed its terminal
+        // refusal yet. Recover that exact retained work even after its owner
+        // expires, without reading current source or admitting execution.
+        // Ticket-bearing requests still need live authority before expansion.
         if let Some(operations) = request.arguments.get("operations") {
-            if let Some(refusal) = kin_mcp::handlers::external_symbols::external_relation_refusal(
-                state.graph.as_ref(),
-                operations,
-                TOOL,
-            )
-            .map_err(|error| error.to_string())?
-            {
-                return refuse_unpublished(state, binding, Some(refusal));
-            }
-            let parsed = kin_mcp::session::parse_staged_operations(operations)?;
-            if let Err(reason) = kin_mcp::session::validate_semantic_operations(&parsed) {
-                return refuse_unpublished(state, binding, Some(reason));
+            if !kin_mcp::source_ticket::contains(operations) {
+                if let Some(reason) = retained_operation_refusal(state, operations)? {
+                    return refuse_unpublished(state, binding, Some(reason));
+                }
             }
         }
     }
+    // The immutable binding hashes the caller's exact request, including its
+    // compact tickets. Receipt recovery above needs only that identity, never
+    // today's source. Expand only unpublished work and retain the original
+    // arguments so a retry after publication still has the same identity.
+    let supplied_request = serde_json::to_value(&request.arguments).map_err(recovery)?;
+    let session_id =
+        SessionId(uuid::Uuid::parse_str(&request.identity.session_id).map_err(recovery)?);
     validate_request_fields(&request.arguments)?;
     // Receipt retrieval does not heartbeat or revive an expired session. New
     // execution requires a currently registered owner and current capabilities.
-    let session_id =
-        SessionId(uuid::Uuid::parse_str(&request.identity.session_id).map_err(recovery)?);
     let _active = state.coordinator.begin_call(&session_id);
     let session = state.coordinator.get_session(&session_id).map_err(recovery)?.ok_or("request_session_expired: the bound session is not registered; an unpublished request cannot be resumed under a new session")?;
     let now = chrono::Utc::now();
@@ -874,6 +894,15 @@ fn execute_locked(
         kin_mcp::session::read_only_session_refusal(kin_mcp::session::WriteDoor::Mutate, &session)
     {
         return Err(refusal);
+    }
+    crate::api::resolve_mcp_source_tickets(state, Some(&session_id), TOOL, &mut request.arguments)
+        .await?;
+    if let Some(binding) = &mut binding {
+        if let Some(operations) = request.arguments.get("operations") {
+            if let Some(reason) = retained_operation_refusal(state, operations)? {
+                return refuse_unpublished(state, binding, Some(reason));
+            }
+        }
     }
     state.coordinator.heartbeat(&session_id).map_err(recovery)?;
     if let Some(operations) = request.arguments.get("operations") {
@@ -925,7 +954,7 @@ fn execute_locked(
         request_hash: request.hash.clone(),
         transaction_id: uuid::Uuid::new_v4().to_string(),
         operations_count: parsed.len(),
-        request: Some(serde_json::to_value(&request.arguments).expect("serializable request")),
+        request: Some(supplied_request),
         receipt: None,
         terminal_refusal: None,
     });
@@ -996,10 +1025,9 @@ fn execute_locked(
         crate::api::transaction_coordination_context(state, &sessions, &commit_arguments);
     let preflight = sessions.evaluate_transaction_write(&request.identity.session_id, scopes);
     if !preflight.allowed {
-        return Err(format!(
-            "coordination enforcement rejected bound request: {}",
-            serde_json::to_string(&preflight).map_err(recovery)?
-        ));
+        return Err(preflight
+            .refusal("coordination enforcement rejected bound request")
+            .map_err(recovery)?);
     }
     let _mutation = state.begin_graph_authority_mutation();
     let result = crate::mcp_commit::commit_bound_transaction(

@@ -28,7 +28,7 @@
 //!   "language": "Python",
 //!   "requested_classes": ["calls", "imports", "references"],
 //!   "classes": { "calls": "present", "imports": "present", "references": "absent" },
-//!   "cross_file_classes": ["calls", "imports"],
+//!   "cross_unit_classes": ["calls", "imports"],
 //!   "reference_enrichment": "unknown",
 //!   "budget_exhausted": false,
 //!   "entities_examined": 3,
@@ -58,7 +58,10 @@
 //!
 //! `reference_enrichment` carries the one fact the scan cannot observe from the
 //! graph: whether this BUILD can produce reference edges for the language at
-//! all. See [`reference_enrichment`].
+//! all. See [`reference_enrichment`]. When it is `language_server_unusable`
+//! and the process that started the server recorded why,
+//! `reference_enrichment_reason` says it ("TypeScript enrichment unavailable:
+//! ..."), so no surface has to say only that a server did not start.
 //!
 //! The single-focal tools attach it to an EMPTY answer only, since that is the
 //! only answer whose trust depends on it: one that returned rows proved the
@@ -69,7 +72,8 @@
 use serde_json::{json, Map, Value};
 
 use kin_core::reference_coverage::{
-    reference_enrichment_for, LanguageServerReadinessMap, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
+    reference_enrichment_for, LanguageServerGapMap, LanguageServerReadiness,
+    LanguageServerReadinessMap, ReferenceEnrichment, ENRICHABLE_LANGUAGES,
 };
 use kin_index::RelationResolution;
 use kin_model::entity::Entity;
@@ -391,7 +395,7 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
             .join(", ")
     };
 
-    json!({
+    let observation = json!({
         "scope": "language",
         "language": language,
         "requested_classes": merged
@@ -399,7 +403,7 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
             .map(|(kind, _)| class_name(*kind))
             .collect::<Vec<_>>(),
         "classes": Value::Object(classes),
-        "cross_file_classes": cross_file,
+        "cross_unit_classes": cross_file,
         "reference_enrichment": enrichment,
         "budget_exhausted": any_budget_exhausted,
         "entities_examined": examined_total,
@@ -424,7 +428,8 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
         } else {
             Value::Object(unproduced_evidence)
         },
-    })
+    });
+    with_enrichment_reason(observation, &observed_languages)
 }
 
 /// The evidence that raises one class every language's scan completed empty on
@@ -533,7 +538,7 @@ pub fn observe_absence_scope(languages: &[LanguageId], scope_entities: Option<us
         "language": language,
         "requested_classes": Vec::<&str>::new(),
         "classes": Map::new(),
-        "cross_file_classes": Vec::<&str>::new(),
+        "cross_unit_classes": Vec::<&str>::new(),
         "reference_enrichment": reference_enrichment(&observed),
         "budget_exhausted": false,
         "entities_examined": 0,
@@ -542,7 +547,7 @@ pub fn observe_absence_scope(languages: &[LanguageId], scope_entities: Option<us
     if let Some(count) = scope_entities {
         observation["scope_entities"] = json!(count);
     }
-    observation
+    with_enrichment_reason(observation, &observed)
 }
 
 /// Record what the query's NAME FILTER selected on its own, beside the scope
@@ -790,6 +795,76 @@ fn reference_enrichment(languages: &[LanguageId]) -> Value {
     json!(weakest_reference_enrichment(languages, &servers))
 }
 
+/// `observation` with `reference_enrichment_reason` added when its languages'
+/// weakest state is a server that cannot start and its publisher recorded
+/// why.
+///
+/// `reference_enrichment` says a server could not start, which sends a reader
+/// looking for why. The reason was published beside that state all along, so
+/// it travels with it instead of stopping at `kin doctor`.
+fn with_enrichment_reason(mut observation: Value, languages: &[LanguageId]) -> Value {
+    let reason = published_language_servers()
+        .and_then(|servers| unusable_server_reason(languages, &servers));
+    if let (Some(reason), Some(fields)) = (reason, observation.as_object_mut()) {
+        fields.insert(
+            REFERENCE_ENRICHMENT_REASON_KEY.to_string(),
+            Value::String(reason),
+        );
+    }
+    observation
+}
+
+/// The key under which an observation carries why its languages' servers
+/// cannot start.
+pub const REFERENCE_ENRICHMENT_REASON_KEY: &str = "reference_enrichment_reason";
+
+/// Why `languages`' servers cannot start, one sentence per distinct reason
+/// naming the languages it holds for by display label ("TypeScript and
+/// JavaScript enrichment unavailable: ..."), or `None` unless the weakest
+/// state among them is a server that cannot start with a recorded reason.
+///
+/// A reason never holds the `"; "` that divides verdict clauses, since it
+/// reaches one.
+pub(crate) fn unusable_server_reason(
+    languages: &[LanguageId],
+    readiness: &LanguageServerReadinessMap,
+) -> Option<String> {
+    if weakest_reference_enrichment(languages, readiness)
+        != ReferenceEnrichment::LanguageServerUnusable
+    {
+        return None;
+    }
+    let mut by_reason: Vec<(String, Vec<&'static str>)> = Vec::new();
+    for language in languages {
+        let Some(LanguageServerReadiness::Unusable { reason }) = readiness.get(language) else {
+            continue;
+        };
+        let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        if reason.is_empty() {
+            continue;
+        }
+        let label = language.profile().display_name;
+        match by_reason.iter_mut().find(|(known, _)| *known == reason) {
+            Some((_, labels)) if !labels.contains(&label) => labels.push(label),
+            Some(_) => {}
+            None => by_reason.push((reason, vec![label])),
+        }
+    }
+    if by_reason.is_empty() {
+        return None;
+    }
+    let sentences: Vec<String> = by_reason
+        .iter()
+        .map(|(reason, labels)| {
+            kin_core::reference_coverage::enrichment_unavailable_sentence(
+                &labels.join(" and "),
+                reason,
+            )
+        })
+        .collect();
+    Some(sentences.join(". ").replace("; ", ", "))
+}
+
 /// What is knowable without the host: whether this build wires an adapter.
 fn build_only_reference_enrichment(languages: &[LanguageId]) -> ReferenceEnrichment {
     if languages
@@ -889,6 +964,30 @@ pub fn publish_language_server_readiness(readiness: LanguageServerReadinessMap) 
     if let Ok(mut slot) = PUBLISHED_SERVERS.write() {
         *slot = Some(readiness);
     }
+}
+
+static PUBLISHED_GAPS: std::sync::RwLock<Option<LanguageServerGapMap>> =
+    std::sync::RwLock::new(None);
+
+/// Publish, per language whose server runs, why it runs without the
+/// environment the repository chose, so calls into dependencies get no
+/// answer from it. Published beside [`publish_language_server_readiness`] by
+/// the same process, because only the process that started a server knows
+/// what it was started with.
+pub fn publish_language_server_gaps(gaps: LanguageServerGapMap) {
+    if let Ok(mut slot) = PUBLISHED_GAPS.write() {
+        *slot = Some(gaps);
+    }
+}
+
+/// The partial gaps a process that starts servers published, or an empty
+/// map when nobody did.
+pub fn published_language_server_gaps() -> LanguageServerGapMap {
+    PUBLISHED_GAPS
+        .read()
+        .ok()
+        .and_then(|gaps| gaps.clone())
+        .unwrap_or_default()
 }
 
 /// Lets a test state which language servers its host has.
@@ -1582,7 +1681,7 @@ mod tests {
         assert_eq!(coverage["classes"]["calls"], json!("absent"));
         assert_eq!(coverage["classes"]["imports"], json!("absent"));
         assert_eq!(coverage["classes"]["references"], json!("absent"));
-        assert_eq!(coverage["cross_file_classes"], json!([]));
+        assert_eq!(coverage["cross_unit_classes"], json!([]));
         assert_eq!(coverage["budget_exhausted"], json!(false));
     }
 
@@ -1607,7 +1706,7 @@ mod tests {
         );
         assert_eq!(coverage["classes"]["calls"], json!("present"));
         assert_eq!(coverage["classes"]["imports"], json!("absent"));
-        assert_eq!(coverage["cross_file_classes"], json!(["calls"]));
+        assert_eq!(coverage["cross_unit_classes"], json!(["calls"]));
     }
 
     /// Stamp the per-file counts the extractor writes, on every entity of a file.
@@ -1686,7 +1785,7 @@ mod tests {
             json!(0),
             "{coverage}"
         );
-        assert_eq!(coverage["cross_file_classes"], json!(["calls"]));
+        assert_eq!(coverage["cross_unit_classes"], json!(["calls"]));
     }
 
     /// The same graph with nothing to resolve stays `absent`. No file carries an
@@ -2192,5 +2291,69 @@ mod tests {
             "requested_classes": ["calls"],
             "classes": {"calls": "present"},
         })));
+    }
+
+    /// The field report's "would not start": the reason the process that
+    /// started the server published travels in the observation, once per
+    /// distinct reason under every language it holds for, and reaches the
+    /// first-contact advice and the verdict clause instead of stopping at
+    /// `kin doctor`. A reason never brings the `; ` that divides clauses.
+    #[test]
+    fn an_unusable_servers_reason_travels_with_the_observation() {
+        let reason = "`typescript-language-server` refused initialize: Could not find a valid \
+                      TypeScript installation; Exiting";
+        let _host = test_support::scoped_language_server_readiness(&[
+            (
+                LanguageId::TypeScript,
+                LanguageServerReadiness::Unusable {
+                    reason: reason.to_string(),
+                },
+            ),
+            (
+                LanguageId::JavaScript,
+                LanguageServerReadiness::Unusable {
+                    reason: reason.to_string(),
+                },
+            ),
+        ]);
+        let observation =
+            observe_absence_scope(&[LanguageId::TypeScript, LanguageId::JavaScript], None);
+        assert_eq!(
+            observation["reference_enrichment"],
+            json!("language_server_unusable")
+        );
+        let carried = observation[REFERENCE_ENRICHMENT_REASON_KEY]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            carried,
+            "TypeScript and JavaScript enrichment unavailable: `typescript-language-server` \
+             refused initialize: Could not find a valid TypeScript installation, Exiting"
+        );
+
+        let advice = crate::first_contact::language_server_advice(
+            &observation,
+            crate::first_contact::Spelling::Kin,
+        )
+        .unwrap_or_default();
+        assert!(advice.contains(carried), "{advice}");
+        assert!(!advice.contains("would not start"), "{advice}");
+
+        let clause = crate::negative::reference_readiness_gap(
+            observation
+                .as_object()
+                .expect("an observation is an object"),
+        )
+        .unwrap_or_default();
+        assert!(
+            clause.starts_with(&format!("reference_enrichment_unusable: {carried}")),
+            "{clause}"
+        );
+        assert!(!clause.contains("; "), "{clause}");
+
+        // A host whose servers run carries no reason at all.
+        let _usable = test_support::scoped_language_servers(&[LanguageId::TypeScript]);
+        let observation = observe_absence_scope(&[LanguageId::TypeScript], None);
+        assert!(observation.get(REFERENCE_ENRICHMENT_REASON_KEY).is_none());
     }
 }

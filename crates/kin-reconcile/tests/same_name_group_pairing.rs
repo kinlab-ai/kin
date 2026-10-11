@@ -890,7 +890,9 @@ fn a_planner_retained_rename_keeps_identity_with_a_same_signature_sibling() {
 }
 
 /// Flask's `stream_with_context`: two `@overload` stubs, then the
-/// implementation, whose nested wrapper calls the function by name.
+/// implementation, whose nested wrapper calls the function by name. The
+/// wrapper is an entity of its own (`stream_with_context.<locals>.decorator`),
+/// so the call written in its body is its call, not the implementation's.
 const SELF_CALL: &str = r#"import typing as t
 from functools import update_wrapper
 
@@ -924,20 +926,36 @@ def stream_with_context(generator_or_function):
     return gen
 "#;
 
-/// Every `Calls` edge between the file's `stream_with_context` definitions,
-/// each end named by its place in the group: the stubs in source order, then
-/// the implementation.
+/// The implementation's nested wrapper, the entity that writes the self-call.
+const SELF_CALL_WRAPPER: &str = "stream_with_context.<locals>.decorator";
+
+/// Every `Calls` edge into the file's `stream_with_context` definitions from
+/// one of them or from the implementation's nested wrapper, each end named by
+/// its place: the stubs in source order, then the implementation, and the
+/// wrapper by name.
 fn overload_group_calls(repo: &LiveRepo) -> Vec<(String, String)> {
-    let mut group: Vec<Entity> = repo
-        .graph
-        .list_all_entities()
-        .unwrap()
-        .into_iter()
+    let entities = repo.graph.list_all_entities().unwrap();
+    let mut group: Vec<Entity> = entities
+        .iter()
         .filter(|entity| entity.name == "stream_with_context")
+        .cloned()
         .collect();
     group.sort_by_key(|entity| entity.span.as_ref().map(|span| span.start_line));
     assert_eq!(group.len(), 3, "two stubs and the implementation");
+    let wrappers: Vec<&Entity> = entities
+        .iter()
+        .filter(|entity| entity.name == SELF_CALL_WRAPPER)
+        .collect();
+    assert_eq!(
+        wrappers.len(),
+        1,
+        "the implementation's nested wrapper is one entity of its own"
+    );
+    let wrapper = wrappers[0].id;
     let label = |id: kin_model::EntityId| -> String {
+        if id == wrapper {
+            return "nested wrapper".into();
+        }
         match group.iter().position(|entity| entity.id == id) {
             Some(0) => "first stub".into(),
             Some(1) => "second stub".into(),
@@ -951,7 +969,7 @@ fn overload_group_calls(repo: &LiveRepo) -> Vec<(String, String)> {
         .filter(|edge| edge.kind == RelationKind::Calls)
         .filter_map(|edge| Some((edge.src.as_entity()?, edge.dst.as_entity()?)))
         .filter(|(src, dst)| {
-            group.iter().any(|entity| entity.id == *src)
+            (*src == wrapper || group.iter().any(|entity| entity.id == *src))
                 && group.iter().any(|entity| entity.id == *dst)
         })
         .map(|(src, dst)| (label(src), label(dst)))
@@ -969,8 +987,9 @@ fn an_edit_and_its_revert_leave_an_overload_groups_self_call_on_the_implementati
         let before = overload_group_calls(&repo);
         assert_eq!(
             before,
-            vec![("implementation".to_string(), "implementation".to_string())],
-            "reopen={reopen}: the first derivation binds the self-call to the implementation"
+            vec![("nested wrapper".to_string(), "implementation".to_string())],
+            "reopen={reopen}: the first derivation binds the wrapper's self-call to the \
+             implementation, never to a stub"
         );
         if reopen {
             repo.reopen();

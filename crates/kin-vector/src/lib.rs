@@ -122,6 +122,93 @@ struct CanonicalRebuildInputs<Id> {
     descriptor: IndexDescriptor,
 }
 
+/// How a save lays out the HNSW graph it writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PersistTopology {
+    /// Rebuild a graph that has changed since it was last canonical, in
+    /// canonical key order, before writing it, so the written topology is a
+    /// pure function of the key set and its vectors. This is what
+    /// [`VectorIndex::save`] does. The rebuild re-inserts every vector on one
+    /// core, so on a large index it costs tens of seconds.
+    #[default]
+    Canonical,
+    /// Write the live graph exactly as its incremental inserts and removals
+    /// left it, with no rebuild. Every vector is present and linked, so the
+    /// written index answers queries correctly, but its topology depends on
+    /// the order vectors arrived in. This is for checkpoints taken while an
+    /// index is still filling, which a canonical save follows once it is
+    /// complete. The live graph stays marked as changed, so that save still
+    /// rebuilds.
+    AsIs,
+}
+
+/// A copy of a [`VectorIndex`] taken for persistence by
+/// [`VectorIndex::persist_snapshot`], detached from the live graph so it can be
+/// canonicalized and written with no lock held.
+pub struct PersistSnapshot<Id: VectorId> {
+    state: PersistSnapshotState<Id>,
+}
+
+enum PersistSnapshotState<Id: VectorId> {
+    /// The live graph was already canonical; this is a plain clone of it.
+    Canonical(HnswGraph<Id>),
+    /// The live graph was not canonical: the inputs a rebuild needs, and the
+    /// mutation counter they were copied at.
+    NeedsRebuild {
+        inputs: CanonicalRebuildInputs<Id>,
+        seq: u64,
+    },
+    /// The live graph was not canonical and is written as it stands, by
+    /// [`PersistTopology::AsIs`]. Nothing is installed back.
+    AsIs(HnswGraph<Id>),
+}
+
+impl<Id: VectorId> PersistSnapshot<Id> {
+    /// Vectors the snapshot holds, which is exactly what a save of it writes.
+    pub fn len(&self) -> usize {
+        match &self.state {
+            PersistSnapshotState::Canonical(graph) | PersistSnapshotState::AsIs(graph) => {
+                graph.active_count()
+            }
+            PersistSnapshotState::NeedsRebuild { inputs, .. } => inputs.items.len(),
+        }
+    }
+
+    /// Whether the snapshot holds no vector.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Dimensionality of the snapshot's vectors.
+    pub fn dimensions(&self) -> usize {
+        match &self.state {
+            PersistSnapshotState::Canonical(graph) | PersistSnapshotState::AsIs(graph) => {
+                graph.dimensions
+            }
+            PersistSnapshotState::NeedsRebuild { inputs, .. } => inputs.dimensions,
+        }
+    }
+
+    /// Whether writing this snapshot runs a full canonical rebuild.
+    pub fn rebuilds(&self) -> bool {
+        matches!(self.state, PersistSnapshotState::NeedsRebuild { .. })
+    }
+
+    /// The graph this snapshot persists as, rebuilding it in canonical order
+    /// when it asks for that, with the mutation counter a rebuild may be
+    /// installed back at.
+    fn into_persisted_graph(self) -> Result<(HnswGraph<Id>, Option<u64>), VectorError> {
+        match self.state {
+            PersistSnapshotState::Canonical(graph) | PersistSnapshotState::AsIs(graph) => {
+                Ok((graph, None))
+            }
+            PersistSnapshotState::NeedsRebuild { inputs, seq } => {
+                Ok((HnswGraph::rebuild_canonical(inputs)?, Some(seq)))
+            }
+        }
+    }
+}
+
 /// Normalization factor for level generation: 1 / ln(M).
 fn ml() -> f64 {
     1.0 / (M as f64).ln()
@@ -3513,7 +3600,7 @@ fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), VectorError> {
             tmp_path.display()
         ))
     })?;
-    file.sync_all()
+    kin_blobs::durable::sync_all(&file)
         .map_err(|e| VectorError::IndexError(format!("fsync failed: {e}")))?;
 
     fs::rename(tmp_path, path).map_err(|e| {
@@ -3538,7 +3625,7 @@ fn write_bytes_with_fsync(path: &Path, bytes: &[u8]) -> Result<(), VectorError> 
             path.display()
         ))
     })?;
-    file.sync_all()
+    kin_blobs::durable::sync_all(&file)
         .map_err(|e| VectorError::IndexError(format!("fsync failed: {e}")))?;
     Ok(())
 }
@@ -3580,7 +3667,7 @@ fn sync_directory(path: &Path) -> Result<(), VectorError> {
             path.display()
         )));
     }
-    dir.sync_all().map_err(|e| {
+    kin_blobs::durable::sync_all(&dir).map_err(|e| {
         VectorError::IndexError(format!("failed to fsync directory {}: {e}", path.display()))
     })
 }
@@ -3996,15 +4083,64 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// Returns the copy and the mutation counter it was taken at, or `None` for
     /// that counter when the live graph was already canonical and the copy is a
     /// plain persistence clone with nothing to install back.
+    #[cfg(test)]
     fn canonical_persist_snapshot(&self) -> Result<(HnswGraph<Id>, Option<u64>), VectorError> {
-        let (inputs, snapshot_seq) = {
-            let graph = self.graph.read();
-            if !graph.canonical_order_dirty {
-                return Ok((graph.clone_for_persist(), None));
-            }
-            (graph.canonical_rebuild_inputs()?, graph.mutation_seq)
+        self.persist_snapshot()?.into_persisted_graph()
+    }
+
+    /// Copy what a save needs under the graph's READ lock and nothing more.
+    ///
+    /// This is the half of [`Self::save_with_options`] that has to be atomic
+    /// with respect to mutation. A caller that keeps its own record beside the
+    /// vectors (KinDB's producer set is one) takes this under the same guard it
+    /// mutates under, so the record and the copy describe one instant, and then
+    /// hands the copy to [`Self::write_persist_snapshot`] with that guard
+    /// released. The rebuild and the IO, which on a large index are tens of
+    /// seconds of one core, then block no writer at all.
+    pub fn persist_snapshot(&self) -> Result<PersistSnapshot<Id>, VectorError> {
+        self.persist_snapshot_with(PersistTopology::Canonical)
+    }
+
+    /// [`Self::persist_snapshot`] with the topology the save writes chosen by
+    /// the caller. [`PersistTopology::AsIs`] copies a changed graph as it
+    /// stands, so writing the copy costs an encode and no rebuild.
+    pub fn persist_snapshot_with(
+        &self,
+        topology: PersistTopology,
+    ) -> Result<PersistSnapshot<Id>, VectorError> {
+        let graph = self.graph.read();
+        let state = match (graph.canonical_order_dirty, topology) {
+            (false, _) => PersistSnapshotState::Canonical(graph.clone_for_persist()),
+            (true, PersistTopology::Canonical) => PersistSnapshotState::NeedsRebuild {
+                inputs: graph.canonical_rebuild_inputs()?,
+                seq: graph.mutation_seq,
+            },
+            (true, PersistTopology::AsIs) => PersistSnapshotState::AsIs(graph.clone_for_persist()),
         };
-        Ok((HnswGraph::rebuild_canonical(inputs)?, Some(snapshot_seq)))
+        Ok(PersistSnapshot { state })
+    }
+
+    /// Canonicalize, encode and atomically write a snapshot taken by
+    /// [`Self::persist_snapshot`], holding no lock except for the brief install
+    /// of a finished rebuild onto a live graph nothing has mutated since. A
+    /// snapshot taken with [`PersistTopology::AsIs`] is encoded as it was
+    /// copied.
+    pub fn write_persist_snapshot(
+        &self,
+        snapshot: PersistSnapshot<Id>,
+        path: &Path,
+        opts: KvecQuantizeOptions,
+    ) -> Result<(), VectorError> {
+        let (graph, snapshot_seq) = snapshot.into_persisted_graph()?;
+        let bytes = encode_v3_with(&graph, opts)?;
+        // Keep the canonical form so an index nobody has touched since does not
+        // re-canonicalize on its next save. Skipped when a mutation landed while
+        // the rebuild was running, which leaves the live graph dirty and the
+        // next save to redo it against the newer content.
+        if let Some(seq) = snapshot_seq {
+            self.install_canonical_rebuild(graph, seq);
+        }
+        atomic_save_bytes(path, &bytes, "vector index")
     }
 
     /// Install an off-lock rebuild onto the live graph, if and only if nothing
@@ -4410,16 +4546,8 @@ impl<Id: VectorId> VectorIndex<Id> {
         // serialize and fsync it with NO lock held, so the GPU-fed upsert path
         // is blocked by neither the HNSW rebuild nor the index IO. Concurrent
         // upserts after the snapshot simply land in the next save.
-        let (snapshot, snapshot_seq) = self.canonical_persist_snapshot()?;
-        let bytes = encode_v3_with(&snapshot, opts)?;
-        // Keep the canonical form so an index nobody has touched since does not
-        // re-canonicalize on its next save. Skipped when a mutation landed while
-        // the rebuild was running, which leaves the live graph dirty and the
-        // next save to redo it against the newer content.
-        if let Some(seq) = snapshot_seq {
-            self.install_canonical_rebuild(snapshot, seq);
-        }
-        atomic_save_bytes(path, &bytes, "vector index")
+        let snapshot = self.persist_snapshot()?;
+        self.write_persist_snapshot(snapshot, path, opts)
     }
 
     /// Load a previously saved HNSW index from disk (dimension check only).
@@ -4544,6 +4672,127 @@ mod tests {
             }
         }
         panic!("no key found for level >= {min_level}");
+    }
+
+    /// The two halves of a save can be taken apart by a caller that fences its
+    /// own writers only while copying: what is written is the copy, a write
+    /// that lands between the halves stays live and is not lost, and a rebuild
+    /// is not installed over it.
+    #[test]
+    fn a_persist_snapshot_writes_what_it_copied_and_keeps_later_writes_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.kvec");
+        let idx = VectorIndex::new(4).unwrap();
+        let copied = DefaultId::new();
+        let later = DefaultId::new();
+        idx.upsert(copied, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let snapshot = idx.persist_snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.dimensions(), 4);
+        idx.upsert(later, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        idx.write_persist_snapshot(snapshot, &path, KvecQuantizeOptions::default())
+            .unwrap();
+
+        let saved = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
+        assert_eq!(saved.len(), 1, "the file holds the copy");
+        assert!(saved.contains(&copied));
+        assert!(!saved.contains(&later));
+        assert_eq!(idx.len(), 2, "the later write is still live");
+        assert!(idx.contains(&later));
+        assert!(
+            idx.graph.read().canonical_order_dirty,
+            "a rebuild of the copy must not be installed over a newer write"
+        );
+    }
+
+    fn spread_vectors(count: u32) -> Vec<(DefaultId, Vec<f32>)> {
+        (0..count)
+            .map(|i| {
+                let f = i as f32;
+                (
+                    DefaultId(uuid::Uuid::from_u128(u128::from(i) * 7919 + 1)),
+                    vec![f.sin(), f.cos(), (i % 7) as f32 * 0.3, (i % 5) as f32 * 0.2],
+                )
+            })
+            .collect()
+    }
+
+    /// An as-is save of a changed graph writes it without a rebuild: every
+    /// vector is there, the reloaded file answers exactly as the live graph
+    /// did, and the live graph stays marked as changed so the next canonical
+    /// save still rebuilds.
+    #[test]
+    fn an_as_is_save_writes_the_live_graph_without_a_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("as-is.kvec");
+        let items = spread_vectors(300);
+        let idx = VectorIndex::new(4).unwrap();
+        for batch in items.chunks(50) {
+            idx.upsert_batch(batch.to_vec()).unwrap();
+        }
+        idx.remove(&items[3].0).unwrap();
+        assert!(idx.graph.read().canonical_order_dirty);
+
+        let snapshot = idx.persist_snapshot_with(PersistTopology::AsIs).unwrap();
+        assert!(!snapshot.rebuilds(), "an as-is snapshot never rebuilds");
+        assert_eq!(snapshot.len(), items.len() - 1);
+        idx.write_persist_snapshot(snapshot, &path, KvecQuantizeOptions::default())
+            .unwrap();
+        assert!(
+            idx.graph.read().canonical_order_dirty,
+            "the live graph is still owed its canonical rebuild"
+        );
+
+        let saved = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
+        assert_eq!(saved.len(), items.len() - 1);
+        assert!(!saved.contains(&items[3].0));
+        for (id, vector) in items.iter().skip(4) {
+            assert!(saved.contains(id));
+            assert_eq!(
+                saved.search_similar(vector, 10).unwrap(),
+                idx.search_similar(vector, 10).unwrap(),
+                "the written topology is the live one"
+            );
+        }
+
+        // Owed and still correct: a canonical save now rebuilds.
+        assert!(idx.persist_snapshot().unwrap().rebuilds());
+    }
+
+    /// As-is checkpoints taken while an index fills do not change what the
+    /// canonical save that completes it writes: the bytes equal those of an
+    /// index that was only ever saved canonically, built in another order.
+    #[test]
+    fn as_is_checkpoints_leave_the_completing_canonical_save_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("checkpoint.kvec");
+        let incremental_path = dir.path().join("incremental.kvec");
+        let canonical_path = dir.path().join("canonical.kvec");
+        let items = spread_vectors(240);
+
+        let incremental = VectorIndex::new(4).unwrap();
+        for batch in items.chunks(40) {
+            incremental.upsert_batch(batch.to_vec()).unwrap();
+            let snapshot = incremental
+                .persist_snapshot_with(PersistTopology::AsIs)
+                .unwrap();
+            incremental
+                .write_persist_snapshot(snapshot, &checkpoint, KvecQuantizeOptions::default())
+                .unwrap();
+        }
+        incremental.save(&incremental_path).unwrap();
+
+        let canonical = VectorIndex::new(4).unwrap();
+        for (id, vector) in items.iter().rev() {
+            canonical.upsert(*id, vector).unwrap();
+        }
+        canonical.save(&canonical_path).unwrap();
+
+        assert_eq!(
+            std::fs::read(&incremental_path).unwrap(),
+            std::fs::read(&canonical_path).unwrap()
+        );
     }
 
     #[test]
@@ -5468,7 +5717,8 @@ mod tests {
         // This is the exact legacy barrier: File::open creates a read-only
         // handle and does not request directory semantics. It cannot provide a
         // Windows namespace durability guarantee.
-        let legacy_barrier = File::open(dir.path()).and_then(|dir| dir.sync_all());
+        let legacy_barrier =
+            File::open(dir.path()).and_then(|dir| kin_blobs::durable::sync_all(&dir));
         assert!(
             legacy_barrier.is_err(),
             "the regression proof expects the legacy read-only directory barrier to fail"

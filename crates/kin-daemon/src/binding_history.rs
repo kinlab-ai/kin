@@ -322,6 +322,7 @@ pub(crate) fn capture_session_materialization(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta,
+        git_snapshot_proofs: Vec::new(),
     };
     let receipt = if capture.observed.verified_binding_history.is_some() {
         authority

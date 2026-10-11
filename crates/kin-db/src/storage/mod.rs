@@ -24,7 +24,7 @@ mod mmap;
 pub(crate) use local_journal::sync_parent_directory;
 #[cfg(feature = "vector")]
 pub(crate) use mmap::open_regular_nofollow;
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 pub(crate) use mmap::read_regular_bounded;
 pub mod repository;
 mod session_publication;
@@ -95,3 +95,29 @@ pub use snapshot::{SnapshotManager, VectorSidecarDisposition, VectorSidecarLoadO
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;
 pub use tiered::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
+
+/// Read exactly `len` bytes from `reader` into the empty `data`, whose capacity
+/// the caller has already reserved, without zero-filling it first.
+///
+/// Filling with `resize(len, 0)` and then `read_exact` wrote every byte twice,
+/// and in an unoptimized build the fill runs one element at a time: reading
+/// the source bodies of a 65 MiB store spent a quarter of its time zeroing
+/// buffers it was about to overwrite. `read_to_end` through a `take` reads
+/// straight into the reserved capacity and never grows it. A short read fails
+/// with the error `read_exact` gives.
+pub(crate) fn read_exact_into_reserved(
+    reader: &mut impl std::io::Read,
+    data: &mut Vec<u8>,
+    len: usize,
+) -> std::io::Result<()> {
+    use std::io::Read as _;
+    debug_assert!(data.is_empty(), "reads into an empty, reserved buffer");
+    let read = reader.take(len as u64).read_to_end(data)?;
+    if read != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ));
+    }
+    Ok(())
+}

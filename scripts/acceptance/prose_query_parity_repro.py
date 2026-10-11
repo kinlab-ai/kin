@@ -422,6 +422,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         # A CLI-autostarted daemon idles out after 60s by default. Without this,
         # the settle below would let the long-lived daemon exit and the first arm
         # would silently read a REPLACEMENT daemon, which is the one state where

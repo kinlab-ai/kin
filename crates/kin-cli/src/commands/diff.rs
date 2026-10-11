@@ -788,6 +788,11 @@ pub async fn run(
     let layout = crate::commands::require_repository_layout()?;
     let workspace_endpoint =
         endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref());
+    // A diff across commits reads history, and a partial store holds only the
+    // snapshot of its checked-out commit. Both renderings say so, and an
+    // endpoint that names a commit the store never admitted says why it is
+    // missing.
+    let partial = kin_core::history_state::standing(&layout).notice();
 
     // ADMIT FIRST, before anything reads, including before the daemon route
     // below. The order is the whole point and I got it wrong once: routing to the
@@ -875,6 +880,9 @@ pub async fn run(
                 println!("{line}");
             }
             println!("{}", admitted_scope_line(&layout));
+            if let Some(partial) = &partial {
+                println!("{}", partial.sentence);
+            }
             println!(
                 "{}",
                 crate::commands::repository_authority::answered_by_line(if content_rendered {
@@ -899,11 +907,21 @@ pub async fn run(
     let authority =
         crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)?;
     let (mut report, _) =
-        inspect_with_endpoint_entities_at(&authority, base.as_deref(), head.as_deref(), None)?;
+        inspect_with_endpoint_entities_at(&authority, base.as_deref(), head.as_deref(), None)
+            .map_err(|error| match &partial {
+                Some(partial) => error.context(partial.sentence.clone()),
+                None => error,
+            })?;
     report.artifact_content =
         collect_artifact_content(&authority, &report.artifact_deltas, full_bodies);
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            crate::commands::log::with_partial_history(
+                serde_json::to_string_pretty(&report)?,
+                partial.as_ref()
+            )?
+        );
     } else {
         let mut lines = render_lines(&report);
         // Under the heading and above every count, for the reason
@@ -935,6 +953,9 @@ pub async fn run(
             println!("{line}");
         }
         println!("{}", admitted_scope_line(&layout));
+        if let Some(partial) = &partial {
+            println!("{}", partial.sentence);
+        }
         println!(
             "{}",
             crate::commands::repository_authority::answered_by_line(

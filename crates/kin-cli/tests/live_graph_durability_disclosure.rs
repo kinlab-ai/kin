@@ -36,6 +36,10 @@ mod common;
 
 use common::Command;
 
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 /// Wall-clock bound for one four-frame stdio session against a live daemon.
 const SESSION_BOUND: Duration = Duration::from_secs(60);
 
@@ -155,7 +159,10 @@ impl IsolatedDaemon {
     fn spawn(repo: &Path, log: &Path, runtime: &common::IsolatedDaemonRuntime) -> Self {
         let sink = fs::File::create(log).expect("create the daemon log");
         let mut command = runtime.daemon_command();
+        let layout = runtime.layout_for(repo);
         let child = command
+            .arg("--store")
+            .arg(layout.root())
             .arg("--repo")
             .arg(repo)
             .arg("--port")
@@ -237,7 +244,10 @@ impl IsolatedDaemon {
         loop {
             let child = self.child.as_mut().expect("daemon child exists");
             if let Some(status) = child.try_wait().expect("inspect daemon child") {
-                panic!("isolated daemon exited before readiness: {status}");
+                panic!(
+                    "isolated daemon exited before readiness: {status}; log:\n{}",
+                    self.log_text()
+                );
             }
             if let Some(port) = fs::read_to_string(kin_root.join("daemon.port"))
                 .ok()
@@ -319,23 +329,29 @@ const UNCOMMITTED_PATH: &str = "src/link_graph.rs";
 const UNCOMMITTED_SOURCE: &[u8] =
     b"pub fn build_link_graph() -> u32 {\n    3\n}\n\npub fn walk_link_graph() -> u32 {\n    build_link_graph() + 1\n}\n\npub fn render_link_graph() -> u32 {\n    walk_link_graph() + 1\n}\n";
 
-fn kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn kin(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env_remove("KIN_DAEMON_URL")
         .current_dir(repo)
         .output()
         .expect("run kin")
 }
 
-fn kin_against_daemon(repo: &Path, home: &Path, port: u16, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn kin_against_daemon(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    port: u16,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(args)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
+        .fixture_daemon_url(format!("http://127.0.0.1:{port}"))
         .current_dir(repo)
         .output()
         .expect("run kin against the isolated daemon")
@@ -372,18 +388,29 @@ fn session_frames() -> String {
 
 /// Drive the real stdio MCP binary against the running daemon and return the
 /// parsed payload of each `tools/call` response, keyed by request id.
-fn run_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_json::Value)> {
+fn run_mcp_session(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    port: u16,
+) -> Vec<(u64, serde_json::Value)> {
     let started = Instant::now();
+    // The stdio client uses a private home and the daemon runtime's registry.
+    // Its central store must resolve exactly as the initialization did.
+    let home = tempdir().expect("private MCP client home");
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["mcp", "start"])
         .current_dir(repo)
         .env_clear()
+        // After `env_clear`, which removes everything set before it. The codes
+        // this test reads are served on an agent profile only as machine
+        // replies.
+        .env("KIN_MCP_MACHINE_REPLIES", "1")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", home)
-        .env("USERPROFILE", home)
+        .env("HOME", home.path())
+        .env("KIN_REGISTRY_PATH", runtime.registry_path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", std::env::temp_dir())
         .env("KIN_VFS_DISABLE", "1")
-        .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
         .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -478,8 +505,12 @@ fn payload(session: &[(u64, serde_json::Value)], id: u64, what: &str) -> serde_j
 /// gap the poll below exists to cross, so a reading taken inside it is "not
 /// yet" rather than a failure. Its text still reaches the caller, which is what
 /// reports it when the bound expires.
-fn live_entity_count(repo: &Path, home: &Path, port: u16) -> (Option<u64>, std::process::Output) {
-    let output = kin_against_daemon(repo, home, port, &["graph", "status"]);
+fn live_entity_count(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    port: u16,
+) -> (Option<u64>, std::process::Output) {
+    let output = kin_against_daemon(repo, runtime, port, &["graph", "status"]);
     if !output.status.success() {
         return (None, output);
     }
@@ -521,7 +552,7 @@ fn live_entity_count(repo: &Path, home: &Path, port: u16) -> (Option<u64>, std::
 fn wait_for_live_growth(
     daemon: &IsolatedDaemon,
     repo: &Path,
-    home: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
     port: u16,
     above: u64,
     since: u64,
@@ -539,7 +570,7 @@ fn wait_for_live_growth(
     // to hide a missing admission is the bug this test kept reporting.
     let deadline = Instant::now() + COUNT_SETTLE_BOUND;
     loop {
-        let (live, status) = live_entity_count(repo, home, port);
+        let (live, status) = live_entity_count(repo, runtime, port);
         if live.is_some_and(|live| live > above) {
             return live.expect("the reading above carried a count");
         }
@@ -567,10 +598,10 @@ fn wait_for_live_growth(
 /// two halves sees a derived tree that trails authority. A caller that wants a
 /// number rather than an event waits for one, and reports the command's own
 /// output when the bound expires instead of a bare `None`.
-fn settled_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
+fn settled_entity_count(repo: &Path, runtime: &common::IsolatedDaemonRuntime, port: u16) -> u64 {
     let deadline = Instant::now() + COUNT_SETTLE_BOUND;
     loop {
-        let (live, status) = live_entity_count(repo, home, port);
+        let (live, status) = live_entity_count(repo, runtime, port);
         if let Some(live) = live {
             return live;
         }
@@ -633,7 +664,7 @@ fn sample_is_live(status: &serde_json::Value) -> bool {
 /// samples under, and every reading was the one settled before the fetch began.
 fn wait_for_a_fresh_recorded_sample(
     repo: &Path,
-    home: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
     port: u16,
 ) -> Vec<(u64, serde_json::Value)> {
     let started = Instant::now();
@@ -643,7 +674,7 @@ fn wait_for_a_fresh_recorded_sample(
     let mut live_but_unlevelled: Option<serde_json::Value> = None;
     let mut last_replay = serde_json::Value::Null;
     loop {
-        let session = settled_mcp_session(repo, home, port);
+        let session = settled_mcp_session(repo, runtime, port);
         let status = payload(&session, 2, "kin_graph_status");
         reads += 1;
         if sample_is_live(&status) {
@@ -743,12 +774,16 @@ fn asks_for_retry(payload: &serde_json::Value) -> bool {
 /// tool asked for. The bound is what keeps this a discriminator rather than a
 /// mask: a daemon that never yields the lock still fails, naming how many times
 /// it refused.
-fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_json::Value)> {
+fn settled_mcp_session(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    port: u16,
+) -> Vec<(u64, serde_json::Value)> {
     let started = Instant::now();
     let mut deadline = started + retry_bound();
     let mut refusals = 0_u32;
     loop {
-        let session = run_mcp_session(repo, home, port);
+        let session = run_mcp_session(repo, runtime, port);
         let status = payload(&session, 2, "kin_graph_status");
         if !asks_for_retry(&status) {
             return session;
@@ -784,14 +819,14 @@ fn settled_mcp_session(repo: &Path, home: &Path, port: u16) -> Vec<(u64, serde_j
 /// a live sample that disagrees with the fixture still fails there.
 fn wait_for_a_live_uncommitted_sample(
     repo: &Path,
-    home: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
     port: u16,
 ) -> Vec<(u64, serde_json::Value)> {
     let started = Instant::now();
     let mut deadline = started + retry_bound();
     let mut replays = 0_u32;
     loop {
-        let session = settled_mcp_session(repo, home, port);
+        let session = settled_mcp_session(repo, runtime, port);
         let status = payload(&session, 2, "kin_graph_status");
         if sample_is_live(&status) {
             return session;
@@ -824,6 +859,55 @@ fn behind(payload: &serde_json::Value) -> Option<serde_json::Value> {
     payload.get("_kin")?.get("behind").cloned()
 }
 
+/// Return only once a newly registered watch on `repo` is no longer handed the
+/// writes made there so far.
+///
+/// macOS FSEvents can hand a stream created "since now" writes that finished
+/// before the stream existed, and on a loaded host it does so for seconds
+/// afterwards. Under a loaded full suite the daemon started next reconciled
+/// every file under `src/`, the stale control included, eighty milliseconds
+/// after it registered its watch and before its catch-up planned anything: the
+/// writes arrived as edits it had watched happen, and nothing was left behind
+/// to disclose. A probe round trip does not rule that out, because the replayed
+/// writes arrived after one had completed. So this asks the question the next
+/// daemon would answer: register a watch, let its readiness probe prove
+/// delivery, and see whether it was handed anything from the working copy.
+/// inotify never hands a watch anything older than itself, so on Linux the
+/// first watch comes back empty.
+/// How long a fence watch must stay empty after proving delivery.
+const FENCE_QUIET: Duration = Duration::from_secs(1);
+
+fn fence_file_events(repo: &Path) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a runtime for the file-event fence");
+    runtime.block_on(async {
+        let deadline = Instant::now() + WATCHER_BOUND;
+        loop {
+            let watcher = kin_index::FileWatcher::new_ready(&worktree(repo), WATCHER_BOUND)
+                .await
+                .expect("a watch on the repository proves delivery");
+            // A replay can trail the readiness probe: one reached a daemon
+            // 630 ms after its watch proved delivery. A watch counts as clean
+            // only after a full second of nothing.
+            tokio::time::sleep(FENCE_QUIET).await;
+            let replayed = watcher.drain();
+            drop(watcher);
+            if replayed.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a new watch on {} was still handed writes made before it existed after \
+                 {WATCHER_BOUND:?}: {replayed:?}",
+                repo.display()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+}
+
 /// Set a host entry's modification time outright.
 ///
 /// Both stamps are written because setting only one is refused on some hosts,
@@ -850,9 +934,7 @@ fn stamp_modified(path: &Path, at: std::time::SystemTime) {
 #[test]
 fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit_records_them() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     // Canonicalized before anything binds it. On macOS a temporary directory
     // is reached through `/var`, which is a symlink to `/private/var`, and the
@@ -861,10 +943,11 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     // watcher events, and ambient admission silently takes nothing: the
     // fixture would sit at the committed entity count with no error anywhere.
     let repo = repo.canonicalize().expect("resolve the repository path");
-    let home = home.canonicalize().expect("resolve the home path");
     seed_repository(&repo);
+    // Initialization and the held daemon share the same store registry.
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
 
-    let init = kin(&repo, &home, &["init", ".", "--json"]);
+    let init = kin(&repo, &runtime, &["init", ".", "--json"]);
     let init_payload: serde_json::Value =
         serde_json::from_slice(&stdout_of(&init, "kin init").into_bytes())
             .expect("init emits JSON");
@@ -877,13 +960,12 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
          {durable_at_init}: {init_payload}"
     );
 
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     // Kept beside the repository rather than inside it: the fixture reads this
     // file while the daemon is watching, and a log under the working copy would
     // be a source of the very events under test.
     let daemon_log = root.path().join("kin-daemon.log");
     let mut daemon = IsolatedDaemon::spawn(&repo, &daemon_log, &runtime);
-    let port = daemon.wait_until_serving(&repo.join(".kin"));
+    let port = daemon.wait_until_serving(runtime.layout().root());
     // Serving is not watching, and the write below is the one the watcher has
     // to see. Nothing replays an event raised before the watch existed.
     daemon.wait_until_watching();
@@ -893,9 +975,16 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     // filesystem, exactly as an agent's `write_file` tool does.
     fs::write(repo.join(UNCOMMITTED_PATH), UNCOMMITTED_SOURCE)
         .expect("write the uncommitted source");
-    let live = wait_for_live_growth(&daemon, &repo, &home, port, durable_at_init, before_write);
+    let live = wait_for_live_growth(
+        &daemon,
+        &repo,
+        &runtime,
+        port,
+        durable_at_init,
+        before_write,
+    );
 
-    let uncommitted = wait_for_a_live_uncommitted_sample(&repo, &home, port);
+    let uncommitted = wait_for_a_live_uncommitted_sample(&repo, &runtime, port);
     let status = payload(&uncommitted, 2, "kin_graph_status");
     let locate = payload(&uncommitted, 3, "semantic_locate");
 
@@ -954,7 +1043,7 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
     // disclosure, and the commit is what the agent should have run.
     let commit = kin_against_daemon(
         &repo,
-        &home,
+        &runtime,
         port,
         &["commit", "-m", "record the link graph"],
     );
@@ -962,7 +1051,7 @@ fn mcp_status_and_locate_disclose_live_only_entities_and_then_stop_once_a_commit
 
     // Read the commit's effect from a live sample, not from whatever the settle
     // was willing to answer with. Every assertion below is unchanged.
-    let recorded = wait_for_a_fresh_recorded_sample(&repo, &home, port);
+    let recorded = wait_for_a_fresh_recorded_sample(&repo, &runtime, port);
     let status_after = payload(&recorded, 2, "kin_graph_status");
     assert!(
         sample_is_live(&status_after),
@@ -1113,19 +1202,17 @@ fn a_settle_that_begins_quiet_and_turns_busy_gets_the_busy_budget() {
 #[test]
 fn the_reconciliation_watch_is_armed_before_the_endpoint_is_published() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     let repo = repo.canonicalize().expect("resolve the repository path");
-    let home = home.canonicalize().expect("resolve the home path");
     seed_repository(&repo);
-    stdout_of(&kin(&repo, &home, &["init", "."]), "kin init");
-
+    // Initialization and the held daemon share the same store registry.
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    stdout_of(&kin(&repo, &runtime, &["init", "."]), "kin init");
+
     let daemon_log = root.path().join("kin-daemon.log");
     let mut daemon = IsolatedDaemon::spawn(&repo, &daemon_log, &runtime);
-    daemon.wait_until_serving(&repo.join(".kin"));
+    daemon.wait_until_serving(runtime.layout().root());
     // Both records have to be present before their positions mean anything.
     // The port file appears a moment before the line that reports it, so the
     // wait above proves the publication happened and this proves it was logged.
@@ -1171,14 +1258,13 @@ fn the_reconciliation_watch_is_armed_before_the_endpoint_is_published() {
 #[test]
 fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let repo = root.path().join("repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     let repo = repo.canonicalize().expect("resolve the repository path");
-    let home = home.canonicalize().expect("resolve the home path");
     seed_repository(&repo);
-    let init = kin(&repo, &home, &["init", ".", "--json"]);
+    // Initialization and the held daemon share the same store registry.
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let init = kin(&repo, &runtime, &["init", ".", "--json"]);
     let init_payload: serde_json::Value =
         serde_json::from_slice(&stdout_of(&init, "kin init").into_bytes())
             .expect("init emits JSON");
@@ -1186,10 +1272,9 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         .as_u64()
         .expect("init reports a durable entity count");
 
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let first_log = root.path().join("kin-daemon-first.log");
     let mut first = IsolatedDaemon::spawn(&repo, &first_log, &runtime);
-    let first_port = first.wait_until_serving(&repo.join(".kin"));
+    let first_port = first.wait_until_serving(runtime.layout().root());
     first.wait_until_watching();
 
     // One ordinary watched write, so this store records a complete admission
@@ -1200,7 +1285,7 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     wait_for_live_growth(
         &first,
         &repo,
-        &home,
+        &runtime,
         first_port,
         durable_at_init,
         before_write,
@@ -1213,10 +1298,10 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     // three entities each and the count came back unchanged over a catch-up
     // that had plainly worked.
     stdout_of(
-        &kin_against_daemon(&repo, &home, first_port, &["commit", "-m", "link graph"]),
+        &kin_against_daemon(&repo, &runtime, first_port, &["commit", "-m", "link graph"]),
         "kin commit",
     );
-    let watched = settled_entity_count(&repo, &home, first_port);
+    let watched = settled_entity_count(&repo, &runtime, first_port);
     assert!(
         watched > durable_at_init,
         "the fixture needs the watched write recorded before the restart, got {watched} against \
@@ -1245,10 +1330,14 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
         &stale,
         std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000),
     );
+    // Both writes happened while nothing watched, and they have to stay that way
+    // for the daemon started next, or the watcher admits the stale control as an
+    // observed edit and there is nothing left behind to disclose.
+    fence_file_events(&repo);
 
     let second_log = root.path().join("kin-daemon-second.log");
     let mut second = IsolatedDaemon::spawn(&repo, &second_log, &runtime);
-    let second_port = second.wait_until_serving(&repo.join(".kin"));
+    let second_port = second.wait_until_serving(runtime.layout().root());
     second.wait_for_record(
         CATCH_UP_RECORD,
         0,
@@ -1276,7 +1365,7 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     // entities is an enrichment defect.
     let deadline = Instant::now() + COUNT_SETTLE_BOUND;
     let caught_up = loop {
-        let (live, status) = live_entity_count(&repo, &home, second_port);
+        let (live, status) = live_entity_count(&repo, &runtime, second_port);
         if live.is_some_and(|live| live > watched) {
             break live.expect("the reading above carried a count");
         }
@@ -1296,19 +1385,42 @@ fn a_file_written_while_no_daemon_watched_is_admitted_by_the_next_one() {
     // FIR-2499's other half, read off the real MCP surface rather than a
     // hand-built health body. The store still holds one path no admission has
     // taken, so every envelope has to say so and none may certify over it.
-    let session = settled_mcp_session(&repo, &home, second_port);
+    let session = settled_mcp_session(&repo, &runtime, second_port);
     let locate = payload(&session, 3, "semantic_locate");
-    let behind = behind(&locate)
-        .unwrap_or_else(|| panic!("a store holding an unadmitted path must disclose it: {locate}"));
-    assert_eq!(
-        behind["unadmitted_paths"],
-        serde_json::json!(1),
-        "exactly the stale file is outstanding; the catch-up took the other one: {behind}"
-    );
+    let behind = behind(&locate).unwrap_or_else(|| {
+        panic!(
+            "a store holding an unadmitted path must disclose it: {locate}\nThe second daemon's \
+             log:\n{}",
+            second.log_text()
+        )
+    });
+    // Which paths are outstanding, and how many, is host inventory. The
+    // semantic surface withholds it from every envelope, and the operator's
+    // `kin graph status` names it, so that is where the bound is read.
+    let (_, status) = live_entity_count(&repo, &runtime, second_port);
+    let status = String::from_utf8_lossy(&status.stdout);
     assert!(
-        behind.get("note").is_none() && behind["measured"].is_boolean(),
-        "the disclosure is the count and whether a walk measured it; what it means for an \
-         answer is written once, in docs/mcp-tools.md: {behind}"
+        status.contains("1 host path(s) observed but not tracked: src/stale_drift.rs."),
+        "exactly the stale file is outstanding; the catch-up took the other one:\n{status}"
+    );
+    for inventory in [
+        "unadmitted_paths",
+        "sample",
+        "underived_paths",
+        "underived_sample",
+        "changed_paths",
+        "changed_sample",
+    ] {
+        assert!(
+            behind.get(inventory).is_none(),
+            "the envelope says the store is behind without publishing host inventory \
+             ({inventory}): {behind}"
+        );
+    }
+    assert!(
+        behind.get("note").is_none() && behind["measured"] == serde_json::json!(true),
+        "the disclosure is that the store is behind and that a walk measured it; what it \
+         means for an answer is written once, in docs/mcp-tools.md: {behind}"
     );
     let durability = durability(&locate);
     assert_ne!(

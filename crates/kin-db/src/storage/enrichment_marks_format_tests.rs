@@ -285,3 +285,56 @@ fn enrichment_proof_marks_reopen_without_promoting_legacy_and_retire_changed_con
         "reopen cannot restore obsolete completion"
     );
 }
+
+/// A current-looking digest cannot relabel a mark from the older observation
+/// formula. Storage and reopen both retain the version boundary.
+#[test]
+fn owner_scoped_marks_refuse_old_or_unknown_versions_even_with_a_matching_digest() {
+    let directory = TempDir::new().unwrap();
+    let (backend, manager) = framed_local_repository(&directory);
+    let mut mark = holding_enrichment_mark(&manager);
+    let lease = manager.read_authority();
+    let workspace = &lease.metadata().workspaces[0];
+    let graph = lease
+        .workspace_graph_snapshot(&workspace.workspace_id)
+        .unwrap()
+        .unwrap();
+    mark.relations = kin_model::enrichment_proof_inputs_by_file(
+        [mark.path.as_str()],
+        graph.entities.values(),
+        graph.relations.values(),
+        graph.resolution_records.values(),
+    )
+    .unwrap()[&mark.path];
+    drop(lease);
+    for (offset, version) in [9, kin_model::ENRICHMENT_PROOF_MARK_VERSION + 1]
+        .into_iter()
+        .enumerate()
+    {
+        mark.version = version;
+        manager
+            .commit_repository_transaction(enrichment_marks_transaction(
+                &manager,
+                0x0e3c_0001 + offset as u128,
+                kin_model::EnrichmentMarksDelta {
+                    retire_all: false,
+                    marks: vec![mark.clone()],
+                },
+            ))
+            .unwrap();
+        assert!(
+            manager.read_authority().metadata().workspaces[0]
+                .enrichment_marks
+                .is_empty(),
+            "matching new inputs do not promote proof version {version}"
+        );
+    }
+    drop(manager);
+    let reopened = RepositoryAuthorityManager::open(repository_id(), backend).unwrap();
+    assert!(
+        reopened.read_authority().metadata().workspaces[0]
+            .enrichment_marks
+            .is_empty(),
+        "an open cannot restore a rejected proof version"
+    );
+}

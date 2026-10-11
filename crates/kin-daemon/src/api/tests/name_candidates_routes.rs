@@ -262,3 +262,131 @@ async fn daemon_routes_answer_a_name_the_way_every_surface_does() {
         "{references}"
     );
 }
+
+const SCHEDULER_SOURCE: &str =
+    "def advance_timers():\n    return 1\n\n\ndef handle_timeout():\n    return advance_timers()\n";
+const SCHEDULER_MOCK_SOURCE: &str =
+    "def advance_timers():\n    return 2\n\n\ndef mock_tick():\n    return advance_timers()\n";
+
+/// A whole name two modules define, `advance_timers` in the scheduler and in
+/// its mock, is answered by every daemon route the way a member name two
+/// owners share is: the walks and the pack refuse it with both candidates and
+/// the module-qualified name that pins each, `find_references` sections both,
+/// and the qualified name pasted back walks the one it names and reports how
+/// it resolved.
+#[tokio::test]
+async fn daemon_routes_answer_a_whole_name_two_modules_define_for_each_of_them() {
+    let (_dir, state) = mcp_lifecycle_fixture();
+    for (target, body) in [
+        ("src/scheduler.py", SCHEDULER_SOURCE),
+        ("src/scheduler_mock.py", SCHEDULER_MOCK_SOURCE),
+    ] {
+        source_tree_conversion_fixture(
+            &state,
+            serde_json::json!({
+                "verb": "create",
+                "target": target,
+                "body": body,
+                "description": "same-name fixture",
+            }),
+        )
+        .await;
+    }
+    let qualified = |payload: &serde_json::Value| {
+        let mut names: Vec<String> = payload["candidates"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no candidates: {payload}"))
+            .iter()
+            .map(|row| row["qualified_name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    let expected = vec![
+        "scheduler.advance_timers".to_string(),
+        "scheduler_mock.advance_timers".to_string(),
+    ];
+
+    let flow = name_candidates_call(
+        &state,
+        "trace_data_flow",
+        serde_json::json!({ "focal": "advance_timers", "direction": "callers", "include_body": false }),
+    )
+    .await;
+    assert_eq!(flow["ambiguous_focal"], true, "{flow}");
+    assert_eq!(flow["resolution"], "same_name", "{flow}");
+    assert_eq!(qualified(&flow), expected, "{flow}");
+
+    let pinned = name_candidates_call(
+        &state,
+        "trace_data_flow",
+        serde_json::json!({
+            "focal": "scheduler.advance_timers",
+            "direction": "callers",
+            "include_body": false,
+        }),
+    )
+    .await;
+    let scheduler = waiting_entity(&state, "src/scheduler.py", "advance_timers");
+    assert_eq!(
+        pinned["focal_entity"]["entity_id"],
+        scheduler.id.to_string(),
+        "{pinned}"
+    );
+    assert_eq!(
+        pinned["focal_entity"]["entity_name"], "advance_timers",
+        "{pinned}"
+    );
+    assert!(pinned.get("focal_file").is_none(), "{pinned}");
+    assert_eq!(
+        pinned["focal_resolution"]["matched"], "qualified_name",
+        "{pinned}"
+    );
+    let chain = pinned["chain"].to_string();
+    assert!(
+        chain.contains("handle_timeout") && !chain.contains("mock_tick"),
+        "{chain}"
+    );
+    let factor = pinned["_kin"]["verdict"]["limiting_factor"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!factor.contains("focal_resolution"), "{factor}");
+
+    let pack = name_candidates_call(
+        &state,
+        "get_context_pack",
+        serde_json::json!({ "entities": ["advance_timers"] }),
+    )
+    .await;
+    assert_eq!(pack["ambiguous_focal"], true, "{pack}");
+    assert_eq!(pack["resolution"], "same_name", "{pack}");
+    assert_eq!(qualified(&pack), expected, "{pack}");
+
+    let path = name_candidates_call(
+        &state,
+        "trace_path",
+        serde_json::json!({ "from": "handle_timeout", "to": "advance_timers" }),
+    )
+    .await;
+    assert_eq!(path["ambiguous_focal"], true, "{path}");
+    assert_eq!(path["end"], "to", "{path}");
+
+    let references = name_candidates_call(
+        &state,
+        "find_references",
+        serde_json::json!({ "query": "advance_timers" }),
+    )
+    .await;
+    let sections = references["candidates_by_owner"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sectioned: {references}"));
+    assert_eq!(sections.len(), 2, "{references}");
+    for section in sections {
+        assert!(section["qualified_name"].is_string(), "{section}");
+        assert!(section["_kin"]["verdict"]["state"].is_string(), "{section}");
+    }
+    assert_eq!(
+        references["focal_resolution"]["sectioned"], 2,
+        "{references}"
+    );
+}

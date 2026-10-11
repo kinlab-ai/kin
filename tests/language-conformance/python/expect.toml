@@ -1,0 +1,187 @@
+# Language conformance fixture: Python. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "python"
+
+[sources]
+module = "shop/ledger.py"
+helper = "shop/helper.py"
+test = "tests/test_ledger.py"
+forms = "shop/forms.py"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "pass"
+expect = [
+  "Function clamp",
+  "Function total",
+  "Class Account",
+  "Method Account.__init__",
+  "Method Account.deposit",
+  "Method Account.validate",
+  "shop/helper.py: Function scale",
+]
+
+[module_name]
+status = "pass"
+name = "ledger"
+
+[module_contains]
+status = "pass"
+top_level = ["clamp", "total", "Account"]
+
+[declaration_extent]
+status = "pass"
+starts = { clamp = "@functools.cache", total = "def total(", Account = "class Account:" }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "pass"
+enclosing = "total"
+name = "double"
+
+[call_same_file]
+status = "pass"
+from = "total"
+to = "clamp"
+
+[call_receiver]
+status = "pass"
+from = "Account.deposit"
+to = "Account.validate"
+
+[imports]
+status = "pass"
+module_path = "shop.helper"
+names = ["scale"]
+
+[tests_detected]
+status = "pass"
+name = "test_total"
+runner = "pytest"
+
+[refuse_unparseable]
+status = "partial"
+note = "An unclosed parenthesis is reported on the line after it, where the grammar gives up."
+gaps = ["line"]
+find = "def clamp(value):"
+replace = "def clamp(value:"
+line = 7
+
+[placement_three_forms]
+status = "pass"
+entity = "Account.validate"
+
+[create_remove_spacing]
+status = "pass"
+anchor = "clamp"
+code = '''
+def clamp_all(values):
+    return [clamp(value) for value in values]'''
+entity = "clamp_all"
+documented = "total"
+doc = '"""Sum the values'
+
+[form_generator]
+status = "pass"
+expect = ["Function count_up"]
+
+[form_async]
+status = "pass"
+expect = ["Function fetch"]
+
+[form_bound_lambda]
+status = "fail"
+gaps = ["Function square", "square"]
+expect = ["Function square"]
+
+[form_default_export]
+status = "n/a"
+reason = "Python has no default export."
+
+[form_overload]
+status = "pass"
+expect = ["Function parse"]
+
+[form_nested_type]
+status = "fail"
+note = "Admitted as `Inner` and `Inner.ping`, without the enclosing class."
+gaps = ["Class Outer.Inner", "Method Outer.Inner.ping", "Outer.Inner", "Outer.Inner.ping"]
+expect = ["Class Outer.Inner", "Method Outer.Inner.ping"]
+
+[form_decorated]
+status = "pass"
+expect = ["Class Point", "Method Point.norm"]
+
+[form_field]
+status = "pass"
+expect = ["Field Point.x", "Field Point.y"]
+
+[body_edit_keeps_entities]
+status = "pass"
+entity = "total"
+find = "    result = 0\n"
+replace = "    result = 0\n    totals = Totals()\n    totals.count = len(values)\n"
+
+[route_source]
+status = "pass"
+entity = "total"
+starts = "def total("
+
+[route_locate]
+status = "pass"
+query = "total"
+entity = "total"
+
+[route_refs]
+status = "pass"
+entity = "clamp"
+caller = "total"
+
+[route_impact]
+status = "pass"
+in = "helper"
+entity = "scale"
+affected = "total"
+
+[route_context]
+status = "pass"
+entity = "Account"
+mentions = ["Account.deposit", "Account.validate"]
+
+[route_update]
+status = "pass"
+entity = "clamp"
+find = "0"
+replace = "1"
+
+[route_patch]
+status = "pass"
+entity = "Account.validate"
+old_text = "> 0"
+new_text = ">= 0"
+
+[route_body_edit]
+status = "pass"
+entity = "total"
+find = "    result = 0\n"
+replace = "    result = 0\n    totals = Totals()\n    totals.count = len(values)\n"
+
+[route_create_sibling]
+status = "pass"
+anchor = "clamp"
+code = "def clamp_all(values):\n    return [clamp(value) for value in values]"
+entity = "clamp_all"
+
+[route_remove]
+status = "pass"
+entity = "clamp"
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

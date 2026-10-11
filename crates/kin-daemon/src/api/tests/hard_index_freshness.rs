@@ -197,9 +197,11 @@ async fn hard_index_failure_for_new_empty_source_remains_incomplete_until_repair
         "unproven"
     );
     let raw = mcp_call(app.clone(), "kin_graph_status", json!({})).await;
+    let raw = tool_result_payload(&raw);
+    assert!(raw.get("source_derivation").is_none());
     assert_eq!(
-        tool_result_payload(&raw)["source_derivation"]["report"]["body_binding"],
-        "unproven"
+        raw["binding_coverage"]["scope"],
+        "live_head"
     );
     let layout = state.layout.clone();
     drop(app);
@@ -222,9 +224,11 @@ async fn hard_index_failure_for_new_empty_source_remains_incomplete_until_repair
         "unproven"
     );
     let raw = mcp_call(app.clone(), "kin_graph_status", json!({})).await;
+    let raw = tool_result_payload(&raw);
+    assert!(raw.get("source_derivation").is_none());
     assert_eq!(
-        tool_result_payload(&raw)["source_derivation"]["report"]["body_binding"],
-        "unproven"
+        raw["binding_coverage"]["scope"],
+        "live_head"
     );
     let (_, admission) = admit_through_api(&app).await;
     assert_eq!(admission["report"]["admitted"], true, "{admission}");
@@ -238,9 +242,11 @@ async fn hard_index_failure_for_new_empty_source_remains_incomplete_until_repair
         "current"
     );
     let raw = mcp_call(app.clone(), "kin_graph_status", json!({})).await;
+    let raw = tool_result_payload(&raw);
+    assert!(raw.get("source_derivation").is_none());
     assert_eq!(
-        tool_result_payload(&raw)["source_derivation"]["report"]["body_binding"],
-        "current"
+        raw["binding_coverage"]["scope"],
+        "live_head"
     );
     commit_through_api(
         &app,
@@ -265,6 +271,7 @@ async fn hard_index_failure_for_new_empty_source_remains_incomplete_until_repair
 async fn readmission_disclosure_causal_routes() {
     async fn observe(
         app: &axum::Router,
+        state: &Arc<DaemonState>,
         phase: &str,
         target: kin_model::EntityId,
     ) -> serde_json::Value {
@@ -308,7 +315,9 @@ async fn readmission_disclosure_causal_routes() {
                 json!({"raw":raw,"stdio_finalization":finalized}),
             );
         }
-        let observation = json!({"phase":phase,"health":health,"calls":calls});
+        let private = observe_live_head_sources(state, &state.graph, None);
+        let observation = json!({"phase":phase,"health":health,"calls":calls,
+            "private_source_derivation":private});
         println!("readmission-disclosure-observation: {observation}");
         observation
     }
@@ -333,13 +342,13 @@ async fn readmission_disclosure_causal_routes() {
         .find(|e| e.name == "target")
         .unwrap()
         .id;
-    let before = observe(&app, "before", target).await;
+    let before = observe(&app, &state, "before", target).await;
     let current = b"def target(value):\n    return value\n\ndef caller():\n    return target(value=1)\n\ndef newly_added():\n    return 2\n";
     std::fs::write(repo.path().join("calls.py"), current).unwrap();
     *state.readmission_index_failure.lock().unwrap() = Some(kin_model::FilePathId::new("calls.py"));
     let (_, admission) = admit_through_api(&app).await;
     assert_eq!(admission["report"]["admitted"], false, "{admission}");
-    let failed = observe(&app, "failed", target).await;
+    let failed = observe(&app, &state, "failed", target).await;
     assert!(
         failed["health"]["reconcile"]["admission_failure_streak"]
             .as_u64()
@@ -373,17 +382,15 @@ async fn readmission_disclosure_causal_routes() {
         let raw = mcp_call_as(app.clone(), tool, args, session).await;
         let raw_value = tool_result_payload(&raw);
         assert_eq!(
-            raw_value["source_derivation"]["scope"], "selected_historical",
+            raw_value["binding_coverage"]["scope"], "selected_historical",
             "{raw_value}"
         );
-        assert!(raw_value["source_derivation"].get("report").is_none());
-        assert!(raw_value["source_derivation"]
+        assert!(raw_value.get("source_derivation").is_none());
+        assert!(raw_value["binding_coverage"].get("report").is_none());
+        assert!(raw_value["binding_coverage"]
             .get("admission_failure")
             .is_none());
-        if tool == "kin_graph_status" {
-            let _: kin_mcp::handlers::entities::GraphStatusReport =
-                serde_json::from_value(raw_value).unwrap();
-        } else {
+        if tool != "kin_graph_status" {
             let finalized = kin_mcp::envelope::finalize(
                 raw,
                 kin_mcp::Envelope::daemon().with_health(&failed["health"]),
@@ -405,18 +412,18 @@ async fn readmission_disclosure_causal_routes() {
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let app = router(Arc::clone(&state));
-    let cold = observe(&app, "cold_without_retry", target).await;
+    let cold = observe(&app, &state, "cold_without_retry", target).await;
     assert_eq!(cold["health"]["reconcile"]["admission_failure_streak"], 0);
     let (_, admission) = admit_through_api(&app).await;
     assert_eq!(admission["report"]["admitted"], true, "{admission}");
-    let rederived = observe(&app, "rederived_before_commit", target).await;
+    let rederived = observe(&app, &state, "rederived_before_commit", target).await;
     commit_through_api(
         &app,
         kin_model::OperationId::new(),
         "repair disclosure graph",
     )
     .await;
-    let repaired = observe(&app, "repaired", target).await;
+    let repaired = observe(&app, &state, "repaired", target).await;
     assert_eq!(
         repaired["health"]["reconcile"]["admission_failure_streak"],
         0
@@ -428,20 +435,18 @@ async fn readmission_disclosure_causal_routes() {
         (&repaired, "current"),
         (&rederived, "current"),
     ] {
-        for call in observation["calls"].as_object().unwrap().values() {
+        assert_eq!(observation["private_source_derivation"]["report"]["body_binding"],
+            binding, "{observation}");
+        for (tool, call) in observation["calls"].as_object().unwrap() {
             let raw: kin_mcp::ToolCallResult = serde_json::from_value(call["raw"].clone()).unwrap();
             let raw = tool_result_payload(&raw);
-            assert_eq!(
-                raw["source_derivation"]["report"]["body_binding"], binding,
-                "{raw}"
-            );
+            assert!(raw.get("source_derivation").is_none(), "{raw}");
+            assert_eq!(raw["binding_coverage"]["scope"], "live_head", "{raw}");
             let result: kin_mcp::ToolCallResult =
                 serde_json::from_value(call["stdio_finalization"].clone()).unwrap();
             let value = tool_result_payload(&result);
-            assert_eq!(
-                value["_kin"]["source_derivation"]["report"]["body_binding"], binding,
-                "{value}"
-            );
+            assert!(value["_kin"].get("source_derivation").is_none(), "{value}");
+            assert_eq!(value["binding_coverage"], raw["binding_coverage"], "{tool}: {value}");
             assert!(
                 !value["_kin"]["verdict"]["limiting_factor"]
                     .as_str()
@@ -476,6 +481,59 @@ async fn readmission_disclosure_causal_routes() {
 // all. It reported that the way a daemon with the spine switched off does, as
 // `not_configured`, which the verdict reads as a fact about the install rather
 // than a gap in the answer, so the answer certified.
+
+/// The positive reference fixture has a settled call census and a measured
+/// non-call census with no reads to match. Class witnesses alone must not
+/// certify its mixed query, and neither scope makes an absence claim.
+fn assert_reference_fixture_answer_scope(payload: &serde_json::Value, calls_only: bool) {
+    let kinds = if calls_only {
+        json!(["calls"])
+    } else {
+        json!(["calls", "imports", "references"])
+    };
+    assert_eq!(payload["relation_kinds"], kinds, "{payload}");
+    assert_eq!(
+        payload["edge_coverage"]["requested_classes"], kinds,
+        "{payload}"
+    );
+    for kind in kinds.as_array().unwrap() {
+        assert_eq!(
+            payload["edge_coverage"]["classes"][kind.as_str().unwrap()],
+            "present",
+            "{payload}"
+        );
+    }
+    assert_eq!(payload["total_upstream"], 1, "{payload}");
+    assert_eq!(
+        payload["references"].as_array().unwrap().len(),
+        1,
+        "{payload}"
+    );
+    assert_eq!(payload["call_sites"]["settled"], true, "{payload}");
+    assert_eq!(
+        payload["call_sites"]["focal_escape"]["residue"]["mentions"],
+        json!({"measured": true, "count": 0, "matched": {}}),
+        "non-call completion must be measured independently of edge presence: {payload}"
+    );
+    let verdict = &payload["_kin"]["verdict"];
+    if calls_only {
+        assert!(
+            verdict["inputs"].get("reference_completion").is_none(),
+            "{payload}"
+        );
+    } else {
+        assert_eq!(
+            verdict["inputs"]["reference_completion"], "certified",
+            "{payload}"
+        );
+    }
+    assert_eq!(verdict["absence_claim"], "not_applicable", "{payload}");
+    assert_eq!(verdict["safe_to_conclude_absent"], false, "{payload}");
+    assert_eq!(
+        payload["negative"]["safe_to_conclude_absent"], false,
+        "{payload}"
+    );
+}
 
 /// Releases a graph-authority writer on the warning a spine initialization
 /// pass logs when it steps aside for that writer.
@@ -608,6 +666,7 @@ async fn a_reference_read_while_spine_initialization_is_deferred_does_not_certif
         body["degradations"]
     );
     let finalized = finalized_payload(deferred, "find_references");
+    assert_reference_fixture_answer_scope(&finalized, false);
     let verdict = &finalized["_kin"]["verdict"];
     assert_ne!(
         verdict["state"], "certified",
@@ -626,11 +685,11 @@ async fn a_reference_read_while_spine_initialization_is_deferred_does_not_certif
     assert_eq!(verdict["inputs"]["cross_repo"], "inconclusive", "{verdict}");
     assert_eq!(
         verdict["limiting_factor"], "spine_initialization_deferred",
-        "the deferral is the one thing wrong with this answer, and the factor must name it: \
-         {verdict}"
+        "the deferred authority is the only gap in this measured positive answer: {verdict}"
     );
 
-    // The writer has gone. The next read builds the spine, and certifies.
+    // The writer has gone. The next read builds the spine, and both the call
+    // census and the measured non-call census can certify the positive answer.
     let settled = mcp_find_references_with_stable_authority(
         &state,
         None,
@@ -646,6 +705,7 @@ async fn a_reference_read_while_spine_initialization_is_deferred_does_not_certif
         "the next read must build the spine"
     );
     let finalized = finalized_payload(settled, "find_references");
+    assert_reference_fixture_answer_scope(&finalized, false);
     assert_eq!(
         finalized["cross_repo"]["status"], "available",
         "{}",
@@ -653,8 +713,26 @@ async fn a_reference_read_while_spine_initialization_is_deferred_does_not_certif
     );
     assert_eq!(
         finalized["_kin"]["verdict"]["state"], "certified",
-        "a deferral must not outlive its writer: {finalized}"
+        "{finalized}"
     );
+    assert_eq!(
+        finalized["_kin"]["verdict"]["limiting_factor"],
+        serde_json::Value::Null,
+        "the deferral must not outlive its writer: {finalized}"
+    );
+    let calls = mcp_find_references_with_stable_authority(
+        &state,
+        None,
+        Arc::clone(&state.graph),
+        RequestGraphAuthority::Head,
+        &find_call_references_arguments(&target),
+        |_| {},
+    )
+    .await
+    .expect("the settled Calls query is served");
+    let calls = finalized_payload(calls, "find_references");
+    assert_reference_fixture_answer_scope(&calls, true);
+    assert_eq!(calls["_kin"]["verdict"]["state"], "certified", "{calls}");
     state.set_spine_initialization_test_hook(None);
 }
 
@@ -731,8 +809,7 @@ async fn a_deferral_another_request_clears_still_keeps_this_read_from_certifying
 }
 
 /// The control: a daemon whose spine is switched off reports `not_configured`
-/// and still certifies. Cross-repo authority does not apply to it, so nothing
-/// is missing from its answer.
+/// and certifies both measured positive scopes.
 #[tokio::test]
 async fn a_reference_read_with_the_spine_switched_off_still_certifies() {
     let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
@@ -741,44 +818,49 @@ async fn a_reference_read_with_the_spine_switched_off_still_certifies() {
     let (state, target) = reference_fixture();
     state.set_spine_disabled_for_test(true);
 
-    let answer = mcp_find_references_with_stable_authority(
-        &state,
-        None,
-        Arc::clone(&state.graph),
-        RequestGraphAuthority::Head,
-        &find_references_arguments(&target),
-        |_| {},
-    )
-    .await
-    .expect("a reference read is served with the spine switched off");
-    let finalized = finalized_payload(answer, "find_references");
-    assert_eq!(
-        finalized["cross_repo"]["status"], "not_configured",
-        "{}",
-        finalized["cross_repo"]
-    );
-    assert_eq!(
-        finalized["_kin"]["verdict"]["inputs"]["cross_repo"], "not_applicable",
-        "{finalized}"
-    );
-    assert_eq!(
-        finalized["_kin"]["verdict"]["state"], "certified",
-        "a spine that is switched off is a fact about the install, not a gap in the answer: \
+    for (arguments, calls_only) in [
+        (find_references_arguments(&target), false),
+        (find_call_references_arguments(&target), true),
+    ] {
+        let answer = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("a reference read is served with the spine switched off");
+        let finalized = finalized_payload(answer, "find_references");
+        assert_reference_fixture_answer_scope(&finalized, calls_only);
+        assert_eq!(
+            finalized["cross_repo"]["status"], "not_configured",
+            "{}",
+            finalized["cross_repo"]
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["inputs"]["cross_repo"], "not_applicable",
+            "{finalized}"
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["state"], "certified",
+            "a spine that is switched off is a fact about the install, not a gap in the answer: \
          {finalized}"
-    );
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["limiting_factor"],
+            serde_json::Value::Null,
+            "{finalized}"
+        );
+    }
 }
 
-/// A derived-member refusal is a standing gap in the answer, neither a deferral
-/// nor a spine nobody configured.
-///
-/// The spine is on, and it refuses a graph that holds an inferred member
-/// because its format cannot carry candidate authority. A drained writer does
-/// not change that, so the refusal must not travel under the deferral's code,
-/// which tells a reader that a later read will build the spine. Nor may it read
-/// as not configured: for as long as the graph holds the member, no cross-repo
-/// authority stands behind an answer read from it.
+/// A graph that holds an inferred member still enters the spine, so a reference
+/// read from it is answered with cross-repo authority behind it. The member
+/// used to refuse the whole graph, and the refusal stood on every answer.
 #[tokio::test]
-async fn a_derived_member_refusal_is_not_reported_as_a_deferred_spine() {
+async fn a_graph_with_an_inferred_member_answers_with_the_spine_behind_it() {
     let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
         kin_model::LanguageId::Python,
     ]);
@@ -789,56 +871,160 @@ async fn a_derived_member_refusal_is_not_reported_as_a_deferred_spine() {
         kin_model::derivation::ENTITY_DERIVATION_KEY.to_string(),
         serde_json::json!({}),
     );
+    assert!(kin_model::is_derived_member(&inferred));
     state.graph.upsert_entity(&inferred).unwrap();
 
+    for (arguments, calls_only) in [
+        (find_references_arguments(&target), false),
+        (find_call_references_arguments(&target), true),
+    ] {
+        let answer = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("a reference read is served over a graph with an inferred member");
+        let spine = state
+            .spine()
+            .expect("the spine holds a graph with an inferred member");
+        assert!(
+            spine
+                .lookup_by_id(&state.cached_repo_id, &inferred.id)
+                .is_some(),
+            "the member enters the spine with the rest of the graph"
+        );
+        let finalized = finalized_payload(answer, "find_references");
+        assert_reference_fixture_answer_scope(&finalized, calls_only);
+        assert_eq!(
+            finalized["cross_repo"]["status"], "available",
+            "{finalized}"
+        );
+        assert_eq!(
+            finalized["cross_repo"]["authority_complete"], true,
+            "{finalized}"
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["state"], "certified",
+            "nothing about the member qualifies an answer about another entity: {finalized}"
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["limiting_factor"],
+            serde_json::Value::Null,
+            "{finalized}"
+        );
+    }
+}
+
+/// A registered sibling whose cross-repo evidence is stale, read against a
+/// Python focal. Registered straight into the daemon's spine and never
+/// refreshed, it stays stale through the read's own pass.
+async fn reference_read_beside_a_stale_sibling(
+    sibling_language: kin_model::LanguageId,
+    calls_only: bool,
+) -> serde_json::Value {
+    let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
+        kin_model::LanguageId::Python,
+    ]);
+    let (state, target) = reference_fixture();
+    state.set_spine_disabled_for_test(false);
+    assert!(
+        state.ensure_spine().is_some(),
+        "{}",
+        state.spine_unavailable_reason()
+    );
+    let spine = state.spine().unwrap();
+    let mut sibling = test_entity("panel", "src/panel.src");
+    sibling.language = sibling_language;
+    spine.register_repo_with_facts(
+        "sibling",
+        vec![kin_spine::EntityEntry {
+            repo_id: "sibling".to_string(),
+            entity_id: sibling.id,
+            name: sibling.name.clone(),
+            kind: sibling.kind,
+            signature: sibling.signature.clone(),
+            fingerprint: sibling.fingerprint.clone(),
+            file_path: sibling.file_origin.as_ref().map(|path| path.0.clone()),
+            role: Some(sibling.role),
+        }],
+        kin_spine::RepoGraphFacts::from_entities(std::slice::from_ref(&sibling)),
+        "sibling-root",
+    );
+
+    let arguments = if calls_only {
+        find_call_references_arguments(&target)
+    } else {
+        find_references_arguments(&target)
+    };
     let answer = mcp_find_references_with_stable_authority(
         &state,
         None,
         Arc::clone(&state.graph),
         RequestGraphAuthority::Head,
-        &find_references_arguments(&target),
+        &arguments,
         |_| {},
     )
     .await
-    .expect("a reference read is served while the spine refuses the graph");
+    .expect("a reference read is served beside a stale sibling");
     assert!(
-        state.spine().is_none(),
-        "the spine must refuse a graph that holds an inferred member"
+        state.spine().unwrap().cross_repo_edges_stale("sibling"),
+        "the fixture must hold the sibling's evidence stale through the read"
     );
-    assert!(
-        state
-            .spine_unavailable_reason()
-            .starts_with("spine_candidate_representation_gap"),
-        "the fixture must reach the derived-member refusal: {}",
-        state.spine_unavailable_reason()
-    );
-    let finalized = finalized_payload(answer, "find_references");
-    let cross_repo = &finalized["cross_repo"];
-    let verdict = &finalized["_kin"]["verdict"];
+    finalized_payload(answer, "find_references")
+}
+
+/// A stale sibling written in a language that cannot reference the focal's
+/// hides no reference from it, so the answer carries no cross-repo gap.
+#[tokio::test]
+async fn a_sibling_in_an_unrelated_language_adds_no_gap() {
+    for calls_only in [false, true] {
+        let finalized =
+            reference_read_beside_a_stale_sibling(kin_model::LanguageId::JavaScript, calls_only)
+                .await;
+        assert_reference_fixture_answer_scope(&finalized, calls_only);
+        assert_eq!(
+            finalized["cross_repo"]["status"], "available",
+            "{finalized}"
+        );
+        assert_eq!(
+            finalized["cross_repo"]["authority_complete"], true,
+            "{finalized}"
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["state"], "certified",
+            "no JavaScript code can reference a Python function: {finalized}"
+        );
+        assert_eq!(
+            finalized["_kin"]["verdict"]["limiting_factor"],
+            serde_json::Value::Null,
+            "{finalized}"
+        );
+    }
+}
+
+/// The same sibling written in the focal's own language could hold a
+/// reference into it, so its stale evidence is a gap in the answer.
+#[tokio::test]
+async fn a_sibling_that_can_reference_the_focal_keeps_the_gap_while_its_evidence_is_stale() {
+    let finalized =
+        reference_read_beside_a_stale_sibling(kin_model::LanguageId::Python, false).await;
     assert_eq!(
-        cross_repo["status"], "unavailable",
-        "the spine is on and refused this graph, which is not a spine nobody configured: \
-         {cross_repo}"
+        finalized["cross_repo"]["authority_complete"], false,
+        "{finalized}"
     );
-    assert_eq!(
-        cross_repo["code"], "spine_candidate_representation_gap",
-        "the refusal names its own standing condition, not the deferral's: {cross_repo}"
+    assert_ne!(
+        finalized["_kin"]["verdict"]["state"], "certified",
+        "{finalized}"
     );
     assert!(
-        cross_repo["reason"]
+        finalized["_kin"]["verdict"]["limiting_factor"]
             .as_str()
-            .is_some_and(|reason| reason.contains("inferred member")),
-        "{cross_repo}"
-    );
-    assert_eq!(verdict["inputs"]["cross_repo"], "inconclusive", "{verdict}");
-    assert_eq!(
-        verdict["state"], "inconclusive",
-        "no cross-repo authority stands behind this answer, so it must not certify: {verdict}"
-    );
-    assert_eq!(
-        verdict["limiting_factor"], "spine_candidate_representation_gap",
-        "the refusal is the one thing wrong with this answer, and the factor must name it: \
-         {verdict}"
+            .is_some_and(|factor| factor.contains("cross_repo_authority_incomplete")),
+        "{finalized}"
     );
 }
 
@@ -888,13 +1074,14 @@ fn unreached_focal_fixture() -> (Arc<DaemonState>, Entity) {
 
 /// Register a sibling repository whose one function calls `focal`, and bring
 /// every registered repository's edges current, the way the blast-radius
-/// fixture does.
+/// fixture does. The sibling is written in the focal's language, since only
+/// code that can reach the focal's runtime can reference it.
 fn register_a_sibling_that_calls(state: &DaemonState, focal: &Entity) {
     let spine = state.ensure_spine().expect("spine enabled in test");
     let consumer = parse_consumer_source(
-        "src/app.rs",
+        "src/app.py",
         &format!(
-            "use provider::{name};\n\npub fn run_task() {{\n    {name}();\n}}\n",
+            "from provider import {name}\n\n\ndef run_task():\n    {name}()\n",
             name = focal.name
         ),
     );
@@ -985,8 +1172,8 @@ async fn kin_refs_still_certifies_an_absence_nothing_disproves() {
 /// A spine whose initialization was deferred, and one that refused the graph,
 /// are gaps in `kin refs` too, each under its own code.
 ///
-/// The control is the same answer built with no spine at all, which certifies,
-/// so the refusals below come from the spine state and from nothing else.
+/// Calls certify with no spine configured. The default mixed query keeps its
+/// non-call completion gap, and both scopes retain an actual spine refusal.
 #[tokio::test]
 async fn kin_refs_reads_a_deferred_or_refusing_spine_as_a_gap() {
     let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
@@ -994,34 +1181,43 @@ async fn kin_refs_reads_a_deferred_or_refusing_spine_as_a_gap() {
     ]);
     let (state, focal) = unreached_focal_fixture();
     let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
-    let request = kin_cli::commands::refs::RefsRequest {
-        entity: focal.id.to_string(),
-        kind: "all".to_string(),
-    };
-    let answer = |spine: kin_spine::DaemonSpine<'_>| {
-        kin_cli::commands::refs::build_refs_response_with_spine(
-            &state.layout,
-            state.graph.as_ref(),
-            &request,
-            &envelope,
-            kin_cli::commands::refs::RefsSpine {
-                repo_id: &state.cached_repo_id,
-                spine,
-                call_site_sources: None,
-            },
-        )
-        .expect("kin refs answers")
-    };
+    for kind in ["all", "calls"] {
+        let request = kin_cli::commands::refs::RefsRequest {
+            entity: focal.id.to_string(),
+            kind: kind.to_string(),
+        };
+        let answer = |spine: kin_spine::DaemonSpine<'_>| {
+            kin_cli::commands::refs::build_refs_response_with_spine(
+                &state.layout,
+                state.graph.as_ref(),
+                &request,
+                &envelope,
+                kin_cli::commands::refs::RefsSpine {
+                    repo_id: &state.cached_repo_id,
+                    spine,
+                    call_site_sources: None,
+                },
+            )
+            .expect("kin refs answers")
+        };
 
-    let control = answer(kin_spine::DaemonSpine::Absent)
-        .negative
-        .expect("an empty answer carries a verdict");
-    assert_eq!(
-        control["safe_to_conclude_absent"], true,
-        "the control must certify, or the refusals below discriminate nothing: {control}"
-    );
+        let control = answer(kin_spine::DaemonSpine::Absent)
+            .negative
+            .expect("an empty answer carries a verdict");
+        assert_eq!(
+            control["safe_to_conclude_absent"],
+            kind == "calls",
+            "only Calls certify without non-call completion: {control}"
+        );
+        assert_eq!(
+            control["trust_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("reference_completion_unmeasured")),
+            kind == "all",
+            "{control}"
+        );
 
-    for (spine, code) in [
+        for (spine, code) in [
         (
             kin_spine::DaemonSpine::Deferred(
                 "could not capture stable spine authority for repo r after 3 attempts: primary \
@@ -1050,5 +1246,6 @@ async fn kin_refs_reads_a_deferred_or_refusing_spine_as_a_gap() {
                 .is_some_and(|reason| reason.contains(code)),
             "{code}: the refusal must name the spine state: {negative}"
         );
+    }
     }
 }

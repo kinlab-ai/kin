@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Context, Result};
 use axum::http::StatusCode;
 use kin_cli::commands::merge::{
-    MergeOutcome, MergeReport, MergeRequest, MergeResponse, MERGE_REPORT_SCHEMA,
+    MergeConfirmRequest, MergeConflict, MergeConflictScope, MergeExpectation, MergeOutcome,
+    MergePreviewRequest, MergePreviewResponse, MergeReport, MergeRequest, MergeResponse,
+    MERGE_REPORT_SCHEMA,
 };
 use kin_db::{LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager};
 use kin_model::{
@@ -86,9 +88,9 @@ fn merge_enrichment(
     }
     match unavailable {
         Some((_, detail)) => MergeEnrichment::Announce(format!(
-            "Cross-file enrichment did not run for this merge ({detail}), so the merged graph \
-             holds only the edges the two branches already carried; run `kin daemon sweep` once \
-             a language server is available"
+            "Language-server enrichment did not run for this merge ({detail}), so the merged \
+             graph holds only the edges the two branches already carried; run `kin daemon sweep` \
+             once a language server is available"
         )),
         None => MergeEnrichment::Sweep,
     }
@@ -148,7 +150,7 @@ pub(crate) fn settle_merged_graph(state: &DaemonState) -> Option<String> {
             // worker drains, so a `false` here is a channel that can never
             // deliver: nothing later converges this graph on its own.
             Some(
-                "Cross-file enrichment could not be queued for this merge (this daemon's \
+                "Language-server enrichment could not be queued for this merge (this daemon's \
                  enrichment worker is not accepting work), so the merged graph holds only the \
                  edges the two branches already carried; restart the daemon and run \
                  `kin daemon sweep`"
@@ -247,9 +249,9 @@ pub(crate) struct CommandRefusal {
 impl CommandRefusal {
     /// A refusal raised before this command's first authority write.
     ///
-    /// Only correct above the `finalize_local_repository_commit` call, which is
-    /// where both of these commands publish. Applying it below that line is the
-    /// mutation the tests for this exist to catch.
+    /// Only correct when the caller knows no transaction has been committed.
+    /// Publication may precede a fallible live-graph installation or finalization,
+    /// so being above the finalization call alone is not proof of a refusal.
     pub(crate) fn before_write((status, message): (StatusCode, String)) -> Self {
         Self {
             status,
@@ -285,6 +287,29 @@ pub(crate) fn execute(
     state: &DaemonState,
     request: &MergeRequest,
 ) -> std::result::Result<MergeResponse, CommandRefusal> {
+    execute_expected(state, request, None)
+}
+
+pub(crate) fn execute_confirm(
+    state: &DaemonState,
+    request: &MergeConfirmRequest,
+) -> std::result::Result<MergeResponse, CommandRefusal> {
+    execute_expected(
+        state,
+        &MergeRequest {
+            source: request.source.clone(),
+            operation_id: request.operation_id,
+            actor: request.actor.clone(),
+        },
+        Some(&request.expected),
+    )
+}
+
+fn execute_expected(
+    state: &DaemonState,
+    request: &MergeRequest,
+    expected: Option<&MergeExpectation>,
+) -> std::result::Result<MergeResponse, CommandRefusal> {
     let graph_mutation = state.begin_graph_authority_mutation();
     let persistence = state.persist_lock.lock().map_err(|_| {
         CommandRefusal::from((
@@ -293,14 +318,29 @@ pub(crate) fn execute(
         ))
     })?;
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
-    // Everything from here to `finalize_local_repository_commit` below runs
-    // before this command's first authority write, so a refusal raised in it
-    // published nothing and says so. Below that call the marker is never
-    // applied, because by then the daemon cannot promise it.
     let authority = ActiveLocalRepositoryAuthority::open_bound(state)
         .map_err(|refusal| CommandRefusal::before_write(merge_bind_refusal(refusal)))?;
-    let outcome = plan_and_publish(state, &authority, request)
-        .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
+    // A guarded confirmation proves refusal before entering any helper that
+    // can publish. Once it enters publication, a failure may follow a committed
+    // transaction and must remain indeterminate. Ordinary CLI merge retains its
+    // existing refusal contract.
+    let prepared = if let Some(expected) = expected {
+        let plan = read_merge_plan(state, &authority, request)
+            .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
+        validate_merge_expectation(expected, &merge_expectation(&plan, &request.source))
+            .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
+        Some(plan)
+    } else {
+        None
+    };
+    let outcome = plan_and_publish(state, &authority, request, prepared).map_err(|error| {
+        let classified = classify_merge_error(error);
+        if expected.is_some() {
+            CommandRefusal::from(classified)
+        } else {
+            CommandRefusal::before_write(classified)
+        }
+    })?;
     let mut execution = match outcome {
         MergeCommandOutcome::Commit(execution) => execution,
         MergeCommandOutcome::ReadOnly(response) => {
@@ -417,33 +457,13 @@ fn plan_and_publish(
     state: &DaemonState,
     authority: &ActiveLocalRepositoryAuthority,
     request: &MergeRequest,
+    prepared: Option<MergePlan>,
 ) -> Result<MergeCommandOutcome> {
-    let plan = read_merge_plan(state, authority, request)?;
-    let bases = plan
-        .graph
-        .find_merge_bases(&plan.ours_change, &plan.theirs_change)
-        .context("resolve exact merge base from graph history")?;
-    let base = match bases.as_slice() {
-        [] => {
-            return Err(merge_conflict(format!(
-                "branch {} and the active branch {} share no common ancestor, and kin does not \
-                 merge unrelated histories; rebase the source onto the target first, or import \
-                 them separately",
-                request.source, plan.target_ref
-            )))
-        }
-        [base] => *base,
-        multiple => {
-            return Err(merge_conflict(format!(
-                "branch {} and the active branch {} have {} merge bases, and kin does not \
-                 resolve a criss-cross merge; merge one of the intermediate branches first so a \
-                 single base remains",
-                request.source,
-                plan.target_ref,
-                multiple.len()
-            )))
-        }
+    let plan = match prepared {
+        Some(plan) => plan,
+        None => read_merge_plan(state, authority, request)?,
     };
+    let base = merge_base(&plan, &request.source)?;
 
     if base == plan.theirs_change {
         return Ok(MergeCommandOutcome::ReadOnly(already_up_to_date(
@@ -460,21 +480,70 @@ fn plan_and_publish(
         .map(MergeCommandOutcome::Commit)
 }
 
+fn merge_base(plan: &MergePlan, source: &RefName) -> Result<SemanticChangeId> {
+    let bases = plan
+        .graph
+        .find_merge_bases(&plan.ours_change, &plan.theirs_change)
+        .context("resolve exact merge base from graph history")?;
+    let base = match bases.as_slice() {
+        [] => {
+            return Err(merge_conflict(format!(
+                "branch {} and the active branch {} share no common ancestor, and kin does not \
+                 merge unrelated histories; rebase the source onto the target first, or import \
+                 them separately",
+                source, plan.target_ref
+            )))
+        }
+        [base] => *base,
+        multiple => {
+            return Err(merge_conflict(format!(
+                "branch {} and the active branch {} have {} merge bases, and kin does not \
+                 resolve a criss-cross merge; merge one of the intermediate branches first so a \
+                 single base remains",
+                source,
+                plan.target_ref,
+                multiple.len()
+            )))
+        }
+    };
+
+    Ok(base)
+}
+
 fn read_merge_plan(
     state: &DaemonState,
     authority: &ActiveLocalRepositoryAuthority,
     request: &MergeRequest,
 ) -> Result<MergePlan> {
-    if !request.source.is_branch() {
+    let lease = authority.manager.read_authority();
+    read_merge_plan_at(state, authority.workspace_id, &request.source, &lease)
+}
+
+fn read_merge_plan_at(
+    state: &DaemonState,
+    workspace_id: kin_model::WorkspaceId,
+    source: &RefName,
+    lease: &kin_db::RepositoryAuthorityState,
+) -> Result<MergePlan> {
+    if !source.is_branch() {
         return Err(merge_bad_request(format!(
             "merge requires a source ref below refs/heads/, found {}",
-            request.source
+            source
         )));
     }
-    let lease = authority.manager.read_authority();
     let roots = lease.roots().clone();
     let metadata = lease.metadata();
-    let workspace = local_workspace(authority, metadata)?.clone();
+    let workspace = metadata
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no workspace {workspace_id}",
+                metadata.repository_id
+            )
+        })?;
     let existing_merge =
         crate::repository_merge_state::workspace_merge_record(metadata, workspace.workspace_id)
             .cloned();
@@ -505,8 +574,8 @@ fn read_merge_plan(
     if workspace.holds_uncommitted_work() {
         // `holds_uncommitted_work` is three clauses and the old refusal named
         // none of them, so a caller met "has graph-owned changes" with nothing
-        // to act on. The rc062j stranger hit that twice. Say which clause
-        // refused and what clears it.
+        // to act on. The rc062j stranger hit that twice. Say what the work is,
+        // by entity, and what clears it.
         // Mirrors `WorkspaceState::holds_uncommitted_work` clause for clause.
         // Its tree arm is a `map_or`, so an unborn head with any tree at all
         // is uncommitted work for a reason neither of the others names.
@@ -518,51 +587,46 @@ fn read_merge_plan(
             .base_tree_hash
             .is_some_and(|base| base != workspace.tree_hash);
         let unborn_with_tree = workspace.base_tree_hash.is_none() && !workspace.tree.is_empty();
+        let work = uncommitted_work(lease, &workspace);
         // Committing is the one remedy named. Setting the work aside is not a
         // way through a merge: `kin stash push` needs `--yes` without a
         // terminal, and once the merge moves this workspace's base `kin stash
         // pop` refuses to restore onto it, so work stashed to clear the way
         // could not come back afterwards. The bare `kin stash` this used to
         // name only prints its usage.
-        let commit_it = "commit it with `kin commit`";
+        let commit = if work.count() == 1 {
+            "commit it with `kin commit`"
+        } else {
+            "commit them with `kin commit`"
+        };
         let (what, remedy) = match (overlay_pending, tree_moved, unborn_with_tree) {
-            (true, true, _) => (
-                "a pending semantic overlay AND a working tree that has moved off its base change"
-                    .to_string(),
-                "commit them with `kin commit`",
-            ),
             (true, false, false) => (
-                "a pending semantic overlay over a working tree that still matches its base \
-                 change; `kin diff` lists the entities and relations it holds"
-                    .to_string(),
-                commit_it,
+                format!(
+                    "{} while the working copy still matches its base change; `kin diff` lists \
+                     the entities and relations it holds",
+                    work.words()
+                ),
+                commit,
             ),
-            (true, _, true) => (
-                "a pending semantic overlay on a branch with no commit yet".to_string(),
-                commit_it,
+            (_, _, true) => (
+                format!("{} on a branch with no commit yet", work.words()),
+                commit,
             ),
-            (false, true, _) => (
-                "a working tree that has moved off its base change".to_string(),
-                commit_it,
-            ),
-            (false, false, true) => (
-                "a working tree on a branch with no commit yet".to_string(),
-                commit_it,
-            ),
+            (true, true, false) | (false, true, false) => (work.words(), commit),
             // Unreachable while `holds_uncommitted_work` is those clauses. A
             // wrong sentence here would be worse than an honest one, so it says
             // so instead.
             (false, false, false) => (
-                "graph-owned changes this refusal could not attribute to the semantic overlay, \
-                 the working tree or an unborn head, which is a defect in the refusal rather \
-                 than in your repository; please report it"
+                "uncommitted changes this refusal could not attribute to an entity, a relation \
+                 or an unborn head, which is a defect in the refusal rather than in your \
+                 repository; please report it"
                     .to_string(),
                 "read `kin graph status`",
             ),
         };
         return Err(merge_conflict(format!(
-            "workspace {} holds {what}; a merge publishes into a workspace that holds neither, \
-             so {remedy}, then merge again",
+            "workspace {} holds {what}; a merge publishes into a workspace that holds no \
+             uncommitted work, so {remedy}, then merge again",
             workspace.workspace_id
         )));
     }
@@ -576,10 +640,10 @@ fn read_merge_plan(
             )))
         }
     };
-    if target_ref == request.source {
+    if &target_ref == source {
         return Err(merge_bad_request(format!(
             "cannot merge branch {} into itself",
-            request.source
+            source
         )));
     }
     let ours_target = workspace.base_target.clone().ok_or_else(|| {
@@ -593,26 +657,26 @@ fn read_merge_plan(
             workspace.workspace_id
         );
     }
+    if lease.resolve_ref_target(&target_ref)?.as_ref() != Some(&ours_target) {
+        return Err(merge_conflict(format!(
+            "active branch {target_ref} moved beyond this workspace's base; refresh the workspace before previewing or merging"
+        )));
+    }
     let ours_change = lease
         .resolve_target_change_id(&ours_target)
         .with_context(|| format!("resolve exact semantic head of {target_ref}"))?;
     let theirs_target = lease
-        .resolve_ref_target(&request.source)
+        .resolve_ref_target(source)
         .with_context(|| {
             format!(
                 "resolve repository branch {} from one authority lease",
-                request.source
+                source
             )
         })?
-        .ok_or_else(|| {
-            merge_conflict(format!(
-                "repository branch {} does not exist",
-                request.source
-            ))
-        })?;
+        .ok_or_else(|| merge_conflict(format!("repository branch {} does not exist", source)))?;
     let theirs_change = lease
         .resolve_target_change_id(&theirs_target)
-        .with_context(|| format!("resolve exact semantic head of {}", request.source))?;
+        .with_context(|| format!("resolve exact semantic head of {}", source))?;
     let ours_policy = resolved_policy(metadata, &ours_change)?;
     let workspace_graph = lease
         .workspace_graph_snapshot(&workspace.workspace_id)
@@ -620,7 +684,7 @@ fn read_merge_plan(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "repository {} has no graph snapshot for workspace {}",
-                authority.repository_id,
+                metadata.repository_id,
                 workspace.workspace_id
             )
         })?;
@@ -628,7 +692,6 @@ fn read_merge_plan(
         .map_err(|error| merge_conflict(error.to_string()))?;
     let mut snapshot = lease.snapshot().clone();
     snapshot.repository_authority = None;
-    drop(lease);
 
     let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
         .context("prepare graph-owned merge history")?;
@@ -645,6 +708,166 @@ fn read_merge_plan(
         graph,
         existing_merge,
     })
+}
+
+fn merge_expectation(plan: &MergePlan, source: &RefName) -> MergeExpectation {
+    MergeExpectation {
+        repository_id: plan.workspace.repository_id.clone(),
+        workspace_id: plan.workspace.workspace_id,
+        roots: plan.roots.clone(),
+        target_ref: plan.target_ref.clone(),
+        source_ref: source.clone(),
+        ours_change: plan.ours_change,
+        theirs_change: plan.theirs_change,
+        workspace_tree_hash: plan.workspace.tree_hash,
+    }
+}
+
+fn validate_merge_expectation(
+    expected: &MergeExpectation,
+    actual: &MergeExpectation,
+) -> Result<()> {
+    if expected != actual {
+        return Err(merge_conflict(
+            "stale merge preview: repository, workspace, branch heads or authority changed; \
+             read a new merge preview before confirming",
+        ));
+    }
+    Ok(())
+}
+
+/// Plan against a fully validated frozen publication without recovery writes.
+/// The caller holds the coordination gate; the persistence gate excludes this
+/// daemon's publishers, and the bounded storage freeze excludes other writers.
+/// No mutation executor or projection/admission operation is called here.
+pub(crate) fn preview(
+    state: &DaemonState,
+    request: &MergePreviewRequest,
+) -> std::result::Result<MergePreviewResponse, (StatusCode, String)> {
+    let result = (|| -> Result<MergePreviewResponse> {
+        let _persistence = state
+            .persist_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon persistence lock poisoned"))?;
+        let binding = state.local_repository_authority_binding()?;
+        binding.revalidate_pinned_namespace().map_err(|error| {
+            merge_conflict(format!(
+                "merge preview repository identity is unavailable: {error}"
+            ))
+        })?;
+        let frozen = binding
+            .freeze_existing_read_only(std::time::Duration::from_secs(2))
+            .context("read merge preview without changing repository storage")?;
+        frozen.ensure_no_active_session_publication()?;
+        let plan = read_merge_plan_at(
+            state,
+            binding.workspace_id(),
+            &request.source,
+            frozen.authority(),
+        )?;
+        let base = merge_base(&plan, &request.source)?;
+        let (outcome, mut conflicts) = if base == plan.theirs_change {
+            (MergeOutcome::AlreadyUpToDate, Vec::new())
+        } else if base == plan.ours_change {
+            (MergeOutcome::FastForward, Vec::new())
+        } else {
+            let base_state = plan.graph.resolve_graph_at(&base)?;
+            let ours = plan.graph.resolve_graph_at(&plan.ours_change)?;
+            let theirs = plan.graph.resolve_graph_at(&plan.theirs_change)?;
+            let composed = compose_merge(&base_state, &ours, &theirs)?;
+            let outcome = if composed.conflicts.is_empty() {
+                MergeOutcome::Merged
+            } else {
+                MergeOutcome::Conflicted
+            };
+            (outcome, composed.conflicts)
+        };
+        conflicts.sort_by_key(|entry| render_subject_identity(&entry.subject));
+        let conflicts_total = conflicts.len();
+        let conflicts = conflicts.iter().take(200).map(preview_conflict).collect();
+        Ok(MergePreviewResponse {
+            schema: "kin.merge-preview.v1".to_string(),
+            expected: merge_expectation(&plan, &request.source),
+            base_change: base,
+            outcome,
+            conflicts,
+            conflicts_total,
+            limitations: vec![
+                "This preview reads recorded branch composition. It does not admit the working copy or create a merge record.".to_string(),
+                "Confirmation rechecks authority, projection, parser certificates and shared admission policy. A clean composition can still be refused.".to_string(),
+            ],
+        })
+    })();
+    result.map_err(classify_merge_error)
+}
+
+/// What a workspace holds uncommitted, named by entity for a refusal.
+///
+/// The overlay names the entities the work changed. The members the work
+/// moved come from the workspace tree against the tree of its base change,
+/// which only history holds, so a base that cannot be resolved here leaves
+/// the overlay to speak alone rather than turning a refusal into an error.
+fn uncommitted_work(
+    lease: &kin_db::RepositoryAuthorityState,
+    workspace: &WorkspaceState,
+) -> crate::entity_words::PendingWork {
+    let base_tree = match &workspace.base_target {
+        None => Some(ResolvedTree::default()),
+        Some(base) => lease
+            .resolve_target_change_id(base)
+            .ok()
+            .and_then(|change| {
+                let mut snapshot = lease.snapshot().clone();
+                snapshot.repository_authority = None;
+                kin_db::InMemoryGraph::from_snapshot(snapshot)
+                    .ok()?
+                    .resolve_tree_at(&change)
+                    .ok()
+            }),
+    };
+    let units = base_tree
+        .and_then(|base| crate::entity_words::pending_units(&base, &workspace.tree).ok())
+        .unwrap_or_default();
+    crate::entity_words::PendingWork::of_workspace(&units, &workspace.semantic_overlay)
+}
+
+/// A tree that would not compose, in entity words: a contested place by the
+/// entity projected there, anything else by the identities it names.
+fn tree_state_words(error: &kin_model::TreeStateError) -> String {
+    match error {
+        kin_model::TreeStateError::DuplicatePath { path }
+        | kin_model::TreeStateError::PathOccupied { path } => format!(
+            "more than one entity would be projected where {} is",
+            crate::entity_words::unit_words(path)
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn preview_conflict(entry: &MergeConflictEntry) -> MergeConflict {
+    let scope = match &entry.subject {
+        MergeConflictSubject::Entity { entity } => MergeConflictScope::Entity {
+            entity: *entity,
+            name: entry
+                .label
+                .as_deref()
+                .map(|label| entity_name_of_label(label).to_string()),
+        },
+        MergeConflictSubject::Relation { relation } => MergeConflictScope::Relation {
+            relation: *relation,
+        },
+        MergeConflictSubject::Artifact { artifact } => MergeConflictScope::Artifact {
+            artifact: *artifact,
+            path: entry.label.clone(),
+        },
+        MergeConflictSubject::Path { path } => MergeConflictScope::Path {
+            path: path.to_string(),
+        },
+    };
+    MergeConflict {
+        scope,
+        detail: render_entry(entry),
+    }
 }
 
 fn already_up_to_date(
@@ -761,6 +984,7 @@ fn fast_forward(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     publish(
         state,
@@ -776,28 +1000,23 @@ fn fast_forward(
     )
 }
 
-fn three_way(
-    state: &DaemonState,
-    authority: &ActiveLocalRepositoryAuthority,
-    request: &MergeRequest,
-    plan: MergePlan,
-    base: SemanticChangeId,
-) -> Result<MergeExecution> {
-    let base_state = plan
-        .graph
-        .resolve_graph_at(&base)
-        .context("resolve exact graph at the merge base")?;
-    let ours_state = plan
-        .graph
-        .resolve_graph_at(&plan.ours_change)
-        .with_context(|| format!("resolve exact graph for branch {}", plan.target_ref))?;
-    let theirs_state = plan
-        .graph
-        .resolve_graph_at(&plan.theirs_change)
-        .with_context(|| format!("resolve exact graph for branch {}", request.source))?;
+struct ComposedMerge {
+    merged_entities: std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    merged_relations: std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+    merged_artifacts: std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    deferred_coverage: BTreeMap<kin_model::RelationId, kin_model::ArtifactId>,
+    conflicts: Vec<MergeConflictEntry>,
+}
 
+/// The same identity composition is used by preview and by publication. It
+/// reads recorded values only: no source parsing, admission, projection or CAS.
+fn compose_merge(
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+) -> Result<ComposedMerge> {
     let mut conflicts = Vec::new();
-    let mut merged_entities = compose(
+    let merged_entities = compose(
         &base_state.entities,
         &ours_state.entities,
         &theirs_state.entities,
@@ -807,8 +1026,8 @@ fn three_way(
         entities_agree,
         &mut conflicts,
     )?;
-    let (mut merged_relations, deferred_coverage) = parse_coverage::compose_relations(
-        [&base_state, &ours_state, &theirs_state],
+    let (merged_relations, deferred_coverage) = parse_coverage::compose_relations(
+        [base_state, ours_state, theirs_state],
         &BTreeSet::new(),
         &mut conflicts,
     )?;
@@ -858,11 +1077,47 @@ fn three_way(
         &merged_relations,
         &merged_entities,
         &merged_artifacts,
-        &base_state,
-        &ours_state,
-        &theirs_state,
+        base_state,
+        ours_state,
+        theirs_state,
         &mut conflicts,
     )?;
+    Ok(ComposedMerge {
+        merged_entities,
+        merged_relations,
+        merged_artifacts,
+        deferred_coverage,
+        conflicts,
+    })
+}
+
+fn three_way(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    request: &MergeRequest,
+    plan: MergePlan,
+    base: SemanticChangeId,
+) -> Result<MergeExecution> {
+    let base_state = plan
+        .graph
+        .resolve_graph_at(&base)
+        .context("resolve exact graph at the merge base")?;
+    let ours_state = plan
+        .graph
+        .resolve_graph_at(&plan.ours_change)
+        .with_context(|| format!("resolve exact graph for branch {}", plan.target_ref))?;
+    let theirs_state = plan
+        .graph
+        .resolve_graph_at(&plan.theirs_change)
+        .with_context(|| format!("resolve exact graph for branch {}", request.source))?;
+
+    let ComposedMerge {
+        mut merged_entities,
+        mut merged_relations,
+        merged_artifacts,
+        deferred_coverage,
+        conflicts,
+    } = compose_merge(&base_state, &ours_state, &theirs_state)?;
     if !conflicts.is_empty() {
         return open_conflicted_merge(state, authority, request, plan, base, conflicts);
     }
@@ -875,6 +1130,16 @@ fn three_way(
         &artifacts_by_id(&theirs_state.tree),
         &merged_artifacts,
         &mut merged_entities,
+    );
+    align_unchanged_relations_with_their_artifacts(
+        &base_state,
+        &ours_state,
+        &theirs_state,
+        &artifacts_by_id(&base_state.tree),
+        &artifacts_by_id(&ours_state.tree),
+        &artifacts_by_id(&theirs_state.tree),
+        &merged_artifacts,
+        &mut merged_relations,
     );
 
     let desired_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
@@ -1033,6 +1298,7 @@ fn three_way(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     let mut execution = publish(
         state,
@@ -1258,7 +1524,8 @@ pub(crate) fn publish_resolved_merge(
         authored.resolved_tree = ResolvedTree::from_artifacts(merged_artifacts.into_values())
             .map_err(|error| {
                 merge_conflict(format!(
-                    "authored file resolutions leave an invalid tree: {error}"
+                    "the authored resolutions leave members that cannot be held together: {}",
+                    tree_state_words(&error)
                 ))
             })?;
         let authored = crate::repository_merge_state::replay_authored_files(
@@ -1283,6 +1550,16 @@ pub(crate) fn publish_resolved_merge(
         &merged_artifacts,
         &mut merged_entities,
     );
+    align_unchanged_relations_with_their_artifacts(
+        &base_state,
+        &ours_state,
+        &theirs_state,
+        &base_artifacts,
+        &ours_artifacts,
+        &theirs_artifacts,
+        &merged_artifacts,
+        &mut merged_relations,
+    );
 
     // The resolutions are the caller's, so a composition they leave broken is
     // named rather than parked again: the record already holds one settlement
@@ -1294,7 +1571,10 @@ pub(crate) fn publish_resolved_merge(
     }
     for (path, count) in settled_paths {
         if count > 1 {
-            residual.push(format!("{count} artifacts still occupy path {path}"));
+            residual.push(format!(
+                "{count} distinct entities still claim the place {} is projected at",
+                crate::entity_words::unit_words(path)
+            ));
         }
     }
     let mut dangling = Vec::new();
@@ -1477,6 +1757,7 @@ pub(crate) fn publish_resolved_merge(
         )),
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction
         .validate()
@@ -1504,13 +1785,14 @@ pub(crate) fn publish_resolved_merge(
         .zip(&drift.drifted_paths)
         .filter(|(_, path)| !authored_paths.contains(*path))
         .collect();
-    if let Some((first, _)) = unrelated_drift.first() {
-        return Err(kin_core::KinError::projection_conflict(format!(
-            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
-             reconcile them into graph authority or discard them before publishing this merge",
-            unrelated_drift.len()
-        ))
-        .into());
+    if !unrelated_drift.is_empty() {
+        return Err(
+            kin_core::KinError::projection_conflict(crate::entity_words::drift_refusal(
+                unrelated_drift.iter().map(|(_, path)| *path),
+                "take them in with `kin admit` or discard them before publishing this merge",
+            ))
+            .into(),
+        );
     }
     // The repository transaction is durable authority. The in-process graph is a
     // derived query view, and a published merge never reached it: the two
@@ -1695,7 +1977,7 @@ fn apply_resolution(
             };
         }
         (MergeConflictSubject::Path { .. }, MergeEntryResolution::Side { .. }) => {
-            bail!("a contested path has no side to take")
+            bail!("a contested place has no side to take")
         }
         (subject, MergeEntryResolution::Payload { payload, .. }) => match (subject, payload) {
             (MergeConflictSubject::Entity { entity }, MergeResolutionPayload::Entity(value)) => {
@@ -1747,7 +2029,7 @@ fn apply_resolution(
                     artifacts: claimants,
                 } = &entry.divergence
                 else {
-                    bail!("a path owner settles a path collision")
+                    bail!("only a contested place is settled by naming the entity that keeps it")
                 };
                 for claimant in claimants {
                     if claimant != owner {
@@ -1755,7 +2037,11 @@ fn apply_resolution(
                     }
                 }
                 if !artifacts.contains_key(owner) {
-                    bail!("the artifact chosen to keep path {path} did not survive composition")
+                    bail!(
+                        "the entity chosen to keep the place {} is projected at did not survive \
+                         composition",
+                        crate::entity_words::unit_words(path)
+                    )
                 }
             }
             (MergeConflictSubject::Path { .. }, MergeResolutionPayload::Removed) => {
@@ -1763,7 +2049,9 @@ fn apply_resolution(
                     artifacts: claimants,
                 } = &entry.divergence
                 else {
-                    bail!("a removal of a contested path settles a path collision")
+                    bail!(
+                        "only a contested place is settled by removing every entity that claims it"
+                    )
                 };
                 for claimant in claimants {
                     artifacts.remove(claimant);
@@ -1772,7 +2060,8 @@ fn apply_resolution(
             _ => {
                 return Err(merge_bad_request(format!(
                     "authoring a merge resolution value for {} is not a proven repository-v6 \
-                     shape; settle it by taking a side, removing it, or naming a path owner",
+                     shape; settle it by taking a side, removing it, or naming the entity that \
+                     keeps a contested place",
                     render_subject(entry)
                 )))
             }
@@ -1925,23 +2214,24 @@ fn project_artifacts_from_settled_entities(
 
         if carried.len() != 1 {
             let decisions = name_decisions(&specific);
+            let unit = member_words(&path);
             let why = if carried.is_empty() {
                 format!(
-                    "no side of {path} carries every one of those entity decisions, and a kin \
+                    "no side of {unit} carries every one of those entity decisions, and a kin \
                      merge composes at the granularity of a whole entity or artifact and never \
                      the line, so there is no third body to publish"
                 )
             } else {
                 format!(
-                    "{} sides of {path} carry every one of those entity decisions and their \
-                     bytes differ, so which body to publish is not determined by what was \
+                    "{} sides of {unit} carry every one of those entity decisions and their \
+                     content differs, so which body to publish is not determined by what was \
                      settled",
                     carried.len()
                 )
             };
             return Err(merge_conflict(format!(
-                "the recorded resolutions disagree about {path}: {} was settled `{}`, while \
-                 inside it {decisions}. {why}. Settle {path} to the side that carries those \
+                "the recorded resolutions disagree about {unit}: {} was settled `{}`, while \
+                 inside it {decisions}. {why}. Settle {unit} to the side that carries those \
                  entity decisions, or re-settle the entities, then continue.",
                 render_subject(entry),
                 side_flag(*side),
@@ -1974,14 +2264,15 @@ fn project_artifacts_from_settled_entities(
             String::new()
         } else {
             format!(
-                ", and the {} settlement(s) covering the whole of {path} follow it, because a \
+                ", and the {} settlement(s) covering the whole of {} follow it, because a \
                  settlement naming a container never overrides one naming something inside it",
-                bulk.len()
+                bulk.len(),
+                member_words(&path)
             )
         };
         projections.push(format!(
             "Projected {} from the `{}` side rather than the `{}` it was settled to, because {}\
-             {subsumed}; a file's bytes follow the entities settled inside it.",
+             {subsumed}; a member's content follows the entities settled inside it.",
             render_subject(entry),
             side_flag(projected),
             side_flag(*side),
@@ -2195,10 +2486,12 @@ fn side_flag(side: MergeSide) -> &'static str {
 /// same value is agreement rather than conflict.
 ///
 /// `agrees` is how this dimension measures "did not move", and it is a
-/// parameter because the answer differs by dimension. Relations and artifacts
-/// use exact equality: their whole value IS their content. An `Entity` is not,
-/// and comparing one exactly is what inflated the conflict set. `reconciler`
-/// stamps the whole FILE's blob hash into every entity's `metadata.extra`, and
+/// parameter because the answer differs by dimension. Artifacts use exact
+/// equality: their whole value is their content. An `Entity` does not, and
+/// neither does a `Relation` whose only movement is the byte span a
+/// neighbour's edit gave it. Comparing either exactly is what inflated the
+/// conflict set. `reconciler` stamps the whole FILE's blob hash into every
+/// entity's `metadata.extra`, and
 /// editing one function moves the byte span of every entity below it, so on a
 /// file both branches touched every entity in it compares unequal on both
 /// sides and every one of them was minted as a conflict. A two-function change
@@ -2374,6 +2667,119 @@ fn align_unchanged_entities_with_their_artifacts(
     }
 }
 
+/// Point every relation both branches left alone at the side its evidence file
+/// publishes from.
+///
+/// Composition takes `ours` when the two sides agree. Agreement ignores the
+/// byte span, so a relation nobody edited still carries ours' span after the
+/// artifact composer has taken theirs. Publish installs that relation without
+/// re-deriving it. The span then names a place in a file this merge did not
+/// publish.
+///
+/// Each evidence record follows the file its own span names. A call that
+/// crosses two files can take its site from one side and leave the other
+/// record where it is. A relation the two sides disagree about is a
+/// settlement's and is left alone. A file that is still conflicted is not in
+/// the merged tree, so its span stays until that file is settled.
+fn align_unchanged_relations_with_their_artifacts(
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+    base_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    ours_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    theirs_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    merged_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    merged_relations: &mut std::collections::HashMap<kin_model::RelationId, kin_model::Relation>,
+) {
+    let base_by_path = artifact_identities_by_path(base_artifacts);
+    let ours_by_path = artifact_identities_by_path(ours_artifacts);
+    let theirs_by_path = artifact_identities_by_path(theirs_artifacts);
+    let sides = [
+        (MergeSide::Ours, ours_artifacts, &ours_by_path),
+        (MergeSide::Theirs, theirs_artifacts, &theirs_by_path),
+        (MergeSide::Base, base_artifacts, &base_by_path),
+    ];
+
+    let mut aligned = Vec::new();
+    for relation_id in merged_relations.keys().copied() {
+        let ours = ours_state.relations.get(&relation_id);
+        let theirs = theirs_state.relations.get(&relation_id);
+        let (Some(ours), Some(theirs)) = (ours, theirs) else {
+            continue;
+        };
+        if ours == theirs || !kin_core::workspace_semantics::relation_content_agrees(ours, theirs) {
+            continue;
+        }
+        let Some(current) = merged_relations.get(&relation_id) else {
+            continue;
+        };
+        let mut updated = current.clone();
+        let mut changed = false;
+        for (index, evidence) in updated.evidence.iter_mut().enumerate() {
+            let Some(file) = evidence
+                .source_span
+                .as_ref()
+                .map(|span| span.file.0.clone())
+            else {
+                continue;
+            };
+            let Some(side) = publishing_side_for_path(file.as_bytes(), &sides, merged_artifacts)
+            else {
+                continue;
+            };
+            let donor = graph_side(&side, base_state, ours_state, theirs_state)
+                .relations
+                .get(&relation_id);
+            let Some(donor_span) = donor
+                .and_then(|relation| relation.evidence.get(index))
+                .and_then(|evidence| evidence.source_span.clone())
+            else {
+                continue;
+            };
+            if donor_span.file.0 != file || evidence.source_span.as_ref() == Some(&donor_span) {
+                continue;
+            }
+            evidence.source_span = Some(donor_span);
+            changed = true;
+        }
+        if changed {
+            aligned.push((relation_id, updated));
+        }
+    }
+    for (relation_id, relation) in aligned {
+        merged_relations.insert(relation_id, relation);
+    }
+}
+
+/// The side whose published bytes occupy `path`, when exactly one merged
+/// artifact does.
+fn publishing_side_for_path(
+    path: &[u8],
+    sides: &[(
+        MergeSide,
+        &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+        &std::collections::HashMap<&[u8], Vec<kin_model::ArtifactId>>,
+    )],
+    merged_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> Option<MergeSide> {
+    let mut identities = BTreeSet::new();
+    for (_, _, by_path) in sides {
+        if let Some(claimants) = by_path.get(path) {
+            identities.extend(claimants.iter().copied());
+        }
+    }
+    let mut published = identities
+        .into_iter()
+        .filter_map(|identity| merged_artifacts.get(&identity));
+    let first = published.next()?;
+    if published.next().is_some() {
+        return None;
+    }
+    sides.iter().find_map(|(side, artifacts, _)| {
+        (artifacts.get(&first.artifact_id) == Some(first)).then_some(*side)
+    })
+}
+
 /// One side's paths, keyed by their bytes, so an entity's file resolves to the
 /// identity that side gave it in one lookup.
 ///
@@ -2529,12 +2935,16 @@ fn collect_dangling_endpoints(
                     ours.entities.contains_key(&entity) || theirs.entities.contains_key(&entity);
                 if !survives && existed && !survives_either_side_entities.contains(&entity) {
                     dangling.entry(*id).or_insert_with(|| {
-                        let name = describe_entity(&ours.entities, &theirs.entities, &entity);
+                        let name = ours
+                            .entities
+                            .get(&entity)
+                            .or_else(|| theirs.entities.get(&entity))
+                            .map(crate::entity_words::entity_words);
                         (
                             *endpoint,
                             format!(
                                 "one branch removed {}, which the other branch still relates to",
-                                name.unwrap_or_else(|| entity.to_string())
+                                name.unwrap_or_else(|| format!("entity {entity}"))
                             ),
                         )
                     });
@@ -2547,16 +2957,17 @@ fn collect_dangling_endpoints(
                     ours.tree.get(&artifact).is_some() || theirs.tree.get(&artifact).is_some();
                 if !survives && existed && !survives_either_side_artifacts.contains(&artifact) {
                     dangling.entry(*id).or_insert_with(|| {
-                        let path = ours
+                        let removed = ours
                             .tree
                             .get(&artifact)
                             .or_else(|| theirs.tree.get(&artifact))
-                            .map(|resolved| resolved.path.to_string())
-                            .unwrap_or_else(|| render_artifact(&artifact));
+                            .map(|resolved| crate::entity_words::unit_words(&resolved.path))
+                            .unwrap_or_else(|| format!("artifact {}", render_artifact(&artifact)));
                         (
                             *endpoint,
                             format!(
-                                "one branch removed {path}, which the other branch still relates to"
+                                "one branch removed {removed}, which the other branch still \
+                                 relates to"
                             ),
                         )
                     });
@@ -2751,13 +3162,14 @@ fn publish(
         &authority.manager,
     )
     .context("validate exact workspace projection before merging")?;
-    if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::projection_conflict(format!(
-            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
-             reconcile them into graph authority or discard them before merging",
-            drift.len()
-        ))
-        .into());
+    if !drift.is_clean() {
+        return Err(
+            kin_core::KinError::projection_conflict(crate::entity_words::drift_refusal(
+                &drift.drifted_paths,
+                "take them in with `kin admit` or discard them before merging",
+            ))
+            .into(),
+        );
     }
     // The repository transaction is durable authority. The in-process graph is a
     // derived query view, and a published merge never reached it: the two
@@ -2925,6 +3337,7 @@ fn open_conflicted_merge(
         merge_transaction_delta: Some(delta),
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction
         .validate()
@@ -3005,14 +3418,15 @@ pub(crate) fn restore_point(workspace: &WorkspaceState) -> MergeWorkspaceRestore
 /// Artifact, Path. Presenting it verbatim spends the whole budget on the rows
 /// that name least. Measured on the rc062a stranger's merge, 22 entity rows and
 /// 3 relation rows filled all 25 lines and the two artifact rows, the only rows
-/// naming a file a reader can open, were never printed at all. The 52 relation
-/// rows that crowded them out carry a bare identity and nothing else, because
-/// the relation composition passes no label.
+/// naming the members a reader edits, were never printed at all. The 52
+/// relation rows that crowded them out carry a bare identity and nothing else,
+/// because the relation composition passes no label.
 ///
-/// So a listing leads with location and narrows from there: a contested path,
-/// then the artifacts, then the entities, then the relations. Ranked by name
-/// rather than by reversing the declaration order, so a new subject variant is
-/// a deliberate edit here rather than a silent reordering of every listing.
+/// So a listing leads with the widest subject and narrows from there: a
+/// contested place, then the artifacts, then the entities, then the relations.
+/// Ranked by name rather than by reversing the declaration order, so a new
+/// subject variant is a deliberate edit here rather than a silent reordering of
+/// every listing.
 fn presentation_rank(subject: &MergeConflictSubject) -> u8 {
     match subject {
         MergeConflictSubject::Path { .. } => 0,
@@ -3026,7 +3440,7 @@ fn presentation_rank(subject: &MergeConflictSubject) -> u8 {
 /// it dropped in the same vocabulary the rows themselves use.
 fn subject_kind(subject: &MergeConflictSubject) -> &'static str {
     match subject {
-        MergeConflictSubject::Path { .. } => "path",
+        MergeConflictSubject::Path { .. } => "contested place",
         MergeConflictSubject::Artifact { .. } => "artifact",
         MergeConflictSubject::Entity { .. } => "entity",
         MergeConflictSubject::Relation { .. } => "relation",
@@ -3094,9 +3508,12 @@ pub(crate) fn render_entry(entry: &MergeConflictEntry) -> String {
         }
         // The claimants are the whole conflict, and naming an owner is the only
         // way to settle it, so the listing names them. A caller who cannot read
-        // the claimants from the listing has no selector to pass back.
+        // the claimants from the listing has no selector to pass back. The
+        // sentence names the claimants by identity and the place by the entity
+        // projected there; the place itself appears only as the argument
+        // `--keep-path` takes back.
         MergeDivergence::PathCollision { artifacts } => format!(
-            "{} distinct artifacts occupy this path after composing both sides ({}); keep one \
+            "{} distinct entities claim this place after composing both sides ({}); keep one \
              with `kin resolve --keep-path {}=<ARTIFACT>`",
             artifacts.len(),
             artifacts
@@ -3134,6 +3551,10 @@ pub(crate) fn render_artifact(artifact: &kin_model::ArtifactId) -> String {
 /// the wrapper form the resolver refuses, quoted by a message the caller is
 /// meant to act on. Routing these sites here keeps one identity form across
 /// every surface, including the refusals.
+///
+/// This is a selector, the form the resolver takes back, which for a
+/// contested place is the place itself. A sentence that has the entry names
+/// its subject with [`render_subject`] instead.
 pub(crate) fn render_subject_identity(subject: &MergeConflictSubject) -> String {
     match subject {
         MergeConflictSubject::Entity { entity } => format!("entity {entity}"),
@@ -3145,21 +3566,71 @@ pub(crate) fn render_subject_identity(subject: &MergeConflictSubject) -> String 
     }
 }
 
+/// Name a subject in a sentence: an entity by its name, a member by its kind
+/// and its own name, a contested place by the entity projected there, each
+/// beside the identity the resolver accepts back.
+///
+/// The label an entry records is structured detail: the resolver matches
+/// selectors against it, so it keeps the place it was composed with. Only the
+/// name is read out of it here.
 pub(crate) fn render_subject(entry: &MergeConflictEntry) -> String {
     match (&entry.subject, &entry.label) {
-        (MergeConflictSubject::Entity { entity }, Some(name)) => {
-            format!("entity {name} ({entity})")
+        (MergeConflictSubject::Entity { entity }, Some(label)) => {
+            format!("entity `{}` ({entity})", entity_name_of_label(label))
         }
-        (MergeConflictSubject::Artifact { artifact }, Some(path)) => {
-            format!("artifact {path} ({})", render_artifact(artifact))
+        (MergeConflictSubject::Artifact { artifact }, Some(place)) => {
+            format!("{} ({})", member_words(place), render_artifact(artifact))
+        }
+        (MergeConflictSubject::Path { path }, _) => {
+            format!(
+                "contested place of {}",
+                crate::entity_words::unit_words(path)
+            )
         }
         (subject, _) => render_subject_identity(subject),
     }
 }
 
-/// Name a conflicting entity by whichever side still carries it, preferring
+/// Name one of several conflicts a selector matched, told apart from the
+/// others: an entity by its name and the unit that holds it, beside the
+/// identity the resolver accepts back.
+///
+/// The candidates of an ambiguous name share that name, so [`render_subject`]
+/// alone would list the same words twice and leave only the identities to
+/// tell them apart. The unit is named as an entity, by its kind and its own
+/// name, never by where it is projected.
+pub(crate) fn render_candidate(entry: &MergeConflictEntry) -> String {
+    match (&entry.subject, entry.label.as_deref()) {
+        (MergeConflictSubject::Entity { entity }, Some(label)) => match label.split_once(" in ") {
+            Some((name, unit)) => format!("entity `{name}` in {} ({entity})", member_words(unit)),
+            None => render_subject(entry),
+        },
+        _ => render_subject(entry),
+    }
+}
+
+/// The entity name an entry's label carries. A label is composed as
+/// `<name> in <unit>` wherever the entity carries a span, which is how the
+/// resolver reads it too, and as the bare name otherwise.
+fn entity_name_of_label(label: &str) -> &str {
+    label.split_once(" in ").map_or(label, |(name, _)| name)
+}
+
+/// The member an artifact entry's label places, named by kind and name.
+fn member_words(place: &str) -> String {
+    match kin_model::RepoPath::from_utf8(place) {
+        Ok(path) => crate::entity_words::unit_words(&path),
+        Err(_) => format!("`{}`", place.rsplit('/').next().unwrap_or(place)),
+    }
+}
+
+/// Label a conflicting entity by whichever side still carries it, preferring
 /// the active branch. A removal on one side leaves only the other side able to
 /// describe what was removed.
+///
+/// The label is structured: the resolver matches a selector against the whole
+/// of it or against the name before ` in `, so it keeps that form. Sentences
+/// read only the name out of it ([`render_subject`]).
 fn describe_entity(
     ours: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
     theirs: &std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
@@ -3340,8 +3811,9 @@ mod tests {
     }
 
     /// One unresolved entry of each kind, labelled the way each composition
-    /// labels it: an entity by name and file, an artifact by path, a relation by
-    /// nothing at all, which is what the relation composition passes.
+    /// labels it: an entity by its name and the unit it is declared in, an
+    /// artifact by where it is projected, a relation by nothing at all, which
+    /// is what the relation composition passes.
     fn entry_of(kind: &str, index: usize) -> MergeConflictEntry {
         let (subject, label) = match kind {
             "path" => (
@@ -3354,13 +3826,13 @@ mod tests {
                 MergeConflictSubject::Artifact {
                     artifact: ArtifactId::new(),
                 },
-                Some(format!("ledger/file{index}.py")),
+                Some(format!("ledger/entry{index}.py")),
             ),
             "entity" => (
                 MergeConflictSubject::Entity {
                     entity: kin_model::EntityId::new(),
                 },
-                Some(format!("symbol{index} in ledger/file0.py")),
+                Some(format!("symbol{index} in ledger/entry0.py")),
             ),
             "relation" => (
                 MergeConflictSubject::Relation {
@@ -3405,21 +3877,22 @@ mod tests {
         entries
     }
 
-    /// The rows that name a file a reader can open have to survive the budget.
+    /// The rows that name the members a reader edits have to survive the
+    /// budget.
     ///
     /// On the stranger's own merge they did not: entries arrive in canonical
     /// subject order, artifacts sort last, and 22 entity rows plus 3 relation
     /// rows filled all 25 lines before either artifact row was reached. The
-    /// listing named 76 conflicts and not one of the files they were in.
+    /// listing named 76 conflicts and not one of the members they were in.
     #[test]
-    fn a_listing_leads_with_the_rows_that_name_a_file() {
+    fn a_listing_leads_with_the_rows_that_name_a_member() {
         let entries = stranger_conflict_shape();
         let borrowed: Vec<&MergeConflictEntry> = entries.iter().collect();
         let lines = render_conflict_lines(&borrowed);
 
         let named: Vec<&String> = lines
             .iter()
-            .filter(|line| line.contains("artifact "))
+            .filter(|line| line.starts_with("  - source `entry"))
             .collect();
         assert_eq!(
             named.len(),
@@ -3430,7 +3903,7 @@ mod tests {
         // budget: a build that sorted them to positions 24 and 25 would satisfy
         // the count above while still burying them.
         assert!(
-            lines[0].contains("artifact ") && lines[1].contains("artifact "),
+            lines[0].starts_with("  - source `entry") && lines[1].starts_with("  - source `entry"),
             "the artifact rows come first: {:?}",
             &lines[..3]
         );
@@ -3485,15 +3958,23 @@ mod tests {
         let kinds: Vec<&str> = lines
             .iter()
             .map(|line| {
-                for kind in ["path", "artifact", "entity", "relation"] {
-                    if line.contains(&format!("  - {kind} ")) {
+                for (kind, lead) in [
+                    ("contested place", "  - contested place of "),
+                    ("artifact", "  - source `"),
+                    ("entity", "  - entity `"),
+                    ("relation", "  - relation "),
+                ] {
+                    if line.starts_with(lead) {
                         return kind;
                     }
                 }
                 panic!("a listing line names no subject kind: {line}");
             })
             .collect();
-        assert_eq!(kinds, vec!["path", "artifact", "entity", "relation"]);
+        assert_eq!(
+            kinds,
+            vec!["contested place", "artifact", "entity", "relation"]
+        );
     }
 
     /// The control. A listing that elides nothing must say nothing about
@@ -3553,10 +4034,22 @@ mod tests {
             rendered.contains(&render_artifact(&right)),
             "listing names its second claimant: {rendered}"
         );
+        // The place is the argument `--keep-path` takes back, and that is the
+        // only place it appears. The sentence names the member projected there.
+        let (sentence, command) = rendered
+            .split_once("keep one with")
+            .expect("the listing names the command that settles it");
         assert!(
-            rendered.contains("docs/notes.md"),
-            "listing names the contested path: {rendered}"
+            command.contains("--keep-path docs/notes.md="),
+            "listing hands back the selector --keep-path accepts: {rendered}"
         );
+        assert!(
+            sentence.contains("Markdown `notes.md`"),
+            "listing names the contested member by kind and name: {rendered}"
+        );
+        assert!(!sentence.contains("docs/notes.md"), "{rendered}");
+        assert!(!sentence.contains("path"), "{rendered}");
+        assert!(!sentence.contains("file"), "{rendered}");
         // A wrapper rendering contains the bare identity as a substring, so the
         // assertions above alone would pass on a listing nothing can select
         // from. The claimants have to appear in the form the resolver accepts.
@@ -3564,6 +4057,76 @@ mod tests {
             !rendered.contains("ArtifactId("),
             "listing carries identities in the form the resolver accepts: {rendered}"
         );
+    }
+
+    /// A listing names an entity by its name and a member by its kind and its
+    /// own name, each beside the identity the resolver takes back, and never
+    /// the place either is projected at. A preview carries the same words.
+    #[test]
+    fn a_conflict_listing_names_entities_and_members_never_their_place() {
+        let entity = kin_model::EntityId::new();
+        let artifact = ArtifactId::new();
+        let entry = |subject, label: &str| MergeConflictEntry {
+            subject,
+            divergence: MergeDivergence::ChangedBothSides,
+            base: MergeSideValue::Absent,
+            ours: MergeSideValue::Absent,
+            theirs: MergeSideValue::Absent,
+            label: Some(label.to_string()),
+            resolution: MergeEntryResolution::Unresolved,
+        };
+        let entries = [
+            entry(
+                MergeConflictSubject::Entity { entity },
+                "sign in pkg/signing/core.py",
+            ),
+            entry(
+                MergeConflictSubject::Artifact { artifact },
+                "docs/guide/notes.md",
+            ),
+        ];
+        let borrowed: Vec<&MergeConflictEntry> = entries.iter().collect();
+        let listing = render_conflict_lines(&borrowed).join("\n");
+
+        assert!(
+            listing.contains(&format!("entity `sign` ({entity})")),
+            "{listing}"
+        );
+        assert!(
+            listing.contains(&format!(
+                "Markdown `notes.md` ({})",
+                render_artifact(&artifact)
+            )),
+            "{listing}"
+        );
+        for place in ["pkg/signing", "core.py", "docs/guide", "path", "file"] {
+            assert!(!listing.contains(place), "{place} in {listing}");
+        }
+
+        // The preview's human words match; its structured place survives only
+        // where a client reads it, on the artifact.
+        let preview = preview_conflict(&entries[0]);
+        assert_eq!(
+            preview.scope,
+            MergeConflictScope::Entity {
+                entity,
+                name: Some("sign".to_string()),
+            }
+        );
+        assert!(
+            !preview.detail.contains("pkg/signing"),
+            "{}",
+            preview.detail
+        );
+        let preview = preview_conflict(&entries[1]);
+        assert_eq!(
+            preview.scope,
+            MergeConflictScope::Artifact {
+                artifact,
+                path: Some("docs/guide/notes.md".to_string()),
+            }
+        );
+        assert!(!preview.detail.contains("docs/guide"), "{}", preview.detail);
     }
 
     /// Taking a side for everything names a subject without the entry that
@@ -3649,7 +4212,9 @@ mod tests {
             visibility: kin_model::Visibility::Public,
             role: kin_model::EntityRole::Source,
             doc_summary: None,
-            metadata: kin_model::EntityMetadata { extra },
+            metadata: kin_model::EntityMetadata {
+                extra: extra.into(),
+            },
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
@@ -4460,10 +5025,168 @@ mod tests {
             "an endpoint present on both sides survives whichever side settles, so no row may \
              describe a removal: {removals:#?}"
         );
+
         assert_eq!(
             conflicts.len(),
             1,
             "the one real conflict is still the only one reported: {conflicts:#?}"
+        );
+    }
+
+    fn contains_edge(
+        id: RelationId,
+        src: ArtifactId,
+        dst: ArtifactId,
+        start: usize,
+        positional: Option<u32>,
+    ) -> Relation {
+        Relation {
+            id,
+            kind: RelationKind::Contains,
+            src: GraphNodeId::Artifact(src),
+            dst: GraphNodeId::Artifact(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![kin_model::RelationEvidence {
+                source_span: Some(kin_model::SourceSpan {
+                    file: kin_model::FilePathId::new("pkg/core.py"),
+                    start_byte: start,
+                    end_byte: start + 24,
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 2,
+                    end_col: 0,
+                }),
+                call_shape: positional.map(|positional| {
+                    kin_model::CallArgShape::new(positional, Vec::new(), false, false)
+                }),
+                ..kin_model::RelationEvidence::default()
+            }],
+        }
+    }
+
+    /// One changed function moves the spans of the edges in its file. Those
+    /// edges are the same edges, so the parked listing carries no relation row.
+    ///
+    /// The artifact still conflicts: the file's bytes are a decision. A
+    /// predicate that dropped every conflict would pass the relation assertion
+    /// and hide that decision.
+    #[test]
+    fn a_span_only_relation_is_not_its_own_conflict() {
+        let target_id = ArtifactId::new();
+        let anchor_id = ArtifactId::new();
+        let relation_id = RelationId::new();
+        let state = |blob: u8, start: usize| {
+            graph_state(
+                artifact(target_id, "pkg/core.py", blob),
+                artifact(anchor_id, "pkg/mod_a.py", 0x20),
+                contains_edge(relation_id, anchor_id, target_id, start, None),
+            )
+        };
+        let composed = compose_merge(&state(0x10, 0), &state(0x11, 16), &state(0x12, 40))
+            .expect("span-only edges compose");
+        let relations: Vec<_> = composed
+            .conflicts
+            .iter()
+            .filter(|entry| matches!(entry.subject, MergeConflictSubject::Relation { .. }))
+            .collect();
+        assert!(
+            relations.is_empty(),
+            "a span moved by the edit is not a relation conflict: {relations:#?}"
+        );
+        assert!(
+            composed
+                .conflicts
+                .iter()
+                .any(|entry| matches!(entry.subject, MergeConflictSubject::Artifact { .. })),
+            "the file both sides changed is still a conflict: {:#?}",
+            composed.conflicts
+        );
+    }
+
+    /// The control for the span rule. A call that took a different shape on
+    /// each side is a conflict, or the rule would publish one side's call as
+    /// the other's.
+    #[test]
+    fn a_call_shape_disagreement_is_still_a_relation_conflict() {
+        let target_id = ArtifactId::new();
+        let anchor_id = ArtifactId::new();
+        let relation_id = RelationId::new();
+        let state = |positional: u32| {
+            graph_state(
+                artifact(target_id, "pkg/core.py", 0x10),
+                artifact(anchor_id, "pkg/mod_a.py", 0x20),
+                contains_edge(relation_id, anchor_id, target_id, 0, Some(positional)),
+            )
+        };
+        let composed = compose_merge(&state(0), &state(1), &state(2))
+            .expect("a real relation disagreement composes");
+        let relations: Vec<_> = composed
+            .conflicts
+            .iter()
+            .filter(|entry| matches!(entry.subject, MergeConflictSubject::Relation { .. }))
+            .collect();
+        assert_eq!(
+            relations.len(),
+            1,
+            "a different call shape stays a relation conflict: {relations:#?}"
+        );
+    }
+
+    /// Composition takes ours when the spans are the only difference. The file
+    /// publishes from theirs, and the edge has to follow it.
+    #[test]
+    fn a_relation_neither_branch_edited_follows_the_file_that_publishes() {
+        let target_id = ArtifactId::new();
+        let anchor_id = ArtifactId::new();
+        let relation_id = RelationId::new();
+        let state = |blob: u8, start: usize| {
+            graph_state(
+                artifact(target_id, "pkg/core.py", blob),
+                artifact(anchor_id, "pkg/mod_a.py", 0x20),
+                contains_edge(relation_id, anchor_id, target_id, start, None),
+            )
+        };
+        let base_state = state(0xa0, 0);
+        let ours_state = state(0xa0, 10);
+        let theirs_state = state(0xb0, 30);
+        let composed = compose_merge(&base_state, &ours_state, &theirs_state)
+            .expect("a one-sided file edit composes");
+        assert!(
+            composed.conflicts.is_empty(),
+            "a one-sided file edit parks nothing: {:#?}",
+            composed.conflicts
+        );
+        assert_eq!(
+            composed
+                .merged_relations
+                .get(&relation_id)
+                .and_then(|relation| relation.evidence[0].source_span.as_ref())
+                .map(|span| span.start_byte),
+            Some(10),
+            "composition alone leaves the edge on ours"
+        );
+
+        let mut merged_relations = composed.merged_relations;
+        align_unchanged_relations_with_their_artifacts(
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &artifacts_by_id(&base_state.tree),
+            &artifacts_by_id(&ours_state.tree),
+            &artifacts_by_id(&theirs_state.tree),
+            &composed.merged_artifacts,
+            &mut merged_relations,
+        );
+        assert_eq!(
+            merged_relations
+                .get(&relation_id)
+                .and_then(|relation| relation.evidence[0].source_span.as_ref())
+                .map(|span| span.start_byte),
+            Some(30),
+            "the edge publishes the span of the file that publishes"
         );
     }
 

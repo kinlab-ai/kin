@@ -3,10 +3,13 @@
 
 use super::*;
 
+// Keep declaration spans equal across the real body conflict. Contains edges
+// preserve their exact syntax evidence, which this certificate test leaves
+// unchanged instead of introducing a separate relation settlement.
 const CORE_BASE: &[u8] =
-    b"def summarize(rows):\n    return len(rows)\n\n\ndef helper(x):\n    return x + 1\n";
+    b"def summarize(rows):\n    return len(rows) + 1\n\n\ndef helper(x):\n    return x + 1\n";
 const CORE_OURS: &[u8] =
-    b"def summarize(rows):\n    return len(rows) + 100\n\n\ndef helper(x):\n    return x + 1\n";
+    b"def summarize(rows):\n    return len(rows) + 2\n\n\ndef helper(x):\n    return x + 1\n";
 const CORE_THEIRS: &[u8] =
     b"def summarize(rows):\n    return len(rows) * 2\n\n\ndef helper(x):\n    return x + 1\n";
 
@@ -33,6 +36,47 @@ async fn post(
         serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)})),
     )
+}
+
+/// An imported tree may already be committed. Accept that exact idempotent
+/// refusal, or a newly published overlay bound to the current branch head.
+async fn settle_post_import_overlay(state: &Arc<DaemonState>) {
+    let before = branch_change(state);
+    let (status, body) = post(
+        state,
+        "/commands/commit",
+        &json!({
+            "operation_id": kin_model::OperationId::new(), "timestamp": Timestamp::now(),
+            "author": "merge test", "message": "settle post-import overlay"
+        }),
+    )
+    .await;
+    let after = branch_change(state);
+    match status {
+        StatusCode::OK => {
+            assert_ne!(
+                after, before,
+                "a successful commit publishes a successor: {body}"
+            );
+            assert_eq!(body["change_id"], after.to_string(), "{body}");
+        }
+        StatusCode::CONFLICT => {
+            assert_eq!(
+                after, before,
+                "an idempotent refusal preserves the head: {body}"
+            );
+            assert_eq!(
+                body,
+                json!({
+                    "error": "nothing_to_commit",
+                    "change_id": before.to_string(),
+                    "message": format!("nothing to commit: this tree is already committed as {before}"),
+                }),
+                "only the exact already-committed tree refusal settles the fixture"
+            );
+        }
+        _ => panic!("post-import settlement failed: {status} {body}"),
+    }
 }
 
 fn fixture(genuine_removal: bool) -> (tempfile::TempDir, kin_core::KinLayout, Arc<DaemonState>) {
@@ -75,7 +119,7 @@ fn fixture(genuine_removal: bool) -> (tempfile::TempDir, kin_core::KinLayout, Ar
     std::fs::write(
         root.join("pkg/core.py"),
         if genuine_removal {
-            b"def summarize(rows):\n    return len(rows)\n"
+            b"def summarize(rows):\n    return len(rows) + 1\n"
         } else {
             CORE_OURS
         },
@@ -93,19 +137,28 @@ fn fixture(genuine_removal: bool) -> (tempfile::TempDir, kin_core::KinLayout, Ar
 async fn body_bound_parse_certificates_do_not_become_authored_merge_conflicts() {
     for side in [kin_model::MergeSide::Ours, kin_model::MergeSide::Theirs] {
         let (repository, layout, state) = fixture(false);
-        let _ = post(
-            &state,
-            "/commands/commit",
-            &json!({
-                "operation_id": kin_model::OperationId::new(), "timestamp": Timestamp::now(),
-                "author": "merge test", "message": "settle post-import overlay"
-            }),
-        )
-        .await;
+        settle_post_import_overlay(&state).await;
         let previous = state
             .graph
             .resolve_graph_at(&branch_change(&state))
             .unwrap();
+        let artifact = previous
+            .tree
+            .artifact_at_path(&kin_model::RepoPath::from_utf8("pkg/core.py").unwrap())
+            .unwrap();
+        let certificate_id = kin_index::parse_coverage_relation_id(artifact.artifact_id);
+        let certificate = previous.relations.get(&certificate_id).unwrap();
+        assert!(kin_index::is_parse_coverage_relation(
+            certificate,
+            "pkg/core.py",
+            artifact.artifact_id
+        ));
+        assert_eq!(
+            kin_index::parse_coverage_source_digest(certificate),
+            Some(kin_model::Hash256::from_bytes(
+                kin_blobs::digest(CORE_OURS).0
+            ))
+        );
         let inherited: std::collections::HashMap<_, _> = previous
             .relations
             .values()
@@ -157,6 +210,13 @@ async fn body_bound_parse_certificates_do_not_become_authored_merge_conflicts() 
                 kin_model::MergeConflictSubject::Artifact { .. }
             )),
             "actual file conflict stays visible"
+        );
+        assert!(
+            !entries.iter().any(|entry| matches!(
+                entry.subject,
+                kin_model::MergeConflictSubject::Relation { relation } if relation == certificate_id
+            )),
+            "the verified body-bound certificate is derived from the settled body"
         );
         assert!(entries.iter().all(|entry| !matches!(entry.subject, kin_model::MergeConflictSubject::Relation { .. })), "derived source certificates must not become independently authored conflicts: {entries:#?}");
         for action in [
@@ -240,15 +300,7 @@ async fn body_bound_parse_certificates_do_not_become_authored_merge_conflicts() 
 #[serial_test::serial(repository_commit)]
 async fn a_real_removed_endpoint_still_creates_a_relation_conflict() {
     let (_repository, _layout, state) = fixture(true);
-    let _ = post(
-        &state,
-        "/commands/commit",
-        &json!({
-            "operation_id": kin_model::OperationId::new(), "timestamp": Timestamp::now(),
-            "author": "merge test", "message": "settle post-import overlay"
-        }),
-    )
-    .await;
+    settle_post_import_overlay(&state).await;
     let request = kin_cli::commands::merge::MergeRequest {
         source: kin_model::RefName::branch(b"feature").unwrap(),
         operation_id: kin_model::OperationId::new(),

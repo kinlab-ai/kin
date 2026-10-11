@@ -226,10 +226,6 @@ pub(super) fn discover(
             .filter(|s| name(s))
             .ok_or("unsupported Cargo package name")?;
         let edition = edition(manifest, package, values)?;
-        let manual = ["lib", "bin", "example", "test", "bench"]
-            .iter()
-            .any(|k| value.get(*k).is_some());
-        let default_auto = edition != "2015" || !manual;
         let base = parent(manifest);
         let mut selected: BTreeMap<(String, String), String> = BTreeMap::new();
         for kind in ["lib", "bin", "example", "test", "bench"] {
@@ -287,6 +283,10 @@ pub(super) fn discover(
                 "test" => "autotests",
                 _ => "autobenches",
             };
+            // Cargo decides this kind by kind: a 2015-edition package that
+            // writes out targets of a kind infers no more of that kind, and
+            // every other kind is still inferred.
+            let default_auto = edition != "2015" || value.get(kind).is_none();
             if !flag(package, auto_key, default_auto)? {
                 continue;
             }

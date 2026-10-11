@@ -526,11 +526,17 @@ fn a_true_or_unset_pure_kin_value_runs() {
 /// call it spends its turns being refused.
 #[test]
 fn the_system_prompt_names_only_the_write_tool_the_belt_carries() {
-    let mutate = kin_tool(0, "kin_mutate", None);
-    let locate = kin_tool(0, "semantic_locate", None);
+    let mutate = kin_tool(0, "mutate", None);
+    let locate = kin_tool(0, "locate", None);
 
     let entity = crate::run::system_prompt_for(&Belt::new(vec![mutate.clone(), locate.clone()]));
-    assert!(entity.contains("mcp__kin__kin_mutate") && entity.contains("name the entity"));
+    assert!(entity.contains("mcp__kin__mutate") && entity.contains("name the entity"));
+    // A server that serves the name the verb replaced carries the write path too.
+    let legacy = crate::run::system_prompt_for(&Belt::new(vec![
+        kin_tool(0, "kin_mutate", None),
+        locate.clone(),
+    ]));
+    assert!(legacy.contains("name the entity"), "{legacy}");
 
     let read_only = crate::run::system_prompt_for(&Belt::new(vec![locate.clone()]));
     assert!(
@@ -538,7 +544,7 @@ fn the_system_prompt_names_only_the_write_tool_the_belt_carries() {
         "{read_only}"
     );
     assert!(
-        !read_only.contains("kin_mutate") && !read_only.contains("edit_file"),
+        !read_only.contains("mutate") && !read_only.contains("edit_file"),
         "{read_only}"
     );
 
@@ -586,9 +592,9 @@ fn the_default_prompt_teaches_entity_changes_and_offers_no_file_verb() {
         prompt.contains(
             "Your tools are the ones on your belt and no others: this repository is a graph, \
              and a change to it is a change to an entity. Every change goes through \
-             mcp__kin__kin_mutate, including a new entity if its operations offer one; there \
-             is no file creation. If the change needs something kin_mutate cannot make, stop \
-             and say so."
+             mcp__kin__mutate, including a new entity if its operations offer one; there is \
+             no file creation. If the change needs something mutate cannot make, stop and \
+             say so."
         ),
         "the prompt must state that there is no file creation: {prompt}"
     );
@@ -605,18 +611,20 @@ fn lexical_lookup_is_on_the_default_belt_and_named_in_its_routing_rule() {
     let prompt =
         crate::run::system_prompt_for(&Belt::new(vec![locate.clone(), lexical_lookup.clone()]));
     assert!(
-        prompt.contains("mcp__kin__lexical_lookup"),
-        "the routing rule must name the tool: {prompt}"
+        prompt.contains("mcp__kin__locate with mode \"literal\""),
+        "the routing rule must name the tool and its mode: {prompt}"
     );
     assert!(
         prompt.contains("inconclusive verdict"),
         "the routing rule must name the second trigger (an inconclusive structural verdict): {prompt}"
     );
 
-    assert!(
-        !belt::is_opt_in("lexical_lookup"),
-        "lexical_lookup must ride the default belt, not KIN_AGENT_BELT=wide"
-    );
+    for literal in ["lexical_lookup", "locate"] {
+        assert!(
+            !belt::is_opt_in(literal),
+            "{literal} must ride the default belt, not KIN_AGENT_BELT=wide"
+        );
+    }
 
     let belt = Belt::new(vec![locate, lexical_lookup]);
     assert_eq!(
@@ -668,6 +676,47 @@ fn the_harness_fills_in_the_session_a_mutate_needs_and_leaves_every_other_call_a
         crate::run::with_harness_session(&mutate, "kin_mutate", None),
         mutate
     );
+}
+
+/// A server that serves verbs gets the same harness: its `mutate` is sent with
+/// the run's session, its `transaction` never reaches the model, and its
+/// `session` reaches the model as the toolchain run alone, always sent as
+/// `exec` under the run's own session whatever action the model wrote.
+#[test]
+fn a_verb_serving_server_gets_the_same_harness() {
+    let mutate = json!({ "operations": [] });
+    let sent = crate::run::with_harness_session(&mutate, "mutate", Some("sess-1"));
+    assert_eq!(sent["session_id"], json!("sess-1"));
+
+    let run = json!({ "argv": ["go", "test", "./..."], "action": "end" });
+    let sent = crate::run::with_harness_session(&run, belt::SESSION_VERB, Some("sess-1"));
+    assert_eq!(sent["action"], json!("exec"));
+    assert_eq!(sent["session_id"], json!("sess-1"));
+    assert_eq!(sent["argv"], run["argv"]);
+
+    assert!(belt::is_harness_owned("transaction"));
+    assert!(!belt::is_harness_owned(belt::SESSION_VERB));
+    assert!(belt::is_opt_in("neighbors") && belt::is_opt_in("history"));
+    assert!(belt::is_mutate("mutate") && belt::is_mutate("kin_mutate"));
+
+    let declared = json!({
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["start", "heartbeat", "end", "exec"]},
+            "session_id": {"type": "string"},
+            "vendor": {"type": "string"},
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "env": {"type": "object"},
+            "timeout_secs": {"type": "integer"}
+        }
+    });
+    let (description, schema) = belt::session_exec_form(&declared);
+    assert!(description.contains("Build, test or run"), "{description}");
+    let properties = schema["properties"].as_object().unwrap();
+    let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["argv", "env", "timeout_secs"]);
+    assert_eq!(schema["required"], json!(["argv"]));
 }
 
 #[test]

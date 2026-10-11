@@ -325,7 +325,9 @@ pub async fn run(
         if let Some(error) = response.error {
             anyhow::bail!(error);
         }
-        for line in response.lines {
+        for line in
+            crate::plain_words::in_sections(&response.lines, &["Call sites", "External calls"])
+        {
             println!("{line}");
         }
     }
@@ -361,6 +363,9 @@ impl kin_context::ContextProjectionProvider for GraphContextProvider {
         entity: &Entity,
         limits: kin_context::ProjectionLimits,
     ) -> kin_context::Result<kin_context::BodyCandidate> {
+        if let Err(reason) = kin_model::require_targeted_source(entity) {
+            return Ok(kin_context::BodyCandidate::Unavailable { reason });
+        }
         if entity.file_origin.is_none() || entity.span.is_none() {
             return Ok(kin_context::BodyCandidate::Unavailable {
                 reason: "graph source coordinates are unavailable".into(),
@@ -451,13 +456,16 @@ fn build_context_response_inner(
         return Ok(refusal_response(lines, &request.entity));
     }
 
-    // A member name several owners share names none of them, so the pack is
-    // refused with every candidate rather than built around one of them.
-    let shared = shared_member_focal_candidates(graph, &request.entity)?.map(|candidates| {
-        crate::entity_identity::name_candidate_lines(
+    // A name that stands for several distinct entities names none of them, so
+    // the pack is refused with every candidate rather than built around one of
+    // them.
+    let shared = ambiguous_focal_candidates(graph, &request.entity)?.map(|(reason, candidates)| {
+        let names = kin_mcp::handlers::entities::candidate_names(graph, &candidates);
+        kin_mcp::handlers::entities::name_candidates_lines_named(
             &crate::entity_ref::parse_entity_ref(&request.entity).name,
-            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            reason,
             &candidates,
+            &names,
         )
     });
     let target = match shared {
@@ -1061,15 +1069,72 @@ pub fn shared_member_focal_candidates(
     graph: &kin_db::InMemoryGraph,
     token: &str,
 ) -> Result<Option<Vec<Entity>>> {
+    Ok(
+        ambiguous_focal_candidates(graph, token)?.and_then(|(reason, candidates)| {
+            (reason == kin_ranking::entity_ranking::CandidateReason::SharedMemberName)
+                .then_some(candidates)
+        }),
+    )
+}
+
+/// The candidates a focal token reaches when it names several distinct
+/// entities and its pins leave more than one of them, with why, or `None` for
+/// any other token.
+///
+/// Several owners' members sharing a member name, several entities sharing a
+/// whole name once the twins of one declaration are folded
+/// ([`kin_ranking::entity_ranking::fold_same_name_twins`]), and a module-qualified
+/// name whose qualifier names several modules all name none of them. Public
+/// for the daemon's `get_context_pack` route, which answers such a token with
+/// every candidate instead of handing the pack builder a ranked one, the way
+/// `get_entity_source`, `trace_data_flow` and `find_references` answer the
+/// same name.
+pub fn ambiguous_focal_candidates(
+    graph: &kin_db::InMemoryGraph,
+    token: &str,
+) -> Result<Option<(kin_ranking::entity_ranking::CandidateReason, Vec<Entity>)>> {
     let reference = crate::entity_ref::parse_entity_ref(token);
     let resolved =
         crate::entity_identity::resolve_identity(graph, &reference.name, &reference.qualifiers)?;
-    if !resolved.member_name {
-        return Ok(None);
-    }
-    let mut matches = resolved.matches;
+    let mut matches = resolved.matches.clone();
     crate::entity_ref::apply_line(&mut matches, reference.line);
-    Ok((matches.len() > 1).then_some(matches))
+    Ok(ambiguous_among(graph, &resolved, &reference.name, matches)?.err())
+}
+
+/// `matches` narrowed to the one entity they stand for, or the candidates and
+/// why when they stand for several distinct entities. An id and a partial name
+/// are left to the caller's own rule and come back whole.
+#[allow(clippy::type_complexity)]
+fn ambiguous_among(
+    graph: &kin_db::InMemoryGraph,
+    resolved: &crate::entity_identity::ResolvedIdentity,
+    name: &str,
+    matches: Vec<Entity>,
+) -> Result<
+    std::result::Result<Vec<Entity>, (kin_ranking::entity_ranking::CandidateReason, Vec<Entity>)>,
+> {
+    use kin_ranking::entity_ranking::CandidateReason;
+    if resolved.addressed_by_id || matches.len() < 2 {
+        return Ok(Ok(matches));
+    }
+    if resolved.member_name {
+        let distinct = kin_ranking::entity_ranking::fold_same_name_twins(graph, matches)?.distinct;
+        return Ok(if distinct.len() > 1 {
+            Err((CandidateReason::SharedMemberName, distinct))
+        } else {
+            Ok(distinct)
+        });
+    }
+    if resolved.exact_name || resolved.qualified_name {
+        let distinct = kin_ranking::entity_ranking::fold_same_name_twins(graph, matches)?.distinct;
+        return Ok(if distinct.len() > 1 {
+            let reason = kin_ranking::entity_ranking::same_name_reason(name, &distinct);
+            Err((reason, distinct))
+        } else {
+            Ok(distinct)
+        });
+    }
+    Ok(Ok(matches))
 }
 
 fn parse_budget(s: &str) -> Result<TokenBudget> {
@@ -1176,6 +1241,21 @@ pub fn question_focals(
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
             LocateScope::SOURCE_ONLY,
         )?;
+    Ok(focals_of_ranking(graph, &result, limit))
+}
+
+/// The focals at the head of a locate ranking, and what that ranking could
+/// see.
+///
+/// Split from [`question_focals`] so a caller that already holds the ranking
+/// `locate` gives the same words takes its focals from that ranking instead of
+/// running a second one. The daemon does: a question on `get_context_pack`
+/// and the same words on `semantic_locate` must not be two rankings.
+pub fn focals_of_ranking(
+    graph: &kin_db::InMemoryGraph,
+    result: &crate::commands::locate::LocateResult,
+    limit: usize,
+) -> (Vec<QuestionFocal>, String) {
     let coverage = result
         .semantic_coverage
         .clone()
@@ -1193,7 +1273,7 @@ pub fn question_focals(
             score: hit.score,
         })
         .collect();
-    Ok((focals, coverage_sentence(&coverage)))
+    (focals, coverage_sentence(&coverage))
 }
 
 /// Files `kin locate` ranks over when a question resolves focals, matching the
@@ -1237,13 +1317,23 @@ fn resolve_focal(
 
     let mut matches = resolved.matches.clone();
     crate::entity_ref::apply_line(&mut matches, reference.line);
-    if resolved.member_name && matches.len() > 1 {
-        return Ok(Err(crate::entity_identity::name_candidate_lines(
-            &reference.name,
-            kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
-            &matches,
-        )));
-    }
+    // A name that stands for several distinct entities names none of them, so
+    // the pack is refused with every candidate rather than built around a
+    // ranked one; the twins of one declaration stand for one.
+    let matches = match ambiguous_among(graph, &resolved, &reference.name, matches)? {
+        Ok(matches) => matches,
+        Err((reason, candidates)) => {
+            let names = kin_mcp::handlers::entities::candidate_names(graph, &candidates);
+            return Ok(Err(
+                kin_mcp::handlers::entities::name_candidates_lines_named(
+                    &reference.name,
+                    reason,
+                    &candidates,
+                    &names,
+                ),
+            ));
+        }
+    };
     let Some(chosen) = crate::entity_identity::choose_definition(graph, &matches)? else {
         // The name is in the graph and the pin excluded every entity carrying
         // it. Naming the twins that do exist is what turns this from a dead end
@@ -1325,6 +1415,29 @@ impl FocalSet {
 
     fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+
+    /// Leave out the focal the question ranked lowest, the last among equals,
+    /// and return its name. A focal the caller named is never left out, and
+    /// neither is the last focal.
+    fn drop_lowest_question_focal(&mut self) -> Option<String> {
+        if self.ids.len() <= 1 {
+            return None;
+        }
+        let position = self
+            .resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, resolution)| resolution.route == "question")
+            .min_by(|(left_index, left), (right_index, right)| {
+                kin_context::multi::focal_rank(left)
+                    .total_cmp(&kin_context::multi::focal_rank(right))
+                    .then(right_index.cmp(left_index))
+            })
+            .map(|(position, _)| position)?;
+        self.ids.remove(position);
+        self.resolutions.remove(position);
+        Some(self.targets.remove(position).name)
     }
 
     /// Take one focal, unless this entity is already in the set.
@@ -1457,6 +1570,57 @@ fn build_multi_focal_response(
     }
 
     let mut provider = provider;
+    let asked = token_budget.max_tokens();
+    // Every focal the fit cannot carry still costs its record in the reply,
+    // so a question ranked into more focals than a tight budget can describe
+    // refuses where fewer would answer. Its lowest-ranked focals are left out
+    // one at a time, and named, until the pack fits or only one is left.
+    // Focals the caller named are never among them.
+    let mut left_out: Vec<String> = Vec::new();
+    loop {
+        let mut noted = guidance.clone();
+        if !left_out.is_empty() {
+            noted.push(format!(
+                "Left out to fit the {asked}-token budget, lowest-ranked first: {}. Raise --budget to include {}.",
+                left_out.join(", "),
+                if left_out.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        let attempt = fit_multi_focal_response(
+            graph,
+            &focals,
+            &noted,
+            &unresolved,
+            (token_budget, request.assistant.as_deref(), coverage.clone()),
+            provider.as_deref_mut(),
+        );
+        let refused = matches!(
+            attempt
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<kin_context::ContextError>()),
+            Some(kin_context::ContextError::BudgetExceeded { .. })
+        );
+        if refused {
+            if let Some(name) = focals.drop_lowest_question_focal() {
+                left_out.push(name);
+                continue;
+            }
+        }
+        return attempt;
+    }
+}
+
+/// Fit one set of focals into the budget and render the reply.
+fn fit_multi_focal_response(
+    graph: &kin_db::InMemoryGraph,
+    focals: &FocalSet,
+    guidance: &[String],
+    unresolved: &[String],
+    (token_budget, assistant, coverage): (TokenBudget, Option<&str>, Option<String>),
+    provider: Option<&mut (dyn kin_context::ContextProjectionProvider + '_)>,
+) -> Result<ContextResponse> {
+    let mut provider = provider;
     let mut focal_entities = Vec::with_capacity(focals.len());
     for id in &focals.ids {
         if let Some(entity) = graph.get_entity(id)? {
@@ -1464,28 +1628,23 @@ fn build_multi_focal_response(
         }
     }
     let external = ExternalCalls::read(graph, &focal_entities, true, provider.as_deref_mut())?;
-    // The call-site section is printed beside the pack and a multi-focal pack
-    // never measures above its budget, so the pack is fitted into what the
-    // section leaves. The report still names the budget the caller asked for.
-    let call_site_reserve =
-        kin_context::estimate_tokens(&external.call_site_lines().join("\n")) + 1;
-    let fitted_budget = TokenBudget::Custom(
-        token_budget
-            .max_tokens()
-            .saturating_sub(call_site_reserve)
-            .max(1),
-    );
-
+    let asked = token_budget.max_tokens();
     let opts = kin_context::MultiFocalOptions {
-        budget: fitted_budget,
+        budget: token_budget,
         max_depth: 2,
         include_tests: true,
         include_contracts: true,
-        assistant_hint: assistant_hint_from(request.assistant.as_deref()),
-        resolutions: focals.resolutions,
+        assistant_hint: assistant_hint_from(assistant),
+        resolutions: focals.resolutions.clone(),
         coverage,
+        ..kin_context::MultiFocalOptions::default()
     };
     if let Some(provider) = provider {
+        // The fit measures the reply exactly as it ships, the call-site
+        // section beside the pack included. Fitted instead into what a
+        // reserve for that section's text left, the reply also carried the
+        // section's JSON unpriced: `--budget 3000` came back at 3,118 tokens,
+        // and a refusal named a floor that did not build.
         let (pack, report, projections) = kin_context::build_multi_focal_pack_with_provider(
             graph,
             &focals.ids,
@@ -1497,40 +1656,58 @@ fn build_multi_focal_response(
                     pack.clone(),
                     report.clone(),
                     &focals.targets,
-                    &guidance,
-                    &unresolved,
+                    guidance,
+                    unresolved,
                     Some(projections),
-                    None,
+                    Some(&external),
                 );
                 measure_response(&mut response)
             },
         )?;
-        let mut report = report;
-        report.budget_tokens = token_budget.max_tokens();
         let mut response = render_multi_response(
             pack,
             report,
             &focals.targets,
-            &guidance,
-            &unresolved,
+            guidance,
+            unresolved,
             Some(&projections),
             Some(&external),
         );
         measure_response(&mut response)?;
         return Ok(response);
     }
+    // Without a source provider the pack is measured as its rendered text,
+    // the header-only shape `measured_tokens` documents, and the call-site
+    // lines beside it are reserved out of the budget.
+    let call_site_reserve =
+        kin_context::estimate_tokens(&external.call_site_lines().join("\n")) + 1;
+    let opts = kin_context::MultiFocalOptions {
+        budget: TokenBudget::Custom(asked.saturating_sub(call_site_reserve).max(1)),
+        ..opts
+    };
     let (pack, mut report) = kin_context::build_multi_focal_pack(graph, &focals.ids, &opts)?;
-    report.budget_tokens = token_budget.max_tokens();
+    report.budget_tokens = asked;
     Ok(render_multi_response(
         pack,
         report,
         &focals.targets,
-        &guidance,
-        &unresolved,
+        guidance,
+        unresolved,
         None,
         Some(&external),
     ))
 }
+
+/// Withheld rows a multi-focal reply names by id, at most. The rest are
+/// counted.
+///
+/// The reply is held to its budget whole, so every id it names is paid for out
+/// of the answer. `get_context_pack` names sixteen bare ids. A row here is an
+/// object of three fields, about twice the tokens of a bare id, so half as many
+/// rows spends what that tool spends. A fixed number rather than a share of
+/// the budget, because a list that grew with the budget moved the smallest
+/// pack's cost with it, and the floor a refusal named no longer built.
+const WITHHELD_ROWS_LISTED_MAX: usize = kin_mcp::budget::CONTEXT_WITHHELD_LISTED_MAX / 2;
 
 fn render_multi_response(
     pack: kin_model::ContextPack,
@@ -1541,6 +1718,12 @@ fn render_multi_response(
     projections: Option<&kin_context::ProjectionReport>,
     external: Option<&ExternalCalls>,
 ) -> ContextResponse {
+    // The whole serialized response is held to the budget, and the builder
+    // adds one withheld row for every row it drops to fit. Named up to a cap
+    // and counted past it, so dropping a row always buys budget rather than
+    // spending it on the row's id.
+    let mut report = report;
+    report.list_withheld_rows_at_most(WITHHELD_ROWS_LISTED_MAX);
     let mut lines = kin_context::render_multi_focal_lines(&pack, &report);
     // Beside the fitted pack, as in a single-focal pack, each row naming the
     // focal that makes the call.
@@ -1630,6 +1813,7 @@ fn empty_multi_focal_report(
     kin_context::MultiFocalReport {
         focals: Vec::new(),
         routes: Vec::new(),
+        row_provenance: BTreeMap::new(),
         route_search: kin_context::RouteSearch {
             max_hops: kin_context::ROUTE_MAX_HOPS,
             ..Default::default()
@@ -1641,6 +1825,8 @@ fn empty_multi_focal_report(
         coverage,
         method: "Method: no focal entity resolved, so no pack was built".to_string(),
         method_style: "full".to_string(),
+        withheld_rows: Vec::new(),
+        withheld_rows_unlisted: 0,
     }
 }
 
@@ -1771,6 +1957,268 @@ mod tests {
             Some(&mut provider)
         )
         .is_err());
+    }
+
+    /// `focals` entities, every pair joined by a direct call, each with
+    /// `neighbours` callees of its own and a source span a provider can read.
+    fn meshed_store(focals: usize, neighbours: usize) -> (kin_db::InMemoryGraph, Vec<Entity>) {
+        meshed_store_with_id_order(focals, neighbours, None)
+    }
+
+    fn meshed_store_with_id_order(
+        focals: usize,
+        neighbours: usize,
+        focal_ids_first: Option<bool>,
+    ) -> (kin_db::InMemoryGraph, Vec<Entity>) {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let graph = kin_db::InMemoryGraph::new();
+        let sequence = std::cell::Cell::new(0u128);
+        let entity_at = |name: String, line: u32| {
+            let mut entity = test_entity(&name);
+            if let Some(focals_first) = focal_ids_first {
+                let group = u128::from(name.starts_with("Session.") != focals_first);
+                sequence.set(sequence.get() + 1);
+                entity.id =
+                    kin_model::EntityId(uuid::Uuid::from_u128((group << 64) | sequence.get()));
+            }
+            let file = kin_model::FilePathId::new(format!("src/{name}.py"));
+            entity.file_origin = Some(file.clone());
+            entity.doc_summary = Some(format!("{name} handles part of the request"));
+            entity.span = Some(kin_model::SourceSpan {
+                file,
+                start_byte: 0,
+                end_byte: 64,
+                start_line: line,
+                start_col: 0,
+                end_line: line + 6,
+                end_col: 0,
+            });
+            graph.upsert_entity(&entity).unwrap();
+            entity
+        };
+        let call = |src: &Entity, dst: &Entity| {
+            graph
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: kin_model::GraphNodeId::Entity(src.id),
+                    dst: kin_model::GraphNodeId::Entity(dst.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        };
+        let mut out = Vec::new();
+        for index in 0..focals {
+            let focal = entity_at(format!("Session.focal_{index}"), 10 + index as u32 * 100);
+            for helper in 0..neighbours {
+                let neighbour = entity_at(
+                    format!("helpers.focal_{index}_helper_{helper}"),
+                    20 + helper as u32 * 10,
+                );
+                call(&focal, &neighbour);
+            }
+            out.push(focal);
+        }
+        for left in 0..focals {
+            for right in (left + 1)..focals {
+                call(&out[left], &out[right]);
+            }
+        }
+        (graph, out)
+    }
+
+    fn five_focal_request(budget: &str) -> ContextRequest {
+        ContextRequest {
+            entity: "Session.focal_0".into(),
+            entities: (1..5)
+                .map(|index| format!("Session.focal_{index}"))
+                .collect(),
+            budget: budget.into(),
+            ..Default::default()
+        }
+    }
+
+    /// What `kin context` measures a reply at: the greater of its complete
+    /// JSON and its rendered text.
+    fn whole_reply_tokens(response: &ContextResponse) -> usize {
+        kin_context::estimate_tokens(&serde_json::to_string_pretty(response).unwrap())
+            .max(kin_context::estimate_tokens(&response.lines.join("\n")))
+    }
+
+    #[test]
+    fn a_budget_refusal_carries_the_same_neighbor_census_as_an_answer() {
+        for focals_first in [true, false] {
+            let (graph, _) = meshed_store_with_id_order(5, 8, Some(focals_first));
+            let build = |budget: usize| {
+                let mut provider = FixtureBodyProvider {
+                    bytes: 220,
+                    reads: 0,
+                };
+                build_context_response_inner(
+                    &graph,
+                    &five_focal_request(&budget.to_string()),
+                    Some(&mut provider),
+                )
+            };
+            let refusal = build(1).expect_err("one token holds no pack");
+            let floor = match refusal.downcast_ref::<kin_context::ContextError>() {
+                Some(kin_context::ContextError::BudgetExceeded { actual, .. }) => *actual,
+                other => panic!("expected a budget refusal, got {other:?}"),
+            };
+            for budget in [floor, floor + 1, 3000] {
+                let response = build(budget).unwrap_or_else(|error| {
+                    panic!("focals_first={focals_first}, budget={budget}: {error}")
+                });
+                assert!(whole_reply_tokens(&response) <= budget);
+                let report = response.multi_focal.as_ref().unwrap();
+                let census: usize = report
+                    .focals
+                    .iter()
+                    .map(|focal| focal.neighborhood_rows + focal.shared_rows + focal.withheld_rows)
+                    .sum();
+                // Forty private helpers plus both ends of every direct focal
+                // pair. They remain candidates even if the output budget
+                // leaves all but one focal out.
+                assert_eq!(census, 60, "focals_first={focals_first}, budget={budget}");
+                let carried_focals = report
+                    .focals
+                    .iter()
+                    .filter(|focal| focal.projection != "elided")
+                    .count();
+                assert_eq!(
+                    report
+                        .focals
+                        .iter()
+                        .map(|focal| focal.shared_rows)
+                        .sum::<usize>(),
+                    carried_focals * 4,
+                    "only focal rows actually carried can be shared"
+                );
+                assert_eq!(
+                    report.elisions[kin_context::group::DEPENDENCIES].total,
+                    40,
+                    "each private helper is counted once globally"
+                );
+            }
+        }
+    }
+
+    /// The failure an offline study hit on psf/requests and fastapi:
+    /// `kin context --question ... --budget 3000` refused with "token budget
+    /// exceeded" instead of trimming. The reply is held to its budget whole,
+    /// and the fit could shed neither the ten route descriptions five focals
+    /// carry nor the list of withheld rows, which grew by one entry for every
+    /// row it dropped. Every budget from the smallest pack up now answers,
+    /// measures within the budget, and says what it left out.
+    #[test]
+    fn a_five_focal_pack_trims_to_its_budget_rather_than_refusing() {
+        let (graph, _) = meshed_store(5, 8);
+        let build = |budget: usize| {
+            let mut provider = FixtureBodyProvider {
+                bytes: 220,
+                reads: 0,
+            };
+            build_context_response_inner(
+                &graph,
+                &five_focal_request(&budget.to_string()),
+                Some(&mut provider),
+            )
+        };
+
+        let response = build(3000).expect("the study's budget trims rather than refusing");
+        assert!(whole_reply_tokens(&response) <= 3000);
+        let report = response.multi_focal.as_ref().unwrap();
+        assert_eq!(report.route_search.pairs_connected, 10);
+        assert_eq!(
+            report.focals.len(),
+            5,
+            "every focal is named, carried or not"
+        );
+
+        let refusal = build(1).expect_err("one token holds no pack");
+        let floor = match refusal.downcast_ref::<kin_context::ContextError>() {
+            Some(kin_context::ContextError::BudgetExceeded { actual, budget }) => {
+                assert_eq!(
+                    *budget, 1,
+                    "the refusal names the budget the caller asked for"
+                );
+                *actual
+            }
+            other => panic!("a budget refusal, got {other:?}: {refusal}"),
+        };
+        assert!(
+            floor < 3000,
+            "the smallest pack is well under the study's budget: {floor}"
+        );
+
+        let mut budget = floor;
+        while budget <= 4000 {
+            let response = build(budget)
+                .unwrap_or_else(|error| panic!("{budget} is at or above the floor: {error}"));
+            let measured = whole_reply_tokens(&response);
+            assert_eq!(response.measured_tokens, measured, "{budget}");
+            assert!(measured <= budget, "{budget}: measured {measured}");
+            let report = response.multi_focal.as_ref().unwrap();
+            assert!(
+                report.withheld_rows.len() <= WITHHELD_ROWS_LISTED_MAX,
+                "{budget}"
+            );
+            assert_eq!(
+                report.routes.len() + report.route_search.routes_withheld,
+                report.route_search.pairs_connected,
+                "{budget}: every connected pair is described or counted"
+            );
+            let elided: usize = report.elisions.values().map(|elision| elision.elided).sum();
+            if elided > 0 {
+                assert!(
+                    response
+                        .lines
+                        .iter()
+                        .any(|line| line.contains(&format!("Raise --budget above {budget}"))),
+                    "{budget}: the reply says rows were left out"
+                );
+            }
+            budget += 97;
+        }
+    }
+
+    /// A question's lowest-ranked focals are the ones a tight budget leaves
+    /// out, one at a time, and a focal the caller named never is.
+    #[test]
+    fn a_tight_budget_leaves_out_the_lowest_ranked_question_focal_first() {
+        let mut focals = FocalSet::default();
+        let entities: Vec<Entity> = ["named", "high", "low", "middle"]
+            .iter()
+            .map(|name| test_entity(name))
+            .collect();
+        focals.admit(
+            &entities[0],
+            kin_context::FocalResolution::by_name("named"),
+            3000,
+        );
+        for (entity, score) in entities[1..].iter().zip([90.0, 10.0, 50.0]) {
+            focals.admit(
+                entity,
+                kin_context::FocalResolution::from_question(score),
+                3000,
+            );
+        }
+        assert_eq!(focals.drop_lowest_question_focal().as_deref(), Some("low"));
+        assert_eq!(
+            focals.drop_lowest_question_focal().as_deref(),
+            Some("middle")
+        );
+        assert_eq!(focals.drop_lowest_question_focal().as_deref(), Some("high"));
+        assert_eq!(
+            focals.drop_lowest_question_focal(),
+            None,
+            "a named focal stays"
+        );
+        assert_eq!(focals.len(), 1);
     }
 
     #[test]
@@ -2422,11 +2870,17 @@ mod tests {
 
     /// A twin is chosen, and the choice is stated. The demo measured this
     /// exact case resolving two ways across ingests of one tree.
+    ///
+    /// The twin is a declaration beside the definition, a header prototype,
+    /// which folds into the definition it declares. Two definitions that each
+    /// carry a body are not twins, and the pack names neither of them (see
+    /// [`two_definitions_under_one_name_are_refused_with_both_candidates`]).
     #[test]
     fn a_twin_is_reported_in_the_method_line() {
         let (graph, _) = linked_store();
         let mut twin = test_entity("applyEdits");
         twin.file_origin = Some(kin_model::FilePathId::new("src/applyEdits.h"));
+        twin.signature = "void applyEdits(void);".to_string();
         graph.upsert_entity(&twin).unwrap();
 
         let response = build_context_response(
@@ -2444,6 +2898,43 @@ mod tests {
             method.contains("1 of 2 under that name"),
             "the method says a choice was made: {method}"
         );
+    }
+
+    /// Two definitions that each carry a body, in two files, are two entities
+    /// under one name rather than twins of one declaration. The pack is built
+    /// around neither: the token is reported unresolved with both candidates,
+    /// and the method line claims no choice.
+    #[test]
+    fn two_definitions_under_one_name_are_refused_with_both_candidates() {
+        let (graph, _) = linked_store();
+        let mut rival = test_entity("applyEdits");
+        rival.file_origin = Some(kin_model::FilePathId::new("src/applyEdits.h"));
+        graph.upsert_entity(&rival).unwrap();
+
+        let response = build_context_response(
+            &graph,
+            &ContextRequest {
+                entity: "applyEdits".to_string(),
+                entities: vec!["TextDocument".to_string()],
+                budget: "8k".to_string(),
+                ..ContextRequest::default()
+            },
+        )
+        .expect("the other focal still builds a pack");
+        assert_eq!(response.unresolved, vec!["applyEdits".to_string()]);
+        assert_eq!(response.focals.len(), 1);
+        let method = &response.lines[1];
+        assert!(
+            !method.contains("under that name"),
+            "no choice was made, so none is stated: {method}"
+        );
+        let rendered = response.lines.join("\n");
+        for file in ["src/applyEdits.ts", "src/applyEdits.h"] {
+            assert!(
+                rendered.contains(file),
+                "every candidate is named: {rendered}"
+            );
+        }
     }
 
     /// The pack's focal choice among twins does not move between ingests.

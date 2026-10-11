@@ -223,7 +223,7 @@ jobs:
         shell: bash
         env:
           COMMIT: ${{ steps.source.outputs.commit }}
-          IMAGE: ghcr.io/firelock-ai/kin
+          IMAGE: ghcr.io/kinlab-ai/kin
         run: |
           set -euo pipefail
           source_image="${IMAGE}:${COMMIT}"
@@ -373,7 +373,7 @@ jobs:
         env:
           COMMIT: ${{ steps.source.outputs.commit }}
           EXPECTED_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
-          IMAGE: ghcr.io/firelock-ai/kin
+          IMAGE: ghcr.io/kinlab-ai/kin
         run: |
           set -euo pipefail
           reference="${IMAGE}:${COMMIT}"
@@ -396,7 +396,7 @@ jobs:
         # the bundle next to the exact digest in GHCR for downstream admission.
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ghcr.io/firelock-ai/kin
+          subject-name: ghcr.io/kinlab-ai/kin
           subject-digest: ${{ steps.subject.outputs.digest }}
           push-to-registry: true
           # The OCI bundle is required; the optional linked-artifact storage
@@ -413,7 +413,7 @@ jobs:
           verified=false
           for attempt in 1 2 3 4 5; do
             if gh attestation verify \
-              "oci://ghcr.io/firelock-ai/kin@${DIGEST}" \
+              "oci://ghcr.io/kinlab-ai/kin@${DIGEST}" \
               --repo "$GITHUB_REPOSITORY" \
               --bundle-from-oci \
               --predicate-type https://slsa.dev/provenance/v1 \
@@ -704,6 +704,8 @@ jobs:
             sampler=$!
           fi
           rc=0
+          # Default archives include graph/vector and optional HTTP support.
+          # Local inference is available in explicitly enabled source builds.
           cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?
           if [ -n "$sampler" ]; then
             kill "$sampler" 2>/dev/null || true
@@ -801,25 +803,24 @@ jobs:
               `does not match tagged Cargo.lock ${tagLockSha}`
             );
           }
-          // Every published archive now carries semantic search. This used to
-          // run only for the one leg that stripped the features, which meant no
-          // leg ever asserted they were PRESENT; a silent feature regression on
-          // any platform would have shipped green. Assert it everywhere.
-          //
-          // `metal` reports the compiled backend rather than the marker cargo
-          // feature (bench_meta.rs `metal_active()` is
-          // `cfg!(target_os = "macos")`), so it is expected on macOS and is a
-          // defect anywhere else.
-          for (const feature of ["vector", "embeddings"]) {
+          // Attest the measured default archive profile on every target.
+          for (const feature of ["vector", "external-embeddings"]) {
             if (!meta.feature_flags.includes(feature)) {
               throw new Error(`release build for ${process.env.TARGET} did not enable ${feature}`);
             }
           }
-          const expectMetal = process.env.TARGET.includes("apple-darwin");
-          if (meta.feature_flags.includes("metal") !== expectMetal) {
-            throw new Error(
-              `release build for ${process.env.TARGET} reported metal=${meta.feature_flags.includes("metal")}, expected ${expectMetal}`
-            );
+          for (const feature of ["embeddings", "metal"]) {
+            if (meta.feature_flags.includes(feature)) {
+              throw new Error(`default release build unexpectedly enabled ${feature}`);
+            }
+          }
+          if (meta.embeddings?.vector_enabled !== true ||
+              meta.embeddings?.embeddings_enabled !== true ||
+              meta.embeddings?.local_inference_enabled !== false ||
+              meta.embeddings?.external_embeddings_enabled !== true ||
+              meta.embeddings?.metal_enabled !== false ||
+              meta.embeddings?.provider !== "none") {
+            throw new Error("release metadata does not attest the engine-free default archive profile");
           }
           NODE
 
@@ -1442,7 +1443,7 @@ jobs:
             carries="${GITHUB_REF_NAME} lands ${changes} changes, listed below."
           fi
           {
-            echo "A graph-native code repository for people and AI agents."
+            echo "A graph-native code repository for AI agents and the people who build with them."
             echo "$carries"
             echo
             cat ./release-notes.md
@@ -2626,7 +2627,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE: ghcr.io/firelock-ai/kin
+          IMAGE: ghcr.io/kinlab-ai/kin
           EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
           EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
         run: |
@@ -3002,7 +3003,7 @@ jobs:
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   # Promote the immutable commit image built by this release workflow so
-  # operators can pin a version (`docker pull ghcr.io/firelock-ai/kin:0.2.7`).
+  # operators can pin a version (`docker pull ghcr.io/kinlab-ai/kin:0.8.2`).
   # No main-push workflow, GCP identity, or mutable latest tag participates.
   version_tag_image:
     name: Version-tag ghcr image
@@ -3042,7 +3043,7 @@ jobs:
 
       - name: Version-tag the release commit's daemon image (no rebuild)
         env:
-          IMAGE: ghcr.io/firelock-ai/kin
+          IMAGE: ghcr.io/kinlab-ai/kin
           EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
           EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
         run: |

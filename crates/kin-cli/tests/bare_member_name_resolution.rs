@@ -743,7 +743,9 @@ fn walk(
             include_body: Some(false),
             max_response_chars: None,
             include_type_edges: None,
+            scope: None,
             target: target.map(str::to_string),
+            include_tests: None,
         },
     )
 }
@@ -756,7 +758,7 @@ fn the_cli_walker_refuses_a_shared_member_focal_with_every_candidate() {
     let graph = python_graph();
     let error = walk(&graph, "get", None).expect_err("a shared member name is no focal");
     let shared = error
-        .downcast_ref::<kin_cli::commands::trace_data_flow::SharedMemberFocal>()
+        .downcast_ref::<kin_cli::commands::trace_data_flow::AmbiguousFocal>()
         .unwrap_or_else(|| panic!("typed for the MCP route: {error}"));
     let mut named: Vec<&str> = shared.candidates.iter().map(|e| e.name.as_str()).collect();
     named.sort_unstable();

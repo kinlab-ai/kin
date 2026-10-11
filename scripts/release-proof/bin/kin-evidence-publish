@@ -48,7 +48,7 @@ const { execFileSync } = require('node:child_process');
 
 const API = process.env.KIN_EVIDENCE_API || 'https://api.github.com';
 const BRANCH = process.env.KIN_EVIDENCE_BRANCH || 'release-evidence';
-const DEFAULT_REPO = 'firelock-ai/kin';
+const DEFAULT_REPO = 'kinlab-ai/kin';
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const PREFLIGHT_RECORD = 'preflight.json';
 const STRANGER_RECORD = 'stranger.env';

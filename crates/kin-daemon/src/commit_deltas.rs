@@ -33,6 +33,11 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{DaemonError, Result};
 
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 /// The delta slices that constitute a semantic commit.
 #[derive(Debug)]
 pub struct CommitDeltas {
@@ -820,7 +825,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
         assert!(kin_index::scan_repository(
-            &missing,
+            &worktree(&missing),
             &kin_index::RepositoryIgnore::default(),
             std::iter::empty()
         )
@@ -1506,10 +1511,10 @@ mod tests {
             }
         }
         let source = layout.working_dir();
-        let ignore =
-            kin_index::RepositoryIgnore::load(&source).map_err(kin_index::IndexError::from)?;
+        let ignore = kin_index::RepositoryIgnore::load(&worktree(&source))
+            .map_err(kin_index::IndexError::from)?;
         let scan = kin_index::scan_repository_preserving_graph_only(
-            &source,
+            &worktree(&source),
             &ignore,
             None,
             tracked_paths.iter(),
@@ -1880,9 +1885,9 @@ mod tests {
             TreeEntry::blob(admitted_hash, false),
         )]);
 
-        let ignore = kin_index::RepositoryIgnore::load(&working).unwrap();
+        let ignore = kin_index::RepositoryIgnore::load(&worktree(&working)).unwrap();
         let scan = kin_index::scan_repository(
-            &working,
+            &worktree(&working),
             &ignore,
             previous.artifacts_by_path().map(|artifact| &artifact.path),
         )
@@ -1944,7 +1949,7 @@ mod tests {
             ),
         ]);
         let scan = kin_index::scan_repository(
-            &working,
+            &worktree(&working),
             &ignore,
             previous_with_gone
                 .artifacts_by_path()
@@ -1992,9 +1997,9 @@ mod tests {
             TreeEntry::blob(hash, false),
         )]);
 
-        let ignore = kin_index::RepositoryIgnore::load(&working).unwrap();
+        let ignore = kin_index::RepositoryIgnore::load(&worktree(&working)).unwrap();
         let scan = kin_index::scan_repository(
-            &working,
+            &worktree(&working),
             &ignore,
             previous.artifacts_by_path().map(|artifact| &artifact.path),
         )
@@ -2039,9 +2044,9 @@ mod tests {
             TreeEntry::blob(stale, false),
         )]);
 
-        let ignore = kin_index::RepositoryIgnore::load(&working).unwrap();
+        let ignore = kin_index::RepositoryIgnore::load(&worktree(&working)).unwrap();
         let scan = kin_index::scan_repository(
-            &working,
+            &worktree(&working),
             &ignore,
             previous.artifacts_by_path().map(|artifact| &artifact.path),
         )
@@ -3018,9 +3023,9 @@ mod tests {
             (ArtifactId::new(), kept.clone(), kept_entry),
         ]);
 
-        let ignore = kin_index::RepositoryIgnore::load(working).unwrap();
+        let ignore = kin_index::RepositoryIgnore::load(&worktree(working)).unwrap();
         let scan = kin_index::scan_repository(
-            working,
+            &worktree(working),
             &ignore,
             previous.artifacts_by_path().map(|artifact| &artifact.path),
         )
@@ -3062,7 +3067,7 @@ mod tests {
             (ArtifactId::new(), gone.clone(), control_entry),
         ]);
         let scan = kin_index::scan_repository(
-            working,
+            &worktree(working),
             &ignore,
             previous_with_gone
                 .artifacts_by_path()

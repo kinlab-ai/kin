@@ -36,6 +36,7 @@ import {
   resolveDaemonBinaryPath,
 } from '../packages/kin-mcp/src/index.js';
 import { emptyGlobalGitConfig } from '../packages/kin-mcp/test/smoke-first-run.mjs';
+import { assertCentralAuthority, assertDurableAuthority } from './lib/npm-proof-authority.mjs';
 
 // `kin status` exits this when nothing admitted the working copy. It is an
 // answer about the report rather than a failure to produce one, and it is the
@@ -58,6 +59,16 @@ const compatibilityMcpLauncher = path.join(
   'kin-mcp.js',
 );
 const commandTimeoutMs = 180_000;
+
+// Whether a reply row anywhere in `value` names `name` in `module`.
+function holdsEntity(value, name, module) {
+  if (Array.isArray(value)) return value.some((item) => holdsEntity(item, name, module));
+  if (value && typeof value === 'object') {
+    if (value.name === name && value.module === module) return true;
+    return Object.values(value).some((item) => holdsEntity(item, name, module));
+  }
+  return false;
+}
 
 function log(message) {
   process.stderr.write(`[windows-npm-proof] ${message}\n`);
@@ -419,18 +430,30 @@ async function proveMcp({ launcher, repoDir, env, label }) {
     request(child, 2, 'tools/list', {});
     const listed = await reader.await(2, commandTimeoutMs);
     const toolNames = (listed.result?.tools || []).map((tool) => tool.name);
-    assert.ok(toolNames.includes('semantic_search'), `${label}: semantic_search is missing`);
+    assert.ok(toolNames.includes('locate'), `${label}: locate is missing`);
 
     request(child, 3, 'tools/call', {
-      name: 'semantic_search',
-      arguments: { query: 'greet', compact: true, limit: 5 },
+      name: 'locate',
+      arguments: { query: 'greet', mode: 'name', compact: true, limit: 5 },
     });
     const searched = await reader.await(3, commandTimeoutMs);
-    assert.equal(searched.error, undefined, `${label}: semantic_search returned an RPC error`);
-    assert.notEqual(searched.result?.isError, true, `${label}: semantic_search returned isError`);
+    assert.equal(searched.error, undefined, `${label}: locate returned an RPC error`);
+    assert.notEqual(searched.result?.isError, true, `${label}: locate returned isError`);
     const rendered = JSON.stringify(searched.result || {});
-    assert.match(rendered, /greet/i, `${label}: semantic_search omitted greet`);
-    assert.match(rendered, /main\.rs/i, `${label}: semantic_search omitted main.rs`);
+    assert.match(rendered, /greet/i, `${label}: locate omitted greet`);
+    // A reply names an entity by its name and the module that holds it, never
+    // by a file, so the committed function is found as `greet` in the crate root.
+    const replies = (searched.result?.content || []).flatMap((block) => {
+      try {
+        return [JSON.parse(block?.text)];
+      } catch {
+        return [];
+      }
+    });
+    assert.ok(
+      holdsEntity(replies, 'greet', 'crate'),
+      `${label}: locate did not return greet in module crate: ${rendered.slice(0, 500)}`,
+    );
 
     child.stdin.end();
     const exited = await waitForExit(child, 30_000);
@@ -440,7 +463,7 @@ async function proveMcp({ launcher, repoDir, env, label }) {
           `stdout:\n${stdout}\nstderr:\n${stderr}`,
       );
     }
-    log(`${label}: real semantic_search returned the committed greet entity`);
+    log(`${label}: real locate by name returned the committed greet entity`);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');
@@ -448,8 +471,23 @@ async function proveMcp({ launcher, repoDir, env, label }) {
   }
 }
 
+function proveCentralStore({ kinBinary, repoDir, env, label }) {
+  const discovered = runChecked(kinBinary, ['store', 'path', '--json', repoDir], {
+    cwd: repoDir, env, label: `${label} store discovery`,
+  });
+  assertCentralAuthority(JSON.parse(discovered.stdout), {
+    repoDir,
+    // The registry override bounds both discovery and the central store census.
+    storesDir: path.join(path.dirname(readEnv(env, 'KIN_REGISTRY_PATH')), 'stores'),
+  });
+  log(`${label}: exact working tree has one admitted central store and no in-tree .kin`);
+}
+
 function stopIsolatedDaemons({ kinBinary, repoDir, env, label }) {
-  if (!fs.existsSync(path.join(repoDir, '.kin'))) return;
+  // Both layouts need cleanup. Each leg pins its own managed home and registry,
+  // so this sweep reaches only the fixture's daemons, including central stores.
+  assert.ok(path.isAbsolute(readEnv(env, 'KIN_HOME') || ''), 'cleanup needs an isolated Kin home');
+  assert.ok(path.isAbsolute(readEnv(env, 'KIN_REGISTRY_PATH') || ''), 'cleanup needs an isolated registry');
   runChecked(kinBinary, ['daemon', 'stop', '--all', '--json'], {
     cwd: repoDir,
     env,
@@ -514,9 +552,8 @@ async function proveCanonical({ workRoot, builtKin, builtDaemon, gitBinary }) {
       { cwd: repoDir, env, label: '@kinlab/kin repository status' },
     );
     const statusJson = JSON.parse(status.stdout);
-    assert.equal(statusJson.schema, 'kin.status.v3');
-    assert.equal(statusJson.authority, 'repository-v6');
-    assert.equal(statusJson.repository?.source_cas_verified, true);
+    assertDurableAuthority(statusJson);
+    proveCentralStore({ kinBinary: managedKin, repoDir, env, label: '@kinlab/kin' });
 
     // When the code is 9, prove it is THAT 9. The `--json` arm renders no
     // banner, so the claim the code makes is unverifiable from the payload
@@ -590,6 +627,7 @@ async function proveCompatibility({ workRoot, builtKin, builtDaemon, gitBinary }
   await copyExecutable(builtDaemon, cachedDaemon);
 
   const env = hermeticEnv({ root, managedBinDir: path.dirname(cachedKin) });
+  setEnv(env, 'KIN_HOME', path.join(root, 'kin-home'));
   setEnv(env, 'KIN_MCP_CACHE_DIR', cacheRoot);
   setEnv(env, 'KIN_MCP_AUTO_INIT', '1');
   setEnv(env, 'KIN_MCP_RELEASE_BASE_URL', 'http://127.0.0.1:9/kin-offline-proof');
@@ -608,17 +646,21 @@ async function proveCompatibility({ workRoot, builtKin, builtDaemon, gitBinary }
   let failure = null;
   try {
     assert.equal(fs.existsSync(path.join(repoDir, '.kin')), false);
+    const uninitialized = runAllowing([1], cachedKin, ['store', 'path', '--json', repoDir], {
+      cwd: repoDir, env, label: '@kinlab/kin-mcp fresh repository',
+    });
+    assert.match(uninitialized.stderr, /not a Kin repository/, 'fresh fixture unexpectedly has authority');
     await proveMcp({
       launcher: compatibilityMcpLauncher,
       repoDir,
       env,
       label: '@kinlab/kin-mcp compatibility wrapper',
     });
-    assert.equal(
-      fs.statSync(path.join(repoDir, '.kin')).isDirectory(),
-      true,
-      '@kinlab/kin-mcp did not perform its opted-in first-run init',
-    );
+    proveCentralStore({ kinBinary: cachedKin, repoDir, env, label: '@kinlab/kin-mcp' });
+    const status = runAllowing([0, EXIT_WORKING_COPY_UNMEASURED], cachedKin, ['status', '--json'], {
+      cwd: repoDir, env, label: '@kinlab/kin-mcp repository status',
+    });
+    assertDurableAuthority(JSON.parse(status.stdout));
     log('@kinlab/kin-mcp: cache-owned auto-init + real MCP proof passed');
   } catch (error) {
     failure = error;

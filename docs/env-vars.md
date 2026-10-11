@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (558 total, 365 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (611 total, 397 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -39,7 +39,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MCP_DAEMON_PATIENCE_SECS` | seconds>=0 | 300 | operational | total wait for one forwarded MCP call once the daemon has shown it is alive but still starting |
 | `KIN_MCP_DAEMON_TIMEOUT_SECS` | seconds>=0 | 60 | operational | how long one forwarded MCP call waits before asking whether the daemon is alive |
 | `KIN_MCP_KIN_BINARY` | path | *(unset)* | operational | explicit native Kin binary used by the @kinlab/kin-mcp wrapper |
+| `KIN_MCP_MACHINE_REPLIES` | enum | 0 | operational | `1` keeps an agent tool profile on machine replies, the raw JSON with its verdict codes and coverage blocks, as tests and harnesses that read those codes need; unset or `0` serves plain replies |
 | `KIN_MCP_RELEASE_BASE_URL` | url | GitHub Releases | operational | release mirror base URL used by the @kinlab/kin-mcp wrapper |
+| `KIN_MCP_REPLY_FORMAT` | enum | json | operational | how a long-lived `kin mcp start` connection writes plain agent replies: json (the default) or text, one line per row that a model reads like the CLI's output; both serve short session handles for ids and cursors |
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
 | `KIN_MCP_TOOL_PROFILE` | string | agent-default | operational | MCP tool surface: agent-default (curated, the default), agent-query (the same belt with no session or transaction tools), agent-search (the measured always-on set, the rest reached through kin_tool_search), agent-routed (one kin tool whose commands reach the agent belt, writes included, and every other tool through describe and call, for clients that send every tool with every request), agent-routed-query (that tool without a write path), full (every tool), benchmark, context-bench |
 | `KIN_MCP_TOOL_PROFILE_PINNED` | bool | false | operational | written by `kin setup` beside KIN_MCP_TOOL_PROFILE in a client's MCP entry when the profile was chosen, with `--tool-profile` or by hand: later `kin setup` and `kin update` runs keep it rather than moving it to the client's default |
@@ -62,11 +64,12 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN` | bool | false | operational | allow the CLI to bootstrap an admin-scoped daemon |
 | `KIN_ALLOW_MASS_DELETION` | bool | false | correctness | permit reconcile to apply mass deletions (data-destructive) |
 | `KIN_ALLOW_OFFLINE_RESTORE` | bool | false | operational | allow restoring a backup without remote verification |
-| `KIN_ALLOW_PARENT_STORE` | bool | false | operational | allow discovering a store in a parent directory |
+| `KIN_ALLOW_PARENT_STORE` | bool | false | operational | let store discovery walk past a repository boundary (a directory carrying .git), so a nested repository or worktree without a store binds an enclosing tree's store |
 | `KIN_ANALYSIS_ENVIRONMENTS` | bool | true | operational | fetch the dependencies a repository's lockfile pins, hash-verified and never run, into a shared store under KIN_HOME/cache so language servers can resolve calls into them; falsy turns analysis environments off, and a repository without a matching environment of its own then reports its environment missing |
 | `KIN_API_URL` | url | *(unset)* | operational | hosted API base URL (release/pipeline commands) |
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
+| `KIN_CI_LANGUAGE_SERVERS_INSTALLED` | enum | *(unset)* | diagnostic | dev/test tooling: `1` once scripts/ci-install-language-servers.sh has installed and proved the language servers, so the kin-daemon reference-enrichment tests require them instead of skipping; Kin itself does not read it |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
 | `KIN_LANGUAGE_SERVER_ASSET_BASE` | url | GitHub Releases | operational | base URL the language-server release binaries are fetched from; set by acceptance checks to drive the standalone install against a fixture |
 | `KIN_LANGUAGE_SERVER_ASSET_SHA256` | string | *(unset)* | operational | sha256 an overridden language-server asset is verified against; IGNORED unless KIN_LANGUAGE_SERVER_ASSET_BASE is also set, so it can never relax the pinned release check |
@@ -75,11 +78,28 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MEMORY_PRESSURE_CRITICAL_FRACTION` | float>=0 | 0.90 | operational | fraction of the memory ceiling at or above which heavy work refuses to start; must be within 0..=1, anything else keeps 0.90, and a value below the elevated fraction is raised to it |
 | `KIN_MEMORY_PRESSURE_ELEVATED_FRACTION` | float>=0 | 0.75 | operational | fraction of the memory ceiling at or above which heavy work shrinks; must be within 0..=1, and anything else keeps 0.75 |
 | `KIN_MEMORY_PRESSURE_SWAP_FRACTION` | float>=0 | 0.50 | operational | fraction of configured swap in use at or above which an already-elevated host is treated as critical; must be within 0..=1, and anything else keeps 0.50. Swap standing never raises a host that has room |
+| `KIN_MODEL_ANSWER_COMPLETENESS_API_KEY_ENV` | string | *(unset)* | correctness | Environment variable name holding the external model credential; never the credential itself |
+| `KIN_MODEL_ANSWER_COMPLETENESS_BASE_URL` | string | *(unset)* | correctness | HTTP endpoint for an explicitly selected external graph model |
+| `KIN_MODEL_ANSWER_COMPLETENESS_MODEL` | string | *(unset)* | correctness | Model identity for the selected graph model slot |
+| `KIN_MODEL_ANSWER_COMPLETENESS_PROVIDER` | enum | none | correctness | Optional graph model provider; none uses algorithmic graph operations |
+| `KIN_MODEL_CALL_TARGET_API_KEY_ENV` | string | *(unset)* | correctness | Environment variable name holding the external model credential; never the credential itself |
+| `KIN_MODEL_CALL_TARGET_BASE_URL` | string | *(unset)* | correctness | HTTP endpoint for an explicitly selected external graph model |
+| `KIN_MODEL_CALL_TARGET_MODEL` | string | *(unset)* | correctness | Model identity for the selected graph model slot |
+| `KIN_MODEL_CALL_TARGET_PROVIDER` | enum | none | correctness | Optional graph model provider; none uses algorithmic graph operations |
+| `KIN_MODEL_EMBEDDINGS_API_KEY_ENV` | string | *(unset)* | correctness | Environment variable name holding the external model credential; never the credential itself |
+| `KIN_MODEL_EMBEDDINGS_BASE_URL` | string | *(unset)* | correctness | HTTP endpoint for an explicitly selected external graph model |
+| `KIN_MODEL_EMBEDDINGS_MODEL` | string | *(unset)* | correctness | Model identity for the selected graph model slot |
+| `KIN_MODEL_EMBEDDINGS_PROVIDER` | enum | none | correctness | Optional graph model provider; none uses algorithmic graph operations |
+| `KIN_MODEL_RERANKING_API_KEY_ENV` | string | *(unset)* | correctness | Environment variable name holding the external model credential; never the credential itself |
+| `KIN_MODEL_RERANKING_BASE_URL` | string | *(unset)* | correctness | HTTP endpoint for an explicitly selected external graph model |
+| `KIN_MODEL_RERANKING_MODEL` | string | *(unset)* | correctness | Model identity for the selected graph model slot |
+| `KIN_MODEL_RERANKING_PROVIDER` | enum | none | correctness | Optional graph model provider; none uses algorithmic graph operations |
 | `KIN_NO_DAEMON` | bool | false | operational | never start or revive a daemon; bind only an already-running one (the probe contract behind `kin mcp start --no-spawn`) |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
 | `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |
 | `KIN_ORG_ID` | string | *(unset)* | operational | organization id for federation/remote |
 | `KIN_ORIGINAL_PATH` | path | *(unset)* | operational | caller's original PATH preserved across a with/exec shim |
+| `KIN_PREPARED_STORE_REUSE` | bool | true | operational | let `kin init` and Git `kin clone` reuse a store this machine already prepared from exactly the same Git refs, found through the prepared-store catalog beside the registry, instead of deriving it again; set to 0 to admit every checkout from scratch |
 | `KIN_PRIMARY_REPO_ID` | string | *(unset)* | operational | primary repo id for a multi-repo daemon |
 | `KIN_PROFILE` | string | accuracy-v2 | correctness | retrieval quality profile: accuracy-v2 (default: measured-accuracy levers, cross-encoder off), accuracy-v1 (opt-in: adds the budget-gated cross-encoder when its model is cached), compat-v0 (pre-profile lever defaults); proof runs pin this explicitly |
 | `KIN_REGEN_ENV_DOC` | string | *(unset)* | diagnostic | dev/test tooling: set to regenerate docs/env-vars.md from the registry |
@@ -102,8 +122,19 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_SEARCH_SEGMENT_COUNT` | usize | 64 | operational | kin-search segment count for a newly established segmented index only; must be >= 1, an unparseable value falls back to 64, and an existing index keeps whatever count it was built with |
 | `KIN_SPINE_MAX_EAGER_SIBLINGS` | usize | 16 | operational | how many registered sibling repositories the daemon loads eagerly into the cross-repo spine at startup, each of which opens that sibling's whole workspace graph serially. Unset keeps 16; zero disables eager sibling loading entirely and the spine answers over the primary alone. A capture stopped here is BOUNDED, not incomplete: the spine says so with captured-of-registered counts and edges between captured repos stay valid, which is what separates a deliberate cap from a sibling that failed to load |
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
+| `KIN_STORE` | path | *(unset)* | operational | store directory for the working tree `kin init` runs in, instead of the central stores directory, like `--store`; recorded in the store index beside the registry so every later process finds it from the working tree, and honoured by discovery only for the tree the store records |
+| `KIN_STORE_LAYOUT` | string | central | operational | where `kin init` puts a new store when neither `--store` nor KIN_STORE names one: `central` (the default, the stores directory beside the registry) or `in-tree` (`.kin` in the working tree); existing stores are found wherever they are |
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
+| `KIN_TEST_ALONE_IN_PROCESS` | string | *(unset)* | diagnostic | dev/test tooling: names the one test a test binary was started to run alone, by kin_core::test_env::alone_in_process; Kin itself does not read it |
+| `KIN_TEST_ENV_FLUSH` | enum | *(unset)* | diagnostic | dev/test tooling: the flush mode the nextest setup script chose for a run, recorded for run receipts; Kin itself does not read it |
+| `KIN_TEST_FLUSH` | enum | full | operational | dev/test tooling, debug builds only: `fsync` flushes files with a plain fsync instead of the full drive flush Apple platforms use, which makes parallel test runs much faster; the nextest setup script sets it, and release builds ignore it (read by the `durable` module of the kin-blobs crate) |
+| `KIN_TEST_FULL_FLUSH` | enum | 0 | diagnostic | dev/test tooling: `1` makes the nextest setup script keep full drive flushes (KIN_TEST_FLUSH=full); Kin itself does not read it |
+| `KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP` | usize | *(unset)* | operational | dev/test tooling: the process group an isolated test runtime contains its daemons in; with KIN_TEST_RUNTIME_OWNER_TOKEN set and this naming the group a daemon actually runs in, the daemon stays in that group instead of detaching from its caller, so the runtime reaps it. The test harness sets both; an operator never does (read by the kin-daemon-spawn crate) |
+| `KIN_TEST_RUNTIME_GUARDIAN_EXECUTABLE` | string | *(unset)* | operational | dev/test tooling: exact executable implementing the existing process-group guardian protocol for a verified runtime; ordinary product execution leaves this unset |
+| `KIN_TEST_RUNTIME_OWNER_TOKEN` | string | *(unset)* | operational | dev/test tooling: names the isolated test runtime that owns a daemon; with KIN_TEST_RUNTIME_CONTAINMENT_PROCESS_GROUP matching the daemon's process group it keeps the daemon in the runtime's group rather than detaching it. The test harness sets both; an operator never does (read by the kin-daemon-spawn crate) |
+| `KIN_TEST_RUNTIME_ROOT` | string | *(unset)* | operational | dev/test tooling: private ownership and cleanup receipts for a verified guardian runtime; paired with its owner token and actual process group |
+| `KIN_TEST_SHARED_TMPDIR` | enum | 0 | diagnostic | dev/test tooling: `1` makes the nextest setup script keep the inherited TMPDIR instead of a fresh one per run; Kin itself does not read it |
 | `KIN_TRANSFER_MAX_DECODED_BODY_BYTES` | usize | 67108864 | operational | kin-daemon receive ceiling for one transfer pack's decoded body closure, in bytes; unset, zero or unparseable keeps the compiled 64 MiB, and the effective bound is always the smaller of this and what the sending peer advertised, so raising it never overrides a peer. It is a transport bound, not the product's answer to repository size, and it is held in memory per concurrent receive |
 | `KIN_TSSERVER_MAX_MEMORY_MB` | usize | a quarter of RAM, 3072 to 16384 | operational | tsserver heap ceiling in MB for the TypeScript language server; values below 1024 are ignored |
 | `KIN_VECTOR_SIMD` | bool | true | correctness | kin-vector NEON SIMD cosine-distance kernel on aarch64, on by default; only 0/false/no/off select the scalar reduction, and the two reduction orders differ in the last ULPs so distances and therefore ranking order can shift |
@@ -144,6 +175,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | auto-shutdown after this idle period; 0 disables idle shutdown |
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
 | `KIN_DAEMON_LSP_FILE_BUDGET_SECS` | seconds>=0 | 120 | operational | wall-clock budget for one file's language-server definitions pass; an overrun is counted and the file gets no definitions from that pass |
+| `KIN_DAEMON_LSP_MAX_IN_FLIGHT` | usize | 8 | operational | most language-server questions the enrichment sweep keeps in flight to one server; answers fold in asking order, so results do not depend on it, and a server that falls behind is sent fewer |
+| `KIN_DAEMON_LSP_SWEEP_LANES` | usize | *(unset)* | operational | most lanes a cold enrichment sweep runs at once, each asking about its own files on its own language-server instances started as a single lane starts them. Unset derives it as half this machine's cores and at most one lane per 4 GiB of the daemon's memory budget, between 1 and 8; 1 walks every file in one lane, in path order, as before |
 | `KIN_DAEMON_MEMORY_BUDGET_BYTES` | usize | *(unset)* | operational | the most one repository daemon and the processes it starts may hold before heavy work backs off, in bytes. Unset derives it as half this machine's total memory, held between 1 GiB and a cap that follows the machine: 8 GiB below 32 GiB of RAM, then 16, 24 and 32 GiB at the 32, 64 and 96 GiB tiers the inference resource plan grades a host on, because a repository daemon holding more than that is pathological for the size of machine it is running on. An operator value wins outright and is not clamped; zero or an unparseable value is ignored, since a budget of zero would refuse every background pass forever |
 | `KIN_DAEMON_PASS_RETRY_BUDGET_SECS` | seconds>=0 | 1800 | operational | cumulative retry delay a failing background pass may spend before it is parked with an announced reason; 0 disables parking |
 | `KIN_DAEMON_PASS_STALL_SECS` | seconds>=0 | 600 | operational | how long a background pass may run without recording durable progress before the daemon stops it; 0 disables stopping |
@@ -152,6 +185,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for all daemon requests; set falsy to opt out |
 | `KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS` | seconds>=0 | 8 | operational | bound on tokio runtime teardown waiting for blocking tasks |
 | `KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | timeout for a daemon-side scope graph build |
+| `KIN_DAEMON_SESSION_SWEEP_SECS` | seconds>=0 | 30 | operational | how often the daemon reaps sessions whose client process exited or whose heartbeat went stale, which is also how long a daemon asked to retire takes to notice its last client left; a whole number of seconds, at least 1 |
 | `KIN_DAEMON_SHUTDOWN_FLUSH_SECS` | seconds>=0 | 300 | operational | how long shutdown waits for the final persistence flush before giving up on it |
 | `KIN_DAEMON_SHUTDOWN_GRACE_SECS` | seconds>=0 | 25 | operational | grace before the shutdown watchdog force-exits; 0 escalates immediately |
 | `KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | how long to wait for the daemon startup lock |
@@ -231,15 +265,18 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_EMBED_OPENAI_TIMEOUT_SECS` | seconds>=0 | 120 | operational | kin-db per-request timeout for an OpenAI-compatible embedding call, in whole seconds; must be > 0 |
 | `KIN_EMBED_PASS_SECONDS` | seconds>=0 | *(unset)* | operational | per-pass wall-clock budget for an embed run |
 | `KIN_EMBED_PIPELINED` | bool | *(unset)* | correctness | kin-db staged embed pipeline overlapping prep, forward, and persist; unset engages it only under the throughput resource profile, and an explicit value overrides in either direction. The serial path is what keeps persisted vector order byte-for-byte, so forcing it on makes a run non-citable |
-| `KIN_EMBED_PROVIDER` | enum | local | correctness | kin-db embedding provider: 'local' (default) embeds in-process, 'openai'/'lmstudio'/'openai-compatible' call an OpenAI-compatible endpoint; an unrecognized value warns and falls back to local |
+| `KIN_EMBED_PROVIDER` | enum | none | correctness | Legacy embedding provider alias for one release: 'none' (default) disables models; 'local' embeds in-process, 'openai'/'lmstudio'/'openai-compatible' call an OpenAI-compatible endpoint; an unrecognized value is refused |
 | `KIN_EMBED_TEST_FORCE_METAL_OOM` | usize | *(unset)* | diagnostic | kin-db fault injection: replaces the first N Metal embedding dispatches with a synthetic out-of-memory so the CPU-degrade retry path can be exercised; unset or non-positive disarms it |
 
 ## Inference
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_DECISION_MODEL_DIR` | path | *(unset)* | correctness | kin-infer decision engine: the local directory of the trained decision model to load (config.json, model.safetensors, tokenizer.json, and an optional kin_student.json with its calibration); unset means no decision model is configured, and a model is never downloaded |
 | `KIN_INFER_BUCKET` | bool | true | operational | kin-infer length-bucketed batched forward, on by default; only 0/false/no/off opts out, and the bucketed path is bit-identical per entity so the opt-out is a safe fallback rather than a different answer |
 | `KIN_INFER_CPU_BACKEND` | enum | accelerate | correctness | kin-infer CPU matmul backend: 'pure-rust' forces the deterministic pure-Rust GEMM for bit-reproducible runs; 'accelerate' uses Apple Accelerate BLAS (the macOS default). BLAS differs from pure-Rust in the last ULPs |
+| `KIN_INFER_CPU_GEMM_SPLIT` | usize | 6 | operational | kin-infer CPU decoder prefill: how many concurrent Accelerate calls split each large projection; changes speed only |
+| `KIN_INFER_CPU_PREFILL_TIMINGS` | string | *(unset)* | diagnostic | kin-infer CPU decoder prefill: any non-empty value other than '0' prints a per-stage time breakdown of every call to stderr |
 | `KIN_INFER_DUMP_ENTITY` | usize | 0 | diagnostic | kin-infer index of the entity traced by KIN_INFER_DUMP_LAYER; an unparseable value falls back to 0 |
 | `KIN_INFER_DUMP_LAYER` | string | *(unset)* | diagnostic | kin-infer prints a per-layer hidden-state fingerprint on both the single and batched paths so the two trajectories can be diffed to localize a divergent op; any present value including '0' enables it |
 | `KIN_INFER_FAST_MATH` | bool | true | correctness | kin-infer MSL fast-math, on by default because that is the toolchain default the shipped kernels were compiled against; only the literal 0 disables it, removing float reassociation and the assume-finite contract and so changing results |
@@ -255,6 +292,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_INFER_MMA` | bool | true | correctness | kin-infer simdgroup_matrix MMA GEMM kernels, on by default; only 0/false/no/off forces the scalar tile, and MMA clears a Metal-vs-CPU cosine and swerank parity gate rather than being bit-identical to it |
 | `KIN_INFER_MMA_WIDE` | bool | false | operational | kin-infer wider 64x64 MMA register tile, numerically identical to the 32x32 MMA by construction; off in every profile because the register pressure cuts embed throughput several-fold, and it stays opt-in so the kernel can be measured in isolation |
 | `KIN_INFER_MSL_VERSION` | enum | *(unset)* | correctness | kin-infer Metal shading language version for the runtime shader compile: '30' and '31' select MSL 3.0/3.1 as a driver-miscompile probe with different codegen, and anything else including unset compiles at the byte-identical MSL 2.4 default |
+| `KIN_INFER_NO_DECODER_PREFILL` | string | *(unset)* | correctness | kin-infer: when set, decoder scoring skips the device-resident Metal prefill and runs the generic decoder pass, whose fp32 arithmetic differs from the prefill's fp16 matrix products in the last digits |
 | `KIN_INFER_NO_FOLD` | bool | false | correctness | kin-infer routes the attention-output and FFN blocks through the unfused per-op linear+add+norm path instead of the fused residency folds; only 1/true/yes/on enable it, and the result is numerically the unfused computation rather than the folded one |
 | `KIN_INFER_NO_POOL_REUSE` | string | *(unset)* | diagnostic | kin-infer stops the Metal buffer pool recycling so every acquire allocates fresh, probing whether a buffer-reuse timing race is the corruption source; any present value including '0' enables it |
 | `KIN_INFER_NO_RESIDENT_STACK` | string | *(unset)* | correctness | kin-infer escape hatch forcing the per-layer accelerator path instead of the whole-stack GPU-resident pass; any present value including '0' forces it, it is read fresh on every call rather than sampled once, and the two paths are what a bit-for-bit A/B compares |
@@ -280,6 +318,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_INIT_DISK_FREE_BYTES` | usize | *(unset)* | operational | the free disk space `kin init` judges a conversion against, in bytes, in place of what the filesystem holding the repository's parent reports. A conversion holds every reachable file version twice, uncompressed, while it copies its capture into the store, so it refuses before any work when free space is under that, and says so in one line when free space is under the store size measured repositories reached. Set it for a filesystem that compresses or deduplicates, where the uncompressed figures overstate what it will use. An operator value wins outright, and zero or an unparseable value is refused rather than ignored. It moves only the up-front check and changes nothing about what a conversion writes |
+| `KIN_INIT_HISTORY` | enum | background | operational | the history mode `kin init` uses over a Git worktree when `--history` is not given. `background` admits the checked-out commit first and derives the full history afterwards at low priority; `none` admits the checked-out commit only, for CI jobs, containers and agent sandboxes; `full` admits the whole reachable history before the store is published. `--history` wins over this, and an unrecognized value is refused rather than ignored |
 | `KIN_INIT_MEMORY_CEILING_BYTES` | usize | *(unset)* | operational | the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves both memory refusals: the forecast taken before capture is judged against it, and the projection taken after planning against it less the memory already in use. It changes nothing about what a conversion holds |
 
 ## Storage
@@ -335,6 +374,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_LOCATE_AMALGAM_PENALTY` | float>=0 | 0.05 | correctness | locate tuning knob: amalgam penalty |
+| `KIN_LOCATE_ARM` | enum | *(unset)* | correctness | retrieval arm for description queries: fused (the pipeline with embeddings), cards (entity cards plus graph expansion, no embeddings read or computed), or either with +scorer, +cross-encoder, +decision-engine or +none to run the candidate scorer; [retrieval] arm in .kin/config.toml fills in when unset, and with neither set each query runs fused when it has search vectors to use and cards when it has none |
 | `KIN_LOCATE_ARTIFACT_ADMIT_LIMIT` | usize | 3 | correctness | locate tuning knob: artifact admit limit |
 | `KIN_LOCATE_ARTIFACT_ADMIT_SHARE` | float>=0 | 0.5 | correctness | locate tuning knob: artifact admit share |
 | `KIN_LOCATE_ARTIFACT_FULL_PRIORITY` | float>=0 | 72.0 | correctness | locate tuning knob: artifact full priority |
@@ -352,6 +392,11 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_BODY_SEED_TOPK` | usize | 3 | correctness | locate tuning knob: body seed topk |
 | `KIN_LOCATE_BODY_SEED_WEIGHT` | float>=0 | 0.5 | correctness | locate tuning knob: body seed weight |
 | `KIN_LOCATE_BROAD_TEST_PENALTY` | float>=0 | 0.1 | correctness | locate tuning knob: broad test penalty |
+| `KIN_LOCATE_CARD_EXPAND_FROM` | usize | 10 | correctness | leading card hits the cards arm expands through the graph to their callers, callees and owner |
+| `KIN_LOCATE_CARD_EXPAND_PER_HIT` | usize | 8 | correctness | neighbours the cards arm takes from each expanded hit |
+| `KIN_LOCATE_CARD_LIMIT` | usize | 100 | correctness | entity cards the cards arm takes from its BM25 ranking, and the entities a description is ranked into on that arm |
+| `KIN_LOCATE_CARD_NEIGHBOURS` | usize | 24 | correctness | direct neighbour names one entity card carries |
+| `KIN_LOCATE_CARD_POOL` | usize | 100 | correctness | candidates the cards arm keeps after fusing its card and graph rankings |
 | `KIN_LOCATE_CENTRALITY_ENTITY_LIMIT` | usize | 20 | correctness | locate tuning knob: centrality entity limit |
 | `KIN_LOCATE_CLI_HEADER_FLOOR` | float>=0 | 0.36 | correctness | locate tuning knob: cli header floor |
 | `KIN_LOCATE_CLI_HEADER_NESTED_FLOOR` | float>=0 | 0.28 | correctness | locate tuning knob: cli header nested floor |
@@ -430,6 +475,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_MIN` | float>=0 | 20.0 | correctness | locate tuning knob: entity dominant resolve min |
 | `KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT` | float>=0 | 8.0 | correctness | locate tuning knob: entity dominant resolve weight |
 | `KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD` | usize | 3 | correctness | locate tuning knob: entity dominant rrf threshold |
+| `KIN_LOCATE_ENTITY_FIRST` | bool | true | correctness | on an arm that reads no embedding, rank a description's entities directly against the evidence index (name, owner, signature, doc summary, body, place, neighbour names) instead of projecting them from the file ranking; a name-shaped query is unaffected; falsy restores the projection |
 | `KIN_LOCATE_ENTITY_FUSION` | bool | context-dependent | correctness | locate tuning knob: entity fusion |
 | `KIN_LOCATE_ENTITY_SURFACE_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: entity surface penalty |
 | `KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT` | float>=0 | 0.0 | correctness | locate tuning knob: explain def floor pct |
@@ -494,7 +540,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_MULTIHOP_SEED_FILES` | usize | repo-size adaptive (5 or 8) | correctness | locate tuning knob: multihop seed files |
 | `KIN_LOCATE_MULTIHOP_SOURCE_DEGREE_THRESHOLD` | usize | 50 | correctness | locate tuning knob: multihop source degree threshold |
 | `KIN_LOCATE_MULTIHOP_TEST_SEED_FILES` | usize | 16 | correctness | locate tuning knob: multihop test seed files |
-| `KIN_LOCATE_MULTIHOP_TIMEOUT_MS` | ms bound (0=unbounded) | profile-dependent (200/500/1000 ms) | correctness | multihop BFS timeout; 0 disables the bound (still capped by depth/frontier) |
+| `KIN_LOCATE_MULTIHOP_TIMEOUT_MS` | ms bound (0=unbounded) | profile-dependent (200/500/1000 ms) | correctness | multihop walk allowance in milliseconds, spent as 20 walk steps per millisecond so the cut falls at the same step on every host and under any load; 0 disables the bound (still capped by depth/frontier) |
 | `KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX` | usize | 3 | correctness | locate tuning knob: multi signal floor max |
 | `KIN_LOCATE_MULTI_SIGNAL_FLOOR_PCT` | float>=0 | 0.2 | correctness | locate tuning knob: multi signal floor pct |
 | `KIN_LOCATE_NAME_TIE_OWNER_MASS_LIMIT` | usize | 16 | correctness | locate tuning knob: name tie owner mass limit |
@@ -562,6 +608,12 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_RRF_RAW_WEIGHT` | float>=0 | 0.05 | correctness | locate tuning knob: rrf raw weight |
 | `KIN_LOCATE_RRF_WEIGHT_EMBEDDING` | float>=0 | 1.0 | correctness | locate tuning knob: rrf weight embedding |
 | `KIN_LOCATE_RRF_WEIGHT_RESOLVE` | float>=0 | 1.0 | correctness | locate tuning knob: rrf weight resolve |
+| `KIN_LOCATE_SCORER` | enum | cross-encoder | correctness | scorer a +scorer arm runs: cross-encoder (the reranker, loaded only from the local model cache and never downloaded mid-query), decision-engine (a small decision model run in process, chosen by KIN_LOCATE_SCORER_MODEL), none (the stage runs and changes nothing) |
+| `KIN_LOCATE_SCORER_CALIBRATION` | string | 1.0,0.0 | correctness | Platt slope and intercept a,b that map the running scorer's logit (the cross-encoder's score, or a decision model's log-odds of yes) to a probability, sigmoid(a*logit+b); the default is the model's own probability; fit on held-out locate data |
+| `KIN_LOCATE_SCORER_CPU_TOP_K` | usize | 8 | correctness | how many leading entities a decision-engine scorer reads when its model runs on the CPU and KIN_LOCATE_SCORER_TOP_K is unset, so the stage stays near its latency budget |
+| `KIN_LOCATE_SCORER_MODEL` | string | Qwen/Qwen3-Reranker-0.6B | correctness | decision model the decision-engine scorer asks whether each candidate is what the query is looking for: a Hugging Face id, optionally id@revision, read only from the local model cache and never downloaded, or a local model directory; Qwen/Qwen3-Reranker-0.6B (a yes-or-no reranker) by default, jaredpalmer/kev-0.6b (a pointer decision model over Qwen/Qwen3-0.6B-Base) also runs; [retrieval] scorer_model in .kin/config.toml fills in when unset |
+| `KIN_LOCATE_SCORER_THRESHOLD` | float>=0 | 0.5 | correctness | calibrated probability below which the scorer rates none of its candidates as the answer and the answer's verdict lists that gap instead of presenting a guess |
+| `KIN_LOCATE_SCORER_TOP_K` | usize | 40 | correctness | how many of the ranking's leading entities the scorer reads and reorders; when unset, a decision-engine scorer running on the CPU reads KIN_LOCATE_SCORER_CPU_TOP_K instead |
 | `KIN_LOCATE_SEED_DIVERSITY_FLOOR_PCT` | float>=0 | 0.01 | correctness | locate tuning knob: seed diversity floor pct |
 | `KIN_LOCATE_SEED_DIVERSITY_PER_FILE_LIMIT` | usize | 3 | correctness | locate tuning knob: seed diversity per file limit |
 | `KIN_LOCATE_SEED_DIVERSITY_TAIL_LIMIT` | usize | 8 | correctness | locate tuning knob: seed diversity tail limit |
@@ -632,6 +684,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_TRACKED_TEXT_MIN_TERMS` | usize | 1 | correctness | locate tuning knob: tracked text min terms |
 | `KIN_LOCATE_TRACKED_TEXT_TERM_LIMIT` | usize | 3x tracked-term limit | correctness | locate tuning knob: tracked text term limit |
 | `KIN_LOCATE_VENDOR_PATH_PENALTY` | float>=0 | 0.01 | correctness | locate tuning knob: vendor path penalty |
+| `KIN_LOCATE_VERBATIM_NAME_ROWS` | bool | true | correctness | include graph entities named verbatim in the query when the rendered file cut would otherwise omit them |
 | `KIN_LOCATE_WEIGHT_COCHANGE` | float>=0 | 1.0 | correctness | locate tuning knob: weight cochange |
 | `KIN_LOCATE_WEIGHT_EMBEDDING` | float>=0 | 1.5 | correctness | locate tuning knob: weight embedding |
 | `KIN_LOCATE_WEIGHT_ERRORS` | float>=0 | 1.0 | correctness | locate tuning knob: weight errors |

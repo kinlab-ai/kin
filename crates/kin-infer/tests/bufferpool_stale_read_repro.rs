@@ -1,25 +1,39 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 //
-// Metal BufferPool populate/recycle window — repro / detector.
+// Metal standalone-norm stale-read detector.
 //
-// Symptom (observed ~1/3 runs): the STANDALONE norm path occasionally reads an
-// unpopulated/stale pooled INPUT buffer. It decodes as the `metal=0` signature —
-// layer_norm of a zero input row = (0 − 0)·inv_std·gamma + beta = beta, so a row
-// collapses to `beta` when its input was actually nonzero.
+// Hammers the standalone `layer_norm` path with rapid submissions and fails if
+// any row reads as unpopulated. LayerNorm of an all-zero row is
+// (0 - 0) * inv_std * gamma + beta = beta, so a row of non-constant input that
+// comes back equal to `beta` (or non-finite) means the kernel read zeros or stale
+// bytes instead of the uploaded input.
 //
-// Source audit (see the PR): the BufferPool acquire/recycle ordering is
-// synchronous-correct by inspection — `commit_wait` gates each standalone op
-// (`commit_bounded(empty); wait_until_completed`) and the per-op input buffer is
-// owned by the caller across that wait, so it only recycles after GPU completion.
-// The residual is therefore a Metal-driver / `StorageModeShared` rapid-reuse
-// timing window, not a Rust-visible logic race. The root-cause fix is a Metal
-// storage/synchronization change (e.g. `StorageModePrivate` + a staging blit, or
-// an explicit fence on reuse) and must be validated on the GPU.
+// Status: passes, reliably, before and after the weight-cache fix described
+// below. It stays `#[ignore]`d only because it needs a Metal device.
 //
-// This test is the on-GPU repro that proves the window and verifies any future
-// fix. It is `#[ignore]`d: it needs a Metal device and currently reproduces a
-// known-open bug, so it is a deliberate repro tool, not a CI gate.
+// An earlier version of this header blamed a `StorageModeShared` rapid-reuse
+// window in the buffer pool. That was never reproduced, and the pool's ordering
+// holds on every path: a standalone op waits on its command buffer before its
+// pooled buffers drop, an asynchronously committed command buffer hands its
+// pooled buffers to its completion handler, and the pipelined segmented forwards
+// wait on their last command buffer before the shared residual can recycle.
+//
+// The stale reads that were real came from the weight cache, not the pool.
+// `GpuCompute::matmul` keeps its `B` operand on the device keyed by the slice's
+// address, length and first and last values, which is sound only for a model
+// weight. The generic decoder passed each attention head's keys and transposed
+// values as that operand, and the allocator reuses a freed slice's address, so a
+// later prompt with the same length and the same first and last tokens was
+// scored against an earlier prompt's keys and values, while every call leaked
+// device buffers. Per-call operands now go through
+// `GpuCompute::matmul_activations`, which uploads through the pool, and the fused
+// add-norm ops upload `gamma` and `beta` per call. The unit tests
+// `matmul_activations_reads_the_operand_a_reused_address_gets_stale_from_the_weight_cache`,
+// `fused_add_norm_reads_per_call_norm_vectors_fresh` and
+// `decoder_passes_only_model_weights_to_weight_caching_matmul` cover that. The
+// standalone norm path uploads its input, `gamma` and `beta` through the pool
+// and has no cached operand, which is why this detector passes.
 //
 //   cargo test -p kin-infer --release --features metal \
 //     --test bufferpool_stale_read_repro -- --ignored --nocapture
@@ -34,7 +48,7 @@ use kin_infer::gpu::{create_compute, GpuBackend};
 /// `beta`, so a row that equals `beta` (or is non-finite) means the input buffer
 /// was not populated before the kernel ran.
 #[test]
-#[ignore = "on-GPU repro of the Metal BufferPool populate/recycle window"]
+#[ignore = "needs a Metal device"]
 fn standalone_norm_rapid_submission_no_stale_read() {
     let gpu = create_compute();
     if gpu.backend() != GpuBackend::Metal {

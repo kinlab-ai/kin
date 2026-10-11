@@ -738,7 +738,9 @@ def check_2(suite):
     env["npm_config_audit"] = "false"
     env["npm_config_fund"] = "false"
 
-    command = [suite.kin, "setup", "--no-interactive", "--skip-mcp-check",
+    # `--verbose` is the full account the grade below reads; a run without a
+    # terminal otherwise prints only the short summary.
+    command = [suite.kin, "setup", "--no-interactive", "--verbose", "--skip-mcp-check",
                "--install-language-servers"]
     rc, out, err = run(command, cwd=work, env=env, timeout=1800)
     # The installer's full account, beside the files it touched: the verdict
@@ -1224,10 +1226,15 @@ MCP_PROBE_ID = 4242
 
 # Two sentences the notice owes a reader who is about to be served nothing.
 UNBOUND_NOTICE = "no repository is bound yet"
-# The repairs a registry install can run. It launches Kin through npx and puts
-# no `kin` on the user's PATH, so a notice whose only repair is `kin init .`
-# names a command that user does not have.
-UNBOUND_REPAIRS = ("kin_init", "npx -y @kinlab/kin@")
+# The repair a registry install can run: the npx form of this release. It
+# launches Kin through npx and puts no `kin` on the user's PATH, so a notice
+# whose only repair is `kin init .` names a command that user does not have.
+UNBOUND_REPAIRS = ("npx -y @kinlab/kin@",)
+# A repair no agent profile serves. Setting a folder up is a command a person
+# runs, not semantic agent work, so the server refuses an init tool on every
+# profile, and a notice that sends the reader's agent to one names a repair
+# that is refused.
+UNSERVED_REPAIR = "init tool"
 
 
 def mcp_initialize(command, cwd, env, timeout=180):
@@ -1347,6 +1354,10 @@ def grade_unbound_start(verdict, alive, stderr_text, stdout_lines, kin_created):
         return False, ("the notice does not name %s, so a reader whose only Kin is this npx "
                        "wrapper is told something is wrong and not what they can run: %s"
                        % (" or ".join(missing), flatten(failure_excerpt(stderr_text))))
+    if UNSERVED_REPAIR in flat:
+        return False, ("the notice sends the reader's agent to an init tool, which no agent "
+                       "profile serves, so the repair it names is refused: %s"
+                       % flatten(failure_excerpt(stderr_text)))
     return True, ("`initialize` was served, the process stayed up, no repository was created "
                   "behind the user, and the notice named the gap and the repair on stderr")
 
@@ -1521,9 +1532,18 @@ if __name__ == "__main__":
 # `sweep complete (3/6 files)` and nothing else. Keying the precondition on the
 # post-fix phrasing alone would grade the pre-fix sweep as a run that never
 # reached the phase, which reports UNREADABLE over a live completion claim.
-OUTCOME_MARKERS = ("cross-file enrichment", "sweep complete", "sweep finished")
-COMPLETION_CLAIMS = ("cross-file enrichment complete", "sweep complete")
-SKIP_ROW = re.compile(r"rust: (\d+) files? not enriched, because")
+OUTCOME_MARKERS = (
+    "cross-file enrichment",
+    "Linked references across files",
+    "sweep complete",
+    "sweep finished",
+)
+COMPLETION_CLAIMS = (
+    "cross-file enrichment complete",
+    "Linked references across files: all",
+    "sweep complete",
+)
+SKIP_ROW = re.compile(r"rust: (\d+) files? (?:not enriched|not checked), because")
 
 
 def _outcome_reported(flat):
@@ -1929,11 +1949,16 @@ class Suite(object):
 
     def base_env(self):
         env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        env["KIN_STORE_LAYOUT"] = "in-tree"
         # The same posture the other suites hold: no inference, no projection,
         # and nothing that could reach an operator's real store.
         env["KIN_DAEMON_AUTO_EMBED"] = "0"
         env["KIN_EMBED_BACKEND"] = "cpu"
         env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        env["KIN_INIT_HISTORY"] = "full"
         env["NO_COLOR"] = "1"
         return env
 
@@ -2713,11 +2738,22 @@ def self_test():
         "roots at one. This server re-resolves its repository on later tool calls, so nothing here\n"
         "needs a restart. Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you.\n"
     )
+    # The notice before the semantic agent surface stopped carrying an init
+    # tool: it sent the agent to one, which no agent profile serves now.
+    init_tool_notice_stderr = (
+        "kin-mcp: /tmp/empty is not a Kin repository, and neither is any folder above it, so no\n"
+        "repository is bound yet. Starting anyway: `initialize` and `tools/list` are served, and a\n"
+        "graph tool called before a repository exists answers by naming the gap.\n"
+        "To set this folder up, ask your agent to call the init tool, or run\n"
+        "`npx -y @kinlab/kin@0.8.0 init .` in it; the folder must be a Git repository or empty.\n"
+        "This server re-resolves its repository on later tool calls, so nothing here needs a restart.\n"
+        "Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you at launch.\n"
+    )
     fixed_notice_stderr = (
         "kin-mcp: /tmp/empty is not a Kin repository, and neither is any folder above it, so no\n"
         "repository is bound yet. Starting anyway: `initialize` and `tools/list` are served, and a\n"
         "graph tool called before a repository exists answers by naming the gap.\n"
-        "To set this folder up, ask your agent to call kin_init, or run\n"
+        "To set this folder up, run\n"
         "`npx -y @kinlab/kin@0.8.0 init .` in it; the folder must be a Git repository or empty.\n"
         "This server re-resolves its repository on later tool calls, so nothing here needs a restart.\n"
         "Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you at launch.\n"
@@ -2743,6 +2779,9 @@ def self_test():
            grade_unbound_start(MCP_SERVED, True, "", served_frame, False)[0], False)
     expect("a notice naming only a repair a registry install cannot run must FAIL",
            grade_unbound_start(MCP_SERVED, True, native_only_notice_stderr, served_frame,
+                               False)[0], False)
+    expect("a notice sending the agent to an init tool no profile serves must FAIL",
+           grade_unbound_start(MCP_SERVED, True, init_tool_notice_stderr, served_frame,
                                False)[0], False)
     expect("a notice naming the gap and not the repair must FAIL",
            grade_unbound_start(MCP_SERVED, True,

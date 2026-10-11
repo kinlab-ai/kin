@@ -164,8 +164,10 @@ fn classify(delta: &EntityDelta) -> Option<(ApiChangeClass, ApiChange)> {
             (false, true) => (ApiChangeClass::Published, Some(old), Some(new)),
             (true, false) => (ApiChangeClass::Unpublished, Some(old), Some(new)),
             (true, true) => {
+                // Signature text that differs only by a comment inside the
+                // declaration is the same signature.
                 if old.fingerprint.signature_hash != new.fingerprint.signature_hash
-                    || old.signature != new.signature
+                    || kin_review::signature_changed(old, new)
                     || old.name != new.name
                 {
                     (ApiChangeClass::SignatureChanged, Some(old), Some(new))
@@ -387,6 +389,19 @@ mod tests {
         assert_eq!(class, ApiChangeClass::SignatureChanged);
         assert_eq!(class.impact(), SemverImpact::Major);
         assert_eq!(change.previous_signature.as_deref(), Some("fn api(v1)"));
+
+        // A comment inside the declaration moves the signature's text and no
+        // token, so it is no API change at all.
+        let mut commented = public.clone();
+        commented.signature = "fn api(/* the value */ v1)".to_string();
+        assert!(
+            classify(&EntityDelta::Modified {
+                old: public.clone(),
+                new: commented,
+            })
+            .is_none(),
+            "a comment in a declaration is not a signature change"
+        );
 
         let mut rebodied = public.clone();
         rebodied.fingerprint = fingerprint(1, 9);

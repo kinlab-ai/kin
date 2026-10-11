@@ -93,8 +93,8 @@ fn daemon_status_and_stop_lifecycle() {
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 
-    kin_core::init(&repo).expect("init scratch repo");
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = runtime.initialize_native_replica(&repo, "main");
     let runtime_root = runtime
         .registry_path()
         .parent()
@@ -122,7 +122,7 @@ fn daemon_status_and_stop_lifecycle() {
         String::from_utf8_lossy(&up.stderr)
     );
 
-    let pid_path = repo.join(".kin/daemon.pid");
+    let pid_path = layout.root().join("daemon.pid");
     let worker_pid = read_pid(&pid_path).expect("worker daemon.pid after autostart");
     assert!(
         is_process_alive(worker_pid),
@@ -140,6 +140,31 @@ fn daemon_status_and_stop_lifecycle() {
         status["current_repo"]["pid"].as_u64(),
         Some(worker_pid as u64)
     );
+    // What the daemon is doing comes from its own health answer: one of the
+    // stable phases, never "unknown" or "stopped" for a daemon that answered.
+    let activity = &status["current_repo"]["activity"];
+    let phase = activity["phase"].as_str().unwrap_or_default();
+    assert!(
+        [
+            "starting",
+            "reconciling",
+            "indexing",
+            "enriching",
+            "reading_history",
+            "idle"
+        ]
+        .contains(&phase),
+        "a running daemon reports what it is doing: {activity}"
+    );
+    assert!(activity["detail"]
+        .as_str()
+        .is_some_and(|detail| !detail.is_empty()));
+    for daemon in status["repo_daemons"].as_array().into_iter().flatten() {
+        assert!(
+            daemon["activity"]["phase"].is_string(),
+            "every listed daemon carries an activity: {daemon}"
+        );
+    }
 
     // ── stop the current repo's worker: clean exit 0, process gone ────────────
     let stop = kin(&runtime, &repo, &["daemon", "stop"]);
@@ -172,6 +197,7 @@ fn daemon_status_and_stop_lifecycle() {
         "kin daemon status (after stop)",
     );
     assert_eq!(status["current_repo"]["state"], "not running");
+    assert_eq!(status["current_repo"]["activity"]["phase"], "stopped");
 
     // ── stop --all: reaps the supervisor (supervisor last), clean exit 0 ──────
     let sup_pid = read_pid(&runtime_root.join("supervisor.pid"));
@@ -200,6 +226,7 @@ fn daemon_status_and_stop_lifecycle() {
 fn spawn_starting_daemon(
     runtime: &common::IsolatedDaemonRuntime,
     repo: &Path,
+    kin_root: &Path,
     gate: &Path,
 ) -> common::RuntimeOwnedChild {
     std::fs::write(gate, b"held").expect("arm the startup gate");
@@ -214,10 +241,9 @@ fn spawn_starting_daemon(
         .stderr(std::process::Stdio::null())
         .spawn_owned()
         .expect("spawn a daemon held in startup");
-    let kin_root = repo.join(".kin");
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if let StartingDaemonOwner::Starting(owner) = starting_daemon_owner(&kin_root) {
+        if let StartingDaemonOwner::Starting(owner) = starting_daemon_owner(kin_root) {
             if owner.identity().pid() == child.id() {
                 break;
             }
@@ -263,14 +289,15 @@ fn a_daemon_still_starting_is_stopped_by_stop_and_stop_all() {
     let root = tempfile::tempdir().expect("temp root");
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    kin_core::init(&repo).expect("init scratch repo");
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = runtime.initialize_native_replica(&repo, "main");
 
     for args in [
         &["daemon", "stop", "--json"][..],
         &["daemon", "stop", "--all", "--json"][..],
     ] {
-        let mut daemon = spawn_starting_daemon(&runtime, &repo, &root.path().join("gate"));
+        let mut daemon =
+            spawn_starting_daemon(&runtime, &repo, layout.root(), &root.path().join("gate"));
         let pid = daemon.id();
         let report = stdout_json(&kin(&runtime, &repo, args), &format!("kin {args:?}"));
         assert_eq!(report["all_stopped"], true, "{report}");
@@ -294,12 +321,11 @@ fn a_maintenance_holder_is_reported_busy_and_never_signalled() {
     let root = tempfile::tempdir().expect("temp root");
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    kin_core::init(&repo).expect("init scratch repo");
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let _maintenance =
-        kin_cli::daemon_client::acquire_repository_runtime_authority(&repo.join(".kin"))
-            .expect("acquire the runtime authority")
-            .expect("nothing else holds the runtime authority");
+    let layout = runtime.initialize_native_replica(&repo, "main");
+    let _maintenance = kin_cli::daemon_client::acquire_repository_runtime_authority(layout.root())
+        .expect("acquire the runtime authority")
+        .expect("nothing else holds the runtime authority");
 
     for args in [
         &["daemon", "stop", "--json"][..],

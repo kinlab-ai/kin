@@ -213,7 +213,8 @@ impl InstallChannel {
             }
             Self::Homebrew => "run `brew reinstall kin`",
             Self::Unknown => {
-                "reinstall Kin from https://github.com/firelock-ai/kin (scripts/install.sh)"
+                "reinstall Kin with its installer from https://github.com/kinlab-ai/kin: \
+                 `curl -fsSL https://get.kinlab.dev/install | sh`"
             }
         }
     }

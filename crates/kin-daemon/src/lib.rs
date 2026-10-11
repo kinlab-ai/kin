@@ -116,16 +116,19 @@
 
 pub(crate) mod accepted_enrichment;
 pub mod api;
+mod artifact_commit;
 pub mod auth_rotation;
 pub mod background_work;
 mod binding_history;
 pub(crate) mod call_site_ledger;
 pub(crate) mod call_site_settlement;
+mod commit_changes;
 pub mod commit_deltas;
 pub mod commit_liveness;
 pub mod daemon;
 mod entity_drafts;
 mod entity_lifecycle;
+mod entity_words;
 pub mod error;
 pub mod gcs_endpoint;
 pub mod graph_only_members;
@@ -135,17 +138,20 @@ pub mod graph_only_members;
 /// test.
 #[cfg(test)]
 mod graph_status_first_contact;
+pub mod history_schedule;
 pub mod hosted_spine_cost;
 pub mod hosted_start;
 mod hydration_requalify;
 pub mod idle_floor;
 mod language_server_command;
 pub mod lifecycle;
+pub(crate) mod live_read_gate;
 mod local_repository_authority;
 pub mod loop_runner;
 mod mcp_commit;
 mod mcp_mutate;
 mod mcp_source_base;
+mod module_code_commit;
 pub(crate) mod owed_enrichment;
 mod pending_commits;
 pub(crate) mod prepared_publication;
@@ -180,7 +186,11 @@ pub mod startup_requalification;
 pub mod state;
 pub mod storage_delegate;
 pub mod supervisor;
+mod sweep_lanes;
 mod sweep_retry;
+mod sweep_waiters;
+#[cfg(test)]
+mod test_fixture_cache;
 pub mod traffic_adapter;
 mod unit_lifecycle;
 pub mod watcher_loss;

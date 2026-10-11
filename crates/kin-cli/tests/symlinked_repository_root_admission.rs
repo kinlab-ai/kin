@@ -139,11 +139,14 @@ fn seed_repository(repo: &Path) {
 const STATUS_SETTLE_BOUND: Duration = Duration::from_secs(60);
 
 /// One `kin graph status`, run through the production route.
-fn graph_status(repo: &Path, home: &Path, port: u16) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
+fn graph_status(
+    repo: &Path,
+    runtime: &common::IsolatedDaemonRuntime,
+    port: u16,
+) -> std::process::Output {
+    runtime
+        .kin_command()
         .args(["graph", "status"])
-        .env("HOME", home)
-        .env("USERPROFILE", home)
         .env("KIN_DAEMON_URL", format!("http://127.0.0.1:{port}"))
         .current_dir(repo)
         .output()
@@ -166,10 +169,10 @@ fn graph_status(repo: &Path, home: &Path, port: u16) -> std::process::Output {
 /// So wait for a reading rather than take the first one. A graph that is
 /// genuinely unhealthy still fails, at the bound, printing the last thing the
 /// command said.
-fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
+fn live_entity_count(repo: &Path, runtime: &common::IsolatedDaemonRuntime, port: u16) -> u64 {
     let deadline = Instant::now() + STATUS_SETTLE_BOUND;
     loop {
-        let output = graph_status(repo, home, port);
+        let output = graph_status(repo, runtime, port);
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.success() {
             return stdout
@@ -198,22 +201,21 @@ fn live_entity_count(repo: &Path, home: &Path, port: u16) -> u64 {
 #[test]
 fn a_repository_bound_through_a_symlinked_root_admits_a_host_write() {
     let root = tempdir().expect("temp root");
-    let home = root.path().join("home");
     let real = root.path().join("real-repo");
     let linked = root.path().join("linked-repo");
-    fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&real).expect("create repo");
     std::os::unix::fs::symlink(&real, &linked).expect("link the repository root");
 
     // Every path from here on is the symlinked spelling, which is what a person
     // with a linked work directory types and what their editor and agent
-    // inherit. Nothing in the test resolves it, because nothing they run would.
+    // inherit. Product requests retain that spelling; layout discovery only
+    // verifies which store serves it and where its endpoint is recorded.
     seed_repository(&linked);
 
-    let init = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let runtime = common::IsolatedDaemonRuntime::new(&linked);
+    let init = runtime
+        .kin_command()
         .args(["init", ".", "--json"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .current_dir(&linked)
         .output()
         .expect("run production kin init route");
@@ -224,11 +226,11 @@ fn a_repository_bound_through_a_symlinked_root_admits_a_host_write() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let runtime = common::IsolatedDaemonRuntime::new(&linked);
+    let layout = runtime.layout_for(&linked);
     let mut daemon = IsolatedDaemon::spawn(&linked, &runtime);
-    let port = daemon.wait_until_serving(&linked.join(".kin"));
+    let port = daemon.wait_until_serving(layout.root());
 
-    let before = live_entity_count(&linked, &home, port);
+    let before = live_entity_count(&linked, &runtime, port);
 
     // The write a person makes: a new file, through the linked root, with no
     // command run afterwards. Ambient admission is what makes it queryable.
@@ -241,7 +243,7 @@ fn a_repository_bound_through_a_symlinked_root_admits_a_host_write() {
     let deadline = Instant::now() + ADMISSION_BOUND;
     let mut latest = before;
     while Instant::now() < deadline {
-        latest = live_entity_count(&linked, &home, port);
+        latest = live_entity_count(&linked, &runtime, port);
         if latest > before {
             break;
         }

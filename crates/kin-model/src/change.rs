@@ -212,7 +212,9 @@ impl EntityHistoryEntry {
             origin: change.origin,
             parents: parents_fit.then(|| change.parents.clone()),
             timestamp: change.timestamp.clone(),
-            author: (change.author.0.len() <= 512).then(|| change.author.clone()),
+            // The author as Git names them, never the time and offset an
+            // earlier import recorded after the address.
+            author: (change.author.0.len() <= 512).then(|| change.author.identity()),
             message: (change.message.len() <= 4096).then(|| change.message.clone()),
             metadata_omissions,
             entity_deltas: include_details

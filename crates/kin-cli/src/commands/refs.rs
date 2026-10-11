@@ -184,7 +184,10 @@ pub async fn run(entity: String, kind: String, all: bool, json: bool) -> Result<
         anyhow::bail!(error);
     }
     for line in response.lines {
-        println!("{}", crate::output_style::paint_refs_line(&line));
+        println!(
+            "{}",
+            crate::output_style::paint_refs_line(&crate::plain_words::line(&line))
+        );
     }
     Ok(())
 }
@@ -195,6 +198,16 @@ pub async fn run_page(
     kind: String,
     cursor: Option<String>,
     max_chars: Option<usize>,
+) -> Result<()> {
+    run_page_with_view(entity, kind, cursor, max_chars, None).await
+}
+
+pub async fn run_page_with_view(
+    entity: String,
+    kind: String,
+    cursor: Option<String>,
+    max_chars: Option<usize>,
+    view: Option<&str>,
 ) -> Result<()> {
     let max_chars = max_chars.unwrap_or(12_000);
     if !(kin_mcp::budget::RESPONSE_MIN_MAX_CHARS..=kin_mcp::budget::RESPONSE_MAX_MAX_CHARS)
@@ -215,6 +228,22 @@ pub async fn run_page(
         ("relation_kinds".into(), serde_json::json!(kinds)),
         ("max_chars".into(), serde_json::json!(max_chars)),
     ]);
+    if let Some(view) = view {
+        if !matches!(view, "references" | "overrides") {
+            anyhow::bail!("--view must be references or overrides");
+        }
+        arguments.insert("view".into(), serde_json::json!(view));
+        if view == "overrides" {
+            if kind != "all" {
+                anyhow::bail!("--view overrides does not accept --kind filters");
+            }
+            let id = uuid::Uuid::parse_str(&entity)
+                .context("--view overrides requires an exact entity UUID returned by Kin")?;
+            arguments.remove("query");
+            arguments.remove("relation_kinds");
+            arguments.insert("entity_id".into(), serde_json::json!(id.to_string()));
+        }
+    }
     if let Some(cursor) = cursor {
         arguments.insert("cursor".into(), serde_json::json!(cursor));
     }
@@ -1333,19 +1362,16 @@ fn refs_absence_verdict(
     envelope: &kin_mcp::Envelope,
     spine: RefsSpine<'_>,
 ) -> Option<serde_json::Value> {
-    kin_mcp::negative::negative_for(
-        "find_references",
-        &refs_absence_payload(
-            graph,
-            target,
-            relation_kinds,
-            addressed_by_name,
-            arrival,
-            spine,
-        ),
-        envelope,
-        &[],
-    )
+    let payload = refs_absence_payload(
+        graph,
+        target,
+        relation_kinds,
+        addressed_by_name,
+        arrival,
+        spine,
+    );
+    let response_gaps = kin_mcp::verdict::Verdict::pre_negative_gaps(&payload);
+    kin_mcp::negative::negative_for("find_references", &payload, envelope, &response_gaps)
 }
 
 /// The absence qualifier for an empty `kin refs` answer.
@@ -1396,7 +1422,7 @@ fn refs_absence_qualifier(
 /// The scope is the one thing this call site must get right, and it is what
 /// makes `find_references` different from the three tools rung one and rung two
 /// wired up. Those declare the fixed reference triple; this one is gated on the
-/// query's OWN `relation_kinds` (`kin_mcp::negative::absence_cross_file_classes`
+/// query's OWN `relation_kinds` (`kin_mcp::negative::absence_cross_unit_classes`
 /// reads that key and only falls back to the triple when a payload does not
 /// report the scope it ran with). So `kin refs --kind calls` must be graded on
 /// calls coverage alone. Handing over the default triple instead would refuse on
@@ -3055,7 +3081,8 @@ mod tests {
             "the CLI must inherit the refusal and name ITS OWN noun, not impact's: {rendered}"
         );
         assert!(
-            rendered.contains("embed_worker_failed") || rendered.contains("holds no cross-file"),
+            rendered.contains("the background search indexer failed")
+                || rendered.contains("links between files"),
             "the line names what the verdict disclosed rather than inventing a cause: {rendered}"
         );
     }
@@ -3098,19 +3125,17 @@ mod tests {
         .next()
         .expect("focal");
         let kinds = parse_relation_kinds("all").unwrap();
-        let mcp = kin_mcp::negative::negative_for(
-            "find_references",
-            &super::refs_absence_payload(
-                &graph,
-                &target,
-                &kinds,
-                Some("orphan"),
-                &kin_mcp::caller_arrival::observe_caller_arrival(&graph, &target),
-                super::RefsSpine::absent(),
-            ),
-            &degraded,
-            &[],
+        let payload = super::refs_absence_payload(
+            &graph,
+            &target,
+            &kinds,
+            Some("orphan"),
+            &kin_mcp::caller_arrival::observe_caller_arrival(&graph, &target),
+            super::RefsSpine::absent(),
         );
+        let response_gaps = kin_mcp::verdict::Verdict::pre_negative_gaps(&payload);
+        let mcp =
+            kin_mcp::negative::negative_for("find_references", &payload, &degraded, &response_gaps);
         assert_eq!(
             response.negative, mcp,
             "the CLI field must BE the gate's object, not a recomputation of it"
@@ -3195,21 +3220,10 @@ mod tests {
         );
     }
 
-    /// THE TICKET'S NEGATIVE CONTROL, taken literally: a genuinely dead entity
-    /// on a healthy enriched store must still read plainly, with no qualifier.
-    ///
-    /// This is the arm that stops the rollout becoming the FIR-2404 failure in
-    /// its opposite costume, and it is not hypothetical. The first CI run of
-    /// this change went red here, on the sibling e2e fixture, because a
-    /// repository with no spine reports `cross_repo: not_configured` and the
-    /// `find_references` gate counts that as a gap. Left alone, every empty
-    /// `kin refs` on every non-federated repository would carry a warning about
-    /// a federation the user never asked for. `only_unconfigured_federation` is
-    /// what withholds that sentence, and this test is what proves it fires:
-    /// all three reference classes are present here, so the coverage gate is
-    /// satisfied and an unconfigured spine is the only thing left to object to.
+    /// Recorded class presence leaves non-call completion unmeasured. A mixed
+    /// query retains that gap, while a settled Call-only query reads plainly.
     #[test]
-    fn a_dead_focal_on_a_coverage_complete_store_reads_plainly() {
+    fn empty_reference_queries_separate_non_call_completion_from_a_settled_call_census() {
         // This fixture isolates other verdict inputs on a measured usable host.
         let _readiness = kin_mcp::edge_coverage::test_support::scoped_language_servers(&[
             kin_model::LanguageId::Rust,
@@ -3255,27 +3269,50 @@ mod tests {
                 .unwrap();
         }
 
-        let response = build_refs_response(
-            &layout,
-            &graph,
-            &RefsRequest {
-                entity: "orphan".to_string(),
-                kind: "all".to_string(),
-            },
-            &refs_test_envelope(),
-        )
-        .expect("refs response");
-        let rendered = response.lines.join("\n");
+        for kind in ["all", "calls", "Calls"] {
+            let response = build_refs_response(
+                &layout,
+                &graph,
+                &RefsRequest {
+                    entity: "orphan".to_string(),
+                    kind: kind.to_string(),
+                },
+                &refs_test_envelope(),
+            )
+            .expect("refs response");
+            let rendered = response.lines.join("\n");
 
-        assert!(
-            rendered.contains("No incoming"),
-            "the fixture must reach the empty arm or this test asserts nothing: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Kin cannot rule out"),
-            "a dead focal on a coverage-complete store reads plainly; an unconfigured spine is \
-             not a gap in this repository: {rendered}"
-        );
+            assert!(
+                rendered.contains("No incoming"),
+                "the fixture must reach the empty arm or this test asserts nothing: {rendered}"
+            );
+            let negative = response
+                .negative
+                .expect("an empty answer carries its verdict");
+            let non_calls = kind == "all";
+            assert_eq!(
+                negative["safe_to_conclude_absent"], !non_calls,
+                "{kind}: {negative}"
+            );
+            assert_eq!(
+                negative["trust_reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("reference_completion_unmeasured"),
+                non_calls,
+                "{kind}: {negative}"
+            );
+            assert_eq!(
+                rendered.contains("non-call completion is unmeasured"),
+                non_calls,
+                "{kind}: {rendered}"
+            );
+            assert_eq!(
+                rendered.contains("Kin cannot rule out"),
+                non_calls,
+                "{kind}: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -3345,6 +3382,7 @@ mod tests {
                 admission_failure: None,
                 local_binding_requirement:
                     kin_mcp::source_derivation::LocalBindingRequirement::Required,
+                binding_scope: None,
             });
             let response = build_refs_response(
                 &layout,
@@ -3366,6 +3404,80 @@ mod tests {
                 response.lines.join("\n").contains("Kin cannot rule out"),
                 reason.is_some(),
                 "{:?}",
+                response.lines
+            );
+            if let Some(reason) = reason {
+                assert!(
+                    negative["trust_reason"].as_str().unwrap().contains(reason),
+                    "{negative}"
+                );
+            }
+        }
+
+        // The same outstanding debt, split by the language that carries it.
+        // Scoped to the Rust focal, debt in Python sources cannot hide a
+        // reference to it, and debt in Rust sources still can.
+        let orphan = entities
+            .iter()
+            .find(|entity| entity.name == "orphan")
+            .unwrap();
+        assert_eq!(orphan.language, kin_model::LanguageId::Rust);
+        for (debt_language, reason) in [
+            (kin_model::LanguageId::Python, None),
+            (
+                kin_model::LanguageId::Rust,
+                Some("local_binding_outstanding"),
+            ),
+        ] {
+            let mut report = SourceDerivationReport::unproven("fixture");
+            report.body_binding = SourceBinding::Current;
+            report.prior_local_binding = PriorLocalBindingStatus::Outstanding;
+            report.outstanding_local_binding_obligations = Some(1);
+            report.local_binding_by_language = Some(
+                [(
+                    kin_review::source_derivation::language_key(debt_language),
+                    kin_review::source_derivation::LanguageBinding {
+                        prior_local_binding: PriorLocalBindingStatus::Outstanding,
+                        outstanding_local_binding_obligations: Some(1),
+                        files: 1,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+            let mut observation = SourceDerivationObservation {
+                scope: SourceObservationScope::LiveHead,
+                checked_scope: "admitted_inventory".into(),
+                sampled: "selected_graph_before_query".into(),
+                report: Some(report),
+                admission_failure: None,
+                local_binding_requirement:
+                    kin_mcp::source_derivation::LocalBindingRequirement::Required,
+                binding_scope: None,
+            };
+            observation.scope_bindings_to([orphan], "resolved_focal");
+            let mut envelope = refs_test_envelope();
+            envelope.source_derivation = Some(observation);
+            let response = build_refs_response(
+                &layout,
+                &graph,
+                &RefsRequest {
+                    entity: "orphan".into(),
+                    kind: "calls".into(),
+                },
+                &envelope,
+            )
+            .unwrap();
+            let negative = response.negative.expect("empty references carry a verdict");
+            assert_eq!(
+                negative["safe_to_conclude_absent"],
+                reason.is_none(),
+                "{debt_language:?}: {negative}"
+            );
+            assert_eq!(
+                response.lines.join("\n").contains("Kin cannot rule out"),
+                reason.is_some(),
+                "{debt_language:?}: {:?}",
                 response.lines
             );
             if let Some(reason) = reason {
@@ -3473,15 +3585,8 @@ mod tests {
         );
     }
 
-    /// The federation guard must not swallow a REAL gap.
-    ///
-    /// Written because falsification found the hole rather than because the
-    /// design predicted it: making `only_unconfigured_federation` fire on any
-    /// trust reason at all left every refs test green. Every one of them runs on
-    /// a coverage-poor store, which renders the absent-class sentence and never
-    /// consults the guard, so an over-broad guard silencing genuine degradation
-    /// was invisible. Coverage is COMPLETE here on purpose, so the absent-class
-    /// path cannot fire and the degraded signal is the only thing left to say.
+    /// Relation-work refusals qualify both scopes. A vector-only flag leaves
+    /// the Call census unchanged and cannot close the mixed query's gap.
     #[test]
     fn a_degraded_daemon_still_speaks_when_coverage_is_complete() {
         // This fixture isolates other verdict inputs on a measured usable host.
@@ -3543,13 +3648,13 @@ mod tests {
                 at_unix: 0,
                 from_budget: false,
             }));
-        let answer = |envelope: &kin_mcp::Envelope| {
+        let answer = |envelope: &kin_mcp::Envelope, kind: &str| {
             build_refs_response(
                 &layout,
                 &graph,
                 &RefsRequest {
                     entity: "orphan".to_string(),
-                    kind: "all".to_string(),
+                    kind: kind.to_string(),
                 },
                 envelope,
             )
@@ -3557,37 +3662,48 @@ mod tests {
             .lines
             .join("\n")
         };
-        let rendered = answer(&degraded);
+        for kind in ["all", "calls"] {
+            let rendered = answer(&degraded, kind);
 
-        assert!(
+            assert!(
             !rendered.contains("holds no cross-file"),
             "coverage is complete here, so the absent-class path must not fire or this test is \
              exercising the wrong branch: {rendered}"
         );
-        assert!(
-            rendered.contains("Kin cannot rule out references it did not see"),
-            "a degraded daemon is a real gap and must still be spoken: {rendered}"
-        );
-        assert!(
-            rendered.contains("memory_pressure"),
-            "and it must name the signal the verdict disclosed: {rendered}"
-        );
+            assert!(
+                rendered.contains("Kin cannot rule out references it did not see"),
+                "a degraded daemon is a real gap and must still be spoken: {rendered}"
+            );
+            assert!(
+                rendered.contains("the machine was low on memory"),
+                "and it must name the signal the verdict disclosed: {rendered}"
+            );
 
-        // The other direction. A stopped embedding worker describes vectors,
-        // which refs never reads, so it no longer puts this answer in doubt.
-        let vectors_only = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
-            "initialized": true,
-            "graph_loaded": true,
-            "graph_entity_count": 3,
-            "graph_generation": 1,
-            "embed_worker_failed": true,
-        }));
-        let rendered = answer(&vectors_only);
-        assert!(!rendered.contains("holds no cross-file"), "{rendered}");
-        assert!(
-            !rendered.contains("Kin cannot rule out references it did not see"),
-            "a flag that describes vectors must not bound an answer read off relations: {rendered}"
+            // The other direction. A stopped embedding worker describes vectors,
+            // which refs never reads, so it no longer puts this answer in doubt.
+            let vectors_only = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+                "initialized": true,
+                "graph_loaded": true,
+                "graph_entity_count": 3,
+                "graph_generation": 1,
+                "embed_worker_failed": true,
+            }));
+            let rendered = answer(&vectors_only, kind);
+            assert!(!rendered.contains("holds no cross-file"), "{rendered}");
+            assert_eq!(
+            rendered.contains("Kin cannot rule out references it did not see"), kind == "all",
+            "a vector flag does not bound Calls, while non-call completion remains unmeasured: {rendered}"
         );
+            assert_eq!(
+                rendered.contains("non-call completion is unmeasured"),
+                kind == "all",
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains("the background search indexer failed"),
+                "{rendered}"
+            );
+        }
     }
 
     /// A focal that never resolved is a lookup failure, not a finding, so it
@@ -5707,14 +5823,22 @@ mod tests {
                 "{view:?}: the disclosure, candidates included, leads the rows: {joined}"
             );
             // The candidate block is whole before the count: its heading, then
-            // the kept call counted by why it is kept, and nothing of it after.
-            let kept = at("  1 more are kept because of");
-            assert!(candidates < kept && kept < count, "{view:?}: {joined}");
+            // the kept call listed with the leftovers to check first, and
+            // nothing of it after. The stray caller's text is not held, so its
+            // unresolved site could spell the name and is listed rather than
+            // counted.
+            let named = at("  1 name find_note, so check them first:");
+            let kept = at("    reindex, unresolved (no answer)");
+            assert!(
+                candidates < named && named < kept && kept < count,
+                "{view:?}: {joined}"
+            );
             assert!(
                 !lines[count..]
                     .iter()
                     .any(|line| line.contains("Unproven call sites")
-                        || line.contains("are kept because of")),
+                        || line.contains("so check them first")
+                        || line.starts_with("    reindex")),
                 "{view:?}: no candidate line follows the rows: {joined}"
             );
         }

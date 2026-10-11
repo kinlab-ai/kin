@@ -160,6 +160,17 @@ export async function runCommand(executable, args, { cwd, env, prefix, deadline 
   return Buffer.concat(chunks).toString('utf8');
 }
 
+export function validateDefaultArchiveFeatures(meta) {
+  assert.equal(meta.embeddings?.vector_enabled, true);
+  assert.equal(meta.embeddings?.embeddings_enabled, true);
+  assert.equal(meta.embeddings?.local_inference_enabled, false);
+  assert.equal(meta.embeddings?.external_embeddings_enabled, true);
+  assert.equal(meta.embeddings?.metal_enabled, false);
+  assert.equal(meta.embeddings?.provider, 'none');
+  for (const feature of ['vector', 'external-embeddings']) assert.ok(meta.feature_flags?.includes(feature));
+  for (const feature of ['embeddings', 'metal']) assert.ok(!meta.feature_flags?.includes(feature));
+}
+
 export async function main() {
   assert.ok(process.env.RUNNER_TEMP && process.env.ARTIFACT, 'requires candidate workflow environment');
   const output = path.join(process.env.RUNNER_TEMP, 'kin-candidate-install');
@@ -221,6 +232,8 @@ export async function main() {
     assert.equal(meta.kin_commit, commit); assert.equal(meta.kin_version, version);
     assert.equal(meta.kin_dirty, false); assert.equal(meta.kin_source_known, true);
     assert.equal(meta.dependency_provenance, lock);
+    validateDefaultArchiveFeatures(meta);
+    result.default_archive_features = meta.embeddings;
     result.scope = 'native archive installation and exact CLI/daemon identity; no signing, public delivery, upgrade or full first-contact claim';
     if (process.env.GITHUB_PATH) fs.appendFileSync(process.env.GITHUB_PATH, `${bin}\n`);
     if (process.env.GITHUB_ENV) for (const key of ['HOME', 'KIN_HOME', 'KIN_DIR', 'KIN_REGISTRY_PATH']) {

@@ -62,6 +62,16 @@ impl JsonRpcResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub tools: ToolsCapability,
+    /// Present on a connection that serves the `ask` prompt.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prompts: Option<PromptsCapability>,
+}
+
+/// Prompts capability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptsCapability {
+    #[serde(rename = "listChanged")]
+    pub list_changed: bool,
 }
 
 /// Tools capability.
@@ -205,6 +215,7 @@ mod tests {
         let make = |instructions: Option<String>| InitializeResult {
             protocol_version: "2024-11-05".into(),
             capabilities: ServerCapabilities {
+                prompts: None,
                 tools: ToolsCapability {
                     list_changed: false,
                 },

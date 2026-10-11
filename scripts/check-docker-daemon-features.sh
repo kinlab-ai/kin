@@ -6,7 +6,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dockerfile="${1:-${repo_root}/Dockerfile}"
-expected='--features kin-daemon/gcs,kin-daemon/firestore'
+# The hosted daemon keeps embeddings, which the Cargo default no longer carries.
+expected='--features kin-daemon/gcs,kin-daemon/firestore,kin-daemon/embeddings'
 
 if [[ ! -f "${dockerfile}" ]]; then
   echo "docker feature contract: missing ${dockerfile}" >&2
@@ -33,4 +34,4 @@ while IFS= read -r line; do
   fi
 done <<<"${production_lines}"
 
-echo "docker feature contract: PASS (${line_count} production invocations use kin-daemon/gcs,kin-daemon/firestore)"
+echo "docker feature contract: PASS (${line_count} production invocations use kin-daemon/gcs,kin-daemon/firestore,kin-daemon/embeddings)"

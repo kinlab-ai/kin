@@ -92,9 +92,29 @@ pub(crate) fn proves_binding_initializer(
     if declarator.kind() != "variable_declarator"
         || declarator.has_error()
         || declarator.child_by_field_name("name") != Some(name)
-        || declarator.start_position().row != caller.start_line as usize
-        || declarator.start_position().column != caller.start_col as usize
-        || declarator.end_position().row != caller.end_line as usize
+    {
+        return false;
+    }
+    // The caller's entity spans the declarator, or, where the declarator
+    // stands alone in its `const`, `let` or `var` statement, the whole
+    // statement with any `export` before it.
+    let spans_caller = |node: tree_sitter::Node| {
+        node.start_position().row == caller.start_line as usize
+            && node.start_position().column == caller.start_col as usize
+            && node.end_position().row == caller.end_line as usize
+    };
+    let statement = declarator.parent().filter(|statement| {
+        matches!(
+            statement.kind(),
+            "lexical_declaration" | "variable_declaration"
+        ) && statement.named_child_count() == 1
+    });
+    let exported = statement
+        .and_then(|statement| statement.parent())
+        .filter(|parent| parent.kind() == "export_statement");
+    if !(spans_caller(declarator)
+        || statement.is_some_and(spans_caller)
+        || exported.is_some_and(spans_caller))
     {
         return false;
     }
@@ -176,6 +196,7 @@ mod tests {
                     name_line: entity.span.start_line,
                     name_col: entity.span.start_col,
                     declares_name: EntityRef::kind_declares_name(entity.kind),
+                    declares_only: false,
                     kind: entity.kind,
                 })
                 .collect();

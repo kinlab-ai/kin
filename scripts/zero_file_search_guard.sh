@@ -171,12 +171,8 @@ allow_for() {
       printf '%s\n' 'let marker_present = tel::consent_marker_path(layout.root()).exists();'
       ;;
     locate_cursor.rs)
-      # The paging-cursor cache, read, written and cleared. It holds a locate
-      # continuation token, never repository content, and no locate result is
-      # derived from it: a miss restarts paging rather than answering.
-      printf '%s\n' 'std::fs::read_to_string(&path)' \
-                    'let _ = std::fs::write(&path, cursor);' \
-                    'let _ = std::fs::remove_file(&path);'
+      # The paging-cursor cache now goes through a kin-io StoreDir confined to
+      # the store, so this module holds no raw primitive and needs no pin.
       ;;
     locate_debug.rs)
       printf '%s\n' 'std::fs::read_to_string(path)'

@@ -585,10 +585,14 @@ function declaredInterfaceFields(declarations, name) {
 
 test('the hosted transfer seam is one contract three implementations read', async () => {
   const seam = await hostedRepositoryTransferSeam();
-  const [declarations, transferSource] = await Promise.all([
+  const [declarations, transferSource, snapshotProofSource] = await Promise.all([
     fs.readFile(path.join(packageRoot, 'src/index.d.ts'), 'utf8'),
     fs.readFile(
       path.join(repositoryRoot, 'crates/kin-remote/src/repository_transfer.rs'),
+      'utf8'
+    ),
+    fs.readFile(
+      path.join(repositoryRoot, 'crates/kin-model/src/git_snapshot_proof.rs'),
       'utf8'
     )
   ]);
@@ -667,6 +671,28 @@ test('the hosted transfer seam is one contract three implementations read', asyn
       );
     }
   }
+
+  // Snapshot proof is a negotiated optional extension, so merely adding its
+  // name to the envelope is insufficient: a required declaration or an empty
+  // serialized Rust field would silently break ordinary schema-5 packs.
+  const pack = rustStructFields(transferSource, 'RepositoryTransferPack');
+  assert.match(
+    pack.body,
+    /#\[serde\(default, skip_serializing_if = "Vec::is_empty"\)\]\s+pub git_snapshot_proofs: Vec<GitSnapshotProof>/,
+    'empty snapshot proofs must stay absent from ordinary Rust wire packs'
+  );
+  assert.match(
+    declarations,
+    /^ {2}git_snapshot_proofs\?: RepositoryTransferGitSnapshotProof\[\];$/m,
+    'snapshot proofs must be an optional, typed pack extension'
+  );
+  const snapshotProof = rustStructFields(snapshotProofSource, 'GitSnapshotProof');
+  assert.ok(snapshotProof, 'the canonical Rust snapshot proof must remain readable');
+  assert.deepEqual(
+    declaredInterfaceFields(declarations, 'RepositoryTransferGitSnapshotProof'),
+    snapshotProof.fields,
+    'the nested proof declaration must match canonical repository/change/object bindings'
+  );
 
   // The two request members that carry a shape of their own.
   const expectation = rustStructFields(transferSource, 'RepositoryTransferExpectation');

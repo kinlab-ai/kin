@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Persisted parser tiers. The indexer's resolution ladder is checked against
 /// this exact set so moving the codec changes neither accepted proof nor bytes.
-pub const PARSER_CONFIDENCES: &[f32] = &[1.0, 0.95, 0.85, 0.86, 0.9, 0.8, 0.7, 0.6, 0.3, 0.2];
+pub const PARSER_CONFIDENCES: &[f32] = &[
+    1.0, 0.95, 0.85, 0.93, 0.86, 0.9, 0.82, 0.8, 0.7, 0.6, 0.65, 0.3, 0.2,
+];
 
 pub const OCCURRENCE_RULE: &str = "parser_occurrence_resolution_v1";
 

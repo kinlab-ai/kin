@@ -18,15 +18,14 @@
 //! with tests that call status first would seed the cache these depend on being
 //! empty.
 //!
-//! Every reply is parsed through `GraphStatusReport`, whose `Deserialize` runs
-//! the same `validate` the production path runs, so parsing is itself an
-//! assertion that the published counters satisfy their cross-counter invariants:
+//! Every reply passes the production public-status forwarding validator before
+//! its semantic fields are read. That checks the published counters against
+//! their cross-counter invariants without reconstructing private inventory:
 //! indexed at most total, pending at least the uncovered count, index keys at
 //! least indexed, and a staleness disclosure present exactly when the sampling
 //! says the reading was replayed.
 
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -35,31 +34,10 @@ use tower::ServiceExt;
 
 use crate::state::DaemonState;
 
-/// Point registry authority at a scratch directory instead of the developer's
-/// real `~/.kin`, once for the whole test binary.
-///
-/// The `TempDir` handle is held in the `OnceLock` beside the path rather than
-/// dropped, because the path stays installed in the environment for the life of
-/// the process: dropping the handle would delete the registry out from under
-/// every test after the first.
-///
-/// Built through `tempfile` rather than `std::fs`, because
-/// `scripts/verify-zero-file-search.py` scans this crate's sources for
-/// filesystem reach and it is right to. It caught this file doing
-/// `std::fs::create_dir_all` and the honest fix is to stop, not to claim an
-/// exemption for test setup that does not need one.
+/// Point registry authority at the test process's one scratch registry instead
+/// of the developer's real `~/.kin`.
 fn install_test_registry_override() {
-    static REGISTRY: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
-    let _guard = crate::test_env_lock();
-    let (_root, path) = REGISTRY.get_or_init(|| {
-        let root = tempfile::tempdir().expect("a scratch directory for the test registry");
-        let path = root.path().join("registry.toml");
-        kin_core::registry::KinRegistry { repos: Vec::new() }
-            .save_to(&path)
-            .unwrap();
-        (root, path)
-    });
-    kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
+    kin_core::test_env::install_test_registry();
 }
 
 /// The daemon an agent meets: opened over a real store, and never yet asked a
@@ -151,12 +129,32 @@ fn result_text(result: &kin_mcp::ToolCallResult) -> String {
     }
 }
 
-/// Parse, which also runs the production `validate`.
-fn parse_report(
-    result: &kin_mcp::ToolCallResult,
-) -> kin_mcp::handlers::entities::GraphStatusReport {
-    serde_json::from_str(&result_text(result))
-        .unwrap_or_else(|error| panic!("status is not a valid report: {error}: {result:?}"))
+/// Validate the actual public reply through the stdio forwarding boundary.
+fn parse_report(result: &kin_mcp::ToolCallResult) -> serde_json::Value {
+    let report: serde_json::Value = serde_json::from_str(&result_text(result))
+        .unwrap_or_else(|error| panic!("status is not valid JSON: {error}: {result:?}"));
+    assert_eq!(report["_kin"]["semantic_surface"], 1);
+    let forwarded = kin_mcp::server::finalize_daemon_graph_status(
+        result.clone(),
+        kin_mcp::Envelope::daemon(),
+        &[],
+        0,
+    );
+    assert_ne!(
+        forwarded.is_error,
+        Some(true),
+        "invalid public status: {forwarded:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(forwarded).unwrap(),
+        serde_json::to_value(result).unwrap(),
+        "forwarding preserves the producer's selected observation and verdict"
+    );
+    assert!(report.get("source_derivation").is_none());
+    assert!(report["enrichment"].get("files").is_none());
+    assert!(report["_kin"]["answered_by"].get("repo_root").is_none());
+    assert!(report["_kin"]["repository"].get("root").is_none());
+    report
 }
 
 /// The defect, at the surface an agent sees.
@@ -183,7 +181,7 @@ async fn first_contact_graph_status_answers_while_an_embedding_pass_holds_the_lo
 
 /// The answer must be a report, and it must name where it came from.
 ///
-/// Parsing runs the production `validate`, so reaching the assertions below at
+/// Decoding runs the public forwarding validator, so reaching the assertions below at
 /// all proves the published counters are internally consistent. The assertions
 /// then pin the three facts a caller needs to know what it is holding: which
 /// graph was read, which authority answered, and at which observation fence.
@@ -201,20 +199,18 @@ async fn the_first_contact_answer_names_its_scope_authority_and_epoch() {
 
     let report = parse_report(&result);
     assert_eq!(
-        report.scope,
-        kin_mcp::handlers::entities::GraphStatusScope::Head,
+        report["scope"], "head",
         "an unscoped call reports the HEAD view"
     );
     assert_eq!(
-        report.authority,
-        kin_mcp::handlers::entities::GraphStatusAuthority::RepoDaemon,
+        report["authority"], "repo-daemon",
         "the answer names the authority that produced it"
     );
     // Nothing has moved this graph's authority since it opened, so the reading's
     // epoch must be the one the daemon is on. A reading carrying some other
     // epoch would be describing a fence this daemon never stood at.
     assert_eq!(
-        report.authority_epoch, epoch,
+        report["authority_epoch"], epoch,
         "the reading carries the epoch it was taken at"
     );
 }
@@ -235,28 +231,28 @@ async fn a_replayed_first_contact_reading_states_its_age_and_what_blocked_the_li
 
     let report = parse_report(&result);
     assert_eq!(
-        report.sampling,
-        kin_mcp::handlers::entities::GraphStatusSampling::LastSettledSelectedGraph,
+        report["sampling"], "last_settled_selected_graph",
         "a reading taken before this call is not a live point-in-time sample"
     );
     let stale = report
-        .stale
-        .as_ref()
+        .get("stale")
         .expect("a replayed reading discloses itself");
     assert_eq!(
-        stale.reason,
-        kin_mcp::handlers::entities::GraphStatusStaleReason::EmbeddingCoverageChanging,
+        stale["reason"], "embedding_coverage_changing",
         "the disclosure names the state that blocked the live sample"
     );
+    let note = stale["note"]
+        .as_str()
+        .expect("a stale reading states its cause");
     assert!(
-        stale.note.contains("in-flight embedding pass"),
+        note.contains("in-flight embedding pass"),
         "the note states the blocking state in words: {}",
-        stale.note
+        note
     );
     assert!(
-        stale.note.contains("kin embed"),
+        note.contains("kin embed"),
         "the note names what would change the outcome: {}",
-        stale.note
+        note
     );
 }
 
@@ -292,16 +288,15 @@ async fn a_boundary_reading_carries_the_graph_the_batch_actually_found() {
 
     let report = parse_report(&result);
     assert_eq!(
-        report.sampling,
-        kin_mcp::handlers::entities::GraphStatusSampling::LastSettledSelectedGraph,
+        report["sampling"], "last_settled_selected_graph",
         "the lock is held, so this is the boundary reading and not a live sample"
     );
     assert_eq!(
-        report.entity_count, live_entities,
+        report["entity_count"], live_entities,
         "the boundary reading carries the entities the batch found, not the empty graph the open saw"
     );
     assert_eq!(
-        report.relation_count, live_relations,
+        report["relation_count"], live_relations,
         "and the relations beside them"
     );
 }
@@ -321,16 +316,15 @@ async fn an_uncontended_first_contact_is_a_live_point_in_time_sample() {
 
     let report = parse_report(&result);
     assert_eq!(
-        report.sampling,
-        kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph,
+        report["sampling"], "point_in_time_selected_graph",
         "an uncontended sample is live"
     );
     assert!(
-        report.stale.is_none(),
+        report.get("stale").is_none(),
         "a live sample carries no staleness disclosure: {report:?}"
     );
     assert_eq!(
-        report.entity_count,
+        report["entity_count"],
         state.graph.entity_count(),
         "a live sample carries this graph's own counters"
     );
@@ -382,16 +376,15 @@ async fn status_samples_live_while_the_first_batch_builds_its_embedder() {
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
     let report = parse_report(&result);
     assert_eq!(
-        report.sampling,
-        kin_mcp::handlers::entities::GraphStatusSampling::PointInTimeSelectedGraph,
+        report["sampling"], "point_in_time_selected_graph",
         "building the embedder holds nothing status samples under, so the answer is live: \
          {report:?}"
     );
     assert!(
-        report.stale.is_none(),
+        report.get("stale").is_none(),
         "a live sample carries no staleness disclosure: {report:?}"
     );
-    assert_eq!(report.entity_count, state.graph.entity_count());
+    assert_eq!(report["entity_count"], state.graph.entity_count());
     assert!(
         matches!(
             outcome,

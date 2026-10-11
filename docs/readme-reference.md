@@ -175,8 +175,8 @@ Replace `ExactEntityName` with a symbol returned by `locate`. `locate` finds the
 entities relevant to an intent, `refs` shows graph-owned callers/importers and
 references, and `trace` returns the focal entity plus nearby semantic context.
 Once embeddings are complete, your configured AI agent can use the vector-backed
-`semantic_locate` tool; `get_context_pack`, `find_references`, and
-`trace_data_flow` expose the graph neighborhood directly.
+`locate` tool; `context`, `refs`, and
+`trace` expose the graph neighborhood directly.
 
 `impact` walks the other way from `refs` and shows what sits downstream of the
 entity you are about to change. Replace the `locate` string with a behavior you
@@ -245,10 +245,13 @@ Kin commits with the author's name and `kin@localhost` as the email, and no
 sign-off trailer. Commits that came in from Git are reused as their original
 objects, so their identity is untouched.
 
-**`kin init` adds exactly one ignore rule.** It writes `/.kin/` into
-`.git/info/exclude`, which is local to your checkout, and leaves your tracked
-`.gitignore` alone. Whether a teammate's checkout carries a Kin store is their
-business, not a tracked file's.
+**`kin init` writes nothing into your checkout.** The store lives in
+`~/.kin/stores`, outside the working tree, so there is nothing to ignore and
+your tracked `.gitignore` is left alone. A repository an earlier version
+initialized keeps its store in `.kin`, and for that one `kin init` writes a
+single `/.kin/` rule into `.git/info/exclude`, which is local to your checkout.
+Whether a teammate's checkout carries a Kin store is their business, not a
+tracked file's.
 
 **Not every language becomes entities.** The adapter table in
 [step 2](#which-files-become-entities) is the whole set. Everything else is
@@ -266,7 +269,7 @@ carried forward by an upgrade command shipped with any format change, or the
 format change does not ship. A format change never rewrites your working tree.
 
 What that recovery looks like, measured on a 261-commit repository: delete
-`.kin`, run `kin init` again, and everything Git holds comes back, all 61 refs
+the store, run `kin init` again, and everything Git holds comes back, all 61 refs
 byte-identical. Nothing native comes back. A commit, a branch, a review, and a
 spec that existed only in Kin were gone, while the edited file survived as an
 uncommitted working-tree change. Re-admission also mints a new repository id
@@ -391,7 +394,7 @@ kin init
   Default ref: refs/heads/main
   History: unborn (no synthetic commit)
   Workspace: empty exact tree
-  Store size: 17.4 KiB under .kin/ (no Git object store here to compare against)
+  Store size: 17.4 KiB in the store (no Git object store here to compare against)
 ```
 
 ```sh
@@ -579,10 +582,10 @@ rule is enforced inside the agent rather than borrowed from a vendor's permissio
 layer. It has Kin's tools and nothing else: there is no shell, no grep, no
 file-reading tool and no file-writing tool, so it cannot answer a repository
 question from raw file search, and a tool it invents is refused by name. It
-changes code through `kin_mutate`, naming the entity it changes. When Kin reports that an empty result cannot be trusted, the
+changes code through `mutate`, naming the entity it changes. When Kin reports that an empty result cannot be trusted, the
 agent is told the answer is unknown and given the named gap instead of concluding
 the thing does not exist. Every change runs under a Kin session, so it carries
-provenance naming the agent. It creates only what `kin_mutate` can create, and
+provenance naming the agent. It creates only what `mutate` can create, and
 it says so rather than working around a change it cannot make. Run `kin agent doctor
 --base-url <url>` first to check both halves answer. See
 [the CLI reference](cli-reference.md#kin-agent) for the full surface.
@@ -666,7 +669,7 @@ args = ["-y", "@kinlab/kin", "mcp", "start", "--repo", "/absolute/path/to/reposi
 
 One caveat worth repeating: these tools answer from the graph, so the repository
 has to be admitted with `kin init .` and embedded with `kin embed` before
-`semantic_locate` can rank anything. [llms-install.md](../llms-install.md) is that
+`locate` can rank anything. [llms-install.md](../llms-install.md) is that
 whole path written so an agent can follow it unattended, from a bare machine to a
 first verified tool call.
 

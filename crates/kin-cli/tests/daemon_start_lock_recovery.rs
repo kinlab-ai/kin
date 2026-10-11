@@ -59,7 +59,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 /// A one-file repository with a store, and no daemon serving it.
-fn seeded_store(repo: &Path, runtime: &common::IsolatedDaemonRuntime) {
+fn seeded_store(repo: &Path, runtime: &common::IsolatedDaemonRuntime) -> PathBuf {
     fs::create_dir_all(repo.join("src")).expect("create src dir");
     fs::write(
         repo.join("src/lib.rs"),
@@ -85,6 +85,7 @@ fn seeded_store(repo: &Path, runtime: &common::IsolatedDaemonRuntime) {
     let init = kin_command(runtime)
         .arg("init")
         .arg(".")
+        .arg("--json")
         .current_dir(repo)
         .output()
         .expect("run kin init");
@@ -93,6 +94,13 @@ fn seeded_store(repo: &Path, runtime: &common::IsolatedDaemonRuntime) {
         "kin init failed: stdout={} stderr={}",
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&init.stdout).expect("kin init reports JSON");
+    let kin_root = PathBuf::from(
+        report["kin_dir"]
+            .as_str()
+            .expect("init reports its control directory"),
     );
 
     let stop = kin_command(runtime)
@@ -105,11 +113,12 @@ fn seeded_store(repo: &Path, runtime: &common::IsolatedDaemonRuntime) {
         "kin daemon stop failed: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
+    kin_root
 }
 
 /// Write the lock exactly as the CLI writes it, naming `pid` as its holder.
-fn plant_startup_lock(repo: &Path, pid: u32) -> PathBuf {
-    let path = repo.join(".kin").join("daemon.start.lock");
+fn plant_startup_lock(kin_root: &Path, pid: u32) -> PathBuf {
+    let path = kin_root.join("daemon.start.lock");
     fs::write(
         &path,
         format!("pid={pid} acquired_at={:?}\n", SystemTime::now()),
@@ -190,9 +199,9 @@ fn age_lock(path: &Path, by: Duration) {
 fn a_question_behind_a_dead_starters_lock_answers_instead_of_waiting_out_the_budget() {
     let repo = tempdir().expect("temp repo");
     let runtime = common::IsolatedDaemonRuntime::new(repo.path());
-    seeded_store(repo.path(), &runtime);
+    let kin_root = seeded_store(repo.path(), &runtime);
 
-    let lock = plant_startup_lock(repo.path(), reaped_pid());
+    let lock = plant_startup_lock(&kin_root, reaped_pid());
     let started = Instant::now();
     let locate = kin_command(&runtime)
         .args(["locate", "lexer", "--json"])
@@ -229,13 +238,13 @@ fn a_question_behind_a_dead_starters_lock_answers_instead_of_waiting_out_the_bud
 fn a_question_behind_a_recycled_pids_lock_answers_instead_of_waiting_out_the_budget() {
     let repo = tempdir().expect("temp repo");
     let runtime = common::IsolatedDaemonRuntime::new(repo.path());
-    seeded_store(repo.path(), &runtime);
+    let kin_root = seeded_store(repo.path(), &runtime);
 
     let mut squatter = std::process::Command::new("sleep")
         .arg("300")
         .spawn()
         .expect("spawn a live process running an image that is not ours");
-    let lock = plant_startup_lock(repo.path(), squatter.id());
+    let lock = plant_startup_lock(&kin_root, squatter.id());
 
     let locate = kin_command(&runtime)
         .args(["locate", "lexer", "--json"])
@@ -265,14 +274,14 @@ fn a_question_behind_a_recycled_pids_lock_answers_instead_of_waiting_out_the_bud
 fn a_startup_lock_a_live_kin_command_holds_is_respected_and_named() {
     let repo = tempdir().expect("temp repo");
     let runtime = common::IsolatedDaemonRuntime::new(repo.path());
-    seeded_store(repo.path(), &runtime);
+    let kin_root = seeded_store(repo.path(), &runtime);
 
     // Outside the repository: this fixture is a copy of a test binary, and the
     // store under test must not be asked to admit one.
     let holder_home = tempdir().expect("temp dir for the holder fixture");
     let mut holder = spawn_kin_named_holder(holder_home.path());
     let holder_pid = holder.id();
-    let lock = plant_startup_lock(repo.path(), holder_pid);
+    let lock = plant_startup_lock(&kin_root, holder_pid);
 
     let locate = kin_command(&runtime)
         .args(["locate", "lexer", "--json"])
@@ -323,12 +332,12 @@ fn a_startup_lock_a_live_kin_command_holds_is_respected_and_named() {
 fn an_old_lock_a_live_kin_command_holds_is_not_taken_on_age() {
     let repo = tempdir().expect("temp repo");
     let runtime = common::IsolatedDaemonRuntime::new(repo.path());
-    seeded_store(repo.path(), &runtime);
+    let kin_root = seeded_store(repo.path(), &runtime);
 
     let holder_home = tempdir().expect("temp dir for the holder fixture");
     let mut holder = spawn_kin_named_holder(holder_home.path());
     let holder_pid = holder.id();
-    let lock = plant_startup_lock(repo.path(), holder_pid);
+    let lock = plant_startup_lock(&kin_root, holder_pid);
     // The bound is 5 s here, so the staleness rule fires at 10 s. Sixty is well
     // past it and cheap.
     age_lock(&lock, Duration::from_secs(60));

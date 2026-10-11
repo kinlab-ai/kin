@@ -20,7 +20,10 @@ pub const SEMANTIC_SEARCH_DESC: &str = "\
 Find code declarations in the semantic graph by name, kind, or language. Kin has \
 already parsed the repository into entities — functions, methods, classes, structs, \
 traits, enums, interfaces, types, and constants — so this matches real declarations, \
-not raw string occurrences the way a grep would. Reach for it as your first step \
+not raw string occurrences the way a grep would. A two-part module.name also \
+matches an exact bare name in a recorded module through a direct Contains edge; \
+same-named modules remain separate matches. This does not resolve import aliases. \
+Reach for it as your first step \
 whenever you need to locate \"the thing called X\" or \"every Y of kind class in \
 language rust\": it answers in one call and hands back the exact file path, line \
 range, signature, and stable entity ID for each match. Those IDs are the currency for \
@@ -36,22 +39,70 @@ On an empty result the response carries an additive `negative` object: its \
 (daemon-owned graph, initialized and loaded, holding entities, no degraded signals) \
 or merely \"not indexed yet\" — check it before treating \"none found\" as ground \
 truth. This filter reads the entity index rather than the vector index, so its \
-absence is gated on the graph being complete, not on embedding coverage. An empty \
-answer also carries `edge_coverage`, naming the languages the filter's own scope \
-spans and how many entities it holds with the name pattern removed. Nothing measures \
-a coverage class for those languages yet, so an empty answer is never certified: a \
-miss cannot separate a declaration the repository lacks from one the extractor never \
-admitted as an entity, and a file the graph has not admitted reads the same way. \
-Where a sharper reason applies it leads instead, naming a scope the index never \
-populated, a language this build wires no adapter for, or the narrowing filter that \
-removed every candidate the name did match.";
+absence is gated on the graph being complete, not on embedding coverage. Every \
+name-filter answer carries `edge_coverage`, naming the languages the filter's scope spans, and \
+its `declarations` reading, taken from each covered file's declaration census (what \
+the grammar shows against what extraction admitted). `complete` certifies the rows, \
+and an empty answer's absence. `complete_except` lists under `matching_unadmitted` \
+every declaration extraction left out that could match the name, with file and line, \
+and under `unparsed_files` any source file held as bytes, and the verdict is \
+`certified_except`: the rows are whole except those. `unmeasured` names the files, or \
+the languages whose adapter takes no census, that nothing measured, and the answer \
+stays inconclusive. Where a sharper reason applies it leads instead, naming a scope \
+the index never populated or the narrowing filter that removed every candidate the \
+name did match. A whole repository-relative file coordinate such as src/main.rs or \
+./main.rs instead selects only recorded file-module surfaces at that exact graph \
+coordinate. It carries coordinate_lookup rather than a declaration census, makes \
+no filesystem or declaration absence claim, and never returns fuzzy filename \
+neighbors on a miss. Read a returned module UUID with source for its recorded \
+member inventory.";
 
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
+    handle_semantic_search_with_sources(
+        args,
+        store,
+        None,
+        crate::handlers::common::EntitySourceScope::WorkspaceHead,
+    )
+}
+
+/// [`handle_semantic_search`] with the request's source authority, so a
+/// declaration the census lists at a module's top level can be read by its
+/// own line, which is how a re-export of another module's member is named.
+pub fn handle_semantic_search_with_sources<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: crate::handlers::common::EntitySourceScope,
+) -> Result<ToolCallResult> {
+    search_names(args, store, repository_authority, source_scope, None)
+}
+
+/// Held content by digest, as a name search reads the regions no parse
+/// could read.
+pub(crate) type UnitText<'a> = &'a dyn Fn(kin_model::Hash256) -> Option<std::sync::Arc<Vec<u8>>>;
+
+/// The name search. `unit_text` stands in for the request's held content
+/// where a caller holds the bytes itself; `None` reads them through the
+/// request's source authority.
+pub(crate) fn search_names<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: crate::handlers::common::EntitySourceScope,
+    unit_text: Option<UnitText<'_>>,
+) -> Result<ToolCallResult> {
     let (query, limit, filter) = build_semantic_search_request(args)?;
     let compact = get_optional_bool(args, "compact", true);
+    if let Some(payload) =
+        crate::file_coordinate_query::lookup(store, &query, limit, &filter, compact)?
+    {
+        let text = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
+        return Ok(ToolCallResult::text(text));
+    }
     // `kind: "command"` used to be dropped on the floor: no `EntityKind` spells
     // a CLI command, `parse_kind_filter` fell through to its wildcard arm, and
     // the request ran unfiltered and unranked. It now narrows to the callable
@@ -61,7 +112,37 @@ pub fn handle_semantic_search<G: GraphStore>(
         .and_then(|value| value.as_str())
         .is_some_and(crate::handlers::common::is_command_kind);
 
-    let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+    let module_query = crate::module_name_query::ModuleNameQuery::load(store, &query)?;
+    let query_names = |filter: &EntityFilter| -> Result<Vec<kin_model::Entity>> {
+        let mut found = store.query_entities(filter).map_err(McpError::graph)?;
+        if let Some(module_query) = &module_query {
+            module_query.extend(store, filter, &mut found)?;
+        }
+        Ok(found)
+    };
+    let entities = query_names(&filter)?;
+    // `Type.method` and `Type::method` name one member: most languages join an
+    // owner and its member with `.`, Rust with `::`, and a reader asking across
+    // languages writes either. A qualified name that matched nothing is asked
+    // again in the other spelling, and the rest of the answer, its census and
+    // its order included, reads the spelling that matched. The reply names the
+    // spelling the caller wrote under [`RESPELLED_FROM_KEY`].
+    let (query, filter, entities, respelled_from) =
+        match (entities.is_empty(), other_member_spelling(&query)) {
+            (true, Some(other)) => {
+                let respelled = EntityFilter {
+                    name_pattern: Some(other.clone()),
+                    ..filter.clone()
+                };
+                let found = query_names(&respelled)?;
+                if found.is_empty() {
+                    (query, filter, entities, None)
+                } else {
+                    (other, respelled, found, Some(query))
+                }
+            }
+            _ => (query, filter, entities, None),
+        };
 
     // A question phrased as a sentence cannot survive the store's name filter:
     // its index tokenizes the pattern and its predicate substring-matches the
@@ -127,14 +208,138 @@ pub fn handle_semantic_search<G: GraphStore>(
             std::cmp::Reverse((rank, path_match))
         });
     }
+    // A name asks for every declaration named so, and the rows are what an
+    // answer's claim to hold them all rests on. The store's pattern index
+    // answers with the names equal to the pattern and, while at most 32 names
+    // share the pattern's words, with those; past 32 it answers with the equal
+    // names alone, and a method `Renderer.measure` asked for as `measure` was
+    // not a row. So the declarations whose own name is the query, the last
+    // segment of a `.` or `::` name, are asked for by that segment, and the
+    // rows hold every one of them whatever else shares its words.
+    let own_name_query = fallback.is_none() && !command_kind && is_one_name(&query);
+    if own_name_query {
+        let mut held: std::collections::HashSet<kin_model::ids::EntityId> =
+            entities.iter().map(|entity| entity.id).collect();
+        for separator in OWN_NAME_SEPARATORS {
+            let own_name = kin_model::graph::EntityFilter {
+                name_pattern: Some(format!("*{separator}{query}")),
+                ..filter.clone()
+            };
+            for entity in store.query_entities(&own_name).map_err(McpError::graph)? {
+                if held.insert(entity.id) {
+                    entities.push(entity);
+                }
+            }
+        }
+    }
+    // Whether the rows are every declaration Kin holds under this name: the
+    // lookup above ran, and no filter of the caller's narrowed it.
+    let own_name_rows_complete =
+        own_name_query && module_query.is_none() && narrowing_filters_of(&filter).is_empty();
+    // A name selects every declaration whose name holds it, and the store
+    // hands them back in no order. The ones a reader asked for lead: a
+    // declaration named exactly so, then one whose own name holds the query,
+    // then one that only sits inside a declaration that does, source code
+    // before test code in each. A reply too small for every row then cuts
+    // the nested test helpers, never the declaration itself.
+    if !command_kind && fallback.is_none() {
+        entities.sort_by_cached_key(|entity| name_search_order(&query, entity));
+    }
+    // A caller confined to a module path keeps the rows inside it, and what
+    // was left out is counted once. Every file is still read by the census, so
+    // a scoped lookup claims no closure over the name.
+    let within = crate::trace_scope::RowScope::from_arguments(store, args)
+        .map_err(McpError::InvalidParams)?;
+    let mut scoped_out = 0usize;
+    if let Some(within) = &within {
+        let before = entities.len();
+        entities.retain(|entity| within.lists(entity));
+        scoped_out = before - entities.len();
+    }
+    let own_name_rows_complete = own_name_rows_complete && within.is_none();
+    // A sort re-orders the leading rows by where each sits in the call graph,
+    // and each re-sorted row carries the fact it was sorted by.
+    let sort =
+        crate::graph_position::RowSort::from_arguments(args).map_err(McpError::InvalidParams)?;
+    let mut sorted_facts: HashMap<kin_model::EntityId, Option<u64>> = HashMap::new();
+    if let Some(sort) = sort {
+        let ids: Vec<Option<kin_model::EntityId>> =
+            entities.iter().map(|entity| Some(entity.id)).collect();
+        let (order, facts) = crate::graph_position::sort_window(store, &ids, sort);
+        for (index, fact) in facts {
+            sorted_facts.insert(entities[index].id, fact);
+        }
+        let mut taken: Vec<Option<kin_model::Entity>> = entities.into_iter().map(Some).collect();
+        entities = order
+            .into_iter()
+            .filter_map(|index| taken[index].take())
+            .collect();
+    }
     let entities = entities;
     let total_matches = entities.len();
     let matched_languages = crate::edge_coverage::languages_of(&entities);
+    // The declaration census for every file this search covers, read before the
+    // rows are cut to `limit` so the admitted entities the name matched can
+    // place a nested declaration inside a matching owner. A sentence the
+    // per-token fallback answered and a command lookup are ranked answers, not
+    // the whole set a name selects, so neither is measured as one.
+    let declarations = if fallback.is_none() && !command_kind {
+        let narrowed = !narrowing_filters_of(&filter).is_empty();
+        let name_matched = if narrowed {
+            query_names(&kin_model::graph::EntityFilter {
+                kinds: None,
+                languages: None,
+                roles: None,
+                ..filter.clone()
+            })?
+        } else {
+            Vec::new()
+        };
+        let mut census_query =
+            crate::declaration_coverage::NameQuery::new(&query, filter.kinds.as_deref());
+        if let Some(module_query) = &module_query {
+            census_query = census_query
+                .with_module_files(module_query.files())
+                .with_ruled_out_files(module_query.ruled_out_files());
+        }
+        let (mut reading, unread) = crate::declaration_coverage::observe_units(
+            store,
+            filter.languages.as_deref(),
+            &census_query,
+            if narrowed { &name_matched } else { &entities },
+        );
+        crate::declaration_coverage::place_residue(&mut reading, store);
+        let held = crate::handlers::common::HeldSourceAuthority::new(store, repository_authority);
+        crate::declaration_coverage::name_reexports(&mut reading, store, &|module| {
+            crate::handlers::common::module_surface_text(&held, module, source_scope)
+        });
+        // A source unit parsed around a syntax error can declare the name
+        // inside what the parse did not read, where neither the rows nor the
+        // census see it. Whether any does is read from held content, and only
+        // for the lookup whose answer could otherwise say it holds every
+        // declaration of the name.
+        if own_name_rows_complete
+            && reading["state"] != crate::declaration_coverage::STATE_UNMEASURED
+        {
+            let from_authority = |digest| held.unit_text(digest);
+            crate::declaration_coverage::read_unread_regions(
+                &mut reading,
+                store,
+                &query,
+                &unread,
+                unit_text.unwrap_or(&from_authority),
+            );
+        }
+        Some(reading)
+    } else {
+        None
+    };
 
     let mut payload = if compact {
         let limited: Vec<_> = entities
-            .into_iter()
+            .iter()
             .take(limit)
+            .cloned()
             .map(CompactSearchResult::from)
             .collect();
         serde_json::to_value(CompactSearchResponse {
@@ -147,8 +352,9 @@ pub fn handle_semantic_search<G: GraphStore>(
         .map_err(McpError::Json)?
     } else {
         let limited: Vec<_> = entities
-            .into_iter()
+            .iter()
             .take(limit)
+            .cloned()
             .map(SemanticSearchResult::from)
             .collect();
         serde_json::to_value(SemanticSearchResponse {
@@ -160,6 +366,32 @@ pub fn handle_semantic_search<G: GraphStore>(
         })
         .map_err(McpError::Json)?
     };
+    if let Some(rows) = payload
+        .get_mut("results")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (row, entity) in rows.iter_mut().zip(entities.iter()) {
+            crate::semantic_owners::RecordedOwners::observe(store, entity).attach(row);
+            if let (Some(sort), Some(fact)) = (sort, sorted_facts.get(&entity.id)) {
+                row[crate::graph_position::fact_key(sort)] =
+                    fact.map_or(serde_json::Value::Null, serde_json::Value::from);
+            }
+        }
+    }
+    if own_name_rows_complete {
+        payload[OWN_NAME_ROWS_COMPLETE_KEY] = serde_json::Value::Bool(true);
+    }
+    if let Some(written) = respelled_from {
+        payload[RESPELLED_FROM_KEY] = serde_json::json!(written);
+    }
+    if let Some(within) = &within {
+        payload[crate::handlers::review::IMPACT_ROW_SCOPE_KEY] =
+            serde_json::json!({ "module": within.module(), "outside": scoped_out });
+    }
+    if let Some(sort) = sort {
+        payload[crate::graph_position::SORTED_KEY] =
+            crate::graph_position::sorted_block(sort, sorted_facts.len());
+    }
 
     // FIR-2430. An empty search is a claim about the region this filter selected,
     // and until this observation existed the claim was certified from daemon
@@ -207,7 +439,7 @@ pub fn handle_semantic_search<G: GraphStore>(
                 roles: None,
                 ..filter.clone()
             };
-            let candidates = store.query_entities(&name_only).map_err(McpError::graph)?;
+            let candidates = query_names(&name_only)?;
             crate::edge_coverage::attach_name_filter_scope(
                 &mut observation,
                 &narrowed_by,
@@ -215,13 +447,20 @@ pub fn handle_semantic_search<G: GraphStore>(
             );
         }
 
+        if let Some(declarations) = declarations {
+            crate::declaration_coverage::attach(&mut observation, declarations);
+        }
         payload[crate::edge_coverage::EDGE_COVERAGE_KEY] = observation;
     } else {
-        // Record the full match set before pagination. This is measured answer
-        // scope, not a claim that the extractor admitted every declaration.
+        // Record the full match set before pagination, beside the declaration
+        // census that says whether the extractor admitted every declaration
+        // the name could select.
         let mut observation =
             crate::edge_coverage::observe_absence_scope(&matched_languages, Some(total_matches));
         observation["scope"] = serde_json::json!("query_matches");
+        if let Some(declarations) = declarations {
+            crate::declaration_coverage::attach(&mut observation, declarations);
+        }
         payload[crate::edge_coverage::EDGE_COVERAGE_KEY] = observation;
     }
 
@@ -239,6 +478,20 @@ pub fn handle_semantic_search<G: GraphStore>(
     if command_kind {
         payload["command_ranked"] = serde_json::json!(true);
         payload["command_entry_points"] = serde_json::json!(command_entry_points);
+    }
+    // A tracked thing Kin does not parse is named like anything else it
+    // holds, and joins the answer after the declarations. A search narrowed
+    // to a kind, a language or a role asked about code, and so did a command
+    // lookup.
+    if !command_kind && narrowing_filters_of(&filter).is_empty() {
+        let held = crate::handlers::common::HeldSourceAuthority::new(store, repository_authority);
+        let asked = payload
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some(asked) = asked {
+            crate::artifact_entity::join_name_search(&mut payload, &held, &asked, limit);
+        }
     }
 
     let json = serde_json::to_string_pretty(&payload).map_err(McpError::Json)?;
@@ -345,6 +598,58 @@ fn retrieve_query_tokens<G: GraphStore>(
         });
     }
     Ok(hits)
+}
+
+/// Where a name search says its rows are every declaration Kin holds whose
+/// own name is the query, before the row limit: it asked the store for that
+/// name as the last segment of a dotted one, and no kind, language, role or
+/// module qualifier narrowed the search. A reply's claim that no other
+/// declaration of the name exists needs this beside the declaration census,
+/// which speaks only for the declarations Kin does not hold.
+pub const OWN_NAME_ROWS_COMPLETE_KEY: &str = "own_name_rows_complete";
+
+/// Where a name search names the spelling the caller wrote, when nothing is
+/// named so and the same member written with the other separator is: asked
+/// for `Owner.member`, it answers for `Owner::member`, and the other way
+/// round. `query` then holds the spelling that matched, which the rows, the
+/// census and the order read.
+pub const RESPELLED_FROM_KEY: &str = "respelled_from";
+
+/// What sits between an owner and its member in a declaration's name:
+/// `Store.pop`, `Store::pop`.
+pub(crate) const OWN_NAME_SEPARATORS: [char; 2] = ['.', ':'];
+
+/// A declaration's own name: the last segment of a `.` or `::` name.
+pub(crate) fn own_name(name: &str) -> &str {
+    name.rsplit(OWN_NAME_SEPARATORS).next().unwrap_or(name)
+}
+
+/// A qualified name written with the other member separator: `Owner.member`
+/// as `Owner::member`, and `Owner::member` as `Owner.member`. `None` for a
+/// name that holds both, neither, or anything a declaration name cannot hold.
+fn other_member_spelling(query: &str) -> Option<String> {
+    let name_like = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$' | '.' | ':');
+    if query.is_empty() || !query.chars().all(name_like) {
+        return None;
+    }
+    let dotted = query.contains('.');
+    let pathed = query.contains("::");
+    let parts = |separator: &str| query.split(separator).all(|part| !part.is_empty());
+    match (dotted, pathed) {
+        (true, false) if parts(".") => Some(query.replace('.', "::")),
+        (false, true) if parts("::") && !query.replace("::", "").contains(':') => {
+            Some(query.replace("::", "."))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `query` is one plain name: no qualifier, wildcard or space.
+fn is_one_name(query: &str) -> bool {
+    !query.is_empty()
+        && query
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
 }
 
 /// The narrowing filters a search request applied beside its name pattern, named
@@ -535,7 +840,23 @@ name, or one owner's member when nothing is named exactly (`get` for the method 
 `ambiguous_focal` with every candidate's id and no body. It returns just \
 the focal entity's body, so it is the most economical way to inspect a single function/method/class; when you also need \
 the surrounding callers, callees, and imports, use get_context_pack or trace_data_flow \
-instead so you don't have to call this repeatedly. Derived candidates have no independent \
+instead so you don't have to call this repeatedly. A Python module returns its own code as \
+`body`, with a source_base a patch carries back: its imports and top-level statements, with each \
+function and class it holds as one `kin:entity` marker line naming the entity and the short id to \
+read it by, never an entity's body or the whole file. Any other module returns its recorded member \
+inventory, never an aggregate body or edit base. Missing member coverage is an explicit semantic gap. \
+A Python class larger than 16 KB returns its own code the same way: its header, docstring and \
+class-level statements, with each member as one `kin:entity` marker line, and a source_base a patch \
+to that code carries back. \
+A class or object literal larger than 4 KB is served as its shape: `header` (its declaration and docstring), \
+and `members` with each member's id and signature, so you read the member you need by its \
+id; pass `full_body: true` for the whole body of one up to 16 KB. Any other body over 12 KB is served \
+as an excerpt: its first 12 KB, `body_excerpt` with the whole body's size and digest, and \
+`next_cursor`; send that back as `cursor` with the same entity_id for the next excerpt. \
+`full_body: true` returns the whole body with its base up to 16 KB, and an excerpt of such a body \
+carries no source_base. A longer body is served only in excerpts, `full_body` included, and each \
+carries a source_base for a patch, never a whole replacement. \
+Derived candidates have no independent \
 body or edit base; their validated shared generator is returned separately as generator_source. \
 A symbol outside the repository (`external_reference:<uuid>`) has no source in this graph, so \
 the call is refused with the error code `external_symbol_has_no_repository_source` and \
@@ -579,7 +900,13 @@ pub fn handle_get_entity_source<G: GraphStore>(
                     reason,
                     candidates,
                 ) => {
-                    return name_candidates_reply("get_entity_source", name, reason, &candidates);
+                    return name_candidates_reply_in(
+                        store,
+                        "get_entity_source",
+                        name,
+                        reason,
+                        &candidates,
+                    );
                 }
                 kin_ranking::entity_ranking::StrictNameResolution::Missing => None,
             }
@@ -588,13 +915,23 @@ pub fn handle_get_entity_source<G: GraphStore>(
 
     match entity {
         Some(entity) => {
+            let owners = crate::semantic_owners::RecordedOwners::observe(store, &entity);
             let held = HeldSourceAuthority::new(store, repository_authority);
-            if let Some(value) = derived_entity_source_at(
+            // A module is its own code where Kin serves that, and its member
+            // inventory otherwise.
+            if let Some(mut value) =
+                crate::module_code::source_reply(&held, &entity, EntitySourceScope::WorkspaceHead)
+            {
+                owners.attach(&mut value);
+                return Ok(ToolCallResult::text(value.to_string()));
+            }
+            if let Some(mut value) = derived_entity_source_at(
                 &held,
                 &entity,
                 EntitySourceScope::WorkspaceHead,
                 1_000_000,
             )? {
+                owners.attach(&mut value);
                 return Ok(ToolCallResult::text(
                     serde_json::to_string_pretty(&value).map_err(McpError::Json)?,
                 ));
@@ -630,14 +967,62 @@ pub fn handle_get_entity_source<G: GraphStore>(
                     );
                 }
             }
+            // A container is served as its shape unless its whole body was
+            // asked for by name.
+            crate::container_shape::shape_source_reply(
+                store,
+                &mut value,
+                get_optional_bool(args, "full_body", false),
+            );
+            owners.attach(&mut value);
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
-        None => Ok(ToolCallResult::error(format!(
-            "Entity not found: {}",
-            id_str
-        ))),
+        None => {
+            // No entity answers to it. A tracked thing Kin does not parse is
+            // read as the artifact it is, the way the daemon's route reads
+            // one.
+            let held = HeldSourceAuthority::new(store, repository_authority);
+            match crate::artifact_entity::source_reply_for_query(
+                &held,
+                &id_str,
+                EntitySourceScope::WorkspaceHead,
+            ) {
+                Ok(Some(value)) => {
+                    return Ok(ToolCallResult::text(
+                        serde_json::to_string_pretty(&value).map_err(McpError::Json)?,
+                    ));
+                }
+                Err(McpError::Other(refusal)) => return Ok(ToolCallResult::error(refusal)),
+                Ok(None) | Err(_) => {}
+            }
+            match entity_source_path_refusal(&id_str) {
+                Some(refusal) => Ok(ToolCallResult::error(refusal)),
+                None => Ok(ToolCallResult::error(format!(
+                    "Entity not found: {}",
+                    id_str
+                ))),
+            }
+        }
     }
+}
+
+/// The refusal a `get_entity_source` call takes when its `entity_id` is a file
+/// path: a request in the wrong form, answered with the form that works rather
+/// than as a search that found nothing. A file is not an entity, and its
+/// entities are each read by their own id.
+pub fn entity_source_path_refusal(entity_id: &str) -> Option<String> {
+    let token = entity_id.trim();
+    let path_like = !token.contains('@')
+        && (token.contains('/') || token.contains('\\'))
+        && parse_entity_id(token).is_err();
+    path_like.then(|| {
+        format!(
+            "`entity_id` takes an entity UUID or an entity name, and {token:?} is a file path. A \
+             file is not an entity here: find the entities it declares with semantic_search or \
+             semantic_locate, then read one with get_entity_source and its id."
+        )
+    })
 }
 
 /// Resolve a candidate's generator separately from an independently editable body.
@@ -727,6 +1112,8 @@ pub struct EntitySourceRow {
 pub enum ResolvedEntitySource {
     /// The entity resolved and its source body was read from graph truth.
     Found(EntitySourceRow),
+    /// Module members from the selected graph, without an aggregate source read.
+    Inventory { value: serde_json::Value },
     /// Candidate metadata with a separately budgeted shared generator, never a member body.
     Derived { value: serde_json::Value },
     /// The ID did not resolve (invalid, stale, or not a UUID). Non-retryable.
@@ -869,6 +1256,30 @@ pub fn assemble_entity_sources_response(
 
     for outcome in resolved {
         match outcome {
+            ResolvedEntitySource::Inventory { mut value } => {
+                returned += 1;
+                let tokens = kin_context::estimate_tokens(&value.to_string());
+                if opts.compact
+                    || budget_exhausted
+                    || opts
+                        .token_budget
+                        .is_some_and(|budget| budget_used.saturating_add(tokens) > budget)
+                {
+                    let object = value.as_object_mut().expect("inventory object");
+                    for key in ["members", "header", "header_complete"] {
+                        object.remove(key);
+                    }
+                    if !opts.compact {
+                        truncated = true;
+                        budget_exhausted = true;
+                        object.insert("omitted".into(), serde_json::json!(true));
+                        object.insert("reason".into(), serde_json::json!("budget"));
+                    }
+                } else {
+                    budget_used = budget_used.saturating_add(tokens);
+                }
+                results.push(value);
+            }
             ResolvedEntitySource::Found(row) => {
                 returned += 1;
                 if opts.compact {
@@ -1041,11 +1452,12 @@ fn resolve_entity_source_generic<G: GraphStore>(
             )) => {
                 return ResolvedEntitySource::Ambiguous {
                     id: id.to_string(),
-                    value: name_candidates_json(
+                    value: name_candidates_json_named(
                         "get_entity_sources",
                         id.trim(),
                         reason,
                         &candidates,
+                        &candidate_names(store, &candidates),
                     ),
                 };
             }
@@ -1065,6 +1477,9 @@ fn resolve_entity_source_generic<G: GraphStore>(
     };
     match store.get_entity(&entity_id) {
         Ok(Some(entity)) => {
+            if let Some(value) = crate::container_shape::module_source_reply(store, &entity) {
+                return ResolvedEntitySource::Inventory { value };
+            }
             match derived_entity_source_at(
                 held,
                 &entity,
@@ -1169,12 +1584,25 @@ calls with one pack. Dependencies and dependents come back as signatures \
 `neighbor_bodies: true` to also get the neighbours' exact bodies within the budget. Set \
 `focal_body: false` when you already hold the focal's body and want its neighbourhood \
 alone: the focal then comes back as its signature with `body_omitted: \"focal_body:false\"`. \
-Both apply to a single `entity_id` pack. The pack carries no `source_base`: to change an \
+Both apply in every mode: with `entities` or `question`, each focal's body and, when asked, \
+each neighbour's body is served within the budget, and a body the budget cannot hold \
+leaves its row as a signature named under `withheld.bodies` by id. An argument a mode has \
+no use for is ignored and named in `notes`. Modules always return their recorded member inventory, \
+with an explicit gap when member coverage is unavailable. A class or object literal focal \
+over 4 KB is served as its shape: `header` and `members` by id and signature. The \
+pack carries no `source_base`: to change an \
 entity, read it with get_entity_source, whose `source_base` the full-body and \
 anchored-patch mutate forms require, so a pack replaces get_entity_source for reading \
-only. `token_budget` and `max_response_chars` bound the \
-serialized context payload, including its envelope. `tokens_used` reports the estimated \
-token cost of that complete payload. \
+only. `token_budget` bounds the whole reply, metadata included, by Kin's token \
+estimate, and `max_response_chars` bounds its characters; `tokens_used` reports what the \
+reply costs and `answer_tokens` what its code (bodies, shapes, signatures) costs. A pack \
+over either bound withholds call-site rows, neighbour bodies, neighbour rows and \
+lower-ranked focals first and names each by id under `withheld`, never an empty refusal; \
+the top focal's body stays while it fits the budget on its own, and a reply that still \
+cannot fit says so under `degradations` as `response_over_token_budget`. The envelope is \
+compact: `_kin` carries the verdict, completeness and budget accounting and one \
+`provenance` line for freshness and source binding. Multi-focal rows carry \
+`why_included`, the producer's recorded reasons for each focal. \
 `focal_entity.body`, when `body_complete` is true, is the exact graph-owned source span, \
 byte for byte, in compact mode too. A span that cannot be served is absent, never clipped \
 or reconstructed past its recorded boundary. Check `body_complete` and the row's \
@@ -1213,16 +1641,16 @@ answered by the chain, and a pack built for either end alone answers a different
 This shape returns `method`, one sentence naming each focal, how it resolved, and what it \
 contributed; `routes`, the entities between each connected pair; `route_search.bounded`, \
 true when a search stopped at its bound so an absent route is not evidence there is none; \
-and `measured_tokens`, what the rendered pack costs, which is never above `token_budget` \
-because rows are dropped until it is not. \
+and `measured_tokens`, what the served code costs, which is never above `token_budget` \
+because bodies go down to signatures, then rows are dropped, until it is not. \
 `external_calls` lists the calls a focal makes into packages outside the repository that a \
 language server proved, each with the symbol's record, `site_state`, `proof` and `sites`, \
 and `caller_id` naming the focal in a pack built from several; `dependencies` holds only \
 repository entities. \
 `call_sites` reads the focal's own call sites from its call-site ledger: one row per site \
 with `line_in_entity`, the `callee` text cut from the focal's own body, its `state` \
-(`proven_target`, `proven_external`, `proven_outside`, `proven_declaration`, `binding`, \
-`not_in_build`, `server_failed` or `unresolved`), the `reason` behind an unsettled state and \
+(`proven_target`, `proven_external`, `proven_outside`, `proven_declaration`, \
+`proven_static`, `binding`, `not_in_build`, `server_failed` or `unresolved`), the `reason` behind an unsettled state and \
 the proven `target` id, beside the counts by state, a `reading` of `owed_enrichment` while no \
 ledger describes the focal yet, and the `clauses` the verdict reads. A site that is not \
 settled makes the answer inconclusive. A pack built from several focals carries the counts \
@@ -1263,29 +1691,23 @@ pub fn handle_get_context_pack<G: GraphStore>(
     // handler's original path and its original payload, so nothing reading
     // today's shape moves under it.
     //
-    // The body controls shape the single-focal pack only. The multi-focal shape
-    // already serves its neighbours as signatures and budgets its focals' bodies
-    // itself, so a control it would silently ignore is refused instead.
+    // Every argument the schema allows is honoured in every mode: `focal_body`
+    // and `neighbor_bodies` shape a multi-focal pack exactly as they shape a
+    // single one. An argument a mode has no use for, or one the tool does not
+    // define, is ignored and named in `notes`, never refused: a refusal here
+    // cost an agent its only body read for the turn.
     let multi_focal = ["entities", "question", "question_focals"]
         .iter()
         .any(|key| args.contains_key(*key));
-    if multi_focal {
-        if let Some(control) = ["focal_body", "neighbor_bodies"]
-            .into_iter()
-            .find(|key| args.contains_key(*key))
-        {
-            return Ok(ToolCallResult::error(format!(
-                "`{control}` applies to a single `entity_id` context pack. A pack built from \
-                 `entities` or `question` serves each focal's body within the budget and its \
-                 neighbours as signatures."
-            )));
-        }
-    }
-    if let Some(result) = multi_focal_pack_result(args, store, repository_authority)? {
+    let notes = context_pack_argument_notes(args, multi_focal);
+    if let Some(result) = multi_focal_pack_result(args, store, repository_authority, &notes)? {
         return Ok(result);
     }
 
-    let id_str = get_string_param(args, "entity_id")?;
+    let id_str = match get_string_param(args, "entity_id") {
+        Ok(id) => id,
+        Err(_) => return Ok(ToolCallResult::error(CONTEXT_PACK_VALID_FORM.to_string())),
+    };
     // A symbol outside the repository has no body or neighborhood of its own
     // in this graph; what the graph holds about it is its record and callers.
     if let Some(node) = super::external_symbols::lookup_external_symbol(store, &id_str)? {
@@ -1297,7 +1719,16 @@ pub fn handle_get_context_pack<G: GraphStore>(
             CONTEXT_PACK_EXTERNAL_WHY,
         );
     }
-    let entity_id = parse_entity_id(&id_str)?;
+    // An `entity_id` that is not an id is a request in the wrong form. Said as
+    // the form that works, since a name belongs in `entities`.
+    let entity_id = match parse_entity_id(&id_str) {
+        Ok(entity_id) => entity_id,
+        Err(_) => {
+            return Ok(ToolCallResult::error(format!(
+                "`entity_id` takes an entity UUID, and {id_str:?} is not one. {CONTEXT_PACK_VALID_FORM}"
+            )))
+        }
+    };
     let depth = get_optional_u64(args, "depth", 2) as u32;
     let include_traffic = get_optional_bool(args, "include_traffic", true);
     let compact = get_optional_bool(args, "compact", false);
@@ -1356,6 +1787,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         references: std::cell::OnceCell::new(),
         external_calls: std::cell::OnceCell::new(),
         call_sites: std::cell::OnceCell::new(),
+        owners: std::cell::OnceCell::new(),
     };
     let (pack, selection, projections) = kin_context::build_context_pack_with_provider(
         store,
@@ -1364,20 +1796,114 @@ pub fn handle_get_context_pack<G: GraphStore>(
         &mut provider,
         limits,
         neighbor_bodies,
+        // The builder fits the answer, the code this pack serves, to the
+        // token budget; the final fit then holds the whole reply to it.
         |pack, selection, projections| {
-            let mut result = render
+            let result = render
                 .render(pack, selection, projections, &fields)
                 .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
-            let json = serialize_with_measured_tokens(&mut result)
-                .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
-            Ok(kin_context::estimate_tokens(&json))
+            Ok(crate::budget::context_answer_tokens(&result))
         },
     )
     .map_err(McpError::from)?;
     let mut result = render.render(&pack, &selection, &projections, &fields)?;
+    attach_context_note_values(&mut result, &notes);
     Ok(ToolCallResult::text(serialize_with_measured_tokens(
         &mut result,
     )?))
+}
+
+/// The forms a `get_context_pack` call can take, for a request that named
+/// none of them usably.
+pub const CONTEXT_PACK_VALID_FORM: &str = "get_context_pack takes `entity_id` (one entity \
+     UUID), `entities` (names or UUIDs, for example [\"Store.containsElement\"]), or \
+     `question` (plain words), alone or together.";
+
+/// Arguments the tool does not define, or that this mode of the pack has no
+/// use for, named so the caller learns they were ignored. Keys the daemon adds
+/// while resolving names and questions are its own and never named.
+fn context_pack_argument_notes(
+    args: &HashMap<String, serde_json::Value>,
+    multi_focal: bool,
+) -> Vec<String> {
+    const INTERNAL: [&str; 5] = [
+        "question_focals",
+        "coverage",
+        "max_focals",
+        "max_response_chars",
+        "session_id",
+    ];
+    let defined: std::collections::BTreeSet<String> = crate::tools::tool_definitions()
+        .tools
+        .into_iter()
+        .find(|tool| tool.name == "get_context_pack")
+        .and_then(|tool| {
+            tool.input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| properties.keys().cloned().collect())
+        })
+        .unwrap_or_default();
+    let mut keys: Vec<&String> = args.keys().collect();
+    keys.sort();
+    let mut notes = Vec::new();
+    for key in keys {
+        // The public query presentation consumes `details` after the pack is
+        // built; it is accepted even though the assembly schema omits it.
+        if key.as_str() == "details" || INTERNAL.contains(&key.as_str()) || key.starts_with('_') {
+            continue;
+        }
+        if !defined.contains(key.as_str()) {
+            notes.push(format!(
+                "`{key}` is not a get_context_pack argument and was ignored"
+            ));
+        } else if multi_focal && matches!(key.as_str(), "compact" | "include_traffic") {
+            notes.push(format!(
+                "`{key}` shapes a single `entity_id` pack and was ignored for this one"
+            ));
+        }
+    }
+    notes
+}
+
+/// Add each note once to the payload's `notes`, beside the pack's own, and
+/// the one sentence that says how to read a container served as its shape when
+/// the pack carries one.
+fn attach_context_note_values(payload: &mut serde_json::Value, notes: &[String]) {
+    if !payload.is_object() {
+        return;
+    }
+    let mut notes = notes.to_vec();
+    let shape = crate::container_shape::SHAPE_PROJECTION;
+    let is_shape = |row: &serde_json::Value| {
+        row.get("projection").and_then(serde_json::Value::as_str) == Some(shape)
+    };
+    let carries_shape = payload.get("focal_entity").is_some_and(is_shape)
+        || ["entities", "dependencies", "dependents", "tests"]
+            .iter()
+            .filter_map(|key| payload.get(*key).and_then(serde_json::Value::as_array))
+            .flatten()
+            .any(is_shape);
+    if carries_shape {
+        notes.push(crate::container_shape::SHAPE_NOTE.to_string());
+    }
+    if notes.is_empty() {
+        return;
+    }
+    let notes = notes.as_slice();
+    let existing = payload
+        .get_mut("notes")
+        .and_then(serde_json::Value::as_array_mut);
+    match existing {
+        Some(existing) => {
+            for note in notes {
+                if !existing.iter().any(|value| value.as_str() == Some(note)) {
+                    existing.push(serde_json::json!(note));
+                }
+            }
+        }
+        None => payload["notes"] = serde_json::json!(notes),
+    }
 }
 
 /// Serve the focal as its signature because the caller asked for the
@@ -1394,6 +1920,11 @@ fn omit_focal_body(row: &mut serde_json::Value) {
             "body_elided",
             "body_unavailable",
             "projection_downgraded_from",
+            // A container's shape is its served content, not requested either.
+            "header",
+            "header_complete",
+            "members",
+            "body_bytes",
         ] {
             object.remove(key);
         }
@@ -1429,6 +1960,7 @@ struct SingleContextRender<'a, G: GraphStore> {
     /// The focal's own call sites, read once for the same reason: the block
     /// describes the focal's ledger, which the budget does not touch.
     call_sites: std::cell::OnceCell<serde_json::Value>,
+    owners: std::cell::OnceCell<crate::semantic_owners::RecordedOwners>,
 }
 
 /// Rendered external call rows and how many calls there were before the cap.
@@ -1478,6 +2010,9 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 "start_line": entity_presentation_start_line(entity),
                 "end_line": entity_presentation_end_line(entity),
             });
+            self.owners
+                .get_or_init(|| crate::semantic_owners::RecordedOwners::observe(store, entity))
+                .attach(&mut row);
             attach_context_projection(entry, fields, projections, &mut row, focal_body);
             if !focal_body {
                 omit_focal_body(&mut row);
@@ -1511,8 +2046,14 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 if let Some(relation) = relation {
                     obj["relation"] = serde_json::json!(relation.as_str());
                 }
+                // Compact rows serve identity and the stored signature, never
+                // a body. Disclose that view before response measurement.
+                obj["projection"] = if compact {
+                    serde_json::json!("SignatureOnly")
+                } else {
+                    serde_json::json!(format!("{:?}", entry.projection_level))
+                };
                 if !compact {
-                    obj["projection"] = serde_json::json!(format!("{:?}", entry.projection_level));
                     // A neighbour is a signature unless its body was asked for, so
                     // only a request for bodies turns a missing one into a gap.
                     attach_context_projection(
@@ -1525,10 +2066,7 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
                 }
                 Ok(obj)
             } else {
-                let mut obj = serde_json::json!({
-                    "id": entry.entity_id.to_string(),
-                    "content": entry.content,
-                });
+                let mut obj = missing_context_entity(entry);
                 if let Some(relation) = relation {
                     obj["relation"] = serde_json::json!(relation.as_str());
                 }
@@ -1687,12 +2225,17 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
         // The projection provider has not read these recovered rows.
         // attach_context_projection names their missing bodies explicitly.
         let mut dependents_withheld = 0usize;
+        // Callers the cap keeps out are the cap's to report, whether or not
+        // the builder's token budget had refused them first.
+        let mut capped: std::collections::HashSet<kin_model::ids::EntityId> =
+            std::collections::HashSet::new();
         for id in certified_ids {
             if packed.contains(id) {
                 continue;
             }
             if dependents.len() >= CERTIFIED_DEPENDENTS_MAX {
                 dependents_withheld += 1;
+                capped.insert(*id);
                 continue;
             }
             let entry = kin_model::context::ContextEntry {
@@ -1857,7 +2400,7 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
         // One map, keyed by the group, with the cause named on each entry: a caller
         // raises `token_budget` for these and `max_chars` for the response budget's,
         // and being told the wrong lever costs a round trip that cannot help.
-        let recovered = |id: &kin_model::ids::EntityId| packed.contains(id);
+        let recovered = |id: &kin_model::ids::EntityId| packed.contains(id) || capped.contains(id);
         let mut budget_groups: Vec<&str> = vec![
             kin_context::group::DEPENDENCIES,
             kin_context::group::DEPENDENTS,
@@ -1929,11 +2472,38 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
             );
         }
 
+        // Every row the token budget refused, by id, for the recovery list
+        // the final fit publishes under `withheld`.
+        let mut withheld_rows: Vec<serde_json::Value> = Vec::new();
+        for group in [
+            kin_context::group::DEPENDENCIES,
+            kin_context::group::DEPENDENTS,
+            kin_context::group::TESTS,
+            kin_context::group::CONTRACTS,
+            kin_context::group::TRANSITIVE_DEPS,
+        ] {
+            for id in selection.budget_elided_ids(group) {
+                if recovered(id) {
+                    continue;
+                }
+                withheld_rows.push(serde_json::json!({
+                    "entity_id": id.to_string(),
+                    "group": group,
+                    "withheld": kin_context::WITHHELD_ROW,
+                }));
+            }
+        }
+        if !withheld_rows.is_empty() {
+            result["withheld_rows"] = serde_json::Value::Array(withheld_rows);
+        }
+
         disclose_withheld_source_reads(&mut result, fields);
         disclose_projection_bodies(&mut result);
         loop {
-            let rendered = serialize_with_measured_tokens(&mut result)?;
-            if kin_context::estimate_tokens(&rendered) <= budget.max_tokens()
+            // Nearby traffic is coordination metadata, not code, and spends
+            // no token budget. The byte ceiling bounds it with everything else.
+            serialize_with_measured_tokens(&mut result)?;
+            if crate::budget::context_answer_tokens(&result) <= budget.max_tokens()
                 || self.traffic.borrow().is_empty()
             {
                 break;
@@ -1957,14 +2527,7 @@ impl<G: GraphStore> SingleContextRender<'_, G> {
         // later charges the envelope, with the same core-first priorities and
         // complete elision accounting. An impossible metadata floor remains
         // above budget, so the builder still reports that refusal.
-        let _ = crate::budget::fit_context_payload(
-            &mut result,
-            "get_context_pack",
-            &crate::budget::ResponseBudget {
-                max_chars: usize::MAX,
-                ..crate::budget::ResponseBudget::default()
-            },
-        );
+        let _ = crate::budget::fit_context_answer_tokens(&mut result);
         Ok(result)
     }
 }
@@ -1997,6 +2560,7 @@ fn multi_focal_pack_result<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     repository_authority: Option<&RequestRepositoryAuthority>,
+    notes: &[String],
 ) -> Result<Option<ToolCallResult>> {
     use kin_context::FocalResolution;
 
@@ -2148,7 +2712,10 @@ fn multi_focal_pack_result<G: GraphStore>(
         assistant_hint: None,
         resolutions,
         coverage: get_optional_string_param(args, "coverage"),
+        focal_bodies: get_optional_bool(args, "focal_body", true),
+        neighbor_bodies: get_optional_bool(args, "neighbor_bodies", false),
     };
+    let focal_bodies = opts.focal_bodies;
     let held = HeldSourceAuthority::new(store, repository_authority);
     // Each focal's calls into symbols outside the repository, read once before
     // the builder renders the pack on every budget retry.
@@ -2158,6 +2725,15 @@ fn multi_focal_pack_result<G: GraphStore>(
     let focal_entities: Vec<kin_model::Entity> = ids
         .iter()
         .filter_map(|id| store.get_entity(id).ok().flatten())
+        .collect();
+    let focal_owners: HashMap<_, _> = focal_entities
+        .iter()
+        .map(|entity| {
+            (
+                entity.id,
+                crate::semantic_owners::RecordedOwners::observe(store, entity),
+            )
+        })
         .collect();
     let call_sites =
         crate::call_sites::callers_block(store, &focal_entities, crate::call_sites::FOCALS_SCOPE);
@@ -2177,8 +2753,11 @@ fn multi_focal_pack_result<G: GraphStore>(
         &opts,
         &mut provider,
         limits,
+        // The answer, the code this pack serves, is what the token budget
+        // bounds. The call-site ledger, coverage and every other reading ride
+        // beside it under the byte ceiling alone.
         |pack, report, projections| {
-            let mut result = render_multi_context(
+            let result = render_multi_context(
                 store,
                 pack,
                 report.clone(),
@@ -2186,12 +2765,11 @@ fn multi_focal_pack_result<G: GraphStore>(
                 &fields,
                 projections,
                 &external_calls,
+                focal_bodies,
+                &focal_owners,
             )
             .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
-            result[crate::call_sites::CALL_SITES_KEY] = call_sites.clone();
-            let json = serialize_with_measured_tokens(&mut result)
-                .map_err(|error| kin_context::ContextError::Other(error.to_string()))?;
-            Ok(kin_context::estimate_tokens(&json))
+            Ok(crate::budget::context_answer_tokens(&result))
         },
     )
     .map_err(McpError::from)?;
@@ -2203,8 +2781,27 @@ fn multi_focal_pack_result<G: GraphStore>(
         &fields,
         &projections,
         &external_calls,
+        focal_bodies,
+        &focal_owners,
     )?;
     result[crate::call_sites::CALL_SITES_KEY] = call_sites;
+    // Measured over every focal's language, as the single-focal pack measures
+    // its one: a pack whose neighbourhoods come from reference edges is only
+    // whole where the graph links those edges across files, and an unreported
+    // observation read as unknown classes on every pack built from a question.
+    let mut languages: Vec<kin_model::ids::LanguageId> = Vec::new();
+    for entity in &focal_entities {
+        if !languages.contains(&entity.language) {
+            languages.push(entity.language);
+        }
+    }
+    result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
+        crate::edge_coverage::observe_cross_file_reference_coverage_for_languages(
+            store,
+            &languages,
+            &default_reference_kinds(),
+        );
+    attach_context_note_values(&mut result, notes);
     Ok(Some(ToolCallResult::text(serialize_with_measured_tokens(
         &mut result,
     )?)))
@@ -2260,6 +2857,49 @@ fn multi_focal_external_calls<G: GraphStore>(
     Ok((rows, total))
 }
 
+/// The rows a multi-focal pack serves after its focals, with their internal
+/// delivery buckets, in the order a reader needs them. These buckets schedule
+/// the budget cut; rendered relationship sections come only from the report's
+/// row provenance. This is also the order the final response
+/// cut keeps them in, since that cut sheds rows from the end: the routes that
+/// join the focals, then the code each focal binds to (its dependencies and
+/// the contracts it implements), and only then the optional neighbourhood a
+/// further hop away and the tests. A pack cut to fit loses a transitive
+/// neighbour before any binding.
+fn multi_context_rows(
+    pack: &kin_model::ContextPack,
+) -> Vec<(&kin_model::context::ContextEntry, &'static str)> {
+    let (routes, transitive): (Vec<_>, Vec<_>) = pack
+        .transitive_deps
+        .iter()
+        .partition(|entry| entry.content.starts_with(kin_context::ROUTE_MARKER));
+    routes
+        .into_iter()
+        .map(|entry| (entry, kin_context::ROUTE_GROUP))
+        .chain(
+            pack.dependency_signatures
+                .iter()
+                .map(|entry| (entry, kin_context::group::DEPENDENCIES)),
+        )
+        .chain(
+            pack.contracts
+                .iter()
+                .map(|entry| (entry, kin_context::group::CONTRACTS)),
+        )
+        .chain(
+            transitive
+                .into_iter()
+                .map(|entry| (entry, kin_context::group::TRANSITIVE_DEPS)),
+        )
+        .chain(
+            pack.tests
+                .iter()
+                .map(|entry| (entry, kin_context::group::TESTS)),
+        )
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_multi_context<G: GraphStore>(
     store: &G,
     pack: &kin_model::ContextPack,
@@ -2268,9 +2908,21 @@ fn render_multi_context<G: GraphStore>(
     fields: &ContextSourceFields,
     projections: &kin_context::ProjectionReport,
     external_calls: &ExternalCallRows,
+    focal_bodies: bool,
+    focal_owners: &HashMap<kin_model::EntityId, crate::semantic_owners::RecordedOwners>,
 ) -> Result<serde_json::Value> {
+    // A focal row always expected its body (or, for a container, its shape);
+    // any other row expected one only when it was admitted with it.
     let row =
-        |entry: &kin_model::context::ContextEntry, section: &str| -> Result<serde_json::Value> {
+        |entry: &kin_model::context::ContextEntry, focal: bool| -> Result<serde_json::Value> {
+            let provenance = report.row_provenance.get(&entry.entity_id);
+            let section = if focal {
+                "focal"
+            } else {
+                provenance.map_or("provenance_unavailable", |provenance| {
+                    provenance.section.as_str()
+                })
+            };
             let entity = store
                 .get_entity(&entry.entity_id)
                 .map_err(McpError::graph)?;
@@ -2280,6 +2932,10 @@ fn render_multi_context<G: GraphStore>(
                     "section": section,
                     "projection": format!("{:?}", entry.projection_level),
                 });
+                attach_multi_context_provenance(&mut row, provenance)?;
+                if focal {
+                    crate::semantic_owners::RecordedOwners::unavailable().attach(&mut row);
+                }
                 if entry.projection_level == kin_model::context::ProjectionLevel::FullBody {
                     downgrade_context_body(&mut row, "entity is unavailable in graph truth");
                     row["projection"] = serde_json::Value::Null;
@@ -2298,36 +2954,35 @@ fn render_multi_context<G: GraphStore>(
                 "section": section,
                 "projection": format!("{:?}", entry.projection_level),
             });
+            attach_multi_context_provenance(&mut obj, provenance)?;
+            if focal {
+                focal_owners
+                    .get(&entity.id)
+                    .unwrap_or(&crate::semantic_owners::RecordedOwners::unavailable())
+                    .attach(&mut obj);
+            }
             attach_context_projection(
                 entry,
                 fields,
                 projections,
                 &mut obj,
-                entry.projection_level == kin_model::context::ProjectionLevel::FullBody,
+                focal || entry.projection_level == kin_model::context::ProjectionLevel::FullBody,
             );
             Ok(obj)
         };
 
     let mut entities = Vec::new();
     for entry in &pack.focal_entities {
-        entities.push(row(entry, "focal")?);
+        let mut focal = row(entry, true)?;
+        // Asked for the neighbourhood alone: the focal is its signature, and
+        // says it was not requested rather than withheld.
+        if !focal_bodies {
+            omit_focal_body(&mut focal);
+        }
+        entities.push(focal);
     }
-    for entry in &pack.transitive_deps {
-        let section = if entry.content.starts_with(kin_context::ROUTE_MARKER) {
-            kin_context::ROUTE_GROUP
-        } else {
-            kin_context::group::TRANSITIVE_DEPS
-        };
-        entities.push(row(entry, section)?);
-    }
-    for entry in &pack.dependency_signatures {
-        entities.push(row(entry, kin_context::group::DEPENDENCIES)?);
-    }
-    for entry in &pack.tests {
-        entities.push(row(entry, kin_context::group::TESTS)?);
-    }
-    for entry in &pack.contracts {
-        entities.push(row(entry, kin_context::group::CONTRACTS)?);
+    for (entry, _) in multi_context_rows(pack) {
+        entities.push(row(entry, false)?);
     }
 
     let mut result = serde_json::json!({
@@ -2338,15 +2993,17 @@ fn render_multi_context<G: GraphStore>(
         "neighborhood_depth": report.neighborhood_depth,
         "token_budget": report.budget_tokens,
         "measured_tokens": report.measured_tokens,
-        "measurement_scope": "complete context payload before envelope and response-budget cuts; tokens_used measures the final output",
+        "measurement_scope": "token_budget bounds the code served (bodies, shapes and signatures) and answer_tokens measures it; tokens_used measures the whole output, metadata included",
         "entities": entities,
         super::external_symbols::EXTERNAL_CALLS_KEY: external_calls.0,
-        "lines": kin_context::render_multi_focal_lines(&pack, &report),
-        "lines_note": "rendered selected projections; whole graph source bodies appear only for FullBody entries",
         "tokens_used": 0,
     });
     if !unresolved.is_empty() {
         result["unresolved"] = serde_json::json!(unresolved);
+    }
+    if !report.withheld_rows.is_empty() {
+        result["withheld_rows"] =
+            serde_json::to_value(&report.withheld_rows).map_err(McpError::Json)?;
     }
     for (group, elision) in &report.elisions {
         crate::budget::record_elision_for(
@@ -2372,6 +3029,22 @@ fn render_multi_context<G: GraphStore>(
     disclose_withheld_source_reads(&mut result, fields);
     disclose_projection_bodies(&mut result);
     Ok(result)
+}
+
+/// Relationship direction is carried by the context producer, never inferred
+/// from the pack vector that happened to retain the row.
+fn attach_multi_context_provenance(
+    row: &mut serde_json::Value,
+    provenance: Option<&kin_context::ContextRowProvenance>,
+) -> Result<()> {
+    if let Some(provenance) = provenance {
+        row["why_included"] = serde_json::to_value(&provenance.reasons).map_err(McpError::Json)?;
+    } else {
+        row["why_included_unavailable"] = serde_json::json!(
+            "the context producer did not record this row's selection provenance"
+        );
+    }
+    Ok(())
 }
 
 fn disclose_projection_bodies(result: &mut serde_json::Value) {
@@ -2508,10 +3181,20 @@ pub fn handle_trace_computation<G: GraphStore>(
             {
                 kin_ranking::entity_ranking::NameResolution::One(entity) => entity,
                 kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) => {
-                    return name_candidates_reply(
+                    return name_candidates_reply_in(
+                        store,
                         "trace_computation",
                         &query,
                         kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                        &candidates,
+                    );
+                }
+                kin_ranking::entity_ranking::NameResolution::SameName(candidates) => {
+                    return name_candidates_reply_in(
+                        store,
+                        "trace_computation",
+                        &query,
+                        kin_ranking::entity_ranking::same_name_reason(&query, &candidates),
                         &candidates,
                     );
                 }
@@ -2546,8 +3229,8 @@ pub fn handle_trace_computation<G: GraphStore>(
 
 pub const FIND_REFERENCES_DESC: &str = "\
 Find who depends on an entity: its direct upstream callers, importers, and references. \
-Give it an entity_id or an exact symbol name (it resolves the best-matching canonical \
-definition) and it returns ONE ROW PER REFERENCING ENTITY, addressed by that caller's \
+Give it an entity_id or an exact symbol name (never a substring match) and it returns \
+ONE ROW PER REFERENCING ENTITY, addressed by that caller's \
 entity id, with its name and kind, `projection.path` (the file the caller is projected \
 into, a projection and never an address), and `sites`: every usage of the focal inside \
 the caller, each a `line_in_entity` counted from 0 at the caller's first line, as a \
@@ -2563,6 +3246,8 @@ graph names members that way) is exact too. An exact whole name answers first; w
 a bare member name (`get` for the method `Scaffold.get`) reaches the owners' members, and \
 when several share it the reply answers each under `candidates_by_owner` instead of \
 choosing one. \
+A method's overrides and member implementations, which reference nothing, are listed \
+under `overridden_by.overriders` with their own `resolution` and never counted. \
 Two callers in one file are two rows, and \
 `total_upstream` is the number of referencing entities, the same unit `kin refs` prints. \
 The `counts` object states the unit outright and adds `files` and `reference_sites`, so \
@@ -2624,12 +3309,14 @@ that question at file granularity rather than projecting any other list to paths
 Satisfaction is structural, so each row is a possible implementation and none is a \
 recorded one, and none is ever added to `total_upstream`. \
 `_kin.verdict` is the one verdict for the whole response and outranks every count in it. \
-The response budget (max_chars, in UTF-8 bytes, default 45000, clamped 2000..60000) is a \
-target, not a hard ceiling: a symbol with hundreds of call sites sheds its inline snippets before \
-it withholds any row, every list it cuts keeps at least one row, and a reply whose kept rows \
-still do not fit ships over the budget and says so under `response_over_budget`. Any cut is \
-reported in `degradations` and in `_kin.response` with the size the response had before the \
-budget, so a short answer is never mistaken for a complete one. \
+The response budget (max_chars, in UTF-8 bytes, clamped 2000..60000) \
+pages the frozen answer losslessly. When present, `_kin.page.answer_rows_complete` says whether all \
+recorded reference rows and owner/override sections have been delivered; it never says \
+unresolved sites cannot add callers. Send `answer_next_cursor` alone as cursor for more \
+recorded rows, or `evidence_next_cursor` alone for the remaining unresolved candidates \
+and coverage readings. The legacy `next_cursor` continues both and remains available \
+when a small page cannot fit the separate delivery handles. Every page keeps the \
+answer's uncertainty, and a partial page never proves absence. \
 Given `external_reference:<uuid>`, a symbol outside the repository, it returns the entities \
 with an edge into that symbol, one row each, with `site_state`, `proof` (resolver, resolver \
 version, proof context and rule) and `sites`, each a `line_in_entity` counted from 0 at the \
@@ -2740,19 +3427,16 @@ fn spine_reference_rows(
         let name = source
             .map(|entity| entity.name.clone())
             .unwrap_or_else(|| edge.src_entity.to_string());
-        let file_path = source
-            .and_then(|entity| entity.file_path.as_deref())
-            .map(|path| format!("[{}] {path}", edge.src_repo))
-            .unwrap_or_else(|| format!("[{}] {}", edge.src_repo, edge.src_entity));
-
         rows.push(ReferenceRow {
-            // The source ID belongs to another repo's graph authority. Returning
-            // it as a local drill-through ID would resolve against the wrong
-            // graph, so the repo-qualified projection path is what names it.
+            recorded_owners: crate::semantic_owners::RecordedOwners::foreign(),
+            // Keep the foreign authority explicit rather than offering its UUID
+            // as a local drill-through ID against the wrong graph.
+            repo_id: Some(edge.src_repo.clone()),
+            foreign_entity_id: Some(edge.src_entity.to_string()),
             entity_id: None,
             name,
             kind: source.map(|entity| format!("{:?}", entity.kind)),
-            file_path: Some(file_path),
+            file_path: None,
             // A federated xref carries no site span from the other repo's graph,
             // and says so rather than leaving an unexplained empty list.
             reference_lines: Vec::new(),
@@ -3091,23 +3775,39 @@ pub(crate) const INTERFACE_DISPATCH_KEY: &str = "interface_dispatch";
 /// prevent.
 ///
 /// `call_site_candidates` is the part of the call-site block a reader acts on:
-/// the unsettled sites whose callee or caller body spells the focal's name,
-/// which are the callers a proven row list can miss, and the count of every
-/// other unsettled site by why it is kept. Without it an answer that proves
-/// three of six callers reads as the whole set.
+/// every unsettled site whose callee or caller body spells the focal's name,
+/// which are the callers a proven row list can miss, and one count of the
+/// sites that could reach it only through a value. Without it an answer that
+/// proves three of six callers reads as the whole set.
 ///
 /// Everything else goes: `candidates`, `interface_dispatch`, `cross_repo`,
 /// `edge_coverage`, `caller_arrival`, the rest of `call_sites`, `counts` and
-/// `focal_resolution`. None of them is deleted from the tool, and a caller who
-/// wants them omits this parameter and gets the whole reply, which is what
-/// makes this selection rather than removal.
-const ANSWER_ONLY_KEYS: [&str; 10] = [
+/// `focal_resolution`. `focal_resolution` is put back when the name was
+/// ambiguous, when its count and rivals stay, because the `ambiguous_name`
+/// degradation points a reader at them to pin the choice. None of them is
+/// deleted from the tool, and a caller who wants them omits this parameter
+/// and gets the whole reply, which is what makes this selection rather than
+/// removal.
+const ANSWER_ONLY_KEYS: [&str; 14] = [
+    "caller_scope",
     "focal_entity",
+    // What a module asked about imports itself imports: an answer to the
+    // other reading of the question, which no other key carries.
+    MODULE_IMPORTS_KEY,
     "relation_kinds",
     "total_upstream",
     "unconfirmed_candidates",
     "references",
+    // How many reference sites the expression budget left without `expr`,
+    // present only when it left some: without it a site with no `expr`
+    // would read as one whose body could not be read.
+    REFERENCES_EXPR_ELIDED_KEY,
     CALL_SITE_CANDIDATES_KEY,
+    // The methods that override the focal. Not references, so never counted
+    // in `total_upstream`, and part of the answer to "what must change with
+    // this method's signature", which is the question an agent asking for a
+    // method's callers is most often about to act on.
+    super::overrides::OVERRIDDEN_BY_KEY,
     "truncated",
     "references_withheld",
     crate::budget::ELISIONS_KEY,
@@ -3117,67 +3817,245 @@ const ANSWER_ONLY_KEYS: [&str; 10] = [
 /// Key of the named call-site candidates an `answer_only` reply keeps.
 pub(crate) const CALL_SITE_CANDIDATES_KEY: &str = "call_site_candidates";
 
-/// At most this many named candidate rows ride an `answer_only` reply.
-const ANSWER_ONLY_NAMED_CANDIDATES_MAX: usize = 20;
+/// Where a reply says how many sites in `references` its expression budget
+/// left without `expr`.
+pub(crate) const REFERENCES_EXPR_ELIDED_KEY: &str = "references_expr_elided";
 
-/// The named part of a reply's store-wide call-site block, for an
-/// `answer_only` reply: each unsettled site whose callee or caller body spells
-/// a call name of the focal, addressed by its caller and its line in that
-/// caller, and every candidate counted by why it is kept. `None` when the
-/// reply holds no store-wide block or the block keeps no candidate.
+/// Where a reply says how many sites in `candidates` its expression budget
+/// left without `expr`.
+pub(crate) const CANDIDATES_EXPR_ELIDED_KEY: &str = "candidates_expr_elided";
+
+/// Where a reply says how many steps of the receiver chains in `references`
+/// dropped their code past the chains' budget.
+pub(crate) const REFERENCES_BINDING_CODE_ELIDED_KEY: &str = "references_receiver_binding_elided";
+
+/// The same for the receiver chains in `candidates`.
+pub(crate) const CANDIDATES_BINDING_CODE_ELIDED_KEY: &str = "candidates_receiver_binding_elided";
+
+/// Where an `answer_only` reply says how many named leftovers the expression
+/// budget left without `expr`.
+pub(crate) const NAMED_EXPR_ELIDED_KEY: &str = "named_expr_elided";
+
+/// The part of a reply's `call_sites` block an `answer_only` reply keeps: every
+/// named leftover, each addressed by its caller's id and name, the module that
+/// holds that caller when the site records one, its line in that caller, its
+/// callee and its state, and the value calls as one count beside the census
+/// that kept them. `None` when the block keeps neither.
+///
+/// Every named leftover is kept, never a sample: they are the only sites that
+/// could add a caller to the rows, and a list cut short would leave the reader
+/// unable to tell the answer is complete except them. A reply too large for its
+/// budget is paged, and these rows page with it. The reasons, prose and the
+/// per-state tally stay in the full reply, since a reader acts on the sites.
+/// Sites that carry nothing a reader could tell apart (no callee, no code, no
+/// line: their caller's text was never read) become one row per caller with an
+/// `occurrences` count. Each is still accounted for; listing them one by one
+/// only paged a reader through records it could not check. Rows with any
+/// readable detail are kept as they are, in order.
+fn collapse_uninspectable_sites(named: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let blank = |row: &serde_json::Value| {
+        row.get("callee").is_none_or(serde_json::Value::is_null)
+            && row.get("expr").is_none_or(serde_json::Value::is_null)
+            && row
+                .get("line_in_entity")
+                .is_none_or(serde_json::Value::is_null)
+    };
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(named.len());
+    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for row in named {
+        if !blank(&row) {
+            out.push(row);
+            continue;
+        }
+        let key = format!(
+            "{}|{}|{}",
+            row["caller"],
+            row["state"],
+            row.get("expr_unavailable")
+                .unwrap_or(&serde_json::Value::Null)
+        );
+        match slot.get(&key) {
+            Some(&at) => {
+                let count = out[at]["occurrences"].as_u64().unwrap_or(1) + 1;
+                out[at]["occurrences"] = serde_json::json!(count);
+            }
+            None => {
+                slot.insert(key, out.len());
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
 fn call_site_candidates_summary(result: &serde_json::Value) -> Option<serde_json::Value> {
     let block = result.get(crate::call_sites::CALL_SITES_KEY)?;
-    let count = block.get("candidate_count")?.as_u64()?;
-    if count == 0 {
-        return None;
-    }
-    let names_the_focal = |reason: &str| {
-        reason == kin_model::call_site_reading::REACH_CALLEE_SPELLS
-            || reason == kin_model::call_site_reading::REACH_BODY_SPELLS
+    // The census's reading of non-call reads answers imports and references.
+    // A question about calls alone did not ask for them, so its reply lists
+    // none of those reads as places to check.
+    let asks_non_call = result
+        .get("relation_kinds")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|kinds| {
+            kinds.iter().any(|kind| {
+                kind.as_str().is_some_and(|kind| {
+                    kind.eq_ignore_ascii_case("imports") || kind.eq_ignore_ascii_case("references")
+                })
+            })
+        });
+    let narrowed;
+    let block = if asks_non_call {
+        block
+    } else {
+        let mut copy = block.clone();
+        for pointer in ["/focal_escape/residue", "/value_calls/census/residue"] {
+            if let Some(residue) = copy
+                .pointer_mut(pointer)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                residue.remove(kin_model::call_site_reading::MENTIONS_KEY);
+            }
+        }
+        narrowed = copy;
+        &narrowed
     };
-    let named: Vec<serde_json::Value> = block["candidates"]
-        .as_array()
+    let named: Vec<serde_json::Value> = block
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
         .iter()
-        .filter(|row| row["reason"].as_str().is_some_and(names_the_focal))
-        .take(ANSWER_ONLY_NAMED_CANDIDATES_MAX)
         .map(|row| {
-            serde_json::json!({
+            let mut kept = serde_json::json!({
                 "caller": row["caller"],
                 "caller_name": row["caller_name"],
                 "line_in_entity": row["line_in_entity"],
                 "callee": row["callee"],
                 "state": row["state"],
-                "state_reason": row["state_reason"],
-                "reason": row["reason"],
-            })
+            });
+            // The caller's module is what lets a later reply write
+            // `module :: caller`. A blank module is the same as none.
+            if let Some(module) = row
+                .get("module")
+                .filter(|module| module.as_str().is_some_and(|module| !module.is_empty()))
+            {
+                kept["module"] = module.clone();
+            }
+            // The call as written and what its receiver says, which is what
+            // lets a reader judge the site without reading its caller.
+            for key in crate::site_expression::EXPR_FIELDS {
+                if let Some(value) = row.get(key) {
+                    kept[key] = value.clone();
+                }
+            }
+            kept
         })
         .collect();
-    let named_total: u64 = block["candidates_by_reason"]
-        .as_object()
-        .map(|by_reason| {
-            by_reason
-                .iter()
-                .filter(|(reason, _)| names_the_focal(reason))
-                .filter_map(|(_, count)| count.as_u64())
-                .sum()
-        })
-        .unwrap_or(named.len() as u64);
-    let mut summary = serde_json::json!({
-        "count": count,
-        "by_reason": block["candidates_by_reason"],
-        "named": named,
-        "detail": "Unsettled call sites that could be calls to the focal. `named` lists the \
-                   ones whose callee or caller body spells its name; the rest are counted by \
-                   why they are kept. None is proven, and none is in `references`.",
+    let named = collapse_uninspectable_sites(named);
+    let value_calls = block.get("value_calls").map(|value| {
+        let mut compact = serde_json::json!({
+            "sites": value["sites"],
+            "census": value["census"],
+        });
+        if value["callers_unread"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        {
+            compact["callers_unread"] = value["callers_unread"].clone();
+        }
+        compact
     });
-    let withheld =
-        named_total.saturating_sub(summary["named"].as_array().map_or(0, Vec::len) as u64);
-    if withheld > 0 {
-        summary["named_withheld"] = serde_json::json!(withheld);
+    // A census that lists sites while no value call was counted is still the
+    // residue the verdict names, and without it a reply reading complete
+    // except listed sites would list none. A census that found the focal is
+    // never held as a value is kept too, as the one fact that lets an answer
+    // with no rows say it checked value uses as well as named ones.
+    let census = value_calls
+        .is_none()
+        .then(|| block.get("focal_escape"))
+        .flatten()
+        .filter(|escape| {
+            escape.get("escape").and_then(serde_json::Value::as_str) == Some("contained")
+                || escape
+                    .get("residue")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|residue| !residue.is_empty())
+        })
+        .cloned();
+    // The decorators the method could run through without a call that spells
+    // its name, which the verdict names as residue: a reply reading complete
+    // except them must list them.
+    let decorators = block
+        .get(crate::call_sites::DISPATCH_DECORATORS_KEY)
+        .and_then(serde_json::Value::as_array)
+        .filter(|decorators| !decorators.is_empty())
+        .cloned();
+    if named.is_empty() && value_calls.is_none() && census.is_none() && decorators.is_none() {
+        return None;
+    }
+    let mut summary = serde_json::json!({ "named": named });
+    if let Some(census) = census {
+        summary["census"] = census;
+    }
+    if let Some(decorators) = decorators {
+        summary[crate::call_sites::DISPATCH_DECORATORS_KEY] = serde_json::Value::Array(decorators);
+    }
+    // The budget's own disclosure when it cut this list, carried as it stands.
+    if let Some(withheld) = block.get("candidates_withheld") {
+        summary["named_withheld"] = withheld.clone();
+    }
+    if let Some(elided) = block.get(crate::call_sites::NAMED_EXPR_ELIDED_KEY) {
+        summary[NAMED_EXPR_ELIDED_KEY] = elided.clone();
+    }
+    if let Some(value_calls) = value_calls {
+        summary["value_calls"] = value_calls;
     }
     Some(summary)
+}
+
+/// The part of `focal_resolution` an `answer_only` reply keeps when the name
+/// was ambiguous: the count and the rivals by id, which the `ambiguous_name`
+/// degradation tells a reader to pin the choice from. `None` otherwise.
+fn focal_resolution_summary(result: &serde_json::Value) -> Option<serde_json::Value> {
+    let resolution = result.get("focal_resolution")?;
+    let same_name = resolution["same_name_candidates"].as_u64()?;
+    (same_name > 1).then(|| {
+        serde_json::json!({
+            "same_name_candidates": same_name,
+            "other_candidates": resolution["other_candidates"],
+        })
+    })
+}
+
+/// Where a name search lists `entity` for `query`: how its own name answers
+/// the query, whether it is test code, how deep it is nested, then its name
+/// and id so the order is the same on every call.
+///
+/// The own name is the last dotted segment: `add_template_filter` for
+/// `App.add_template_filter`, `my_reverse` for
+/// `test_add_template_filter.<locals>.my_reverse`, which matches the query
+/// only through the function it is declared in.
+fn name_search_order(
+    query: &str,
+    entity: &kin_model::Entity,
+) -> (u8, bool, usize, String, kin_model::EntityId) {
+    let own = |name: &str| own_name(name).to_ascii_lowercase();
+    let asked = own(query.trim());
+    let named = own(&entity.name);
+    let rank = if entity.name.eq_ignore_ascii_case(query.trim()) || named == asked {
+        0
+    } else if named.contains(&asked) {
+        1
+    } else {
+        2
+    };
+    (
+        rank,
+        entity.role == kin_model::EntityRole::Test,
+        entity.name.matches('.').count(),
+        entity.name.clone(),
+        entity.id,
+    )
 }
 
 /// Narrow a finished reply to the answer and what qualifies it.
@@ -3194,7 +4072,15 @@ fn call_site_candidates_summary(result: &serde_json::Value) -> Option<serde_json
 /// measured replies. `crate::budget::render` strips that control field on the
 /// way out.
 pub(crate) fn project_answer_only(result: &mut serde_json::Value) {
+    if result
+        .get(AMBIGUOUS_CANDIDATES_KEY)
+        .is_some_and(serde_json::Value::is_array)
+    {
+        project_sectioned_answer_only(result);
+        return;
+    }
     let candidates = call_site_candidates_summary(result);
+    let resolution = focal_resolution_summary(result);
     let Some(map) = result.as_object_mut() else {
         return;
     };
@@ -3202,10 +4088,101 @@ pub(crate) fn project_answer_only(result: &mut serde_json::Value) {
         map.insert(CALL_SITE_CANDIDATES_KEY.to_string(), candidates);
     }
     map.retain(|key, _| ANSWER_ONLY_KEYS.contains(&key.as_str()));
+    if let Some(resolution) = resolution {
+        map.insert("focal_resolution".to_string(), resolution);
+    }
     map.insert(
         crate::budget::JSON_FORMAT_KEY.to_string(),
         serde_json::json!("compact"),
     );
+}
+
+/// Top-level keys a sectioned `answer_only` reply keeps: how the name was read,
+/// the sections, and every candidate the sections left out.
+const SECTIONED_ANSWER_ONLY_KEYS: [&str; 11] = [
+    "caller_scope",
+    "relation_kinds",
+    "ambiguous_focal",
+    "query",
+    "resolution",
+    "candidate_count",
+    AMBIGUOUS_CANDIDATES_KEY,
+    "focal_resolution",
+    "unsectioned_candidates",
+    "omitted_candidates",
+    "degradations",
+];
+
+/// Keys each section of a sectioned `answer_only` reply keeps beside the ones
+/// [`project_answer_only`] keeps for a single-focal reply: the labels that name
+/// it and its own verdict.
+pub(crate) const SECTION_LABEL_KEYS: [&str; 3] =
+    ["owner_qualified_name", "qualified_name", "entity_id"];
+
+/// [`project_answer_only`] for a sectioned reply: each section is narrowed the
+/// way a single-focal reply is, keeping its labels and the state, absence
+/// reading and limiting factor of its own verdict, so a sectioned answer costs
+/// what its answers cost rather than several full replies.
+fn project_sectioned_answer_only(result: &mut serde_json::Value) {
+    if let Some(sections) = result
+        .get_mut(AMBIGUOUS_CANDIDATES_KEY)
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for section in sections.iter_mut() {
+            let labels: Vec<(String, serde_json::Value)> = SECTION_LABEL_KEYS
+                .iter()
+                .filter_map(|key| {
+                    section
+                        .get(*key)
+                        .map(|value| ((*key).to_string(), value.clone()))
+                })
+                .collect();
+            let verdict = section
+                .pointer("/_kin/verdict")
+                .and_then(serde_json::Value::as_object)
+                .map(|full| {
+                    ["state", "safe_to_conclude_absent", "limiting_factor"]
+                        .iter()
+                        .filter_map(|key| {
+                            full.get(*key)
+                                .map(|value| ((*key).to_string(), value.clone()))
+                        })
+                        .collect::<serde_json::Map<_, _>>()
+                });
+            project_answer_only(section);
+            if let Some(map) = section.as_object_mut() {
+                // A single-focal reply puts `focal_resolution` back when the
+                // name is ambiguous. A section is already one of those
+                // candidates, and the parent keeps the resolution, so the
+                // section does not restate it.
+                map.remove("focal_resolution");
+                map.remove(crate::budget::JSON_FORMAT_KEY);
+                for (key, value) in labels {
+                    map.insert(key, value);
+                }
+                if let Some(verdict) = verdict {
+                    map.insert(
+                        crate::envelope::ENVELOPE_KEY.to_string(),
+                        serde_json::json!({ "verdict": verdict }),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(map) = result.as_object_mut() {
+        if let Some(resolution) = map
+            .get_mut("focal_resolution")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            // The sentence restates the listing it sits beside.
+            resolution.remove("detail");
+        }
+        map.retain(|key, _| SECTIONED_ANSWER_ONLY_KEYS.contains(&key.as_str()));
+        map.insert(
+            crate::budget::JSON_FORMAT_KEY.to_string(),
+            serde_json::json!("compact"),
+        );
+    }
 }
 
 /// How many candidate rows an answered dispatch question produced.
@@ -3541,6 +4518,38 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
         .into_iter()
         .map(ReferenceSite::to_json)
         .collect();
+    // The chain that typed the call's receiver, when the linker bound this
+    // caller through it: from a proven edge first, since that is the one the
+    // row counts.
+    let receiver_binding = row
+        .edges
+        .iter()
+        .filter(|edge| edge.resolution.is_proven() && !edge.receiver_name_guess)
+        .chain(row.edges.iter())
+        .find_map(|edge| edge.receiver_binding.clone());
+    // Where the caller binds the receivers of a row no proven chain bound,
+    // once per name.
+    let mut receiver_bound: Vec<serde_json::Value> = Vec::new();
+    let proven = row
+        .edges
+        .iter()
+        .filter(|edge| edge.resolution.is_proven() && !edge.receiver_name_guess);
+    if proven.clone().all(|edge| edge.receiver_binding.is_none()) {
+        for entry in proven
+            .filter_map(|edge| edge.receiver_bound.as_deref())
+            .flatten()
+        {
+            if receiver_bound.len() >= crate::receiver_binding::RECEIVER_BOUND_MAX {
+                break;
+            }
+            if !receiver_bound
+                .iter()
+                .any(|seen| seen["name"] == entry["name"])
+            {
+                receiver_bound.push(entry.clone());
+            }
+        }
+    }
     let mut value = serde_json::json!({
         "entity_id": row.entity_id,
         "name": row.name,
@@ -3607,6 +4616,24 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
         // parsing the label.
         "via_override_of": row.via_override_of,
     });
+    row.recorded_owners.attach(&mut value);
+    if let (Some(repo_id), Some(entity_id)) = (row.repo_id, row.foreign_entity_id) {
+        value["repo_id"] = serde_json::json!(repo_id);
+        value["foreign_entity_id"] = serde_json::json!(entity_id);
+    }
+    // How the call's receiver was proven to hold the focal's class: the call,
+    // the binding in the caller, and each link after it, each addressed by
+    // entity id with the code it stands on. Absent when no receiver chain
+    // bound the row.
+    if let Some(binding) = receiver_binding {
+        value[crate::receiver_binding::RECEIVER_BINDING_KEY] = serde_json::json!(*binding);
+    }
+    // A proven row no chain bound: the line in the caller that binds each
+    // receiver its calls are made through, as the caller's own value-origin
+    // facts record it. Absent when they record none.
+    if !receiver_bound.is_empty() {
+        value[crate::receiver_binding::RECEIVER_BOUND_KEY] = serde_json::json!(receiver_bound);
+    }
     if include_snippets {
         value["signature"] = serde_json::json!(row.signature);
         value["snippet"] = serde_json::json!(row.snippet);
@@ -3633,6 +4660,12 @@ pub const SPINE_ROOT_STALE: &str = "spine_root_stale";
 /// finishes builds it.
 pub const SPINE_INITIALIZATION_DEFERRED: &str = "spine_initialization_deferred";
 
+/// The daemon's spine refused this repository's graph for a standing reason,
+/// and the daemon registers no other repository for it to federate. A spine
+/// there would have held this repository alone, so the refusal hides no
+/// reference from another repository: a note about the install, never a gap.
+pub const SPINE_REFUSED_WITHOUT_PEERS: &str = "spine_refused_without_peers";
+
 /// Split a spine unavailability reason into its code and human detail, or
 /// `None` for a reason that carries no recognized code (a binding failure, say,
 /// whose message is not one of the conditions computed here).
@@ -3645,6 +4678,7 @@ fn split_spine_unavailable_reason(reason: &str) -> (Option<&'static str>, &str) 
         SPINE_REPO_UNREGISTERED,
         SPINE_ROOT_STALE,
         SPINE_INITIALIZATION_DEFERRED,
+        SPINE_REFUSED_WITHOUT_PEERS,
         kin_spine::SPINE_CANDIDATE_REPRESENTATION_GAP,
     ] {
         if let Some(detail) = reason
@@ -3724,6 +4758,19 @@ pub fn daemon_spine_xref(
         // own code. A gap in the answer for as long as the reason stands.
         kin_spine::DaemonSpine::Refused(reason) => {
             kin_spine::SpineQuery::Unavailable(reason.to_string())
+        }
+        // The same refusal on a daemon whose spine would have held this
+        // repository alone. It hides no reference from another repository, so
+        // it travels under its own code, which the absence gate and the
+        // verdict read as a note about the install.
+        kin_spine::DaemonSpine::RefusedWithoutPeers(reason) => {
+            kin_spine::SpineQuery::Unavailable(format!(
+                "{SPINE_REFUSED_WITHOUT_PEERS}: the cross-repo spine refused repository \
+                 {repo_id}'s graph and this daemon registers no other repository for it to \
+                 federate, so the refusal hides no reference from another repository and says \
+                 nothing about references inside this one ({})",
+                reason.replace(crate::verdict::CLAUSE_SEPARATOR, ", ")
+            ))
         }
         kin_spine::DaemonSpine::Absent => kin_spine::SpineQuery::NotConfigured,
     };
@@ -3816,6 +4863,91 @@ pub async fn handle_find_references_with_authority_at<G: GraphStore>(
     .await
 }
 
+/// Validate a selected receiver-proof request before any cursor can resume.
+pub fn validate_reference_proof_arguments(args: &HashMap<String, serde_json::Value>) -> Result<()> {
+    if args
+        .get("include_tests")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(McpError::InvalidParams(
+            "include_tests must be a boolean".into(),
+        ));
+    }
+    if args
+        .get("include_tests")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        && (args.get("view").and_then(serde_json::Value::as_str) == Some("overrides")
+            || args
+                .get("proof_for_caller")
+                .is_some_and(|value| !value.is_null()))
+    {
+        return Err(McpError::InvalidParams(
+            "include_tests=false cannot scope view=overrides or proof_for_caller".into(),
+        ));
+    }
+    if args
+        .get(crate::trace_scope::SCOPE_ARGUMENT)
+        .is_some_and(|value| !value.is_null())
+        && (args.get("view").and_then(serde_json::Value::as_str) == Some("overrides")
+            || args
+                .get("proof_for_caller")
+                .is_some_and(|value| !value.is_null()))
+    {
+        return Err(McpError::InvalidParams(
+            "scope narrows the callers a reference answer lists; it cannot be combined with \
+             view=overrides or proof_for_caller"
+                .into(),
+        ));
+    }
+    if let Some(view) = args.get("view") {
+        match view.as_str() {
+            Some("references") => {}
+            Some("overrides") => {
+                if !args.contains_key("cursor") {
+                    let focal = get_string_param(args, "entity_id")?;
+                    parse_entity_id(&focal)?;
+                }
+                for incompatible in [
+                    "query",
+                    "relation_kinds",
+                    "proof_for_caller",
+                    "min_resolution",
+                    "include_snippets",
+                ] {
+                    if args.contains_key(incompatible) {
+                        return Err(McpError::InvalidParams(format!(
+                            "view=overrides cannot be combined with {incompatible}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                return Err(McpError::InvalidParams(
+                    "view must be references or overrides".into(),
+                ));
+            }
+        }
+    }
+    if let Some(selector) = args
+        .get("proof_for_caller")
+        .filter(|value| !value.is_null())
+    {
+        if args.get("cursor").is_some_and(|value| !value.is_null()) {
+            return Err(McpError::InvalidParams(
+                "proof_for_caller cannot be combined with cursor".into(),
+            ));
+        }
+        let caller = selector.as_str().ok_or_else(|| {
+            McpError::InvalidParams("proof_for_caller must be a caller UUID".into())
+        })?;
+        parse_entity_id(caller)?;
+        let focal = get_string_param(args, "entity_id")?;
+        parse_entity_id(&focal)?;
+    }
+    Ok(())
+}
+
 async fn handle_find_references_with_authority_source<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -3823,8 +4955,27 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
     source_scope: EntitySourceScope,
 ) -> Result<ToolCallResult> {
+    validate_reference_proof_arguments(args)?;
     let include_snippets = get_optional_bool(args, "include_snippets", false);
+    let include_tests = get_optional_bool(args, "include_tests", true);
     let min_resolution = min_resolution_from_args(args)?;
+    // A scope lists the callers inside one module path and counts the rest.
+    // Resolved before any work, so a scope that names no module path is
+    // refused rather than answered as though nothing in it uses the entity.
+    let within = crate::trace_scope::RowScope::from_arguments(store, args)
+        .map_err(McpError::InvalidParams)?;
+    let within = within.as_ref();
+    // The callers of a symbol outside the repository are read another way,
+    // which a scope does not narrow.
+    let unscoped_for_external = || -> Result<()> {
+        if within.is_some() {
+            return Err(McpError::InvalidParams(
+                "scope is not supported for a symbol outside the repository; ask without scope"
+                    .into(),
+            ));
+        }
+        Ok(())
+    };
     let relation_kinds = if let Some(raw_kinds) = get_optional_string_array(args, "relation_kinds")
     {
         if raw_kinds.is_empty() {
@@ -3846,11 +4997,26 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         default_reference_kinds()
     };
 
+    // An entity Kin holds without parsing it is named in the text of others,
+    // which is all Kin knows of what refers to it. Anything else is left to
+    // the read below.
+    {
+        let held = HeldSourceAuthority::new(store, repository_authority);
+        if let Some(reply) = crate::artifact_entity::mentions::refs_reply(&held, args, source_scope)
+        {
+            return Ok(ToolCallResult::text(
+                serde_json::to_string_pretty(&reply).map_err(McpError::Json)?,
+            ));
+        }
+    }
+
     // A query may carry an ID emitted by another tool. Resolve held external
     // identities through the same reader as entity_id, before name ranking.
     if get_optional_string_param(args, "entity_id").is_none() {
         if let Some(query) = get_optional_string_param(args, "query") {
             if let Some(node) = super::external_symbols::lookup_external_symbol(store, &query)? {
+                require_all_caller_roles_for_external(include_tests)?;
+                unscoped_for_external()?;
                 let result = super::external_symbols::external_references_reply(
                     store,
                     &node,
@@ -3877,6 +5043,8 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         // an edge into it, each with the sites the resolver proved.
         if let Some(node) = super::external_symbols::lookup_external_symbol(store, &entity_id_str)?
         {
+            require_all_caller_roles_for_external(include_tests)?;
+            unscoped_for_external()?;
             let result = super::external_symbols::external_references_reply(
                 store,
                 &node,
@@ -3894,24 +5062,48 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         let entity_id = parse_entity_id(&entity_id_str)?;
         store.get_entity(&entity_id).map_err(McpError::graph)?
     } else if let Some(query) = get_optional_string_param(args, "query") {
-        // The name rule every surface shares. A bare name that several
-        // OWNER-QUALIFIED entities share is answered for every one of them,
-        // labelled and sectioned, instead of quietly keeping a ranked winner and
-        // discarding the rest; a name one owner carries is that owner's member.
-        // Two entities that carry an identical name with NEITHER of them
-        // owner-qualified (a `resolve` free function in each of two unrelated
-        // files, say) are not a shared member name, because there is no
-        // owner-qualified name a caller could retype to pin one. That case keeps
-        // its ranked single answer and the `ambiguous_name` disclosure below.
-        match kin_ranking::entity_ranking::resolve_name(store, &query).map_err(McpError::graph)? {
+        // Exact, member and module-qualified names only: a missing symbol must
+        // not silently select a substring cousin. A name that several distinct
+        // entities carry is answered for every one of them, labelled and
+        // sectioned, instead of quietly keeping a ranked winner and discarding
+        // the rest: members of several owners sharing a member name, and
+        // entities sharing a whole name (the DOM, ART and test renderers'
+        // `commitTextUpdate`, or `_make_timedelta` in two modules) alike. The
+        // twins of one declaration, a prototype beside its definition or two
+        // arms of one declaration in a file, were folded into one entity by the
+        // resolver and are answered once.
+        match kin_ranking::entity_ranking::resolve_name_exact(store, &query)
+            .map_err(McpError::graph)?
+        {
             kin_ranking::entity_ranking::NameResolution::One(entity) => Some(entity),
+            kin_ranking::entity_ranking::NameResolution::SameName(siblings) => {
+                let reason = kin_ranking::entity_ranking::same_name_reason(&query, &siblings);
+                return build_sectioned_reference_reply(
+                    store,
+                    siblings,
+                    &query,
+                    reason,
+                    &relation_kinds,
+                    include_snippets,
+                    include_tests,
+                    within,
+                    min_resolution,
+                    authority_source,
+                    repository_authority,
+                    source_scope,
+                )
+                .await;
+            }
             kin_ranking::entity_ranking::NameResolution::SharedMemberName(siblings) => {
                 return build_sectioned_reference_reply(
                     store,
                     siblings,
                     &query,
+                    CandidateReason::SharedMemberName,
                     &relation_kinds,
                     include_snippets,
+                    include_tests,
+                    within,
                     min_resolution,
                     authority_source,
                     repository_authority,
@@ -3928,6 +5120,8 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
                 match named.as_slice() {
                     [] => None,
                     [node] => {
+                        require_all_caller_roles_for_external(include_tests)?;
+                        unscoped_for_external()?;
                         let result = super::external_symbols::external_references_reply_by_name(
                             store,
                             node,
@@ -3941,6 +5135,8 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
                         return Ok(ToolCallResult::text(json));
                     }
                     candidates => {
+                        require_all_caller_roles_for_external(include_tests)?;
+                        unscoped_for_external()?;
                         let result = super::external_symbols::external_name_candidates_json(
                             "find_references",
                             &query,
@@ -3963,11 +5159,78 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         return Ok(ToolCallResult::error(FIND_REFERENCES_FOCAL_MISS));
     };
 
+    if args.get("view").and_then(serde_json::Value::as_str) == Some("overrides") {
+        let answer = super::overrides::focused_overrides(store, &target)?;
+        return Ok(ToolCallResult::text(serde_json::to_string(&answer)?));
+    }
+
+    if let Some(selector) = get_optional_string_param(args, "proof_for_caller") {
+        let caller_id = parse_entity_id(&selector)?;
+        let caller = store
+            .get_entity(&caller_id)
+            .map_err(McpError::graph)?
+            .ok_or_else(|| {
+                McpError::InvalidParams("proof_for_caller names no stored entity".into())
+            })?;
+        let row = collect_graph_reference_row_for_caller_at(
+            store,
+            &target.id,
+            caller_id,
+            &relation_kinds,
+            repository_authority,
+            source_scope,
+        )?;
+        let mut proof = row.map(|row| reference_row_json(row, false)).unwrap_or_else(|| {
+            let mut proof = serde_json::json!({
+                "entity_id": caller.id.to_string(), "name": caller.name, "kind": format!("{:?}", caller.kind),
+            });
+            crate::semantic_owners::RecordedOwners::observe(store, &caller).attach(&mut proof);
+            proof
+        });
+        let has_chain = proof
+            .get(crate::receiver_binding::RECEIVER_BINDING_KEY)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|steps| !steps.is_empty());
+        let has_gap = proof
+            .get(crate::receiver_binding::RECEIVER_BINDING_MISSING_KEY)
+            .is_some_and(|value| !value.is_null());
+        proof["status"] = serde_json::json!(if has_gap {
+            "partial"
+        } else if has_chain {
+            "recorded"
+        } else {
+            "not_recorded"
+        });
+        if !has_chain && !has_gap {
+            proof["why"] = serde_json::json!("Kin has no stored receiver chain for this caller and target. This does not change the reference's recorded resolution.");
+        }
+        let mut rows = vec![proof];
+        crate::receiver_binding::cap_step_code(
+            &mut rows,
+            crate::receiver_binding::RECEIVER_BINDING_CODE_BYTES_MAX,
+        );
+        let mut focal = serde_json::json!({
+            "id": target.id.to_string(), "name": target.name, "kind": format!("{:?}", target.kind),
+        });
+        // Placed by its module, as the caller row beside it is.
+        if let Some(module) = crate::semantic_owners::entity_module(store, &target) {
+            focal["module"] = serde_json::json!(module);
+        }
+        return Ok(ToolCallResult::text(serde_json::to_string(
+            &serde_json::json!({
+                "focal_entity": focal,
+                "receiver_proof": rows.remove(0),
+            }),
+        )?));
+    }
+
     let result = build_reference_reply_for_focal(
         store,
         &target,
         &relation_kinds,
         include_snippets,
+        include_tests,
+        within,
         min_resolution,
         authority_source,
         repository_authority,
@@ -3999,11 +5262,38 @@ pub const NAME_CANDIDATES_DETAILED_MAX: usize = 25;
 /// Rust workspace, that hundreds of owners define, or a two-letter partial one.
 pub const NAME_CANDIDATES_LISTED_MAX: usize = 200;
 
+/// The spelling that names each candidate alone, keyed by entity id: its own
+/// name when no other candidate carries it, otherwise that name behind as few
+/// of its module names as it takes (`flask.app._make_timedelta`,
+/// `Scheduler.advanceTimers`). A caller can paste it back as the query. A
+/// candidate absent from the map has no such spelling, and its entity id is
+/// its only address.
+pub type CandidateNames = HashMap<kin_model::EntityId, String>;
+
+/// [`CandidateNames`] for `candidates`, read from the Module entities the store
+/// holds. Empty when the store cannot be read, so a listing never fails for
+/// want of a convenience.
+pub fn candidate_names<G: GraphStore>(
+    store: &G,
+    candidates: &[kin_model::Entity],
+) -> CandidateNames {
+    kin_ranking::entity_ranking::distinguishing_names(store, candidates).unwrap_or_default()
+}
+
 /// One candidate, with what a caller needs to choose it: the name, the member
 /// name and owner when it is an owner's member, the kind, the file and the
 /// signature. The entity id is the exact address; the rest is context.
 pub fn name_candidate_json(entity: &kin_model::Entity) -> serde_json::Value {
-    serde_json::json!({
+    name_candidate_json_named(entity, None)
+}
+
+/// [`name_candidate_json`] with the candidate's `qualified_name`, the spelling
+/// a caller can pass back as the query to name it alone.
+pub fn name_candidate_json_named(
+    entity: &kin_model::Entity,
+    qualified_name: Option<&str>,
+) -> serde_json::Value {
+    let mut row = serde_json::json!({
         "entity_id": entity.id,
         "name": entity.name,
         "member_name": kin_ranking::entity_ranking::lookup_member_name(entity),
@@ -4011,7 +5301,11 @@ pub fn name_candidate_json(entity: &kin_model::Entity) -> serde_json::Value {
         "kind": entity.kind,
         "file_path": entity.file_origin.as_ref().map(|path| path.to_string()),
         "signature": entity.signature,
-    })
+    });
+    if let Some(qualified_name) = qualified_name {
+        row["qualified_name"] = serde_json::json!(qualified_name);
+    }
+    row
 }
 
 /// A candidate past [`NAME_CANDIDATES_DETAILED_MAX`]: its id and its name.
@@ -4024,16 +5318,30 @@ pub fn name_candidate_brief_json(entity: &kin_model::Entity) -> serde_json::Valu
 pub fn name_candidate_listing(
     candidates: &[kin_model::Entity],
 ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>, usize) {
+    name_candidate_listing_named(candidates, &CandidateNames::new())
+}
+
+/// [`name_candidate_listing`] with each row's `qualified_name` from `names`.
+pub fn name_candidate_listing_named(
+    candidates: &[kin_model::Entity],
+    names: &CandidateNames,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>, usize) {
     let detailed = candidates
         .iter()
         .take(NAME_CANDIDATES_DETAILED_MAX)
-        .map(name_candidate_json)
+        .map(|entity| name_candidate_json_named(entity, names.get(&entity.id).map(String::as_str)))
         .collect();
     let brief = candidates
         .iter()
         .skip(NAME_CANDIDATES_DETAILED_MAX)
         .take(NAME_CANDIDATES_LISTED_MAX - NAME_CANDIDATES_DETAILED_MAX)
-        .map(name_candidate_brief_json)
+        .map(|entity| {
+            let mut row = name_candidate_brief_json(entity);
+            if let Some(name) = names.get(&entity.id) {
+                row["qualified_name"] = serde_json::json!(name);
+            }
+            row
+        })
         .collect();
     let omitted = candidates.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
     (detailed, brief, omitted)
@@ -4048,6 +5356,10 @@ pub fn name_candidates_situation(
     use kin_ranking::entity_ranking::CandidateReason;
     match reason {
         CandidateReason::SameName => format!("{total} entities are named '{query}' exactly"),
+        CandidateReason::SameQualifiedName => format!(
+            "'{query}' reaches {total} entities: its module qualifier names more than one module \
+             holding that name"
+        ),
         CandidateReason::SharedMemberName => format!(
             "No entity is named '{query}' exactly, and {total} members of different owners \
              carry it as their member name"
@@ -4097,13 +5409,30 @@ pub fn name_candidates_json(
     reason: kin_ranking::entity_ranking::CandidateReason,
     candidates: &[kin_model::Entity],
 ) -> serde_json::Value {
+    name_candidates_json_named(tool, query, reason, candidates, &CandidateNames::new())
+}
+
+/// [`name_candidates_json`] whose rows carry each candidate's `qualified_name`,
+/// the spelling the caller can pass back to name it alone.
+pub fn name_candidates_json_named(
+    tool: &str,
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+    names: &CandidateNames,
+) -> serde_json::Value {
     let total = candidates.len();
-    let (detailed, brief, omitted) = name_candidate_listing(candidates);
+    let (detailed, brief, omitted) = name_candidate_listing_named(candidates, names);
     let detail = format!(
         "{}, so {tool} answered about none of them rather than choosing one. {} Call {tool} \
-         again with one candidate's `entity_id`, or with its owner-qualified `name`.",
+         again with one candidate's `entity_id`, or with its {}.",
         name_candidates_situation(query, reason, total),
         name_candidates_listing_sentence(total, brief.len(), omitted),
+        if names.is_empty() {
+            "owner-qualified `name`"
+        } else {
+            "`qualified_name`"
+        },
     );
     let mut value = serde_json::json!({
         "ambiguous_focal": true,
@@ -4138,6 +5467,23 @@ pub fn name_candidates_reply(
     Ok(ToolCallResult::text(json))
 }
 
+/// [`name_candidates_reply`] whose rows carry each candidate's
+/// `qualified_name`, read from `store`.
+pub fn name_candidates_reply_in<G: GraphStore>(
+    store: &G,
+    tool: &str,
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+) -> Result<ToolCallResult> {
+    let names = candidate_names(store, candidates);
+    let json = serde_json::to_string_pretty(&name_candidates_json_named(
+        tool, query, reason, candidates, &names,
+    ))
+    .map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
 /// [`name_candidates_json`] for a surface that answers in text, so `kin refs`,
 /// `kin trace`, `kin graph source`, `kin path` and a text tool say it in the
 /// same words: the situation, one row per candidate (kind, name, file, id),
@@ -4148,15 +5494,32 @@ pub fn name_candidates_lines(
     reason: kin_ranking::entity_ranking::CandidateReason,
     candidates: &[kin_model::Entity],
 ) -> Vec<String> {
+    name_candidates_lines_named(query, reason, candidates, &CandidateNames::new())
+}
+
+/// [`name_candidates_lines`] whose rows lead with each candidate's
+/// `qualified_name` where it has one, the spelling a caller can pass back.
+pub fn name_candidates_lines_named(
+    query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
+    candidates: &[kin_model::Entity],
+    names: &CandidateNames,
+) -> Vec<String> {
     let mut lines = vec![format!(
         "{}, so there is no one entity to answer about:",
         name_candidates_situation(query, reason, candidates.len())
     )];
+    let spelled = |candidate: &kin_model::Entity| {
+        names
+            .get(&candidate.id)
+            .cloned()
+            .unwrap_or_else(|| candidate.name.clone())
+    };
     for candidate in candidates.iter().take(NAME_CANDIDATES_DETAILED_MAX) {
         lines.push(format!(
             "  {:<9} {}  {}  {}",
             kin_review::StableEntityIdentity::from_entity(candidate).kind,
-            candidate.name,
+            spelled(candidate),
             candidate
                 .file_origin
                 .as_ref()
@@ -4170,7 +5533,7 @@ pub fn name_candidates_lines(
         .skip(NAME_CANDIDATES_DETAILED_MAX)
         .take(NAME_CANDIDATES_LISTED_MAX - NAME_CANDIDATES_DETAILED_MAX)
     {
-        lines.push(format!("  {}  {}", candidate.name, candidate.id));
+        lines.push(format!("  {}  {}", spelled(candidate), candidate.id));
     }
     let omitted = candidates.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
     if omitted > 0 {
@@ -4179,10 +5542,15 @@ pub fn name_candidates_lines(
         ));
     }
     if let Some(first) = candidates.first() {
-        lines.push(format!(
-            "Name one by its owner-qualified name, for example `{}`, or pass its id.",
-            first.name
-        ));
+        match names.get(&first.id) {
+            Some(qualified) => lines.push(format!(
+                "Name one by its qualified name, for example `{qualified}`, or pass its id."
+            )),
+            None => lines.push(format!(
+                "Name one by its owner-qualified name, for example `{}`, or pass its id.",
+                first.name
+            )),
+        }
     }
     lines
 }
@@ -4350,7 +5718,11 @@ pub fn fit_trace_ambiguity_payload(payload: &mut serde_json::Value, max_bytes: u
         if focal {
             let detailed = payload["candidates"].as_array_mut().and_then(Vec::pop);
             if let Some(row) = detailed {
-                let brief = serde_json::json!({"entity_id":row["entity_id"],"name":row["name"]});
+                let mut brief =
+                    serde_json::json!({"entity_id":row["entity_id"],"name":row["name"]});
+                if row.get("qualified_name").is_some() {
+                    brief["qualified_name"] = row["qualified_name"].clone();
+                }
                 if !payload["more_candidates"].is_array() {
                     payload["more_candidates"] = serde_json::json!([]);
                 }
@@ -4374,7 +5746,7 @@ pub fn fit_trace_ambiguity_payload(payload: &mut serde_json::Value, max_bytes: u
                 for entry in entries {
                     if entry["reason"] == "ambiguous_name" {
                         entry["detail"] = serde_json::json!(format!(
-                            "trace_data_flow answered about none of the {total} candidates. {full} are listed in full under candidates, {brief} by id under more_candidates, and {omitted} are omitted. Call again with an entity_id or owner-qualified name."));
+                            "trace_data_flow answered about none of the {total} candidates. {full} are listed in full under candidates, {brief} by id under more_candidates, and {omitted} are omitted. Call again with an entity_id or qualified name."));
                     }
                 }
             }
@@ -4421,15 +5793,25 @@ fn trace_ambiguity_refusal(
 /// decide how many are delivered at once.
 pub fn trace_name_candidates_unpaged_reply(
     query: &str,
+    reason: CandidateReason,
     candidates: &[kin_model::Entity],
+    names: &CandidateNames,
 ) -> Result<ToolCallResult> {
     let value = serde_json::json!({
-        "ambiguous_focal": true, "query": query, "resolution": "shared_member_name",
+        "ambiguous_focal": true, "query": query, "resolution": reason.as_str(),
         "candidate_count": candidates.len(),
-        "candidates": candidates.iter().map(name_candidate_json).collect::<Vec<_>>(),
+        "candidates": candidates
+            .iter()
+            .map(|entity| name_candidate_json_named(entity, names.get(&entity.id).map(String::as_str)))
+            .collect::<Vec<_>>(),
         "degradations": [{
             "component": "focal_resolution", "reason": "ambiguous_name",
-            "detail": format!("The focal names {} candidates, so no focal was selected. Read the candidate pages and repeat with one entity_id.", candidates.len()),
+            "detail": format!(
+                "{}, so no focal was selected and nothing was walked. Read the candidate pages \
+                 and repeat with one candidate's entity_id{}.",
+                name_candidates_situation(query, reason, candidates.len()),
+                if names.is_empty() { "" } else { " or qualified_name" },
+            ),
         }],
     });
     Ok(ToolCallResult::text(
@@ -4439,15 +5821,12 @@ pub fn trace_name_candidates_unpaged_reply(
 
 pub fn trace_name_candidates_reply(
     query: &str,
+    reason: CandidateReason,
     candidates: &[kin_model::Entity],
+    names: &CandidateNames,
     max_bytes: usize,
 ) -> Result<ToolCallResult> {
-    let mut value = name_candidates_json(
-        "trace_data_flow",
-        query,
-        CandidateReason::SharedMemberName,
-        candidates,
-    );
+    let mut value = name_candidates_json_named("trace_data_flow", query, reason, candidates, names);
     let fits = fit_trace_ambiguity_payload(&mut value, max_bytes);
     let text = crate::budget::render(&value).map_err(McpError::Json)?;
     Ok(if fits {
@@ -4462,8 +5841,8 @@ pub fn trace_name_candidates_reply(
 /// found. Public so a caller reading the sections names them the same way.
 pub const AMBIGUOUS_CANDIDATES_KEY: &str = "candidates_by_owner";
 
-/// Answer `find_references` for every entity a bare name resolves to, rather
-/// than the resolver's single ranked winner.
+/// Answer `find_references` for every entity a name resolves to, rather than
+/// the resolver's single ranked winner.
 ///
 /// `kin_ranking::entity_ranking::select_best_entity` has to pick one match and
 /// discard the rest, which is the right contract for a resolver with one
@@ -4473,30 +5852,52 @@ pub const AMBIGUOUS_CANDIDATES_KEY: &str = "candidates_by_owner";
 /// `View.dispatch_request` and `MethodView.dispatch_request` answered
 /// `find_references(query: "dispatch_request")` with one of the three and its
 /// caller list, and nothing in the response said the other two existed or
-/// what called them.
+/// what called them. The same held for whole names: `commitTextUpdate`
+/// answered for the ART renderer's copy of three renderer implementations, and
+/// `_make_timedelta` for `sansio/app.py`'s copy when the question was about
+/// `app.py`'s.
 ///
 /// Each `siblings` entry gets its own labelled section --
 /// [`build_reference_reply_for_focal`]'s ordinary reply body, addressed by
 /// that entity directly (`resolution_query_for_focal: None`), unchanged --
-/// filed under its own `owner_qualified_name` and `entity_id`. The response
-/// carries no top-level `focal_entity`, `references`, or `total_upstream`:
-/// there is no single one of those left to name, which is the fact this whole
-/// reply exists to disclose rather than paper over with a silent pick. Its
-/// top-level `degradations` entry is what a generic reader already folds into
-/// `_kin.verdict`: this query reported a degradation, so the answer did not
-/// run at full, single-focal capability.
+/// filed under its `qualified_name`, `owner_qualified_name` and `entity_id`.
+/// The envelope grades each section as the single-focal answer it is and
+/// composes the response's one verdict from theirs. The response carries no
+/// top-level `focal_entity`, `references`, or `total_upstream`: there is no
+/// single one of those left to name. Its top-level `focal_resolution` says how
+/// the name was read and that every candidate was answered for, and an
+/// `ambiguous_name` degradation remains only when some candidate went
+/// unanswered because the section cap left it out.
+#[allow(clippy::too_many_arguments)]
 async fn build_sectioned_reference_reply<G: GraphStore>(
     store: &G,
     mut siblings: Vec<kin_model::Entity>,
     query: &str,
+    reason: CandidateReason,
     relation_kinds: &[RelationKind],
     include_snippets: bool,
+    include_tests: bool,
+    within: Option<&crate::trace_scope::RowScope>,
     min_resolution: RelationResolution,
     authority_source: FindReferencesAuthoritySource<'_>,
     repository_authority: Option<&RequestRepositoryAuthority>,
     source_scope: EntitySourceScope,
 ) -> Result<ToolCallResult> {
     let total_candidates = siblings.len();
+    let names = candidate_names(store, &siblings);
+    // The twins the resolver folded into these candidates, named so the answer
+    // still says which declarations each section stands for.
+    let folded =
+        match kin_ranking::entity_ranking::reach_by_name(store, query).map_err(McpError::graph)? {
+            kin_ranking::entity_ranking::NameReach::Exact(found)
+            | kin_ranking::entity_ranking::NameReach::Members(found)
+            | kin_ranking::entity_ranking::NameReach::Qualified(found) => {
+                kin_ranking::entity_ranking::fold_same_name_twins(store, found)
+                    .map_err(McpError::graph)?
+                    .folded
+            }
+            kin_ranking::entity_ranking::NameReach::Neither => Vec::new(),
+        };
     // Bounded the way a resolution disclosure's own candidate list already is
     // (`RESOLUTION_CANDIDATES_LISTED_MAX`): each section pays for a full
     // reference collection, cross-repo lookup and edge-coverage scan, and an
@@ -4514,6 +5915,8 @@ async fn build_sectioned_reference_reply<G: GraphStore>(
             sibling,
             relation_kinds,
             include_snippets,
+            include_tests,
+            within,
             min_resolution,
             authority_source.clone(),
             repository_authority,
@@ -4526,6 +5929,12 @@ async fn build_sectioned_reference_reply<G: GraphStore>(
                 "owner_qualified_name".to_string(),
                 serde_json::Value::String(sibling.name.clone()),
             );
+            if let Some(qualified) = names.get(&sibling.id) {
+                object.insert(
+                    "qualified_name".to_string(),
+                    serde_json::Value::String(qualified.clone()),
+                );
+            }
             object.insert("entity_id".to_string(), serde_json::json!(sibling.id));
         }
         sections.push(section);
@@ -4535,7 +5944,8 @@ async fn build_sectioned_reference_reply<G: GraphStore>(
         .iter()
         .take(NAME_CANDIDATES_LISTED_MAX)
         .map(|entity| {
-            let mut row = name_candidate_json(entity);
+            let mut row =
+                name_candidate_json_named(entity, names.get(&entity.id).map(String::as_str));
             if let Some(object) = row.as_object_mut() {
                 object.remove("signature");
                 // Addressed by `entity_id`, as every `find_references` row is,
@@ -4552,10 +5962,7 @@ async fn build_sectioned_reference_reply<G: GraphStore>(
         })
         .collect();
     let omitted = unsectioned.len().saturating_sub(NAME_CANDIDATES_LISTED_MAX);
-    let situation = format!(
-        "No entity is named '{query}' exactly, and {total_candidates} members of different \
-         owners carry it as their member name"
-    );
+    let situation = name_candidates_situation(query, reason, total_candidates);
     let coverage = if listed.is_empty() {
         format!(
             "this answer sections a full reply for every one of them under \
@@ -4573,34 +5980,245 @@ async fn build_sectioned_reference_reply<G: GraphStore>(
             "this answer sections a full reply for the first {sectioned_count} (ordered by \
              file, then name) under `{AMBIGUOUS_CANDIDATES_KEY}` rather than silently choosing \
              one, lists the next {} by id under `unsectioned_candidates`, and leaves {omitted} \
-             more unlisted; name the owner to narrow",
+             more unlisted; name the module or owner to narrow",
             listed.len()
         )
     };
     let detail = format!(
-        "{situation}, so {coverage}. Address one directly by its owner-qualified name -- \
-         `{AMBIGUOUS_CANDIDATES_KEY}[].owner_qualified_name` -- or by its entity id for a \
-         single, unsectioned answer about just that entity."
+        "{situation}, so {coverage}. Each section carries its own verdict. Address one directly \
+         by its `qualified_name` or its `entity_id` for a single, unsectioned answer about just \
+         that entity."
     );
+    let other_candidates: Vec<serde_json::Value> = unsectioned
+        .iter()
+        .take(RESOLUTION_CANDIDATES_LISTED_MAX)
+        .map(|entity| resolution_candidate_json(entity, names.get(&entity.id)))
+        .collect();
+    let mut focal_resolution = serde_json::json!({
+        "addressed_by": "name",
+        "matched": match reason {
+            CandidateReason::SharedMemberName => "member_name",
+            CandidateReason::SameQualifiedName => "qualified_name",
+            _ => "exact_name",
+        },
+        "same_name_candidates": total_candidates,
+        // How many of them this answer answered for, each in its own section.
+        // Equal to `same_name_candidates` when none was left out, which is
+        // what lets the verdict read the resolution as settled rather than as
+        // a choice made among them.
+        "sectioned": sectioned_count,
+        "other_candidates": other_candidates,
+        "detail": detail,
+    });
+    if !folded.is_empty() {
+        focal_resolution["folded_twins"] = serde_json::Value::Array(
+            folded
+                .iter()
+                .take(RESOLUTION_CANDIDATES_LISTED_MAX)
+                .map(|entity| resolution_candidate_json(entity, None))
+                .collect(),
+        );
+    }
     let mut result = serde_json::json!({
         "ambiguous_focal": true,
-        "resolution": kin_ranking::entity_ranking::CandidateReason::SharedMemberName.as_str(),
+        "query": query,
+        "relation_kinds": relation_kinds
+            .iter()
+            .copied()
+            .map(relation_kind_name)
+            .collect::<Vec<_>>(),
+        "resolution": reason.as_str(),
         "candidate_count": total_candidates,
         AMBIGUOUS_CANDIDATES_KEY: sections,
-        "degradations": [{
+        "focal_resolution": focal_resolution,
+    });
+    disclose_reference_caller_scope(&mut result, include_tests, within, None);
+    if !listed.is_empty() {
+        result["unsectioned_candidates"] = serde_json::Value::Array(listed);
+        // Only a candidate left unanswered makes this answer less than the
+        // question asked, and that is what a degradation says.
+        result["degradations"] = serde_json::json!([{
             "component": "focal_resolution",
             "reason": "ambiguous_name",
             "detail": detail,
-        }],
-    });
-    if !listed.is_empty() {
-        result["unsectioned_candidates"] = serde_json::Value::Array(listed);
+        }]);
     }
     if omitted > 0 {
         result["omitted_candidates"] = serde_json::json!(omitted);
     }
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+/// One entity in a `focal_resolution` listing: addressed by id, with the file
+/// only as its projection, and the spelling that names it alone when it has
+/// one.
+fn resolution_candidate_json(
+    entity: &kin_model::Entity,
+    qualified_name: Option<&String>,
+) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "kind": entity.kind,
+        "projection": {
+            "path": entity.file_origin.as_ref().map(|path| path.to_string()),
+        },
+    });
+    if let Some(qualified_name) = qualified_name {
+        row["qualified_name"] = serde_json::json!(qualified_name);
+    }
+    row
+}
+
+fn require_all_caller_roles_for_external(include_tests: bool) -> Result<()> {
+    if !include_tests {
+        return Err(McpError::InvalidParams(
+            "include_tests=false is not supported for external-symbol reference coverage; use include_tests=true to retain its evidence".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reference_caller_in_scope<G: GraphStore>(store: &G, row: &ReferenceRow) -> Result<bool> {
+    let caller = row.entity_id.as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .map(kin_model::EntityId)
+        .map(|id| store.get_entity(&id).map_err(McpError::graph))
+        .transpose()?.flatten()
+        .ok_or_else(|| McpError::InvalidParams(
+            "include_tests=false cannot classify an unowned caller; use include_tests=true to retain its evidence".into(),
+        ))?;
+    Ok(caller.role != kin_model::EntityRole::Test)
+}
+
+fn scope_reference_rows<G: GraphStore>(
+    store: &G,
+    rows: &mut Vec<ReferenceRow>,
+    include_tests: bool,
+) -> Result<()> {
+    if !include_tests {
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows.drain(..) {
+            if reference_caller_in_scope(store, &row)? {
+                kept.push(row);
+            }
+        }
+        *rows = kept;
+    }
+    Ok(())
+}
+
+/// Where a reference answer about a module, asked for imports, serves what
+/// the module itself imports: `{"names": [{"name", "module", "imported"?,
+/// "outside_repository"}], "names_total", "scope"}`.
+///
+/// The rows of a reference answer are who imports the module. A reader asking
+/// about a module's imports as often wants the other direction, which no
+/// other reply serves: which names its own import statements bind, from
+/// which modules, and whether the repository holds each one.
+pub const MODULE_IMPORTS_KEY: &str = "module_imports";
+
+/// What [`MODULE_IMPORTS_KEY`] covers: a file's record holds every name a
+/// `from` import binds and every imported module the file reads, never an
+/// `import m` whose name it does not read.
+pub const MODULE_IMPORTS_SCOPE: &str = "recorded_import_bindings";
+
+/// The most names one [`MODULE_IMPORTS_KEY`] block lists.
+pub const MODULE_IMPORTS_MAX: usize = 60;
+
+/// The names the module `target` binds by its own import statements, as its
+/// file's record holds them, when `relation_kinds` asks about imports. `None`
+/// for any other focal, and when the record cannot be read.
+fn module_imports<G: GraphStore + ?Sized>(
+    store: &G,
+    target: &kin_model::entity::Entity,
+    relation_kinds: &[RelationKind],
+) -> Option<serde_json::Value> {
+    if target.kind != EntityKind::Module || !relation_kinds.contains(&RelationKind::Imports) {
+        return None;
+    }
+    let path = target.file_origin.as_ref()?;
+    let census = kin_db::call_site_escape::StoreCensus { store };
+    let bound = kin_db::call_site_escape::ReceiverImports::new(&census).bound_in(path)?;
+    let names: Vec<serde_json::Value> = bound
+        .iter()
+        .take(MODULE_IMPORTS_MAX)
+        .map(|import| {
+            let mut row = serde_json::json!({
+                "name": import.name,
+                "module": import.module,
+                "outside_repository": import.outside_repository,
+            });
+            if let Some(imported) = &import.imported {
+                row["imported"] = serde_json::json!(imported);
+            }
+            row
+        })
+        .collect();
+    Some(serde_json::json!({
+        "names": names,
+        "names_total": bound.len(),
+        "scope": MODULE_IMPORTS_SCOPE,
+    }))
+}
+
+/// Say which callers an answer is about, when it is not about all of them:
+/// that test code was left out, and the module path the callers were
+/// confined to, with how many recorded callers sat outside it when the
+/// answer counted them (a sectioned answer counts in each section).
+fn disclose_reference_caller_scope(
+    result: &mut serde_json::Value,
+    include_tests: bool,
+    within: Option<&crate::trace_scope::RowScope>,
+    outside: Option<usize>,
+) {
+    let mut scope = serde_json::Map::new();
+    if !include_tests {
+        scope.insert("include_tests".into(), serde_json::json!(false));
+        scope.insert("excluded_role".into(), serde_json::json!("test"));
+        scope.insert(
+            "basis".into(),
+            serde_json::json!("current_stored_caller_role"),
+        );
+    }
+    if let Some(within) = within {
+        scope.insert(
+            REFERENCE_SCOPE_MODULE_KEY.into(),
+            serde_json::json!(within.module()),
+        );
+        if let Some(outside) = outside {
+            scope.insert(
+                REFERENCE_SCOPE_OUTSIDE_KEY.into(),
+                serde_json::json!(outside),
+            );
+        }
+    }
+    if !scope.is_empty() {
+        result["caller_scope"] = serde_json::Value::Object(scope);
+    }
+}
+
+/// Where a reference answer's `caller_scope` names the module path its
+/// callers were confined to.
+pub const REFERENCE_SCOPE_MODULE_KEY: &str = "module";
+
+/// Where a reference answer's `caller_scope` counts the recorded callers
+/// that sat outside [`REFERENCE_SCOPE_MODULE_KEY`] and are not listed.
+pub const REFERENCE_SCOPE_OUTSIDE_KEY: &str = "outside_module";
+
+/// Whether `row`'s caller is listed under `within`: an entity inside the
+/// module path, or one that cannot be placed. A caller in another
+/// repository belongs to no module of this one.
+fn reference_row_in_module_scope<G: GraphStore>(
+    store: &G,
+    row: &ReferenceRow,
+    within: &crate::trace_scope::RowScope,
+) -> bool {
+    match row.entity_id.as_deref() {
+        Some(id) => within.lists_id(store, id),
+        None => false,
+    }
 }
 
 /// Build one `find_references` reply body: reference rows, withheld
@@ -4624,6 +6242,8 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     target: &kin_model::Entity,
     relation_kinds: &[RelationKind],
     include_snippets: bool,
+    include_tests: bool,
+    within: Option<&crate::trace_scope::RowScope>,
     min_resolution: RelationResolution,
     authority_source: FindReferencesAuthoritySource<'_>,
     repository_authority: Option<&RequestRepositoryAuthority>,
@@ -4637,6 +6257,7 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
         repository_authority,
         source_scope,
     )?;
+    scope_reference_rows(store, &mut rows, include_tests)?;
     // ── Federated Xrefs via Spine ─────────────────────────────────────
     let cross_repo_query = match authority_source {
         FindReferencesAuthoritySource::Ambient(binding) => match binding.repo_id {
@@ -4661,6 +6282,11 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
         Ok((repo_id, query)) => match query {
             kin_spine::SpineQuery::Found(body) => {
                 let federated_rows = spine_reference_rows(&repo_id, &target.id, &body);
+                if !include_tests && !federated_rows.is_empty() {
+                    return Err(McpError::InvalidParams(
+                        "include_tests=false cannot classify federated caller roles; use include_tests=true to retain their evidence".into(),
+                    ));
+                }
                 let relation_subtype_complete =
                     reference_filter_covers_unknown_subtypes(relation_kinds)
                         || federated_rows.is_empty();
@@ -4701,6 +6327,16 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
         },
     };
 
+    // A scope keeps the callers inside one module path. The rest are
+    // counted, never listed, and a caller from another repository is among
+    // them.
+    let mut outside_scope = 0usize;
+    if let Some(within) = within {
+        let recorded = rows.len();
+        rows.retain(|row| reference_row_in_module_scope(store, row, within));
+        outside_scope = recorded - rows.len();
+    }
+
     // Same order as the shared CLI collector, entity id included: rows come off
     // a hash map, and several callers can share a file and a name, so without
     // the last key the order of two such rows is whatever the map iterated.
@@ -4709,6 +6345,8 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
             .cmp(&right.file_path)
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.entity_id.cmp(&right.entity_id))
+            .then_with(|| left.repo_id.cmp(&right.repo_id))
+            .then_with(|| left.foreign_entity_id.cmp(&right.foreign_entity_id))
     });
 
     // Read off the rows before they are projected, where the caller's entity id
@@ -4807,6 +6445,55 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     }
     let rows = counted_rows;
 
+    // The reading of every caller in the store that could reach the focal,
+    // taken before the rows are counted, because a named call site it promotes
+    // under the name-unique rule joins the answer as a row of its own and
+    // supersedes the withheld candidate row of the same caller.
+    // A Call census neither adds rows nor proves completion for another
+    // relation kind. A mixed query can use it for its requested Call rows.
+    let arrival = relation_kinds.contains(&RelationKind::Calls).then(|| {
+        reference_caller_arrival_scoped(
+            store,
+            target,
+            repository_authority,
+            source_scope,
+            include_tests,
+            within,
+        )
+    });
+    // A question about imports or references alone reads no call site, and a
+    // Call census settles calls alone. What decides those kinds is the
+    // census's reading of the focal's non-call reads, matched against the rows
+    // stored into it, so this takes that reading and nothing else. Without it
+    // every such answer read `reference_completion_unmeasured`, whatever the
+    // rows were.
+    let mention_block = (arrival.is_none()
+        && relation_kinds
+            .iter()
+            .any(|kind| matches!(kind, RelationKind::Imports | RelationKind::References)))
+    .then(|| {
+        reference_mention_block(
+            store,
+            target,
+            repository_authority,
+            source_scope,
+            include_tests,
+        )
+    });
+    let name_unique_rows = if let Some(arrival) = &arrival {
+        let held = HeldSourceAuthority::new(store, repository_authority);
+        let caller_text = crate::handlers::common::HeldCallerText::new(&held, source_scope);
+        name_unique_reference_rows(
+            Some((store, &caller_text)),
+            arrival.scan.as_deref(),
+            &rows,
+            &mut candidate_rows,
+            include_snippets,
+        )
+    } else {
+        Vec::new()
+    };
+
     // Rows this response counts at `name_only` only because the floor above
     // dropped to `name_only` for lack of anything stronger IN THE STORE, not
     // because a caller asked for the wide read (which leaves `min_resolution`
@@ -4836,8 +6523,24 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     // section that appears only when it has rows is one no reader learns to look
     // for, and the reader who most needs this one is the reader who got an empty
     // reference list and is deciding whether the method is dead.
-    let dispatch =
+    let mut dispatch =
         collect_interface_dispatch_candidates(store, target, repository_authority, source_scope)?;
+    if !include_tests {
+        if let Some(DispatchCandidates::Candidates { rows, .. }) = &mut dispatch {
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows.drain(..) {
+                if reference_caller_in_scope(store, &row.row)? {
+                    kept.push(row);
+                }
+            }
+            *rows = kept;
+        }
+    }
+    if let (Some(within), Some(DispatchCandidates::Candidates { rows, .. })) =
+        (within, &mut dispatch)
+    {
+        rows.retain(|row| reference_row_in_module_scope(store, &row.row, within));
+    }
 
     // The other direction of the same gap, and the one a reader asks about more
     // often: where is this interface method implemented. A concrete method
@@ -4856,22 +6559,61 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     // What this answer counted, computed before the rows are projected. One row
     // is one referencing entity, so `referencing_entities` is the row count and
     // `files` is what the pre-FIR-2398 `total_upstream` was reporting.
-    let counts = reference_counts(
+    let mut counts = reference_counts(
         &rows,
         &candidate_rows,
         dispatch.as_ref().map(dispatch_candidate_count),
     );
+    // Rows served under the name-unique rule, counted apart from every proven
+    // number above: each is a caller whose call spells the focal's one call
+    // name while the store holds no other definition that name can reach, and
+    // none of them is proven.
+    counts["name_unique"] = serde_json::json!(name_unique_rows.len());
 
     // `entity_id` remains the local drill-through keystone. Federated rows use
     // repo-qualified paths and carry no local entity id.
-    let references = rows
+    let mut references = rows
         .into_iter()
         .map(|row| reference_row_json(row, include_snippets))
         .collect::<Vec<_>>();
-    let candidates = candidate_rows
+    if !name_unique_rows.is_empty() {
+        references.extend(name_unique_rows);
+        // The order every other row already has: file, then name, then id.
+        references.sort_by(|left, right| {
+            let key = |row: &serde_json::Value| {
+                (
+                    row["projection"]["path"].as_str().map(str::to_string),
+                    row["name"].as_str().unwrap_or_default().to_string(),
+                    row["entity_id"].as_str().map(str::to_string),
+                )
+            };
+            key(left).cmp(&key(right))
+        });
+    }
+    let mut candidates = candidate_rows
         .into_iter()
         .map(|row| reference_row_json(row, include_snippets))
         .collect::<Vec<_>>();
+    // Each site carries the expression it sits in, within one byte budget per
+    // list, spent in the order the rows are served.
+    let references_expr = crate::site_expression::cap_reference_rows(
+        &mut references,
+        crate::site_expression::REFERENCE_EXPR_BYTES_MAX,
+    );
+    let candidates_expr = crate::site_expression::cap_reference_rows(
+        &mut candidates,
+        crate::site_expression::REFERENCE_EXPR_BYTES_MAX,
+    );
+    // Each receiver chain quotes a declaration once per list, within its own
+    // byte budget, so callers typed through one context cost one quote.
+    let references_code = crate::receiver_binding::cap_step_code(
+        &mut references,
+        crate::receiver_binding::RECEIVER_BINDING_CODE_BYTES_MAX,
+    );
+    let candidates_code = crate::receiver_binding::cap_step_code(
+        &mut candidates,
+        crate::receiver_binding::RECEIVER_BINDING_CODE_BYTES_MAX,
+    );
 
     // What the graph can structurally answer over the edge classes this query
     // reads. A reference list is only evidence about the code when the graph
@@ -4893,19 +6635,26 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
         &witnessed,
     );
 
+    let mut focal_entity = serde_json::json!({
+        "id": target.id,
+        "name": target.name,
+        "kind": target.kind,
+        "projection": {
+            "path": target.file_origin.as_ref().map(|p| p.to_string()),
+        },
+        "signature": target.signature,
+    });
+    // Placed the way every row below places its caller: by the dotted module
+    // that contains it, read from the graph's module records. Absent when the
+    // graph records no module for it, as on a row.
+    if let Some(module) = crate::semantic_owners::entity_module(store, target) {
+        focal_entity["module"] = serde_json::json!(module);
+    }
     let mut result = serde_json::json!({
         // The focal is addressed by its id, as every row below addresses its
-        // caller. Its file is served only as the projection it is, never with
-        // a line.
-        "focal_entity": {
-            "id": target.id,
-            "name": target.name,
-            "kind": target.kind,
-            "projection": {
-                "path": target.file_origin.as_ref().map(|p| p.to_string()),
-            },
-            "signature": target.signature,
-        },
+        // caller, and placed by its module. Its projection is labelled as the
+        // projection it is, and never served with a line.
+        "focal_entity": focal_entity,
         "relation_kinds": relation_kinds
             .iter()
             .copied()
@@ -4942,12 +6691,71 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
         "candidates": candidates,
         "cross_repo": cross_repo,
     });
+    disclose_reference_caller_scope(&mut result, include_tests, within, Some(outside_scope));
+    if let Some(imports) = module_imports(store, target, relation_kinds) {
+        result[MODULE_IMPORTS_KEY] = imports;
+    }
+    // Reference sites no pass could decide over unchanged inputs: served as
+    // references above, listed here so the verdict never reads them as proven.
+    crate::undecided_sites::disclose_undecided_reference_sites(
+        &mut result,
+        store,
+        target,
+        relation_kinds,
+    );
+    for (key, cut, unit) in [
+        (
+            REFERENCES_EXPR_ELIDED_KEY,
+            references_expr,
+            "sites in `references`",
+        ),
+        (
+            CANDIDATES_EXPR_ELIDED_KEY,
+            candidates_expr,
+            "sites in `candidates`",
+        ),
+    ] {
+        if let Some(disclosure) =
+            cut.disclosure(crate::site_expression::REFERENCE_EXPR_BYTES_MAX, unit)
+        {
+            result[key] = disclosure;
+        }
+    }
+    for (key, cut) in [
+        (REFERENCES_BINDING_CODE_ELIDED_KEY, references_code),
+        (CANDIDATES_BINDING_CODE_ELIDED_KEY, candidates_code),
+    ] {
+        if let Some(disclosure) =
+            cut.disclosure(crate::receiver_binding::RECEIVER_BINDING_CODE_BYTES_MAX)
+        {
+            result[key] = disclosure;
+        }
+    }
     if let Some(dispatch) = dispatch {
-        result[INTERFACE_DISPATCH_KEY] = interface_dispatch_json(dispatch, include_snippets);
+        let mut block = interface_dispatch_json(dispatch, include_snippets);
+        if let Some(rows) = block
+            .get_mut("candidates")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let cut = crate::site_expression::cap_reference_rows(
+                rows,
+                crate::site_expression::REFERENCE_EXPR_BYTES_MAX,
+            );
+            if let Some(disclosure) = cut.disclosure(
+                crate::site_expression::REFERENCE_EXPR_BYTES_MAX,
+                "sites in `interface_dispatch.candidates`",
+            ) {
+                block[CANDIDATES_EXPR_ELIDED_KEY] = disclosure;
+            }
+        }
+        result[INTERFACE_DISPATCH_KEY] = block;
     }
     if let Some(implementations) = implementations.as_ref() {
         result[INTERFACE_IMPLEMENTATIONS_KEY] = interface_implementations_json(implementations);
     }
+    // Where this method is overridden, which no reference edge carries. Held
+    // under its own key for the reason the implementations block above is.
+    super::overrides::attach_overridden_by(store, target, &mut result)?;
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
     // Whether a caller could have reached this focal through a call site the
     // linker recorded no edge for (FIR-2775). `edge_coverage` above answers
@@ -4968,15 +6776,20 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     // focal escapes as a value, so an unresolved `json.dumps` no longer counts
     // against `_make_timedelta`, while a same-name unresolved site in a file
     // that never imports the focal's file still does, as a candidate row.
-    let arrival = reference_caller_arrival(store, target, repository_authority, source_scope);
-    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] = arrival.to_json();
+    // Taken above, before the rows were counted.
     // Every caller in the files that can reach the focal, tallied through the
     // one site-state reading, so the verdict reads this answer's sites the way
     // it reads a pack's. Absent when the family could not be established,
     // which `caller_arrival` already says.
     // Qualified by the owed callers outside the family, since a caller can
     // reach the focal without importing its file.
-    if let Some(block) = arrival.call_sites_block() {
+    if let Some(arrival) = arrival {
+        result[crate::caller_arrival::CALLER_ARRIVAL_KEY] = arrival.to_json();
+        if let Some(block) = arrival.call_sites_block() {
+            result[crate::call_sites::CALL_SITES_KEY] = block;
+        }
+    }
+    if let Some(block) = mention_block {
         result[crate::call_sites::CALL_SITES_KEY] = block;
     }
     disclose_withheld_candidates(&mut result);
@@ -5009,6 +6822,130 @@ async fn build_reference_reply_for_focal<G: GraphStore>(
     Ok(result)
 }
 
+/// The `name_unique` reference rows a store-wide reading promoted, one per
+/// caller, in the shape [`reference_row_json`] serves.
+///
+/// A caller already counted by a proven edge keeps its proven row alone: it is
+/// in the answer, and its promoted site stays counted under
+/// `call_sites.name_unique`. A withheld candidate row of a promoted caller is
+/// superseded and removed from `candidate_rows`: the promotion is the stronger
+/// reading of the same call, and holding the caller in both would count it as
+/// withheld while serving it as a row.
+///
+/// A promoted row is never proven. Its `resolution` is `name_unique`, which no
+/// proven-edge floor, absence gate or dead-code reading counts, and it carries
+/// each promoted site addressed inside the caller as every row does.
+/// Each row also says how far the chain typing its call's receiver got and
+/// which link it lacks, as `receiver_binding` and `receiver_binding_missing`
+/// (see [`crate::receiver_binding::chain_gap`]), when `graph` is given and the
+/// graph can tell.
+fn name_unique_reference_rows<G: GraphStore>(
+    graph: Option<(&G, &dyn crate::handlers::external_symbols::SiteText)>,
+    scan: Option<&crate::call_sites::FocalScan>,
+    counted: &[ReferenceRow],
+    candidate_rows: &mut Vec<ReferenceRow>,
+    include_snippets: bool,
+) -> Vec<serde_json::Value> {
+    let Some(scan) = scan else {
+        return Vec::new();
+    };
+    let counted_ids: std::collections::HashSet<&str> = counted
+        .iter()
+        .filter_map(|row| row.entity_id.as_deref())
+        .collect();
+    let mut rows = Vec::new();
+    for (caller, sites) in scan.promoted_callers() {
+        let id = caller.id.to_string();
+        if counted_ids.contains(id.as_str()) {
+            continue;
+        }
+        candidate_rows.retain(|row| row.entity_id.as_deref() != Some(id.as_str()));
+        let served: Vec<serde_json::Value> = sites
+            .iter()
+            .map(|site| {
+                let mut served = serde_json::json!({
+                    "line_in_entity": site.line_in_entity,
+                    "callee": site.callee,
+                });
+                match (&site.expr, site.expr_unavailable) {
+                    (Some(expr), _) => {
+                        served["expr"] = serde_json::json!(expr);
+                        if let Some(receiver) = &site.receiver {
+                            served["receiver"] = serde_json::json!(receiver);
+                        }
+                    }
+                    (None, Some(reason)) => served["expr_unavailable"] = serde_json::json!(reason),
+                    (None, None) => {}
+                }
+                served
+            })
+            .collect();
+        let mut row = serde_json::json!({
+            "entity_id": id,
+            "name": caller.name,
+            "kind": format!("{:?}", caller.kind),
+            "role": caller.role,
+            "projection": { "path": caller.file_origin.as_ref().map(|path| path.to_string()) },
+            "site_count": served.len(),
+            "sites": served,
+            "sites_absent_reason": serde_json::Value::Null,
+            "sites_partial_reason": serde_json::Value::Null,
+            "relation_kinds": ["calls"],
+            "resolution": NAME_UNIQUE_RESOLUTION,
+            "via_override_of": serde_json::Value::Null,
+        });
+        if let Some((store, text)) = graph {
+            crate::semantic_owners::RecordedOwners::observe(store, caller).attach(&mut row);
+            // The first site made through a receiver, whose chain the linker
+            // could not finish: how far it got, and the link it lacks.
+            let gap = sites.iter().find_map(|site| {
+                let receiver = site.receiver.as_deref()?;
+                let method = site.callee.as_deref()?;
+                let (steps, missing) =
+                    crate::receiver_binding::chain_gap(store, caller, receiver, method)?;
+                Some((site, steps, missing))
+            });
+            if let Some((site, steps, missing)) = gap {
+                // The caller's body is read only for a binding it quotes.
+                let body = steps
+                    .iter()
+                    .any(|step| step.entity == Some(caller.id))
+                    .then(|| crate::site_expression::whole_text(text, caller).ok())
+                    .flatten();
+                row[crate::receiver_binding::RECEIVER_BINDING_KEY] =
+                    serde_json::json!(crate::receiver_binding::served_steps(
+                        store,
+                        caller,
+                        body.as_deref(),
+                        crate::receiver_binding::CallAt {
+                            line_in_entity: site
+                                .line_in_entity
+                                .and_then(|line| u32::try_from(line).ok()),
+                            code: site.expr.as_deref(),
+                        },
+                        &steps,
+                    ));
+                row[crate::receiver_binding::RECEIVER_BINDING_MISSING_KEY] =
+                    crate::receiver_binding::missing_json(&missing);
+            }
+        }
+        if graph.is_none() {
+            crate::semantic_owners::RecordedOwners::unavailable().attach(&mut row);
+        }
+        if include_snippets {
+            row["signature"] = serde_json::json!(caller.signature);
+            row["snippet"] = serde_json::Value::Null;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// The `resolution` a reference row promoted under the name-unique rule
+/// carries: a call whose callee spells the focal's one call name while the
+/// store holds no other definition that name can reach. Never proven.
+pub const NAME_UNIQUE_RESOLUTION: &str = "name_unique";
+
 /// The reading of the callers that could reach `target` that
 /// `find_references` and `kin refs` both serve: the census of whether the
 /// focal escapes as a value, taken at `source_scope` through the held
@@ -5022,11 +6959,30 @@ pub fn reference_caller_arrival<G: GraphStore>(
     repository_authority: Option<&RequestRepositoryAuthority>,
     source_scope: EntitySourceScope,
 ) -> crate::caller_arrival::CallerArrival {
+    reference_caller_arrival_scoped(
+        store,
+        target,
+        repository_authority,
+        source_scope,
+        true,
+        None,
+    )
+}
+
+fn reference_caller_arrival_scoped<G: GraphStore>(
+    store: &G,
+    target: &kin_model::Entity,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+    include_tests: bool,
+    within: Option<&crate::trace_scope::RowScope>,
+) -> crate::caller_arrival::CallerArrival {
     let held = HeldSourceAuthority::new(store, repository_authority);
     let escape = held
-        .escape_evidence_batch(
+        .escape_evidence_batch_scoped(
             source_scope,
             &[(target, kin_model::focal_call_names(target))],
+            include_tests,
         )
         .pop()
         .unwrap_or(crate::call_sites::NO_CENSUS);
@@ -5035,10 +6991,46 @@ pub fn reference_caller_arrival<G: GraphStore>(
         crate::call_sites::SCAN_TEXT_READS_MAX,
         source_scope,
     );
-    let scan = crate::call_sites::scan_focal(store, target, &text, escape)
+    let scan = crate::call_sites::scan_focal_scoped(store, target, &text, escape, include_tests)
         .ok()
-        .map(std::sync::Arc::new);
-    crate::caller_arrival::observe_caller_arrival_with(store, target, scan)
+        .map(|mut scan| {
+            // The reading speaks of the callers the question is about: a
+            // caller outside the scope holds no site in it.
+            if let Some(within) = within {
+                scan.confine(|caller| within.lists(caller));
+            }
+            std::sync::Arc::new(scan)
+        });
+    crate::caller_arrival::observe_caller_arrival_with_scope(store, target, scan, include_tests)
+}
+
+/// The census's reading of `target`'s non-call reads, as the block a reference
+/// answer that asks for imports or references and not calls serves (see
+/// [`crate::call_sites::mention_block`]). Taken through the held authority at
+/// `source_scope`, like the census behind a caller reading, so the two read one
+/// store one way.
+fn reference_mention_block<G: GraphStore>(
+    store: &G,
+    target: &kin_model::Entity,
+    repository_authority: Option<&RequestRepositoryAuthority>,
+    source_scope: EntitySourceScope,
+    include_tests: bool,
+) -> serde_json::Value {
+    let held = HeldSourceAuthority::new(store, repository_authority);
+    let escape = held
+        .escape_evidence_batch_scoped(
+            source_scope,
+            &[(target, kin_model::focal_call_names(target))],
+            include_tests,
+        )
+        .pop()
+        .unwrap_or(crate::call_sites::NO_CENSUS);
+    let text = super::external_symbols::CalleeText::with_read_limit_at(
+        &held,
+        crate::call_sites::SCAN_TEXT_READS_MAX,
+        source_scope,
+    );
+    crate::call_sites::mention_block(store, &text, &escape)
 }
 
 /// Batched reachability check: classify many entities in a single call.
@@ -5579,64 +7571,135 @@ semantic_search → get_entity_source → find_references. Use it to start explo
 once you've identified a specific entity, the targeted tools (get_entity_source, \
 get_context_pack, find_references, trace_data_flow) let you go deeper precisely.";
 
+// ContextEntry.content is a rendered projection, potentially with generated
+// origin comments. Without the entity, it cannot be separated into exact source
+// and metadata safely. Keep the selected identity and disclose the missing read.
+fn missing_context_entity(entry: &kin_model::context::ContextEntry) -> serde_json::Value {
+    serde_json::json!({
+        "id": entry.entity_id,
+        "projection_unavailable": "The selected entity is unavailable in the graph; its semantic projection could not be recovered.",
+    })
+}
+
+fn exploration_entity(entity: &kin_model::Entity) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "id": entity.id,
+        "name": entity.name,
+        "kind": entity.kind,
+        "language": entity.language,
+        "signature": entity.signature,
+    });
+    // A generated container label is not a declared semantic name. Preserve
+    // actual endpoint names and source signatures even when they contain '/'.
+    if matches!(
+        entity.kind,
+        EntityKind::Module | EntityKind::Package | EntityKind::File
+    ) {
+        if let Some(origin) = &entity.file_origin {
+            if entity.name == origin.0 {
+                row.as_object_mut().unwrap().remove("name");
+                row["semantic_identity_gap"] = serde_json::json!(
+                    "Use the recorded entity_id; a semantic name is unavailable."
+                );
+            }
+            if entity.signature == format!("module {origin}")
+                || entity.signature == format!("package {origin}")
+            {
+                row.as_object_mut().unwrap().remove("signature");
+            }
+        }
+    }
+    row
+}
+
+// Admit whole records, never a cut or reconstructed program string. Keep the
+// first record of a nonempty group even if it exceeds the budget, so a bounded
+// answer cannot masquerade as a graph miss; the final measured cost says so.
+fn push_exploration_row(
+    reply: &mut serde_json::Value,
+    section: &str,
+    row: serde_json::Value,
+    token_budget: usize,
+) -> Result<bool> {
+    let content = reply["content"].as_object_mut().unwrap();
+    let rows = content
+        .entry(section.to_owned())
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .unwrap();
+    let first = rows.is_empty();
+    rows.push(row);
+    let encoded = serde_json::to_string_pretty(reply).map_err(McpError::Json)?;
+    if !first && kin_context::estimate_tokens(&encoded) > token_budget {
+        reply["content"][section].as_array_mut().unwrap().pop();
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn finish_exploration(mut reply: serde_json::Value) -> Result<ToolCallResult> {
+    for _ in 0..16 {
+        let text = serde_json::to_string_pretty(&reply).map_err(McpError::Json)?;
+        let tokens = kin_context::estimate_tokens(&text);
+        let exceeds = tokens > reply["token_budget"].as_u64().unwrap_or(0) as usize;
+        if reply["tokens_used"].as_u64() == Some(tokens as u64)
+            && reply["over_token_budget"].as_bool() == Some(exceeds)
+        {
+            return Ok(ToolCallResult::text(text));
+        }
+        reply["tokens_used"] = serde_json::json!(tokens);
+        reply["over_token_budget"] = serde_json::json!(exceeds);
+    }
+    Err(McpError::InvalidParams(
+        "Could not settle exploration response accounting".into(),
+    ))
+}
+
 pub fn handle_explore_codebase<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
     repository_authority: Option<&RequestRepositoryAuthority>,
 ) -> Result<ToolCallResult> {
-    use kin_context::{build_context_pack, estimate_tokens, ContextOptions};
+    use kin_context::{build_context_pack_with_provenance, ContextOptions};
     use kin_model::context::TokenBudget;
 
-    // One held authority for the whole exploration: the trace rendering below
-    // reads a body per chain step and per constant it finds.
+    // One held authority for all bodies and constants in this exploration.
     let held = HeldSourceAuthority::new(store, repository_authority);
-
     let query = get_string_param(args, "query")?;
     let strategy = args
         .get("strategy")
         .and_then(|v| v.as_str())
         .unwrap_or("search");
     let token_budget = get_optional_u64(args, "token_budget", 8000) as usize;
-
-    let mut output = String::new();
-    let mut tokens_used: usize = 0;
+    let mut reply = serde_json::json!({
+        "strategy": strategy,
+        "query": query,
+        "tokens_used": 0,
+        "token_budget": token_budget,
+        "over_token_budget": false,
+        "content": {},
+    });
 
     match strategy {
         "overview" => {
-            // Get all entities and summarize by kind/language.
             let all_entities = store
                 .query_entities(&EntityFilter::default())
                 .map_err(McpError::graph)?;
-
-            let total = all_entities.len();
-            let mut by_kind: HashMap<String, usize> = HashMap::new();
-            let mut by_lang: HashMap<String, usize> = HashMap::new();
-
-            for e in &all_entities {
-                *by_kind.entry(format!("{:?}", e.kind)).or_default() += 1;
-                *by_lang.entry(e.language.to_string()).or_default() += 1;
-            }
-
-            output.push_str(&format!("# Codebase Overview ({} entities)\n\n", total));
-
-            output.push_str("## By Kind\n");
-            let mut kinds: Vec<_> = by_kind.into_iter().collect();
-            kinds.sort_by(|a, b| b.1.cmp(&a.1));
-            for (kind, count) in &kinds {
-                output.push_str(&format!("  {}: {}\n", kind, count));
-            }
-
-            output.push_str("\n## By Language\n");
-            let mut langs: Vec<_> = by_lang.into_iter().collect();
-            langs.sort_by(|a, b| b.1.cmp(&a.1));
-            for (lang, count) in &langs {
-                output.push_str(&format!("  {}: {}\n", lang, count));
-            }
-
-            // Top declarations (public functions, classes, traits) up to budget.
-            output.push_str("\n## Top Declarations\n");
-            let mut top_decls: Vec<_> = all_entities
+            let entities: Vec<_> = all_entities
                 .iter()
+                .filter(|e| e.kind != EntityKind::File)
+                .collect();
+            let mut by_kind = std::collections::BTreeMap::<String, usize>::new();
+            let mut by_language = std::collections::BTreeMap::<String, usize>::new();
+            for entity in &entities {
+                *by_kind.entry(format!("{:?}", entity.kind)).or_default() += 1;
+                *by_language.entry(entity.language.to_string()).or_default() += 1;
+            }
+            reply["content"]["entity_count"] = serde_json::json!(entities.len());
+            reply["content"]["by_kind"] = serde_json::json!(by_kind);
+            reply["content"]["by_language"] = serde_json::json!(by_language);
+            let mut declarations: Vec<_> = entities
+                .into_iter()
                 .filter(|e| {
                     e.visibility == kin_model::entity::Visibility::Public
                         && matches!(
@@ -5650,387 +7713,239 @@ pub fn handle_explore_codebase<G: GraphStore>(
                         )
                 })
                 .collect();
-            top_decls.sort_by(|a, b| a.name.cmp(&b.name));
-
-            for decl in &top_decls {
-                let line = format!(
-                    "  {:?} {} ({}){}\n",
-                    decl.kind,
-                    decl.name,
-                    decl.language,
-                    decl.file_origin
-                        .as_ref()
-                        .map(|p| format!(" — {}", p))
-                        .unwrap_or_default(),
-                );
-                let line_tokens = estimate_tokens(&line);
-                if tokens_used + line_tokens > token_budget {
-                    output.push_str(&format!(
-                        "  ... ({} more declarations truncated)\n",
-                        top_decls.len() - tokens_used
-                    ));
+            declarations.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+            reply["content"]["declarations"] = serde_json::json!([]);
+            for (index, entity) in declarations.iter().enumerate() {
+                if !push_exploration_row(
+                    &mut reply,
+                    "declarations",
+                    exploration_entity(entity),
+                    token_budget,
+                )? {
+                    reply["content"]["declarations_omitted"] =
+                        serde_json::json!(declarations.len() - index);
                     break;
                 }
-                tokens_used += line_tokens;
-                output.push_str(&line);
             }
-
-            // Also filter by query if it's not just a broad request.
             if !query.is_empty() && query != "*" {
-                let filter = EntityFilter {
-                    name_pattern: Some(query.clone()),
-                    ..Default::default()
-                };
-                let matched = store.query_entities(&filter).map_err(McpError::graph)?;
-                if !matched.is_empty() {
-                    output.push_str(&format!(
-                        "\n## Matching '{}' ({} results)\n",
-                        query,
-                        matched.len()
-                    ));
-                    for e in matched.iter().take(20) {
-                        let line =
-                            format!("  {} {:?} {} — {}\n", e.id, e.kind, e.name, e.signature,);
-                        let line_tokens = estimate_tokens(&line);
-                        if tokens_used + line_tokens > token_budget {
-                            break;
-                        }
-                        tokens_used += line_tokens;
-                        output.push_str(&line);
+                let matched = store
+                    .query_entities(&EntityFilter {
+                        name_pattern: Some(query.clone()),
+                        ..Default::default()
+                    })
+                    .map_err(McpError::graph)?;
+                reply["content"]["matching"] = serde_json::json!([]);
+                reply["content"]["match_count"] = serde_json::json!(matched.len());
+                let mut shown = 0;
+                for entity in matched.iter().take(20) {
+                    if !push_exploration_row(
+                        &mut reply,
+                        "matching",
+                        exploration_entity(entity),
+                        token_budget,
+                    )? {
+                        break;
                     }
+                    shown += 1;
                 }
+                reply["content"]["matches_omitted"] = serde_json::json!(matched.len() - shown);
             }
         }
         "trace" => {
             let trace_query = parse_trace_query(&query);
-            let filter = EntityFilter {
-                name_pattern: Some(trace_query.symbol.clone()),
-                ..Default::default()
-            };
-            let matches = store.query_entities(&filter).map_err(McpError::graph)?;
-
+            let matches = store
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(trace_query.symbol.clone()),
+                    ..Default::default()
+                })
+                .map_err(McpError::graph)?;
             let resolution = kin_ranking::entity_ranking::resolve_name(store, &trace_query.symbol)
                 .map_err(McpError::graph)?;
-            if let kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) =
-                &resolution
-            {
-                for line in name_candidates_lines(
-                    &trace_query.symbol,
-                    kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+            let listed = match &resolution {
+                kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) => {
+                    Some((
+                        kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
+                        candidates,
+                    ))
+                }
+                kin_ranking::entity_ranking::NameResolution::SameName(candidates) => Some((
+                    kin_ranking::entity_ranking::same_name_reason(&trace_query.symbol, candidates),
                     candidates,
-                ) {
-                    output.push_str(&line);
-                    output.push('\n');
+                )),
+                _ => None,
+            };
+            if let Some((reason, candidates)) = listed {
+                reply["content"]["ambiguous_focal"] = serde_json::json!(true);
+                reply["content"]["resolution"] = serde_json::json!(reason.as_str());
+                reply["content"]["candidate_count"] = serde_json::json!(candidates.len());
+                reply["content"]["guidance"] =
+                    serde_json::json!("Select a candidate by entity_id or qualified_name.");
+                let names = candidate_names(store, candidates);
+                for (index, entity) in candidates.iter().enumerate() {
+                    let mut row = exploration_entity(entity);
+                    if let Some(name) = names.get(&entity.id) {
+                        row["qualified_name"] = serde_json::json!(name);
+                    }
+                    if !push_exploration_row(&mut reply, "candidates", row, token_budget)? {
+                        reply["content"]["candidates_omitted"] =
+                            serde_json::json!(candidates.len() - index);
+                        break;
+                    }
                 }
             } else if let kin_ranking::entity_ranking::NameResolution::One(focal) = resolution {
-                output.push_str(&format!(
-                    "# Trace: {} ({:?}, {})\n",
-                    focal.name, focal.kind, focal.language
-                ));
-                output.push_str(&format!("  Signature: {}\n", focal.signature));
-                if let Some(ref fp) = focal.file_origin {
-                    output.push_str(&format!("  File: {}\n", fp));
-                }
-                if let Some(ref span) = focal.span {
-                    let (start_line, end_line) = presentation_span_lines(span);
-                    output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
-                }
-
+                reply["content"]["focal_entity"] = exploration_entity(&focal);
                 let chain = collect_primary_trace_chain(store, &focal, 12)?;
-
-                if !chain.is_empty() {
-                    output.push_str("\n## Ordered Call Chain\n");
-                    tokens_used = estimate_tokens(&output);
-
-                    for (index, step) in chain.iter().enumerate() {
-                        if !push_with_budget(
-                            &mut output,
-                            &mut tokens_used,
-                            token_budget,
-                            &format!("\n{}. {} ({:?})\n", index + 1, step.name, step.kind),
-                        ) {
-                            output.push_str("  ... (truncated)\n");
-                            break;
-                        }
-
-                        if let Some(read_path) = entity_read_path(step) {
-                            if !push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                &format!("   File: {read_path}\n"),
-                            ) {
-                                output.push_str("  ... (truncated)\n");
-                                break;
-                            }
-                        }
-                        if let Some(span) = step.span.as_ref() {
-                            let (start_line, end_line) = presentation_span_lines(span);
-                            if !push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                &format!("   Lines: {start_line}–{end_line}\n"),
-                            ) {
-                                output.push_str("  ... (truncated)\n");
-                                break;
-                            }
-                        }
-
-                        let outgoing_calls =
-                            outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let step_body = trace_body_held(&held, step)?;
-                        let constants = trace_constants_for_step(store, step, &step_body)?;
-
-                        if !push_with_budget(
-                            &mut output,
-                            &mut tokens_used,
-                            token_budget,
-                            "   Body:\n",
-                        ) || !push_indented_body(
-                            &mut output,
-                            &mut tokens_used,
-                            token_budget,
-                            &step_body,
-                        ) {
-                            output.push_str("       ... [truncated]\n");
-                            break;
-                        }
-
-                        if let Some(next_step) = chain.get(index + 1) {
-                            if !push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                &format!("   Next call: {}\n", next_step.name),
-                            ) {
-                                output.push_str("  ... (truncated)\n");
-                                break;
-                            }
-                        } else if outgoing_calls.is_empty()
-                            && !push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                "   Next call: none\n",
-                            )
-                        {
-                            output.push_str("  ... (truncated)\n");
-                            break;
-                        }
-
-                        if !constants.is_empty() {
-                            if !push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                "   Imported constants:\n",
-                            ) {
-                                output.push_str("  ... (truncated)\n");
-                                break;
-                            }
-                            for constant in &constants {
-                                if !push_with_budget(
-                                    &mut output,
-                                    &mut tokens_used,
-                                    token_budget,
-                                    &format!("     - {} ({:?})\n", constant.name, constant.kind),
-                                ) {
-                                    output.push_str("  ... (truncated)\n");
-                                    break;
-                                }
-                                let constant_body = trace_body_held(&held, constant)?;
-                                if !push_indented_body(
-                                    &mut output,
-                                    &mut tokens_used,
-                                    token_budget,
-                                    &constant_body,
-                                ) {
-                                    output.push_str("       ... [truncated]\n");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(input_literal) = trace_query.input_literal {
-                    if let Some(evaluation) =
-                        evaluate_trace_chain_held(&held, &chain, input_literal)?
+                reply["content"]["chain"] = serde_json::json!([]);
+                for (index, step) in chain.iter().enumerate() {
+                    let mut row = exploration_entity(step);
+                    row["step"] = serde_json::json!(index + 1);
+                    let constants = if matches!(
+                        step.kind,
+                        EntityKind::Module | EntityKind::Package | EntityKind::File
+                    ) {
+                        row["body_unavailable"] = serde_json::json!(
+                            "This entity is a container; read its recorded member identities with source."
+                        );
+                        Vec::new()
+                    } else {
+                        let body = trace_body_held(&held, step)?;
+                        let constants = trace_constants_for_step(store, step, &body)?;
+                        row["body"] = serde_json::json!(body);
+                        // The held read can supply a signature when an independent
+                        // body is unavailable; do not claim a complete body here.
+                        row["projection"] = serde_json::json!("body_or_signature");
+                        constants
+                    };
+                    if let Some(next) = chain.get(index + 1) {
+                        row["next"] = exploration_entity(next);
+                    } else if outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?
+                        .is_empty()
                     {
-                        if push_with_budget(
-                            &mut output,
-                            &mut tokens_used,
-                            token_budget,
-                            "\n## Evaluation Walkthrough\n",
-                        ) {
-                            let _ = push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                &format!("  Input: {input_literal}\n"),
-                            );
-                            for (index, step) in evaluation.iter().enumerate() {
-                                if !push_with_budget(
-                                    &mut output,
-                                    &mut tokens_used,
-                                    token_budget,
-                                    &format!(
-                                        "  {}. {}({}) = {} [{}]\n",
-                                        index + 1,
-                                        step.name,
-                                        input_literal,
-                                        step.value,
-                                        step.detail
-                                    ),
-                                ) {
-                                    output.push_str("  ... (truncated)\n");
-                                    break;
-                                }
+                        row["next"] = serde_json::Value::Null;
+                    }
+                    let mut constant_rows = Vec::new();
+                    for constant in &constants {
+                        let mut constant_row = exploration_entity(constant);
+                        constant_row["body"] = serde_json::json!(trace_body_held(&held, constant)?);
+                        constant_row["projection"] = serde_json::json!("body_or_signature");
+                        constant_rows.push(constant_row);
+                    }
+                    row["constants"] = serde_json::json!(constant_rows);
+                    if !push_exploration_row(&mut reply, "chain", row, token_budget)? {
+                        reply["content"]["chain_steps_omitted"] =
+                            serde_json::json!(chain.len() - index);
+                        break;
+                    }
+                }
+                if let Some(input) = trace_query.input_literal.filter(|_| {
+                    chain.iter().all(|step| {
+                        !matches!(
+                            step.kind,
+                            EntityKind::Module | EntityKind::Package | EntityKind::File
+                        )
+                    })
+                }) {
+                    if let Some(evaluation) = evaluate_trace_chain_held(&held, &chain, input)? {
+                        reply["content"]["input"] = serde_json::json!(input);
+                        reply["content"]["final_result"] =
+                            serde_json::json!(evaluation.last().map(|s| s.value));
+                        for (index, step) in evaluation.iter().enumerate() {
+                            let row = serde_json::json!({
+                                "step": index + 1, "name": step.name, "value": step.value,
+                                "expression": step.detail,
+                            });
+                            if !push_exploration_row(&mut reply, "evaluation", row, token_budget)? {
+                                reply["content"]["evaluation_steps_omitted"] =
+                                    serde_json::json!(evaluation.len() - index);
+                                break;
                             }
-                            let final_value =
-                                evaluation.last().map(|step| step.value).unwrap_or_default();
-                            let _ = push_with_budget(
-                                &mut output,
-                                &mut tokens_used,
-                                token_budget,
-                                &format!("  Final result: {final_value}\n"),
-                            );
                         }
                     }
                 }
-
-                let mut similar_candidates = matches;
-                if similar_candidates.len() <= 1 {
+                let mut similar = matches;
+                if similar.len() <= 1 {
                     if let Some(broader_query) = broaden_trace_query(&trace_query.symbol) {
-                        let broader_matches = store
+                        for entity in store
                             .query_entities(&EntityFilter {
                                 name_pattern: Some(broader_query),
                                 ..Default::default()
                             })
-                            .map_err(McpError::graph)?;
-                        for entity in broader_matches {
-                            if !similar_candidates.iter().any(|known| known.id == entity.id) {
-                                similar_candidates.push(entity);
+                            .map_err(McpError::graph)?
+                        {
+                            if !similar.iter().any(|known| known.id == entity.id) {
+                                similar.push(entity);
                             }
                         }
                     }
                 }
-
-                let similar = similar_candidates
-                    .into_iter()
-                    .filter(|entity| entity.id != focal.id)
-                    .collect::<Vec<_>>();
-
-                if !similar.is_empty() {
-                    let header = "\n## Similar Matches\n";
-                    if push_with_budget(&mut output, &mut tokens_used, token_budget, header) {
-                        for entity in similar {
-                            let line = format!(
-                                "  - {} ({:?}){}\n",
-                                entity.name,
-                                entity.kind,
-                                entity_read_path(&entity)
-                                    .map(|path| format!(" — {path}"))
-                                    .unwrap_or_default(),
-                            );
-                            if !push_with_budget(&mut output, &mut tokens_used, token_budget, &line)
-                            {
-                                output.push_str("  ... (truncated)\n");
-                                break;
-                            }
-                        }
+                similar.retain(|entity| entity.id != focal.id);
+                reply["content"]["similar_matches"] = serde_json::json!([]);
+                for (index, entity) in similar.iter().enumerate() {
+                    if !push_exploration_row(
+                        &mut reply,
+                        "similar_matches",
+                        exploration_entity(entity),
+                        token_budget,
+                    )? {
+                        reply["content"]["similar_matches_omitted"] =
+                            serde_json::json!(similar.len() - index);
+                        break;
                     }
                 }
             } else {
-                output.push_str(&format!("No entities found matching '{}'\n", query));
+                reply["content"]["matched"] = serde_json::json!(false);
+                reply["content"]["message"] =
+                    serde_json::json!("No matching entity was found in the graph.");
             }
         }
         _ => {
-            // "search" strategy: find top 3 matches, build context packs.
-            let filter = EntityFilter {
-                name_pattern: Some(query.clone()),
-                ..Default::default()
-            };
-            let entities = store.query_entities(&filter).map_err(McpError::graph)?;
-
-            if entities.is_empty() {
-                output.push_str(&format!("No entities found matching '{}'\n", query));
-            } else {
-                let top_n = entities.into_iter().take(3).collect::<Vec<_>>();
-                let per_entity_budget = token_budget / top_n.len();
-
-                output.push_str(&format!(
-                    "# Search: '{}' ({} results shown)\n\n",
-                    query,
-                    top_n.len()
-                ));
-
-                for entity in &top_n {
-                    let budget = match per_entity_budget {
-                        0..=8000 => TokenBudget::Small8k,
-                        8001..=16000 => TokenBudget::Medium16k,
-                        _ => TokenBudget::Large32k,
-                    };
-                    let opts = ContextOptions {
-                        budget,
-                        max_depth: 1,
-                        include_traffic: false,
-                        ..ContextOptions::default()
-                    };
-
-                    output.push_str(&format!(
-                        "## {} ({:?}, {})\n",
-                        entity.name, entity.kind, entity.language
-                    ));
-                    output.push_str(&format!("  ID: {}\n", entity.id));
-                    output.push_str(&format!("  Signature: {}\n", entity.signature));
-                    if let Some(ref fp) = entity.file_origin {
-                        output.push_str(&format!("  File: {}\n", fp));
-                    }
-                    if let Some(ref span) = entity.span {
-                        let (start_line, end_line) = presentation_span_lines(span);
-                        output.push_str(&format!("  Lines: {start_line}–{end_line}\n"));
-                    }
-
-                    match build_context_pack(store, &entity.id, &opts) {
-                        Ok(pack) => {
-                            if !pack.dependency_signatures.is_empty() {
-                                output.push_str("  Dependencies:\n");
-                                for dep in &pack.dependency_signatures {
-                                    let line = format!("    {}\n", dep.content.trim());
-                                    let line_tokens = estimate_tokens(&line);
-                                    if tokens_used + line_tokens > token_budget {
-                                        output.push_str("    ... (truncated)\n");
-                                        break;
-                                    }
-                                    tokens_used += line_tokens;
-                                    output.push_str(&line);
-                                }
-                            }
+            let entities = store
+                .query_entities(&EntityFilter {
+                    name_pattern: Some(query.clone()),
+                    ..Default::default()
+                })
+                .map_err(McpError::graph)?;
+            reply["content"]["match_count"] = serde_json::json!(entities.len());
+            reply["content"]["matches"] = serde_json::json!([]);
+            let per_entity_budget = token_budget / entities.len().clamp(1, 3);
+            let mut shown = 0;
+            for entity in entities.iter().take(3) {
+                let mut row = exploration_entity(entity);
+                let opts = ContextOptions {
+                    budget: TokenBudget::Custom(per_entity_budget),
+                    max_depth: 1,
+                    include_traffic: false,
+                    ..ContextOptions::default()
+                };
+                match build_context_pack_with_provenance(store, &entity.id, &opts) {
+                    Ok((pack, selection)) => {
+                        let mut dependencies = Vec::new();
+                        for entry in &pack.dependency_signatures {
+                            let mut dependency = match store
+                                .get_entity(&entry.entity_id)
+                                .map_err(McpError::graph)?
+                            {
+                                Some(entity) => exploration_entity(&entity),
+                                None => missing_context_entity(entry),
+                            };
+                            dependency["relation"] = serde_json::json!(selection
+                                .relation_for(&entry.entity_id)
+                                .as_str());
+                            dependencies.push(dependency);
                         }
-                        Err(_) => {
-                            output.push_str("  (context pack unavailable)\n");
-                        }
+                        row["dependencies"] = serde_json::json!(dependencies);
                     }
-                    output.push('\n');
+                    Err(_) => row["context_unavailable"] = serde_json::json!(true),
                 }
+                if !push_exploration_row(&mut reply, "matches", row, token_budget)? {
+                    break;
+                }
+                shown += 1;
             }
+            reply["content"]["matches_omitted"] = serde_json::json!(entities.len() - shown);
         }
     }
-
-    tokens_used = estimate_tokens(&output);
-
-    let result = serde_json::json!({
-        "strategy": strategy,
-        "query": query,
-        "tokens_used": tokens_used,
-        "token_budget": token_budget,
-        "content": output,
-    });
-
-    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
-    Ok(ToolCallResult::text(json))
+    finish_exploration(reply)
 }
 
 pub const DEAD_CODE_DESC: &str = "\
@@ -6391,11 +8306,22 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
         let scoped = store
             .query_entities(&kin_model::graph::EntityFilter::default())
             .map_err(McpError::graph)?;
-        result[crate::edge_coverage::EDGE_COVERAGE_KEY] =
-            crate::edge_coverage::observe_absence_scope(
-                &crate::edge_coverage::languages_of(&scoped),
-                Some(scoped.len()),
-            );
+        let mut observation = crate::edge_coverage::observe_absence_scope(
+            &crate::edge_coverage::languages_of(&scoped),
+            Some(scoped.len()),
+        );
+        // No admitted entity carries the name, so nothing encloses a nested
+        // declaration that could; the census alone says what was skipped.
+        crate::declaration_coverage::attach(
+            &mut observation,
+            crate::declaration_coverage::observe(
+                store,
+                None,
+                &crate::declaration_coverage::NameQuery::new(trimmed, None),
+                &[],
+            ),
+        );
+        result[crate::edge_coverage::EDGE_COVERAGE_KEY] = observation;
     }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
@@ -6450,14 +8376,19 @@ contain was never looked for. Do not read such a chain as evidence that X never 
 including `reference_lines` for the 1-based syntax sites that introduced the hop and \
 `reference_lines_absent_reason` when the parser recorded no usable site. For a `callee` step \
 those lines live in its parent's file; for a `caller` step they live in the step's own \
-`entity_file`. A symbol the graph owns no file for carries explicit nulls plus `external: true` \
+`entity_file`. An inward step whose edge is not a call is a `referrer` or `importer`, not a \
+`caller`; an inward type use is withheld and counted as `type_uses_withheld` unless \
+include_type_edges is set. \
+A symbol the graph owns no file for carries explicit nulls plus `external: true` \
 rather than a shorter record, and one symbol never appears both located and file-less in one response. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the direction that was walked, so an empty 'callers' result is \
 never read as \"this calls nothing\". A focal name the graph holds more than once, and a method \
 whose incoming calls may not have been linked, each downgrade that flag rather than certifying \
-absence. A focal that resolves to no entity at all carries the same object, naming the \
+absence. A callers walk from a method reads every traced method's named call sites under \
+`call_sites`, as find_references does, and certifies only when each is proven or listed. \
+A focal that resolves to no entity at all carries the same object, naming the \
 resolution miss rather than reporting an empty chain. \
 Each step carries `resolution` for the weakest hop on its path: `type_resolved`, \
 `import_scoped`, or `name_only`. A chain is only as trustworthy as its weakest hop, so a \
@@ -6785,6 +8716,10 @@ fn trace_entity_value(
         "entity_kind": format!("{:?}", entity.kind),
         "entity_role": format!("{:?}", entity.role).to_lowercase(),
         "entity_file": entity.file_origin.as_ref().map(|path| path.to_string()),
+        // The module the entity is declared in, filled by `name_trace_modules`
+        // once the chain is whole. Null until then, and wherever the graph's
+        // module records name none, so the keys stay uniform.
+        "entity_module": serde_json::Value::Null,
         "external": trace_entity_is_external(entity),
         "start_line": start_line,
         "end_line": end_line,
@@ -6793,6 +8728,123 @@ fn trace_entity_value(
         "span_coherence": serde_json::Value::Null,
         "crossing": crossing,
     })
+}
+
+/// Name the module every step's entity is declared in, and return the focal's.
+///
+/// Read from the graph's module records, once per source unit, and never from
+/// a path, so a reader can tell which unit each hop sits in through a reply
+/// that carries no coordinates. A step whose entity the graph holds no module
+/// record for, or one outside the repository, keeps its null. The CLI walker a
+/// daemon answers through names them the same way.
+fn name_trace_modules<G: GraphStore>(
+    store: &G,
+    focal: &kin_model::entity::Entity,
+    chain: &mut [serde_json::Value],
+) -> Option<String> {
+    let mut modules = crate::semantic_owners::DeclaringModules::new(store);
+    for step in chain.iter_mut() {
+        if step["external"].as_bool() == Some(true) {
+            continue;
+        }
+        let entity = step["entity_id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .and_then(|id| {
+                store
+                    .get_entity(&kin_model::ids::EntityId(id))
+                    .ok()
+                    .flatten()
+            });
+        if let Some(module) = entity.and_then(|entity| modules.of(&entity)) {
+            step["entity_module"] = serde_json::Value::from(module);
+        }
+    }
+    modules.of(focal)
+}
+
+/// Quote the line of code at each site of every located step, so a chain
+/// shows what links each step to its parent without a read of either body.
+///
+/// A callee's sites sit in its parent's body; a caller's, referrer's or
+/// importer's sit in its own (see `reference_lines` in [`trace_step_value`]).
+/// Each body is read once, through the held authority the named-scope reading
+/// uses, at the workspace head, and never from a file. A body that cannot be
+/// read, or a line outside it, leaves that site with its line alone. The CLI
+/// walker a daemon answers through quotes the same way
+/// ([`crate::site_expression::quote_lines`]).
+fn quote_trace_sites<G: GraphStore>(
+    store: &G,
+    focal: &kin_model::entity::Entity,
+    chain: &mut [serde_json::Value],
+) {
+    use crate::site_expression::{
+        quote_lines, spelled_name, trace_sites_in_parent, TRACE_REFERENCE_SITES_KEY,
+    };
+    let held = HeldSourceAuthority::new(store, None);
+    let text = super::common::HeldCallerText::new(&held, EntitySourceScope::WorkspaceHead);
+    let ids: Vec<Option<kin_model::ids::EntityId>> = chain
+        .iter()
+        .map(|step| {
+            step["entity_id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .map(kin_model::ids::EntityId)
+        })
+        .collect();
+    let mut entities: HashMap<kin_model::ids::EntityId, Option<kin_model::entity::Entity>> =
+        HashMap::from([(focal.id, Some(focal.clone()))]);
+    let mut spent = 0usize;
+    for index in 0..chain.len() {
+        // Every step carries the key, null where nothing is quoted: a chain's
+        // steps share one key set.
+        chain[index][TRACE_REFERENCE_SITES_KEY] = serde_json::Value::Null;
+        let step = &chain[index];
+        if step["external"].as_bool() == Some(true) {
+            continue;
+        }
+        let lines: Vec<u64> = step["reference_lines"]
+            .as_array()
+            .map(|lines| lines.iter().filter_map(serde_json::Value::as_u64).collect())
+            .unwrap_or_default();
+        if lines.is_empty() {
+            continue;
+        }
+        let parent = step["parent_step"].as_u64().unwrap_or(0) as usize;
+        let parent_id = if parent == 0 {
+            Some(focal.id)
+        } else {
+            ids.get(parent - 1).copied().flatten()
+        };
+        let (holder_id, named_id) = if trace_sites_in_parent(step["role"].as_str().unwrap_or("")) {
+            (parent_id, ids[index])
+        } else {
+            (ids[index], parent_id)
+        };
+        let (Some(holder_id), Some(named_id)) = (holder_id, named_id) else {
+            continue;
+        };
+        for id in [holder_id, named_id] {
+            entities
+                .entry(id)
+                .or_insert_with(|| store.get_entity(&id).ok().flatten());
+        }
+        let (Some(holder), Some(named)) = (
+            entities.get(&holder_id).cloned().flatten(),
+            entities.get(&named_id).cloned().flatten(),
+        ) else {
+            continue;
+        };
+        if let Some(sites) = quote_lines(
+            &text,
+            &holder,
+            spelled_name(&named.name),
+            &lines,
+            &mut spent,
+        ) {
+            chain[index][TRACE_REFERENCE_SITES_KEY] = serde_json::json!(sites);
+        }
+    }
 }
 
 /// One chain step: its edge, its depth, its entity record, and its own fan-out
@@ -6826,6 +8878,10 @@ fn trace_step_value(
         // Explicit null when lines exist, and the same two reason strings
         // `find_references` uses when they do not.
         "reference_lines_absent_reason": reference_lines_absent_reason,
+        // The code on the first of those lines, as written, filled once the
+        // chain is whole; null when no line is recorded or its text cannot be
+        // read.
+        "code": serde_json::Value::Null,
         "fanout_truncated": false,
         "fanout_dropped": 0,
         // Why the walk stopped here, or null for an ordinary step. Written on
@@ -6866,6 +8922,7 @@ fn trace_external_step_value<T: super::external_symbols::SiteText + ?Sized>(
         "reference_lines": [],
         "reference_lines_absent_reason": ReferenceLinesAbsent::SitesInEntity.as_str(),
         "reference_lines_partial_reason": serde_json::Value::Null,
+        "code": serde_json::Value::Null,
         "fanout_truncated": false,
         "fanout_dropped": 0,
         "terminal": TraceTerminal::ExternalReference.as_str(),
@@ -6915,8 +8972,8 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
                 dropped: (clip["dropped_callees"].as_u64().unwrap_or(0)
                     + clip["dropped_callers"].as_u64().unwrap_or(0))
                     as usize,
-                dropped_crossing_file: Some(
-                    clip["dropped_crossing_file"].as_u64().unwrap_or(0) as usize
+                dropped_crossing_unit: Some(
+                    clip["dropped_crossing_unit"].as_u64().unwrap_or(0) as usize
                 ),
                 limit_per_step: clip["limit_per_step"].as_u64().unwrap_or(0) as usize,
             });
@@ -6928,10 +8985,10 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
     result["spine_clipped_steps"] = serde_json::Value::from(nodes.len());
     let spine_crossing: usize = nodes
         .iter()
-        .filter_map(|node| node.dropped_crossing_file)
+        .filter_map(|node| node.dropped_crossing_unit)
         .sum();
     if spine_crossing > 0 {
-        result["spine_dropped_crossing_file"] = serde_json::Value::from(spine_crossing);
+        result["spine_dropped_crossing_unit"] = serde_json::Value::from(spine_crossing);
     }
     // One producer for both walks and for the response-budget pass that
     // restates this disclosure after it cuts the chain further. Its remediation
@@ -7225,6 +9282,12 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
         .get("include_type_edges")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // Whether the walk reads code whose stored role is Test. See
+    // `crate::trace_reach::Scans`.
+    let include_tests = args
+        .get("include_tests")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     let direction = match get_optional_string_param(args, "direction") {
         Some(value) => match value.trim().to_lowercase().as_str() {
             "calls" | "callee" | "callees" | "out" | "outgoing" => "calls",
@@ -7238,6 +9301,10 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
         },
         None => "both",
     };
+    // A semantic scope the walk is confined to, checked before anything is
+    // walked; see `crate::trace_scope`.
+    let scope_request =
+        crate::trace_scope::ScopeRequest::from_arguments(args).map_err(McpError::InvalidParams)?;
 
     // A symbol outside the repository is where a walk stops, never where one
     // starts, so it is refused by what it is rather than as a focal no entity
@@ -7272,20 +9339,40 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
             .get_entity(&kin_model::ids::EntityId(uuid))
             .map_err(McpError::graph)?
     } else {
-        match kin_ranking::entity_ranking::resolve_name(store, trimmed).map_err(McpError::graph)? {
-            kin_ranking::entity_ranking::NameResolution::One(entity) => Some(entity),
+        // A walk has one focal, so a name that reaches several distinct
+        // entities, same-named definitions in several modules or several
+        // owners' members, is refused with every candidate rather than walked
+        // from a ranked one: `advanceTimers` walked SchedulerMock's copy when
+        // the question was about Scheduler's.
+        let refused = match kin_ranking::entity_ranking::resolve_name(store, trimmed)
+            .map_err(McpError::graph)?
+        {
+            kin_ranking::entity_ranking::NameResolution::One(entity) => Ok(Some(entity)),
             kin_ranking::entity_ranking::NameResolution::SharedMemberName(candidates) => {
+                Err((CandidateReason::SharedMemberName, candidates))
+            }
+            kin_ranking::entity_ranking::NameResolution::SameName(candidates) => Err((
+                kin_ranking::entity_ranking::same_name_reason(trimmed, &candidates),
+                candidates,
+            )),
+            kin_ranking::entity_ranking::NameResolution::Missing => Ok(None),
+        };
+        match refused {
+            Ok(entity) => entity,
+            Err((reason, candidates)) => {
+                let names = candidate_names(store, &candidates);
                 return if bound_response {
                     trace_name_candidates_reply(
                         trimmed,
+                        reason,
                         &candidates,
+                        &names,
                         crate::budget::ResponseBudget::from_arguments(args).max_chars,
                     )
                 } else {
-                    trace_name_candidates_unpaged_reply(trimmed, &candidates)
+                    trace_name_candidates_unpaged_reply(trimmed, reason, &candidates, &names)
                 };
             }
-            kin_ranking::entity_ranking::NameResolution::Missing => None,
         }
     };
     let Some(focal_entity) = focal_entity else {
@@ -7294,7 +9381,29 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
             trimmed
         )));
     };
-    let same_name_candidates = same_name_entity_count(store, &focal_entity.name)?;
+    // The block every surface that resolves a focal publishes, counted by the
+    // rule that resolved it, so the verdict reads a walk's resolution the way
+    // it reads a reference list's.
+    let focal_resolution = focal_resolution_for(
+        store,
+        &focal_entity,
+        if focal_id.is_some() {
+            None
+        } else {
+            Some(trimmed)
+        },
+    )?;
+    // A scope that names no module path is refused, so a typo never reads as
+    // a walk that found nothing in scope.
+    let scope = match &scope_request {
+        Some(request) => match crate::trace_scope::TraceScope::resolve(store, request) {
+            Ok(scope) => Some(scope),
+            Err(refusal) => {
+                return Ok(ToolCallResult::error(format!("trace_data_flow: {refusal}")));
+            }
+        },
+        None => None,
+    };
 
     // The kinds a data-flow claim actually rests on, and the ones the coverage
     // observation below is measured against.
@@ -7330,6 +9439,10 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
         name_index.insert(focal_entity.name.clone(), 0);
     }
     let mut external_identities_merged = 0usize;
+    // Entities that reach a node only by naming it as a type, withheld from a
+    // callers walk unless `include_type_edges` asks for them.
+    let mut type_users: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
     let mut clipped_steps: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
     // What each node's expansion produced, keyed by step index (`0` is the
@@ -7347,7 +9460,7 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
     // asked for is still the chain.
     let mut target_name: Option<String> = None;
     let mut target_unresolved: Option<String> = None;
-    let mut target_shared: Option<(String, Vec<kin_model::Entity>)> = None;
+    let mut target_shared: Option<(String, CandidateReason, Vec<kin_model::Entity>)> = None;
     let mut callee_reach: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
     let mut caller_reach: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
     if let Some(target) = get_optional_string_param(args, "target")
@@ -7366,7 +9479,17 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
                     // Ranking toward one owner's member would be a silent pick
                     // of the question itself; the walk ranks by relevance and
                     // says why.
-                    target_shared = Some((target.clone(), candidates));
+                    target_shared = Some((
+                        target.clone(),
+                        CandidateReason::SharedMemberName,
+                        candidates,
+                    ));
+                    None
+                }
+                kin_ranking::entity_ranking::NameResolution::SameName(candidates) => {
+                    let reason =
+                        kin_ranking::entity_ranking::same_name_reason(&target, &candidates);
+                    target_shared = Some((target.clone(), reason, candidates));
                     None
                 }
                 kin_ranking::entity_ranking::NameResolution::Missing => None,
@@ -7463,6 +9586,18 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
                     continue;
                 }
 
+                // A type use reached inward names this node as a type and does
+                // not call it, so it is no caller, and the walk would stop at
+                // it anyway. On a method it is the enclosing class, whose span
+                // holds the member's own call sites a second time. It is
+                // counted rather than listed, and `include_type_edges` walks
+                // it. The edge still counts above: the graph held a neighbor
+                // here, so the node is not a leaf.
+                if role == "caller" && rel.kind == RelationKind::UsesType && !include_type_edges {
+                    type_users.insert(next_id);
+                    continue;
+                }
+
                 let candidate_at = match candidate_index.get(&(next_id, role)) {
                     Some(&existing) => {
                         let candidate: &mut TraceFanoutCandidate = &mut candidates[existing];
@@ -7500,6 +9635,23 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
                         else {
                             continue;
                         };
+                        // Held to the scope while the walk runs, so a path
+                        // that leaves it is never followed back in.
+                        if scope
+                            .as_ref()
+                            .is_some_and(|scope| !scope.admits_step(&entity, node.step))
+                        {
+                            continue;
+                        }
+                        // A walk that leaves tests out never steps into one
+                        // on its way inward. What the focal calls is followed
+                        // wherever it leads.
+                        if !include_tests
+                            && role != "callee"
+                            && entity.role == kin_model::EntityRole::Test
+                        {
+                            continue;
+                        }
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         // The candidate's own role decides which sense of
@@ -7572,6 +9724,13 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
             } else {
                 Vec::new()
             };
+            // A symbol outside the repository belongs to no module.
+            if scope
+                .as_ref()
+                .is_some_and(|scope| !scope.admits_external(external_callees.len()))
+            {
+                external_callees.clear();
+            }
 
             // This node's relations were read to the end, so what the graph held
             // for it is now a fact rather than a guess.
@@ -7629,7 +9788,7 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
                 });
                 let crossing = crossing_callees + crossing_callers;
                 if crossing > 0 {
-                    clip["dropped_crossing_file"] = serde_json::Value::from(crossing);
+                    clip["dropped_crossing_unit"] = serde_json::Value::from(crossing);
                 }
                 clipped_steps.push(clip);
             }
@@ -7727,7 +9886,7 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
                 path_resolutions.insert(step_index, resolution);
                 chain.push(trace_step_value(
                     step_index,
-                    candidate.role,
+                    crate::trace_named_scope::step_role(candidate.role, candidate.relation_kind),
                     &format!("{:?}", candidate.relation_kind),
                     resolution.as_str(),
                     node.step,
@@ -7787,6 +9946,17 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
         frontier = next_frontier;
     }
 
+    // Each step shows the call that proves it, not only its line.
+    crate::trace_reach::quote_chain(
+        store,
+        &focal_entity,
+        &mut chain,
+        &super::external_symbols::CalleeText::with_read_limit_at(
+            &HeldSourceAuthority::new(store, None),
+            crate::handlers::common::TRACE_STEP_CODE_READS_MAX,
+            EntitySourceScope::WorkspaceHead,
+        ),
+    );
     let total_steps = chain.len();
     // The walk expands exactly the reference kinds above, so a chain is only
     // evidence about the focal when the graph holds cross-file edges of those
@@ -7882,13 +10052,17 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
     {
         truncated = true;
     }
+    quote_trace_sites(store, &focal_entity, &mut chain);
+    let mut focal_record = trace_entity_value(&focal_entity, None);
+    focal_record["entity_module"] =
+        serde_json::Value::from(name_trace_modules(store, &focal_entity, &mut chain));
 
     let mut result = serde_json::json!({
         "focal_id": focal_entity.id.to_string(),
         "focal_name": focal_entity.name.clone(),
         "focal_kind": format!("{:?}", focal_entity.kind),
-        "focal_file": focal_entity.file_origin.as_ref().map(|p| p.to_string()),
-        "focal_entity": trace_entity_value(&focal_entity, None),
+        // Placed by the module it is declared in, as every step is.
+        "focal_entity": focal_record,
         "direction": direction,
         "depth": depth,
         "limit_per_step": limit_per_step,
@@ -7904,18 +10078,124 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
         "chain": chain,
         "total_steps": total_steps,
         "truncated": truncated,
-        "focal_resolution": {
-            "addressed_by": if focal_id.is_some() { "entity_id" } else { "name" },
-            "same_name_candidates": same_name_candidates,
-        },
+        "focal_resolution": focal_resolution,
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    let withheld_type_uses = type_users.difference(&visited).count();
+    if withheld_type_uses > 0 {
+        result["type_uses_withheld"] = serde_json::Value::from(withheld_type_uses);
+    }
+    // The walk read callers of a method, so it takes the named-scope reading
+    // `find_references` takes, for the focal and every expanded method in the
+    // chain, and the verdict reads it (see `crate::trace_named_scope`). Taken
+    // before the response bound, which only ever removes steps.
+    let held = HeldSourceAuthority::new(store, None);
+    let mut scans = crate::trace_reach::Scans::reading_tests(include_tests);
+    if want_callers
+        && kin_core::reference_coverage::kind_under_resolves_incoming_calls(focal_entity.kind)
+    {
+        let mut expanded: Vec<usize> = expansion.keys().copied().collect();
+        expanded.sort_unstable();
+        let mut methods: Vec<(usize, kin_model::Entity)> = Vec::new();
+        for step in expanded {
+            if step == 0 {
+                methods.push((0, focal_entity.clone()));
+                continue;
+            }
+            let Some(record) = chain.get(step - 1) else {
+                continue;
+            };
+            if !record["entity_kind"]
+                .as_str()
+                .is_some_and(kin_core::reference_coverage::kind_name_under_resolves_incoming_calls)
+            {
+                continue;
+            }
+            let Some(id) = record["entity_id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            else {
+                continue;
+            };
+            if let Some(entity) = store
+                .get_entity(&kin_model::ids::EntityId(id))
+                .map_err(McpError::graph)?
+            {
+                methods.push((step, entity));
+            }
+        }
+        let methods: Vec<crate::trace_named_scope::TraceMethod<'_>> = methods
+            .iter()
+            .map(|(step, entity)| crate::trace_named_scope::TraceMethod {
+                step: *step,
+                entity,
+            })
+            .collect();
+        result[crate::call_sites::CALL_SITES_KEY] = crate::trace_named_scope::read_methods_with(
+            store,
+            &held,
+            EntitySourceScope::WorkspaceHead,
+            &methods,
+            &mut scans,
+        );
+    }
+    // A walk that reads callers also answers the reach question as a closed
+    // set, sharing the scans the reading above took. Held apart from the
+    // payload until the chain is bounded, so a bounded reply cuts the chain
+    // exactly as it did before the block existed.
+    let reach = want_callers.then(|| {
+        crate::trace_reach::read_in_scope(
+            store,
+            &held,
+            EntitySourceScope::WorkspaceHead,
+            &focal_entity,
+            crate::trace_reach::Limits::default(),
+            &mut crate::trace_reach::WorkMeter::shipped(),
+            &mut scans,
+            scope.as_ref(),
+        )
+    });
+    if let Some(scope) = &scope {
+        let focal_dropped: u64 = clipped_steps
+            .iter()
+            .filter(|clip| clip["step"].as_u64() == Some(0))
+            .map(|clip| {
+                clip["dropped_callees"].as_u64().unwrap_or(0)
+                    + clip["dropped_callers"].as_u64().unwrap_or(0)
+            })
+            .sum();
+        let block = {
+            let steps: Vec<crate::trace_scope::ChainStep<'_>> = result["chain"]
+                .as_array()
+                .map(|chain| {
+                    chain
+                        .iter()
+                        .map(crate::trace_scope::ChainStep::of_json)
+                        .collect()
+                })
+                .unwrap_or_default();
+            scope.block(
+                &focal_entity,
+                focal_terminal.map(TraceTerminal::as_str),
+                focal_dropped,
+                &steps,
+                depth,
+                direction,
+                reach.as_ref(),
+            )
+        };
+        result[crate::trace_scope::SCOPE_KEY] = block;
+    }
+    if !bound_response {
+        if let Some(reach) = &reach {
+            result[crate::trace_reach::REACH_KEY] = reach.clone();
+        }
+    }
     if let Some(name) = target_name {
         result["target_name"] = serde_json::Value::from(name);
     }
-    if let Some((target, candidates)) = target_shared {
-        let disclosure =
-            target_ambiguous_degradation(&target, CandidateReason::SharedMemberName, &candidates);
+    if let Some((target, reason, candidates)) = target_shared {
+        let disclosure = target_ambiguous_degradation(&target, reason, &candidates);
         result["target_ambiguity"] = trace_target_listing(&disclosure);
         append_trace_degradation(
             &mut result,
@@ -8008,6 +10288,22 @@ fn handle_trace_data_flow_inner<G: GraphStore>(
     }
 
     let fits = !bound_response || fit_trace_ambiguity_payload(&mut result, max_response_chars);
+    // A bounded reply carries the reach block in whatever room the bounded
+    // chain left, cut and disclosed as a bound when it does not fit whole.
+    if bound_response {
+        if let Some(mut reach) = reach {
+            let used = crate::budget::render(&result)
+                .map(|json| json.len())
+                .unwrap_or(usize::MAX);
+            let room = max_response_chars
+                .saturating_sub(used)
+                .saturating_sub(super::common::TRACE_DISCLOSURE_RESERVE_CHARS);
+            if crate::trace_reach::fit(&mut reach, room) {
+                result[crate::trace_reach::REACH_KEY] = reach;
+            }
+        }
+        crate::trace_scope::reconcile(&mut result);
+    }
     let json = crate::budget::render(&result).map_err(McpError::Json)?;
     Ok(if fits {
         ToolCallResult::text(json)
@@ -8117,24 +10413,66 @@ pub fn focal_resolution_for<G: GraphStore>(
     target: &kin_model::Entity,
     query: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let (same_name_candidates, other_candidates, matched_by) = match query {
-        // A bare member name that one owner carries resolved by the member
-        // rule, which excludes every name that merely contains the query, so
-        // the set it chose among is that one member. Counting the substring
-        // cousins here would call a settled answer ambiguous: `route` on
-        // pallets/flask resolves to `Scaffold.route` and used to report 16.
-        Some(query)
-            if kin_ranking::entity_ranking::is_member_name_match(target, query)
-                && matches!(
-                    kin_ranking::entity_ranking::reach_by_name(store, query)
-                        .map_err(McpError::graph)?,
-                    kin_ranking::entity_ranking::NameReach::Members(ref members)
-                        if members.len() == 1 && members[0].id == target.id
-                ) =>
-        {
-            (1, Vec::new(), "member_name")
+    let reached = match query {
+        Some(query) => Some(
+            kin_ranking::entity_ranking::reach_by_name(store, query).map_err(McpError::graph)?,
+        ),
+        None => None,
+    };
+    let mut member_candidates: Vec<serde_json::Value> = Vec::new();
+    let (same_name_candidates, other_candidates, matched_by) = match (query, reached) {
+        // A name a tier reached resolved by that tier, which excludes every
+        // name that merely contains the query, so the set it chose among is
+        // what the tier reached: the one member a bare member name reaches,
+        // the entities named the query exactly, or the ones a module-qualified
+        // name reaches. Counting the substring cousins here would call a
+        // settled answer ambiguous: `route` on pallets/flask resolves to
+        // `Scaffold.route` and used to report 16, and `setEnabled` counted
+        // every name containing it. Only the twins the resolver folded into
+        // the focal remain as other candidates.
+        (
+            Some(_),
+            Some(
+                kin_ranking::entity_ranking::NameReach::Exact(found)
+                | kin_ranking::entity_ranking::NameReach::Members(found)
+                | kin_ranking::entity_ranking::NameReach::Qualified(found),
+            ),
+        ) if found.iter().any(|entity| entity.id == target.id) => {
+            let matched = if found.iter().all(|entity| entity.name == target.name)
+                && Some(target.name.as_str()) == query.map(str::trim)
+            {
+                "exact_name"
+            } else if kin_ranking::entity_ranking::is_member_name_match(
+                target,
+                query.unwrap_or_default().trim(),
+            ) {
+                "member_name"
+            } else {
+                "qualified_name"
+            };
+            let others = found
+                .iter()
+                .filter(|entity| entity.id != target.id)
+                .take(RESOLUTION_CANDIDATES_LISTED_MAX)
+                .map(|entity| resolution_candidate_json(entity, None))
+                .collect();
+            if matched == "exact_name" {
+                // Owners' members that carry the name as their member name are
+                // not what the name resolves to, since the exact tier answers
+                // first, but a reader who meant one of them can ask for it.
+                // Named, never counted.
+                member_candidates =
+                    kin_ranking::entity_ranking::members_named(store, target.name.as_str())
+                        .map_err(McpError::graph)?
+                        .iter()
+                        .filter(|entity| entity.id != target.id)
+                        .take(RESOLUTION_CANDIDATES_LISTED_MAX)
+                        .map(|entity| resolution_candidate_json(entity, None))
+                        .collect();
+            }
+            (found.len(), others, matched)
         }
-        Some(query) => {
+        (Some(query), _) => {
             let (count, others) = query_resolution_candidates(store, query, &target.id)?;
             (count, others, "query_name_pattern")
         }
@@ -8142,12 +10480,12 @@ pub fn focal_resolution_for<G: GraphStore>(
         // ambiguity to report. What still applies is the twin question: a name
         // the graph holds twice (two cfg arms admitted as distinct entities)
         // means an edge the extractor could not attribute sits on neither.
-        None => {
+        (None, _) => {
             let count = same_name_entity_count(store, &target.name)?;
             (count, Vec::new(), "exact_focal_name")
         }
     };
-    Ok(serde_json::json!({
+    let mut resolution = serde_json::json!({
         "addressed_by": if query.is_some() { "name" } else { "entity_id" },
         "same_name_candidates": same_name_candidates,
         // Which rule produced the number. Without it the same field means two
@@ -8157,7 +10495,11 @@ pub fn focal_resolution_for<G: GraphStore>(
         // A count alone says the tool guessed and leaves no way to ask again.
         // These are addressable by id, bounded, and never include the winner.
         "other_candidates": other_candidates,
-    }))
+    });
+    if !member_candidates.is_empty() {
+        resolution["member_candidates"] = serde_json::Value::Array(member_candidates);
+    }
+    Ok(resolution)
 }
 
 fn same_name_entity_count<G: GraphStore>(store: &G, name: &str) -> Result<usize> {
@@ -8221,7 +10563,10 @@ the repository reaches a leaf row with `kind: \"external_symbol\"` and an id of 
 that symbol's neighborhood and not the focal's. Pass the id as `entity_id` to walk from the \
 symbol to its callers. A walk that follows the focal's own calls, 'out' or 'both', also \
 carries `call_sites`, the focal's call sites as get_context_pack serves them, and a site \
-that is not settled makes the answer inconclusive.";
+that is not settled makes the answer inconclusive. `relations` holds the edges between \
+the entities `entities` lists; `relation_count` counts every edge the walk crossed, so a \
+walk `limit` cut reports `truncated`. The envelope is compact: `_kin` carries the \
+verdict, completeness and budget accounting and one `provenance` line.";
 
 /// Traverse the neighborhood around a focal entity in the requested direction.
 ///
@@ -8293,6 +10638,9 @@ pub fn handle_graph_neighborhood_with_authority<G: GraphStore>(
     let mut entities: Vec<serde_json::Value> = Vec::new();
     let mut walked_languages = Vec::new();
     let mut relations: Vec<serde_json::Value> = Vec::new();
+    // Each relation's two ends as the entity rows name them, so the reply can
+    // keep exactly the edges between the entities it lists.
+    let mut relation_ends: Vec<[String; 2]> = Vec::new();
     let mut seen_relations: std::collections::HashSet<kin_model::ids::RelationId> =
         std::collections::HashSet::new();
     let mut truncated = false;
@@ -8329,6 +10677,7 @@ pub fn handle_graph_neighborhood_with_authority<G: GraphStore>(
                             caller.as_ref(),
                             &text,
                         ));
+                        relation_ends.push([address.clone(), edge.entity.to_string()]);
                     }
                     if !visited.insert(edge.entity) {
                         continue;
@@ -8399,6 +10748,7 @@ pub fn handle_graph_neighborhood_with_authority<G: GraphStore>(
                         // structure, so an unmarked guess spreads furthest here.
                         "resolution": RelationResolution::of(&rel).as_str(),
                     }));
+                    relation_ends.push([current.to_string(), neighbor.to_string()]);
                 }
 
                 if !visited.insert(neighbor) {
@@ -8433,6 +10783,10 @@ pub fn handle_graph_neighborhood_with_authority<G: GraphStore>(
                                 caller.as_ref(),
                                 &text,
                             ));
+                            relation_ends.push([
+                                current.to_string(),
+                                external::external_address(&edge.target),
+                            ]);
                         }
                         if !visited_external.insert(edge.target) {
                             continue;
@@ -8515,8 +10869,24 @@ pub fn handle_graph_neighborhood_with_authority<G: GraphStore>(
     // Return compact entity summaries (name, kind, file, id) instead of full
     // entity objects to keep response sizes bounded.
     entities.truncate(limit);
-    // Cap relations to match the entity limit to avoid unbounded output.
-    relations.truncate(limit * 3);
+    // An edge is returned only when the reply lists both of its ends. The walk
+    // crosses every edge of every entity it expands, and once `limit` cuts the
+    // entity rows most of those edges end at an entity the reply no longer
+    // names: on the 0.8.3 pilot a depth-2 incoming walk at `limit: 50` shipped
+    // 150 edge rows, 36,644 bytes of a 49,690-byte reply, most of them to ids
+    // the reader could not look up here. `relation_count` still counts every
+    // edge the walk crossed, and `truncated` says the walk was cut.
+    let listed: std::collections::HashSet<&str> = entities
+        .iter()
+        .filter_map(|row| row.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    let relations: Vec<serde_json::Value> = relations
+        .into_iter()
+        .zip(&relation_ends)
+        .filter(|(_, [from, to])| listed.contains(from.as_str()) && listed.contains(to.as_str()))
+        .map(|(row, _)| row)
+        .take(limit * 3)
+        .collect();
 
     let focal_id = match (&external_focal, focal_entity_id) {
         (Some(node), _) => node.address(),
@@ -8752,6 +11122,13 @@ pub struct GraphStatusReport {
     /// semantic_locate reports as its `vector_sidecar` degradation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_keys_not_in_graph: Option<usize>,
+    /// Whether a description `locate` on this graph ranks with search vectors
+    /// now. `false` when the setup uses none: the cards arm, named by an
+    /// operator or chosen because no vector is usable, in which case the
+    /// embedding counters above describe the store and are not a gap in any
+    /// answer. Absent from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_vectors_used: Option<bool>,
     /// Observed counts do not attest that every eligible source was enriched.
     pub completion_attested: bool,
     /// Why every counter above is an earlier instant's, when it is (FIR-2135).
@@ -8814,6 +11191,8 @@ struct GraphStatusReportWire {
     embedding_index_keys: Option<usize>,
     #[serde(default)]
     embedding_keys_not_in_graph: Option<usize>,
+    #[serde(default)]
+    search_vectors_used: Option<bool>,
     #[serde(deserialize_with = "deserialize_graph_status_unattested")]
     completion_attested: bool,
     #[serde(default)]
@@ -8857,6 +11236,7 @@ impl<'de> Deserialize<'de> for GraphStatusReport {
             embeddings_total: wire.embeddings_total,
             embedding_index_keys: wire.embedding_index_keys,
             embedding_keys_not_in_graph: wire.embedding_keys_not_in_graph,
+            search_vectors_used: wire.search_vectors_used,
             completion_attested: wire.completion_attested,
             stale: wire.stale,
             response_envelope: wire.response_envelope,
@@ -8953,6 +11333,7 @@ impl GraphStatusReport {
                 enrichment,
                 self.stale.is_none(),
                 self.scope,
+                self.status_page.is_some(),
             )?;
         }
         crate::status_pages::validate_collections(
@@ -9160,6 +11541,7 @@ pub fn handle_daemon_graph_status_observation(
         embedding_keys_not_in_graph: observation
             .embedding_index_keys
             .map(|keys| keys.saturating_sub(observation.embeddings_indexed)),
+        search_vectors_used: None,
         completion_attested: false,
         stale: None,
         response_envelope: None,
@@ -9209,6 +11591,7 @@ pub fn handle_daemon_graph_status_stale_observation(
         embedding_keys_not_in_graph: observation
             .embedding_index_keys
             .map(|keys| keys.saturating_sub(observation.embeddings_indexed)),
+        search_vectors_used: None,
         completion_attested: false,
         stale: Some(staleness),
         response_envelope: None,
@@ -9249,6 +11632,28 @@ pub fn with_repository_base(
         return result;
     };
     report.repository_base = Some(base);
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) if report.validate().is_ok() => ToolCallResult::text(text),
+        _ => result,
+    }
+}
+
+/// Attach whether description queries on this graph rank with search vectors.
+///
+/// Read when the answer is sent, like the repository base, so it rides on an
+/// already-validated report rather than inside the counters' fence. An error
+/// result or an unreadable report leaves the answer exactly as it was.
+pub fn with_search_vectors_used(result: ToolCallResult, used: bool) -> ToolCallResult {
+    if result.is_error == Some(true) {
+        return result;
+    }
+    let Some(crate::types::ContentBlock::Text { text }) = result.content.first() else {
+        return result;
+    };
+    let Ok(mut report) = serde_json::from_str::<GraphStatusReport>(text) else {
+        return result;
+    };
+    report.search_vectors_used = Some(used);
     match serde_json::to_string_pretty(&report) {
         Ok(text) if report.validate().is_ok() => ToolCallResult::text(text),
         _ => result,
@@ -9652,6 +12057,9 @@ mod tests {
     fn the_wire_row_carries_the_callers_role_and_a_federated_row_reports_null() {
         let local = super::reference_row_json(
             ReferenceRow {
+                recorded_owners: crate::semantic_owners::RecordedOwners::unavailable(),
+                repo_id: None,
+                foreign_entity_id: None,
                 entity_id: Some("local".to_string()),
                 name: "test_send".to_string(),
                 kind: Some("Function".to_string()),
@@ -9702,8 +12110,11 @@ mod tests {
             "{local}"
         );
 
-        let federated = super::reference_row_json(
+        let mut federated = super::reference_row_json(
             ReferenceRow {
+                recorded_owners: crate::semantic_owners::RecordedOwners::foreign(),
+                repo_id: Some("other".into()),
+                foreign_entity_id: Some("00000000-0000-0000-0000-000000000001".into()),
                 entity_id: None,
                 name: "consumer".to_string(),
                 kind: None,
@@ -9731,6 +12142,14 @@ mod tests {
         assert_eq!(federated["projection"]["path"], "[other] src/app.py");
         assert_eq!(federated["sites"], serde_json::json!([]));
         assert_eq!(federated["sites_absent_reason"], "federated_xref");
+        crate::semantic_surface::project("find_references", &mut federated);
+        assert_eq!(federated["repo_id"], "other");
+        assert_eq!(
+            federated["foreign_entity_id"],
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert!(federated["entity_id"].is_null());
+        assert!(federated.get("projection").is_none());
     }
 
     /// The description states the unit it walks and promises nothing finer.
@@ -9932,6 +12351,58 @@ mod tests {
             Some(end) => text[..=end].to_string(),
             None => text.to_string(),
         }
+    }
+
+    #[test]
+    fn exploration_public_surface_preserves_names_and_program_literals() {
+        let store = InMemoryGraph::new();
+        let mut entity = make_entity("file", "private/physical-origin.rs");
+        entity.signature = "fn file() -> &'static str { \"config/settings.json\" }".into();
+        store.upsert_entity(&entity).unwrap();
+        for strategy in ["overview", "search"] {
+            let args = HashMap::from([
+                ("query".into(), serde_json::json!("file")),
+                ("strategy".into(), serde_json::json!(strategy)),
+                ("token_budget".into(), serde_json::json!(8000)),
+            ]);
+            let result = handle_explore_codebase(&args, &store, None).unwrap();
+            let mut wire = serde_json::to_value(result).unwrap();
+            crate::semantic_surface::present_result(&mut wire, "explore_codebase");
+            let text = wire["content"][0]["text"].as_str().unwrap();
+            let reply: serde_json::Value = serde_json::from_str(text).unwrap();
+            let section = if strategy == "overview" {
+                "declarations"
+            } else {
+                "matches"
+            };
+            let row = &reply["content"][section][0];
+            assert_eq!(row["name"], entity.name);
+            assert_eq!(row["signature"], entity.signature);
+            assert!(!text.contains("private/physical-origin.rs"), "{text}");
+            assert_eq!(reply["tokens_used"], kin_context::estimate_tokens(text));
+        }
+    }
+
+    #[test]
+    fn missing_context_entity_does_not_relabel_rendered_metadata_as_source() {
+        let entry = kin_model::context::ContextEntry {
+            entity_id: EntityId::new(),
+            projection_level: kin_model::context::ProjectionLevel::SignatureOnly,
+            content: "// file: private/origin.rs\n// same-file neighbor\nfn file() {}\n".into(),
+        };
+        let mut row = missing_context_entity(&entry);
+        row["relation"] = serde_json::json!("dependency_edge");
+        let result = ToolCallResult::text(serde_json::to_string_pretty(&row).unwrap());
+        let mut wire = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut wire, "get_context_pack");
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let reply: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reply["id"], entry.entity_id.to_string());
+        assert_eq!(reply["relation"], "dependency_edge");
+        assert!(reply["projection_unavailable"].is_string());
+        assert!(reply.get("body").is_none());
+        assert!(reply.get("content").is_none());
+        assert!(!text.contains("private/origin.rs"));
     }
 
     fn make_entity(name: &str, file: &str) -> Entity {
@@ -10200,9 +12671,20 @@ mod tests {
         let rows = spine_reference_rows("provider", &target.id, &response);
 
         assert_eq!(rows.len(), 1);
+        let foreign = reference_row_json(rows[0].clone(), false);
+        assert_eq!(foreign["semantic_owners"], serde_json::json!([]));
+        assert_eq!(
+            foreign["semantic_owner_gap"],
+            "owner_repository_not_selected"
+        );
+        assert_eq!(foreign["foreign_entity_id"], source.id.to_string());
+        assert!(foreign["entity_id"].is_null());
         assert_eq!(rows[0].name, "run_task");
         assert_eq!(rows[0].kind.as_deref(), Some("Function"));
-        assert_eq!(rows[0].file_path.as_deref(), Some("[consumer] src/app.rs"));
+        assert!(rows[0].file_path.is_none());
+        assert!(rows[0].entity_id.is_none());
+        assert_eq!(rows[0].repo_id.as_deref(), Some("consumer"));
+        assert_eq!(rows[0].foreign_entity_id, Some(source.id.to_string()));
         assert_eq!(rows[0].signature.as_deref(), Some("fn run_task()"));
         assert!(rows[0].relation_kinds.is_empty());
     }
@@ -10240,6 +12722,11 @@ mod tests {
         let incoming = spine_reference_rows("provider", &target.id, &incoming_response);
         assert_eq!(incoming.len(), 1);
         assert!(incoming[0].relation_kinds.is_empty());
+        // Edge identity remains useful even when the foreign declaration's
+        // descriptive metadata was unavailable.
+        assert_eq!(incoming[0].repo_id.as_deref(), Some("consumer"));
+        assert_eq!(incoming[0].foreign_entity_id, Some(source.id.to_string()));
+        assert!(incoming[0].entity_id.is_none());
     }
 
     #[test]
@@ -10436,6 +12923,745 @@ mod tests {
         entity
     }
 
+    /// A Rust method is named `TypedHeaderRejection::name`, and a reader who
+    /// writes members the way most languages do asks for
+    /// `TypedHeaderRejection.name`. That was "no declaration Kin holds is
+    /// named" it, while the same lookup by the leaf alone listed every field
+    /// and method called `name` in the workspace. Either spelling now finds the
+    /// declarations the other names, and only them.
+    #[test]
+    fn a_member_name_is_found_in_either_separator_spelling() {
+        let store = InMemoryGraph::new();
+        let method = make_entity_in(
+            LanguageId::Rust,
+            "TypedHeaderRejection::name",
+            "axum-extra/src/typed_header.rs",
+        );
+        let unrelated = make_entity_in(LanguageId::Rust, "Field::name", "axum/src/multipart.rs");
+        let python = make_entity_in(LanguageId::Python, "Prompt.ask", "rich/prompt.py");
+        for entity in [&method, &unrelated, &python] {
+            store.upsert_entity(entity).unwrap();
+        }
+        for (query, wanted) in [
+            ("TypedHeaderRejection.name", "TypedHeaderRejection::name"),
+            ("TypedHeaderRejection::name", "TypedHeaderRejection::name"),
+            ("Prompt::ask", "Prompt.ask"),
+        ] {
+            let reply = parsed_response(
+                &handle_semantic_search(&search_args(query, None), &store).unwrap(),
+            );
+            assert_eq!(reply["total_matches"], 1, "{query}: {reply}");
+            assert_eq!(reply["results"][0]["name"], wanted, "{query}: {reply}");
+            // A respelling is said as one: `query` is the spelling that
+            // matched and `respelled_from` the one the caller wrote.
+            if query == wanted {
+                assert!(reply.get(RESPELLED_FROM_KEY).is_none(), "{query}: {reply}");
+            } else {
+                assert_eq!(reply["query"], wanted, "{query}: {reply}");
+                assert_eq!(reply[RESPELLED_FROM_KEY], query, "{query}: {reply}");
+                let plain = crate::plain_reply::plain_answer(
+                    reply.as_object().unwrap().clone(),
+                    "semantic_search",
+                );
+                assert_eq!(plain[RESPELLED_FROM_KEY], query, "{query}: {plain}");
+                assert!(
+                    plain["_kin"]["meaning"]
+                        .as_str()
+                        .is_some_and(|meaning| meaning.contains(&format!(
+                            "Nothing is named {query} as written; Kin read it as {wanted}"
+                        ))),
+                    "{query}: {plain}"
+                );
+            }
+        }
+        assert_eq!(other_member_spelling("a.b.c"), Some("a::b::c".to_string()));
+        assert_eq!(other_member_spelling("a::b"), Some("a.b".to_string()));
+        for unchanged in ["name", "a.b::c", "a..b", "a:b", "src/lib.rs", "two words"] {
+            assert_eq!(other_member_spelling(unchanged), None, "{unchanged}");
+        }
+    }
+
+    fn qualified_module_fixture() -> (InMemoryGraph, Entity, Entity) {
+        let store = InMemoryGraph::new();
+        let wanted = make_entity_in(LanguageId::Python, "normalize_rate", "one/rate_engine.py");
+        let other = make_entity_in(LanguageId::Python, "normalize_rate", "other_engine.py");
+        for (name, entity) in [("rate_engine", &wanted), ("other_engine", &other)] {
+            let module = module_entity(
+                LanguageId::Python,
+                name,
+                &entity.file_origin.as_ref().unwrap().0,
+            );
+            store.upsert_entity(&module).unwrap();
+            store.upsert_entity(entity).unwrap();
+            store
+                .upsert_relation(&make_relation(module.id, entity.id, RelationKind::Contains))
+                .unwrap();
+        }
+        (store, wanted, other)
+    }
+
+    #[test]
+    fn a_dotted_module_path_locates_the_module_itself() {
+        let (store, _, _) = qualified_module_fixture();
+        // `one.rate_engine` is the module a row's `module` field names: the
+        // module `rate_engine` in the folder `one`, not a member of a module
+        // called `one`.
+        let reply = parsed_response(
+            &handle_semantic_search(&search_args("one.rate_engine", Some("module")), &store)
+                .unwrap(),
+        );
+        assert_eq!(reply["total_matches"], 1, "{reply}");
+        assert_eq!(reply["results"][0]["name"], "rate_engine");
+        // A path that names no module still finds none.
+        let reply = parsed_response(
+            &handle_semantic_search(&search_args("two.rate_engine", Some("module")), &store)
+                .unwrap(),
+        );
+        assert_eq!(reply["total_matches"], 0, "{reply}");
+    }
+
+    #[test]
+    fn module_qualified_locate_uses_recorded_module_membership() {
+        let (store, wanted, other) = qualified_module_fixture();
+        for (query, expected) in [
+            ("rate_engine.normalize_rate", wanted.id),
+            ("other_engine.normalize_rate", other.id),
+            ("RATE_ENGINE.NORMALIZE_RATE", wanted.id),
+        ] {
+            let reply = parsed_response(
+                &handle_semantic_search(&search_args(query, Some("function")), &store).unwrap(),
+            );
+            assert_eq!(reply["total_matches"], 1, "{query}: {reply}");
+            assert_eq!(reply["results"][0]["id"], expected.to_string());
+        }
+        for query in [
+            "missing.normalize_rate",
+            "rate_engine.missing",
+            "engine.normalize_rate",
+        ] {
+            let reply = parsed_response(
+                &handle_semantic_search(&search_args(query, None), &store).unwrap(),
+            );
+            assert_eq!(reply["total_matches"], 0, "{query}: {reply}");
+        }
+        let bare = parsed_response(
+            &handle_semantic_search(&search_args("normalize_rate", None), &store).unwrap(),
+        );
+        assert_eq!(bare["total_matches"], 2);
+    }
+
+    #[test]
+    fn semantic_owner_cues_use_contains_and_keep_lookup_and_plain_identity() {
+        let (store, wanted, _) = qualified_module_fixture();
+        let unowned = make_entity_in(LanguageId::Python, "normalize_rate", "one/rate_engine.py");
+        store.upsert_entity(&unowned).unwrap();
+        let reply = handle_semantic_search(&search_args("normalize_rate", None), &store).unwrap();
+        let machine = parsed_response(&reply);
+        let rows = machine["results"].as_array().unwrap();
+        let owned = rows
+            .iter()
+            .find(|row| row["id"] == wanted.id.to_string())
+            .unwrap();
+        let missing = rows
+            .iter()
+            .find(|row| row["id"] == unowned.id.to_string())
+            .unwrap();
+        assert_eq!(missing["semantic_owners"], serde_json::json!([]));
+        assert_eq!(missing["semantic_owner_gap"], "no_recorded_owner");
+        let owner = &owned["semantic_owners"][0];
+        assert_eq!(owner["name"], "rate_engine");
+        // The file sits in a folder that is no package, so its module is named
+        // from the repository root and the hint pins this module alone.
+        assert_eq!(
+            owner["member_lookup_query"],
+            "one.rate_engine.normalize_rate"
+        );
+        assert_eq!(owner["relationship"], "Contains");
+        assert_eq!(owner["resolution"], "type_resolved");
+        let edge = store
+            .get_all_relations_for_entity(&wanted.id)
+            .unwrap()
+            .into_iter()
+            .find(|edge| owner["relation_id"] == edge.id.to_string())
+            .unwrap();
+        assert_eq!(edge.dst, GraphNodeId::Entity(wanted.id));
+        assert_eq!(
+            edge.src.to_string(),
+            format!("entity:{}", owner["entity_id"].as_str().unwrap())
+        );
+        // The same-origin declaration above must make a qualified lookup
+        // refuse its missing membership, never quietly inherit the module.
+        assert!(
+            handle_semantic_search(&search_args("rate_engine.normalize_rate", None), &store)
+                .is_err()
+        );
+        let (complete, wanted, _) = qualified_module_fixture();
+        let qualified = parsed_response(
+            &handle_semantic_search(&search_args("rate_engine.normalize_rate", None), &complete)
+                .unwrap(),
+        );
+        assert_eq!(qualified["results"][0]["id"], wanted.id.to_string());
+
+        let mut rendered = serde_json::to_value(reply).unwrap();
+        crate::semantic_surface::present_result(&mut rendered, "semantic_search");
+        crate::query_reply::QueryPresentation::default().present(
+            &mut rendered,
+            "semantic_search",
+            &HashMap::new(),
+        );
+        let plain: serde_json::Value =
+            serde_json::from_str(rendered["content"][0]["text"].as_str().unwrap()).unwrap();
+        for row in rows {
+            let shown = plain["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|shown| shown["entity_id"] == row["id"])
+                .unwrap();
+            assert_eq!(shown["semantic_owners"], row["semantic_owners"]);
+            assert_eq!(shown["semantic_owner_gap"], row["semantic_owner_gap"]);
+        }
+    }
+
+    #[test]
+    fn semantic_owner_cues_keep_ambiguity_and_hide_only_unsafe_owner_labels() {
+        let (store, wanted, _) = qualified_module_fixture();
+        let second = module_entity(LanguageId::Python, "alternate", "one/rate_engine.py");
+        let unsafe_owner =
+            module_entity(LanguageId::Python, "private/source.py", "private/source.py");
+        let synthetic = module_entity(LanguageId::Python, "LICENSE", "LICENSE");
+        let extensionless = module_entity(LanguageId::Python, "private/owner", "different.py");
+        let spaced = module_entity(LanguageId::Python, "private area/owner", "different.py");
+        let control = module_entity(LanguageId::Python, "owner\nextra", "different.py");
+        for owner in [
+            &second,
+            &unsafe_owner,
+            &synthetic,
+            &extensionless,
+            &spaced,
+            &control,
+        ] {
+            store.upsert_entity(owner).unwrap();
+            store
+                .upsert_relation(&make_relation(owner.id, wanted.id, RelationKind::Contains))
+                .unwrap();
+        }
+        let mut row = serde_json::json!({"id":wanted.id,"name":wanted.name,
+            "body":"return 'private/source.py; LICENSE'"});
+        crate::semantic_owners::RecordedOwners::observe(&store, &wanted).attach(&mut row);
+        let owners = row["semantic_owners"].as_array().unwrap();
+        assert_eq!(owners.len(), 7);
+        assert!(owners
+            .iter()
+            .any(|owner| owner["member_lookup_query"] == "one.rate_engine.normalize_rate"));
+        assert!(owners.iter().any(|owner| owner["member_lookup_query"]
+            .as_str()
+            .is_some_and(|query| query.ends_with("alternate.normalize_rate"))));
+        for id in [
+            unsafe_owner.id,
+            synthetic.id,
+            extensionless.id,
+            spaced.id,
+            control.id,
+        ] {
+            let owner = owners
+                .iter()
+                .find(|owner| owner["entity_id"] == id.to_string())
+                .unwrap();
+            assert!(owner.get("name").is_none() && owner.get("member_lookup_query").is_none());
+            assert!(owner["relation_id"].is_string());
+            assert_eq!(owner["semantic_identity_gap"], "owner_name_unavailable");
+        }
+        assert_eq!(row["semantic_owner_gap"], "recorded_owners_partial");
+        let owners = row["semantic_owners"].clone();
+        crate::semantic_surface::project("semantic_search", &mut row);
+        assert_eq!(row["semantic_owners"], owners);
+        assert_eq!(row["body"], "return 'private/source.py; LICENSE'");
+    }
+
+    #[test]
+    fn semantic_owner_cues_do_not_promote_weak_missing_or_derived_owners() {
+        let store = InMemoryGraph::new();
+        let member = make_entity_in(LanguageId::Python, "run", "unit.py");
+        let owner = module_entity(LanguageId::Python, "unit", "unit.py");
+        for entity in [&member, &owner] {
+            store.upsert_entity(entity).unwrap();
+        }
+        let mut weak = make_relation(owner.id, member.id, RelationKind::Contains);
+        weak.confidence = 0.7;
+        store.upsert_relation(&weak).unwrap();
+        let missing = make_relation(EntityId::new(), member.id, RelationKind::Contains);
+        store.upsert_relation(&missing).unwrap();
+        let reply = handle_semantic_search(&search_args("run", None), &store).unwrap();
+        let machine = parsed_response(&reply);
+        let row = &machine["results"][0];
+        assert_eq!(row["semantic_owners"], serde_json::json!([]));
+        assert_eq!(row["semantic_owner_candidate_count"], 1);
+        assert_eq!(row["semantic_owner_gap"], "recorded_owners_partial");
+        let mut rendered = serde_json::to_value(reply).unwrap();
+        crate::semantic_surface::present_result(&mut rendered, "semantic_search");
+        crate::query_reply::QueryPresentation::default().present(
+            &mut rendered,
+            "semantic_search",
+            &HashMap::new(),
+        );
+        let plain: serde_json::Value =
+            serde_json::from_str(rendered["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(plain["results"][0]["semantic_owner_candidate_count"], 1);
+        assert_eq!(
+            plain["results"][0]["semantic_owners"],
+            serde_json::json!([])
+        );
+
+        // A legacy manual edge is strong on its own, but the actual selected
+        // endpoint says this member was inferred from generating syntax.
+        let derived_store = InMemoryGraph::new();
+        let mut derived = member.clone();
+        let span = kin_model::SourceSpan {
+            file: FilePathId::new("unit.py"),
+            start_byte: 0,
+            end_byte: 10,
+            start_line: 1,
+            end_line: 1,
+            start_col: 0,
+            end_col: 10,
+        };
+        let derivation = kin_model::derivation::EntityDerivation {
+            schema: kin_model::derivation::DerivationSchema::V1,
+            generator: span.clone(),
+            assignment: span,
+            source_blob_hash: "0".repeat(64),
+            owner: "unit".into(),
+            member_key: "run".into(),
+            rule: "computed-member".into(),
+            conditions: vec!["runtime member assignment".into()],
+        };
+        derived.metadata.extra.insert(
+            kin_model::derivation::ENTITY_DERIVATION_KEY.into(),
+            serde_json::to_value(derivation).unwrap(),
+        );
+        assert!(kin_model::entity_derivation(&derived).unwrap().is_some());
+        derived_store.upsert_entity(&derived).unwrap();
+        derived_store.upsert_entity(&owner).unwrap();
+        let mut manual = make_relation(owner.id, derived.id, RelationKind::Contains);
+        manual.origin = RelationOrigin::Manual;
+        assert!(kin_index::RelationResolution::of(&manual).is_proven());
+        derived_store.upsert_relation(&manual).unwrap();
+        let mut row = serde_json::json!({"id":derived.id});
+        crate::semantic_owners::RecordedOwners::observe(&derived_store, &derived).attach(&mut row);
+        assert_eq!(row["semantic_owners"], serde_json::json!([]));
+        assert_eq!(row["semantic_owner_candidate_count"], 1);
+        assert_eq!(row["semantic_owner_gap"], "recorded_owners_partial");
+        let frozen = row.clone();
+        crate::semantic_owners::RecordedOwners::observe(&derived_store, &derived).attach(&mut row);
+        assert_eq!(row, frozen);
+        crate::semantic_owners::RecordedOwners::unavailable().attach(&mut row);
+        assert_eq!(row["semantic_owner_gap"], "owner_observation_unavailable");
+        assert!(row.get("semantic_owner_candidate_count").is_none());
+        assert_eq!(row["id"], derived.id.to_string());
+    }
+
+    #[test]
+    fn semantic_owner_cues_are_selected_graph_scoped_bounded_and_budget_stable() {
+        let selected = InMemoryGraph::new();
+        let other = InMemoryGraph::new();
+        let member = make_entity_in(LanguageId::Python, "run", "unit.py");
+        selected.upsert_entity(&member).unwrap();
+        other.upsert_entity(&member).unwrap();
+        for index in 0..66 {
+            let mut owner = make_entity_in(LanguageId::Python, &format!("Owner{index}"), "unit.py");
+            owner.kind = EntityKind::Class;
+            selected.upsert_entity(&owner).unwrap();
+            selected
+                .upsert_relation(&make_relation(owner.id, member.id, RelationKind::Contains))
+                .unwrap();
+        }
+        let mut held = serde_json::json!({"id":member.id,"name":member.name});
+        crate::semantic_owners::RecordedOwners::observe(&selected, &member).attach(&mut held);
+        assert_eq!(held["semantic_owners"].as_array().unwrap().len(), 64);
+        assert_eq!(held["semantic_owners_omitted"], 2);
+        assert_eq!(held["semantic_owner_gap"], "recorded_owners_partial");
+        let mut elsewhere = serde_json::json!({"id":member.id,"name":member.name});
+        crate::semantic_owners::RecordedOwners::observe(&other, &member).attach(&mut elsewhere);
+        assert_eq!(elsewhere["semantic_owners"], serde_json::json!([]));
+        assert_eq!(elsewhere["semantic_owner_gap"], "no_recorded_owner");
+
+        let (store, mut member, _) = qualified_module_fixture();
+        member.signature = "x".repeat(20_000);
+        store.upsert_entity(&member).unwrap();
+        let args = search_args("rate_engine.normalize_rate", None);
+        let reply = handle_semantic_search(&args, &store).unwrap();
+        let owners = parsed_response(&reply)["results"][0]["semantic_owners"].clone();
+        let budget = crate::budget::ResponseBudget {
+            max_chars: 2_000,
+            ..Default::default()
+        };
+        // The machine budget deliberately retains one indivisible identity
+        // record, including its signature, and discloses an overflow. The
+        // default public locate presentation omits signatures after grading.
+        let finalized = crate::envelope::finalize_bounded(
+            reply,
+            ready_daemon_envelope(4),
+            "semantic_search",
+            &budget,
+        );
+        let mut rendered = serde_json::to_value(finalized).unwrap();
+        crate::semantic_surface::present_result(&mut rendered, "semantic_search");
+        let machine_text = rendered["content"][0]["text"].as_str().unwrap();
+        assert!(machine_text.len() > budget.max_chars);
+        let machine: serde_json::Value = serde_json::from_str(machine_text).unwrap();
+        assert_eq!(machine["results"][0]["id"], member.id.to_string());
+        assert_eq!(machine["results"][0]["semantic_owners"], owners);
+        assert_eq!(machine["results"][0]["signature"], member.signature);
+        assert_eq!(
+            machine["_kin"]["response"]["chars_after_budget"],
+            machine_text.len()
+        );
+        assert!(machine["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == crate::budget::OVER_BUDGET_REASON));
+        crate::query_reply::QueryPresentation::default().present(
+            &mut rendered,
+            "semantic_search",
+            &args,
+        );
+        let plain_text = rendered["content"][0]["text"].as_str().unwrap();
+        let plain: serde_json::Value = serde_json::from_str(plain_text).unwrap();
+        assert_eq!(plain["results"][0]["entity_id"], member.id.to_string());
+        assert_eq!(plain["results"][0]["semantic_owners"], owners);
+        assert!(plain["results"][0].get("signature").is_none());
+        assert!(
+            plain_text.len() <= budget.max_chars,
+            "{} bytes: {plain_text}",
+            plain_text.len()
+        );
+    }
+
+    #[test]
+    fn semantic_owner_refs_freeze_selected_callers_before_paging() {
+        let _cache = crate::trace_pages::cache_test_guard();
+        let store = InMemoryGraph::new();
+        let other = InMemoryGraph::new();
+        let mut target = make_entity_in(LanguageId::Python, "target", "unit.py");
+        let mut parent = make_entity_in(LanguageId::Python, "enclose", "unit.py");
+        target.file_origin = None;
+        parent.file_origin = None;
+        for graph in [&store, &other] {
+            graph.upsert_entity(&target).unwrap();
+            graph.upsert_entity(&parent).unwrap();
+        }
+        let mut ownership_edges = Vec::new();
+        for index in 0..12 {
+            let mut caller = make_entity_in(
+                LanguageId::Python,
+                &format!("enclose.<locals>.caller_{index}"),
+                "unit.py",
+            );
+            caller.file_origin = None;
+            let call = make_relation(caller.id, target.id, RelationKind::Calls);
+            for graph in [&store, &other] {
+                graph.upsert_entity(&caller).unwrap();
+                graph.upsert_relation(&call).unwrap();
+            }
+            let owner = make_relation(parent.id, caller.id, RelationKind::Contains);
+            store.upsert_relation(&owner).unwrap();
+            ownership_edges.push(owner);
+        }
+        let rows =
+            collect_graph_reference_members(&store, &target.id, &[RelationKind::Calls], None)
+                .unwrap();
+        assert_eq!(rows.len(), 12);
+        let references: Vec<_> = rows
+            .into_iter()
+            .map(|row| reference_row_json(row, false))
+            .collect();
+        for row in &references {
+            let witness = &row["semantic_owners"][0];
+            assert_eq!(witness["entity_id"], parent.id.to_string());
+            assert_eq!(witness["name"], "enclose");
+            assert_eq!(witness["kind"], "function");
+            assert!(witness.get("member_lookup_query").is_none());
+            assert!(ownership_edges
+                .iter()
+                .any(|edge| witness["relation_id"] == edge.id.to_string()
+                    && row["entity_id"] == edge.dst.as_entity().unwrap().to_string()));
+        }
+        // Same UUIDs and names in another selected graph do not borrow edges.
+        for row in collect_graph_reference_members(&other, &target.id, &[RelationKind::Calls], None)
+            .unwrap()
+        {
+            let row = reference_row_json(row, false);
+            assert_eq!(row["semantic_owners"], serde_json::json!([]));
+            assert_eq!(row["semantic_owner_gap"], "no_recorded_owner");
+        }
+        let authority = serde_json::json!({"repo":"owners", "generation":1});
+        let args = HashMap::from([("entity_id".into(), serde_json::json!(target.id))]);
+        let context = crate::reference_pages::context(&args, &authority);
+        let mut page = crate::trace_pages::start_kind(
+            serde_json::json!({
+                "references":references, "total_upstream":12,
+                "focal_entity":{"id":target.id,"name":target.name},
+                "_kin":{"verdict":{"state":"inconclusive","safe_to_conclude_absent":false}}
+            }),
+            context.clone(),
+            4_000,
+            crate::trace_pages::PageKind::References,
+        )
+        .unwrap();
+        assert!(
+            page["next_cursor"].is_string(),
+            "the observation must page: {page}"
+        );
+        for relation in ownership_edges {
+            store.remove_relation(&relation.id).unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages < 40);
+            assert!(serde_json::to_vec(&page).unwrap().len() <= 4_000);
+            let held = page["references"].as_array().unwrap();
+            seen.extend(held.iter().cloned());
+            // Owner evidence is served whole with details; the short row
+            // names the caller by its qualified name and leaves owners out.
+            let presented = |details: bool| {
+                let mut public =
+                    serde_json::to_value(ToolCallResult::text(page.to_string())).unwrap();
+                crate::semantic_surface::present_result(&mut public, "find_references");
+                let mut arguments = args.clone();
+                arguments.insert("details".into(), serde_json::json!(details));
+                crate::query_reply::QueryPresentation::default().present(
+                    &mut public,
+                    "find_references",
+                    &arguments,
+                );
+                serde_json::from_str::<serde_json::Value>(
+                    public["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap()
+            };
+            let (plain, short) = (presented(true), presented(false));
+            for row in held {
+                let find = |reply: &serde_json::Value| {
+                    reply["references"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|shown| shown["entity_id"] == row["entity_id"])
+                        .cloned()
+                        .unwrap()
+                };
+                assert_eq!(find(&plain)["semantic_owners"], row["semantic_owners"]);
+                assert!(find(&short).get("semantic_owners").is_none());
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            page = crate::reference_pages::resume(cursor, &context, 4_000).unwrap();
+        }
+        assert_eq!(seen.len(), references.len());
+        for (shown, original) in seen.iter().zip(&references) {
+            assert_eq!(shown["entity_id"], original["entity_id"]);
+            assert_eq!(
+                shown["semantic_owners"], original["semantic_owners"],
+                "continuations retain frozen owner evidence after graph changes"
+            );
+            assert!(shown.get("projection").is_none());
+        }
+    }
+
+    #[test]
+    fn semantic_owner_cues_survive_single_and_multi_context_focal_presentation() {
+        let (store, wanted, other) = qualified_module_fixture();
+        let sessions = SessionRegistry::empty_for_test();
+        for multi in [false, true] {
+            let mut args = HashMap::from([
+                ("focal_body".to_string(), serde_json::json!(false)),
+                ("include_traffic".to_string(), serde_json::json!(false)),
+                ("token_budget".to_string(), serde_json::json!(8000)),
+            ]);
+            if multi {
+                args.insert(
+                    "question_focals".into(),
+                    serde_json::json!([
+                        {"entity_id":wanted.id,"route":"id"},{"entity_id":other.id,"route":"id"}
+                    ]),
+                );
+            } else {
+                args.insert("entity_id".into(), serde_json::json!(wanted.id));
+            }
+            let result = handle_get_context_pack(&args, &store, &sessions, None).unwrap();
+            let machine = parsed_response(&result);
+            let focals: Vec<_> = if multi {
+                machine["entities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["section"] == "focal")
+                    .collect()
+            } else {
+                vec![&machine["focal_entity"]]
+            };
+            assert_eq!(focals.len(), if multi { 2 } else { 1 });
+            assert!(focals.iter().all(|row| row["semantic_owners"]
+                .as_array()
+                .is_some_and(|owners| owners.len() == 1)));
+            for key in ["dependencies", "dependents", "transitive_deps"] {
+                assert!(machine[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .all(|row| row.get("semantic_owners").is_none()));
+            }
+            let mut rendered = serde_json::to_value(result).unwrap();
+            crate::semantic_surface::present_result(&mut rendered, "get_context_pack");
+            crate::query_reply::QueryPresentation::default().present(
+                &mut rendered,
+                "get_context_pack",
+                &HashMap::new(),
+            );
+            let plain: serde_json::Value =
+                serde_json::from_str(rendered["content"][0]["text"].as_str().unwrap()).unwrap();
+            for focal in focals {
+                let shown = if multi {
+                    plain["entities"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["entity_id"] == focal["id"])
+                        .unwrap()
+                } else {
+                    &plain["entity"]
+                };
+                assert_eq!(shown["semantic_owners"], focal["semantic_owners"]);
+            }
+        }
+    }
+
+    #[test]
+    fn module_qualified_locate_retains_ambiguity_and_existing_qualified_names() {
+        let (store, _, _) = qualified_module_fixture();
+        let second = make_entity_in(LanguageId::Python, "normalize_rate", "two/rate_engine.py");
+        let module = module_entity(LanguageId::Python, "rate_engine", "two/rate_engine.py");
+        store.upsert_entity(&module).unwrap();
+        store.upsert_entity(&second).unwrap();
+        store
+            .upsert_relation(&make_relation(module.id, second.id, RelationKind::Contains))
+            .unwrap();
+        let existing = make_method_in(LanguageId::Python, "Rate.normalize_rate", "class.py");
+        store.upsert_entity(&existing).unwrap();
+        let reply = parsed_response(
+            &handle_semantic_search(&search_args("rate_engine.normalize_rate", None), &store)
+                .unwrap(),
+        );
+        assert_eq!(reply["total_matches"], 2, "{reply}");
+        let reply = parsed_response(
+            &handle_semantic_search(&search_args("Rate.normalize_rate", Some("method")), &store)
+                .unwrap(),
+        );
+        assert_eq!(reply["total_matches"], 1, "{reply}");
+        assert_eq!(reply["results"][0]["id"], existing.id.to_string());
+    }
+
+    #[test]
+    fn module_qualified_locate_preserves_kind_language_and_role_filters() {
+        let (store, _, _) = qualified_module_fixture();
+        for (key, value) in [("kind", "method"), ("kind", "test"), ("language", "rust")] {
+            let mut args = search_args("rate_engine.normalize_rate", None);
+            args.insert(key.into(), serde_json::json!(value));
+            let reply = parsed_response(&handle_semantic_search(&args, &store).unwrap());
+            assert_eq!(reply["total_matches"], 0, "{reply}");
+            assert_eq!(
+                reply["edge_coverage"][crate::edge_coverage::NAME_FILTER_KEY]["candidates"],
+                1,
+                "{reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_qualified_locate_refuses_unrecorded_membership() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&module_entity(
+                LanguageId::Python,
+                "rate_engine",
+                "rate_engine.py",
+            ))
+            .unwrap();
+        store
+            .upsert_entity(&make_entity_in(
+                LanguageId::Python,
+                "normalize_rate",
+                "rate_engine.py",
+            ))
+            .unwrap();
+        let error =
+            handle_semantic_search(&search_args("rate_engine.normalize_rate", None), &store)
+                .unwrap_err();
+        assert!(error.to_string().contains("module membership"), "{error}");
+    }
+
+    #[test]
+    fn module_qualified_locate_ignores_lexical_collisions_and_external_modules() {
+        let (store, wanted, _) = qualified_module_fixture();
+        for name in [
+            "normalize_rate_helper",
+            "denormalize_rate",
+            "Other.normalize_rate",
+        ] {
+            // Intentionally no Contains edge: these are not the requested bare
+            // leaf, so they must neither become answers nor cause a refusal.
+            store
+                .upsert_entity(&make_entity_in(
+                    LanguageId::Python,
+                    name,
+                    "one/rate_engine.py",
+                ))
+                .unwrap();
+        }
+        let mut external = module_entity(LanguageId::Python, "rate_engine", "external");
+        external.file_origin = None;
+        external.role = EntityRole::External;
+        store.upsert_entity(&external).unwrap();
+        let reply = parsed_response(
+            &handle_semantic_search(&search_args("rate_engine.normalize_rate", None), &store)
+                .unwrap(),
+        );
+        assert_eq!(reply["total_matches"], 1, "{reply}");
+        assert_eq!(reply["results"][0]["id"], wanted.id.to_string());
+    }
+
+    #[test]
+    fn module_qualified_locate_refuses_more_than_the_module_bound() {
+        let store = InMemoryGraph::new();
+        for n in 0..65 {
+            store
+                .upsert_entity(&module_entity(
+                    LanguageId::Python,
+                    "rate_engine",
+                    &format!("{n}/rate_engine.py"),
+                ))
+                .unwrap();
+        }
+        let error =
+            handle_semantic_search(&search_args("rate_engine.normalize_rate", None), &store)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("candidate bound (64)"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("no complete match set or absence"),
+            "{error}"
+        );
+    }
+
     /// FIR-2430, end to end through the handler that built the bad answer.
     ///
     /// The store is shaped like expressjs/express as the stranger run found it:
@@ -10482,7 +13708,13 @@ mod tests {
         assert_eq!(found_coverage["scope"], "query_matches");
         assert_eq!(found_coverage["language"], "JavaScript");
         assert_eq!(found_coverage["scope_entities"], 1);
-        assert_eq!(found_coverage["classes"], serde_json::json!({}));
+        // The graph holds these entities without the tree or certificates a
+        // declaration census is read from, so the class is published as
+        // unmeasured rather than left out or read as complete.
+        assert_eq!(
+            found_coverage["classes"],
+            serde_json::json!({"declarations": "unmeasured"})
+        );
 
         // The reported call, verbatim. The region is populated (one module), so
         // what stops the certification is that nothing resolves the program
@@ -10564,15 +13796,15 @@ mod tests {
         // The Python half clears the enrichment gate, and FIR-2464 is what earns
         // it: the host probe found a server for this language, so the
         // observation reports `available` rather than leaving the question open.
-        // It still does not certify, because `observe_absence_scope` measures no
-        // coverage class and the shipped v0.5.43 answer that did certify on this
-        // exact shape was wrong twice in one session.
+        // It still does not certify, because no declaration census covers these
+        // files, and the shipped v0.5.43 answer that did certify on this exact
+        // shape was wrong twice in one session.
         assert_eq!(negative["safe_to_conclude_absent"], false);
         assert_eq!(negative["trust"], "inconclusive");
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(
-            reason.contains("absence_coverage_unmeasured"),
-            "a resolved program with no measured coverage names that: {negative}"
+            reason.contains(crate::declaration_coverage::CENSUS_UNMEASURED_CODE),
+            "a resolved program with no measured census names that: {negative}"
         );
         assert!(
             !reason.contains("entity_index_unresolved"),
@@ -10584,7 +13816,7 @@ mod tests {
     ///
     /// `semantic_search(query: "request", kind: "method")` on psf/requests
     /// answered zero and reported `safe_to_conclude_absent: true` with "safe to
-    /// treat the target as genuinely absent/unused", about a name the graph
+    /// treat the target as genuinely absent or unused", about a name the graph
     /// resolves. Nothing that existed could see it: the store is Python, which
     /// this build enriches, the scope holds entities, and the tool traverses no
     /// edge, so every gate correctly read healthy. The name's own side is the
@@ -10665,11 +13897,12 @@ mod tests {
         // this gate stays quiet. Without it the fix would be indistinguishable
         // from firing the name-filter reason on every kind-filtered answer.
         //
-        // The zero is not certifiable either, since FIR-2496: this store's
-        // observation measures no coverage class, so nothing separates a
-        // declaration the repository lacks from one the extractor never
-        // admitted. Both retain unknown readiness; the independent name-filter
-        // clause must occur only when a filter actually removed a candidate.
+        // The zero is not certifiable either, because this store holds
+        // no tree or certificate a declaration census is read from, so nothing
+        // separates a declaration the repository lacks from one the extractor
+        // never admitted. Both retain unknown readiness; the independent
+        // name-filter clause must occur only when a filter actually removed a
+        // candidate.
         let absent = parsed_response(
             &handle_semantic_search(&search_args("zzz_not_a_symbol", Some("method")), &store)
                 .unwrap(),
@@ -10699,8 +13932,9 @@ mod tests {
         assert!(
             reason
                 .split("; ")
-                .any(|clause| clause.starts_with("absence_coverage_unmeasured:")),
-            "a name that matched nothing is limited by the coverage nobody measured, not by a \
+                .any(|clause| clause
+                    .starts_with(crate::declaration_coverage::CENSUS_UNMEASURED_CODE)),
+            "a name that matched nothing is limited by the census nobody took, not by a \
              filter that removed nothing: {negative}"
         );
         assert!(
@@ -10789,13 +14023,17 @@ mod tests {
         )
         .unwrap()
         .to_value();
+        // No tree or certificate holds these files, so no census measured them.
         let factor = verdict["limiting_factor"].as_str().unwrap();
-        assert!(factor.contains("answer_coverage_unmeasured"), "{verdict}");
+        assert!(
+            factor.contains(crate::declaration_coverage::CENSUS_UNMEASURED_CODE),
+            "{verdict}"
+        );
         assert!(!factor.contains("absence_coverage_unmeasured"), "{verdict}");
         let gaps = crate::negative::absence_coverage_clauses("semantic_search", &payload);
         assert!(
             gaps.iter()
-                .any(|gap| gap.starts_with("answer_coverage_unmeasured")),
+                .any(|gap| gap.starts_with(crate::declaration_coverage::CENSUS_UNMEASURED_CODE)),
             "{gaps:?}"
         );
         assert!(
@@ -11209,6 +14447,75 @@ mod tests {
             assert_eq!(row["reference_count_complete"], false);
             assert_eq!(row["verdict_complete"], false);
         }
+    }
+
+    /// The focal of a reference reply is placed the way each row places its
+    /// caller: by the dotted module that contains it, read from the graph's
+    /// own module records. Without it, a reader who asks where the focal lives
+    /// has only its projection to go on.
+    #[tokio::test]
+    async fn find_references_places_the_focal_and_its_caller_by_module() {
+        let store = InMemoryGraph::new();
+        let mut modules = Vec::new();
+        for (name, unit) in [
+            ("pkg", "pkg/__init__.py"),
+            ("parsing", "pkg/parsing.py"),
+            ("storage", "pkg/storage.py"),
+        ] {
+            let mut module = make_entity(name, unit);
+            module.kind = EntityKind::Module;
+            modules.push(module);
+        }
+        let target = make_entity("parse_note", "pkg/parsing.py");
+        let caller = make_entity("ingest", "pkg/storage.py");
+        let loose = make_entity("loose", "scripts/loose.py");
+        for entity in modules.iter().chain([&target, &caller, &loose]) {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(caller.id, loose.id, RelationKind::Calls))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(body["focal_entity"]["module"], "pkg.parsing", "{body:#}");
+        let refs = body["references"].as_array().unwrap();
+        assert_eq!(refs.len(), 1, "{body:#}");
+        assert_eq!(refs[0]["module"], "pkg.storage", "{body:#}");
+
+        // The receiver proof names its focal the same way.
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            (
+                "proof_for_caller".to_string(),
+                serde_json::json!(caller.id.to_string()),
+            ),
+        ]);
+        let proof = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(proof["focal_entity"]["module"], "pkg.parsing", "{proof:#}");
+        assert_eq!(
+            proof["receiver_proof"]["module"], "pkg.storage",
+            "{proof:#}"
+        );
+
+        // A focal the graph records no module for carries none, as a row
+        // does; nothing stands in for it.
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(loose.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert!(body["focal_entity"].get("module").is_none(), "{body:#}");
+        assert_eq!(body["references"][0]["module"], "pkg.storage", "{body:#}");
     }
 
     #[tokio::test]
@@ -11744,6 +15051,141 @@ mod tests {
         assert_eq!(listed["implements"], IMPLEMENTS_INTERFACE_CANDIDATE);
     }
 
+    /// A change to an interface method's signature has to be made in every
+    /// method that implements it, and Go records no edge for an
+    /// implementation, so `affected_overrides` holds none. Measured on gin:
+    /// `impact` on `Core.MarshalIndent` said 0 methods implement it while
+    /// five codecs do. The answer lists the method-set candidates beside the
+    /// overrides, marked as candidates, and names them on its answer line.
+    #[tokio::test]
+    async fn impact_on_an_interface_method_lists_the_methods_that_implement_it() {
+        let (store, spec, buffer_write) = go_implementations_graph();
+        // The package the implementation is declared in, which places its row.
+        let mut package = go_entity(
+            EntityKind::Module,
+            "buf",
+            "internal/buf/buffer.go",
+            "package buf",
+        );
+        package.span = buffer_write.span.clone();
+        store.upsert_entity(&package).unwrap();
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let result = crate::handlers::review::handle_impact_analysis(
+            &HashMap::from([
+                (
+                    "entity_ids".to_string(),
+                    serde_json::json!([spec.id.to_string()]),
+                ),
+                ("include_traffic".to_string(), serde_json::json!(false)),
+            ]),
+            &store,
+            &sessions,
+        )
+        .await
+        .unwrap();
+        let body = parsed_response(&result);
+        let rows = body[crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY]
+            .as_array()
+            .unwrap_or_else(|| panic!("the implementations are listed: {body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0]["id"], buffer_write.id.to_string(), "{body}");
+        assert_eq!(rows[0]["name"], "Buffer.Write", "{body}");
+        assert_eq!(
+            rows[0]["resolution"], IMPLEMENTS_INTERFACE_CANDIDATE,
+            "{body}"
+        );
+        // Written like every other impact row: the entity's own kind, its
+        // role, which a reader leaving test code out drops a row by, and the
+        // module that places it.
+        assert_eq!(rows[0]["kind"], "method", "{body}");
+        assert_eq!(rows[0]["role"], "source", "{body}");
+        assert!(
+            rows[0]["module"]
+                .as_str()
+                .is_some_and(|module| module.ends_with("buf")),
+            "{body}"
+        );
+        assert!(
+            body[crate::impact_sections::INTERFACE_IMPLEMENTATIONS_NOTE_KEY]
+                .as_str()
+                .is_some_and(|note| note.contains("not a recorded one")),
+            "{body}"
+        );
+        // A concrete method is no contract, and gets no such list.
+        let result = crate::handlers::review::handle_impact_analysis(
+            &HashMap::from([
+                (
+                    "entity_ids".to_string(),
+                    serde_json::json!([buffer_write.id.to_string()]),
+                ),
+                ("include_traffic".to_string(), serde_json::json!(false)),
+            ]),
+            &store,
+            &sessions,
+        )
+        .await
+        .unwrap();
+        let body = parsed_response(&result);
+        assert!(
+            body.get(crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY)
+                .is_none(),
+            "{body}"
+        );
+    }
+
+    /// A test fake that satisfies an interface is test code like any other:
+    /// an impact answer that leaves test code out leaves it out of the
+    /// implementations too, and counts it among what it left out.
+    #[tokio::test]
+    async fn impact_leaves_a_test_implementation_out_with_the_rest_of_test_code() {
+        let (store, spec, buffer_write) = go_implementations_graph();
+        let mut fake = buffer_write.clone();
+        fake.role = kin_model::EntityRole::Test;
+        store.upsert_entity(&fake).unwrap();
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let impact = |include_tests: bool| {
+            let store = &store;
+            let sessions = &sessions;
+            let spec = spec.id.to_string();
+            async move {
+                let result = crate::handlers::review::handle_impact_analysis(
+                    &HashMap::from([
+                        ("entity_ids".to_string(), serde_json::json!([spec])),
+                        ("include_traffic".to_string(), serde_json::json!(false)),
+                        (
+                            "include_tests".to_string(),
+                            serde_json::json!(include_tests),
+                        ),
+                    ]),
+                    store,
+                    sessions,
+                )
+                .await
+                .unwrap();
+                parsed_response(&result)
+            }
+        };
+        let with_tests = impact(true).await;
+        let rows = with_tests[crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY]
+            .as_array()
+            .unwrap_or_else(|| panic!("the fake is listed with test code: {with_tests}"));
+        assert_eq!(rows.len(), 1, "{with_tests}");
+        assert_eq!(rows[0]["role"], "test", "{with_tests}");
+
+        let without = impact(false).await;
+        assert!(
+            without[crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY]
+                .as_array()
+                .is_none_or(|rows| rows.is_empty()),
+            "{without}"
+        );
+        assert_eq!(
+            without[crate::handlers::review::IMPACT_TESTS_EXCLUDED_KEY]["entities"],
+            1,
+            "{without}"
+        );
+    }
+
     /// The control. A type that misses one contract method is not an
     /// implementation, which is exactly the mistake the one-line grep makes and
     /// pays for in precision.
@@ -11856,6 +15298,110 @@ mod tests {
                 .unwrap()
                 .contains(&buffer_write.id.to_string()),
             "nor a same-name reference candidate: {body}"
+        );
+    }
+
+    /// Asked about a method, `find_references` names what overrides it beside
+    /// the callers and never among them.
+    ///
+    /// The measured miss: "which functions must change if
+    /// `SessionInterface.open_session` gains a required parameter" answered the
+    /// two callers and none of the three overrides, one of which sat in the
+    /// same file with its `Overrides` edge already in the graph.
+    #[tokio::test]
+    async fn find_references_lists_overrides_of_a_method_outside_its_references() {
+        let store = InMemoryGraph::new();
+        let base = make_method_in(
+            LanguageId::Python,
+            "SessionInterface.open_session",
+            "src/flask/sessions.py",
+        );
+        let secure = make_method_in(
+            LanguageId::Python,
+            "SecureCookieSessionInterface.open_session",
+            "src/flask/sessions.py",
+        );
+        let nested = make_method_in(
+            LanguageId::Python,
+            "test_session_error_pops_context.<locals>.FailingSessionInterface.open_session",
+            "tests/test_reqctx.py",
+        );
+        let caller = make_method_in(
+            LanguageId::Python,
+            "AppContext._get_session",
+            "src/flask/ctx.py",
+        );
+        for entity in [&base, &secure, &nested, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        for relation in [
+            make_relation(secure.id, base.id, RelationKind::Overrides),
+            make_relation(nested.id, base.id, RelationKind::Overrides),
+            make_relation_with_site(
+                caller.id,
+                base.id,
+                RelationKind::Calls,
+                "src/flask/ctx.py",
+                3,
+            ),
+        ] {
+            store.upsert_relation(&relation).unwrap();
+        }
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(base.id.to_string()),
+        )]);
+        let mut body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+
+        let block = &body[super::super::overrides::OVERRIDDEN_BY_KEY];
+        assert_eq!(block["count"], 2, "{body}");
+        let overriders: Vec<&str> = block["overriders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            overriders,
+            vec![
+                "SecureCookieSessionInterface.open_session",
+                "test_session_error_pops_context.<locals>.FailingSessionInterface.open_session",
+            ]
+        );
+        assert!(block["overriders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("line").is_none() && row["resolution"] == "type_resolved"));
+        // The references are the callers alone, and the count is theirs.
+        let referenced: Vec<&str> = body["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(referenced, vec!["AppContext._get_session"], "{body}");
+        assert_eq!(body["total_upstream"], 1, "{body}");
+
+        // The block rides an answer-only reply.
+        project_answer_only(&mut body);
+        assert_eq!(
+            body[super::super::overrides::OVERRIDDEN_BY_KEY]["count"],
+            2,
+            "{body}"
+        );
+
+        // An override asked about has no overrides of its own to list, and
+        // still says so.
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(secure.id.to_string()),
+        )]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(
+            body[super::super::overrides::OVERRIDDEN_BY_KEY]["count"],
+            0,
+            "{body}"
         );
     }
 
@@ -12092,10 +15638,8 @@ mod tests {
     /// for only one, `find_references` now sections a full reply for each of
     /// the three under `candidates_by_owner`, labelled by its own
     /// owner-qualified name. `find_references_reports_an_ambiguous_name_resolution`
-    /// beside this test is the fixture that does NOT section: two bare,
-    /// unqualified identically-named functions have no owner-qualified name
-    /// to label a section with, so that case keeps the single-answer-plus-count
-    /// shape this one used to have.
+    /// beside this test is the whole-name case, two unqualified functions with
+    /// one name, which is sectioned the same way.
     #[tokio::test]
     async fn find_references_counts_what_the_query_could_have_meant() {
         let store = InMemoryGraph::new();
@@ -12192,23 +15736,26 @@ mod tests {
             );
         }
 
-        let degradations = body["degradations"]
-            .as_array()
-            .unwrap_or_else(|| panic!("an ambiguous resolution must degrade: {body}"));
+        // The ambiguity is named, with how many candidates, and because every
+        // one of them was answered for it is a settled resolution rather than
+        // a degradation.
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 3,
+            "{body}"
+        );
+        assert_eq!(body["focal_resolution"]["sectioned"], 3, "{body}");
         assert!(
-            degradations
-                .iter()
-                .any(|entry| entry["reason"] == "ambiguous_name"
-                    && entry["detail"]
-                        .as_str()
-                        .is_some_and(|detail| detail.contains('3'))),
+            body["focal_resolution"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains('3')),
             "the ambiguity must be named, with how many candidates: {body}"
         );
+        assert!(body.get("degradations").is_none(), "{body}");
 
-        // The verdict half of this is asserted where `negative_for` is callable
-        // directly, in `negative::tests`. This handler returns its payload
-        // before the envelope layer attaches one, so asserting it here would be
-        // asserting on a key this call never produces.
+        // The verdict half of this, each section graded as its own answer and
+        // the response's verdict composed from theirs, is asserted through the
+        // envelope in `same_name_tests`. This handler returns its payload
+        // before the envelope layer attaches one.
     }
 
     /// The control for the case above, and the reason the field cannot simply be
@@ -12257,14 +15804,17 @@ mod tests {
         );
     }
 
-    /// A bare name that matches several entities is resolved to one of them and
-    /// says so.
+    /// A bare name that several entities carry as their whole name is answered
+    /// for each of them, never for a ranked one.
     ///
-    /// A repository holding both `Database.resolve` and `LinkGraph.resolve`
-    /// answered `find_references(query: "resolve")` with one of them and its
-    /// reference list, and nothing in the response mentioned that the other
-    /// existed. The answer was correct; a rename driven by it on a colliding
-    /// name is a rename driven by an unannounced guess.
+    /// A repository holding a `resolve` function in `database.rs` and another
+    /// in `link_graph.rs` answered `find_references(query: "resolve")` with one
+    /// of them and its reference list, and at first nothing in the response
+    /// mentioned that the other existed; later it said so and still answered
+    /// for one. A rename driven by it on a colliding name is a rename driven by
+    /// a guess. Two unrelated free functions have no owner to label a section
+    /// with, and they are sectioned by entity id and the module-qualified name
+    /// that names each alone.
     #[tokio::test]
     async fn find_references_reports_an_ambiguous_name_resolution() {
         let store = InMemoryGraph::new();
@@ -12282,15 +15832,17 @@ mod tests {
             body["focal_resolution"]["same_name_candidates"], 2,
             "two entities carry this name and the response must say so: {body}"
         );
-        let degradations = body["degradations"]
+        assert_eq!(body["resolution"], "same_name", "{body}");
+        let mut sectioned: Vec<String> = body[AMBIGUOUS_CANDIDATES_KEY]
             .as_array()
-            .unwrap_or_else(|| panic!("an ambiguous resolution must degrade: {body}"));
-        assert!(
-            degradations
-                .iter()
-                .any(|entry| entry["reason"] == "ambiguous_name"),
-            "the ambiguity must be named, not left to focal_entity: {body}"
-        );
+            .unwrap_or_else(|| panic!("each entity is answered in its own section: {body}"))
+            .iter()
+            .map(|section| section["entity_id"].as_str().unwrap().to_string())
+            .collect();
+        sectioned.sort_unstable();
+        let mut expected = vec![one.id.to_string(), two.id.to_string()];
+        expected.sort_unstable();
+        assert_eq!(sectioned, expected, "{body}");
 
         // Addressing the same entity by id is not ambiguous and must not
         // degrade: the caller already pinned the choice.
@@ -12443,23 +15995,20 @@ mod tests {
              Database.resolve's: {other_section}"
         );
 
-        // Neither section's own `degradations` (if any) is what discloses the
-        // ambiguity -- that is a fact about the QUERY, not about one candidate
-        // -- so it travels once, at the top.
-        let degradations = body["degradations"]
-            .as_array()
-            .unwrap_or_else(|| panic!("a sectioned answer must degrade: {body}"));
-        let disclosure = degradations
-            .iter()
-            .find(|entry| entry["reason"] == "ambiguous_name")
-            .unwrap_or_else(|| panic!("the ambiguity must be named: {body}"));
-        assert_eq!(disclosure["component"], "focal_resolution", "{disclosure}");
+        // Neither section's own blocks are what disclose the ambiguity -- that
+        // is a fact about the QUERY, not about one candidate -- so it travels
+        // once, at the top, in `focal_resolution`. Every candidate was
+        // answered, so it is not a degradation.
+        let disclosure = &body["focal_resolution"];
+        assert_eq!(disclosure["matched"], "member_name", "{disclosure}");
+        assert_eq!(disclosure["sectioned"], 2, "{disclosure}");
         let detail = disclosure["detail"].as_str().unwrap();
         assert!(detail.contains("resolve"), "{detail}");
         assert!(
-            detail.contains("owner-qualified"),
+            detail.contains("qualified_name") && detail.contains("entity_id"),
             "the disclosure must point the caller at the remedy: {detail}"
         );
+        assert!(body.get("degradations").is_none(), "{body}");
     }
 
     /// The pallets/flask shape the bare-name benchmark arm lost 25 points on:
@@ -12726,14 +16275,22 @@ mod tests {
             serde_json::json!(helper.id),
             "{body}"
         );
-        let others: Vec<&str> = body["focal_resolution"]["other_candidates"]
+        // The member is disclosed beside the answer, and not counted as a
+        // candidate the name could have resolved to: the exact tier answers
+        // first, so the resolution itself is not ambiguous.
+        assert_eq!(
+            body["focal_resolution"]["same_name_candidates"], 1,
+            "{body}"
+        );
+        assert_eq!(body["focal_resolution"]["matched"], "exact_name", "{body}");
+        let members: Vec<&str> = body["focal_resolution"]["member_candidates"]
             .as_array()
-            .unwrap()
+            .unwrap_or_else(|| panic!("the member is disclosed: {body}"))
             .iter()
             .map(|row| row["name"].as_str().unwrap())
             .collect();
         assert_eq!(
-            others,
+            members,
             vec!["Flask.url_for"],
             "the member is disclosed: {body}"
         );
@@ -13168,6 +16725,155 @@ mod tests {
             vec![members[10].id.to_string(), members[11].id.to_string()]
         );
         assert!(body.get("omitted_candidates").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn find_references_exact_name_rejects_substring_cousins_and_missing_names() {
+        let store = InMemoryGraph::new();
+        let cousin = make_entity_in(
+            LanguageId::Python,
+            "test_app_ctx_globals_methods",
+            "tests/test_appctx.py",
+        );
+        let caller = make_entity_in(LanguageId::Python, "run_tests", "tests/runner.py");
+        for entity in [&cousin, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(caller.id, cousin.id, RelationKind::Calls))
+            .unwrap();
+
+        // Even a referenced cousin is not the requested focal. Empty and glob
+        // queries must not turn an exact reference lookup into discovery.
+        for query in ["_app_ctx", "app_ctx", "_app*", "", "absent_symbol"] {
+            let args = HashMap::from([("query".to_string(), serde_json::json!(query))]);
+            let result = handle_find_references(&args, &store, None).await.unwrap();
+            assert_eq!(result.is_error, Some(true), "query={query:?}: {result:?}");
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            assert_eq!(text, FIND_REFERENCES_FOCAL_MISS, "query={query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn find_references_exact_name_preserves_whole_and_member_precedence() {
+        for include_exact in [false, true] {
+            let store = InMemoryGraph::new();
+            let exact = make_entity_in(LanguageId::Python, "_app_ctx", "src/globals.py");
+            let member = make_method_in(LanguageId::Python, "Scope._app_ctx", "src/scope.py");
+            let cousin = make_entity_in(
+                LanguageId::Python,
+                "test_app_ctx_globals_methods",
+                "tests/test_appctx.py",
+            );
+            for entity in [&member, &cousin] {
+                store.upsert_entity(entity).unwrap();
+            }
+            if include_exact {
+                store.upsert_entity(&exact).unwrap();
+            }
+            let target = if include_exact { &exact } else { &member };
+            for (query, expected) in [("_app_ctx", target), ("Scope._app_ctx", &member)] {
+                let args = HashMap::from([("query".to_string(), serde_json::json!(query))]);
+                let result = handle_find_references(&args, &store, None).await.unwrap();
+                assert_ne!(result.is_error, Some(true), "{result:?}");
+                let body = parsed_response(&result);
+                assert_eq!(
+                    body["focal_entity"]["id"],
+                    serde_json::json!(expected.id),
+                    "{body}"
+                );
+                assert!(body.get("ambiguous_focal").is_none(), "{body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn find_references_exact_name_preserves_module_qualification_and_ambiguity() {
+        let store = InMemoryGraph::new();
+        let first = make_entity_in(LanguageId::Python, "_app_ctx", "src/flask/ctx.py");
+        let second = make_entity_in(LanguageId::Python, "_app_ctx", "src/flask/helpers.py");
+        for (name, file) in [
+            ("flask", "src/flask/__init__.py"),
+            ("ctx", "src/flask/ctx.py"),
+            ("helpers", "src/flask/helpers.py"),
+        ] {
+            let mut module = make_entity_in(LanguageId::Python, name, file);
+            module.kind = EntityKind::Module;
+            store.upsert_entity(&module).unwrap();
+        }
+        for entity in [&first, &second] {
+            store.upsert_entity(entity).unwrap();
+        }
+
+        let args = HashMap::from([("query".to_string(), serde_json::json!("_app_ctx"))]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(body["ambiguous_focal"], true, "{body}");
+        assert_eq!(body["candidate_count"], 2, "{body}");
+        let sections = body[AMBIGUOUS_CANDIDATES_KEY].as_array().unwrap();
+        for expected in [&first, &second] {
+            assert!(
+                sections
+                    .iter()
+                    .any(|row| row["entity_id"] == expected.id.to_string()),
+                "{body}"
+            );
+        }
+
+        for (query, expected) in [
+            ("ctx._app_ctx", &first),
+            ("flask.ctx._app_ctx", &first),
+            ("flask.helpers._app_ctx", &second),
+        ] {
+            let args = HashMap::from([("query".to_string(), serde_json::json!(query))]);
+            let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+            assert_eq!(
+                body["focal_entity"]["id"],
+                serde_json::json!(expected.id),
+                "{query}: {body}"
+            );
+            assert!(body.get("ambiguous_focal").is_none(), "{body}");
+        }
+        let args = HashMap::from([("query".to_string(), serde_json::json!("missing._app_ctx"))]);
+        assert_eq!(
+            handle_find_references(&args, &store, None)
+                .await
+                .unwrap()
+                .is_error,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn find_references_exact_name_preserves_declaration_twin_folding() {
+        let store = InMemoryGraph::new();
+        let mut prototype = make_entity_in(LanguageId::C, "dispatch", "include/api.h");
+        prototype.signature = "void dispatch(void);".to_string();
+        let mut definition = make_entity_in(LanguageId::C, "dispatch", "src/api.c");
+        definition.signature = "void dispatch(void)".to_string();
+        let mut arm = definition.clone();
+        arm.id = EntityId::new();
+        let caller = make_entity_in(LanguageId::C, "serve", "src/server.c");
+        for entity in [&prototype, &definition, &arm, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(
+                caller.id,
+                definition.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let args = HashMap::from([("query".to_string(), serde_json::json!("dispatch"))]);
+        let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
+        assert_eq!(
+            body["focal_entity"]["id"],
+            serde_json::json!(definition.id),
+            "{body}"
+        );
+        assert!(body.get("ambiguous_focal").is_none(), "{body}");
+        assert_eq!(body["total_upstream"], 1, "{body}");
+        assert_eq!(body["references"][0]["name"], "serve", "{body}");
     }
 
     /// A bare name matching no entity at all keeps today's refusal exactly:
@@ -13837,10 +17543,13 @@ mod tests {
         );
         spine.refresh_cross_repo_edges("provider", &[], &[], &["provider".to_string()]);
 
-        let args = HashMap::from([(
-            "entity_id".to_string(),
-            serde_json::json!(target.id.to_string()),
-        )]);
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
         let matching = handle_find_references_with_authority(
             &args,
             &graph,
@@ -13920,10 +17629,13 @@ mod tests {
         // which is the ordinary state of a fresh single-repo install.
         let spine = kin_spine::InMemorySpineBackend::new();
 
-        let args = HashMap::from([(
-            "entity_id".to_string(),
-            serde_json::json!(target.id.to_string()),
-        )]);
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
         let response = handle_find_references_with_authority(
             &args,
             &graph,
@@ -14643,7 +18355,7 @@ mod tests {
 
         assert!(response["references"].as_array().unwrap().is_empty());
         assert_eq!(
-            response["edge_coverage"]["cross_file_classes"],
+            response["edge_coverage"]["cross_unit_classes"],
             serde_json::json!([]),
             "the observation is what makes the gap visible: {}",
             response["edge_coverage"]
@@ -14664,7 +18376,7 @@ mod tests {
         );
         assert!(
             trust_reason(&response).contains(
-                "the graph holds no cross-file calls, imports, references edges for Rust"
+                "the graph holds no calls, imports, references edges between modules for Rust"
             ),
             "the absent classes are named: {}",
             trust_reason(&response)
@@ -14894,10 +18606,13 @@ mod tests {
         spine.register_repo("nk", vec![spine_entry("nk", &target)], &registered_root);
         spine.refresh_cross_repo_edges("nk", &[], &[], &["nk".to_string()]);
 
-        let args = HashMap::from([(
-            "entity_id".to_string(),
-            serde_json::json!(target.id.to_string()),
-        )]);
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
         let response = parsed_response(&crate::finalize_with_envelope(
             handle_find_references_with_authority(
                 &args,
@@ -14917,8 +18632,8 @@ mod tests {
 
         assert!(response["references"].as_array().unwrap().is_empty());
         assert_eq!(
-            response["edge_coverage"]["cross_file_classes"],
-            serde_json::json!(["calls", "imports", "references"]),
+            response["edge_coverage"]["cross_unit_classes"],
+            serde_json::json!(["calls"]),
             "every requested class is linked across files, which since FIR-2672 is what an \
              earned absence needs: {}",
             response["edge_coverage"]
@@ -15013,10 +18728,13 @@ mod tests {
         );
         spine.refresh_cross_repo_edges("requests", &[], &[], &["requests".to_string()]);
 
-        let args = HashMap::from([(
-            "entity_id".to_string(),
-            serde_json::json!(target.id.to_string()),
-        )]);
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
         parsed_response(&crate::finalize_with_envelope(
             handle_find_references_with_authority(
                 &args,
@@ -15367,7 +19085,7 @@ mod tests {
 
         assert!(response["references"].as_array().unwrap().is_empty());
         assert_eq!(
-            response["edge_coverage"]["cross_file_classes"],
+            response["edge_coverage"]["cross_unit_classes"],
             serde_json::json!(["calls"]),
             "the fixture is the express shape: calls linked, imports not: {}",
             response["edge_coverage"]
@@ -16435,7 +20153,7 @@ mod tests {
             "the walk continued beneath the clipped focal: {untargeted}"
         );
         assert_eq!(
-            untargeted["clipped_steps"][0]["dropped_crossing_file"], 2,
+            untargeted["clipped_steps"][0]["dropped_crossing_unit"], 2,
             "two module-crossing hops were dropped: {untargeted}"
         );
         assert!(
@@ -17300,34 +21018,81 @@ mod tests {
     /// candidate lands on neither, and the walk follows one twin. An empty
     /// chain there answers for both twins a question that was asked of one, so
     /// it must never be certified.
+    ///
+    /// Arms of one declaration in one file fold to one entity when the walk is
+    /// addressed by name, and the folded twin stays named as the other
+    /// candidate, so the resolution still refuses to certify. Same-named
+    /// definitions in two files are two answers, and the walk refuses the
+    /// name rather than following one. Pinned by id, the walk answers for the
+    /// entity it was given and reports the twin count the way a pinned
+    /// `find_references` does, which is a bound on completeness and not an
+    /// ambiguity.
     #[test]
     fn trace_data_flow_same_named_twins_never_certify_absence() {
         let store = InMemoryGraph::new();
-        let real = make_entity("process_embedding_queue", "src/engine/graph.rs");
-        let stub = make_entity("process_embedding_queue", "src/engine/graph_stub.rs");
-        store.upsert_entity(&real).unwrap();
-        store.upsert_entity(&stub).unwrap();
+        let unix = make_entity("process_embedding_queue", "src/engine/graph.rs");
+        let windows = make_entity("process_embedding_queue", "src/engine/graph.rs");
+        store.upsert_entity(&unix).unwrap();
+        store.upsert_entity(&windows).unwrap();
 
         let response = traced_response(
             &store,
-            &real.id.to_string(),
+            "process_embedding_queue",
             "callers",
             structurally_ready_envelope(),
         );
-        assert_eq!(response["total_steps"], 0);
+        assert_eq!(response["total_steps"], 0, "{response}");
         assert_eq!(response["focal_resolution"]["same_name_candidates"], 2);
+        assert_eq!(
+            response["focal_resolution"]["other_candidates"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "the folded twin is named: {response}"
+        );
         assert_eq!(
             response["negative"]["safe_to_conclude_absent"], false,
             "a name the graph holds twice cannot certify absence for either twin: {}",
             response["negative"]
         );
         assert!(trust_reason(&response).contains("focal_resolution_ambiguous"));
+
+        let store = InMemoryGraph::new();
+        let real = make_entity("process_embedding_queue", "src/engine/graph.rs");
+        let stub = make_entity("process_embedding_queue", "src/engine/graph_stub.rs");
+        store.upsert_entity(&real).unwrap();
+        store.upsert_entity(&stub).unwrap();
+        let refused = traced_response(
+            &store,
+            "process_embedding_queue",
+            "callers",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(refused["ambiguous_focal"], true, "{refused}");
+        assert_eq!(refused["candidate_count"], 2, "{refused}");
+
+        let pinned = traced_response(
+            &store,
+            &real.id.to_string(),
+            "callers",
+            structurally_ready_envelope(),
+        );
+        assert_eq!(pinned["focal_resolution"]["addressed_by"], "entity_id");
+        assert_eq!(pinned["focal_resolution"]["same_name_candidates"], 2);
+        assert_eq!(
+            pinned["focal_resolution"]["other_candidates"],
+            serde_json::json!([])
+        );
     }
 
     /// Receiver-method calls are linked by bare name while method entities are
     /// keyed by their qualified name, so a method's incoming call edges are
-    /// frequently missing. `find_references` has always refused to certify that
-    /// absence; the trace reads the same edges and now refuses too.
+    /// frequently missing. A callers walk from a method takes the named-scope
+    /// reading `find_references` takes for it, and that reading, not the
+    /// focal's kind alone, decides the method gate (see
+    /// `crate::trace_named_scope`, which pins both sides of it). This graph
+    /// links nothing across files, so the empty walk still refuses absence on
+    /// its own substrate, and the reply says the method was read.
     #[test]
     fn trace_data_flow_method_focal_never_certifies_an_empty_callers_walk() {
         let store = InMemoryGraph::new();
@@ -17346,7 +21111,12 @@ mod tests {
             "an empty callers walk on a method is not proof of disuse: {}",
             response["negative"]
         );
-        assert!(trust_reason(&response).contains("method_call_resolution_incomplete"));
+        assert!(trust_reason(&response).contains("cross_file_edges_absent"));
+        assert_eq!(
+            response[crate::call_sites::CALL_SITES_KEY]["methods"]["read"],
+            1,
+            "{response:#}"
+        );
     }
 
     /// An empty walk is empty only on the side that was walked. This focal is
@@ -17511,10 +21281,32 @@ mod tests {
             "the direction parameter must be declared: {}",
             tool.input_schema
         );
-        assert!(
-            tool.description.contains("both directions"),
-            "the description must state that traversal is bidirectional"
+        assert_eq!(
+            tool.input_schema["properties"]["direction"]["type"],
+            "string"
         );
+        assert_eq!(
+            tool.input_schema["properties"]["direction"]["default"],
+            "both"
+        );
+        for semantic_term in [
+            "dependencies",
+            "dependents",
+            "both",
+            "UUID",
+            "relationships",
+        ] {
+            assert!(
+                tool.description.contains(semantic_term),
+                "{semantic_term}: {}",
+                tool.description
+            );
+        }
+        for physical_selector in ["file", "files", "file_path", "path", "directory"] {
+            assert!(tool.input_schema["properties"]
+                .get(physical_selector)
+                .is_none());
+        }
     }
 
     /// This file may not quietly go back to the outgoing-only traversal:
@@ -17897,49 +21689,328 @@ mod tests {
                 "reason": REACH_CALLEE_SPELLS,
             })
         };
+        // Thirteen named leftovers, more than any sample the reply once cut
+        // them to: every one rides the answer-only reply.
+        let rows: Vec<serde_json::Value> = (0..13)
+            .map(|index| named(&format!("caller_{index}"), index))
+            .collect();
         let mut reply = serde_json::json!({
             "focal_entity": { "name": "AppContext.pop" },
             "references": [],
             "total_upstream": 3,
             "unconfirmed_candidates": 0,
+            "focal_resolution": { "same_name_candidates": 1, "other_candidates": [] },
             crate::call_sites::CALL_SITES_KEY: {
-                "candidate_count": 3,
-                "candidates_by_reason": { REACH_CALLEE_SPELLS: 2, REACH_FOCAL_ESCAPES: 1 },
-                "candidates": [
-                    named("test_teardown_on_pop", 10),
-                    named("test_context_test", 4),
-                    {
-                        "caller": "github_link-id",
-                        "caller_name": "github_link",
-                        "callee": "endswith",
-                        "state": "unresolved",
-                        "reason": REACH_FOCAL_ESCAPES,
-                    },
-                ],
+                "candidate_count": 13,
+                "candidates": rows,
+                "value_calls": {
+                    "sites": 1256,
+                    "callers": 400,
+                    "callers_unread": 0,
+                    "by_reason": { REACH_FOCAL_ESCAPES: 1256 },
+                    "census": { "escape": "unknown", "reason": "dynamic access in the domain" },
+                },
             },
         });
         project_answer_only(&mut reply);
         let summary = &reply[CALL_SITE_CANDIDATES_KEY];
-        assert_eq!(summary["count"], 3, "{reply}");
-        assert_eq!(summary["by_reason"][REACH_FOCAL_ESCAPES], 1, "{reply}");
-        let names: Vec<&str> = summary["named"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["caller_name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["test_teardown_on_pop", "test_context_test"]);
-        assert_eq!(summary["named"][0]["line_in_entity"], 10);
-        assert!(
-            summary.get("named_withheld").is_none(),
-            "every named row fit: {reply}"
+        let named_rows = summary["named"].as_array().unwrap();
+        assert_eq!(named_rows.len(), 13, "{reply}");
+        assert_eq!(
+            named_rows[12],
+            serde_json::json!({
+                "caller": "caller_12-id",
+                "caller_name": "caller_12",
+                "line_in_entity": 12,
+                "callee": "pop",
+                "state": "unresolved",
+            }),
+            "a row carries what a reader acts on and nothing else: {reply}"
         );
+        assert_eq!(summary["value_calls"]["sites"], 1256, "{reply}");
+        assert_eq!(
+            summary["value_calls"]["census"]["escape"], "unknown",
+            "{reply}"
+        );
+        assert!(
+            summary["value_calls"].get("callers_unread").is_none(),
+            "{reply}"
+        );
+        for dropped in ["count", "by_reason", "detail", "named_withheld"] {
+            assert!(summary.get(dropped).is_none(), "{dropped}: {reply}");
+        }
         let text = serde_json::to_string(summary).unwrap();
         assert!(
             !text.contains("test_reqctx.py"),
             "a candidate is addressed by its caller, never by file: {reply}"
         );
         assert!(reply.get(crate::call_sites::CALL_SITES_KEY).is_none());
+        assert!(
+            reply.get("focal_resolution").is_none(),
+            "an unambiguous name keeps no resolution block: {reply}"
+        );
+    }
+
+    /// A named leftover's module is the only place a later reply can read
+    /// which module holds the caller. The projection that prints
+    /// `caller_module` reads this key.
+    #[test]
+    fn a_named_leftover_keeps_the_callers_module() {
+        let mut reply = serde_json::json!({
+            "focal_entity": { "name": "move_cursor_to_column" },
+            "references": [],
+            "total_upstream": 0,
+            "unconfirmed_candidates": 0,
+            crate::call_sites::CALL_SITES_KEY: {
+                "candidate_count": 2,
+                "candidates": [
+                    {
+                        "caller": "caller-id",
+                        "caller_name": "test_move_cursor_to_column",
+                        "module": "tests.test_win32_console",
+                        "line_in_entity": 40,
+                        "callee": "move_cursor_to_column",
+                        "state": "unresolved",
+                        "expr": "term.move_cursor_to_column(5)",
+                    },
+                    {
+                        "caller": "blank-id",
+                        "caller_name": "other",
+                        "module": "",
+                        "line_in_entity": 1,
+                        "callee": "move_cursor_to_column",
+                        "state": "unresolved",
+                        "expr": "other()",
+                    },
+                ],
+            },
+        });
+        project_answer_only(&mut reply);
+        let named = reply[CALL_SITE_CANDIDATES_KEY]["named"].as_array().unwrap();
+        assert_eq!(named[0]["module"], "tests.test_win32_console", "{reply}");
+        assert!(
+            named[1].get("module").is_none(),
+            "a blank module is the same as none: {reply}"
+        );
+    }
+
+    /// An answer with no leftovers keeps the census that found the focal is
+    /// never held as a value: it is the fact that lets an empty answer say it
+    /// checked value uses too. A census that measured nothing keeps no block.
+    #[test]
+    fn an_answer_only_reply_keeps_a_census_that_ruled_out_value_uses() {
+        let reply = |escape: &str| {
+            let mut reply = serde_json::json!({
+                "focal_entity": { "name": "_make_timedelta" },
+                "references": [],
+                "total_upstream": 0,
+                "unconfirmed_candidates": 0,
+                crate::call_sites::CALL_SITES_KEY: {
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "focal_escape": {"entities_checked": 1767, "escape": escape, "residue": {}},
+                },
+            });
+            project_answer_only(&mut reply);
+            reply
+        };
+        let contained = reply("contained");
+        assert_eq!(
+            contained[CALL_SITE_CANDIDATES_KEY],
+            serde_json::json!({"named": [], "census": {
+                "entities_checked": 1767, "escape": "contained", "residue": {}}}),
+            "{contained}"
+        );
+        let unknown = reply("unknown");
+        assert!(unknown.get(CALL_SITE_CANDIDATES_KEY).is_none(), "{unknown}");
+    }
+
+    /// The non-call reads the census matched or listed answer imports and
+    /// references. A reply to a question about calls alone keeps them out of
+    /// the places it lists to check; one that asked for references keeps them.
+    #[test]
+    fn an_answer_only_reply_lists_non_call_reads_only_when_they_were_asked_for() {
+        let reply = |kinds: serde_json::Value| {
+            let mut reply = serde_json::json!({
+                "focal_entity": { "name": "formatOwnerStack" },
+                "references": [],
+                "total_upstream": 0,
+                "unconfirmed_candidates": 0,
+                "relation_kinds": kinds,
+                crate::call_sites::CALL_SITES_KEY: {
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "focal_escape": {"entities_checked": 9, "escape": "contained", "residue": {
+                        "mentions": {"measured": true, "count": 1, "matched": {},
+                            "unmatched": {"count": 1, "sites": [{"kind": "import"}]}}}},
+                },
+            });
+            project_answer_only(&mut reply);
+            reply
+        };
+        let calls = reply(serde_json::json!(["calls"]));
+        assert!(
+            calls[CALL_SITE_CANDIDATES_KEY]["census"]["residue"]
+                .get("mentions")
+                .is_none(),
+            "{calls}"
+        );
+        let references = reply(serde_json::json!(["calls", "references"]));
+        assert_eq!(
+            references[CALL_SITE_CANDIDATES_KEY]["census"]["residue"]["mentions"]["count"], 1,
+            "{references}"
+        );
+    }
+
+    /// A caller whose call spells the focal's one call name, while the store
+    /// holds no other definition it can reach, is served as a `name_unique`
+    /// row. It supersedes the caller's withheld candidate row, and a caller a
+    /// proven edge already counts keeps its proven row alone.
+    #[test]
+    fn a_promoted_caller_is_served_as_a_name_unique_row_and_supersedes_its_withheld_row() {
+        use crate::call_sites::fixture::{admit, ledger, proof_context, spanned_entity};
+        use kin_model::{CallSiteState, LanguageId, UnresolvedReason};
+
+        struct Text<'a>(&'a str);
+        impl super::super::external_symbols::SiteText for Text<'_> {
+            fn quote(
+                &self,
+                caller: &kin_model::Entity,
+                site: &kin_model::entity::SourceSpan,
+            ) -> std::result::Result<String, &'static str> {
+                let span = caller.span.as_ref().ok_or("caller_has_no_span")?;
+                super::super::external_symbols::quote_site(caller, site, self.0, span.start_byte)
+            }
+        }
+
+        let store = InMemoryGraph::new();
+        let body = "def run():\n    store.lookup(1)\n";
+        let caller = spanned_entity("run", "app.py", LanguageId::Python, 0, body);
+        let focal = spanned_entity(
+            "Store.lookup",
+            "lib.py",
+            LanguageId::Python,
+            0,
+            "def lookup(self, key):\n    pass\n",
+        );
+        let context = proof_context(LanguageId::Python, "current");
+        let context_id = context.id();
+        admit(
+            &store,
+            &[&caller],
+            vec![
+                context,
+                ledger(
+                    &caller,
+                    body,
+                    context_id,
+                    vec![(
+                        "lookup",
+                        CallSiteState::Unresolved {
+                            reason: UnresolvedReason::NoAnswer,
+                        },
+                    )],
+                ),
+            ],
+        );
+        let scan = crate::call_sites::scan_focal(
+            &store,
+            &focal,
+            &Text(body),
+            crate::call_sites::NO_CENSUS,
+        )
+        .unwrap();
+        assert_eq!(scan.promoted.len(), 1, "{:?}", scan.name_unique);
+
+        let row_for = |entity: &kin_model::Entity| ReferenceRow {
+            recorded_owners: crate::semantic_owners::RecordedOwners::observe(&store, entity),
+            repo_id: None,
+            foreign_entity_id: None,
+            entity_id: Some(entity.id.to_string()),
+            name: entity.name.clone(),
+            kind: Some(format!("{:?}", entity.kind)),
+            file_path: entity.file_origin.as_ref().map(|path| path.to_string()),
+            reference_lines: Vec::new(),
+            site_addresses: std::collections::BTreeMap::new(),
+            reference_lines_partial: None,
+            reference_lines_absent: None,
+            signature: None,
+            snippet: None,
+            relation_kinds: vec![RelationKind::Calls],
+            resolution: Some(RelationResolution::NameOnly),
+            via_override_of: None,
+            receiver_name_guess: true,
+            role: Some(entity.role),
+            edges: Vec::new(),
+        };
+        let mut withheld = vec![row_for(&caller)];
+        let rows = name_unique_reference_rows::<kin_db::InMemoryGraph>(
+            None,
+            Some(&scan),
+            &[],
+            &mut withheld,
+            false,
+        );
+        assert!(
+            withheld.is_empty(),
+            "the promotion supersedes the withheld row"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["resolution"], NAME_UNIQUE_RESOLUTION, "{}", rows[0]);
+        assert_eq!(rows[0]["entity_id"], caller.id.to_string(), "{}", rows[0]);
+        assert_eq!(
+            rows[0]["sites"],
+            serde_json::json!([{
+                "line_in_entity": 1,
+                "callee": "lookup",
+                "expr": "store.lookup(1)",
+                "receiver": "store",
+            }]),
+            "{}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["projection"]["path"], "app.py", "{}", rows[0]);
+
+        let counted = vec![row_for(&caller)];
+        assert!(
+            name_unique_reference_rows::<kin_db::InMemoryGraph>(
+                None,
+                Some(&scan),
+                &counted,
+                &mut Vec::new(),
+                false
+            )
+            .is_empty(),
+            "a counted caller is not served twice"
+        );
+    }
+
+    /// The `ambiguous_name` degradation tells a reader to pin the choice from
+    /// `focal_resolution.other_candidates`, so an answer-only reply keeps that
+    /// pointer's target whenever the name was ambiguous.
+    #[test]
+    fn answer_only_keeps_the_rivals_an_ambiguous_name_points_to() {
+        let mut reply = serde_json::json!({
+            "focal_entity": { "name": "_make_timedelta" },
+            "references": [],
+            "total_upstream": 1,
+            "focal_resolution": {
+                "addressed_by": "name",
+                "same_name_candidates": 2,
+                "matched": "exact_name",
+                "other_candidates": [{ "id": "rival-id", "name": "_make_timedelta" }],
+            },
+            "degradations": [{ "component": "focal_resolution", "reason": "ambiguous_name" }],
+        });
+        project_answer_only(&mut reply);
+        assert_eq!(
+            reply["focal_resolution"],
+            serde_json::json!({
+                "same_name_candidates": 2,
+                "other_candidates": [{ "id": "rival-id", "name": "_make_timedelta" }],
+            }),
+            "{reply}"
+        );
     }
 
     /// The parameter serves the same answer and the trust observations that qualify it.
@@ -18513,11 +22584,18 @@ mod tests {
         );
     }
 
+    /// A focal entity and `callers` entities that each call it, written as two
+    /// batches and one text-index flush.
+    ///
+    /// One write per entity and per edge re-indexed the focal's text on every
+    /// edge, and that text names every caller so far, so building 400 callers
+    /// cost more than the handlers under test. The batches leave the same
+    /// entities, edges and indexes the handlers read.
     fn wide_store(callers: usize) -> (InMemoryGraph, EntityId) {
-        let store = InMemoryGraph::new();
         let focal = make_entity("resolve_redirects", "src/sessions.rs");
         let focal_id = focal.id;
-        store.upsert_entity(&focal).unwrap();
+        let mut entities = vec![focal];
+        let mut relations = Vec::with_capacity(callers);
         for index in 0..callers {
             let mut caller = make_entity(
                 &format!("caller_number_{index}_with_a_realistic_symbol_name"),
@@ -18528,11 +22606,13 @@ mod tests {
                  method survives the hop."
                     .to_string(),
             );
-            store.upsert_entity(&caller).unwrap();
-            store
-                .upsert_relation(&make_relation(caller.id, focal_id, RelationKind::Calls))
-                .unwrap();
+            relations.push(make_relation(caller.id, focal_id, RelationKind::Calls));
+            entities.push(caller);
         }
+        let store = InMemoryGraph::new();
+        store.upsert_entities_batch(&entities).unwrap();
+        store.upsert_relations_batch(&relations).unwrap();
+        store.flush_text_index().unwrap();
         (store, focal_id)
     }
 
@@ -19400,5 +23480,78 @@ mod tests {
             payload[crate::query_tokens::LEXICAL_FALLBACK_KEY]["matched"],
             serde_json::json!(0)
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_context_order_tests {
+    use kin_model::context::{ContextEntry, ProjectionLevel};
+
+    fn entry(content: &str) -> ContextEntry {
+        ContextEntry {
+            entity_id: kin_model::EntityId::new(),
+            projection_level: ProjectionLevel::SignatureOnly,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_pack_serves_routes_and_bindings_before_optional_neighbours() {
+        let pack = kin_model::ContextPack {
+            focal_entities: vec![entry("def asked(): ...")],
+            dependency_signatures: vec![entry("def binding(): ...")],
+            transitive_deps: vec![
+                entry("def further(): ..."),
+                entry(&format!("{} a -> b", kin_context::ROUTE_MARKER)),
+            ],
+            contracts: vec![entry("class Contract: ...")],
+            tests: vec![entry("def test_asked(): ...")],
+            work_items: Vec::new(),
+            annotations: Vec::new(),
+            traffic: Vec::new(),
+            supporting_artifacts: Vec::new(),
+            token_budget: kin_model::context::TokenBudget::Custom(4000),
+            actual_tokens: 0,
+        };
+        let sections: Vec<&str> = super::multi_context_rows(&pack)
+            .into_iter()
+            .map(|(_, section)| section)
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                kin_context::ROUTE_GROUP,
+                kin_context::group::DEPENDENCIES,
+                kin_context::group::CONTRACTS,
+                kin_context::group::TRANSITIVE_DEPS,
+                kin_context::group::TESTS,
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod collapse_uninspectable_tests {
+    use super::collapse_uninspectable_sites;
+    use serde_json::json;
+
+    #[test]
+    fn blank_sites_collapse_per_caller_and_readable_sites_stay() {
+        let blank = |caller: &str| json!({"caller":caller,"caller_name":caller,"line_in_entity":null,"callee":null,"state":"unresolved"});
+        let readable = json!({"caller":"a","caller_name":"a","line_in_entity":3,"callee":"pop","state":"unresolved","expr":"x.pop()"});
+        let rows = vec![
+            blank("spec"),
+            readable.clone(),
+            blank("spec"),
+            blank("bundle"),
+            blank("spec"),
+        ];
+        let out = collapse_uninspectable_sites(rows);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["caller"], "spec");
+        assert_eq!(out[0]["occurrences"], 3);
+        assert_eq!(out[1], readable);
+        assert_eq!(out[2]["caller"], "bundle");
+        assert!(out[2].get("occurrences").is_none());
     }
 }

@@ -831,6 +831,67 @@ fn rust_invalidation_compares_exact_id_path_and_blob_but_ignores_unrelated_asset
     ));
 }
 
+/// A Cargo manifest held as a link reads its target, which can be named
+/// anything, so in a tree that holds one, a change at a path that could hold
+/// a manifest's text nominates every Rust source. A tree with no linked
+/// manifest still ignores it, and an asset no manifest text could be is
+/// ignored either way.
+#[test]
+fn a_linked_manifest_makes_its_possible_targets_project_inputs() {
+    use kin_index::rust_project::{affected_source_batch, is_project_input_of};
+    let f = fixture(&[
+        ("shared/tool.toml", MANIFEST),
+        ("crates/tool/src/lib.rs", "pub fn work() {}"),
+        ("readme.txt", "old"),
+    ]);
+    let link = TreeEntry::Symlink {
+        target_blob: kin_blobs::digest(b"../../shared/tool.toml"),
+    };
+    let linked = ResolvedTree::from_artifacts(f.tree.artifacts().cloned().chain([
+        kin_model::ResolvedArtifact {
+            artifact_id: ArtifactId::new(),
+            path: RepoPath::from_utf8("crates/tool/Cargo.toml").unwrap(),
+            entry: link,
+        },
+    ]))
+    .unwrap();
+    let changed = |tree: &ResolvedTree, path: &str| {
+        ResolvedTree::from_artifacts(tree.artifacts().cloned().map(|mut a| {
+            if a.path.as_bytes() == path.as_bytes() {
+                a.entry = TreeEntry::blob(kin_blobs::digest(b"new"), false);
+            }
+            a
+        }))
+        .unwrap()
+    };
+    assert!(is_project_input_of(&linked, b"shared/tool.toml"));
+    assert!(!is_project_input_of(&f.tree, b"shared/tool.toml"));
+    assert!(!is_project_input_of(&linked, b"readme.txt"));
+    let plan = affected_source_batch(
+        &linked,
+        &changed(&linked, "shared/tool.toml"),
+        Default::default(),
+    )
+    .unwrap()
+    .expect("a linked manifest's possible target is a project input");
+    assert_eq!(
+        plan.affected_sources,
+        vec![kin_model::FilePathId::new("crates/tool/src/lib.rs")]
+    );
+    assert!(affected_source_batch(
+        &f.tree,
+        &changed(&f.tree, "shared/tool.toml"),
+        Default::default()
+    )
+    .unwrap()
+    .is_none());
+    assert!(
+        affected_source_batch(&linked, &changed(&linked, "readme.txt"), Default::default())
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn assert_non_rs_support_is_explicitly_unproven(files: &[(&str, &str)]) {
     use kin_index::rust_project::RustProjectObservation;
     let f = fixture(files);
@@ -879,4 +940,51 @@ fn non_rs_path_module_is_unproven_until_support_invalidation_is_available() {
             "use crate::owner::leaf::work; pub fn run() { work(); }",
         ),
     ]);
+}
+
+/// Cargo decides 2015-edition target inference kind by kind: a package that
+/// writes out `[lib]` still has its binaries inferred, and one that writes out
+/// a `[[bin]]` infers no more binaries while its examples are still inferred.
+#[test]
+fn edition_2015_target_inference_is_decided_kind_by_kind() {
+    let roots = |manifest: &str| {
+        let f = fixture(&[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", "pub fn library() {}"),
+            ("src/main.rs", "fn main() {}"),
+            ("src/cli.rs", "fn main() {}"),
+            ("examples/demo.rs", "fn main() {}"),
+        ]);
+        let mut roots: Vec<_> = f
+            .authority()
+            .unwrap()
+            .targets()
+            .iter()
+            .map(|target| (target.kind.clone(), target.root.clone()))
+            .collect();
+        roots.sort();
+        roots
+    };
+    let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(kind, root)| (kind.to_string(), root.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        roots("[package]\nname='old'\n[lib]\nname='old'\n"),
+        owned(&[
+            ("bin", "src/main.rs"),
+            ("example", "examples/demo.rs"),
+            ("lib", "src/lib.rs"),
+        ])
+    );
+    assert_eq!(
+        roots("[package]\nname='old'\n[[bin]]\nname='cli'\npath='src/cli.rs'\n"),
+        owned(&[
+            ("bin", "src/cli.rs"),
+            ("example", "examples/demo.rs"),
+            ("lib", "src/lib.rs"),
+        ])
+    );
 }

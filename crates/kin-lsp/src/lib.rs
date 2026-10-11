@@ -11,19 +11,23 @@ pub mod analysis_env;
 pub mod cache;
 pub mod call_sites;
 pub mod client;
+pub mod concurrency;
 pub mod discovery;
 pub mod enrichment;
 pub mod error;
 pub mod external_symbols;
 pub mod file_enrichment;
 pub mod lifecycle;
+pub mod pace;
 pub mod proof;
 pub mod proof_context;
 pub mod protocol;
+pub mod readiness_probe;
 pub mod registry;
 pub mod relation_identity;
 mod server_process;
 mod source_positions;
+pub mod start_failure;
 mod typescript_call_hierarchy;
 
 pub use enrichment::{DocumentProvider, EnrichmentResult, EntityIndex, EntityRef};
@@ -38,5 +42,7 @@ pub use registry::{
 };
 pub use typescript_call_hierarchy::TypeScriptGrammars;
 
+#[cfg(test)]
+mod concurrency_tests;
 #[cfg(test)]
 mod enrichment_integrity_tests;

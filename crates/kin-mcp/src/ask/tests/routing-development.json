@@ -1,0 +1,2488 @@
+{
+ "about": "Questions developers asked about Flask and React, with the route the keyword rules give each one. The ask router is held to these routes question by question.",
+ "routes": [
+  {
+   "source": "first question",
+   "question": "What calls `AppContext.pop`? Check everything, tests and examples included. List every function that calls it.",
+   "intent": "callers_direct",
+   "target": "AppContext.pop",
+   "include_tests": true,
+   "candidates": [
+    "AppContext.pop"
+   ],
+   "targets": [
+    "AppContext.pop"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "I want to add a required parameter to `SessionInterface.open_session`. What has to change anywhere, tests included? List every function that calls it and every method that overrides it.",
+   "intent": "change_impact",
+   "target": "SessionInterface.open_session",
+   "include_tests": true,
+   "candidates": [
+    "SessionInterface.open_session"
+   ],
+   "targets": [
+    "SessionInterface.open_session"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "Is `_make_timedelta` in flask.app used anywhere, tests included? Can I delete it? On the line right after FINAL ANSWER write `VERDICT: USED` or `VERDICT: UNUSED`, then list every function that uses it (calls it, or passes or stores it as a value), or no lines if it is unused.",
+   "intent": "is_it_used",
+   "target": "_make_timedelta",
+   "include_tests": true,
+   "candidates": [
+    "_make_timedelta"
+   ],
+   "targets": [
+    "_make_timedelta"
+   ],
+   "qualifier": "flask.app",
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What inside the flask package can end up calling `App._find_error_handler`, directly or through other calls? Flask's own code only: skip tests and examples, and don't follow calls into other libraries. List every function.",
+   "intent": "callers_transitive",
+   "target": "App._find_error_handler",
+   "include_tests": false,
+   "candidates": [
+    "App._find_error_handler"
+   ],
+   "targets": [
+    "App._find_error_handler"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": "flask"
+  },
+  {
+   "source": "first question",
+   "question": "What calls `Store.containsElement` in React DevTools? Skip tests. List every function that calls it.",
+   "intent": "callers_direct",
+   "target": "Store.containsElement",
+   "include_tests": false,
+   "candidates": [
+    "Store.containsElement"
+   ],
+   "targets": [
+    "Store.containsElement"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "I want to add a required parameter to `commitTextUpdate`, the reconciler host-config function. What has to change? List every function that calls it and every renderer's implementation of it.",
+   "intent": "change_impact",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "Is `setEnabled` in ReactDOMEventListener (react-dom-bindings) used anywhere? Can I delete it? On the line right after FINAL ANSWER write `VERDICT: USED` or `VERDICT: UNUSED`, then list every function that uses it (calls it, or passes or stores it as a value), or no lines if it is unused.",
+   "intent": "is_it_used",
+   "target": "setEnabled",
+   "include_tests": true,
+   "candidates": [
+    "setEnabled"
+   ],
+   "targets": [
+    "setEnabled"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What can end up calling `advanceTimers` in the scheduler's Scheduler module (the real one, not the mock), directly or through other calls? List every function.",
+   "intent": "callers_transitive",
+   "target": "advanceTimers",
+   "include_tests": true,
+   "candidates": [
+    "advanceTimers"
+   ],
+   "targets": [
+    "advanceTimers"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What calls `App.add_template_filter` (`Flask` inherits it)? Check everything, tests and examples included. List every function that calls it.",
+   "intent": "callers_direct",
+   "target": "App.add_template_filter",
+   "include_tests": true,
+   "candidates": [
+    "App.add_template_filter",
+    "Flask"
+   ],
+   "targets": [
+    "App.add_template_filter"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "I want to add a required parameter to `JSONProvider.dumps`. What has to change anywhere, tests included? List every function that calls it (directly, or by passing the method to other code that calls it) and every method that overrides it.",
+   "intent": "change_impact",
+   "target": "JSONProvider.dumps",
+   "include_tests": true,
+   "candidates": [
+    "JSONProvider.dumps"
+   ],
+   "targets": [
+    "JSONProvider.dumps"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "Is the function `flask.json.load` used anywhere, tests included? Can I delete it? On the line right after FINAL ANSWER write `VERDICT: USED` or `VERDICT: UNUSED`, then list every function that uses it (calls it, or passes or stores it as a value), or no lines if it is unused.",
+   "intent": "is_it_used",
+   "target": "flask.json.load",
+   "include_tests": true,
+   "candidates": [
+    "flask.json.load"
+   ],
+   "targets": [
+    "flask.json.load"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What inside the flask package can end up calling `get_root_path`, directly or through other calls? Flask's own code only: skip tests and examples, and don't follow calls into other libraries. List every function.",
+   "intent": "callers_transitive",
+   "target": "get_root_path",
+   "include_tests": false,
+   "candidates": [
+    "get_root_path"
+   ],
+   "targets": [
+    "get_root_path"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": "flask"
+  },
+  {
+   "source": "first question",
+   "question": "What calls `resolveClassComponentProps` in react-reconciler? Skip tests. List every function that calls it.",
+   "intent": "callers_direct",
+   "target": "resolveClassComponentProps",
+   "include_tests": false,
+   "candidates": [
+    "resolveClassComponentProps"
+   ],
+   "targets": [
+    "resolveClassComponentProps"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "I want to add a required parameter to `pushSegmentFinale`, the Fizz host-config function. What has to change? List every function that calls it and every renderer's implementation of it. Skip the tests themselves, but renderers that exist for testing still count.",
+   "intent": "change_impact",
+   "target": "pushSegmentFinale",
+   "include_tests": false,
+   "candidates": [
+    "pushSegmentFinale"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "Is `logRecoverableError` in the test renderer's host config (ReactFiberConfigTestHost) used anywhere? Can I delete it? On the line right after FINAL ANSWER write `VERDICT: USED` or `VERDICT: UNUSED`, then list every function that uses it (calls it, or passes or stores it as a value), or no lines if it is unused.",
+   "intent": "is_it_used",
+   "target": "logRecoverableError",
+   "include_tests": true,
+   "candidates": [
+    "logRecoverableError"
+   ],
+   "targets": [
+    "logRecoverableError"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What can end up calling `isFiberSuspenseAndTimedOut` inside react-reconciler, directly or through other calls? Only the reconciler's own code: skip tests, and don't follow calls that pass through other packages. List every function.",
+   "intent": "callers_transitive",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": "react-reconciler"
+  },
+  {
+   "source": "first question",
+   "question": "What calls `FlaskCliRunner.invoke`? Check everything, tests and examples included. List every function that calls it.",
+   "intent": "callers_direct",
+   "target": "FlaskCliRunner.invoke",
+   "include_tests": true,
+   "candidates": [
+    "FlaskCliRunner.invoke"
+   ],
+   "targets": [
+    "FlaskCliRunner.invoke"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "I want to add a required parameter to `Scaffold.add_url_rule`. What has to change inside the flask package itself? Skip tests, examples and docs. List every function that calls it or one of its overrides, and every method that overrides it.",
+   "intent": "change_impact",
+   "target": "Scaffold.add_url_rule",
+   "include_tests": false,
+   "candidates": [
+    "Scaffold.add_url_rule"
+   ],
+   "targets": [
+    "Scaffold.add_url_rule"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": "flask"
+  },
+  {
+   "source": "first question",
+   "question": "Is `make_response` in flask.helpers used anywhere, tests included? Can I delete it? On the line right after FINAL ANSWER write `VERDICT: USED` or `VERDICT: UNUSED`, then list every function that uses it (calls it, or passes or stores it as a value), or no lines if it is unused.",
+   "intent": "is_it_used",
+   "target": "make_response",
+   "include_tests": true,
+   "candidates": [
+    "make_response"
+   ],
+   "targets": [
+    "make_response"
+   ],
+   "qualifier": "flask.helpers",
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What inside the flask package can end up calling `Scaffold.route`, directly or through other calls? Flask's own code only: skip tests and examples, and don't follow calls into other libraries. List every function.",
+   "intent": "callers_transitive",
+   "target": "Scaffold.route",
+   "include_tests": false,
+   "candidates": [
+    "Scaffold.route"
+   ],
+   "targets": [
+    "Scaffold.route"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": "flask"
+  },
+  {
+   "source": "first question",
+   "question": "What calls `formatOwnerStack`, the shared one in ReactOwnerStackFrames? Skip tests. List every function that calls it.",
+   "intent": "callers_direct",
+   "target": "formatOwnerStack",
+   "include_tests": false,
+   "candidates": [
+    "formatOwnerStack"
+   ],
+   "targets": [
+    "formatOwnerStack"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "I want to add a required parameter to `measureInstance`, the reconciler host-config function. What has to change? List every function that calls it and every renderer's implementation of it. Skip the tests themselves, but renderers that exist for testing still count.",
+   "intent": "change_impact",
+   "target": "measureInstance",
+   "include_tests": false,
+   "candidates": [
+    "measureInstance"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "Is `basicStateReducer` in ReactFiberHooks used anywhere? Can I delete it? On the line right after FINAL ANSWER write `VERDICT: USED` or `VERDICT: UNUSED`, then list every function that uses it (calls it, or passes or stores it as a value), or no lines if it is unused.",
+   "intent": "is_it_used",
+   "target": "basicStateReducer",
+   "include_tests": true,
+   "candidates": [
+    "basicStateReducer"
+   ],
+   "targets": [
+    "basicStateReducer"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "first question",
+   "question": "What can end up calling `getStylesObjectFromElement` inside react-dom-bindings, directly or through other calls? Only that package's own code: skip tests, and don't follow calls that pass through other packages. List every function.",
+   "intent": "callers_transitive",
+   "target": "getStylesObjectFromElement",
+   "include_tests": false,
+   "candidates": [
+    "getStylesObjectFromElement"
+   ],
+   "targets": [
+    "getStylesObjectFromElement"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": "react-dom-bindings"
+  },
+  {
+   "source": "follow-up",
+   "question": "Who directly calls the isFiberSuspenseAndTimedOut function defined in packages/react-reconciler/src/ReactFiberTreeReflection.js?",
+   "intent": "callers_direct",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": true,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src/ReactFiberTreeReflection.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the collectFirstScopedNode function in react-reconciler.ReactFiberScope? List all callers.",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNode",
+   "include_tests": true,
+   "candidates": [
+    "collectFirstScopedNode"
+   ],
+   "targets": [
+    "collectFirstScopedNode"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the collectNearestContextValues function in react-reconciler.ReactFiberScope? List all callers.",
+   "intent": "callers_direct",
+   "target": "collectNearestContextValues",
+   "include_tests": true,
+   "candidates": [
+    "collectNearestContextValues"
+   ],
+   "targets": [
+    "collectNearestContextValues"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the collectScopedNodes function in react-reconciler.ReactFiberScope? List all callers.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodes",
+   "include_tests": true,
+   "candidates": [
+    "collectScopedNodes"
+   ],
+   "targets": [
+    "collectScopedNodes"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the collectFirstScopedNodeFromChildren function in react-reconciler.ReactFiberScope? List all callers.",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNodeFromChildren",
+   "include_tests": true,
+   "candidates": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "targets": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the collectNearestChildContextValues function in react-reconciler.ReactFiberScope? List all callers.",
+   "intent": "callers_direct",
+   "target": "collectNearestChildContextValues",
+   "include_tests": true,
+   "candidates": [
+    "collectNearestChildContextValues"
+   ],
+   "targets": [
+    "collectNearestChildContextValues"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the collectScopedNodesFromChildren function in react-reconciler.ReactFiberScope? List all callers.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodesFromChildren",
+   "include_tests": true,
+   "candidates": [
+    "collectScopedNodesFromChildren"
+   ],
+   "targets": [
+    "collectScopedNodesFromChildren"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the DO_NOT_USE_queryFirstNode function in react-reconciler.ReactFiberScope? List all callers, including any that pass it as a value or callback.",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryFirstNode",
+   "include_tests": true,
+   "candidates": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the getChildContextValues function in react-reconciler.ReactFiberScope? List all callers, including any that pass it as a value or callback.",
+   "intent": "callers_direct",
+   "target": "getChildContextValues",
+   "include_tests": true,
+   "candidates": [
+    "getChildContextValues"
+   ],
+   "targets": [
+    "getChildContextValues"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls the DO_NOT_USE_queryAllNodes function in react-reconciler.ReactFiberScope? List all callers, including any that pass it as a value or callback.",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryAllNodes",
+   "include_tests": true,
+   "candidates": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Where is createScopeInstance defined and what does its code look like? Show the code.",
+   "intent": "where_is_it",
+   "target": "createScopeInstance",
+   "include_tests": true,
+   "candidates": [
+    "createScopeInstance"
+   ],
+   "targets": [
+    "createScopeInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "show_source",
+   "labelled_alternates": [
+    "where_is_it"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls createScopeInstance? List all callers.",
+   "intent": "callers_direct",
+   "target": "createScopeInstance",
+   "include_tests": true,
+   "candidates": [
+    "createScopeInstance"
+   ],
+   "targets": [
+    "createScopeInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src, are there any places that call a method on a scope instance object, such as fiber._reactScopeInstance.getChildContextValues, scopeInstance.DO_NOT_USE_queryAllNodes, scopeInstance.DO_NOT_USE_queryFirstNode, or scopeInstance.containsNode? Which functions contain such calls?",
+   "intent": "callers_direct",
+   "target": "fiber._reactScopeInstance.getChildContextValues",
+   "include_tests": true,
+   "candidates": [
+    "fiber._reactScopeInstance.getChildContextValues",
+    "scopeInstance.DO_NOT_USE_queryAllNodes",
+    "scopeInstance.DO_NOT_USE_queryFirstNode",
+    "scopeInstance.containsNode"
+   ],
+   "targets": [
+    "fiber._reactScopeInstance.getChildContextValues",
+    "scopeInstance.DO_NOT_USE_queryAllNodes",
+    "scopeInstance.DO_NOT_USE_queryFirstNode",
+    "scopeInstance.containsNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "other",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "Show the code of completeWork in react-reconciler.ReactFiberCompleteWork, specifically the part dealing with scopeInstance or createScopeInstance.",
+   "intent": "show_source",
+   "target": "completeWork",
+   "include_tests": true,
+   "candidates": [
+    "completeWork",
+    "scopeInstance",
+    "createScopeInstance"
+   ],
+   "targets": [
+    "completeWork"
+   ],
+   "qualifier": "react-reconciler.ReactFiberCompleteWork",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "show_source",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "What are the file paths for the module react-reconciler.ReactFiberScope and for the functions collectFirstScopedNode, collectFirstScopedNodeFromChildren, collectNearestContextValues, collectNearestChildContextValues, collectScopedNodes, collectScopedNodesFromChildren, DO_NOT_USE_queryAllNodes, DO_NOT_USE_queryFirstNode, getChildContextValues, createScopeInstance?",
+   "intent": "other",
+   "target": "collectFirstScopedNode",
+   "include_tests": true,
+   "candidates": [
+    "collectFirstScopedNode",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestContextValues",
+    "collectNearestChildContextValues",
+    "collectScopedNodes",
+    "collectScopedNodesFromChildren",
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "createScopeInstance"
+   ],
+   "targets": [
+    "collectFirstScopedNode",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestContextValues",
+    "collectNearestChildContextValues",
+    "collectScopedNodes",
+    "collectScopedNodesFromChildren",
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "createScopeInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "where_is_it",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src (excluding __tests__ directories), is isFiberSuspenseAndTimedOut exported and imported/used anywhere other than ReactFiberScope.js? Where is ReactScope-test.internal.js located in the repository?",
+   "intent": "is_it_used",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "is_it_used",
+   "labelled_alternates": [
+    "where_is_it"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions in packages/react-reconciler/src can end up calling the `isFiberSuspenseAndTimedOut` function defined in packages/react-reconciler/src/ReactFiberTreeReflection.js, either directly or through a chain of other calls? Follow the chain to any depth, but count only functions defined in packages/react-reconciler/src and calls made from code there, and ignore test files (anything under a __tests__ directory). List every one.",
+   "intent": "callers_transitive",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src/ReactFiberTreeReflection.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_transitive",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call isFiberSuspenseAndTimedOut, in packages/react-reconciler/src, excluding test files? List every call site.",
+   "intent": "callers_direct",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src (excluding test files), which functions call DO_NOT_USE_queryAllNodes, DO_NOT_USE_queryFirstNode, getChildContextValues, collectScopedNodesFromChildren, collectFirstScopedNodeFromChildren, or collectNearestChildContextValues?",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestChildContextValues"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding any __tests__ files) that calls isFiberSuspenseAndTimedOut directly.",
+   "intent": "callers_direct",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding any __tests__ files) that calls any of these functions: DO_NOT_USE_queryAllNodes, DO_NOT_USE_queryFirstNode, getChildContextValues, collectScopedNodesFromChildren, collectFirstScopedNodeFromChildren, collectNearestChildContextValues. Include where each caller is located.",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestChildContextValues"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__ files) that calls DO_NOT_USE_queryAllNodes, whether directly or through a stored reference/object property.",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__ files) that calls DO_NOT_USE_queryFirstNode, whether directly or through a stored reference/object property.",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryFirstNode",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__ files) that calls getChildContextValues, whether directly or through a stored reference/object property.",
+   "intent": "callers_direct",
+   "target": "getChildContextValues",
+   "include_tests": false,
+   "candidates": [
+    "getChildContextValues"
+   ],
+   "targets": [
+    "getChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src (excluding __tests__), which files import or reference ReactFiberScope.js, and is there any code in that directory that calls any of the collectScopedNodes, collectFirstScopedNode, collectNearestContextValues, collectScopedNodesFromChildren, or collectFirstScopedNodeFromChildren functions via an object property or stored value rather than a direct name?",
+   "intent": "is_it_used",
+   "target": "collectScopedNodes",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodes",
+    "collectFirstScopedNode",
+    "collectNearestContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "targets": [
+    "collectScopedNodes",
+    "collectFirstScopedNode",
+    "collectNearestContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "is_it_used",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__) that calls createScopeInstance (the one from ReactFiberScope.js).",
+   "intent": "callers_direct",
+   "target": "createScopeInstance",
+   "include_tests": false,
+   "candidates": [
+    "createScopeInstance"
+   ],
+   "targets": [
+    "createScopeInstance"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__) that calls collectScopedNodes.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodes",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodes"
+   ],
+   "targets": [
+    "collectScopedNodes"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__) that calls collectFirstScopedNode.",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNode",
+   "include_tests": false,
+   "candidates": [
+    "collectFirstScopedNode"
+   ],
+   "targets": [
+    "collectFirstScopedNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__) that calls collectScopedNodesFromChildren.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodesFromChildren",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodesFromChildren"
+   ],
+   "targets": [
+    "collectScopedNodesFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__) that calls collectFirstScopedNodeFromChildren.",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNodeFromChildren",
+   "include_tests": false,
+   "candidates": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "targets": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__) that calls collectNearestContextValues.",
+   "intent": "callers_direct",
+   "target": "collectNearestContextValues",
+   "include_tests": false,
+   "candidates": [
+    "collectNearestContextValues"
+   ],
+   "targets": [
+    "collectNearestContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions in packages/react-reconciler/src/ReactFiberScope.js call collectScopedNodesFromChildren? List all callers in the whole repository excluding test files.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodesFromChildren",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodesFromChildren"
+   ],
+   "targets": [
+    "collectScopedNodesFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src/ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions call collectFirstScopedNodeFromChildren? List all callers in the whole repository excluding test files.",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNodeFromChildren",
+   "include_tests": false,
+   "candidates": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "targets": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions call collectScopedNodes? List all callers in the whole repository excluding test files.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodes",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodes"
+   ],
+   "targets": [
+    "collectScopedNodes"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src (excluding __tests__), is there any code that calls .queryAll, .queryFirst, or .getChildren as a method on a scope object (e.g. on the object returned by createScopeInstance, or on a scope stored on a fiber)? If yes, name the functions and files.",
+   "intent": "callers_direct",
+   "target": "createScopeInstance",
+   "include_tests": false,
+   "candidates": [
+    "createScopeInstance"
+   ],
+   "targets": [
+    "createScopeInstance"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "other",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function in packages/react-reconciler/src (excluding __tests__) that calls containsNode (the one from ReactFiberScope.js), directly or as a member call on a scope object.",
+   "intent": "callers_direct",
+   "target": "containsNode",
+   "include_tests": false,
+   "candidates": [
+    "containsNode"
+   ],
+   "targets": [
+    "containsNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src (excluding __tests__): where is the object returned by createScopeInstance stored (which property, on which object), and does any function in packages/react-reconciler/src call a member of it, such as .containsNode, .DO_NOT_USE_queryAllNodes, .DO_NOT_USE_queryFirstNode, or .getChildContextValues? Name any such functions and their files.",
+   "intent": "where_is_it",
+   "target": "createScopeInstance",
+   "include_tests": false,
+   "candidates": [
+    "createScopeInstance"
+   ],
+   "targets": [
+    "createScopeInstance"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "other",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src/ReactFiberCompleteWork.js, show the exact code where completeWork calls createScopeInstance: which fiber property or object is the returned scope instance assigned to, and under what condition?",
+   "intent": "show_source",
+   "target": "completeWork",
+   "include_tests": true,
+   "candidates": [
+    "completeWork",
+    "createScopeInstance"
+   ],
+   "targets": [
+    "completeWork"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src/ReactFiberCompleteWork.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "show_source",
+   "labelled_alternates": [
+    "other"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src (excluding __tests__), does any code call members of a scope instance object — that is, anything of the form X.containsNode(...), X.DO_NOT_USE_queryAllNodes(...), X.DO_NOT_USE_queryFirstNode(...), or X.getChildContextValues(...) where X is a scope instance? If yes, name each function and file. If no, say so.",
+   "intent": "callers_direct",
+   "target": "excluding",
+   "include_tests": false,
+   "candidates": [
+    "excluding",
+    "__tests__",
+    "members",
+    "scope",
+    "instance",
+    "object",
+    "form",
+    "X",
+    "yes",
+    "name",
+    "say"
+   ],
+   "targets": [
+    "excluding"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "other",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions defined in packages/react-reconciler/src (excluding any __tests__ files) call any of these: ReactFiberScope.DO_NOT_USE_queryAllNodes, ReactFiberScope.DO_NOT_USE_queryFirstNode, ReactFiberScope.getChildContextValues, ReactFiberScope.collectScopedNodes, ReactFiberScope.collectFirstScopedNode, ReactFiberScope.collectNearestContextValues, ReactFiberScope.collectScopedNodesFromChildren, ReactFiberScope.collectFirstScopedNodeFromChildren, ReactFiberScope.collectNearestChildContextValues? List every caller function that is itself defined in packages/react-reconciler/src.",
+   "intent": "callers_direct",
+   "target": "ReactFiberScope.DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "ReactFiberScope.DO_NOT_USE_queryAllNodes",
+    "ReactFiberScope.DO_NOT_USE_queryFirstNode",
+    "ReactFiberScope.getChildContextValues",
+    "ReactFiberScope.collectScopedNodes",
+    "ReactFiberScope.collectFirstScopedNode",
+    "ReactFiberScope.collectNearestContextValues",
+    "ReactFiberScope.collectScopedNodesFromChildren",
+    "ReactFiberScope.collectFirstScopedNodeFromChildren",
+    "ReactFiberScope.collectNearestChildContextValues"
+   ],
+   "targets": [
+    "ReactFiberScope.DO_NOT_USE_queryAllNodes",
+    "ReactFiberScope.DO_NOT_USE_queryFirstNode",
+    "ReactFiberScope.getChildContextValues",
+    "ReactFiberScope.collectScopedNodes",
+    "ReactFiberScope.collectFirstScopedNode",
+    "ReactFiberScope.collectNearestContextValues",
+    "ReactFiberScope.collectScopedNodesFromChildren",
+    "ReactFiberScope.collectFirstScopedNodeFromChildren",
+    "ReactFiberScope.collectNearestChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls ReactFiberScope.DO_NOT_USE_queryAllNodes? List only callers defined in packages/react-reconciler/src, excluding __tests__ files.",
+   "intent": "callers_direct",
+   "target": "ReactFiberScope.DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "ReactFiberScope.DO_NOT_USE_queryAllNodes"
+   ],
+   "targets": [
+    "ReactFiberScope.DO_NOT_USE_queryAllNodes"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls ReactFiberScope.DO_NOT_USE_queryFirstNode? List only callers defined in packages/react-reconciler/src, excluding __tests__ files.",
+   "intent": "callers_direct",
+   "target": "ReactFiberScope.DO_NOT_USE_queryFirstNode",
+   "include_tests": false,
+   "candidates": [
+    "ReactFiberScope.DO_NOT_USE_queryFirstNode"
+   ],
+   "targets": [
+    "ReactFiberScope.DO_NOT_USE_queryFirstNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who calls ReactFiberScope.getChildContextValues? List only callers defined in packages/react-reconciler/src, excluding __tests__ files.",
+   "intent": "callers_direct",
+   "target": "ReactFiberScope.getChildContextValues",
+   "include_tests": false,
+   "candidates": [
+    "ReactFiberScope.getChildContextValues"
+   ],
+   "targets": [
+    "ReactFiberScope.getChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "What is the file path of ReactFiberScope.collectScopedNodes? Just the file path, not the code.",
+   "intent": "other",
+   "target": "ReactFiberScope.collectScopedNodes",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberScope.collectScopedNodes"
+   ],
+   "targets": [
+    "ReactFiberScope.collectScopedNodes"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "where_is_it",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "What file is the ReactFiberScope module defined in? Give me the file path.",
+   "intent": "where_is_it",
+   "target": "ReactFiberScope",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberScope"
+   ],
+   "targets": [
+    "ReactFiberScope"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "where_is_it",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src, are there any functions (other than the ReactFiberScope methods themselves) that call any of: DO_NOT_USE_queryAllNodes, DO_NOT_USE_queryFirstNode, getChildContextValues, collectScopedNodesFromChildren, collectFirstScopedNodeFromChildren, or collectNearestChildContextValues? Ignore test files.",
+   "intent": "callers_direct",
+   "target": "ReactFiberScope",
+   "include_tests": false,
+   "candidates": [
+    "ReactFiberScope",
+    "DO_NOT_USE_queryAllNodes",
+    "DO_NOT_USE_queryFirstNode",
+    "getChildContextValues",
+    "collectScopedNodesFromChildren",
+    "collectFirstScopedNodeFromChildren",
+    "collectNearestChildContextValues"
+   ],
+   "targets": [
+    "ReactFiberScope"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In packages/react-reconciler/src, are there any functions that call the `scope` object's queryAll, queryFirst, or getContextValues methods (i.e., scope.queryAll, scope.queryFirst, scope.getContextValues)? Ignore test files.",
+   "intent": "callers_direct",
+   "target": "scope",
+   "include_tests": false,
+   "candidates": [
+    "scope",
+    "scope.queryAll",
+    "scope.queryFirst",
+    "scope.getContextValues"
+   ],
+   "targets": [
+    "scope"
+   ],
+   "qualifier": null,
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "other",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "Who are the direct callers of react-reconciler.ReactFiberScope :: DO_NOT_USE_queryAllNodes, excluding test files?",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who are the direct callers of react-reconciler.ReactFiberScope :: DO_NOT_USE_queryFirstNode, excluding test files?",
+   "intent": "callers_direct",
+   "target": "DO_NOT_USE_queryFirstNode",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who are the direct callers of react-reconciler.ReactFiberScope :: getChildContextValues, excluding test files?",
+   "intent": "callers_direct",
+   "target": "getChildContextValues",
+   "include_tests": false,
+   "candidates": [
+    "getChildContextValues"
+   ],
+   "targets": [
+    "getChildContextValues"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who are the direct callers of react-reconciler.ReactFiberScope :: collectScopedNodes, excluding test files?",
+   "intent": "callers_direct",
+   "target": "collectScopedNodes",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodes"
+   ],
+   "targets": [
+    "collectScopedNodes"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who are the direct callers of react-reconciler.ReactFiberScope :: collectFirstScopedNode, excluding test files?",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNode",
+   "include_tests": false,
+   "candidates": [
+    "collectFirstScopedNode"
+   ],
+   "targets": [
+    "collectFirstScopedNode"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Who are the direct callers of react-reconciler.ReactFiberScope :: collectNearestContextValues, excluding test files?",
+   "intent": "callers_direct",
+   "target": "collectNearestContextValues",
+   "include_tests": false,
+   "candidates": [
+    "collectNearestContextValues"
+   ],
+   "targets": [
+    "collectNearestContextValues"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "What is the file path of react-reconciler.ReactFiberScope :: collectScopedNodes?",
+   "intent": "other",
+   "target": "collectScopedNodes",
+   "include_tests": true,
+   "candidates": [
+    "collectScopedNodes"
+   ],
+   "targets": [
+    "collectScopedNodes"
+   ],
+   "qualifier": "react-reconciler.ReactFiberScope",
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "where_is_it",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every direct caller of react-reconciler.ReactFiberTreeReflection :: isFiberSuspenseAndTimedOut that is defined in packages/react-reconciler/src (excluding any test code), with file paths.",
+   "intent": "callers_direct",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": "react-reconciler.ReactFiberTreeReflection",
+   "paths": [
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "List every function defined in packages/react-reconciler/src (excluding __tests__ files) that directly calls isFiberSuspenseAndTimedOut (the one from ReactFiberTreeReflection.js).",
+   "intent": "callers_direct",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": false,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberTreeReflection.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions defined in packages/react-reconciler/src (excluding __tests__ files) directly call collectScopedNodes, collectFirstScopedNode, or collectNearestContextValues (all from ReactFiberScope.js)? List them per callee.",
+   "intent": "callers_direct",
+   "target": "collectScopedNodes",
+   "include_tests": false,
+   "candidates": [
+    "collectScopedNodes",
+    "collectFirstScopedNode",
+    "collectNearestContextValues"
+   ],
+   "targets": [
+    "collectScopedNodes",
+    "collectFirstScopedNode",
+    "collectNearestContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call the function named collectScopedNodes declared in ReactFiberScope.js (packages/react-reconciler/src/ReactFiberScope.js)?",
+   "intent": "callers_direct",
+   "target": "collectScopedNodes",
+   "include_tests": true,
+   "candidates": [
+    "collectScopedNodes"
+   ],
+   "targets": [
+    "collectScopedNodes"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call the function named collectFirstScopedNode declared in ReactFiberScope.js (packages/react-reconciler/src/ReactFiberScope.js)?",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNode",
+   "include_tests": true,
+   "candidates": [
+    "collectFirstScopedNode"
+   ],
+   "targets": [
+    "collectFirstScopedNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call the function named collectNearestContextValues declared in ReactFiberScope.js (packages/react-reconciler/src/ReactFiberScope.js)?",
+   "intent": "callers_direct",
+   "target": "collectNearestContextValues",
+   "include_tests": true,
+   "candidates": [
+    "collectNearestContextValues"
+   ],
+   "targets": [
+    "collectNearestContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call the function named collectScopedNodesFromChildren declared in ReactFiberScope.js (packages/react-reconciler/src/ReactFiberScope.js)?",
+   "intent": "callers_direct",
+   "target": "collectScopedNodesFromChildren",
+   "include_tests": true,
+   "candidates": [
+    "collectScopedNodesFromChildren"
+   ],
+   "targets": [
+    "collectScopedNodesFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call the function named collectFirstScopedNodeFromChildren declared in ReactFiberScope.js (packages/react-reconciler/src/ReactFiberScope.js)?",
+   "intent": "callers_direct",
+   "target": "collectFirstScopedNodeFromChildren",
+   "include_tests": true,
+   "candidates": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "targets": [
+    "collectFirstScopedNodeFromChildren"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions directly call the function named collectNearestChildContextValues declared in ReactFiberScope.js (packages/react-reconciler/src/ReactFiberScope.js)?",
+   "intent": "callers_direct",
+   "target": "collectNearestChildContextValues",
+   "include_tests": true,
+   "candidates": [
+    "collectNearestChildContextValues"
+   ],
+   "targets": [
+    "collectNearestChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js"
+   ],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "follow-up",
+   "question": "In non-test code of packages/react-reconciler/src, is the function DO_NOT_USE_queryAllNodes from ReactFiberScope.js called anywhere (directly or as a member of a scope object), e.g. via getScopeInstance(...).DO_NOT_USE_queryAllNodes?",
+   "intent": "is_it_used",
+   "target": "DO_NOT_USE_queryAllNodes",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryAllNodes"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "is_it_used",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "In non-test code of packages/react-reconciler/src, is the function DO_NOT_USE_queryFirstNode from ReactFiberScope.js called anywhere (directly or as a member of a scope object)?",
+   "intent": "is_it_used",
+   "target": "DO_NOT_USE_queryFirstNode",
+   "include_tests": false,
+   "candidates": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "targets": [
+    "DO_NOT_USE_queryFirstNode"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "is_it_used",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "In non-test code of packages/react-reconciler/src, is the function getChildContextValues from ReactFiberScope.js called anywhere (directly or as a member of a scope object, e.g. on a scope returned by getScopeInstance)?",
+   "intent": "is_it_used",
+   "target": "getChildContextValues",
+   "include_tests": false,
+   "candidates": [
+    "getChildContextValues",
+    "getScopeInstance"
+   ],
+   "targets": [
+    "getChildContextValues"
+   ],
+   "qualifier": null,
+   "paths": [
+    "ReactFiberScope.js",
+    "packages/react-reconciler/src"
+   ],
+   "scope_words": null,
+   "labelled_intent": "is_it_used",
+   "labelled_alternates": [
+    "callers_direct"
+   ]
+  },
+  {
+   "source": "follow-up",
+   "question": "Which functions call isFiberSuspenseAndTimedOut (from ReactFiberTreeReflection) directly, i.e. what are all its direct callers, including in test files so I can see the full set of call sites?",
+   "intent": "callers_direct",
+   "target": "isFiberSuspenseAndTimedOut",
+   "include_tests": true,
+   "candidates": [
+    "isFiberSuspenseAndTimedOut",
+    "ReactFiberTreeReflection"
+   ],
+   "targets": [
+    "isFiberSuspenseAndTimedOut"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "labelled_intent": "callers_direct",
+   "labelled_alternates": []
+  },
+  {
+   "source": "declares follow-up",
+   "question": "What is the code for react-noop-renderer.ReactNoopServer's pushSegmentFinale? And is ReactNoopServer a test renderer? Also, are there any other renderer configurations (like ReactFizzConfigBrowser or ReactFizzConfigStatic) that implement pushSegmentFinale?",
+   "intent": "declares",
+   "target": "pushSegmentFinale",
+   "include_tests": true,
+   "candidates": [
+    "pushSegmentFinale",
+    "ReactNoopServer",
+    "ReactFizzConfigBrowser",
+    "ReactFizzConfigStatic"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "pushSegmentFinale",
+    "modules": [
+     "ReactNoopServer",
+     "ReactFizzConfigBrowser",
+     "ReactFizzConfigStatic"
+    ],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares follow-up",
+   "question": "Are there any other modules or classes that implement pushSegmentFinale besides ReactFizzConfigDOM, ReactFizzConfigDOMLegacy, ReactFizzConfigMarkup, and ReactNoopServer? For example, is there a ReactFizzConfigBrowser or ReactFizzConfigStatic?",
+   "intent": "declares",
+   "target": "pushSegmentFinale",
+   "include_tests": true,
+   "candidates": [
+    "pushSegmentFinale",
+    "ReactFizzConfigDOM",
+    "ReactFizzConfigDOMLegacy",
+    "ReactFizzConfigMarkup",
+    "ReactNoopServer",
+    "ReactFizzConfigBrowser",
+    "ReactFizzConfigStatic"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "pushSegmentFinale",
+    "modules": [
+     "ReactFizzConfigDOM",
+     "ReactFizzConfigDOMLegacy",
+     "ReactFizzConfigMarkup",
+     "ReactNoopServer",
+     "ReactFizzConfigBrowser",
+     "ReactFizzConfigStatic"
+    ],
+    "known": [
+     "ReactFizzConfigDOM",
+     "ReactFizzConfigDOMLegacy",
+     "ReactFizzConfigMarkup",
+     "ReactNoopServer"
+    ],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares follow-up",
+   "question": "In react-native-renderer, is there a ReactFiberConfigFabric (without WithViewTransition) that also declares or implements measureInstance? And in react-noop-renderer, does ReactFiberConfigNoopNoMutation declare a measureInstance function?",
+   "intent": "declares",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigFabric",
+    "WithViewTransition",
+    "measureInstance",
+    "ReactFiberConfigNoopNoMutation"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "measureInstance",
+    "modules": [
+     "ReactFiberConfigFabric",
+     "ReactFiberConfigNoopNoMutation"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares follow-up",
+   "question": "Does react-native-renderer have a ReactFiberConfigFabric (without WithViewTransition) that declares measureInstance? List all measureInstance declarations in react-native-renderer.",
+   "intent": "declares",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigFabric",
+    "WithViewTransition",
+    "measureInstance"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "measureInstance",
+    "modules": [
+     "ReactFiberConfigFabric"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares follow-up",
+   "question": "Does the module ReactFiberConfigFabric (without WithViewTransition) in react-native-renderer declare or export a measureInstance function? Does it import measureInstance from ReactFiberConfigFabricWithViewTransition?",
+   "intent": "declares",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigFabric",
+    "WithViewTransition",
+    "measureInstance",
+    "ReactFiberConfigFabricWithViewTransition"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "measureInstance",
+    "modules": [
+     "ReactFiberConfigFabric",
+     "ReactFiberConfigFabricWithViewTransition"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares follow-up",
+   "question": "In react-native-renderer, does the ReactFiberConfigFabric module (the one without WithViewTransition, entity ff68ace9) export or define a measureInstance? If so, is it its own implementation or does it re-export from ReactFiberConfigFabricWithViewTransition?",
+   "intent": "declares",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigFabric",
+    "WithViewTransition",
+    "measureInstance",
+    "ReactFiberConfigFabricWithViewTransition"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "measureInstance",
+    "modules": [
+     "ReactFiberConfigFabric",
+     "ReactFiberConfigFabricWithViewTransition"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Does ReactFiberConfigDOM declare commitTextUpdate?",
+   "intent": "declares",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigDOM",
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "commitTextUpdate",
+    "modules": [
+     "ReactFiberConfigDOM"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Does the module ReactFiberConfigART define a `commitTextUpdate` function?",
+   "intent": "declares",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "commitTextUpdate",
+    "modules": [],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Are there any other declarations of `commitTextUpdate` besides the DOM and ART ones?",
+   "intent": "declares",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "commitTextUpdate",
+    "modules": [],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Is there another implementation of pushSegmentFinale anywhere in the repository?",
+   "intent": "declares",
+   "target": "pushSegmentFinale",
+   "include_tests": true,
+   "candidates": [
+    "pushSegmentFinale"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "pushSegmentFinale",
+    "modules": [],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Does react-reconciler's ReactFiberConfigWithNoMutation export commitTextUpdate or re-export it from somewhere?",
+   "intent": "declares",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigWithNoMutation",
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "commitTextUpdate",
+    "modules": [
+     "ReactFiberConfigWithNoMutation"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Are there additional renderers that implement measureInstance, for example ReactFiberConfigTestHost?",
+   "intent": "declares",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "measureInstance",
+    "ReactFiberConfigTestHost"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "measureInstance",
+    "modules": [
+     "ReactFiberConfigTestHost"
+    ],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Does flask.app define a function named _make_timedelta, or is it declared anywhere else too?",
+   "intent": "declares",
+   "target": "app",
+   "include_tests": true,
+   "candidates": [
+    "flask.app"
+   ],
+   "targets": [
+    "app"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "app",
+    "modules": [
+     "flask",
+     "flask.app"
+    ],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Besides ReactFiberConfigDOM, which other modules declare commitTextUpdate?",
+   "intent": "declares",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigDOM",
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "commitTextUpdate",
+    "modules": [
+     "ReactFiberConfigDOM"
+    ],
+    "known": [
+     "ReactFiberConfigDOM"
+    ],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Is `commitTextUpdate` declared in ReactNoopServer or only in the reconciler configs?",
+   "intent": "declares",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "commitTextUpdate",
+    "modules": [],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Is there any more declarations of the function `_make_timedelta` in the flask package?",
+   "intent": "declares",
+   "target": "_make_timedelta",
+   "include_tests": true,
+   "candidates": [
+    "_make_timedelta"
+   ],
+   "targets": [
+    "_make_timedelta"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "_make_timedelta",
+    "modules": [],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Does ReactFizzConfigBrowser implement pushSegmentFinale?",
+   "intent": "declares",
+   "target": "pushSegmentFinale",
+   "include_tests": true,
+   "candidates": [
+    "ReactFizzConfigBrowser",
+    "pushSegmentFinale"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "pushSegmentFinale",
+    "modules": [
+     "ReactFizzConfigBrowser"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Does the ReactFiberConfigTestHost module export measureInstance?",
+   "intent": "declares",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigTestHost",
+    "measureInstance"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "measureInstance",
+    "modules": [
+     "ReactFiberConfigTestHost"
+    ],
+    "known": [],
+    "asked_other": false
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Whether any other module re-exports commitTextUpdate, such as ReactFiberConfig.custom?",
+   "intent": "declares",
+   "target": "custom",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfig.custom"
+   ],
+   "targets": [
+    "custom"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "custom",
+    "modules": [
+     "ReactFiberConfig",
+     "ReactFiberConfig.custom"
+    ],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "declares written",
+   "question": "Which modules declare `Scaffold.add_url_rule`, and are there other implementations?",
+   "intent": "declares",
+   "target": "add_url_rule",
+   "include_tests": true,
+   "candidates": [
+    "Scaffold.add_url_rule"
+   ],
+   "targets": [
+    "add_url_rule"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null,
+   "declares": {
+    "function": "add_url_rule",
+    "modules": [
+     "Scaffold",
+     "Scaffold.add_url_rule"
+    ],
+    "known": [],
+    "asked_other": true
+   }
+  },
+  {
+   "source": "keeps its route",
+   "question": "Who calls commitTextUpdate and does ReactFiberConfigDOM implement it?",
+   "intent": "callers_direct",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "commitTextUpdate",
+    "ReactFiberConfigDOM"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Which functions override or implement SessionInterface.open_session, what has to change if I rename it?",
+   "intent": "change_impact",
+   "target": "SessionInterface.open_session",
+   "include_tests": true,
+   "candidates": [
+    "SessionInterface.open_session"
+   ],
+   "targets": [
+    "SessionInterface.open_session"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Is pushSegmentFinale used anywhere, or is its declaration dead code?",
+   "intent": "is_it_used",
+   "target": "pushSegmentFinale",
+   "include_tests": true,
+   "candidates": [
+    "pushSegmentFinale"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Show the implementation of measureInstance in ReactFiberConfigDOM.",
+   "intent": "show_source",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "measureInstance",
+    "ReactFiberConfigDOM"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Where is commitTextUpdate declared?",
+   "intent": "where_is_it",
+   "target": "commitTextUpdate",
+   "include_tests": true,
+   "candidates": [
+    "commitTextUpdate"
+   ],
+   "targets": [
+    "commitTextUpdate"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "What can end up calling measureInstance, and which modules declare it?",
+   "intent": "callers_transitive",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "measureInstance"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "What is the code for ReactFiberConfigDOM, does it export anything?",
+   "intent": "other",
+   "target": "ReactFiberConfigDOM",
+   "include_tests": true,
+   "candidates": [
+    "ReactFiberConfigDOM"
+   ],
+   "targets": [
+    "ReactFiberConfigDOM"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Show me another implementation of measureInstance, with its source code.",
+   "intent": "show_source",
+   "target": "measureInstance",
+   "include_tests": true,
+   "candidates": [
+    "measureInstance"
+   ],
+   "targets": [
+    "measureInstance"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Who calls _make_timedelta? Does flask.app define it?",
+   "intent": "callers_direct",
+   "target": "flask.app",
+   "include_tests": true,
+   "candidates": [
+    "flask.app"
+   ],
+   "targets": [
+    "flask.app"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  },
+  {
+   "source": "keeps its route",
+   "question": "Does the reconciler use pushSegmentFinale anywhere? Referenced anywhere counts.",
+   "intent": "is_it_used",
+   "target": "pushSegmentFinale",
+   "include_tests": true,
+   "candidates": [
+    "pushSegmentFinale"
+   ],
+   "targets": [
+    "pushSegmentFinale"
+   ],
+   "qualifier": null,
+   "paths": [],
+   "scope_words": null
+  }
+ ]
+}

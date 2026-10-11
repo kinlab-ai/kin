@@ -13,7 +13,7 @@
 //!   the ledger under [`ResolutionRecordId::call_sites`], the proof context
 //!   validated in the selected graph for each language, and why
 //!   no resolver can prove a language's sites, from whether that process
-//!   switched enrichment off ([`publish_enrichment_switched_off`]) and the
+//!   switched enrichment off, and how ([`publish_enrichment_switch`]), and the
 //!   language-server readiness it probed
 //!   ([`crate::edge_coverage::publish_language_server_readiness`]);
 //! - [`focal_block`], [`callers_block`] and [`store_block`] build the one
@@ -39,6 +39,7 @@ use kin_model::{
 use serde_json::{json, Value};
 
 use crate::handlers::external_symbols::SiteText;
+use crate::site_expression::{self, FocalOwner, ReceiverHint};
 
 /// The key every payload carries the block under.
 pub const CALL_SITES_KEY: &str = "call_sites";
@@ -46,9 +47,8 @@ pub const CALL_SITES_KEY: &str = "call_sites";
 /// Site rows one block serves before it says how many it withheld.
 pub const CALL_SITE_ROWS_MAX: usize = 50;
 
-/// Illustrative unsettled candidates in a reference answer. Counts, reasons
-/// and clauses still describe the full scan; samples must leave room for the
-/// proven reference rows and their qualifications at the default budget.
+/// Residue sites one escape summary serves before it counts the rest.
+/// Counts and clauses still describe the full census.
 pub const CALL_SITE_CANDIDATE_SAMPLE_MAX: usize = 5;
 
 /// Files with owed callers a store-wide block names before it says how many
@@ -63,7 +63,7 @@ pub const FOCALS_SCOPE: &str = "the focals' own bodies";
 
 /// The scope of a block taken over the callers in the files that import the
 /// focal's file.
-pub const FAMILY_SCOPE: &str = "the files that import the focal's file";
+pub const FAMILY_SCOPE: &str = "the modules that import the focal's module";
 
 /// The scope of a block taken over the whole store.
 pub const STORE_SCOPE: &str = "the store";
@@ -102,16 +102,19 @@ pub fn published_current_proof_contexts() -> Option<HashMap<LanguageId, Resoluti
 /// suite runs threaded or one process per test.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use super::EnrichmentSwitch;
+
     thread_local! {
-        static SWITCHED_OFF: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        static SWITCHED_OFF: std::cell::Cell<Option<EnrichmentSwitch>> =
+            const { std::cell::Cell::new(None) };
     }
 
-    pub(crate) fn switched_off_override() -> Option<bool> {
+    pub(crate) fn switched_off_override() -> Option<EnrichmentSwitch> {
         SWITCHED_OFF.with(std::cell::Cell::get)
     }
 
     /// Restores the previous answer on drop, including on unwind.
-    pub(crate) struct SwitchedOffGuard(Option<bool>);
+    pub(crate) struct SwitchedOffGuard(Option<EnrichmentSwitch>);
 
     impl Drop for SwitchedOffGuard {
         fn drop(&mut self) {
@@ -123,50 +126,80 @@ pub(crate) mod test_support {
     /// off for the process serving the graph.
     #[must_use = "binding the guard is what keeps the declared answer in force"]
     pub(crate) fn scoped_enrichment_switched_off(switched_off: bool) -> SwitchedOffGuard {
-        SwitchedOffGuard(SWITCHED_OFF.with(|slot| slot.replace(Some(switched_off))))
+        scoped_enrichment_switch(if switched_off {
+            EnrichmentSwitch::Off
+        } else {
+            EnrichmentSwitch::On
+        })
+    }
+
+    /// Declare, for the rest of this scope, how enrichment stands for the
+    /// process serving the graph.
+    #[must_use = "binding the guard is what keeps the declared answer in force"]
+    pub(crate) fn scoped_enrichment_switch(switch: EnrichmentSwitch) -> SwitchedOffGuard {
+        SwitchedOffGuard(SWITCHED_OFF.with(|slot| slot.replace(Some(switch))))
     }
 }
 
 // ── Why no resolver can prove a language's call sites ─────────────────────
 
-static ENRICHMENT_SWITCHED_OFF: std::sync::RwLock<Option<bool>> = std::sync::RwLock::new(None);
+/// How language-server enrichment stands for the process serving this graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentSwitch {
+    /// Enrichment runs.
+    On,
+    /// Switched off for the process: an environment switch, or a store whose
+    /// graph is its only write authority.
+    Off,
+    /// Switched off by the repository's own setting, which
+    /// `kin daemon sweep --enable` turns on.
+    OffForRepository,
+}
 
-/// Publish whether language-server enrichment is switched off for the process
-/// serving this graph.
+static ENRICHMENT_SWITCHED_OFF: std::sync::RwLock<Option<EnrichmentSwitch>> =
+    std::sync::RwLock::new(None);
+
+/// Publish how language-server enrichment stands for the process serving this
+/// graph.
 ///
 /// Published by the process that decides it, when it decides it, because a
 /// switched-off daemon publishes no language-server readiness: it never
 /// looks. Until this is called it is unknown, and unknown claims nothing.
-pub fn publish_enrichment_switched_off(switched_off: bool) {
+pub fn publish_enrichment_switch(switch: EnrichmentSwitch) {
     if let Ok(mut slot) = ENRICHMENT_SWITCHED_OFF.write() {
-        *slot = Some(switched_off);
+        *slot = Some(switch);
     }
 }
 
-/// Whether enrichment is switched off: a test's own answer, when it declared
-/// one, and the published one otherwise.
-fn enrichment_switched_off() -> Option<bool> {
+/// How enrichment stands: a test's own answer, when it declared one, and the
+/// published one otherwise.
+fn enrichment_switched_off() -> Option<EnrichmentSwitch> {
     #[cfg(test)]
-    if let Some(switched_off) = test_support::switched_off_override() {
-        return Some(switched_off);
+    if let Some(switch) = test_support::switched_off_override() {
+        return Some(switch);
     }
     ENRICHMENT_SWITCHED_OFF.read().ok().and_then(|slot| *slot)
 }
 
 /// Why no resolver can prove `language`'s call sites, from what the process
-/// running the resolvers published: enrichment switched off, then its probe
-/// of the language's server. A server the probe found missing, or that
-/// could not start, proves nothing until the host changes, and a language no
-/// build of Kin enriches never has one. Nothing published, or a language the
-/// probe did not report on, is unknown, and reads as owed.
+/// running the resolvers published: enrichment switched off, by the process or
+/// by the repository's own setting, then its probe of the language's server.
+/// A server the probe found missing, or that could not start, proves nothing
+/// until the host changes, and a language no build of Kin enriches never has
+/// one. Nothing published, or a language the probe did not report on, is
+/// unknown, and reads as owed.
 pub fn no_resolver_for(
-    switched_off: Option<bool>,
+    switch: Option<EnrichmentSwitch>,
     readiness: Option<&kin_core::reference_coverage::LanguageServerReadinessMap>,
     language: LanguageId,
 ) -> Option<NoResolver> {
     use kin_core::reference_coverage::{LanguageServerReadiness, ENRICHABLE_LANGUAGES};
-    if switched_off == Some(true) {
-        return Some(NoResolver::EnrichmentOff);
+    match switch {
+        Some(EnrichmentSwitch::Off) => return Some(NoResolver::EnrichmentOff),
+        Some(EnrichmentSwitch::OffForRepository) => {
+            return Some(NoResolver::EnrichmentOffForRepository)
+        }
+        Some(EnrichmentSwitch::On) | None => {}
     }
     match readiness?.get(&language) {
         Some(LanguageServerReadiness::Absent) => Some(NoResolver::NoLanguageServer),
@@ -178,6 +211,16 @@ pub fn no_resolver_for(
         None if !ENRICHABLE_LANGUAGES.contains(&language) => Some(NoResolver::NoLanguageServer),
         None => None,
     }
+}
+
+/// [`no_resolver_for`] over what the process running the resolvers has
+/// published now, captured once, for a reader that reads ledgers through
+/// facts of its own: the impact observation reads a caller with no ledger the
+/// way [`GraphSiteFacts`] and the store-wide status read it.
+pub fn host_no_resolver() -> impl Fn(LanguageId) -> Option<NoResolver> {
+    let switched_off = enrichment_switched_off();
+    let readiness = crate::edge_coverage::published_language_server_readiness();
+    move |language| no_resolver_for(switched_off, readiness.as_ref(), language)
 }
 
 // ── The reading's facts, from a graph ─────────────────────────────────────
@@ -192,7 +235,7 @@ pub fn no_resolver_for(
 /// qualifies the answer instead.
 pub struct GraphSiteFacts<'s, G: GraphStore + ?Sized> {
     store: &'s G,
-    switched_off: Option<bool>,
+    switched_off: Option<EnrichmentSwitch>,
     readiness: Option<kin_core::reference_coverage::LanguageServerReadinessMap>,
 }
 
@@ -457,6 +500,18 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
     inside: &std::collections::HashSet<String>,
     names: &[String],
 ) -> Option<Vec<OwedFile>> {
+    owed_outside_scoped(store, language, inside, names, true)
+}
+
+/// [`owed_outside`] restricted to callers whose stored role is not `Test`
+/// when `include_tests` is false. Unknown caller state remains owed.
+pub fn owed_outside_scoped<G: GraphStore + ?Sized>(
+    store: &G,
+    language: LanguageId,
+    inside: &std::collections::HashSet<String>,
+    names: &[String],
+    include_tests: bool,
+) -> Option<Vec<OwedFile>> {
     let filter = kin_model::graph::EntityFilter {
         languages: Some(vec![language]),
         ..Default::default()
@@ -464,6 +519,7 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
     let entities = store.query_entities(&filter).ok()?;
     let outside: Vec<Entity> = entities
         .into_iter()
+        .filter(|entity| caller_in_scope(entity, include_tests))
         .filter(|entity| {
             entity.span.as_ref().is_some_and(|span| {
                 !inside.contains(&span.file.0) && span.start_byte < span.end_byte
@@ -471,6 +527,12 @@ pub fn owed_outside<G: GraphStore + ?Sized>(
         })
         .collect();
     Some(owed_files(store, &outside))
+}
+
+/// Whether a current graph entity contributes to the requested caller scope.
+/// Role is persisted entity metadata, never inferred from its name or path.
+pub(crate) fn caller_in_scope(entity: &Entity, include_tests: bool) -> bool {
+    include_tests || entity.role != kin_model::EntityRole::Test
 }
 
 /// The longest preview the parser keeps whole; a longer body is summarised
@@ -490,6 +552,24 @@ pub fn whole_body_preview(entity: &Entity) -> Option<&str> {
         .get(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY)
         .and_then(Value::as_str)
         .filter(|preview| preview.chars().count() <= WHOLE_BODY_PREVIEW_CHARS)
+}
+
+/// Whether the text `entity` records of its body spells one of `names`:
+/// true only for a name the parse-time preview holds, whole or cut short.
+/// Where [`could_name_focal`] asks what cannot be ruled out, this asks what
+/// was seen.
+fn spells_focal_name(entity: &Entity, names: &[String]) -> bool {
+    entity
+        .metadata
+        .extra
+        .get(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY)
+        .and_then(Value::as_str)
+        .is_some_and(|preview| {
+            names
+                .iter()
+                .filter(|name| !name.is_empty())
+                .any(|name| kin_model::spells_identifier(preview, name))
+        })
 }
 
 /// Whether `entity`'s body could spell one of `names`, the names a call to
@@ -513,7 +593,9 @@ pub fn could_name_focal(entity: &Entity, names: &[String]) -> bool {
     match preview {
         None => true,
         Some(preview) if preview.chars().count() > WHOLE_BODY_PREVIEW_CHARS => true,
-        Some(preview) => names.iter().any(|name| preview.contains(name)),
+        Some(preview) => names
+            .iter()
+            .any(|name| kin_model::spells_identifier(preview, name)),
     }
 }
 
@@ -534,9 +616,9 @@ pub fn owed_outside_clause(owed: Option<&[OwedFile]>) -> Option<String> {
 /// reader of the published counts states the same sentence.
 pub fn owed_outside_counts_clause(files: u64, callers: u64) -> String {
     format!(
-        "{}: {callers} caller(s) in {files} file(s) outside {FAMILY_SCOPE} have call sites the \
+        "{}: {callers} caller(s) in {files} module(s) outside {FAMILY_SCOPE} have call sites the \
          graph has not settled yet because their derivation or enrichment is owed, and a caller \
-         can reach the focal without importing its file, so one may be missing from this \
+         can reach the focal without importing its module, so one may be missing from this \
          answer until `kin daemon sweep` settles them",
         kin_model::call_site_reading::CALL_SITES_OWED
     )
@@ -547,7 +629,7 @@ pub fn owed_outside_unreadable_clause() -> String {
     format!(
         "{}: the entity index for the focal's language could not be read, so callers outside \
          {FAMILY_SCOPE} were not checked, and one that reaches the focal without importing its \
-         file may be missing from this answer",
+         module may be missing from this answer",
         kin_model::call_site_reading::CALL_SITES_OWED
     )
 }
@@ -666,6 +748,35 @@ fn exact_text<T: SiteText + ?Sized>(text: &T, entity: &Entity) -> Option<String>
     .ok()
 }
 
+/// A recorded site's own bytes, without requiring the caller's whole body.
+/// Invalid or empty coordinates cannot establish which callee was spelled.
+fn exact_site_text<T: SiteText + ?Sized>(
+    text: &T,
+    entity: &Entity,
+    site: &CallSite,
+) -> Option<String> {
+    let span = entity.span.as_ref()?;
+    let start_byte = span.start_byte.checked_add(site.offset as usize)?;
+    let end_byte = start_byte.checked_add(site.length as usize)?;
+    if start_byte >= end_byte || end_byte > span.end_byte {
+        return None;
+    }
+    text.quote(
+        entity,
+        &SourceSpan {
+            file: span.file.clone(),
+            start_byte,
+            end_byte,
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+        },
+    )
+    .ok()
+    .filter(|text| !text.is_empty())
+}
+
 /// Whether `text` is one identifier, the shape of a placeable callee token.
 fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
@@ -689,6 +800,10 @@ pub struct CandidateSite {
     /// which is `caller`.
     #[serde(rename = "projection", serialize_with = "serialize_projection")]
     pub caller_file: Option<String>,
+    /// The module that holds the caller, which is how a reader places the
+    /// site: the projection above is withheld at the agent surface.
+    #[serde(rename = "module", skip_serializing_if = "Option::is_none")]
+    pub caller_module: Option<String>,
     /// The site's line counted from 0 at the caller's first line, when the
     /// caller's text was read.
     pub line_in_entity: Option<u64>,
@@ -702,6 +817,82 @@ pub struct CandidateSite {
     pub state_reason: Option<String>,
     /// Why it can reach the focal (see [`kin_model::site_could_call_at`]).
     pub reason: &'static str,
+    /// The call as written, cut from the caller's own body: its receiver and
+    /// callee through its argument list, on one line (see
+    /// [`site_expression::read_expression`]). Read for every named leftover,
+    /// never for a value call, which is only counted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr: Option<String>,
+    /// What the callee is reached through, when the site names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    /// What the receiver says about reaching the focal's owner (see
+    /// [`ReceiverHint`]), left out when it says nothing either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_hint: Option<&'static str>,
+    /// Why a named leftover carries no `expr`: its caller's body could not be
+    /// read, or the site is not inside it. Never a guess in its place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expr_unavailable: Option<&'static str>,
+    /// For a named leftover made through a receiver, the link of the chain
+    /// typing that receiver the graph could not establish (see
+    /// [`crate::receiver_binding::chain_gap`]): the step, the name it had to
+    /// resolve and why it did not. Absent when the graph cannot tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_binding_missing: Option<Value>,
+    /// For a named leftover made on a name its file imports, the module the
+    /// import statement names and whether no file of the repository can
+    /// supply it (see [`site_expression::RECEIVER_IMPORT_KEY`]). Absent when
+    /// the file's record does not bind the receiver by one import statement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_import: Option<Value>,
+    /// Whether the call is written on no value, in a language whose adapter
+    /// says a bare name never reads a member through an implicit instance
+    /// ([`kin_parser::site_syntax::SiteSyntax::bare_calls_reach_no_member`]):
+    /// its callee token follows no member operator, so it calls a name its
+    /// scope binds and reads no member off an object (see
+    /// [`site_expression::written_bare`]). Left out for a call made on one,
+    /// for a site whose text was not read and for every other language.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bare_call: bool,
+}
+
+/// Fill `row`'s expression fields from its caller's exact text `body` at the
+/// site keyed `(offset, length)`: the call as written, its receiver, and, for
+/// a site whose callee spells a call name, what that receiver says about
+/// reaching the focal's owner.
+fn address_expression(
+    row: &mut CandidateSite,
+    caller: &Entity,
+    body: &str,
+    (offset, length): (u32, u32),
+    owner: &FocalOwner,
+) {
+    let syntax = site_expression::syntax_of(caller);
+    let start = offset as usize;
+    let Some(expression) =
+        site_expression::read_expression(body, start, start + length as usize, &syntax)
+    else {
+        row.expr_unavailable = Some("site_outside_caller");
+        return;
+    };
+    if row.reason == kin_model::call_site_reading::REACH_CALLEE_SPELLS {
+        row.receiver_hint = expression
+            .receiver
+            .as_deref()
+            .map_or(ReceiverHint::Unknown, |receiver| {
+                site_expression::receiver_hint(receiver, caller, owner, &syntax)
+            })
+            .wire();
+    }
+    // Only where the caller's adapter says a bare name never reads a member
+    // through an implicit instance.
+    row.bare_call = syntax.bare_calls_reach_no_member
+        && expression.receiver.is_none()
+        && site_expression::written_bare(body, start);
+    row.expr = Some(expression.expr);
+    row.receiver = expression.receiver;
+    row.expr_unavailable = None;
 }
 
 /// A candidate's file as the labelled projection every reference row serves:
@@ -722,29 +913,310 @@ fn serialize_projection<S: serde::Serializer>(
 pub struct ScannedCaller {
     pub entity: Entity,
     pub reading: CallerSites,
+    /// Whether the caller is in the named scope: its body could spell a call
+    /// name of the focal, or a proven site calls the focal from it. A caller
+    /// outside that scope was read only because the focal may be held as a
+    /// value, and whatever it holds is counted as a value call.
+    pub named: bool,
+}
+
+/// The unsettled sites a reading kept only because the focal may be held as a
+/// value or reached through a name computed at run time. None of them spells a
+/// call name of the focal, so they are counted once, beside the census reason
+/// that kept them, rather than listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ValueCalls {
+    /// Sites kept this way.
+    pub sites: u64,
+    /// Callers holding them.
+    pub callers: u64,
+    /// Callers that never spell a call name of the focal whose sites are not
+    /// known at all, because their derivation or enrichment is owed or no
+    /// resolver can prove them. Read only because the focal may escape.
+    pub callers_unread: u64,
+    /// Those sites by why each is kept.
+    pub by_reason: BTreeMap<&'static str, u64>,
+}
+
+impl ValueCalls {
+    /// Whether nothing was kept this way.
+    pub fn is_empty(&self) -> bool {
+        self.sites == 0 && self.callers_unread == 0
+    }
+}
+
+/// Whether a reading promoted named sites to `name_unique` reference rows, and
+/// why not when it did not.
+///
+/// A promoted site is never proven. It is a site whose callee spells the
+/// focal's one call name while the store holds exactly one definition that
+/// name can reach, the focal itself, and nothing the resolver settled says the
+/// name goes anywhere else. It is served as a reference row labelled
+/// `name_unique` and counted apart from proven rows, and it never licenses an
+/// absence or a dead-code claim.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NameUnique {
+    /// The rule held and every unresolved or server-failed site whose callee
+    /// spells `name` was promoted.
+    Promoted { name: String },
+    /// The rule did not hold, for `reason`.
+    NotApplied { reason: &'static str },
+}
+
+/// The focal is not a function or a method with one call name.
+const UNIQUE_NOT_ONE_CALL_NAME: &str = "the focal is not a function or method with one call name";
+/// Another definition in the calling languages carries the call name.
+const UNIQUE_SHARED_DEFINITION: &str =
+    "another definition in the calling languages carries the call name";
+/// A symbol outside the repository carries the call name.
+const UNIQUE_EXTERNAL_SYMBOL: &str = "a symbol outside the repository carries the call name";
+/// A settled site that spells the call name was proven to call something else.
+const UNIQUE_CONTESTED: &str =
+    "a settled call site that spells the call name was proven to call something else";
+/// A caller holding settled sites that could spell the call name was not read.
+const UNIQUE_CONTEST_UNREAD: &str =
+    "a caller whose settled sites could spell the call name could not be read";
+/// No unresolved or server-failed site spells the call name.
+const UNIQUE_NOTHING_TO_PROMOTE: &str =
+    "no unresolved or server-failed call site spells the call name";
+/// The graph could not be read to establish the rule.
+const UNIQUE_UNREADABLE: &str = "the entity index could not be read to establish the rule";
+
+/// Entity kinds that can never be reached by a call spelling their name, so
+/// sharing it does not contest a promotion: type-level declarations and file
+/// structure.
+const NEVER_CALLED_KINDS: [kin_model::EntityKind; 9] = [
+    kin_model::EntityKind::Interface,
+    kin_model::EntityKind::TraitDef,
+    kin_model::EntityKind::TypeAlias,
+    kin_model::EntityKind::Module,
+    kin_model::EntityKind::Package,
+    kin_model::EntityKind::File,
+    kin_model::EntityKind::DocumentNode,
+    kin_model::EntityKind::Schema,
+    kin_model::EntityKind::EnumDef,
+];
+
+/// The last segment of a graph name, the member a call spells.
+fn leaf_name(name: &str) -> &str {
+    name.rsplit(['.', ':']).next().unwrap_or(name)
+}
+
+/// The one call name a named site could be promoted under, or why promotion
+/// does not apply: the focal must be a function or a non-constructor method
+/// with one call name, the store's calling languages must hold no other
+/// definition that name could reach (a callable, a class or a value that may
+/// hold one, and never a body-less declaration such as an interface member or
+/// an overload signature), and no symbol outside the repository may carry it.
+/// Whether a settled site contests the name is read during the scan.
+fn unique_call_name<G: GraphStore + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    names: &[String],
+) -> Result<String, &'static str> {
+    let [name] = names else {
+        return Err(UNIQUE_NOT_ONE_CALL_NAME);
+    };
+    if !matches!(
+        focal.kind,
+        kin_model::EntityKind::Function | kin_model::EntityKind::Method
+    ) || name.is_empty()
+    {
+        return Err(UNIQUE_NOT_ONE_CALL_NAME);
+    }
+    let languages = calling_languages(focal.language);
+    let mut others = HashSet::new();
+    for pattern in [name.clone(), format!("*.{name}"), format!("*::{name}")] {
+        let found = store
+            .query_entities(&kin_model::graph::EntityFilter {
+                name_pattern: Some(pattern),
+                languages: Some(languages.clone()),
+                ..Default::default()
+            })
+            .map_err(|_| UNIQUE_UNREADABLE)?;
+        for entity in found {
+            if entity.id == focal.id
+                || leaf_name(&entity.name) != name
+                || NEVER_CALLED_KINDS.contains(&entity.kind)
+                || !kin_core::disambiguation::carries_body(&entity)
+            {
+                continue;
+            }
+            others.insert(entity.id);
+        }
+    }
+    if !others.is_empty() {
+        return Err(UNIQUE_SHARED_DEFINITION);
+    }
+    let externals = store.external_references().map_err(|_| UNIQUE_UNREADABLE)?;
+    if externals.into_iter().any(|reference| {
+        let node = crate::handlers::external_symbols::ExternalSymbolNode {
+            id: reference.id,
+            reference,
+        };
+        // A SCIP descriptor ends its member in `#name().` or `/name().`, and
+        // a display name in `Type.name`: the leaf is what follows the last
+        // separator of either form.
+        let display = node.display_name();
+        display
+            .trim_end_matches(['(', ')', '.', '#'])
+            .rsplit(['.', ':', '#', '/', ' '])
+            .next()
+            == Some(name.as_str())
+    }) {
+        return Err(UNIQUE_EXTERNAL_SYMBOL);
+    }
+    Ok(name.clone())
+}
+
+/// The ledger keys of the sites of `caller` that sit at `spans`, the call
+/// expressions (or callee tokens) its proven edges to a focal carry, read
+/// against `body`, the caller's exact text. A span outside the caller's own
+/// text, or one whose callee is itself an expression, names no site.
+fn edge_site_keys(caller: &Entity, body: &str, spans: &[SourceSpan]) -> HashSet<(u32, u32)> {
+    let Some(own) = caller.span.as_ref() else {
+        return HashSet::new();
+    };
+    let syntax = site_expression::syntax_of(caller);
+    spans
+        .iter()
+        .filter(|span| span.file == own.file)
+        .filter_map(|span| {
+            let start = span.start_byte.checked_sub(own.start_byte)?;
+            let end = span.end_byte.checked_sub(own.start_byte)?;
+            let (from, to) = site_expression::callee_token(body, start, end, &syntax)?;
+            Some((u32::try_from(from).ok()?, u32::try_from(to - from).ok()?))
+        })
+        .collect()
+}
+
+/// Whether a settled state proves the call reaches `focal` itself.
+fn targets_focal(state: &kin_model::CallSiteState, focal: EntityId) -> bool {
+    match state {
+        kin_model::CallSiteState::ProvenTarget { target } => *target == focal,
+        kin_model::CallSiteState::ProvenDeclaration { declaration, .. } => *declaration == focal,
+        _ => false,
+    }
+}
+
+/// Whether a settled site in `body` spells `name` and was proven to go
+/// somewhere other than `focal`.
+fn contests_name(ledger: &CallSiteLedger, body: &str, name: &str, focal: EntityId) -> bool {
+    ledger.sites.iter().any(|site| {
+        SiteStateKind::of(&site.state).is_settled()
+            && !targets_focal(&site.state, focal)
+            && kin_model::site_text(site, body) == Some(name)
+    })
 }
 
 /// What a store-wide reading of one focal's possible callers found.
 #[derive(Debug, Clone)]
 pub struct FocalScan {
+    /// Whether callers with the current stored `Test` role were included.
+    pub include_tests: bool,
+    /// The focal the reading was taken for.
+    pub focal: EntityId,
     /// The names a call to the focal is spelled with.
     pub names: Vec<String>,
     /// Whether the focal may be held as a value.
     pub escape: FocalEscape,
-    /// Every unsettled site that could be a call to the focal, in caller
-    /// file, caller name and site order.
+    /// Every unsettled site that could be a call to the focal, the ones tied
+    /// to it by name first, then in caller file, caller name and site order.
     pub candidates: Vec<CandidateSite>,
+    /// The named leftovers: every site of `candidates` whose reason ties it to
+    /// the focal by name ([`kin_model::reach_is_named`]) and that was not
+    /// promoted. Never sampled.
+    pub named: Vec<CandidateSite>,
+    /// Named sites served as `name_unique` reference rows (see [`NameUnique`]).
+    pub promoted: Vec<CandidateSite>,
+    /// Whether named sites were promoted, and why not when they were not.
+    pub name_unique: NameUnique,
+    /// The sites kept only because the focal may be held as a value, counted.
+    pub value_calls: ValueCalls,
     /// Every caller whose body could call the focal by name, or through a
     /// value when it escapes, or that a proven site calls it from, each read
     /// through the one site-state reading and narrowed.
     pub callers: Vec<ScannedCaller>,
     /// Callers some proven site calls the focal from.
     pub proven_callers: HashSet<EntityId>,
+    /// Test-role callers a reading that excludes tests left out: each one
+    /// that calls the focal by a proven site, or whose body could spell one
+    /// of its call names. Their sites were not read, so this counts callers,
+    /// never sites, and it is empty for a reading that includes tests.
+    pub excluded_test_callers: Vec<EntityId>,
+    /// Settled sites a resolver proved call the focal itself.
+    pub settled_to_focal: u64,
+    /// Sites the ledger leaves open that a proven `Calls` edge from their
+    /// caller to the focal carries: the call is that edge's, so for this
+    /// focal it is answered and is no leftover. The ledger settles a site
+    /// only where one target is proven and every other is ruled out, which a
+    /// tier that names one of an open set never does: a call of a name
+    /// imported from a module fork stub reaches the declaration each variant
+    /// supplies, and each of those edges carries the site.
+    pub proven_by_edge: u64,
+    /// Whether a language may run the focal without a call spelling its name
+    /// (see [`kin_model::member_may_dispatch_without_its_name`]), so no
+    /// reading of the sites that spell it is the whole set of its callers.
+    pub implicit_dispatch: bool,
+    /// When [`Self::implicit_dispatch`] holds only because the method is
+    /// declared under decorators, those decorators, less Python's
+    /// name-preserving ones (see [`kin_model::member_dispatch_decorators`]):
+    /// the method can then run without a call that spells its name only
+    /// through what one of them does with it, so a reference answer lists them
+    /// as its residue rather than leaving its callers unaccounted for. `None`
+    /// while any other dispatch could run it. The focal's display name rides
+    /// along so the listing can say what each decorator is on.
+    pub dispatch_decorators: Option<(String, Vec<String>)>,
+    /// Whether [`Self::implicit_dispatch`] holds only because the focal is a
+    /// constructor (see [`kin_model::member_dispatches_by_construction`]), so
+    /// a reference answer can name the constructions no call name shows
+    /// rather than the bare method gate.
+    pub construction_dispatch: bool,
+    /// The line each listed residue site sits on, as written, keyed by file
+    /// and 1-based line (see [`site_expression::residue_lines`]).
+    pub residue_lines: BTreeMap<(String, u32), site_expression::ResidueLine>,
     kept: HashSet<(EntityId, u32, u32)>,
+    named_kept: HashSet<(EntityId, u32, u32)>,
     judged: HashSet<EntityId>,
 }
 
 impl FocalScan {
+    /// Confine the reading to the callers `keep` admits, for a question
+    /// about one part of the repository, and return how many callers it
+    /// left out.
+    ///
+    /// A caller left out holds no site in what remains: its named
+    /// leftovers, the rows the name-unique rule would promote from it and
+    /// its own reading are gone, so the clauses the reading calls for speak
+    /// of the callers kept. An unresolved site in a caller left out could
+    /// add that caller alone, and it is not one the question asked about.
+    /// What the reading counts without a caller, the value calls and the
+    /// census of where the focal is held as a value, stays as it was, so
+    /// the confined reading is never stronger than the evidence for it.
+    pub fn confine(&mut self, keep: impl Fn(&Entity) -> bool) -> usize {
+        let outside: HashSet<EntityId> = self
+            .callers
+            .iter()
+            .filter(|caller| !keep(&caller.entity))
+            .map(|caller| caller.entity.id)
+            .collect();
+        if outside.is_empty() {
+            return 0;
+        }
+        self.callers
+            .retain(|caller| !outside.contains(&caller.entity.id));
+        for sites in [&mut self.candidates, &mut self.named, &mut self.promoted] {
+            sites.retain(|site| !outside.contains(&site.caller));
+        }
+        self.proven_callers
+            .retain(|caller| !outside.contains(caller));
+        self.kept.retain(|(caller, _, _)| !outside.contains(caller));
+        self.named_kept
+            .retain(|(caller, _, _)| !outside.contains(caller));
+        outside.len()
+    }
+
     /// Whether `site` of `caller` could be a call to the focal. A caller the
     /// scan ruled out by its whole body holds no such site.
     pub fn keeps(&self, caller: EntityId, site: &CallSite) -> bool {
@@ -756,13 +1228,32 @@ impl FocalScan {
         self.judged.contains(&caller)
     }
 
-    /// The tally over every caller the scan read, narrowed.
+    /// The tally over the named scope: every caller that could spell a call
+    /// name of the focal, narrowed to the settled sites that call the focal
+    /// and the unsettled sites tied to it by name. Settled sites that go
+    /// elsewhere are not the focal's call sites and are not counted, and
+    /// neither are the value calls, which [`Self::value_calls`] counts.
     pub fn tally(&self) -> CallSiteTally {
         let mut tally = CallSiteTally::default();
-        for caller in &self.callers {
-            tally.add(&caller.reading);
+        for caller in self.callers.iter().filter(|caller| caller.named) {
+            let id = caller.entity.id;
+            tally.add_sites(&caller.reading, |site| {
+                self.named_kept.contains(&(id, site.offset, site.length))
+                    || targets_focal(&site.state, self.focal)
+            });
         }
         tally
+    }
+
+    /// Whether every site that could call the focal by name is either proven
+    /// or listed: no caller in the named scope is owed its sites, stale,
+    /// unverified or without a resolver.
+    pub fn named_complete(&self) -> bool {
+        let tally = self.tally();
+        tally.callers_owed() == 0
+            && tally.callers_unproven_no_resolver == 0
+            && tally.callers_stale == 0
+            && tally.callers_unverified == 0
     }
 
     /// Callers read that no current ledger describes.
@@ -776,6 +1267,30 @@ impl FocalScan {
                 )
             })
             .count()
+    }
+
+    /// Each caller holding a promoted site, with its promoted sites, in the
+    /// order the sites sort.
+    pub fn promoted_callers(&self) -> Vec<(&Entity, Vec<&CandidateSite>)> {
+        let entities: HashMap<EntityId, &Entity> = self
+            .callers
+            .iter()
+            .map(|caller| (caller.entity.id, &caller.entity))
+            .collect();
+        let mut grouped: Vec<(&Entity, Vec<&CandidateSite>)> = Vec::new();
+        for site in &self.promoted {
+            let Some(entity) = entities.get(&site.caller) else {
+                continue;
+            };
+            match grouped
+                .iter_mut()
+                .find(|(caller, _)| caller.id == site.caller)
+            {
+                Some((_, sites)) => sites.push(site),
+                None => grouped.push((entity, vec![site])),
+            }
+        }
+        grouped
     }
 }
 
@@ -795,46 +1310,119 @@ pub const NO_CENSUS: FocalEscape = FocalEscape::Unknown {
 /// for the focal (see
 /// [`crate::handlers::common::HeldSourceAuthority::escape_evidence_batch`]).
 ///
+/// The kept sites split in two. A site whose callee or caller body spells a
+/// call name of the focal, or whose text was not read in a caller that could
+/// spell one, is a named leftover, and every one is listed. A site kept only
+/// because the focal may be held as a value, or reached through a name built
+/// at run time, is a value call, counted once beside the census reason. When
+/// the focal's one call name reaches exactly one definition in the store, the
+/// focal, a named unresolved site is promoted to a `name_unique` row instead
+/// (see [`NameUnique`]).
+///
 /// While the focal may escape, every unsettled site of every caller in the
-/// calling languages is kept and no text is needed to decide; `text` then
-/// only fills the callee and line of the rows a block serves. While it is
-/// contained, a caller whose whole preview spells none of its call names
-/// holds no site that could call it (the census saw no dynamic access in
-/// the domain), and the rest are judged by their exact text, read through
-/// `text`. A reader that holds no text keeps every site text would have
-/// ruled out.
+/// calling languages is kept and no text is needed to decide; the text of a
+/// caller that could spell a call name is still read, so its named sites are
+/// told apart from its value calls. While it is contained, a caller whose
+/// whole preview spells none of its call names holds no site that could call
+/// it (the census saw no dynamic access in the domain), and the rest are
+/// judged by their exact text, read through `text`. A reader that holds no
+/// text keeps every site text would have ruled out.
 pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
     store: &G,
     focal: &Entity,
     text: &T,
     escape: FocalEscape,
 ) -> crate::error::Result<FocalScan> {
-    let names = focal_call_names(focal);
-    let escapes = escape.may_escape();
-    let proven_callers: HashSet<EntityId> = store
+    scan_focal_scoped(store, focal, text, escape, true)
+}
+
+/// [`scan_focal`] over the requested caller roles. Definition lookup and the
+/// escape census retain their full binding domain; only caller contributions
+/// are excluded, before sites, debt, candidates and tallies are collected.
+pub fn scan_focal_scoped<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    text: &T,
+    escape: FocalEscape,
+    include_tests: bool,
+) -> crate::error::Result<FocalScan> {
+    // The census's alias names are call names too, and what it lists is
+    // served beside the rows, so only an escape it could not list widens the
+    // scan to every unsettled site.
+    let names = escape.call_names(focal);
+    let escapes = escape.may_escape_unlisted(&names);
+    let calls_in: Vec<kin_model::Relation> = store
         .get_all_relations_for_entity(&focal.id)
         .map_err(crate::error::McpError::graph)?
-        .iter()
+        .into_iter()
         .filter(|relation| {
             relation.kind == kin_model::RelationKind::Calls
                 && relation.dst.as_entity() == Some(focal.id)
         })
+        .collect();
+    let mut proven_callers: HashSet<EntityId> = calls_in
+        .iter()
         .filter_map(|relation| relation.src.as_entity())
         .collect();
+    // Where each caller's proven edges to the focal say the call is written.
+    let mut proven_calls: HashMap<EntityId, Vec<SourceSpan>> = HashMap::new();
+    for relation in &calls_in {
+        if let Some(caller) = relation.src.as_entity() {
+            let (sites, _) = kin_index::occurrence::proven_sites(relation);
+            if !sites.is_empty() {
+                proven_calls.entry(caller).or_default().extend(sites);
+            }
+        }
+    }
     let entities = store
         .query_entities(&kin_model::graph::EntityFilter {
             languages: Some(calling_languages(focal.language)),
             ..Default::default()
         })
         .map_err(crate::error::McpError::graph)?;
+    let mut excluded_test_callers: Vec<EntityId> = Vec::new();
+    if !include_tests {
+        proven_callers.retain(|id| {
+            let excluded = matches!(
+                store.get_entity(id),
+                Ok(Some(entity)) if !caller_in_scope(&entity, false)
+            );
+            if excluded {
+                excluded_test_callers.push(*id);
+            }
+            !excluded
+        });
+    }
+    let proven_in_tests: HashSet<EntityId> = excluded_test_callers.iter().copied().collect();
     let facts = GraphSiteFacts::new(store);
     let mut scan = FocalScan {
+        include_tests,
+        focal: focal.id,
         names,
         escape,
         candidates: Vec::new(),
+        named: Vec::new(),
+        promoted: Vec::new(),
+        name_unique: NameUnique::NotApplied {
+            reason: UNIQUE_NOT_ONE_CALL_NAME,
+        },
+        value_calls: ValueCalls::default(),
         callers: Vec::new(),
         proven_callers,
+        excluded_test_callers,
+        settled_to_focal: 0,
+        proven_by_edge: 0,
+        implicit_dispatch: focal.kind == kin_model::EntityKind::Method
+            && kin_model::member_may_dispatch_without_its_name(focal),
+        dispatch_decorators: (focal.kind == kin_model::EntityKind::Method
+            && kin_model::member_may_dispatch_without_its_name(focal))
+        .then(|| kin_model::member_dispatch_decorators(focal))
+        .flatten()
+        .map(|decorators| (focal.name.clone(), decorators)),
+        construction_dispatch: kin_model::member_dispatches_by_construction(focal),
+        residue_lines: BTreeMap::new(),
         kept: HashSet::new(),
+        named_kept: HashSet::new(),
         judged: HashSet::new(),
     };
     if matches!(scan.escape, FocalEscape::NonCallable { .. }) {
@@ -842,6 +1430,21 @@ pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
         // unproven call sites out of the focal's call domain.
         return Ok(scan);
     }
+    // The names a receiver of the focal's owner is spelled with, for reading
+    // what each named leftover's receiver says.
+    let owner = FocalOwner::of(focal);
+    // The name a named site could be promoted under, decided before the walk
+    // so the walk reads the settled sites that could contest it only when the
+    // rest of the rule already holds.
+    let mut unique = unique_call_name(store, focal, &scan.names);
+    // Callers whose settled sites could contest the name and whose text the
+    // walk did not otherwise need, read after it so the named leftovers are
+    // addressed first.
+    let mut contest_pending: Vec<usize> = Vec::new();
+    // Excluded callers contribute no sites or counts, but a settled binding
+    // can still refute the global name-uniqueness rule. Read that evidence
+    // after in-scope candidates so it cannot consume their text budget first.
+    let mut excluded_contests: Vec<(Entity, CallSiteLedger)> = Vec::new();
     // Each kept site with its caller's index in `scan.callers` and its key,
     // so rows sort by site and the served ones can be addressed after.
     let mut kept_sites: Vec<(CandidateSite, usize, (u32, u32))> = Vec::new();
@@ -853,27 +1456,73 @@ pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
         else {
             continue;
         };
-        let file = span.file.0.clone();
-        if !escapes
-            && !could_name_focal(&entity, &scan.names)
-            && !scan.proven_callers.contains(&entity.id)
-        {
+        let could_name = could_name_focal(&entity, &scan.names);
+        if !caller_in_scope(&entity, include_tests) {
+            // Counted only where the test's recorded text spells a call
+            // name. One with no text on record, or text cut short, could
+            // spell it too, and is not counted for something nobody read.
+            if could_name
+                && !proven_in_tests.contains(&entity.id)
+                && spells_focal_name(&entity, &scan.names)
+            {
+                scan.excluded_test_callers.push(entity.id);
+            }
+            if unique.is_ok() && could_name {
+                if let CallerSites::Current(ledger) = read_caller_sites(&facts, &entity) {
+                    if ledger.sites.iter().any(|site| {
+                        SiteStateKind::of(&site.state).is_settled()
+                            && !targets_focal(&site.state, scan.focal)
+                    }) {
+                        excluded_contests.push((entity, ledger));
+                    }
+                }
+            }
             continue;
         }
+        let file = span.file.0.clone();
+        let named_caller = could_name || scan.proven_callers.contains(&entity.id);
+        if !escapes && !named_caller {
+            continue;
+        }
+        // Read once per caller, and only when one of its sites is kept.
+        let caller_module = std::cell::OnceCell::new();
         let reading = read_caller_sites(&facts, &entity);
         scan.judged.insert(entity.id);
         let Some(ledger) = reading.ledger() else {
-            scan.callers.push(ScannedCaller { entity, reading });
+            if !named_caller && !matches!(reading, CallerSites::NoSites) {
+                scan.value_calls.callers_unread += 1;
+            }
+            scan.callers.push(ScannedCaller {
+                entity,
+                reading,
+                named: named_caller,
+            });
             continue;
         };
         let recorded_only = !matches!(reading, CallerSites::Current(_));
+        if !recorded_only {
+            scan.settled_to_focal += ledger
+                .sites
+                .iter()
+                .filter(|site| targets_focal(&site.state, scan.focal))
+                .count() as u64;
+        }
+        // Whether this caller's settled sites could say the call name goes
+        // somewhere other than the focal, which only matters while the rest
+        // of the promotion rule holds.
+        let could_contest = unique.is_ok()
+            && could_name
+            && !recorded_only
+            && ledger.sites.iter().any(|site| {
+                SiteStateKind::of(&site.state).is_settled()
+                    && !targets_focal(&site.state, scan.focal)
+            });
         // While the focal is contained, text decides which sites could call
         // it. While it may escape, every unsettled site stays whatever the
         // text says, and the text of a caller that could spell a call name is
         // still read so a site whose callee spells it is told apart from one
         // kept only because the focal may be held as a value. That is what
-        // puts the named sites first, where a reader looks.
-        let could_name = could_name_focal(&entity, &scan.names);
+        // splits the named leftovers from the value calls.
         let body = if (!escapes || could_name)
             && ledger
                 .sites
@@ -884,8 +1533,24 @@ pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
         } else {
             None
         };
+        if could_contest {
+            match (body.as_deref(), &unique) {
+                (Some(body), Ok(name)) => {
+                    if contests_name(ledger, body, name, scan.focal) {
+                        unique = Err(UNIQUE_CONTESTED);
+                    }
+                }
+                _ => contest_pending.push(scan.callers.len()),
+            }
+        }
         let spelling = body.as_deref().or_else(|| whole_body_preview(&entity));
+        // The sites of this caller a proven edge to the focal carries.
+        let proven_here = match (body.as_deref(), proven_calls.get(&entity.id)) {
+            (Some(body), Some(spans)) => edge_site_keys(&entity, body, spans),
+            _ => HashSet::new(),
+        };
         let mut keys = Vec::new();
+        let mut value_sites_here = 0u64;
         for site in &ledger.sites {
             // A ledger under another context or none recorded its states
             // under a proof that may not hold, so a site it recorded as
@@ -900,39 +1565,91 @@ pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
             } else {
                 site.clone()
             };
+            // A structural caller may have readable site evidence without
+            // a body. That evidence can distinguish its callee but cannot
+            // stand in for complete caller text or receiver/escape analysis.
+            let site_text = if body.is_none()
+                && (!escapes || could_name)
+                && !SiteStateKind::of(&judged.state).is_settled()
+            {
+                exact_site_text(text, &entity, site)
+            } else {
+                None
+            };
             let at = body
                 .as_deref()
-                .and_then(|body| kin_model::site_text(site, body));
+                .and_then(|body| kin_model::site_text(site, body))
+                .or(site_text.as_deref());
+            // An open site a proven edge to the focal carries is that edge's
+            // call: answered for this focal, whatever else it may reach.
+            if !SiteStateKind::of(&judged.state).is_settled() && proven_here.contains(&site.key()) {
+                scan.proven_by_edge += 1;
+                continue;
+            }
             let Some(mut why) =
                 kin_model::site_could_call_at(&judged, at, &scan.names, spelling, escapes)
             else {
                 continue;
             };
-            // A caller whose body could spell a call name but whose text was
+            // A call through a lookup by a computed name is the census's to
+            // judge: it read every such lookup in the domain against the focal
+            // and lists each one that could fetch it, so the call is not kept
+            // a second time as dynamic access. A site whose text was not read
+            // could be a literal lookup that spells a name, and stays.
+            if why == kin_model::call_site_reading::REACH_DYNAMIC_ACCESS
+                && at.is_some()
+                && scan.escape.judged_dynamic_access()
+            {
+                continue;
+            }
+            // A caller whose body could spell a call name but whose site was
             // not read (past the read bound) may hold a named site; saying it
             // is kept only because the focal escapes would be a guess.
             if escapes
                 && could_name
-                && body.is_none()
+                && at.is_none()
                 && why == kin_model::call_site_reading::REACH_FOCAL_ESCAPES
             {
                 why = kin_model::call_site_reading::REACH_TEXT_UNKNOWN;
             }
             keys.push(site.key());
-            kept_sites.push((
-                CandidateSite {
-                    caller: entity.id,
-                    caller_name: entity.name.clone(),
-                    caller_file: Some(file.clone()),
-                    line_in_entity: body.as_deref().and_then(|body| line_in(body, site)),
-                    callee: at.filter(|text| is_identifier(text)).map(str::to_string),
-                    state: reading.site_kind(site),
-                    state_reason: site_state_reason(&site.state),
-                    reason: why,
-                },
-                scan.callers.len(),
-                site.key(),
-            ));
+            if kin_model::reach_is_named(why) {
+                scan.named_kept
+                    .insert((entity.id, site.offset, site.length));
+            } else {
+                value_sites_here += 1;
+                scan.value_calls.sites += 1;
+                *scan.value_calls.by_reason.entry(why).or_default() += 1;
+            }
+            let mut row = CandidateSite {
+                caller: entity.id,
+                caller_name: entity.name.clone(),
+                caller_file: Some(file.clone()),
+                caller_module: caller_module
+                    .get_or_init(|| crate::semantic_owners::entity_module(store, &entity))
+                    .clone(),
+                line_in_entity: body.as_deref().and_then(|body| line_in(body, site)),
+                callee: at.filter(|text| is_identifier(text)).map(str::to_string),
+                state: reading.site_kind(site),
+                state_reason: site_state_reason(&site.state),
+                reason: why,
+                expr: None,
+                receiver: None,
+                receiver_hint: None,
+                expr_unavailable: None,
+                receiver_binding_missing: None,
+                receiver_import: None,
+                bare_call: false,
+            };
+            if kin_model::reach_is_named(why) {
+                if let Some(body) = body.as_deref() {
+                    address_expression(&mut row, &entity, body, site.key(), &owner);
+                }
+            }
+            kept_sites.push((row, scan.callers.len(), site.key()));
+        }
+        if value_sites_here > 0 {
+            scan.value_calls.callers += 1;
         }
         let kept: HashSet<(u32, u32)> = keys.iter().copied().collect();
         for (offset, length) in keys {
@@ -945,6 +1662,7 @@ pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
         scan.callers.push(ScannedCaller {
             entity,
             reading: narrowed,
+            named: named_caller,
         });
     }
     kept_sites.sort_by(|(left, _, left_key), (right, _, right_key)| {
@@ -963,44 +1681,175 @@ pub fn scan_focal<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
                 right_key,
             ))
     });
-    // The rows a block serves are addressed inside their callers even when
-    // no text was needed to keep them.
-    let mut bodies: HashMap<usize, Option<String>> = HashMap::new();
-    for (row, caller, (offset, length)) in kept_sites.iter_mut().take(CALL_SITE_ROWS_MAX) {
-        if row.line_in_entity.is_some() {
+    // Every named row is served, so every one is addressed inside its caller,
+    // with the call as written, even when no text was needed to keep it. Each
+    // caller's body is read once however many of its sites are listed; value
+    // calls are only counted.
+    let mut bodies: HashMap<usize, Result<String, &'static str>> = HashMap::new();
+    for (row, caller, (offset, length)) in kept_sites
+        .iter_mut()
+        .filter(|(row, _, _)| kin_model::reach_is_named(row.reason))
+    {
+        if row.expr.is_some() || row.expr_unavailable.is_some() {
             continue;
         }
+        let entity = &scan.callers[*caller].entity;
         let body = bodies
             .entry(*caller)
-            .or_insert_with(|| exact_text(text, &scan.callers[*caller].entity));
-        if let Some(body) = body.as_deref() {
-            let site = CallSite {
-                offset: *offset,
-                length: *length,
-                state: kin_model::CallSiteState::ProvenOutside,
-            };
-            row.line_in_entity = line_in(body, &site);
-            row.callee = kin_model::site_text(&site, body)
-                .filter(|text| is_identifier(text))
-                .map(str::to_string);
+            .or_insert_with(|| site_expression::whole_text(text, entity));
+        match body {
+            Ok(body) => {
+                let site = CallSite {
+                    offset: *offset,
+                    length: *length,
+                    state: kin_model::CallSiteState::ProvenOutside,
+                };
+                if row.line_in_entity.is_none() {
+                    row.line_in_entity = line_in(body, &site);
+                    row.callee = kin_model::site_text(&site, body)
+                        .filter(|text| is_identifier(text))
+                        .map(str::to_string);
+                }
+                address_expression(row, entity, body, (*offset, *length), &owner);
+            }
+            Err(reason) => row.expr_unavailable = Some(*reason),
+        }
+    }
+    // A named leftover made through a receiver says which link of the chain
+    // typing it is missing, so a reader knows what the graph could not prove
+    // before reading the caller. One made on a name its file imports says
+    // which module the import names, and whether the repository holds it.
+    let census = kin_db::call_site_escape::StoreCensus { store };
+    let mut imports = kin_db::call_site_escape::ReceiverImports::new(&census);
+    for (row, caller, _) in kept_sites
+        .iter_mut()
+        .filter(|(row, _, _)| kin_model::reach_is_named(row.reason))
+    {
+        let (Some(receiver), Some(method)) = (row.receiver.as_deref(), row.callee.as_deref())
+        else {
+            continue;
+        };
+        let entity = &scan.callers[*caller].entity;
+        if let Some((_, missing)) =
+            crate::receiver_binding::chain_gap(store, entity, receiver, method)
+        {
+            row.receiver_binding_missing = Some(crate::receiver_binding::missing_brief(&missing));
+        }
+        let line = entity
+            .span
+            .as_ref()
+            .zip(row.line_in_entity)
+            .and_then(|(span, line)| u32::try_from(line).ok()?.checked_add(span.start_line));
+        if let Some(import) = entity
+            .file_origin
+            .as_ref()
+            .zip(line)
+            .and_then(|(path, line)| imports.of(path, receiver, line))
+        {
+            row.receiver_import = Some(json!({
+                "module": import.module,
+                "outside_repository": import.outside_repository,
+            }));
         }
     }
     scan.candidates = kept_sites.into_iter().map(|(row, _, _)| row).collect();
+    // Promotion: the rest of the rule held during the walk, so the settled
+    // sites of callers whose text it did not need are read now, and any that
+    // spells the name and goes elsewhere, or that cannot be read, stops it.
+    // A call made on a name its file imports from outside the repository
+    // runs that module's own member, so it is never read as a call to a
+    // module-level focal that merely shares the name. A method keeps it: an
+    // outside module can hand out a value of a class declared here.
+    let on_outside_import = |site: &CandidateSite| {
+        !owner.is_member()
+            && site
+                .receiver_import
+                .as_ref()
+                .and_then(|import| import.get("outside_repository"))
+                .and_then(Value::as_bool)
+                == Some(true)
+    };
+    let promotable = |site: &CandidateSite| {
+        site.reason == kin_model::call_site_reading::REACH_CALLEE_SPELLS
+            && matches!(
+                site.state,
+                SiteStateKind::Unresolved | SiteStateKind::ServerFailed
+            )
+            && !on_outside_import(site)
+    };
+    if unique.is_ok() && !scan.candidates.iter().any(promotable) {
+        unique = Err(UNIQUE_NOTHING_TO_PROMOTE);
+    }
+    if unique.is_ok() {
+        for caller in contest_pending {
+            let Ok(name) = &unique else {
+                break;
+            };
+            let entity = &scan.callers[caller].entity;
+            let Some(ledger) = scan.callers[caller].reading.ledger() else {
+                continue;
+            };
+            match exact_text(text, entity) {
+                Some(body) if contests_name(ledger, &body, name, scan.focal) => {
+                    unique = Err(UNIQUE_CONTESTED);
+                }
+                Some(_) => {}
+                None => unique = Err(UNIQUE_CONTEST_UNREAD),
+            }
+        }
+    }
+    if unique.is_ok() {
+        for (entity, ledger) in excluded_contests {
+            let Ok(name) = &unique else {
+                break;
+            };
+            match exact_text(text, &entity) {
+                Some(body) if contests_name(&ledger, &body, name, scan.focal) => {
+                    unique = Err(UNIQUE_CONTESTED);
+                }
+                Some(_) => {}
+                None => unique = Err(UNIQUE_CONTEST_UNREAD),
+            }
+        }
+    }
+    scan.name_unique = match unique {
+        Ok(name) => NameUnique::Promoted { name },
+        Err(reason) => NameUnique::NotApplied { reason },
+    };
+    let promote = matches!(scan.name_unique, NameUnique::Promoted { .. });
+    for candidate in &scan.candidates {
+        if !kin_model::reach_is_named(candidate.reason) {
+            continue;
+        }
+        if promote && promotable(candidate) {
+            scan.promoted.push(candidate.clone());
+        } else {
+            scan.named.push(candidate.clone());
+        }
+    }
+    // Sites whose receiver can hold the focal's owner first, then the ones
+    // nothing says about, then literals and builtins, each group in the order
+    // above. None is dropped.
+    scan.named
+        .sort_by_key(|row| ReceiverHint::rank_of(row.receiver_hint));
+    scan.residue_lines =
+        site_expression::residue_lines(store, text, &scan.escape, CALL_SITE_CANDIDATE_SAMPLE_MAX);
     Ok(scan)
 }
 
 /// How strongly a kept site's reason ties it to the focal, strongest first:
-/// its callee spells a call name, then its caller's body does, then it could
-/// reach the focal only through access the text cannot name, and last it is
-/// kept only because the focal may be held as a value. Rows sort by this
-/// before file, so the sites a reader should check come before the ones every
-/// unsettled site in the store would be.
+/// its callee spells a call name, then its caller's body does, then its text
+/// was not read in a caller that could spell one, then it could reach the
+/// focal only through access the text cannot name, and last it is kept only
+/// because the focal may be held as a value. Rows sort by this before file,
+/// so the named leftovers come before the value calls.
 pub fn reach_rank(reason: &str) -> u8 {
     match reason {
         kin_model::call_site_reading::REACH_CALLEE_SPELLS => 0,
         kin_model::call_site_reading::REACH_BODY_SPELLS => 1,
-        kin_model::call_site_reading::REACH_FOCAL_ESCAPES => 3,
-        _ => 2,
+        kin_model::call_site_reading::REACH_FOCAL_ESCAPES => 4,
+        reason if kin_model::reach_is_named(reason) => 2,
+        _ => 3,
     }
 }
 
@@ -1058,7 +1907,8 @@ pub struct CallsEvidence {
     /// Store-wide unsettled sites that could be calls to the focal.
     pub candidates: Vec<CandidateSite>,
     /// Why it is not settled, each once, in this order:
-    /// [`UNSETTLED_CANDIDATE_SITES`], [`CALLERS_WITHOUT_LEDGER`],
+    /// [`UNSETTLED_CANDIDATE_SITES`], [`ESCAPE_RESIDUE_LISTED`], [`UNKEYED_LOOKUPS_COUNTED`],
+    /// [`CALLERS_WITHOUT_LEDGER`],
     /// [`NO_VALIDATED_CONTEXT`], [`LEDGER_NOT_UNDER_CURRENT_CONTEXT`],
     /// [`PROVEN_TARGET_NOT_LIVE`], [`UNATTRIBUTED_EXPRESSIONS`].
     pub unsettled_because: Vec<&'static str>,
@@ -1075,7 +1925,18 @@ pub fn calls_evidence_for<G: GraphStore + ?Sized>(
     store: &G,
     focal: &Entity,
 ) -> crate::error::Result<CallsEvidence> {
-    calls_evidence_for_with(store, focal, &NoSiteText, NO_CENSUS)
+    calls_evidence_for_scoped(store, focal, true)
+}
+
+/// [`calls_evidence_for`] over the requested caller roles, preserving unknown
+/// and unowned file inventory as a gap even when test callers are excluded.
+pub fn calls_evidence_for_scoped<G: GraphStore + ?Sized>(
+    store: &G,
+    focal: &Entity,
+    include_tests: bool,
+) -> crate::error::Result<CallsEvidence> {
+    let scan = scan_focal_scoped(store, focal, &NoSiteText, NO_CENSUS, include_tests)?;
+    Ok(calls_evidence_from(store, focal, &scan))
 }
 
 /// [`calls_evidence_for`] with `text`, the reader of callers' graph-held
@@ -1122,6 +1983,12 @@ pub fn calls_evidence_from<G: GraphStore + ?Sized>(
     if !scan.candidates.is_empty() {
         add(UNSETTLED_CANDIDATE_SITES);
     }
+    if escape_residue_clause(&scan.escape).is_some() {
+        add(ESCAPE_RESIDUE_LISTED);
+    }
+    if unkeyed_lookups_clause(&scan.escape).is_some() {
+        add(UNKEYED_LOOKUPS_COUNTED);
+    }
     // Candidate rows are a result, not a completeness census. An empty stale
     // ledger or an unattributed expression produces no row but still prevents
     // replacing the store's binding proof. Audit the full calling-language
@@ -1132,9 +1999,14 @@ pub fn calls_evidence_from<G: GraphStore + ?Sized>(
     }) {
         Ok(entities) => entities
             .into_iter()
+            .filter(|entity| caller_in_scope(entity, scan.include_tests))
             .map(|entity| {
                 let reading = read_caller_sites(&facts, &entity);
-                ScannedCaller { entity, reading }
+                ScannedCaller {
+                    entity,
+                    reading,
+                    named: true,
+                }
             })
             .collect(),
         Err(_) => {
@@ -1239,7 +2111,7 @@ pub fn calls_evidence_from<G: GraphStore + ?Sized>(
 /// ledger: the censuses of its entities' current ledgers add up to at least
 /// the parse-side count stamped on the file. A file with no parse-side count,
 /// or with an entity whose ledger is not current, cannot show it.
-fn file_attributes_every_call<G: GraphStore + ?Sized>(
+pub(crate) fn file_attributes_every_call<G: GraphStore + ?Sized>(
     store: &G,
     facts: &GraphSiteFacts<'_, G>,
     file: &str,
@@ -1270,35 +2142,354 @@ fn file_attributes_every_call<G: GraphStore + ?Sized>(
     census >= parsed
 }
 
-/// The block `find_references` serves for a focal: the tally over every
-/// caller in the store that could call it, narrowed to the sites that could,
-/// and one row per unsettled site that could be a call to it, at most
-/// [`CALL_SITE_CANDIDATE_SAMPLE_MAX`] of them. The block is unsettled exactly while its
-/// clauses name something, and any candidate row is such a site.
+/// Where an answer-only reply lists the named leftovers a `call_sites` block
+/// carries under `candidates`.
+pub const ANSWER_ONLY_NAMED_PATH: &str = "call_site_candidates.named";
+
+/// The text before a clause's first colon: its code.
+fn clause_code(clause: &str) -> &str {
+    clause.split(':').next().unwrap_or(clause).trim()
+}
+
+/// The clause the named leftovers call for: how many sites that spell a call
+/// name are not proven, and where each one is listed.
+fn named_leftovers_clause(scan: &FocalScan) -> String {
+    let listed = scan.named.len();
+    let promoted = scan.promoted.len();
+    let names = scan.names.join(", ");
+    let promoted_part = if promoted > 0 {
+        format!(
+            ", and {promoted} are served as `name_unique` reference rows because the store \
+             holds one definition that name can reach"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{}: {} call site(s) whose callee or caller body spells {names} are not proven: \
+         {listed} are listed by caller and line under `call_sites.candidates` \
+         (`{ANSWER_ONLY_NAMED_PATH}` in an answer-only reply){promoted_part}, so the answer is \
+         complete except those sites",
+        kin_model::call_site_reading::NAMED_LEFTOVERS,
+        listed + promoted,
+    )
+}
+
+/// The census reason as a clause fragment: why a value call could reach the
+/// focal at all.
+fn census_words(escape: &FocalEscape) -> String {
+    let reason = match escape {
+        FocalEscape::Unknown { reason } => {
+            format!("the escape census could not rule that out ({reason})")
+        }
+        FocalEscape::Escapes { reason, .. } => {
+            format!("the escape census found it may be ({reason})")
+        }
+        FocalEscape::Contained { .. } | FocalEscape::NonCallable { .. } => {
+            "the escape census found it is not, so only a name computed at run time could \
+             reach it"
+                .to_string()
+        }
+    };
+    reason.replace(crate::verdict::CLAUSE_SEPARATOR, ", ")
+}
+
+/// The clause the value calls call for: how many sites, and how many callers
+/// whose sites are not known, could reach the focal only through a value or a
+/// computed name, and why the census kept them.
+fn value_calls_clause(scan: &FocalScan) -> String {
+    let value = &scan.value_calls;
+    let mut parts = Vec::new();
+    if value.sites > 0 {
+        parts.push(format!(
+            "{} unsettled call site(s) in {} caller(s) never spell a call name of the focal",
+            value.sites, value.callers
+        ));
+    }
+    if value.callers_unread > 0 {
+        parts.push(format!(
+            "{} caller(s) that never spell one have call sites the graph has not settled",
+            value.callers_unread
+        ));
+    }
+    format!(
+        "{}: {}, and they could reach it only if it is held as a value or looked up by a \
+         computed name, and {}, so they are counted under `call_sites.value_calls` rather \
+         than listed",
+        kin_model::call_site_reading::VALUE_CALLS_UNMEASURED,
+        parts.join(", and "),
+        census_words(&scan.escape),
+    )
+    .replace(crate::verdict::CLAUSE_SEPARATOR, ", ")
+}
+
+/// The clauses a named block calls for: the named scope's own tally clauses,
+/// with every per-site clause the listing answers replaced by one
+/// [`kin_model::call_site_reading::NAMED_LEFTOVERS`] clause, and one
+/// [`kin_model::call_site_reading::VALUE_CALLS_UNMEASURED`] clause for the value
+/// calls. Caller-level clauses stay: a caller whose sites are owed, stale,
+/// unverified or unprovable holds sites nobody listed.
+pub fn named_clauses(scan: &FocalScan) -> Vec<String> {
+    let mut clauses: Vec<String> = scan
+        .tally()
+        .clauses(NAMED_SCOPE)
+        .into_iter()
+        .filter(|clause| {
+            !kin_model::call_site_reading::LISTED_SITE_CODES.contains(&clause_code(clause))
+        })
+        .collect();
+    if !scan.named.is_empty() || !scan.promoted.is_empty() {
+        clauses.push(named_leftovers_clause(scan));
+    }
+    if !scan.value_calls.is_empty() {
+        clauses.push(value_calls_clause(scan));
+    }
+    if let Some(clause) = escape_residue_clause(&scan.escape) {
+        clauses.push(clause);
+    }
+    if let Some(clause) = unkeyed_lookups_clause(&scan.escape) {
+        clauses.push(clause);
+    }
+    if let Some(clause) = decorator_dispatch_clause(scan) {
+        clauses.push(clause);
+    }
+    clauses.sort();
+    clauses
+}
+
+/// Where a `call_sites` block says how a method it reads may run without a
+/// call that spells its name, when that is known.
+pub const IMPLICIT_DISPATCH_THROUGH_KEY: &str = "implicit_dispatch_through";
+
+/// [`IMPLICIT_DISPATCH_THROUGH_KEY`] for a constructor: constructions that
+/// spell no name the block follows.
+pub const CONSTRUCTION_DISPATCH: &str = "construction";
+
+/// Where a `call_sites` block lists the decorators a method may run through
+/// without a call that spells its name, when they are the only way it can
+/// (see [`FocalScan::dispatch_decorators`]). An empty list says the method is
+/// declared under Python's name-preserving decorators alone.
+pub const DISPATCH_DECORATORS_KEY: &str = "dispatch_decorators";
+
+/// The decorator sites a named block lists, or `None` when the method may run
+/// without a call that spells its name through something other than its
+/// decorators, or not at all. Each site names the decorator as written ahead
+/// of the declaration and the method it sits on.
+fn dispatch_decorator_sites(scan: &FocalScan) -> Option<Value> {
+    if !scan.implicit_dispatch {
+        return None;
+    }
+    let (focal_name, decorators) = scan.dispatch_decorators.as_ref()?;
+    Some(json!(decorators
+        .iter()
+        .map(|name| json!({
+            "kind": "decorator",
+            "name": name,
+            "expr": format!("@{name}"),
+            "inside": focal_name,
+            "inside_id": scan.focal.to_string(),
+        }))
+        .collect::<Vec<_>>()))
+}
+
+/// The clause a method run through its decorators calls for: which decorators
+/// it is declared under, so the answer is complete except what they do with
+/// it. `None` when the method's callers need no such clause or when something
+/// other than its decorators could run it, which keeps the method gate.
+fn decorator_dispatch_clause(scan: &FocalScan) -> Option<String> {
+    if !scan.implicit_dispatch {
+        return None;
+    }
+    let (focal_name, decorators) = scan.dispatch_decorators.as_ref()?;
+    if decorators.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = decorators.iter().map(|name| format!("@{name}")).collect();
+    Some(
+        format!(
+            "{}: {focal_name} is declared under {} ({}), and a call that spells its name runs \
+             what that decorator returned, so it could run without such a call only through \
+             what the decorator does with it, each listed in `call_sites.{DISPATCH_DECORATORS_KEY}`",
+            kin_model::call_site_reading::DECORATOR_DISPATCH_LISTED,
+            if decorators.len() == 1 {
+                "1 decorator".to_string()
+            } else {
+                format!("{} decorators", decorators.len())
+            },
+            listed.join(", "),
+        )
+        .replace(crate::verdict::CLAUSE_SEPARATOR, ", "),
+    )
+}
+
+/// The block `find_references` serves for a focal: the tally over the named
+/// scope (every caller that could spell a call name of the focal, narrowed to
+/// the settled sites that call the focal and the unsettled sites tied to it by
+/// name), one row for every named leftover, never a sample, the promotion
+/// reading, and the value calls counted once with the census reason. The
+/// block is settled exactly while its clauses name nothing; while it names
+/// only the listed residue, the verdict reads it as complete except that
+/// residue.
 pub fn named_block(scan: &FocalScan) -> Value {
     let tally = scan.tally();
     let mut block = block_json(&tally, NAMED_SCOPE);
-    block["call_names"] = json!(scan.names);
-    block["focal_escape"] = json!(scan.escape);
-    block["candidate_count"] = json!(scan.candidates.len());
-    let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
-    for candidate in &scan.candidates {
-        *by_reason.entry(candidate.reason).or_default() += 1;
+    let clauses = named_clauses(scan);
+    block["settled"] = json!(clauses.is_empty());
+    block["clauses"] = json!(clauses);
+    block["named_complete"] = json!(scan.named_complete());
+    if scan.implicit_dispatch {
+        block["implicit_dispatch"] = json!(true);
     }
-    block["candidates_by_reason"] = json!(by_reason);
-    block["candidates"] = json!(scan
-        .candidates
-        .iter()
-        .take(CALL_SITE_CANDIDATE_SAMPLE_MAX)
-        .collect::<Vec<_>>());
-    let withheld = scan
-        .candidates
-        .len()
-        .saturating_sub(CALL_SITE_CANDIDATE_SAMPLE_MAX);
-    if withheld > 0 {
-        block["candidates_withheld"] = json!(withheld);
+    if let Some(decorators) = dispatch_decorator_sites(scan) {
+        block[DISPATCH_DECORATORS_KEY] = decorators;
+    }
+    if scan.implicit_dispatch && scan.construction_dispatch {
+        block[IMPLICIT_DISPATCH_THROUGH_KEY] = json!(CONSTRUCTION_DISPATCH);
+    }
+    block["call_names"] = json!(scan.names);
+    let mut focal_escape = scan.escape.summary_json(CALL_SITE_CANDIDATE_SAMPLE_MAX);
+    site_expression::annotate_residue(&mut focal_escape, &scan.residue_lines);
+    block["focal_escape"] = focal_escape.clone();
+    block["settled_to_focal"] = json!(scan.settled_to_focal);
+    if scan.proven_by_edge > 0 {
+        block["proven_by_edge"] = json!(scan.proven_by_edge);
+    }
+    block["candidate_count"] = json!(scan.named.len());
+    block["candidates"] = json!(scan.named);
+    if let Some(rows) = block["candidates"].as_array_mut() {
+        let cut = site_expression::cap_expressions(
+            rows.iter_mut(),
+            site_expression::NAMED_EXPR_BYTES_MAX,
+        );
+        if let Some(disclosure) = cut.disclosure(
+            site_expression::NAMED_EXPR_BYTES_MAX,
+            "rows, listed most likely to reach the focal first,",
+        ) {
+            block[NAMED_EXPR_ELIDED_KEY] = disclosure;
+        }
+    }
+    block["name_unique"] = json!({
+        "reading": scan.name_unique,
+        "promoted": scan.promoted.len(),
+    });
+    if !scan.value_calls.is_empty() {
+        block["value_calls"] = json!({
+            "sites": scan.value_calls.sites,
+            "callers": scan.value_calls.callers,
+            "callers_unread": scan.value_calls.callers_unread,
+            "by_reason": scan.value_calls.by_reason,
+            "census": focal_escape,
+        });
     }
     block
+}
+
+/// The scope a [`mention_block`] reads: the focal's non-call reads.
+pub const MENTION_SCOPE: &str = "the focal's non-call reads";
+
+/// The residue lists a [`mention_block`] keeps: the census's reading of the
+/// focal's non-call reads, the lookups by a computed name that bound them,
+/// and the regions no record covers.
+const MENTION_RESIDUE_KEYS: [&str; 3] = [
+    kin_model::call_site_reading::MENTIONS_KEY,
+    "unkeyed_lookups",
+    "unrecorded",
+];
+
+/// The block a reference answer serves when it asks for imports or references
+/// and not calls: the escape census's reading of every non-call read of the
+/// focal, matched against the rows the graph stores into it, which is what
+/// decides whether those kinds are complete (`reference_completion` in the
+/// verdict). Each unmatched read is addressed by the declaration it sits in
+/// and its line, as a named block addresses its residue.
+///
+/// It carries no tally and no `settled`, because it read no call site: a call
+/// census settles calls alone, and this block makes no claim about them. The
+/// census's call residue (values passed on, reflective lookups, protocol
+/// dispatch) is left out for the same reason; a value use is a non-call read
+/// and already sits in the mention reading.
+pub fn mention_block<G: GraphStore + ?Sized, T: SiteText + ?Sized>(
+    store: &G,
+    text: &T,
+    escape: &FocalEscape,
+) -> Value {
+    let lines = site_expression::residue_lines(store, text, escape, CALL_SITE_CANDIDATE_SAMPLE_MAX);
+    let mut focal_escape = escape.summary_json(CALL_SITE_CANDIDATE_SAMPLE_MAX);
+    if let Some(residue) = focal_escape
+        .get_mut("residue")
+        .and_then(Value::as_object_mut)
+    {
+        residue.retain(|key, _| MENTION_RESIDUE_KEYS.contains(&key.as_str()));
+    }
+    site_expression::annotate_residue(&mut focal_escape, &lines);
+    json!({
+        "scope": MENTION_SCOPE,
+        "focal_escape": focal_escape,
+    })
+}
+
+/// Where a named block says how many of its `candidates` its expression
+/// budget left without `expr`, beside the list.
+pub const NAMED_EXPR_ELIDED_KEY: &str = "candidates_expr_elided";
+
+/// A focal the escape census lists sites for is reachable without a call
+/// that spells its call names.
+pub const ESCAPE_RESIDUE_LISTED: &str = "escape_residue_listed";
+
+/// Lookups by a name no record follows could reach the focal, counted rather
+/// than listed (see [`kin_model::EscapeResidue::unkeyed_lookups`]).
+pub const UNKEYED_LOOKUPS_COUNTED: &str = kin_model::call_site_reading::UNKEYED_LOOKUPS_COUNTED;
+
+/// The clause naming what the census listed as able to reach the focal
+/// without a call that spells a call name, or `None` when it listed nothing a
+/// reader can check. Unkeyed lookups are the clause of their own
+/// ([`unkeyed_lookups_clause`]).
+pub fn escape_residue_clause(escape: &FocalEscape) -> Option<String> {
+    let residue = escape.residue()?;
+    if residue.lists_nothing_to_check() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (count, what) in [
+        (residue.values.len(), "value uses"),
+        (residue.implicit_calls.len(), "implicit calls"),
+        (residue.reflective.len(), "reflective lookups"),
+        (residue.unrecorded.len(), "unrecorded regions"),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {what}"));
+        }
+    }
+    if let Some(protocol) = &residue.protocol {
+        parts.push(match &protocol.through {
+            Some(through) => format!("implicit dispatch through {through}"),
+            None => format!("{} protocol dispatch sites", protocol.sites.len()),
+        });
+    }
+    Some(format!(
+        "escape_residue_listed: {} sites could reach the focal without a call that spells \
+         its call names ({}), each listed in focal_escape.residue",
+        residue.unsettled_count(),
+        parts.join(", ")
+    ))
+}
+
+/// The clause counting lookups by a name computed at run time that no record
+/// follows and that spell no call name, or `None` when there are none. They
+/// could reach the focal as they could reach any declaration their receiver
+/// holds, which every reader that does not run the program shares, so the
+/// answer counts them and names no site to check. The clause is residue: it
+/// keeps the verdict `certified_except`, so it never licenses an absence.
+pub fn unkeyed_lookups_clause(escape: &FocalEscape) -> Option<String> {
+    let count = escape.residue()?.unkeyed_lookups.len();
+    (count > 0).then(|| {
+        format!(
+            "{UNKEYED_LOOKUPS_COUNTED}: {count} lookups by a name computed at run time could \
+             reach the focal as they could reach anything their receiver holds, and none \
+             spells a call name, so they are counted in focal_escape.residue.unkeyed_lookups \
+             rather than listed as sites to check"
+        )
+    })
 }
 
 // ── Text ──────────────────────────────────────────────────────────────────
@@ -1307,81 +2498,74 @@ pub fn named_block(scan: &FocalScan) -> Value {
 pub const CANDIDATE_LINES_MAX: usize = 20;
 
 /// The unsettled call sites a store-wide reading kept, in plain words for a
-/// person at a terminal: the ones whose callee or caller body spells the
-/// focal's name, each at its caller and its line in that caller, then every
-/// other one counted by why it is kept. Empty when the reading kept none.
+/// person at a terminal: the named leftovers, each at its caller and its line
+/// in that caller, the sites promoted to `name_unique` rows, and the value
+/// calls counted once by why they are kept. Empty when the reading kept none.
 pub fn candidate_lines(scan: &FocalScan, focal_name: &str) -> Vec<String> {
-    use kin_model::call_site_reading::{
-        REACH_BODY_SPELLS, REACH_CALLEE_SPELLS, REACH_FOCAL_ESCAPES,
-    };
     if scan.candidates.is_empty() {
         return Vec::new();
     }
-    let names_it = |reason: &str| reason == REACH_CALLEE_SPELLS || reason == REACH_BODY_SPELLS;
-    let named: Vec<&CandidateSite> = scan
-        .candidates
-        .iter()
-        .filter(|candidate| names_it(candidate.reason))
-        .collect();
     let mut lines = vec![format!(
         "Unproven call sites that could call {focal_name}: {}.",
         scan.candidates.len()
     )];
-    if !named.is_empty() {
+    let site_line = |candidate: &CandidateSite| {
+        let at = candidate
+            .line_in_entity
+            .map(|line| format!(", line {line} in it"))
+            .unwrap_or_default();
+        let callee = match (&candidate.expr, &candidate.callee) {
+            (Some(expr), _) => format!(": {expr}"),
+            (None, Some(callee)) => format!(" calls {callee}"),
+            (None, None) => String::new(),
+        };
+        let why = candidate
+            .state_reason
+            .as_deref()
+            .map(|reason| format!(" ({})", reason.replace('_', " ")))
+            .unwrap_or_default();
+        format!(
+            "    {}{at}{callee}, {}{why}",
+            candidate.caller_name,
+            candidate.state.wire().replace('_', " ")
+        )
+    };
+    if !scan.promoted.is_empty() {
+        lines.push(format!(
+            "  {} name {focal_name}, and the store holds no other definition that name can \
+             reach, so each is a name_unique reference:",
+            scan.promoted.len()
+        ));
+        lines.extend(scan.promoted.iter().map(site_line));
+    }
+    if !scan.named.is_empty() {
         lines.push(format!(
             "  {} name {focal_name}, so check them first:",
-            named.len()
+            scan.named.len()
         ));
-        for candidate in named.iter().take(CANDIDATE_LINES_MAX) {
-            let at = candidate
-                .line_in_entity
-                .map(|line| format!(", line {line} in it"))
-                .unwrap_or_default();
-            let callee = candidate
-                .callee
-                .as_deref()
-                .map(|callee| format!(" calls {callee}"))
-                .unwrap_or_default();
-            let why = candidate
-                .state_reason
-                .as_deref()
-                .map(|reason| format!(" ({})", reason.replace('_', " ")))
-                .unwrap_or_default();
+        lines.extend(scan.named.iter().take(CANDIDATE_LINES_MAX).map(site_line));
+        if scan.named.len() > CANDIDATE_LINES_MAX {
             lines.push(format!(
-                "    {}{at}{callee}, {}{why}",
-                candidate.caller_name,
-                candidate.state.wire().replace('_', " ")
-            ));
-        }
-        if named.len() > CANDIDATE_LINES_MAX {
-            lines.push(format!(
-                "    and {} more that name it.",
-                named.len() - CANDIDATE_LINES_MAX
+                "    and {} more that name it, every one in the call_sites block.",
+                scan.named.len() - CANDIDATE_LINES_MAX
             ));
         }
     }
-    let mut rest: BTreeMap<&str, usize> = BTreeMap::new();
-    for candidate in scan.candidates.iter().filter(|c| !names_it(c.reason)) {
-        *rest.entry(candidate.reason).or_default() += 1;
-    }
-    for (reason, count) in rest {
-        let line = if reason == REACH_FOCAL_ESCAPES {
-            let census = match &scan.escape {
-                FocalEscape::Unknown { reason } => {
-                    format!("this graph cannot rule that out ({reason})")
-                }
-                FocalEscape::Escapes { reason } => format!("it may be ({reason})"),
-                FocalEscape::Contained { .. } | FocalEscape::NonCallable { .. } => {
-                    "it is not".to_string()
-                }
-            };
+    if !scan.value_calls.is_empty() {
+        let unread = if scan.value_calls.callers_unread > 0 {
             format!(
-                "  {count} more could reach it only if {focal_name} is held as a value, and {census}."
+                ", and {} caller(s) that never spell it are owed their sites",
+                scan.value_calls.callers_unread
             )
         } else {
-            format!("  {count} more are kept because of {reason}.")
+            String::new()
         };
-        lines.push(line);
+        lines.push(format!(
+            "  {} more could reach it only if {focal_name} is held as a value or looked up by a \
+             computed name, and {}{unread}.",
+            scan.value_calls.sites,
+            census_words(&scan.escape)
+        ));
     }
     lines
 }
@@ -1830,15 +3014,7 @@ mod tests {
                     ),
                 ],
             );
-            let scan = scan_focal(
-                &store,
-                &focal,
-                &NoSiteText,
-                FocalEscape::Contained {
-                    entities_checked: 2,
-                },
-            )
-            .unwrap();
+            let scan = scan_focal(&store, &focal, &NoSiteText, FocalEscape::contained(2)).unwrap();
             assert!(scan.candidates.is_empty());
             assert!(
                 !scan
@@ -1856,6 +3032,132 @@ mod tests {
                 "{evidence:?}"
             );
         }
+    }
+
+    /// `_json.load(fp)` in a file that says `import json as _json`: the named
+    /// site says which module its receiver is imported from, read from the
+    /// record of the caller's file, and whether the tree holds a file that
+    /// could be that module. `src/flask/json/` sits inside the package
+    /// `flask`, so it is not what `import json` finds; a `json.py` at the
+    /// repository root is.
+    #[test]
+    fn a_named_site_says_what_its_receiver_is_imported_from() {
+        const READS: &str = "def read_config(fp):\n    return _json.load(fp)\n";
+        let py = LanguageId::Python;
+        let blob = |byte: u8| kin_model::Hash256::from_bytes([byte; 32]);
+        let scan_with = |extra: Option<&str>| {
+            let store = InMemoryGraph::new();
+            let focal = spanned_entity(
+                "load",
+                "src/flask/json/__init__.py",
+                py,
+                0,
+                "def load(fp):\n    pass\n",
+            );
+            let mut reader = spanned_entity("read_config", "tests/test_config.py", py, 200, READS);
+            // The reader starts on line 10 of its file, so the call is on 11.
+            let mut record = kin_model::FileEscapeRecord::new(kin_model::ModuleScope::Open);
+            record.values.insert(
+                "_json".into(),
+                vec![kin_model::ValueOccurrence {
+                    line: 11,
+                    context: kin_model::OccurrenceContext::Mention,
+                    binding: kin_model::OccurrenceBinding::Import,
+                    receiver: None,
+                    receiver_kind: None,
+                    aliases: Vec::new(),
+                    module: Some("json".into()),
+                    import: Some((0, 19)),
+                    imported: Some("json".into()),
+                    target_line: None,
+                    form: Some(kin_model::MentionForm::Receiver),
+                }],
+            );
+            reader
+                .metadata
+                .extra
+                .insert("blob_hash".into(), json!(blob(0x71).to_string()));
+            reader.metadata.extra.insert(
+                kin_model::VALUE_ESCAPE_RECORD_KEY.into(),
+                record.to_metadata(),
+            );
+            let context = proof_context(py, "1.1.400");
+            let context_id = id_of(&context);
+            admit(
+                &store,
+                &[&focal, &reader],
+                vec![
+                    context,
+                    ledger(
+                        &reader,
+                        READS,
+                        context_id,
+                        vec![(
+                            "load",
+                            CallSiteState::Unresolved {
+                                reason: UnresolvedReason::NoAnswer,
+                            },
+                        )],
+                    ),
+                ],
+            );
+            let files = [
+                ("src/flask/__init__.py", 0x70),
+                ("tests/test_config.py", 0x71),
+                ("src/flask/json/__init__.py", 0x72),
+            ];
+            let tree_deltas = files
+                .into_iter()
+                .chain(extra.map(|path| (path, 0x73)))
+                .map(|(path, byte)| kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(
+                        kin_model::RepoPath::from_utf8(path).unwrap(),
+                        kin_model::TreeEntry::blob(blob(byte), false),
+                    ),
+                })
+                .collect();
+            store
+                .apply_transaction_delta(&TransactionDelta {
+                    tree_deltas,
+                    ..Default::default()
+                })
+                .unwrap();
+            scan_focal(&store, &focal, &Body(READS), NO_CENSUS).unwrap()
+        };
+        let import_of = |rows: &[CandidateSite]| {
+            let [row] = rows else {
+                panic!("{rows:?}");
+            };
+            assert_eq!(row.caller_name, "read_config");
+            assert_eq!(row.receiver.as_deref(), Some("_json"));
+            assert_eq!(row.expr.as_deref(), Some("_json.load(fp)"));
+            row.receiver_import.clone()
+        };
+        // `load` is the one definition of its name, and still a call on the
+        // outside module is never promoted to a row of it.
+        let outside = scan_with(None);
+        assert!(outside.promoted.is_empty(), "{:?}", outside.promoted);
+        assert_eq!(
+            import_of(&outside.named),
+            Some(json!({"module": "json", "outside_repository": true}))
+        );
+        // The row serializes the field where a reply's named rows read it.
+        let served = serde_json::to_value(&outside.named[0]).unwrap();
+        assert_eq!(
+            served[site_expression::RECEIVER_IMPORT_KEY]["module"],
+            "json"
+        );
+        assert!(site_expression::EXPR_FIELDS.contains(&site_expression::RECEIVER_IMPORT_KEY));
+        // With a `json.py` the repository could supply, the site is read as
+        // before: the name is unique, so it is promoted, and it says what
+        // its receiver imports.
+        let inside = scan_with(Some("json.py"));
+        assert!(inside.named.is_empty(), "{:?}", inside.named);
+        assert_eq!(
+            import_of(&inside.promoted),
+            Some(json!({"module": "json", "outside_repository": false}))
+        );
     }
 
     #[test]
@@ -2018,32 +3320,44 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let read = |off, readiness, language| no_resolver_for(off, readiness, language);
+        let read = |switch, readiness, language| no_resolver_for(switch, readiness, language);
+        let on = Some(EnrichmentSwitch::On);
         assert_eq!(read(None, None, LanguageId::Python), None);
-        assert_eq!(read(Some(false), None, LanguageId::Python), None);
+        assert_eq!(read(on, None, LanguageId::Python), None);
         assert_eq!(
-            read(Some(true), Some(&probed), LanguageId::Python),
+            read(
+                Some(EnrichmentSwitch::Off),
+                Some(&probed),
+                LanguageId::Python
+            ),
             Some(NoResolver::EnrichmentOff)
         );
-        assert_eq!(read(Some(false), Some(&probed), LanguageId::Python), None);
+        // The repository's own setting is named as itself, ahead of any probe,
+        // so a reading says how to turn it on instead of calling it owed.
         assert_eq!(
-            read(Some(false), Some(&probed), LanguageId::Go),
+            read(
+                Some(EnrichmentSwitch::OffForRepository),
+                Some(&probed),
+                LanguageId::Go
+            ),
+            Some(NoResolver::EnrichmentOffForRepository)
+        );
+        assert_eq!(read(on, Some(&probed), LanguageId::Python), None);
+        assert_eq!(
+            read(on, Some(&probed), LanguageId::Go),
             Some(NoResolver::NoLanguageServer)
         );
         assert_eq!(
-            read(Some(false), Some(&probed), LanguageId::Rust),
+            read(on, Some(&probed), LanguageId::Rust),
             Some(NoResolver::ServerCannotStart {
                 reason: "no Cargo".to_string()
             })
         );
         // Enrichable, and the probe said nothing about it: unknown.
-        assert_eq!(
-            read(Some(false), Some(&probed), LanguageId::TypeScript),
-            None
-        );
+        assert_eq!(read(on, Some(&probed), LanguageId::TypeScript), None);
         // A language no build of Kin enriches.
         assert_eq!(
-            read(Some(false), Some(&probed), LanguageId::Java),
+            read(on, Some(&probed), LanguageId::Java),
             Some(NoResolver::NoLanguageServer)
         );
     }
@@ -2210,23 +3524,184 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_site_whose_callee_spells_the_focal_is_listed_before_escape_only_sites() {
-        use kin_model::call_site_reading::{REACH_CALLEE_SPELLS, REACH_FOCAL_ESCAPES};
-        let fixture = fixture(true);
-        let focal = spanned_entity(
+    /// A second definition of `mystery` beside the focal, with an empty
+    /// ledger so it adds no owed caller: the name no longer reaches one
+    /// definition, so no named site is promoted.
+    fn admit_rival(store: &InMemoryGraph, context: ResolutionRecordId) -> Entity {
+        let body = "def mystery(other):\n    pass\n";
+        let rival = spanned_entity("Other.mystery", "other.py", LanguageId::Python, 0, body);
+        admit(
+            store,
+            &[&rival],
+            vec![ledger(&rival, body, context, Vec::new())],
+        );
+        rival
+    }
+
+    fn mystery_focal() -> Entity {
+        spanned_entity(
             "mystery",
             "lib.py",
             LanguageId::Python,
             0,
             "def mystery(data):\n    pass\n",
+        )
+    }
+
+    fn unknown_census() -> FocalEscape {
+        FocalEscape::Unknown {
+            reason: "dynamic reflective access in the domain",
+        }
+    }
+
+    /// Holds only exact recorded callee quotations, never an aggregate body.
+    struct SiteOnlyText<'a> {
+        body: &'a str,
+        readable: bool,
+    }
+
+    impl SiteText for SiteOnlyText<'_> {
+        fn quote(&self, caller: &Entity, site: &SourceSpan) -> Result<String, &'static str> {
+            let span = caller.span.as_ref().ok_or("caller_has_no_span")?;
+            if !self.readable
+                || (site.start_byte == span.start_byte && site.end_byte == span.end_byte)
+            {
+                return Err("caller_source_unavailable");
+            }
+            let token = quote_site(caller, site, self.body, span.start_byte)?;
+            if token == "unread" || !is_identifier(&token) {
+                return Err("caller_source_unavailable");
+            }
+            Ok(token)
+        }
+    }
+
+    fn site_only_scan(escape: FocalEscape, readable: bool) -> FocalScan {
+        let body = "mystery(); different(); unread();";
+        let store = InMemoryGraph::new();
+        let mut caller = spanned_entity("app", "app.py", LanguageId::Python, 0, body);
+        caller.kind = kin_model::EntityKind::Module;
+        caller.signature = "module app.py".into();
+        let context = proof_context(LanguageId::Python, "current");
+        admit(
+            &store,
+            &[&caller],
+            vec![
+                context.clone(),
+                ledger(
+                    &caller,
+                    body,
+                    context.id(),
+                    vec![
+                        (
+                            "mystery",
+                            CallSiteState::Unresolved {
+                                reason: UnresolvedReason::NoAnswer,
+                            },
+                        ),
+                        (
+                            "different",
+                            CallSiteState::Unresolved {
+                                reason: UnresolvedReason::NoAnswer,
+                            },
+                        ),
+                        (
+                            "unread",
+                            CallSiteState::Unresolved {
+                                reason: UnresolvedReason::NoAnswer,
+                            },
+                        ),
+                    ],
+                ),
+            ],
         );
+        admit_rival(&store, context.id());
+        scan_focal(
+            &store,
+            &mystery_focal(),
+            &SiteOnlyText { body, readable },
+            escape,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn site_only_text_narrows_contained_callers_without_a_whole_body() {
+        use kin_model::call_site_reading::{REACH_CALLEE_SPELLS, REACH_TEXT_UNKNOWN};
+        let scan = site_only_scan(FocalEscape::contained(1), true);
+        assert_eq!(
+            scan.candidates.len(),
+            2,
+            "known different token is not a contained call; unread remains: {:?}",
+            scan.candidates
+        );
+        assert!(scan
+            .candidates
+            .iter()
+            .any(|site| site.callee.as_deref() == Some("mystery")
+                && site.reason == REACH_CALLEE_SPELLS));
+        assert!(scan
+            .candidates
+            .iter()
+            .any(|site| site.callee.is_none() && site.reason == REACH_TEXT_UNKNOWN));
+        assert_eq!(scan.value_calls.sites, 0);
+        assert!(
+            scan.promoted.is_empty(),
+            "a shared name never becomes a proof"
+        );
+    }
+
+    #[test]
+    fn site_only_text_preserves_escaping_values_and_unread_sites() {
+        use kin_model::call_site_reading::{
+            REACH_CALLEE_SPELLS, REACH_FOCAL_ESCAPES, REACH_TEXT_UNKNOWN,
+        };
+        let scan = site_only_scan(unknown_census(), true);
+        assert_eq!(
+            scan.candidates.len(),
+            3,
+            "escaping-value possibilities must not be deleted"
+        );
+        assert!(scan
+            .candidates
+            .iter()
+            .any(|site| site.callee.as_deref() == Some("mystery")
+                && site.reason == REACH_CALLEE_SPELLS));
+        assert!(scan
+            .candidates
+            .iter()
+            .any(|site| site.callee.as_deref() == Some("different")
+                && site.reason == REACH_FOCAL_ESCAPES));
+        assert!(scan
+            .candidates
+            .iter()
+            .any(|site| site.callee.is_none() && site.reason == REACH_TEXT_UNKNOWN));
+        assert_eq!(scan.value_calls.sites, 1);
+        assert_eq!(scan.named.len(), 2);
+        assert!(scan.promoted.is_empty());
+    }
+
+    #[test]
+    fn unread_site_text_never_certifies_absence() {
+        use kin_model::call_site_reading::REACH_TEXT_UNKNOWN;
+        let scan = site_only_scan(FocalEscape::contained(1), false);
+        assert_eq!(scan.candidates.len(), 3);
+        assert!(scan
+            .candidates
+            .iter()
+            .all(|site| site.callee.is_none() && site.reason == REACH_TEXT_UNKNOWN));
+        assert!(!named_block(&scan)["settled"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn a_site_whose_callee_spells_the_focal_is_listed_before_escape_only_sites() {
+        use kin_model::call_site_reading::{REACH_CALLEE_SPELLS, REACH_FOCAL_ESCAPES};
+        let fixture = fixture(true);
+        admit_rival(&fixture.store, fixture.context);
+        let focal = mystery_focal();
         // A census that cannot rule escape out keeps every unsettled site, and
         // the one whose callee spells the focal's name still comes first.
-        let escape = FocalEscape::Unknown {
-            reason: "dynamic reflective access in the domain",
-        };
-        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), escape).unwrap();
+        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), unknown_census()).unwrap();
         let rows: Vec<(Option<&str>, &str)> = scan
             .candidates
             .iter()
@@ -2239,31 +3714,100 @@ mod tests {
                 (Some("handler"), REACH_FOCAL_ESCAPES),
             ]
         );
+        // The named site is listed, and the value call is counted, not listed.
         let block = named_block(&scan);
-        assert_eq!(block["candidate_count"], 2, "{block}");
+        assert_eq!(block["candidate_count"], 1, "{block}");
+        assert_eq!(block["candidates"][0]["callee"], "mystery", "{block}");
+        assert_eq!(block["value_calls"]["sites"], 1, "{block}");
         assert_eq!(
-            block["candidates_by_reason"][REACH_CALLEE_SPELLS], 1,
+            block["value_calls"]["by_reason"][REACH_FOCAL_ESCAPES], 1,
             "{block}"
         );
         assert_eq!(
-            block["candidates_by_reason"][REACH_FOCAL_ESCAPES], 1,
+            block["value_calls"]["census"]["escape"], "unknown",
             "{block}"
         );
     }
 
+    /// Confined to the callers a question is about, a reading holds no site
+    /// of a caller left out: its unresolved call is in no list, and the
+    /// clauses the reading calls for speak of the callers kept. With no
+    /// caller kept that holds such a site, nothing is left to list.
     #[test]
-    fn named_candidate_samples_preserve_the_full_census_and_uncertainty() {
+    fn a_confined_reading_holds_no_site_of_a_caller_left_out() {
+        let store = InMemoryGraph::new();
+        let body = "def run():\n    mystery()\n";
+        let inside = spanned_entity("run", "pkg/app.py", LanguageId::Python, 0, body);
+        let outside = spanned_entity("run_elsewhere", "other/lib.py", LanguageId::Python, 0, body);
+        let focal = mystery_focal();
+        let context = proof_context(LanguageId::Python, "current");
+        let unresolved = || {
+            vec![(
+                "mystery",
+                CallSiteState::Unresolved {
+                    reason: UnresolvedReason::NoAnswer,
+                },
+            )]
+        };
+        let records = vec![
+            context.clone(),
+            ledger(&inside, body, context.id(), unresolved()),
+            ledger(&outside, body, context.id(), unresolved()),
+        ];
+        admit(&store, &[&inside, &outside], records);
+        admit_rival(&store, context.id());
+        let whole = scan_focal(&store, &focal, &Body(body), unknown_census()).unwrap();
+        assert_eq!(whole.named.len(), 2);
+        let leftovers = |scan: &FocalScan| {
+            named_clauses(scan)
+                .iter()
+                .any(|clause| clause_code(clause) == kin_model::call_site_reading::NAMED_LEFTOVERS)
+        };
+        assert!(leftovers(&whole));
+
+        // Every caller kept: the reading is as it was.
+        let mut kept = whole.clone();
+        assert_eq!(kept.confine(|_| true), 0);
+        assert_eq!(json!(kept.named), json!(whole.named));
+
+        // One caller kept: its site alone is listed.
+        let mut confined = whole.clone();
+        assert_eq!(
+            confined.confine(|caller| caller.id == inside.id),
+            whole.callers.len() - 1
+        );
+        for sites in [&confined.named, &confined.candidates] {
+            assert_eq!(sites.len(), 1);
+            assert_eq!(sites[0].caller, inside.id);
+        }
+        assert_eq!(confined.callers.len(), 1);
+        let block = named_block(&confined);
+        assert_eq!(block["candidate_count"], 1, "{block}");
+        assert!(leftovers(&confined));
+        assert!(whole
+            .callers
+            .iter()
+            .any(|scanned| scanned.entity.id == outside.id));
+        assert!(confined
+            .callers
+            .iter()
+            .all(|scanned| scanned.entity.id != outside.id));
+
+        // No caller kept: nothing is listed, and no clause says something is.
+        let mut none = whole.clone();
+        assert_eq!(none.confine(|_| false), whole.callers.len());
+        assert!(none.named.is_empty() && none.candidates.is_empty());
+        assert!(!leftovers(&none));
+        assert_eq!(named_block(&none)["candidate_count"], 0);
+    }
+
+    #[test]
+    fn named_leftovers_are_listed_in_full_at_every_size() {
         for site_count in [0, 3, 5, 613] {
             let store = InMemoryGraph::new();
             let body = format!("def run():\n{}", "    mystery()\n".repeat(site_count));
             let caller = spanned_entity("run", "app.py", LanguageId::Python, 0, &body);
-            let focal = spanned_entity(
-                "mystery",
-                "lib.py",
-                LanguageId::Python,
-                0,
-                "def mystery(): pass\n",
-            );
+            let focal = mystery_focal();
             let context = proof_context(LanguageId::Python, "current");
             let records = vec![
                 context.clone(),
@@ -2284,70 +3828,513 @@ mod tests {
                 ),
             ];
             admit(&store, &[&caller], records);
-            let scan = scan_focal(
-                &store,
-                &focal,
-                &Body(&body),
-                FocalEscape::Unknown {
-                    reason: "dynamic reflective access in the domain",
-                },
-            )
-            .unwrap();
+            admit_rival(&store, context.id());
+            let scan = scan_focal(&store, &focal, &Body(&body), unknown_census()).unwrap();
             assert_eq!(scan.candidates.len(), site_count);
+            assert_eq!(scan.named.len(), site_count);
             let block = named_block(&scan);
-            // Sampling presentation must not change any whole-scan truth.
-            for (key, value) in block_json(&scan.tally(), NAMED_SCOPE).as_object().unwrap() {
-                assert_eq!(&block[key], value, "{key}, {site_count}");
+            // Every named leftover is served, never a sample. Its call as
+            // written rides within the list's byte budget, and past it the
+            // row keeps its address and the list counts what it dropped.
+            let per_row = "expr".len() + 4 + "\"mystery()\"".len();
+            let served = site_count.min(site_expression::NAMED_EXPR_BYTES_MAX / per_row);
+            let mut expected = json!(&scan.named);
+            for row in expected.as_array_mut().unwrap().iter_mut().skip(served) {
+                row.as_object_mut().unwrap().remove("expr");
             }
-            let kept = site_count.min(5);
-            assert_eq!(block["candidates"], json!(&scan.candidates[..kept]));
-            assert_eq!(block["candidate_count"], site_count);
+            assert_eq!(block["candidates"], expected, "{site_count}");
             assert_eq!(
-                block["candidates_withheld"].as_u64().unwrap_or(0),
-                (site_count - kept) as u64
+                block["candidates"][0]["expr"],
+                json!(scan.named.first().map(|_| "mystery()"))
             );
-            assert_eq!(
-                block["candidates_by_reason"]
-                    .as_object()
+            if site_count > served {
+                assert_eq!(
+                    block[NAMED_EXPR_ELIDED_KEY]["served"], served,
+                    "{site_count}"
+                );
+                assert_eq!(block[NAMED_EXPR_ELIDED_KEY]["elided"], site_count - served);
+                let added: usize = block["candidates"]
+                    .as_array()
                     .unwrap()
-                    .values()
-                    .map(|count| count.as_u64().unwrap())
-                    .sum::<u64>(),
-                site_count as u64
-            );
+                    .iter()
+                    .filter_map(|row| row.get("expr"))
+                    .map(|expr| "expr".len() + 4 + expr.to_string().len())
+                    .sum();
+                assert!(added <= site_expression::NAMED_EXPR_BYTES_MAX, "{added}");
+            } else {
+                assert!(block.get(NAMED_EXPR_ELIDED_KEY).is_none(), "{site_count}");
+            }
+            assert_eq!(block["candidate_count"], site_count);
+            assert!(block.get("candidates_withheld").is_none(), "{site_count}");
+            assert!(block.get("value_calls").is_none(), "{site_count}");
+            let clauses: Vec<&str> = block["clauses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
             if site_count > 0 {
                 assert_eq!(block["settled"], false);
-                assert!(!block["clauses"].as_array().unwrap().is_empty());
                 assert_eq!(block["sites"], site_count);
+                // One residue clause, never the per-state code it replaces.
+                assert_eq!(clauses.len(), 1, "{clauses:?}");
+                assert!(clauses[0].starts_with("named_leftovers: "), "{clauses:?}");
+                assert!(
+                    clauses[0].contains(&format!("{site_count} call site(s)")),
+                    "{clauses:?}"
+                );
             } else {
-                assert!(block.get("candidates_withheld").is_none());
+                assert_eq!(block["settled"], true, "{block}");
+                assert!(clauses.is_empty(), "{clauses:?}");
             }
+            assert_eq!(block["named_complete"], true, "{block}");
         }
+    }
+
+    #[test]
+    fn settled_sites_count_only_when_they_call_the_focal() {
+        let fixture = fixture(true);
+        // `run` calls `helper`, `dumps`, a binding and `mystery`. Read for
+        // `helper` under a census that proves it contained, only the proven
+        // call to `helper` is in scope: the call to `dumps` is settled
+        // elsewhere, and neither unsettled site can be a call to `helper`.
+        let scan = scan_focal(
+            &fixture.store,
+            &fixture.helper,
+            &Body(BODY),
+            FocalEscape::contained(2),
+        )
+        .unwrap();
+        assert_eq!(scan.settled_to_focal, 1);
+        let block = named_block(&scan);
+        assert_eq!(block["sites"], 1, "{block}");
+        assert_eq!(block["settled_to_focal"], 1, "{block}");
+        assert_eq!(block["settled"], true, "{block}");
+        assert_eq!(block["named_complete"], true, "{block}");
+        assert_eq!(block["clauses"], json!([]), "{block}");
+        assert!(block.get("value_calls").is_none(), "{block}");
+    }
+
+    #[test]
+    fn a_name_one_definition_carries_is_promoted_and_never_listed_twice() {
+        let fixture = fixture(true);
+        let focal = mystery_focal();
+        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), unknown_census()).unwrap();
+        assert_eq!(
+            scan.name_unique,
+            NameUnique::Promoted {
+                name: "mystery".to_string()
+            }
+        );
+        assert_eq!(scan.promoted.len(), 1);
+        assert!(scan.named.is_empty());
+        let callers = scan.promoted_callers();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].0.id, fixture.run.id);
+        assert_eq!(callers[0].1[0].line_in_entity, Some(4));
+        let block = named_block(&scan);
+        assert_eq!(block["candidate_count"], 0, "{block}");
+        assert_eq!(block["name_unique"]["promoted"], 1, "{block}");
+        assert_eq!(
+            block["name_unique"]["reading"]["state"], "promoted",
+            "{block}"
+        );
+        // A promoted site is not proven, so it is still residue.
+        assert!(
+            block["clauses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|clause| clause
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("named_leftovers: 1 call site(s)")
+                        && text.contains("1 are served as `name_unique`"))),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn a_shared_name_is_never_promoted() {
+        let fixture = fixture(true);
+        admit_rival(&fixture.store, fixture.context);
+        let scan = scan_focal(
+            &fixture.store,
+            &mystery_focal(),
+            &Body(BODY),
+            unknown_census(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan.name_unique,
+            NameUnique::NotApplied {
+                reason: UNIQUE_SHARED_DEFINITION
+            }
+        );
+        assert!(scan.promoted.is_empty());
+        assert_eq!(scan.named.len(), 1);
+    }
+
+    #[test]
+    fn a_name_a_settled_site_proves_elsewhere_is_never_promoted() {
+        let store = InMemoryGraph::new();
+        let body = "def run():\n    a.mystery()\n    b.mystery()\n";
+        let caller = spanned_entity("run", "app.py", LanguageId::Python, 0, body);
+        let context = proof_context(LanguageId::Python, "current");
+        let records = vec![
+            context.clone(),
+            ledger(
+                &caller,
+                body,
+                context.id(),
+                vec![
+                    ("mystery", CallSiteState::ProvenOutside),
+                    (
+                        "mystery",
+                        CallSiteState::Unresolved {
+                            reason: UnresolvedReason::NoAnswer,
+                        },
+                    ),
+                ],
+            ),
+        ];
+        admit(&store, &[&caller], records);
+        let scan = scan_focal(&store, &mystery_focal(), &Body(body), unknown_census()).unwrap();
+        assert_eq!(
+            scan.name_unique,
+            NameUnique::NotApplied {
+                reason: UNIQUE_CONTESTED
+            }
+        );
+        assert_eq!(scan.named.len(), 1);
+        assert!(scan.promoted.is_empty());
+    }
+
+    #[test]
+    fn a_binding_site_is_never_promoted() {
+        let store = InMemoryGraph::new();
+        let body = "def run():\n    mystery()\n";
+        let caller = spanned_entity("run", "app.py", LanguageId::Python, 0, body);
+        let context = proof_context(LanguageId::Python, "current");
+        let records = vec![
+            context.clone(),
+            ledger(
+                &caller,
+                body,
+                context.id(),
+                vec![("mystery", CallSiteState::Binding { may_call: None })],
+            ),
+        ];
+        admit(&store, &[&caller], records);
+        let scan = scan_focal(&store, &mystery_focal(), &Body(body), unknown_census()).unwrap();
+        assert_eq!(
+            scan.name_unique,
+            NameUnique::NotApplied {
+                reason: UNIQUE_NOTHING_TO_PROMOTE
+            }
+        );
+        assert_eq!(scan.named.len(), 1);
+        assert_eq!(scan.named[0].state, SiteStateKind::Binding);
+    }
+
+    #[test]
+    fn a_symbol_outside_the_repository_that_carries_the_name_stops_promotion() {
+        let fixture = fixture(true);
+        let external = ExternalReference::new_resolved(
+            "kin-scip-v1",
+            "pip python 3.12",
+            "lib/Thing#mystery().",
+        )
+        .expect("a resolved external symbol");
+        fixture
+            .store
+            .apply_transaction_delta(&TransactionDelta {
+                external_reference_deltas: vec![ExternalReferenceDelta::Added { new: external }],
+                ..TransactionDelta::default()
+            })
+            .expect("the external symbol is admitted");
+        let scan = scan_focal(
+            &fixture.store,
+            &mystery_focal(),
+            &Body(BODY),
+            unknown_census(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan.name_unique,
+            NameUnique::NotApplied {
+                reason: UNIQUE_EXTERNAL_SYMBOL
+            }
+        );
+        assert!(scan.promoted.is_empty());
+    }
+
+    /// `flask.app._make_timedelta`: `class App` in `sansio/app.py` spells
+    /// the name (its own twin) and calls `ConfigAttribute[timedelta](...)`,
+    /// whose callee is a subscript with a computed key. The census judged
+    /// every lookup by a computed name in the domain and listed none that
+    /// could fetch the focal, so the call is no value call of it.
+    #[test]
+    fn a_contained_focal_leaves_calls_through_computed_lookups_to_the_census() {
+        const CALL: &str = "ConfigAttribute[timedelta](\"X\", get_converter=_make_timedelta)";
+        let app = format!("class App:\n    permanent = {CALL}\n");
+        let store = InMemoryGraph::new();
+        let caller = spanned_entity("App", "sansio/app.py", LanguageId::Python, 0, &app);
+        let focal = spanned_entity(
+            "_make_timedelta",
+            "app.py",
+            LanguageId::Python,
+            500,
+            "def _make_timedelta(value):\n    return value\n",
+        );
+        let context = proof_context(LanguageId::Python, "1.1.400");
+        let context_id = id_of(&context);
+        admit(
+            &store,
+            &[&caller, &focal],
+            vec![
+                context,
+                ledger(&focal, "", context_id, Vec::new()),
+                ledger(
+                    &caller,
+                    &app,
+                    context_id,
+                    vec![(
+                        CALL,
+                        CallSiteState::Unresolved {
+                            reason: UnresolvedReason::CalleeNotPlaceable,
+                        },
+                    )],
+                ),
+            ],
+        );
+        let contained = scan_focal(&store, &focal, &Body(&app), FocalEscape::contained(2)).unwrap();
+        assert!(
+            contained.value_calls.is_empty(),
+            "{:?}",
+            contained.value_calls
+        );
+        assert!(contained.named.is_empty());
+        let block = named_block(&contained);
+        assert!(block.get("value_calls").is_none(), "{block}");
+        assert_eq!(block["settled"], true, "{block}");
+        // With no census the call may hold the focal as a value.
+        let unknown = scan_focal(&store, &focal, &Body(&app), NO_CENSUS).unwrap();
+        assert_eq!(unknown.value_calls.sites, 1);
+        // Without the caller's text the call may be a literal lookup that
+        // spells a name, so it stays.
+        let untexted = scan_focal(&store, &focal, &NoSiteText, FocalEscape::contained(2)).unwrap();
+        assert_eq!(untexted.value_calls.sites, 1);
+    }
+
+    /// A dead-code reading: nothing calls the focal. Lookups by a name no
+    /// record follows are counted in one clause of their own, and a lookup
+    /// whose key names the focal (here `getattr(module, "_make_timedelta")`,
+    /// which an adapter keeps as the key's literal) is listed residue a reader
+    /// must check. Neither settles the block, so neither licenses an absence.
+    #[test]
+    fn a_dead_code_reading_counts_unkeyed_lookups_and_lists_a_keyed_one() {
+        use kin_model::{EscapeResidue, ResidueSite};
+        const CALL: &str = "ConfigAttribute[timedelta](\"X\", get_converter=_make_timedelta)";
+        let app = format!("class App:\n    permanent = {CALL}\n");
+        let store = InMemoryGraph::new();
+        let caller = spanned_entity("App", "sansio/app.py", LanguageId::Python, 0, &app);
+        let focal = spanned_entity(
+            "_make_timedelta",
+            "app.py",
+            LanguageId::Python,
+            500,
+            "def _make_timedelta(value):\n    return value\n",
+        );
+        let context = proof_context(LanguageId::Python, "1.1.400");
+        let context_id = id_of(&context);
+        admit(
+            &store,
+            &[&caller, &focal],
+            vec![
+                context,
+                ledger(&focal, "", context_id, Vec::new()),
+                ledger(
+                    &caller,
+                    &app,
+                    context_id,
+                    vec![(
+                        CALL,
+                        CallSiteState::Unresolved {
+                            reason: UnresolvedReason::CalleeNotPlaceable,
+                        },
+                    )],
+                ),
+            ],
+        );
+        let site = |line: u32, excerpt: &str| ResidueSite {
+            file: "cli.py".into(),
+            line,
+            kind: "computed_member",
+            name: None,
+            detail: Some(excerpt.into()),
+        };
+        let unkeyed = || vec![site(49, "app = getattr(module, attr_name, None)")];
+
+        // Only unkeyed lookups: one counted clause, the block unsettled.
+        let only_unkeyed = FocalEscape::Contained {
+            entities_checked: 2,
+            residue: EscapeResidue {
+                unkeyed_lookups: unkeyed(),
+                ..EscapeResidue::default()
+            },
+        };
+        let scan = scan_focal(&store, &focal, &Body(&app), only_unkeyed).unwrap();
+        assert!(scan.value_calls.is_empty(), "{:?}", scan.value_calls);
+        let clauses = named_clauses(&scan);
+        assert_eq!(clauses.len(), 1, "{clauses:?}");
+        assert!(
+            clauses[0].starts_with("unkeyed_lookups_counted: 1 lookups"),
+            "{clauses:?}"
+        );
+        assert!(escape_residue_clause(&scan.escape).is_none());
+        let block = named_block(&scan);
+        assert_eq!(block["settled"], false, "{block}");
+        assert_eq!(
+            block["focal_escape"]["residue"]["unkeyed_lookups"]["count"], 1,
+            "{block}"
+        );
+        let evidence = calls_evidence_from(&store, &focal, &scan);
+        assert!(!evidence.settled);
+        assert!(evidence
+            .unsettled_because
+            .contains(&UNKEYED_LOOKUPS_COUNTED));
+        assert!(!evidence.unsettled_because.contains(&ESCAPE_RESIDUE_LISTED));
+
+        // A lookup whose key names the focal stays a listed site.
+        let keyed = FocalEscape::Contained {
+            entities_checked: 2,
+            residue: EscapeResidue {
+                reflective: vec![site(80, "getattr(module, \"_make_timedelta\")")],
+                unkeyed_lookups: unkeyed(),
+                ..EscapeResidue::default()
+            },
+        };
+        let scan = scan_focal(&store, &focal, &Body(&app), keyed).unwrap();
+        let clauses = named_clauses(&scan);
+        assert_eq!(clauses.len(), 2, "{clauses:?}");
+        assert!(
+            clauses[0].starts_with("escape_residue_listed: 1 sites"),
+            "{clauses:?}"
+        );
+        assert!(
+            clauses[1].starts_with("unkeyed_lookups_counted: 1 lookups"),
+            "{clauses:?}"
+        );
+        let block = named_block(&scan);
+        assert_eq!(block["settled"], false, "{block}");
+        assert_eq!(
+            block["focal_escape"]["residue"]["reflective"]["sites"][0]["line"], 80,
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn value_calls_are_counted_once_with_the_census_reason() {
+        let fixture = fixture(true);
+        admit_rival(&fixture.store, fixture.context);
+        let scan = scan_focal(
+            &fixture.store,
+            &mystery_focal(),
+            &Body(BODY),
+            unknown_census(),
+        )
+        .unwrap();
+        assert_eq!(scan.value_calls.sites, 1);
+        assert_eq!(scan.value_calls.callers, 1);
+        let clauses = named_clauses(&scan);
+        assert_eq!(clauses.len(), 2, "{clauses:?}");
+        assert!(
+            clauses[0].starts_with("named_leftovers: 1 call site(s)"),
+            "{clauses:?}"
+        );
+        assert!(
+            clauses[1]
+                .starts_with("value_calls_unmeasured: 1 unsettled call site(s) in 1 caller(s)")
+                && clauses[1].contains("dynamic reflective access in the domain"),
+            "{clauses:?}"
+        );
+        for clause in &clauses {
+            assert!(
+                !clause.contains(crate::verdict::CLAUSE_SEPARATOR),
+                "{clause}"
+            );
+        }
+        // The binding that is only a value call no longer reads as its own code.
+        assert!(
+            !clauses
+                .iter()
+                .any(|clause| clause.starts_with("binding_unproven")),
+            "{clauses:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_caller_still_owed_its_sites_keeps_the_scope_open() {
+        let fixture = fixture(false);
+        let scan = scan_focal(
+            &fixture.store,
+            &mystery_focal(),
+            &Body(BODY),
+            unknown_census(),
+        )
+        .unwrap();
+        assert!(!scan.named_complete());
+        let block = named_block(&scan);
+        assert_eq!(block["named_complete"], false, "{block}");
+        assert!(
+            block["clauses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|clause| clause
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("call_sites_owed"))),
+            "an owed caller's sites were never listed, so it stays a gap: {block}"
+        );
     }
 
     #[test]
     fn a_terminal_lists_the_named_candidates_and_counts_the_rest() {
         let fixture = fixture(true);
-        let focal = spanned_entity(
-            "mystery",
-            "lib.py",
-            LanguageId::Python,
-            0,
-            "def mystery(data):\n    pass\n",
-        );
-        let escape = FocalEscape::Unknown {
-            reason: "dynamic reflective access in the domain",
-        };
-        let scan = scan_focal(&fixture.store, &focal, &Body(BODY), escape).unwrap();
+        let scan = scan_focal(
+            &fixture.store,
+            &mystery_focal(),
+            &Body(BODY),
+            unknown_census(),
+        )
+        .unwrap();
         assert_eq!(
             candidate_lines(&scan, "mystery"),
             vec![
                 "Unproven call sites that could call mystery: 2.".to_string(),
-                "  1 name mystery, so check them first:".to_string(),
-                "    run, line 4 in it calls mystery, unresolved (no answer)".to_string(),
-                "  1 more could reach it only if mystery is held as a value, and this graph \
-                 cannot rule that out (dynamic reflective access in the domain)."
+                "  1 name mystery, and the store holds no other definition that name can reach, \
+                 so each is a name_unique reference:"
                     .to_string(),
+                "    run, line 4 in it: mystery(data), unresolved (no answer)".to_string(),
+                "  1 more could reach it only if mystery is held as a value or looked up by a \
+                 computed name, and the escape census could not rule that out (dynamic \
+                 reflective access in the domain)."
+                    .to_string(),
+            ]
+        );
+        admit_rival(&fixture.store, fixture.context);
+        let scan = scan_focal(
+            &fixture.store,
+            &mystery_focal(),
+            &Body(BODY),
+            unknown_census(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_lines(&scan, "mystery")[1..3],
+            [
+                "  1 name mystery, so check them first:".to_string(),
+                "    run, line 4 in it: mystery(data), unresolved (no answer)".to_string(),
             ]
         );
     }
@@ -2358,6 +4345,11 @@ mod tests {
     #[test]
     fn a_candidate_row_serves_its_file_as_a_projection() {
         let fixture = fixture(true);
+        admit_rival(&fixture.store, fixture.context);
+        // The module the callers' unit declares, which is how a row places them.
+        let mut module = spanned_entity("app", "app.py", LanguageId::Python, 0, BODY);
+        module.kind = kin_model::EntityKind::Module;
+        fixture.store.upsert_entity(&module).unwrap();
         let focal = spanned_entity(
             "mystery",
             "lib.py",
@@ -2372,6 +4364,7 @@ mod tests {
         let block = named_block(&scan);
         let rows = block["candidates"].as_array().expect("candidate rows");
         assert!(!rows.is_empty(), "{block}");
+        let mut placed = 0;
         for row in rows {
             assert!(row.get("caller_file").is_none(), "{row}");
             assert!(row.get("file_path").is_none(), "{row}");
@@ -2379,8 +4372,16 @@ mod tests {
                 row["projection"]["path"].is_string(),
                 "the caller's file is a labelled projection: {row}"
             );
+            if row["projection"]["path"] == "app.py" {
+                assert_eq!(row["module"], "app", "a row is placed by its module: {row}");
+                placed += 1;
+            }
             assert!(row["caller"].is_string(), "{row}");
         }
+        assert!(
+            placed > 0,
+            "no candidate sat in the module the test placed: {block}"
+        );
     }
 
     #[test]
@@ -2572,6 +4573,678 @@ mod tests {
             "{lines:?}"
         );
     }
+
+    /// Each caller's own body, keyed by the caller, the way the answer's body
+    /// reader hands them over, counting how often each caller is read. A
+    /// caller it holds no body for reads as unavailable.
+    struct Bodies {
+        bodies: HashMap<EntityId, String>,
+        reads: std::cell::RefCell<HashMap<EntityId, usize>>,
+    }
+
+    impl SiteText for Bodies {
+        fn quote(&self, caller: &Entity, site: &SourceSpan) -> Result<String, &'static str> {
+            let span = caller.span.as_ref().ok_or("caller_has_no_span")?;
+            let body = self
+                .bodies
+                .get(&caller.id)
+                .ok_or("caller_source_unavailable")?;
+            *self.reads.borrow_mut().entry(caller.id).or_default() += 1;
+            quote_site(caller, site, body, span.start_byte)
+        }
+    }
+
+    /// A caller whose body starts at graph line `start_line` of `file`.
+    fn caller_at(
+        name: &str,
+        file: &str,
+        language: LanguageId,
+        start_line: u32,
+        body: &str,
+    ) -> Entity {
+        let mut entity = spanned_entity(name, file, language, 0, body);
+        let span = entity.span.as_mut().unwrap();
+        span.start_line = start_line;
+        span.end_line = start_line + body.matches('\n').count() as u32;
+        entity
+    }
+
+    /// Record, the way an adapter does, what `binding` holds in `caller`.
+    fn bind(caller: &mut Entity, binding: &str, origin: Value) {
+        caller.metadata.extra.insert(
+            kin_parser::value_origins::VALUE_ORIGINS_KEY.into(),
+            json!({
+                "version": kin_parser::value_origins::VALUE_ORIGINS_VERSION,
+                "bindings": { binding: origin },
+            }),
+        );
+    }
+
+    /// One caller of a fixture: the entity, its body, the tokens its ledger
+    /// holds an unresolved site for in body order, and whether the body
+    /// reader holds its body.
+    struct Caller {
+        entity: Entity,
+        body: &'static str,
+        tokens: Vec<&'static str>,
+        readable: bool,
+    }
+
+    fn caller(entity: Entity, body: &'static str, tokens: Vec<&'static str>) -> Caller {
+        Caller {
+            entity,
+            body,
+            tokens,
+            readable: true,
+        }
+    }
+
+    /// Admit `callers` beside a rival definition of the focal's call name (so
+    /// no site is promoted), each with a current ledger, and a body reader
+    /// holding every readable caller's body.
+    fn admit_callers(
+        language: LanguageId,
+        rival: (&str, &str),
+        callers: &[Caller],
+    ) -> (InMemoryGraph, Bodies) {
+        let store = InMemoryGraph::new();
+        let rival_body = "function rival() {}\n";
+        let rival = spanned_entity(rival.0, rival.1, language, 5_000, rival_body);
+        let context = proof_context(language, "current");
+        let mut records = vec![
+            context.clone(),
+            ledger(&rival, rival_body, context.id(), Vec::new()),
+        ];
+        for caller in callers {
+            records.push(ledger(
+                &caller.entity,
+                caller.body,
+                context.id(),
+                caller
+                    .tokens
+                    .iter()
+                    .map(|token| {
+                        (
+                            *token,
+                            CallSiteState::Unresolved {
+                                reason: UnresolvedReason::NoAnswer,
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        let mut entities: Vec<&Entity> = callers.iter().map(|caller| &caller.entity).collect();
+        entities.push(&rival);
+        admit(&store, &entities, records);
+        let text = Bodies {
+            bodies: callers
+                .iter()
+                .filter(|caller| caller.readable)
+                .map(|caller| (caller.entity.id, caller.body.to_string()))
+                .collect(),
+            reads: std::cell::RefCell::new(HashMap::new()),
+        };
+        (store, text)
+    }
+
+    /// Flask's `AppContext.pop` and callers shaped like the ones its tests
+    /// hold: calls through untyped values, through a value the caller
+    /// constructs as the owner and writes over several lines, through a
+    /// literal and a builtin, and one whose body the reader cannot read. A
+    /// census lists a value use, a reflective lookup and a binding.
+    fn flask_pop() -> (InMemoryGraph, Entity, Bodies, FocalEscape) {
+        use kin_model::value_escape::{EscapeResidue, ResidueSite};
+        let py = LanguageId::Python;
+        let focal = spanned_entity(
+            "AppContext.pop",
+            "src/flask/ctx.py",
+            py,
+            0,
+            "def pop(self, exc=None):\n    pass\n",
+        );
+        let manual_body =
+            "def test_manual_pop(app):\n    ctx = AppContext(app)\n    ctx.push()\n    \
+                           ctx.pop(\n        None,  # no error (yet)\n    )\n";
+        let mut manual = caller_at(
+            "test_manual_pop",
+            "tests/test_appctx.py",
+            py,
+            40,
+            manual_body,
+        );
+        bind(
+            &mut manual,
+            "ctx",
+            json!({"call": {"callee": "AppContext"}}),
+        );
+        let cookie_body = "def test_max_cookie_size(app, client, recwarn):\n    \
+                           app.config[\"SESSION_COOKIE_DOMAIN\"] = \".localhost\"\n    \
+                           w = recwarn.pop()\n    assert \"too large\" in str(w.message)\n";
+        let lang_body = "def pull_lang_code(endpoint, values):\n    \
+                         flask.g.lang_code = values.pop(\"lang_code\", None)\n";
+        let teardown_body =
+            "def app_teardown1(e=None):\n    assert flask.g.seen.pop() == \"app_1\"\n";
+        let literal_body = "def test_literals():\n    [1, 2].pop()\n    dict(a=1).pop(\"a\")\n    \
+                            \"abc\".strip()\n";
+        let unreadable_body = "def test_unreadable(stack):\n    stack.pop()\n";
+        let session_body = "def test_session_special_types(app, client):\n    \
+                            expect_exception(flask.session.pop, \"foo\")\n";
+        let check_body = "def check_method(self, method):\n        \
+                          base_method = getattr(Flask, method.__name__)  # the base\n";
+        let mut unreadable = caller(
+            caller_at(
+                "test_unreadable",
+                "tests/test_unreadable.py",
+                py,
+                7,
+                unreadable_body,
+            ),
+            unreadable_body,
+            vec!["pop"],
+        );
+        unreadable.readable = false;
+        let callers = vec![
+            caller(manual, manual_body, vec!["push", "pop"]),
+            caller(
+                caller_at(
+                    "test_max_cookie_size",
+                    "tests/test_basic.py",
+                    py,
+                    1930,
+                    cookie_body,
+                ),
+                cookie_body,
+                vec!["pop"],
+            ),
+            caller(
+                caller_at(
+                    "test_url_processors.<locals>.pull_lang_code",
+                    "tests/test_basic.py",
+                    py,
+                    1653,
+                    lang_body,
+                ),
+                lang_body,
+                vec!["pop"],
+            ),
+            caller(
+                caller_at(
+                    "test_nested_callback_order.<locals>.app_teardown1",
+                    "tests/test_blueprints.py",
+                    py,
+                    919,
+                    teardown_body,
+                ),
+                teardown_body,
+                vec!["pop"],
+            ),
+            caller(
+                caller_at(
+                    "test_literals",
+                    "tests/test_literals.py",
+                    py,
+                    3,
+                    literal_body,
+                ),
+                literal_body,
+                vec!["pop", "pop", "strip"],
+            ),
+            unreadable,
+            // The census's residue sits in these two.
+            caller(
+                caller_at(
+                    "test_session_special_types",
+                    "tests/test_basic.py",
+                    py,
+                    391,
+                    session_body,
+                ),
+                session_body,
+                vec![],
+            ),
+            caller(
+                caller_at(
+                    "Flask.check_method",
+                    "src/flask/app.py",
+                    py,
+                    273,
+                    check_body,
+                ),
+                check_body,
+                vec![],
+            ),
+        ];
+        let (store, text) = admit_callers(py, ("RequestContext.pop", "src/flask/ctx.py"), &callers);
+        let residue_site =
+            |file: &str, line: u32, kind, name: Option<&str>, detail: &str| ResidueSite {
+                file: file.to_string(),
+                line,
+                kind,
+                name: name.map(str::to_string),
+                detail: Some(detail.to_string()),
+            };
+        let escape = FocalEscape::Escapes {
+            reason: "a use of its name holds it as a value: see residue.values",
+            residue: EscapeResidue {
+                values: vec![residue_site(
+                    "tests/test_basic.py",
+                    393,
+                    "argument",
+                    Some("pop"),
+                    "flask.session",
+                )],
+                bindings: vec![residue_site(
+                    "src/flask/sessions.py",
+                    96,
+                    "binding",
+                    Some("pop"),
+                    "",
+                )],
+                reflective: vec![residue_site(
+                    "src/flask/app.py",
+                    275,
+                    "computed_member",
+                    None,
+                    "getattr(Flask, method.__name__)",
+                )],
+                ..EscapeResidue::default()
+            },
+        };
+        (store, focal, text, escape)
+    }
+
+    /// A named leftover made through a receiver says which link of the chain
+    /// typing it the graph lacks: a receiver no fact binds lacks its binding,
+    /// a field chain is no binding at all, and a bound receiver whose file
+    /// carries no certificate says nothing rather than guess.
+    #[test]
+    fn named_leftovers_name_the_missing_link_of_their_receiver_chain() {
+        let (store, focal, text, escape) = flask_pop();
+        let scan = scan_focal(&store, &focal, &text, escape).unwrap();
+        let missing = |caller: &str| -> Vec<Option<Value>> {
+            scan.named
+                .iter()
+                .filter(|row| row.caller_name == caller)
+                .map(|row| row.receiver_binding_missing.clone())
+                .collect()
+        };
+        assert_eq!(
+            missing("test_max_cookie_size"),
+            vec![Some(json!({
+                "step": "binding",
+                "name": "recwarn",
+                "reason": "no_value_origin_fact",
+            }))]
+        );
+        assert_eq!(
+            missing("test_nested_callback_order.<locals>.app_teardown1"),
+            vec![Some(json!({
+                "step": "binding",
+                "name": "flask.g.seen",
+                "reason": "receiver_not_a_name",
+            }))]
+        );
+        assert_eq!(missing("test_manual_pop"), vec![None]);
+    }
+
+    /// The pilot's `AppContext.pop` leftovers each carry the call as written
+    /// and its receiver, so a reader judges `values.pop("lang_code", None)`
+    /// the way a grep hit shows it, without reading the caller. The sites
+    /// whose receiver can hold the focal's owner come first and the literal
+    /// and builtin ones last, none dropped; the caller whose body could not
+    /// be read says so and guesses nothing; and every caller is read once
+    /// however many of its sites are listed.
+    #[test]
+    fn named_leftovers_carry_their_call_as_written_most_likely_first() {
+        let (store, focal, text, escape) = flask_pop();
+        let scan = scan_focal(&store, &focal, &text, escape).unwrap();
+        let rows: Vec<Value> = scan
+            .named
+            .iter()
+            .map(|row| {
+                json!({
+                    "caller_name": row.caller_name,
+                    "line_in_entity": row.line_in_entity,
+                    "expr": row.expr,
+                    "receiver": row.receiver,
+                    "receiver_hint": row.receiver_hint,
+                    "expr_unavailable": row.expr_unavailable,
+                })
+            })
+            .collect();
+        let row = |caller: &str, line: Option<u64>, expr: Option<&str>, receiver: Option<&str>| {
+            json!({
+                "caller_name": caller,
+                "line_in_entity": line,
+                "expr": expr,
+                "receiver": receiver,
+                "receiver_hint": null,
+                "expr_unavailable": null,
+            })
+        };
+        let hinted = |mut row: Value, hint: &str| {
+            row["receiver_hint"] = json!(hint);
+            row
+        };
+        let mut unreadable = row("test_unreadable", None, None, None);
+        unreadable["expr_unavailable"] = json!("caller_source_unavailable");
+        assert_eq!(
+            rows,
+            vec![
+                hinted(
+                    row(
+                        "test_manual_pop",
+                        Some(3),
+                        Some("ctx.pop(None,)"),
+                        Some("ctx")
+                    ),
+                    "typed_as_owner",
+                ),
+                row(
+                    "test_max_cookie_size",
+                    Some(2),
+                    Some("recwarn.pop()"),
+                    Some("recwarn"),
+                ),
+                row(
+                    "test_url_processors.<locals>.pull_lang_code",
+                    Some(1),
+                    Some("values.pop(\"lang_code\", None)"),
+                    Some("values"),
+                ),
+                row(
+                    "test_nested_callback_order.<locals>.app_teardown1",
+                    Some(1),
+                    Some("flask.g.seen.pop()"),
+                    Some("flask.g.seen"),
+                ),
+                unreadable,
+                hinted(
+                    row(
+                        "test_literals",
+                        Some(1),
+                        Some("[1, 2].pop()"),
+                        Some("[1, 2]")
+                    ),
+                    "literal",
+                ),
+                hinted(
+                    row(
+                        "test_literals",
+                        Some(2),
+                        Some("dict(a=1).pop(\"a\")"),
+                        Some("dict(a=1)"),
+                    ),
+                    "builtin",
+                ),
+            ],
+        );
+        // One read per caller, however many of its sites are listed.
+        let reads = text.reads.borrow();
+        assert!(reads.values().all(|reads| *reads == 1), "{reads:?}");
+
+        // The served block and the answer-only reply keep all of it, and the
+        // listed residue carries the line each site sits on.
+        let block = named_block(&scan);
+        assert!(block.get(NAMED_EXPR_ELIDED_KEY).is_none(), "{block}");
+        let mut reply = json!({
+            "focal_entity": { "name": "AppContext.pop" },
+            "references": [],
+            "total_upstream": 0,
+            "unconfirmed_candidates": 0,
+            CALL_SITES_KEY: block,
+        });
+        crate::handlers::entities::project_answer_only(&mut reply);
+        let candidates = &reply["call_site_candidates"];
+        assert_eq!(
+            candidates["named"][2]["expr"],
+            "values.pop(\"lang_code\", None)"
+        );
+        assert_eq!(candidates["named"][2]["receiver"], "values");
+        assert_eq!(candidates["named"][0]["receiver_hint"], "typed_as_owner");
+        assert_eq!(
+            candidates["named"][4]["expr_unavailable"],
+            "caller_source_unavailable"
+        );
+        assert!(candidates["named"][4].get("expr").is_none());
+        let residue = &candidates["value_calls"]["census"]["residue"];
+        assert_eq!(
+            residue["values"]["sites"][0]["expr"], "expect_exception(flask.session.pop, \"foo\")",
+            "{residue}"
+        );
+        assert_eq!(
+            residue["reflective"]["sites"][0]["expr"],
+            "base_method = getattr(Flask, method.__name__)",
+            "{residue}"
+        );
+        assert_eq!(
+            residue["bindings"]["sites"][0]["expr_unavailable"], "no_entity_holds_line",
+            "a site no entity holds says so rather than reading a file: {residue}"
+        );
+    }
+
+    /// JavaScript and TypeScript callers read the same way: an optional call,
+    /// a template literal holding a bracket, a chain broken over lines with a
+    /// comment in its arguments, a constructor call, and the language's own
+    /// literals and globals.
+    /// React's reconciler calls a host-config function by the name it imports
+    /// from a fork stub. The linker binds the call to the declaration each
+    /// fork variant supplies, an open set, so the ledger leaves the site
+    /// open. Asked about one of those declarations, the site is the proven
+    /// edge's own call and no leftover. Asked about a declaration no edge
+    /// reaches, the noop renderer's member, it stays listed.
+    #[test]
+    fn an_open_site_a_proven_edge_carries_is_answered_for_that_focal_only() {
+        let js = LanguageId::JavaScript;
+        let dom = spanned_entity(
+            "measureInstance",
+            "packages/react-dom-bindings/src/client/ReactFiberConfigDOM.js",
+            js,
+            0,
+            "function measureInstance(instance) {\n  return null;\n}\n",
+        );
+        let mut noop = spanned_entity(
+            "createReactNoop.<locals>.mutationHostConfig.measureInstance",
+            "packages/react-noop-renderer/src/createReactNoop.js",
+            js,
+            0,
+            "measureInstance(instance) {\n  return null;\n}\n",
+        );
+        noop.kind = kin_model::EntityKind::Method;
+        let body = "function measureViewTransitionHostInstancesRecursive(instance) {\n  \
+                    const nextMeasurement = measureInstance(instance);\n  \
+                    return nextMeasurement;\n}\n";
+        let reconciler = "packages/react-reconciler/src/ReactFiberCommitViewTransitions.js";
+        let measure = caller_at(
+            "measureViewTransitionHostInstancesRecursive",
+            reconciler,
+            js,
+            900,
+            body,
+        );
+        let callers = vec![caller(measure.clone(), body, vec!["measureInstance"])];
+        let (store, text) = admit_callers(
+            js,
+            (
+                "measureInstance",
+                "packages/react-art/src/ReactFiberConfigART.js",
+            ),
+            &callers,
+        );
+        // The declarations themselves hold no call, and their ledgers say so.
+        let context = proof_context(js, "current");
+        let empty = |entity: &Entity| ledger(entity, "", context.id(), Vec::new());
+        admit(
+            &store,
+            &[&dom, &noop],
+            vec![context.clone(), empty(&dom), empty(&noop)],
+        );
+        // The module fork tier's edge to the DOM variant, carrying the call.
+        let call = "measureInstance(instance)";
+        let own = measure.span.as_ref().unwrap();
+        let start = own.start_byte + body.find(call).unwrap();
+        store
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind: kin_model::RelationKind::Calls,
+                src: kin_model::GraphNodeId::Entity(measure.id),
+                dst: kin_model::GraphNodeId::Entity(dom.id),
+                confidence: kin_index::resolution::MODULE_FORK_CONFIDENCE,
+                origin: kin_model::RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: vec![
+                    kin_model::RelationEvidence {
+                        source_span: Some(SourceSpan {
+                            file: own.file.clone(),
+                            start_byte: start,
+                            end_byte: start + call.len(),
+                            start_line: own.start_line + 1,
+                            start_col: 26,
+                            end_line: own.start_line + 1,
+                            end_col: 26 + call.len() as u32,
+                        }),
+                        ..Default::default()
+                    },
+                    kin_model::RelationEvidence {
+                        parser_rule: Some(kin_index::MODULE_FORK_EVIDENCE_RULE.to_string()),
+                        source_path: Some(
+                            "packages/react-reconciler/src/ReactFiberConfig.js".to_string(),
+                        ),
+                        resolved_path: Some(
+                            "packages/react-reconciler/src/forks/ReactFiberConfig.dom.js"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    },
+                ],
+            })
+            .unwrap();
+        let contained = || FocalEscape::Contained {
+            entities_checked: 4,
+            residue: kin_model::value_escape::EscapeResidue::default(),
+        };
+
+        let asked_dom = scan_focal(&store, &dom, &text, contained()).unwrap();
+        assert_eq!(asked_dom.proven_by_edge, 1);
+        assert!(asked_dom.named.is_empty(), "{:?}", asked_dom.named);
+        assert!(asked_dom.candidates.is_empty());
+        let block = named_block(&asked_dom);
+        assert_eq!(block["proven_by_edge"], 1, "{block}");
+        assert_eq!(block["candidate_count"], 0, "{block}");
+        assert_eq!(block["clauses"], json!([]), "{block}");
+        assert_eq!(block["settled"], true, "{block}");
+
+        // No edge reaches the noop renderer's member, so for it the same
+        // site is what it was: a call that spells the name, left to check.
+        let asked_noop = scan_focal(&store, &noop, &text, contained()).unwrap();
+        assert_eq!(asked_noop.proven_by_edge, 0);
+        assert_eq!(asked_noop.named.len(), 1, "{:?}", asked_noop.named);
+        assert_eq!(asked_noop.named[0].caller, measure.id);
+        assert_eq!(asked_noop.named[0].expr.as_deref(), Some(call));
+        // It is written on no object, and the row says so.
+        assert!(asked_noop.named[0].bare_call);
+        assert_eq!(
+            serde_json::to_value(&asked_noop.named[0]).unwrap()["bare_call"],
+            true
+        );
+        let block = named_block(&asked_noop);
+        assert!(block.get("proven_by_edge").is_none(), "{block}");
+        let clauses = named_clauses(&asked_noop);
+        assert_eq!(clauses.len(), 1, "{clauses:?}");
+        assert!(clauses[0].starts_with("named_leftovers: 1 call site(s)"));
+    }
+
+    #[test]
+    fn js_and_ts_leftovers_carry_their_call_as_written() {
+        let ts = LanguageId::TypeScript;
+        let js = LanguageId::JavaScript;
+        let focal = spanned_entity(
+            "Stack.pop",
+            "src/stack.ts",
+            ts,
+            0,
+            "pop(): number {\n    return 0;\n  }\n",
+        );
+        let drain_body = "function drain(items: Stack): void {\n  items\n    .pop(\n      \
+                          1, // first (of many)\n    );\n}\n";
+        let mut drain = caller_at("drain", "src/drain.ts", ts, 10, drain_body);
+        bind(
+            &mut drain,
+            "items",
+            json!({"declared": {"type_name": "Stack"}}),
+        );
+        let make_body = "function make(): number {\n  return new Stack().pop();\n}\n";
+        let queue_body = "function useQueue(queue) {\n  return queue?.pop(`a)`, b);\n}\n";
+        let literal_body =
+            "function literal(text) {\n  const last = [3, 4].pop();\n  JSON.parse(text).pop();\n}\n";
+        let callers = vec![
+            caller(drain, drain_body, vec!["pop"]),
+            caller(
+                caller_at("make", "src/make.ts", ts, 3, make_body),
+                make_body,
+                vec!["pop"],
+            ),
+            caller(
+                caller_at("useQueue", "src/queue.js", js, 1, queue_body),
+                queue_body,
+                vec!["pop"],
+            ),
+            caller(
+                caller_at("literal", "src/literal.js", js, 1, literal_body),
+                literal_body,
+                vec!["pop", "pop"],
+            ),
+        ];
+        let (store, text) = admit_callers(ts, ("Other.pop", "src/other.ts"), &callers);
+        let scan = scan_focal(&store, &focal, &text, unknown_census()).unwrap();
+        // Every one of these is made on a value.
+        assert!(scan.named.iter().all(|row| !row.bare_call));
+        type Row<'s> = (&'s str, Option<&'s str>, Option<&'s str>, Option<&'s str>);
+        let rows: Vec<Row> = scan
+            .named
+            .iter()
+            .map(|row| {
+                (
+                    row.caller_name.as_str(),
+                    row.expr.as_deref(),
+                    row.receiver.as_deref(),
+                    row.receiver_hint,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "drain",
+                    Some("items.pop(1,)"),
+                    Some("items"),
+                    Some("typed_as_owner")
+                ),
+                (
+                    "make",
+                    Some("new Stack().pop()"),
+                    Some("new Stack()"),
+                    Some("names_owner"),
+                ),
+                ("useQueue", Some("queue?.pop(`a)`, b)"), Some("queue"), None),
+                (
+                    "literal",
+                    Some("[3, 4].pop()"),
+                    Some("[3, 4]"),
+                    Some("literal")
+                ),
+                (
+                    "literal",
+                    Some("JSON.parse(text).pop()"),
+                    Some("JSON.parse(text)"),
+                    Some("builtin"),
+                ),
+            ],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2613,7 +5286,7 @@ mod owed_outside_tests {
         let text = text_lines(&block).join("\n");
         assert!(!text.contains("every site in scope is settled"), "{text}");
         assert!(
-            text.contains("not settled: call_sites_owed: 3 caller(s) in 2 file(s) outside"),
+            text.contains("not settled: call_sites_owed: 3 caller(s) in 2 module(s) outside"),
             "{text}"
         );
         assert!(text.contains("pkg/views.py (2 caller(s))"), "{text}");
@@ -2769,7 +5442,7 @@ mod owed_outside_tests {
         let gaps = impact_arrival_gaps(&payload);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         assert!(
-            gaps[0].starts_with("call_sites_owed: 2 caller(s) in 1 file(s) outside"),
+            gaps[0].starts_with("call_sites_owed: 2 caller(s) in 1 module(s) outside"),
             "{gaps:?}"
         );
         let settled = json!({ CALLER_ARRIVAL_KEY: {

@@ -92,31 +92,37 @@ pub enum WorkspaceCarryConflictKind {
 }
 
 impl WorkspaceCarryConflictKind {
-    /// The clause naming what this conflict would have cost, phrased for a
-    /// caller who is looking at their own working tree.
+    /// The clause naming what this conflict would have cost, phrased about
+    /// the pending work it follows in a refusal. A refusal names that work by
+    /// entity, so this speaks of members and entities and never of the place
+    /// either is projected at.
     pub const fn reason(self) -> &'static str {
         match self {
             Self::AdditionWouldOverwriteMember => {
-                "the destination branch tracks this path with different content, so carrying the \
-                 pending addition would overwrite it"
+                "the destination branch holds a different version of it, so carrying the pending \
+                 addition would overwrite that version"
             }
             Self::MemberDiffersBetweenBranches => {
                 "the destination branch holds this member differently from the state the pending \
                  change was made against"
             }
             Self::PathIsInsideADestinationMember => {
-                "the destination branch tracks a file or an independent checkout at an enclosing \
-                 path, so this path cannot exist there"
+                "the destination branch holds an entity or an independent checkout that would \
+                 have to contain it, so it cannot exist there"
             }
             Self::PathIsADestinationDirectory => {
-                "the destination branch tracks members beneath this path, so a file cannot take \
-                 its place"
+                "the destination branch holds other entities where this one would go, so it \
+                 cannot take their place"
             }
         }
     }
 }
 
-/// One pending entry that refuses to replay, named by the path a caller sees.
+/// One pending entry that refuses to replay.
+///
+/// `path` is where the entry is projected, the structured detail a caller
+/// resolves the entities it holds from. A refusal names those entities, not
+/// the place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceCarryConflict {
     pub path: RepoPath,
@@ -150,9 +156,9 @@ pub struct WorkspaceCarryPlan {
 /// every reason the transition must refuse.
 ///
 /// The two refusals are kept apart because they read differently to a caller.
-/// [`Self::Refused`] is about paths on disk and names each one;
-/// [`Self::SemanticallyRefused`] is about graph subjects and names counts and
-/// kinds, because there is no path to point at.
+/// [`Self::Refused`] is about members of the tree, each of which a caller names
+/// by the entities it holds; [`Self::SemanticallyRefused`] is about graph
+/// subjects and names counts and kinds.
 #[derive(Debug, Clone)]
 pub enum WorkspaceCarry {
     Carried(Box<WorkspaceCarryPlan>),

@@ -230,6 +230,8 @@ def run_arm(kin, tmp, name, path_value):
     home.mkdir()
     build_corpus(work)
     env = {
+        # Written against a store that holds its complete history.
+        "KIN_INIT_HISTORY": "full",
         "HOME": str(home),
         "KIN_HOME": str(home),
         "PATH": path_value,

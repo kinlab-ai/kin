@@ -19,8 +19,8 @@ can be satisfied by a broken tool:
   2  the budget the tool advertises is the budget it enforces, and its ceiling is
      one a real MCP client accepts
   3  no ranked list the budget cuts ships empty
-  4  a response the budget could not bring under its ceiling says so, and one
-     reporting `bounded: false` is one that fits
+  4  impact pages fit their requested ceiling and preserve every impact bucket
+     and original safety reading through an advancing continuation
   5  a pack cut by its own token budget publishes what it cut, under that
      budget's name, and leaves no group empty
   6  a row whose inline source the budget took says so on the row
@@ -61,9 +61,10 @@ a failure here rather than a silent pass in CI.
 """
 from __future__ import print_function
 
-from trace_pages import TraceAnswer, mcp_trace
+from trace_pages import TraceAnswer, mcp_trace, mcp_impact, mcp_locate, IMPACT_COLLECTIONS
 
 import argparse
+import copy
 import functools
 import json
 import os
@@ -72,6 +73,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -92,6 +98,11 @@ REFUSED_BY_A_REAL_CLIENT = 117313
 IMPACT_LISTS = [
     "entity_impacts",
     "affected_callers",
+    "affected_value_uses",
+    "affected_overrides",
+    "affected_override_callers",
+    "override_caller_candidates",
+    "same_name_implementations",
     "affected_dependents",
     "affected_contract_consumers",
     "affected_tests",
@@ -345,6 +356,27 @@ def grade_empty_walk(payload):
             "a walk that withheld nothing claims an elision: %s" % json.dumps(elisions)
         )
     return problems
+
+
+# The reply budgets check_2 grades. max_output_bytes is the one name the verbs
+# serve; the other two are the older names the registered tools still carry.
+# mcp_surface_contract.py imports these, so the per pull request gate and this
+# check name the same parameters.
+ADVERTISED_BUDGET_KEYS = ("max_output_bytes", "max_chars", "max_response_chars")
+
+
+def advertised_budgets(tool_name, properties):
+    """The (key, schema) pairs one listed tool advertises as a reply budget.
+
+    `exec` and `session` serve `max_output_bytes` as the bytes a toolchain run
+    keeps per stream, not as a reply budget, so it is not one there.
+    """
+    return [
+        (key, properties[key])
+        for key in ADVERTISED_BUDGET_KEYS
+        if key in properties
+        and not (key == "max_output_bytes" and tool_name in ("exec", "session"))
+    ]
 
 
 def grade_advertised_budget(schema):
@@ -675,9 +707,14 @@ class Suite(object):
         if not os.path.isdir(self.kin_home):
             os.makedirs(self.kin_home)
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = self.kin_home
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
@@ -857,9 +894,14 @@ class Suite(object):
         `content[0].text` first, because the outer frame is an envelope and
         reading payload keys off its top level comes back empty for every key.
         """
-        if method == "trace_data_flow" and not raw_result:
+        if method in ("trace_data_flow", "impact_analysis") and not raw_result:
             try:
-                return mcp_trace(self.kin, self.repo, self.env, params, timeout)
+                if method == "trace_data_flow":
+                    return mcp_trace(self.kin, self.repo, self.env, params, timeout)
+                self.impact_exchange = getattr(self, "impact_exchange", 0) + 1
+                transcript = os.path.join(self.workdir, "impact-mcp-%03d.jsonl" % self.impact_exchange)
+                return mcp_impact(self.kin, self.repo, self.env, params, timeout,
+                                  transcript_path=transcript)
             except ValueError as exc:
                 raise McpError(str(exc))
         env = dict(self.env)
@@ -1067,11 +1109,9 @@ def check_2(suite):
     for tool in tools:
         schema = tool.get("inputSchema") or tool.get("input_schema") or {}
         properties = schema.get("properties") or {}
-        for key in ("max_chars", "max_response_chars"):
-            if key not in properties:
-                continue
+        for key, budget in advertised_budgets(tool.get("name"), properties):
             graded += 1
-            for problem in grade_advertised_budget(properties[key]):
+            for problem in grade_advertised_budget(budget):
                 res.bad("%s.%s: %s" % (tool.get("name"), key, problem))
     if graded == 0:
         res.unknown("no tool advertised a budget parameter, so nothing was graded")
@@ -1081,118 +1121,168 @@ def check_2(suite):
     return res
 
 
+# The ranked lists a locate answer carries, on either arm.
+LOCATE_LISTS = ["entities", "results"]
+
+# The smallest budget a caller may name. A machine locate answer's verdict,
+# negative and degradations already measure past it, so at this ceiling the
+# answer cannot fit on one page and has to page.
+LOCATE_FLOOR = 2000
+
+
+def locate_page_rows(wire):
+    """Ranked rows one emitted page carries."""
+    try:
+        page = json.loads(wire)
+    except ValueError:
+        return 0
+    return sum(len(page.get(key) or []) for key in LOCATE_LISTS)
+
+
+def ranking_position(cursor):
+    """Where a ranking cursor resumes: its page, next offset and page size.
+
+    The ranking key before them is minted per call, so two calls asking the
+    same question hand back different keys for the same position.
+    """
+    if not isinstance(cursor, str):
+        return cursor
+    parts = cursor.split(".")
+    return tuple(parts[-3:]) if parts[0] == "v2" and len(parts) == 5 else cursor
+
+
+def without_observation_times(value):
+    """`value` with every `read_at` removed, at any depth.
+
+    The whole answer and the paged one are two calls, so a reading stamped with the
+    moment it was taken differs between them by the time the second call took. That
+    is when it was read, not what it says.
+    """
+    if isinstance(value, dict):
+        return {key: without_observation_times(inner) for key, inner in value.items()
+                if key != "read_at"}
+    if isinstance(value, list):
+        return [without_observation_times(inner) for inner in value]
+    return value
+
+
+def grade_locate_pages(whole, paged, ceiling):
+    """Problems with a locate answer paged at `ceiling` against the same answer whole.
+
+    A budget changes delivery, never the answer: every page fits the ceiling
+    (the page reader refuses one that does not), the first page already holds
+    a ranked row, and the pages reassemble every row and every safety reading
+    the whole answer carried, its ranking's own cursor included. Returns a list
+    of problems, empty when the paging is correct, so the self-test can drive
+    it with no binary and no fixture.
+    """
+    problems = []
+    wires = getattr(paged, "page_wires", ())
+    if len(wires) < 2:
+        problems.append("the %d-character call did not page" % ceiling)
+    elif locate_page_rows(wires[0]) == 0:
+        problems.append("the first page carried no ranked row, so it reads as an empty answer")
+    populated = [key for key in LOCATE_LISTS if whole.get(key)]
+    if not populated:
+        problems.append("the ceiling call ranked nothing")
+    for key in LOCATE_LISTS:
+        if (paged.get(key) or []) != (whole.get(key) or []):
+            problems.append("locate pages changed or lost `%s`" % key)
+    for key in ("degradations", "negative", "total_ranked"):
+        if without_observation_times(paged.get(key)) != without_observation_times(whole.get(key)):
+            problems.append("locate pages changed the original `%s`" % key)
+    if ranking_position(paged.get("next_cursor")) != ranking_position(whole.get("next_cursor")):
+        problems.append("locate pages handed back a ranking cursor for another position: %r, "
+                        "not %r" % (paged.get("next_cursor"), whole.get("next_cursor")))
+    for key in ("verdict", "completeness"):
+        # The account of the answer rides the verdict of a reply served whole,
+        # and is not part of what the answer said.
+        mine = dict((paged.get("_kin") or {}).get(key) or {})
+        theirs = dict((whole.get("_kin") or {}).get(key) or {})
+        mine.pop("answer", None)
+        theirs.pop("answer", None)
+        if without_observation_times(mine) != without_observation_times(theirs):
+            problems.append("locate pages changed the original `_kin.%s`" % key)
+    return problems
+
+
 def check_3(suite):
     res = Result("3", "FIR-2600", "no ranked list the budget cuts ships empty")
-    lists = ["entities", "files"]
     query = {"query": "hop", "limit": 60}
     try:
         whole = suite.mcp("semantic_locate", dict(query, max_chars=60000))
-        cut = suite.mcp("semantic_locate", dict(query, max_chars=2000))
-    except McpError as exc:
-        res.unknown("semantic_locate unreadable: %s" % exc)
+        paged = mcp_locate(suite.kin, suite.repo, suite.env,
+                           dict(query, max_chars=LOCATE_FLOOR))
+    except (McpError, ValueError) as exc:
+        res.bad("locate page contract unreadable: %s" % exc)
         return res
-
-    # The same query at two budgets. Anything the walk found at the ceiling it
-    # still found at the floor, so a list that is full in one and empty in the
-    # other was emptied by the budget and by nothing else. This needs no counter
-    # to be true, which is why it is the check.
-    populated = [key for key in lists if whole.get(key)]
-    if not populated:
-        res.unknown("the ceiling call filled no list, so the rule was not exercised")
-        return res
-    for key in populated:
-        rows = cut.get(key)
-        if not isinstance(rows, list) or not rows:
-            res.bad(
-                "`%s` held %d entries at the ceiling and %r at the floor, so the budget "
-                "emptied it" % (key, len(whole[key]), rows)
-            )
-    problems, graded = grade_buckets(cut, lists)
-    for problem in problems:
+    with open(os.path.join(suite.workdir, "locate-pages.json"), "w") as handle:
+        json.dump({"floor": list(paged.page_wires)}, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    for problem in grade_locate_pages(whole, paged, LOCATE_FLOOR):
         res.bad(problem)
-    if graded == 0:
-        res.unknown("the floor call cut nothing, so the elision rule was not exercised")
-        return res
     if not res.failed:
-        res.ok(
-            "%d of %d lists were cut and every one kept an entry: %s"
-            % (
-                graded,
-                len(populated),
-                json.dumps(cut.get("elisions") or {}, sort_keys=True),
-            )
-        )
+        res.ok("%d pages at %d characters carried all %d ranked rows and every original "
+               "safety reading, the first already holding %d"
+               % (len(paged.page_wires), LOCATE_FLOOR,
+                  sum(len(whole.get(key) or []) for key in LOCATE_LISTS),
+                  locate_page_rows(paged.page_wires[0])))
     return res
+
+
+def grade_impact_pages(whole, paged):
+    """A smaller wire budget changes delivery, never the reconstructed answer."""
+    problems = []
+    if len(getattr(paged, "page_bytes", ())) < 2:
+        problems.append("the floor call did not exercise an impact continuation")
+    populated = [key for key in IMPACT_LISTS if whole.get(key)]
+    if not populated:
+        problems.append("the ceiling call filled no impact list")
+    if not any(not key.startswith("affected_") for key in populated):
+        problems.append("the control filled no list outside the blast-radius buckets")
+    for key in IMPACT_LISTS:
+        # Empty paged collections are omitted by the record transport. All
+        # populated rows and their full fields must still match exactly.
+        if (paged.get(key) or []) != (whole.get(key) or []):
+            problems.append("impact pages changed or lost %s" % key)
+    for key in ("degradations", "edge_coverage", "negative"):
+        if paged.get(key) != whole.get(key):
+            problems.append("impact pages changed the original %s reading" % key)
+    for key in ("verdict", "completeness"):
+        if (paged.get("_kin") or {}).get(key) != (whole.get("_kin") or {}).get(key):
+            problems.append("impact pages changed the original _kin.%s reading" % key)
+    return problems
 
 
 def check_4(suite):
     res = Result(
         "4",
         "FIR-2602",
-        "an impact response is counted whole, and never reports a bound it did not hold",
+        "impact pages fit their ceiling and preserve every row and safety reading",
     )
-    target = {"files": ["src/chain.py"], "include_traffic": False}
+    # Selected by entity, as every semantic tool is: changing `hop_0` reaches
+    # every hop above it, `entry`, and the 24 tests that cover it, which is
+    # enough rows to page at the floor.
     try:
+        target = {"entity_ids": [suite.entity_id("hop_0")], "include_traffic": False}
         whole = suite.mcp("impact_analysis", dict(target, max_chars=60000))
         cut = suite.mcp("impact_analysis", dict(target, max_chars=2000))
     except McpError as exc:
-        res.unknown("impact_analysis unreadable: %s" % exc)
+        res.bad("impact page contract unreadable: %s" % exc)
         return res
 
-    for label, payload in (("ceiling", whole), ("floor", cut)):
-        for problem in grade_budget_accounting(payload):
-            res.bad("%s call: %s" % (label, problem))
-
-    # The bulk of this fixture's impact report is outside the four `affected_*`
-    # buckets, which is the shape FIR-2602 was measured on. A list full at the
-    # ceiling and empty at the floor was emptied by the budget and by nothing
-    # else, and needs no counter to be true.
-    populated = [key for key in IMPACT_LISTS if whole.get(key)]
-    if not populated:
-        res.unknown("the ceiling call filled no impact list, so the rule was not exercised")
-        return res
-    outside = [
-        key
-        for key in populated
-        if not key.startswith("affected_") or key in ("affected_work_items", "affected_annotations")
-    ]
-    if not outside:
-        res.unknown(
-            "every populated list is a blast-radius bucket, so the FIR-2602 shape was "
-            "not reproduced"
-        )
-        return res
-    for key in populated:
-        rows = cut.get(key)
-        if not isinstance(rows, list) or not rows:
-            res.bad(
-                "`%s` held %d entries at the ceiling and %r at the floor, so the budget "
-                "emptied it" % (key, len(whole[key]), rows)
-            )
-
-    problems, graded = grade_buckets(cut, IMPACT_LISTS)
-    for problem in problems:
+    # Preserve the exact emitted payload bytes, not a reconstructed JSON
+    # serialization, so bound/accounting findings can be reviewed directly.
+    with open(os.path.join(suite.workdir, "impact-pages.json"), "w") as handle:
+        json.dump({"ceiling": list(whole.page_wires), "floor": list(cut.page_wires)},
+                  handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    for problem in grade_impact_pages(whole, cut):
         res.bad(problem)
-    if graded == 0:
-        res.unknown("the floor call cut no impact list, so the elision rule was not exercised")
-        return res
-
     if not res.failed:
-        accounting = cut["_kin"]["response"]
-        res.ok(
-            "the report measured %d characters and was cut to %d against a %d ceiling; "
-            "%d of %d lists were cut and every one kept an entry, %d of them outside the "
-            "blast-radius buckets: %s"
-            % (
-                accounting["chars_before_budget"],
-                accounting["chars_after_budget"],
-                accounting["max_chars"],
-                graded,
-                len(populated),
-                len(outside),
-                json.dumps(cut.get("elisions") or {}, sort_keys=True),
-            )
-        )
+        res.ok("%d bounded impact pages preserved %d bucket rows and all original safety readings"
+               % (len(cut.page_bytes), sum(len(whole.get(key) or [])
+                                           for key in IMPACT_COLLECTIONS)))
     return res
 
 
@@ -1343,107 +1433,38 @@ def check_7(suite):
     return res
 
 
-def grade_final_page(payload, ceiling, lists):
-    """Problems with a final page that went over its ceiling.
-
-    A page with no cursor cannot be continued, so the budget owes it this: the
-    ranked list is cut and says so, the cut leaves an entry, the page either
-    fits under the ceiling or discloses that one entry per list cannot fit, and
-    no remediation names a cursor the page does not have. Returns a list of
-    problems, empty when the page is correct, so the self-test can drive it with
-    no binary and no fixture.
-    """
-    problems = []
-    after = ((payload.get("_kin") or {}).get("response") or {}).get("chars_after_budget")
-    reasons = [entry.get("reason") for entry in (payload.get("degradations") or [])]
-    residual = "response_over_budget" in reasons
-    if not isinstance(after, int):
-        problems.append("the response published no integer chars_after_budget")
-    elif after > ceiling and not residual:
-        problems.append(
-            "the final page shipped %d characters against a %d ceiling and disclosed no "
-            "residual" % (after, ceiling)
-        )
-    elif after <= ceiling and residual:
-        problems.append(
-            "the final page fits at %d under %d yet still claims it could not fit"
-            % (after, ceiling)
-        )
-    elisions = payload.get("elisions") or {}
-    cut_lists = [key for key in lists if key in elisions]
-    if not cut_lists:
-        problems.append(
-            "no ranked list published an elision, so the ceiling was not paid for by a cut"
-        )
-    for key in cut_lists:
-        rows = payload.get(key)
-        if not isinstance(rows, list) or not rows:
-            problems.append("`%s` was cut to %r, so the budget emptied it" % (key, rows))
-    remedies = [
-        entry.get("remediation") or "" for entry in (payload.get("degradations") or [])
-    ]
-    if any("follow `next_cursor`" in remedy for remedy in remedies):
-        problems.append(
-            "a page with no cursor offered cursor recovery: %r" % (remedies,)
-        )
-    if not any("max_chars" in remedy for remedy in remedies):
-        problems.append(
-            "no remediation named max_chars as the way to the withheld rows: %r" % (remedies,)
-        )
-    return problems
-
-
 def check_8(suite):
     res = Result("8", "FIR-2600", "a final page over the ceiling is cut, fits, and says so")
-    ceiling = 2000
-    lists = ["entities", "files"]
+    res.title = "a paged ranking page hands back the ranking's own cursor, which reaches the rows after it"
+    query = {"query": "hop", "limit": 10}
     try:
-        cut = suite.mcp(
-            "semantic_locate", {"query": "hop", "limit": 60, "max_chars": ceiling}
-        )
-    except McpError as exc:
-        res.unknown("semantic_locate unreadable: %s" % exc)
+        whole = suite.mcp("semantic_locate", dict(query, max_chars=60000))
+        ranking = whole.get("next_cursor")
+        if not ranking:
+            res.unknown("the ranking fit one ranking page, so no ranking cursor was exercised")
+            return res
+        paged = mcp_locate(suite.kin, suite.repo, suite.env,
+                           dict(query, max_chars=LOCATE_FLOOR))
+        following = suite.mcp(
+            "semantic_locate", dict(query, max_chars=60000, cursor=paged.get("next_cursor")))
+    except (McpError, ValueError) as exc:
+        res.bad("locate page contract unreadable: %s" % exc)
         return res
-
-    # This check is about the page that cannot be continued. A followable cursor
-    # means the caller was handed a recovery path and check 3 owns that case, so
-    # say the case was not reached rather than grading the wrong one.
-    cursor = cut.get("next_cursor")
-    if cursor:
-        res.unknown(
-            "the floor call returned a followable cursor (%r), so the final-page "
-            "case was not exercised" % (cursor,)
-        )
-        return res
-    # A page that was never over its ceiling has nothing to pay for, so there is
-    # no cut to grade. Anything else, over the ceiling or already cut, is the
-    # case this check owns.
-    after = ((cut.get("_kin") or {}).get("response") or {}).get("chars_after_budget")
-    if isinstance(after, int) and after <= ceiling and not (cut.get("elisions") or {}):
-        res.unknown(
-            "the floor call fit under its ceiling with nothing cut, so the "
-            "final-page elision rule was not exercised"
-        )
-        return res
-    for problem in grade_final_page(cut, ceiling, lists):
+    for problem in grade_locate_pages(whole, paged, LOCATE_FLOOR):
         res.bad(problem)
+    seen = {row.get("entity_id") or row.get("id")
+            for key in LOCATE_LISTS for row in whole.get(key) or []}
+    after = [row.get("entity_id") or row.get("id")
+             for key in LOCATE_LISTS for row in following.get(key) or []]
+    if not after:
+        res.bad("the ranking cursor the pages handed back reached no rows")
+    elif seen.intersection(after):
+        res.bad("the ranking cursor the pages handed back repeated %d row(s) already served"
+                % len(seen.intersection(after)))
     if not res.failed:
-        after = ((cut.get("_kin") or {}).get("response") or {}).get("chars_after_budget")
-        # Say which of the two legal outcomes held. Calling an over-ceiling page
-        # "under its ceiling" would be the check reporting something false while
-        # passing, which is the shape this suite exists to catch.
-        if isinstance(after, int) and after <= ceiling:
-            where = "and fits at %s characters under its %d ceiling" % (after, ceiling)
-        else:
-            where = (
-                "and, at %s characters against a %d ceiling, discloses that one entry per "
-                "list still does not fit" % (after, ceiling)
-            )
-        res.ok(
-            "the final page was cut, kept an entry in every list it cut, named the ceiling "
-            "rather than a cursor, %s: %s"
-            % (where, json.dumps(cut.get("elisions") or {}, sort_keys=True))
-        )
+        res.ok("%d pages at %d characters carried ranking page 1 whole, and its cursor reached "
+               "%d further rows with none repeated"
+               % (len(paged.page_wires), LOCATE_FLOOR, len(after)))
     return res
 
 
@@ -1859,6 +1880,51 @@ def self_test():
     lost["chain"] = []
     expect("trace pages losing a step fail", bool(grade_paged_walk(lost, paged)), True)
 
+    # The locate paging grader, against one correct walk and one break per rule.
+    whole_rank = {
+        "entities": [{"entity_id": "a"}, {"entity_id": "b"}, {"entity_id": "c"}],
+        "next_cursor": "v2.key.1.3.3", "total_ranked": 9,
+        "negative": {"trust": "inconclusive"}, "degradations": [{"reason": "x"}],
+        "_kin": {"verdict": {"state": "inconclusive", "answer": {"said": 1}},
+                 "completeness": {"status": "unknown"}},
+    }
+
+    def locate_walk(first_rows=1, **over):
+        walked = TraceAnswer(copy.deepcopy(dict(whole_rank, **over)))
+        walked["_kin"]["verdict"].pop("answer", None)
+        first = json.dumps({"entities": [{"entity_id": "a"}] * first_rows})
+        walked.page_wires = (first, json.dumps({"entities": []}))
+        return walked
+
+    expect("a lossless locate walk passes",
+           grade_locate_pages(whole_rank, locate_walk(), 2000), [])
+    expect("a locate answer that did not page fails",
+           len(grade_locate_pages(whole_rank, TraceAnswer(whole_rank), 2000)) >= 1, True)
+    expect("a first page with no row fails",
+           len(grade_locate_pages(whole_rank, locate_walk(first_rows=0), 2000)), 1)
+    expect("a walk that lost a row fails",
+           len(grade_locate_pages(whole_rank, locate_walk(entities=[{"entity_id": "a"}]), 2000)), 1)
+    expect("a walk that lost the ranking cursor fails",
+           len(grade_locate_pages(whole_rank, locate_walk(next_cursor=None), 2000)), 1)
+    expect("a ranking cursor minted under another key for the same position passes",
+           grade_locate_pages(whole_rank, locate_walk(next_cursor="v2.other.1.3.3"), 2000), [])
+    expect("a ranking cursor for another position fails",
+           len(grade_locate_pages(whole_rank, locate_walk(next_cursor="v2.k.1.1.1"), 2000)), 1)
+    timed = dict(whole_rank, negative={"trust": "inconclusive", "semantic_coverage": {
+        "indexed": 0, "total": 250, "read_at": "2026-10-09T16:12:08Z"}})
+    expect("a walk whose readings were taken a second later passes",
+           grade_locate_pages(timed, locate_walk(negative={"trust": "inconclusive",
+                                                           "semantic_coverage": {
+               "indexed": 0, "total": 250, "read_at": "2026-10-09T16:12:09Z"}}), 2000), [])
+    expect("a walk whose coverage reading changed fails",
+           len(grade_locate_pages(timed, locate_walk(negative={"trust": "inconclusive",
+                                                               "semantic_coverage": {
+               "indexed": 5, "total": 250, "read_at": "2026-10-09T16:12:08Z"}}), 2000)), 1)
+    expect("a walk that changed the verdict fails",
+           len(grade_locate_pages(whole_rank, locate_walk(
+               _kin={"verdict": {"state": "certified"}, "completeness": {"status": "unknown"}}),
+               2000)), 1)
+
     token_only = {
         "_kin": {"response": {"bounded": True, "max_chars": 60000}},
         "elisions": {"dependencies": {"reason": "token_budget"}},
@@ -1876,103 +1942,6 @@ def self_test():
     oversized_walk = dict(fitting_walk, detail="x" * 13000)
     expect("an oversized cut walk fails its advertised ceiling", bool(grade_ceiling_walk(oversized_walk, 12000, True)[0]), True)
 
-    # The final-page grader, against one correct page and one break per rule it
-    # enforces. A grader that cannot fail is what lets a regression ship green.
-    def final_page(**over):
-        page = {
-            "_kin": {"response": {"chars_after_budget": 1900}},
-            "entities": [{"id": "a"}],
-            "elisions": {"entities": {"kept": 1, "elided": 19, "total": 20}},
-            "degradations": [
-                {"remediation": "raise `max_chars`, or narrow the request with `limit`"}
-            ],
-        }
-        page.update(over)
-        return page
-
-    expect("a correct final page passes", grade_final_page(final_page(), 2000, ["entities"]), [])
-    # The second legal outcome. The envelope alone can exceed a 2000-character
-    # ceiling, measured at 19,344 on the real fixture, so a page that cannot fit
-    # even at one entry per list is correct when it says exactly that.
-    expect(
-        "an over-ceiling page that discloses the residual passes",
-        grade_final_page(
-            final_page(
-                _kin={"response": {"chars_after_budget": 2400}},
-                degradations=[
-                    {
-                        "reason": "response_over_budget",
-                        "remediation": "narrow the request, or raise max_chars",
-                    }
-                ],
-            ),
-            2000,
-            ["entities"],
-        ),
-        [],
-    )
-    expect(
-        "a final page over its ceiling with no residual disclosure fails",
-        len(grade_final_page(
-            final_page(_kin={"response": {"chars_after_budget": 2400}}), 2000, ["entities"]
-        )),
-        1,
-    )
-    expect(
-        "a page that fits yet claims it could not fit fails",
-        len(grade_final_page(
-            final_page(
-                degradations=[
-                    {
-                        "reason": "response_over_budget",
-                        "remediation": "narrow the request, or raise max_chars",
-                    }
-                ]
-            ),
-            2000,
-            ["entities"],
-        )),
-        1,
-    )
-    expect(
-        "a final page that cut nothing fails",
-        len(grade_final_page(final_page(elisions={}), 2000, ["entities"])),
-        1,
-    )
-    expect(
-        "a final page with an emptied list fails",
-        len(grade_final_page(final_page(entities=[]), 2000, ["entities"])),
-        1,
-    )
-    expect(
-        "a final page claiming cursor recovery fails",
-        len(grade_final_page(
-            final_page(degradations=[{"remediation": "follow `next_cursor`"}]),
-            2000,
-            ["entities"],
-        )),
-        2,
-    )
-    # This input separates the two remedy rules. The one above breaks both at
-    # once, so either rule going missing showed up as the same 2-to-1 count and
-    # the two hid each other. Here the ceiling IS named, so only the cursor
-    # claim is wrong and only that rule can catch it.
-    expect(
-        "a cursor claim is caught even when the ceiling is named",
-        len(grade_final_page(
-            final_page(degradations=[
-                {"remediation": "follow `next_cursor`, or raise `max_chars`"}
-            ]),
-            2000,
-            ["entities"],
-        )),
-        1,
-    )
-    expect(
-        "a final page with no size fails",
-        len(grade_final_page(final_page(_kin={}), 2000, ["entities"])),
-        1,
-    )
 
     whole = {
         "chain": [{"step": 1}, {"step": 2}],
@@ -2584,9 +2553,16 @@ def main(argv):
                         help="keep the run root whatever the result")
     parser.add_argument("--json", default=None, help="write the report here")
     parser.add_argument("--label", default="", help="label recorded in the report")
+    parser.add_argument("--only", default="", help="comma-separated check ids (default: all)")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     opts = parser.parse_args(argv)
+    requested = set(opts.only.split(",")) if opts.only else set()
+    available = {ident for ident, _ in CHECKS}
+    if requested - available:
+        parser.error("unknown check ids: %s" % ", ".join(sorted(requested - available)))
+    selected = [(ident, check) for ident, check in CHECKS
+                if not requested or ident in requested]
 
     if opts.self_test:
         return self_test()
@@ -2631,7 +2607,7 @@ def main(argv):
         raise
 
     results = []
-    for ident, check in CHECKS:
+    for ident, check in selected:
         try:
             res = check(suite)
         except subprocess.TimeoutExpired as exc:
@@ -2648,7 +2624,7 @@ def main(argv):
         results.append(res)
 
     retention = settle(results)
-    for res in results[len(CHECKS):]:
+    for res in results[len(selected):]:
         print("CHECK %s - %s %s" % (res.id, res.status, res.detail))
 
     failed = [r for r in results if r.status == FAIL]

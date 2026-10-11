@@ -422,3 +422,134 @@ async fn startup_restamps_a_source_entity_loaded_without_its_digest() {
         "the served entity is stamped with its file's bytes again"
     );
 }
+
+/// One unit whose persisted layout disagrees with its own bytes is re-derived
+/// at startup, and the start serves.
+///
+/// resend/react-email's `postcss-import.d.ts` holds only
+/// `declare module 'postcss-import';`. An earlier build gave that declaration
+/// and the unit's own module one identity, so the graph held one entity where
+/// the parse held two, and the layout it persisted disagreed with every fresh
+/// parse. The startup census refused that layout as an error re-deriving could
+/// not repair, and the daemon exited without serving any of the repository.
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_rederives_a_unit_whose_layout_disagrees_with_its_bytes() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = open_test_state(&repo);
+    std::fs::create_dir_all(repo.path().join("packages/editor")).unwrap();
+    let shim = b"declare module 'postcss-import';\n".to_vec();
+    std::fs::write(repo.path().join("packages/editor/postcss-import.d.ts"), &shim).unwrap();
+    std::fs::write(
+        repo.path().join("packages/editor/render.ts"),
+        b"export function render(): string { return ''; }\n",
+    )
+    .unwrap();
+    sync_filesystem_with_graph(&state).await.unwrap();
+    let unit = FilePathId::new("packages/editor/postcss-import.d.ts");
+    let declared = || {
+        state
+            .graph
+            .query_entities(&EntityFilter {
+                file_path: Some(unit.clone()),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let mut modules: Vec<String> = declared().into_iter().map(|entity| entity.name).collect();
+    modules.sort();
+    assert_eq!(modules, ["\"postcss-import\"", "postcss-import"]);
+
+    // The layout an earlier build left: regions naming declarations the graph
+    // does not hold for these bytes.
+    let mut layout = state.graph.get_file_layout(&unit).unwrap().unwrap();
+    for region in &mut layout.regions {
+        if let kin_model::SourceRegion::EntityRef { entity_id, .. } = region {
+            *entity_id = EntityId::new();
+        }
+    }
+    state.graph.upsert_file_layout(&layout).unwrap();
+
+    let (cancel, receiver) = tokio::sync::watch::channel(false);
+    let (watch_tx, watch_rx) = tokio::sync::oneshot::channel();
+    let (canonical_tx, canonical_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(run_loop_armed(
+        Arc::clone(&state),
+        LoopConfig::default(),
+        receiver.clone(),
+        Some(WatchArmed::with_canonical_ready(watch_tx, canonical_tx)),
+    ));
+    crate::daemon::await_watch_armed(watch_rx, Duration::from_secs(10)).await;
+    let ready = tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::daemon::await_canonical_ready(canonical_rx, receiver),
+    )
+    .await
+    .expect("the startup repair must finish within its bound");
+    cancel.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    ready.expect("one unit's disagreeing layout must not stop the start");
+
+    let held = state.graph.get_file_layout(&unit).unwrap().unwrap();
+    let named: std::collections::BTreeSet<EntityId> = held
+        .regions
+        .iter()
+        .filter_map(|region| match region {
+            kin_model::SourceRegion::EntityRef { entity_id, .. } => Some(*entity_id),
+            kin_model::SourceRegion::Trivia { .. } => None,
+        })
+        .collect();
+    let ids: std::collections::BTreeSet<EntityId> =
+        declared().into_iter().map(|entity| entity.id).collect();
+    assert_eq!(named, ids, "the re-derivation republished the unit's layout");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        state.reconciler.read().await.projection().get_content(&unit),
+        Some(shim.as_slice()),
+        "the unit is served with an editable projection"
+    );
+}
+
+/// A unit the restore withholds is recorded partly parsed with the check it
+/// failed, where readers of how completely a unit was read look for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_withheld_unit_is_recorded_partly_parsed_with_its_reason() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = open_test_state(&repo);
+    std::fs::write(
+        repo.path().join("render.ts"),
+        b"export function render(): string { return ''; }\n",
+    )
+    .unwrap();
+    sync_filesystem_with_graph(&state).await.unwrap();
+    let unit = FilePathId::new("render.ts");
+    let regions = state
+        .graph
+        .get_file_layout(&unit)
+        .unwrap()
+        .unwrap()
+        .regions;
+
+    hold_partly_parsed(
+        &state,
+        &[kin_reconcile::StaleCanonicalSource {
+            file: unit.clone(),
+            reason: kin_reconcile::LAYOUT_DIFFERS_FROM_SOURCE,
+        }],
+    );
+
+    let held = state.graph.get_file_layout(&unit).unwrap().unwrap();
+    match &held.parse_completeness {
+        ParseCompleteness::Partial(reason) => assert!(
+            reason.contains(kin_reconcile::LAYOUT_DIFFERS_FROM_SOURCE),
+            "{reason}"
+        ),
+        other => panic!("a withheld unit must read partial with its reason: {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(&held.regions).unwrap(),
+        serde_json::to_value(&regions).unwrap(),
+        "its declarations stay as the graph holds them"
+    );
+}

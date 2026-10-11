@@ -7,15 +7,15 @@ Five assertions in this repository read the served MCP surface and every one of
 them runs only on `main`'s push:
 
   * `.github/workflows/install-proof.yml`, "Graph query and MCP tool-call
-    proof", throws `MCP tools/list omitted semantic_search` and then calls that
-    tool through `tools/call` twice
+    proof", throws `MCP tools/list omitted locate` and then calls that tool
+    through `tools/call` twice
   * `scripts/prove-windows-npm-first-run.mjs` asserts
-    `toolNames.includes('semantic_search')` for both npm entrypoints, then calls
-    it and requires the committed entity back
+    `toolNames.includes('locate')` for both npm entrypoints, then calls it and
+    requires the committed entity back
   * `scripts/acceptance/magic_repro.py` `check_6` requires `include_body` or
-    `compact` on the served `trace_data_flow`
+    `compact` on the served `trace`
   * the same file's `check_14`, arm 3, requires the literal
-    `last_settled_selected_graph` in the served `kin_graph_status` description
+    `last_settled_selected_graph` in the served `status` description
   * `scripts/acceptance/response_budget_elisions.py` `check_2` grades every
     advertised `max_chars` or `max_response_chars`, and reports UNREADABLE when
     it finds none
@@ -37,12 +37,15 @@ Check 0 is the positive control and every other check depends on it. The server
 prints which tool profile it resolved, and a run that graded `full` would pass
 every assertion below while saying nothing about the surface an agent is served.
 
+Check 16 holds agent-default to its exact set and its byte ceiling, the
+bytes every client that loads what it is handed resends on every turn.
+
 Checks 13 and 14 run last, because they edit the fixture. Check 13 drives the
-write path on both write surfaces, `agent-default`'s named tools and
-`agent-routed`'s `session` and `mutate` commands: a session opened under the
-caller's own UUID, one committed entity edit, the exact body read back with no
-line offsets, and a mutate under an unopened session refused by `kin_mutate`
-itself. Check 14 reads the same entity on `agent-routed-query`, which numbers
+write path on both write surfaces, `agent-default`'s named `session`, `mutate`
+and `source` tools and `agent-routed`'s commands of the same names: a session
+opened under the caller's own UUID, one committed entity edit, the exact body
+read back with no line offsets, and a mutate under an unopened session refused
+by the mutate handler itself. Check 14 reads the same entity on `agent-routed-query`, which numbers
 body lines as `+N`, and has every write refused with the sentence naming
 `agent-routed`.
 
@@ -55,6 +58,7 @@ a failure here rather than a silent pass in CI.
 from __future__ import print_function
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -64,6 +68,11 @@ import sys
 import tempfile
 import uuid
 
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from magic_repro import (  # noqa: E402
@@ -71,11 +80,99 @@ from magic_repro import (  # noqa: E402
     graph_status_description,
     trace_shape_knob,
 )
-from response_budget_elisions import grade_advertised_budget  # noqa: E402
+from response_budget_elisions import (  # noqa: E402
+    advertised_budgets,
+    grade_advertised_budget,
+)
 
 PASS = "PASS"
 FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
+
+# The crate whose served listings this suite measures on the wire.
+KIN_MCP_SOURCE = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+    "crates", "kin-mcp", "src",
+))
+
+# Every byte ceiling below is read from the crate constant that a crate test
+# also holds, never written out here. A second copy of one number drifts: this
+# file held agent-default at 8,672 while the crate had moved it to 8,759, and
+# agent-search at 4,231 while the crate held 4,224, so one gate failed a
+# listing the other passed and the other passed one it should have failed.
+# Both measure the same thing, the compact serialization of the served
+# listing, so the same number grades both.
+CEILING_READ_ERRORS = []
+
+
+def crate_ceiling(source, name):
+    """The value of `pub const <name>: usize = N;` in crates/kin-mcp/src/<source>.
+
+    Returns None and records why when the source cannot be read or declares the
+    name other than exactly once; `main` and `--self-test` then refuse to grade
+    rather than measure against a number nobody declared.
+    """
+    path = os.path.join(KIN_MCP_SOURCE, source)
+    try:
+        with io.open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except (IOError, OSError) as error:
+        CEILING_READ_ERRORS.append("cannot read %s for %s: %s" % (path, name, error))
+        return None
+    found = re.findall(
+        r"^pub const %s: usize = ([0-9_]+);$" % re.escape(name), text, re.MULTILINE
+    )
+    if len(found) != 1:
+        CEILING_READ_ERRORS.append(
+            "%s declares %s %d times, not once" % (path, name, len(found))
+        )
+        return None
+    return int(found[0].replace("_", ""))
+
+
+def crate_tool_names(function):
+    """The tool names `crates/kin-mcp/src/tools.rs::<function>` returns.
+
+    The function lists `crate::verbs::<VERB>` constants, resolved through the
+    `pub const <VERB>: &str = "<name>";` lines in verbs.rs. Returns an empty
+    tuple and records why when either source cannot be read, the function is
+    not found, or it names a verb verbs.rs does not declare.
+    """
+    texts = {}
+    for source in ("tools.rs", "verbs.rs"):
+        path = os.path.join(KIN_MCP_SOURCE, source)
+        try:
+            with io.open(path, encoding="utf-8") as handle:
+                texts[source] = handle.read()
+        except (IOError, OSError) as error:
+            CEILING_READ_ERRORS.append("cannot read %s for %s: %s" % (path, function, error))
+            return ()
+    body = re.findall(
+        r"^pub fn %s\(\) -> &'static \[&'static str\] \{\n(.*?)^\}$" % re.escape(function),
+        texts["tools.rs"], re.MULTILINE | re.DOTALL,
+    )
+    if len(body) != 1:
+        CEILING_READ_ERRORS.append(
+            "tools.rs declares %s %d times, not once" % (function, len(body))
+        )
+        return ()
+    code = "\n".join(line.split("//", 1)[0] for line in body[0].splitlines())
+    verbs = dict(re.findall(r'^pub const ([A-Z_]+): &str = "([^"]+)";$', texts["verbs.rs"],
+                            re.MULTILINE))
+    names = []
+    for verb in re.findall(r"crate::verbs::([A-Z_]+)", code):
+        if verb not in verbs:
+            CEILING_READ_ERRORS.append(
+                "%s names verbs::%s, which verbs.rs does not declare" % (function, verb)
+            )
+            return ()
+        names.append(verbs[verb])
+    if not names or re.search(r'"[^"]*"', code):
+        CEILING_READ_ERRORS.append(
+            "%s is not a plain list of verbs, so this file cannot read it" % function
+        )
+        return ()
+    return tuple(names)
 
 # The profile `kin setup` writes into every agent's MCP entry, and the one the
 # five graders above are served. Named rather than left to the binary's default:
@@ -83,38 +180,62 @@ UNREADABLE = "UNREADABLE"
 AGENT_DEFAULT_PROFILE = "agent-default"
 
 # The query profile and the exact names it serves, read out of
-# crates/kin-mcp/src/tools.rs::agent_query_tool_names on 2026-09-02, with
-# lexical_lookup joining the profile when the literal lookup over the graph's
-# text index landed on 2026-09-19. Written out rather than derived: the served
-# set is a public surface, and a check that derived it from the binary under
-# test would agree with any surface that binary happened to serve.
+# crates/kin-mcp/src/tools.rs::agent_query_tool_names when the agent surface
+# moved to plain verbs: nine verbs in place of the twelve tools they fold.
+# Written out rather than derived: the served set is a public surface, and a
+# check that derived it from the binary under test would agree with any surface
+# that binary happened to serve.
+# The front door: one tool that takes a question in plain words and runs the
+# query verbs for it, from crates/kin-mcp/src/ask/compose.rs TOOL_NAME.
+FRONT_DOOR_NAME = "ask"
+
 AGENT_QUERY_PROFILE = "agent-query"
 AGENT_QUERY_NAMES = (
-    "find_references",
-    "get_context_pack",
-    "get_entity_source",
-    "graph_neighborhood",
-    "impact_analysis",
-    "kin_graph_status",
-    "kin_provenance_query",
-    "lexical_lookup",
-    "semantic_locate",
-    "semantic_search",
-    "trace_data_flow",
-    "trace_path",
+    "ask",
+    "context",
+    "history",
+    "impact",
+    "locate",
+    "neighbors",
+    "refs",
+    "source",
+    "status",
+    "trace",
 )
 
-# The share of agent-default's tools/list the query profile may cost.
+# The most bytes agent-query's tools/list may cost, from
+# kin_mcp::tools::AGENT_QUERY_LIST_CEILING_BYTES.
 #
 # Native tool calling re-sends the whole tools array on every turn, so this is a
 # per-turn cost. Measured on 2026-09-02 by the demo's MCP executor against a
 # real `kin mcp start`: agent-default's tools/list was 30,194 bytes and 8,627
 # tokens on google/gemma-4-e4b, 36 percent of that run's 24,000-token ceiling
-# before the model had asked anything (FIR-3107). The assertion is in BYTES,
-# because bytes are what this process can measure; the demo measured 3.5 bytes
-# per token on that model, so the ratio held here is the ratio of the token cost
-# on it too.
-AGENT_QUERY_LIST_CEILING_PERCENT = 65
+# before the model had asked anything. This was once held as a share
+# of agent-default, 65 percent; once agent-default became the nine query verbs
+# and two writes, the query profile was 67 percent of it by construction, so
+# the share measured the write half rather than the query profile. The crate
+# holds the query profile's own ceiling in bytes, and that is the one graded.
+AGENT_QUERY_LIST_CEILING_BYTES = crate_ceiling("tools.rs", "AGENT_QUERY_LIST_CEILING_BYTES")
+
+# The whole agent-default set, read from
+# crates/kin-mcp/src/tools.rs::agent_default_tool_names through the verb names
+# in verbs.rs, the way the ceilings are read. A written-out copy held exec and
+# init after the crate stopped serving them, so it failed the surface it was
+# meant to hold. The byte ceiling below holds a belt that kept every tool, so
+# the set is checked against the served listing exactly, and two controls stay
+# written out here: the default carries the whole query profile, and it carries
+# the writes, so a crate edit that met the ceiling by dropping either fails.
+AGENT_DEFAULT_NAMES = crate_tool_names("agent_default_tool_names")
+AGENT_DEFAULT_REQUIRED_WRITES = ("mutate", "transaction")
+
+# Every tool name that writes, on any profile. The query profile serves none.
+WRITE_TOOL_NAMES = ("exec", "init", "mutate", "session", "transaction")
+
+# The most bytes agent-default's tools/list may cost, measured on the wire as a
+# client reads it, from kin_mcp::tools::AGENT_DEFAULT_LIST_CEILING_BYTES, which
+# holds the same ceiling as a crate test and records each step it took: 47,538
+# at bfb744592 down to the verbs and the 2026-10-03 and 2026-10-04 cuts.
+AGENT_DEFAULT_LIST_CEILING_BYTES = crate_ceiling("tools.rs", "AGENT_DEFAULT_LIST_CEILING_BYTES")
 
 # The tool-search profile and the exact always-on set it serves, read out of
 # crates/kin-mcp/src/tools.rs::agent_search_tool_names on 2026-09-03. Written
@@ -122,69 +243,77 @@ AGENT_QUERY_LIST_CEILING_PERCENT = 65
 # from the binary under test would agree with any surface that binary served.
 AGENT_SEARCH_PROFILE = "agent-search"
 AGENT_SEARCH_NAMES = (
+    "ask",
     "kin_tool_call",
-    "get_context_pack",
-    "kin_graph_status",
+    "context",
+    "status",
     "kin_tool_search",
-    "semantic_locate",
-    "trace_data_flow",
+    "locate",
+    "trace",
 )
 
 # The name of the tool that reaches everything the profile withholds.
 TOOL_SEARCH_NAME = "kin_tool_search"
 
-# Four tools the 2026-09-03 measurement moved behind the search: impact_analysis
-# was offered 24 times and called none, get_entity_source 24 and once,
-# find_references five calls of which four came from the one arm with no flow
-# walker, and no arm reached for a transaction tool at all. Named here so the
-# exact-set assertion above has a second, independently written control.
+# Four tools the 2026-09-03 measurement moved behind the search, by the verbs
+# that serve them now: impact_analysis was offered 24 times and called none,
+# get_entity_source 24 and once, find_references five calls of which four came
+# from the one arm with no flow walker, and no arm reached for a transaction
+# tool at all. Named here so the exact-set assertion above has a second,
+# independently written control.
 WITHHELD_BY_DESIGN = (
-    "impact_analysis",
-    "find_references",
-    "get_entity_source",
-    "kin_transaction_commit",
+    "impact",
+    "refs",
+    "source",
+    "transaction",
 )
 
+# A read-only verb agent-search withholds, which check 11 discovers and runs
+# through the dispatcher.
+HIDDEN_QUERY = "refs"
+
 # The most bytes agent-search's tools/list may cost, measured on the profile AS
-# SERVED. Mirrors kin_mcp::tools::AGENT_SEARCH_LIST_CEILING_BYTES, which holds
-# the same ceiling as a crate test; this one holds it on the wire, where a
-# spawned server resolves the profile and writes the listing a client reads.
-#
-# Grounded in a measurement. The three retrieval tools measured 4,928 bytes on
-# kin-mcp 0.6.4, so this leaves the search tool's schema, kin_graph_status and
-# normal prose growth inside a ceiling that is still a third of agent-query's
-# 15,345 bytes.
-AGENT_SEARCH_LIST_CEILING_BYTES = 8_000
+# SERVED, from kin_mcp::tools::AGENT_SEARCH_LIST_CEILING_BYTES, which holds the
+# same ceiling as a crate test; this one holds it on the wire, where a spawned
+# server resolves the profile and writes the listing a client reads.
+AGENT_SEARCH_LIST_CEILING_BYTES = crate_ceiling("tools.rs", "AGENT_SEARCH_LIST_CEILING_BYTES")
 
 # The routed profile: one tool whose commands reach the query belt, for a client
 # that loads every tool it is handed and re-sends them all with every request.
-# Read out of crates/kin-mcp/src/routed.rs on 2026-09-22, where the same ceiling
-# is ROUTED_LIST_CEILING_BYTES and a crate test holds it; this holds it on the
-# wire, and grades that a routed command reaches its named tool through a real
-# daemon.
+# The ceiling is crates/kin-mcp/src/routed.rs's ROUTED_LIST_CEILING_BYTES, which
+# a crate test holds; this holds it on the wire, and grades that a routed
+# command reaches its named tool through a real daemon.
 AGENT_ROUTED_PROFILE = "agent-routed"
 ROUTED_TOOL_NAME = "kin"
-ROUTED_LIST_CEILING_BYTES = 3_200
+ROUTED_LIST_CEILING_BYTES = crate_ceiling("routed.rs", "ROUTED_LIST_CEILING_BYTES")
 AGENT_ROUTED_QUERY_PROFILE = "agent-routed-query"
 # The refusal a write gets on the read-only routed surface names the profile
 # that carries it (crates/kin-mcp/src/routed.rs, `refused_read_only`).
 ROUTED_WRITE_REFUSAL = "The agent-routed profile carries Kin's writes."
+# No routed surface carries `exec`, so it is refused as a command the router
+# does not have (crates/kin-mcp/src/routed.rs, `operator_commands_have_no_direct_
+# generic_or_description_route`), on the read-only surface and the write one.
+ROUTED_NO_EXEC = "There is no command 'exec'."
 # The note beside a numbered body (crates/kin-mcp/src/entity_lines.rs).
 NUMBERING_KEY = "about_body"
 NUMBERED_LINE = re.compile(r"^\+(\d+)\t")
-# What kin_mutate answers for a session it never registered: the handler's own
-# refusal, which a routed call must reach rather than a routing one.
+# What the mutate handler answers for a session it never registered: the
+# handler's own refusal, which a routed call must reach rather than a routing
+# one.
 UNKNOWN_SESSION = "Session not found"
 
 # The tool names the two shipped proofs assert literally. Read out of
-# .github/workflows/install-proof.yml and scripts/prove-windows-npm-first-run.mjs
-# on 2026-09-02; both assert this one name and no other. Adding a name to either
-# file adds it here.
-PROOF_ASSERTED_NAMES = ("semantic_search",)
+# .github/workflows/install-proof.yml and scripts/prove-windows-npm-first-run.mjs;
+# both assert this one name and no other. Adding a name to either file adds it
+# here.
+PROOF_ASSERTED_NAMES = ("locate",)
 
-# The budget parameter names response_budget_elisions.check_2 grades.
-BUDGET_KEYS = ("max_chars", "max_response_chars")
-
+# The search both shipped proofs make: a name lookup for the seeded entity.
+SEARCH_ARGS = {"query": "hello", "mode": "name", "compact": True, "limit": 5}
+# The seeded entity as a reply names it: the function and the module that holds
+# it. The fixture writes it in src/probe.py.
+SEEDED_NAME = "hello"
+SEEDED_MODULE = "src.probe"
 
 # BEGIN failure evidence excerpt
 # Every suite carries this block byte for byte, because a suite is also copied
@@ -345,9 +474,15 @@ def listing_bytes(listing):
 
     Compact, the way serde writes it, with no separators of Python's own.
     `json.dumps` defaults insert `", "` and `": "` and read 4.5 percent high on
-    this listing: 34,470 against the 32,976 the wire carries.
+    this listing: 34,470 against the 32,976 the wire carries. UTF-8 rather than
+    `\\uXXXX` escapes for the same reason: serde writes a non-ASCII character
+    as its UTF-8 bytes, and the crate ceilings these bytes are graded against
+    count them that way.
     """
-    return len(json.dumps(listing, separators=(",", ":"), sort_keys=True))
+    return len(
+        json.dumps(listing, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+        .encode("utf-8")
+    )
 
 
 def grade_query_profile(query, default):
@@ -368,7 +503,9 @@ def grade_query_profile(query, default):
     write_side = [
         name
         for name in served
-        if name.startswith("kin_session_") or name.startswith("kin_transaction_")
+        if name in WRITE_TOOL_NAMES
+        or name.startswith("kin_session_")
+        or name.startswith("kin_transaction_")
     ]
     if write_side:
         problems.append("agent-query serves the write tools %s" % write_side)
@@ -379,56 +516,138 @@ def grade_query_profile(query, default):
         return problems
     query_bytes = listing_bytes(query)
     default_bytes = listing_bytes(default)
-    if query_bytes * 100 > default_bytes * AGENT_QUERY_LIST_CEILING_PERCENT:
+    if query_bytes > AGENT_QUERY_LIST_CEILING_BYTES:
         problems.append(
-            "agent-query's tools/list is %d bytes against agent-default's %d (%d%%), over "
-            "the %d%% ceiling the profile exists to buy"
-            % (
-                query_bytes,
-                default_bytes,
-                query_bytes * 100 // max(default_bytes, 1),
-                AGENT_QUERY_LIST_CEILING_PERCENT,
-            )
+            "agent-query's tools/list is %d bytes, over the %d-byte ceiling the profile "
+            "exists to buy" % (query_bytes, AGENT_QUERY_LIST_CEILING_BYTES)
+        )
+    if query_bytes >= default_bytes:
+        problems.append(
+            "agent-query's tools/list is %d bytes, no fewer than agent-default's %d"
+            % (query_bytes, default_bytes)
         )
     return problems
+
+
+def grade_default_profile_bytes(listing):
+    """agent-default serves its whole set, under its byte ceiling.
+
+    Every client that loads what it is handed resends this listing on every
+    turn, and a bare `kin mcp start` serves it, so its size is a per-turn cost
+    for everyone who has not picked another profile.
+    """
+    tools = listing.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return ["the agent-default profile listed no tools"]
+    served = sorted(name for name in (tool.get("name") for tool in tools) if name)
+    problems = []
+    expected = sorted(AGENT_DEFAULT_NAMES)
+    # The front door is the one query name the default belt does not carry
+    # until a benchmark gate on the default profile says it should.
+    uncarried = sorted(
+        set(AGENT_QUERY_NAMES + AGENT_DEFAULT_REQUIRED_WRITES)
+        - set(AGENT_DEFAULT_NAMES)
+        - {FRONT_DOOR_NAME}
+    )
+    if uncarried:
+        problems.append(
+            "the crate's agent-default set no longer carries %s, so its ceiling holds a "
+            "smaller belt" % uncarried
+        )
+    if served != expected:
+        problems.append(
+            "agent-default serves %s, not the set this suite grades; missing %s, extra %s"
+            % (
+                len(served),
+                sorted(set(expected) - set(served)),
+                sorted(set(served) - set(expected)),
+            )
+        )
+    default_bytes = listing_bytes(listing)
+    if default_bytes > AGENT_DEFAULT_LIST_CEILING_BYTES:
+        problems.append(
+            "agent-default's tools/list is %d bytes, over the %d-byte ceiling"
+            % (default_bytes, AGENT_DEFAULT_LIST_CEILING_BYTES)
+        )
+    return problems
+
+
+def holds_entity(value, name, module):
+    """Whether a reply row anywhere in `value` names `name` in `module`."""
+    if isinstance(value, dict):
+        if value.get("name") == name and value.get("module") == module:
+            return True
+        return any(holds_entity(item, name, module) for item in value.values())
+    if isinstance(value, list):
+        return any(holds_entity(item, name, module) for item in value)
+    return False
 
 
 def grade_search_call(payload):
     """install-proof's validateSearch and the Windows proof's four assertions.
 
     Both require the same three things of one real `tools/call`: no RPC error,
-    no `isError`, and the seeded entity and its file named in the rendered
-    result. The fixture's entity is `hello` in `probe.py`, which is what
-    install-proof seeds and asserts.
+    no `isError`, and a reply row naming the seeded entity and the module that
+    holds it. A reply addresses an entity by its name and module, never by a
+    file, so the module is what proves the row is the seeded one. The fixture's
+    entity is `hello` in module `src.probe`; install-proof seeds the same
+    function at the root, as module `probe`.
     """
     if payload is None:
-        return ["semantic_search returned no result frame"]
+        return ["the search returned no result frame"]
     if payload.get("error"):
-        return ["semantic_search returned an RPC error: %s" % json.dumps(payload["error"])[:200]]
+        return ["the search returned an RPC error: %s" % json.dumps(payload["error"])[:200]]
     result = payload.get("result")
     if not isinstance(result, dict):
-        return ["semantic_search returned no result object"]
+        return ["the search returned no result object"]
     if result.get("isError") is True:
-        return ["semantic_search returned isError: %s" % json.dumps(result)[:200]]
-    rendered = json.dumps(result)
-    missing = [needle for needle in ("hello", "probe.py") if needle not in rendered]
-    if missing:
-        return ["semantic_search did not return the seeded entity: %s absent" % ", ".join(missing)]
+        return ["the search returned isError: %s" % json.dumps(result)[:200]]
+    reply = search_payload(payload)
+    if reply is None:
+        return ["the search reply is not JSON: %s" % json.dumps(result)[:200]]
+    if not holds_entity(reply, SEEDED_NAME, SEEDED_MODULE):
+        return [
+            "the search did not return the seeded entity: no row names %s in module %s: %s"
+            % (SEEDED_NAME, SEEDED_MODULE, json.dumps(reply)[:300])
+        ]
     return []
+
+
+def grade_discovered_refs(payload):
+    """The hidden `refs`, run through the dispatcher, answered about the seed.
+
+    Its reply names the entity it was asked about as `focal_entity`, and the
+    fixture's `caller` in the seeded module is the reference it finds.
+    """
+    problems = [
+        problem for problem in grade_search_call(payload)
+        if not problem.startswith("the search did not return the seeded entity")
+    ]
+    if problems:
+        return problems
+    reply = search_payload(payload) or {}
+    focal = reply.get("focal_entity") or {}
+    if focal.get("name") != SEEDED_NAME:
+        problems.append("refs answered about %r, not %s" % (focal.get("name"), SEEDED_NAME))
+    if not holds_entity(reply.get("references"), "caller", SEEDED_MODULE):
+        problems.append(
+            "refs did not find caller in module %s: %s" % (SEEDED_MODULE, json.dumps(reply)[:300])
+        )
+    return problems
 
 
 def grade_discovered_query(listing, lookup, frames):
     """A discovered hidden query works without opening direct calls or writes."""
     if len(frames) != 3:
         return ["discovered query controls returned fewer than three frames"]
-    problems = grade_search_call(frames[0])
+    problems = grade_discovered_refs(frames[0])
     names = {tool.get("name") for tool in listing.get("tools") or []}
-    if "semantic_search" in names or "kin_tool_call" not in names:
+    if HIDDEN_QUERY in names or "kin_tool_call" not in names:
         problems.append("the query was not hidden behind the served dispatcher")
     invocation = (lookup or {}).get("invocation") or {}
-    if (invocation.get("profile_enabled") or {}).get("semantic_search") is not False:
+    if (invocation.get("profile_enabled") or {}).get(HIDDEN_QUERY) is not False:
         problems.append("discovery did not mark the hidden query directly disabled")
-    if (invocation.get("callable_via_dispatcher") or {}).get("semantic_search") is not True:
+    if (invocation.get("callable_via_dispatcher") or {}).get(HIDDEN_QUERY) is not True:
         problems.append("discovery did not mark the hidden query callable through the dispatcher")
     for label, frame, reason in (
         ("direct hidden query", frames[1], "not enabled"),
@@ -590,8 +809,8 @@ def grade_schema_fidelity(registry, lookups):
 # and `context-bench` are served tools/list only: their bytes feed citable
 # results, and the sweep reads them rather than calling anything.
 ALL_PROFILES = [
-    "agent-default", "agent-query", "agent-search", "agent-routed", "agent-routed-query",
-    "benchmark", "context-bench", "full",
+    "agent-default", "agent-query", "agent-search", "agent-ask", "agent-routed",
+    "agent-routed-query", "benchmark", "context-bench", "full",
 ]
 
 # The JSON-schema keywords a provider tool API refuses at the top of a tool's
@@ -626,9 +845,10 @@ def grade_portable_schemas(listings):
 def grade_routed_profile(listing, search_frame, describe_frame):
     """The routed profile serves one tool, under its ceiling, that reaches the belt.
 
-    The search goes through the routed tool to `semantic_search` and must bring
+    The search goes through the routed tool's `locate` command and must bring
     back the seeded entity, graded by the same reader the install proof's
-    search is. `describe` must hand back the command's schemas.
+    search is. `describe` must hand back the command's schema: one under
+    `args_schema`, or one per variant for a command that runs several tools.
     """
     tools = listing.get("tools")
     if not isinstance(tools, list) or not tools:
@@ -644,8 +864,10 @@ def grade_routed_profile(listing, search_frame, describe_frame):
             % (routed_bytes, ROUTED_LIST_CEILING_BYTES)
         )
     problems.extend("routed search: %s" % problem for problem in grade_search_call(search_frame))
-    described = search_payload(describe_frame)
-    variants = (described or {}).get("variants")
+    described = search_payload(describe_frame) or {}
+    variants = described.get("variants")
+    if variants is None:
+        variants = [described] if "args_schema" in described else None
     if not isinstance(variants, list) or not all(
         isinstance(variant, dict) and isinstance(variant.get("args_schema"), dict)
         for variant in variants or [None]
@@ -680,32 +902,28 @@ def refusal_text(frame):
     return json.dumps(result)
 
 
-def grade_write_family(label, frames, session_id, body, disk):
-    """One write surface, end to end: session, commit, exact read-back, refusal.
+def grade_write_family(label, frames, body, disk):
+    """One write surface, end to end: commit, exact read-back, refusal.
 
-    `frames` answer, in order: a session opened under the caller's own UUID, a
-    `kin_mutate` of one entity under it, that entity's source, and a mutate
-    under a UUID no session was opened for. The body read back must be the
-    committed text byte for byte, with no `+N` offsets, because an agent on a
-    write surface restates what it reads into its next edit.
+    `frames` answer, in order: a `mutate` of one entity that names no session,
+    that entity's source, and a mutate under a UUID no session was opened for.
+    A write that names no session runs in the connection's own, so the first
+    must commit with no session opened by the caller. The body read back must
+    be the committed text byte for byte, with no `+N` offsets, because an agent
+    on a write surface restates what it reads into its next edit.
     """
-    if len(frames) != 4 or any(frame is None for frame in frames):
-        return ["%s: the server answered %d of the 4 calls" % (
+    if len(frames) != 3 or any(frame is None for frame in frames):
+        return ["%s: the server answered %d of the 3 calls" % (
             label, len([frame for frame in frames if frame is not None]))]
     problems = []
-    opened = search_payload(frames[0])
-    if opened is None:
-        problems.append("%s: the session did not open: %s" % (label, (refusal_text(frames[0]) or "")[:300]))
-    elif opened.get("session_id") != session_id:
-        problems.append("%s: the session opened as %r, not the caller's %r"
-                        % (label, opened.get("session_id"), session_id))
-    committed = search_payload(frames[1])
+    committed = search_payload(frames[0])
     if committed is None:
-        problems.append("%s: the mutate was refused: %s" % (label, (refusal_text(frames[1]) or "")[:300]))
+        problems.append("%s: the mutate that named no session was refused: %s"
+                        % (label, (refusal_text(frames[0]) or "")[:300]))
     elif committed.get("status") != "committed":
         problems.append("%s: the mutate answered status %r, not committed"
                         % (label, committed.get("status")))
-    source = search_payload(frames[2])
+    source = search_payload(frames[1])
     if source is None:
         problems.append("%s: the source read answered nothing" % label)
     else:
@@ -716,21 +934,22 @@ def grade_write_family(label, frames, session_id, body, disk):
             problems.append("%s: a write surface served numbered lines" % label)
     if disk is None or body not in disk:
         problems.append("%s: the file on disk does not carry the committed body" % label)
-    refused = refusal_text(frames[3])
+    refused = refusal_text(frames[2])
     if refused is None or UNKNOWN_SESSION not in refused:
-        problems.append("%s: a mutate under an unopened session was not refused by kin_mutate "
-                        "itself: %s" % (label, (refused or json.dumps(frames[3]))[:300]))
+        problems.append("%s: a mutate under an unopened session was not refused by the mutate "
+                        "handler itself: %s" % (label, (refused or json.dumps(frames[2]))[:300]))
     return problems
 
 
 def grade_read_only_routed(frames, body, disk_before, disk_after):
     """The read-only routed surface: numbered bodies, and every write refused.
 
-    `frames` answer, in order: an entity's source, a `mutate`, a `session`, and
-    a `call` of `kin_mutate`. The source must number every line as `+N` and a
+    `frames` answer, in order: an entity's source, a `mutate`, an `exec`, and
+    a `call` of the `mutate` tool. The source must number every line as `+N` and a
     tab, carry the note that says so, and strip back to the committed body. The
-    three writes must each be refused with the sentence naming the profile that
-    carries writes, and the file must be byte-identical afterwards.
+    two writes must each be refused with the sentence naming the profile that
+    carries writes, `exec` must be refused as a command no routed surface
+    carries, and the file must be byte-identical afterwards.
     """
     if len(frames) != 4 or any(frame is None for frame in frames):
         return ["the server answered %d of the 4 calls" % len(
@@ -751,11 +970,15 @@ def grade_read_only_routed(frames, body, disk_before, disk_after):
             problems.append("the numbered body does not strip back to the committed text")
         if not source.get(NUMBERING_KEY):
             problems.append("the numbered body came without its %s note" % NUMBERING_KEY)
-    for label, frame in (("mutate", frames[1]), ("session", frames[2]), ("call kin_mutate", frames[3])):
+    for label, frame, sentence, reason in (
+        ("mutate", frames[1], ROUTED_WRITE_REFUSAL, "the profile that carries writes"),
+        ("exec", frames[2], ROUTED_NO_EXEC, "the router carrying no such command"),
+        ("call mutate", frames[3], ROUTED_WRITE_REFUSAL, "the profile that carries writes"),
+    ):
         refused = refusal_text(frame)
-        if refused is None or ROUTED_WRITE_REFUSAL not in refused:
-            problems.append("%s was not refused with the profile that carries writes: %s"
-                            % (label, (refused or json.dumps(frame))[:300]))
+        if refused is None or sentence not in refused:
+            problems.append("%s was not refused with %s: %s"
+                            % (label, reason, (refused or json.dumps(frame))[:300]))
     if disk_before is None or disk_before != disk_after:
         problems.append("the file changed on the read-only surface")
     return problems
@@ -765,10 +988,10 @@ def grade_trace_shape_knob(listing):
     """magic_repro.py check_6, through check_6's own reader."""
     knob, keys = trace_shape_knob(listing)
     if keys is None:
-        return ["trace_data_flow is absent from tools/list, which magic_repro check_6 reads"]
+        return ["trace is absent from tools/list, which magic_repro check_6 reads"]
     if knob is None:
         return [
-            "trace_data_flow advertises neither include_body nor compact, which "
+            "trace advertises neither include_body nor compact, which "
             "magic_repro.py check_6 requires: %s" % keys
         ]
     return []
@@ -778,10 +1001,10 @@ def grade_graph_status_description(listing):
     """magic_repro.py check_14 arm 3, through check_14's own reader."""
     description = graph_status_description(listing)
     if not description:
-        return ["tools/list carries no kin_graph_status description, which magic_repro check_14 reads"]
+        return ["tools/list carries no status description, which magic_repro check_14 reads"]
     if AS_OF_EARLIER_SAMPLING not in description:
         return [
-            "the served kin_graph_status description does not name %r, so an agent cannot "
+            "the served status description does not name %r, so an agent cannot "
             "know to read `stale`, and magic_repro.py check_14 arm 3 fails on main"
             % AS_OF_EARLIER_SAMPLING
         ]
@@ -809,19 +1032,15 @@ def grade_advertised_budgets(listing, registry):
     problems = []
     graded = 0
     for tool in listing.get("tools") or []:
-        properties = _budget_properties(listing, tool.get("name"))
-        for key in BUDGET_KEYS:
-            if key not in properties:
-                continue
+        name = tool.get("name")
+        served = advertised_budgets(name, _budget_properties(listing, name))
+        for key, budget in served:
             graded += 1
             problems.extend(
-                "%s.%s: %s" % (tool.get("name"), key, problem)
-                for problem in grade_advertised_budget(properties[key])
+                "%s.%s: %s" % (name, key, problem)
+                for problem in grade_advertised_budget(budget)
             )
-        registered = _budget_properties(registry, tool.get("name"))
-        if any(key in registered for key in BUDGET_KEYS) and not any(
-            key in properties for key in BUDGET_KEYS
-        ):
+        if advertised_budgets(name, _budget_properties(registry, name)) and not served:
             problems.append(
                 "%s registers a budget parameter and agent-default advertises none, so "
                 "response_budget_elisions.py check_2 grades a smaller set than it did"
@@ -888,6 +1107,8 @@ class Suite(object):
         self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
@@ -1027,7 +1248,7 @@ def run_checks(suite, verbose=False):
     try:
         served, calls, stderr = suite.serve(
             AGENT_DEFAULT_PROFILE,
-            [("semantic_search", {"query": "hello", "compact": True, "limit": 5})],
+            [("locate", dict(SEARCH_ARGS))],
         )
     except McpError as error:
         for ident, source, title in CHECK_TITLES:
@@ -1062,17 +1283,17 @@ def run_checks(suite, verbose=False):
         "2", "install-proof + windows-npm",
         "a real tools/call returns the seeded entity",
         grade_search_call(calls[0]),
-        "semantic_search returned the seeded hello entity from probe.py",
+        "locate by name returned the seeded hello entity in module %s" % SEEDED_MODULE,
     )
 
     record(
-        "3", "magic:6", "trace_data_flow advertises its shape knob",
+        "3", "magic:6", "trace advertises its shape knob",
         grade_trace_shape_knob(served),
-        "trace_data_flow advertises %r" % (trace_shape_knob(served)[0],),
+        "trace advertises %r" % (trace_shape_knob(served)[0],),
     )
 
     record(
-        "4", "magic:14", "the kin_graph_status description names the as-of-earlier shape",
+        "4", "magic:14", "the status description names the as-of-earlier shape",
         grade_graph_status_description(served),
         "the served description names %r" % AS_OF_EARLIER_SAMPLING,
     )
@@ -1100,6 +1321,18 @@ def run_checks(suite, verbose=False):
             "every served name is a registered name across %d served and %d registered tools"
             % (len(served.get("tools") or []), len(registry.get("tools") or [])),
         )
+
+    record(
+        "16", "belt size",
+        "agent-default serves its whole set under its byte ceiling",
+        grade_default_profile_bytes(served),
+        "agent-default served %d tools in %d bytes, under the %d-byte ceiling"
+        % (
+            len(served.get("tools") or []),
+            listing_bytes(served),
+            AGENT_DEFAULT_LIST_CEILING_BYTES,
+        ),
+    )
 
     try:
         query, _, query_stderr = suite.serve(AGENT_QUERY_PROFILE, [])
@@ -1142,11 +1375,9 @@ def run_checks(suite, verbose=False):
             AGENT_SEARCH_PROFILE,
             [(TOOL_SEARCH_NAME, {"need": name}) for name in registered_names]
             + [
-                ("kin_tool_call", {"tool": "semantic_search", "arguments": {
-                    "query": "hello", "compact": True, "limit": 5,
-                }}),
-                ("semantic_search", {"query": "hello"}),
-                ("kin_tool_call", {"tool": "kin_mutate", "arguments": {}}),
+                ("kin_tool_call", {"tool": HIDDEN_QUERY, "arguments": {"query": "hello"}}),
+                (HIDDEN_QUERY, {"query": "hello"}),
+                ("kin_tool_call", {"tool": "mutate", "arguments": {}}),
             ],
         )
     except McpError as error:
@@ -1181,9 +1412,9 @@ def run_checks(suite, verbose=False):
             "11", "discovered query invocation",
             "a hidden query executes while direct profile and write boundaries stay closed",
             grade_discovered_query(
-                search, lookups.get("semantic_search"), lookup_frames[len(registered_names):]
+                search, lookups.get(HIDDEN_QUERY), lookup_frames[len(registered_names):]
             ),
-            "the discovered query returned hello from probe.py; direct hidden calls and "
+            "the discovered query returned the seeded hello entity; direct hidden calls and "
             "wrapped writes were refused",
         )
         if registry is None or not registered_names:
@@ -1212,8 +1443,8 @@ def run_checks(suite, verbose=False):
         routed, routed_frames, routed_stderr = suite.serve(
             AGENT_ROUTED_PROFILE,
             [
-                (ROUTED_TOOL_NAME, {"command": "search", "args": {"query": "hello", "limit": 5}}),
-                (ROUTED_TOOL_NAME, {"command": "describe", "args": {"command": "search"}}),
+                (ROUTED_TOOL_NAME, {"command": "locate", "args": dict(SEARCH_ARGS)}),
+                (ROUTED_TOOL_NAME, {"command": "describe", "args": {"command": "locate"}}),
             ],
         )
     except McpError as error:
@@ -1226,7 +1457,7 @@ def run_checks(suite, verbose=False):
             "the routed profile serves one tool under its ceiling and reaches the belt",
             grade_routed_profile(routed, routed_frames[0], routed_frames[1]),
             "agent-routed served %s in %d bytes, under the %d-byte ceiling, and its routed "
-            "search returned hello from probe.py"
+            "search returned the seeded hello entity"
             % (ROUTED_TOOL_NAME, listing_bytes(routed), ROUTED_LIST_CEILING_BYTES),
         )
         if AGENT_ROUTED_PROFILE not in (routed_stderr or ""):
@@ -1286,7 +1517,6 @@ def run_checks(suite, verbose=False):
     ):
         if not focal:
             break
-        session_id = str(uuid.uuid4())
         body = (
             'def hello(name):\n    """Greet by name. The entity the shipped install proof '
             'seeds and asserts."""\n    return "hello from the %s write path, " + name' % family
@@ -1296,7 +1526,7 @@ def run_checks(suite, verbose=False):
         # family: the named family's commit moves the one the routed family needs.
         try:
             _, based, _ = suite.serve(profile, [
-                wrap("get_entity_source", "source", {"entity_id": focal}),
+                wrap("source", "source", {"entity_id": focal}),
             ])
         except McpError as error:
             write_problems = None
@@ -1304,25 +1534,20 @@ def run_checks(suite, verbose=False):
             break
         base = (search_payload(based[0]) or {}).get("source_base") if based else None
         if not isinstance(base, dict):
-            write_problems.append("%s: get_entity_source served no source_base for hello: %s" % (
+            write_problems.append("%s: source served no source_base for hello: %s" % (
                 family, (refusal_text(based[0]) if based else None) or json.dumps(based)[:300]))
             continue
         last_base = base
         try:
             _, frames, _ = suite.serve(profile, [
-                wrap("kin_session_start", "session", {
-                    "vendor": "acceptance", "client_name": "kin-mcp-surface-contract",
-                    "cwd": suite.repo, "session_id": session_id,
-                }),
-                wrap("kin_mutate", "mutate", {
-                    "session_id": session_id,
+                wrap("mutate", "mutate", {
                     "operations": [guarded(body, base, "the %s write path" % family)],
                     "summary": "mcp surface contract: the %s write path" % family,
                 }),
-                wrap("get_entity_source", "source", {"entity_id": focal}),
+                wrap("source", "source", {"entity_id": focal}),
                 # Guarded as well, so it reaches the session check this frame grades
                 # instead of the refusal of an unguarded replacement.
-                wrap("kin_mutate", "mutate", {
+                wrap("mutate", "mutate", {
                     "session_id": str(uuid.uuid4()),
                     "operations": [guarded(body, base, "never opened")],
                     "summary": "never opened",
@@ -1332,7 +1557,7 @@ def run_checks(suite, verbose=False):
             write_problems = None
             write_unread = "the %s server was unreadable: %s" % (profile, error)
             break
-        write_problems.extend(grade_write_family(family, frames, session_id, body, disk()))
+        write_problems.extend(grade_write_family(family, frames, body, disk()))
         committed_body = body
     if write_problems is None:
         res = Result(*[entry for entry in CHECK_TITLES if entry[0] == "13"][0])
@@ -1341,11 +1566,11 @@ def run_checks(suite, verbose=False):
     else:
         record(
             "13", "write surfaces",
-            "each write surface opens a session, commits an edit and reads back its exact body",
+            "each write surface commits an edit with no session named and reads back its exact body",
             write_problems,
-            "agent-default's named tools and agent-routed's session and mutate commands each "
-            "committed an edit to hello under the caller's own session id, read the exact body "
-            "back, and refused a mutate under an unopened session",
+            "agent-default's named mutate and agent-routed's mutate command each committed an "
+            "edit to hello with no session named, read the exact body back, and refused a mutate "
+            "under an unopened session",
         )
 
     before = disk()
@@ -1359,12 +1584,11 @@ def run_checks(suite, verbose=False):
                     "session_id": str(uuid.uuid4()),
                     "operations": [guarded("x", last_base or {}, "refused")],
                 }}),
-                (ROUTED_TOOL_NAME, {"command": "session", "args": {
-                    "vendor": "acceptance", "client_name": "kin-mcp-surface-contract",
-                    "cwd": suite.repo,
+                (ROUTED_TOOL_NAME, {"command": "exec", "args": {
+                    "argv": ["python3", "-m", "pytest"],
                 }}),
                 (ROUTED_TOOL_NAME, {"command": "call", "args": {
-                    "tool": "kin_mutate", "arguments": {"session_id": str(uuid.uuid4())},
+                    "tool": "mutate", "arguments": {"session_id": str(uuid.uuid4())},
                 }}),
             ])
         except McpError as error:
@@ -1384,7 +1608,7 @@ def run_checks(suite, verbose=False):
             "the read-only routed profile numbers bodies and refuses every write",
             grade_read_only_routed(read_only, committed_body, before, disk()),
             "agent-routed-query numbered hello's body as +N lines that strip back to the "
-            "committed text, and refused mutate, session and a call of kin_mutate by naming "
+            "committed text, and refused mutate, session and a call of mutate by naming "
             "agent-routed",
         )
         if AGENT_ROUTED_QUERY_PROFILE not in (read_only_stderr or ""):
@@ -1405,8 +1629,8 @@ CHECK_TITLES = [
     ("1", "install-proof + windows-npm",
      "every tool name the shipped proofs assert is served under that name"),
     ("2", "install-proof + windows-npm", "a real tools/call returns the seeded entity"),
-    ("3", "magic:6", "trace_data_flow advertises its shape knob"),
-    ("4", "magic:14", "the kin_graph_status description names the as-of-earlier shape"),
+    ("3", "magic:6", "trace advertises its shape knob"),
+    ("4", "magic:14", "the status description names the as-of-earlier shape"),
     ("5", "response_budget:2", "every advertised budget is one a client accepts"),
     ("6", "the general form", "no name is served that the registry does not carry"),
     ("7", "FIR-3107", "the query profile serves its exact set and costs far fewer bytes"),
@@ -1418,11 +1642,12 @@ CHECK_TITLES = [
     ("12", "routed profile",
      "the routed profile serves one tool under its ceiling and reaches the belt"),
     ("13", "write surfaces",
-     "each write surface opens a session, commits an edit and reads back its exact body"),
+     "each write surface commits an edit with no session named and reads back its exact body"),
     ("14", "read-only routed profile",
      "the read-only routed profile numbers bodies and refuses every write"),
     ("15", "portable schemas",
      "no tool on any profile opens its input schema with a combinator"),
+    ("16", "belt size", "agent-default serves its whole set under its byte ceiling"),
 ]
 
 
@@ -1446,15 +1671,20 @@ def self_test():
                    "problems" if want_problems else "none")
             )
 
+    def seeded_reply(name=SEEDED_NAME, module=SEEDED_MODULE):
+        rows = [{"entity_id": "e1", "kind": "function", "name": name, "module": module}]
+        text = json.dumps({"query": SEEDED_NAME, "results": rows, "total": 1})
+        return {"result": {"content": [{"type": "text", "text": text}]}}
+
     def listing(**over):
         tools = [
             {
-                "name": "semantic_search",
-                "description": "Find code declarations.",
+                "name": "locate",
+                "description": "Find code by name or by what it does.",
                 "inputSchema": {"properties": {"query": {}}},
             },
             {
-                "name": "trace_data_flow",
+                "name": "trace",
                 "description": "Walk a chain.",
                 "inputSchema": {
                     "properties": {
@@ -1465,7 +1695,7 @@ def self_test():
                 },
             },
             {
-                "name": "kin_graph_status",
+                "name": "status",
                 "description": "Reports health, and may answer with a "
                                "last_settled_selected_graph reading.",
                 "inputSchema": {"properties": {}},
@@ -1479,14 +1709,14 @@ def self_test():
 
     registry = {
         "tools": [
-            {"name": "semantic_search", "inputSchema": {"properties": {"query": {}}}},
+            {"name": "locate", "inputSchema": {"properties": {"query": {}}}},
             {
-                "name": "trace_data_flow",
+                "name": "trace",
                 "inputSchema": {
                     "properties": {"max_chars": {"minimum": 500, "default": 25000, "maximum": 60000}}
                 },
             },
-            {"name": "kin_graph_status", "inputSchema": {"properties": {}}},
+            {"name": "status", "inputSchema": {"properties": {}}},
         ]
     }
 
@@ -1502,7 +1732,7 @@ def self_test():
     expect("budgets on a good listing", grade_advertised_budgets(good, registry), False)
     expect("registration on a good listing", grade_served_names_are_registered(good, registry), False)
     expect("call on a good result",
-           grade_search_call({"result": {"content": [{"text": "hello in probe.py"}]}}), False)
+           grade_search_call(seeded_reply()), False)
     portable = json.loads(json.dumps(good))
     for tool in portable["tools"]:
         tool["inputSchema"]["type"] = "object"
@@ -1532,21 +1762,32 @@ def self_test():
             ]
         }
 
-    default_listing = profile_listing(
-        list(AGENT_QUERY_NAMES)
-        + [
-            "kin_session_start",
-            "kin_session_heartbeat",
-            "kin_session_end",
-            "kin_transaction_begin",
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_transaction_abort",
-        ],
-        padding=400,
-    )
+    default_listing = profile_listing(list(AGENT_DEFAULT_NAMES), padding=400)
     expect("query profile on a good pair",
            grade_query_profile(profile_listing(AGENT_QUERY_NAMES), default_listing), False)
+    expect("query profile when it outgrew its ceiling",
+           grade_query_profile(
+               profile_listing(AGENT_QUERY_NAMES, padding=1_000),
+               profile_listing(list(AGENT_DEFAULT_NAMES), padding=2_000),
+           ), True)
+
+    # The default belt: its whole set, under its ceiling, and each break.
+    whole_default = list(AGENT_DEFAULT_NAMES)
+    expect("default profile on a good listing",
+           grade_default_profile_bytes(profile_listing(whole_default)), False)
+    expect("default profile when it outgrew its ceiling",
+           grade_default_profile_bytes(profile_listing(whole_default, padding=900)), True)
+    expect("default profile when it met the ceiling by dropping a tool",
+           grade_default_profile_bytes(
+               profile_listing([n for n in whole_default if n != "transaction"])),
+           True)
+    expect("default profile when an old name came back beside its verb",
+           grade_default_profile_bytes(profile_listing(whole_default + ["semantic_search"])),
+           True)
+    expect("default profile when an unknown tool joined it",
+           grade_default_profile_bytes(profile_listing(whole_default + ["kin_artifact_read"])),
+           True)
+    expect("default profile on an empty listing", grade_default_profile_bytes({"tools": []}), True)
 
     for retired in ("kin_artifact_read", "kin_artifact_list", "list_file_entities"):
         expect("query profile exposes retired %s" % retired,
@@ -1560,7 +1801,7 @@ def self_test():
     expect("control on no notice at all", grade_profile_notice(""), True)
 
     renamed = listing()
-    renamed["tools"][0]["name"] = "find_declarations"
+    renamed["tools"][0]["name"] = "semantic_search"
     expect("names when the served name moved", grade_proof_asserted_names(renamed), True)
     expect("registration when the served name moved",
            grade_served_names_are_registered(renamed, registry), True)
@@ -1589,6 +1830,13 @@ def self_test():
            grade_search_call({"result": {"isError": True, "content": []}}), True)
     expect("call on a result missing the seeded entity",
            grade_search_call({"result": {"content": [{"text": "nothing here"}]}}), True)
+    expect("call on the seeded name in another module",
+           grade_search_call(seeded_reply(module="src.other")), True)
+    expect("call on another name in the seeded module",
+           grade_search_call(seeded_reply(name="goodbye")), True)
+    expect("call naming the seeded file and not its module",
+           grade_search_call({"result": {"content": [{"text": json.dumps(
+               {"results": [{"name": SEEDED_NAME, "file_path": "src/probe.py"}]})}]}}), True)
     expect("call on no frame at all", grade_search_call(None), True)
 
     moved = profile_listing(AGENT_QUERY_NAMES)
@@ -1596,9 +1844,10 @@ def self_test():
     expect("query profile when a served name moved",
            grade_query_profile(moved, default_listing), True)
 
-    writeful = profile_listing(list(AGENT_QUERY_NAMES) + ["kin_transaction_commit"])
-    expect("query profile when a write tool joined it",
-           grade_query_profile(writeful, default_listing), True)
+    for write in ("transaction", "kin_transaction_commit"):
+        writeful = profile_listing(list(AGENT_QUERY_NAMES) + [write])
+        expect("query profile when %s joined it" % write,
+               grade_query_profile(writeful, default_listing), True)
 
     # The whole point of the profile, and the break that would make it
     # pointless: a query listing that costs what the default costs.
@@ -1624,9 +1873,9 @@ def self_test():
 
     search_registry = {
         "tools": [
-            definition("semantic_locate"),
-            definition("trace_data_flow", "focal"),
-            definition("impact_analysis", "entity_ids"),
+            definition("locate"),
+            definition("trace", "focal"),
+            definition("impact", "entity_ids"),
         ]
     }
 
@@ -1659,7 +1908,7 @@ def self_test():
         problems.append("payload reader did not read a well-formed tool result")
 
     # The always-on set moved.
-    grown = profile_listing(list(AGENT_SEARCH_NAMES) + ["impact_analysis"])
+    grown = profile_listing(list(AGENT_SEARCH_NAMES) + ["impact"])
     expect("search profile when a withheld tool joined it",
            grade_search_profile(grown), True)
     shrunk = profile_listing([n for n in AGENT_SEARCH_NAMES if n != TOOL_SEARCH_NAME])
@@ -1676,11 +1925,11 @@ def self_test():
 
     # A tool the search stopped finding: the new silent failure.
     lost = dict(good_lookups)
-    lost["impact_analysis"] = lookup("impact_analysis", matches=[], named=[])
+    lost["impact"] = lookup("impact", matches=[], named=[])
     expect("reachability when a tool falls out of the index",
            grade_tool_reachability(search_registry, lost), True)
     unanswered = dict(good_lookups)
-    unanswered["impact_analysis"] = None
+    unanswered["impact"] = None
     expect("reachability when the search did not answer",
            grade_tool_reachability(search_registry, unanswered), True)
     expect("reachability when a tool was never looked up",
@@ -1691,22 +1940,22 @@ def self_test():
     # A schema that drifted from what `full` serves, which reachability alone
     # would pass: the tool is found, and the definition cannot be called from.
     drifted = dict(good_lookups)
-    trimmed = json.loads(json.dumps(definition("impact_analysis", "entity_ids")))
+    trimmed = json.loads(json.dumps(definition("impact", "entity_ids")))
     trimmed["inputSchema"]["properties"] = {}
-    drifted["impact_analysis"] = lookup("impact_analysis", matches=[trimmed], named=["impact_analysis"])
+    drifted["impact"] = lookup("impact", matches=[trimmed], named=["impact"])
     expect("fidelity when the returned schema was trimmed",
            grade_schema_fidelity(search_registry, drifted), True)
     summarized = dict(good_lookups)
-    short = json.loads(json.dumps(definition("impact_analysis", "entity_ids")))
+    short = json.loads(json.dumps(definition("impact", "entity_ids")))
     short["description"] = "Impact."
-    summarized["impact_analysis"] = lookup(
-        "impact_analysis", matches=[short], named=["impact_analysis"]
+    summarized["impact"] = lookup(
+        "impact", matches=[short], named=["impact"]
     )
     expect("fidelity when the search returned a short form",
            grade_schema_fidelity(search_registry, summarized), True)
     named_only = dict(good_lookups)
-    named_only["impact_analysis"] = lookup(
-        "impact_analysis", matches=[], named=["impact_analysis"]
+    named_only["impact"] = lookup(
+        "impact", matches=[], named=["impact"]
     )
     expect("fidelity when a match was named but not returned",
            grade_schema_fidelity(search_registry, named_only), True)
@@ -1717,16 +1966,31 @@ def self_test():
 
     dispatch_listing = {"tools": [{"name": "kin_tool_call"}]}
     dispatch_lookup = {"invocation": {
-        "profile_enabled": {"semantic_search": False},
-        "callable_via_dispatcher": {"semantic_search": True},
+        "profile_enabled": {HIDDEN_QUERY: False},
+        "callable_via_dispatcher": {HIDDEN_QUERY: True},
     }}
+    discovered_refs = {"result": {"content": [{"type": "text", "text": json.dumps({
+        "focal_entity": {"id": "e1", "kind": "function", "name": SEEDED_NAME},
+        "references": [{"entity_id": "e2", "name": "caller", "module": SEEDED_MODULE}],
+    })}]}}
     dispatch_frames = [
-        {"result": {"content": [{"type": "text", "text": "hello probe.py"}]}},
+        discovered_refs,
         {"error": {"message": "tool is not enabled in this MCP profile"}},
         {"error": {"message": "kin_tool_call is read-only"}},
     ]
     expect("discovered query and closed boundaries",
            grade_discovered_query(dispatch_listing, dispatch_lookup, dispatch_frames), False)
+    expect("discovered refs about another entity",
+           grade_discovered_refs({"result": {"content": [{"type": "text", "text": json.dumps({
+               "focal_entity": {"name": "goodbye"},
+               "references": [{"name": "caller", "module": SEEDED_MODULE}],
+           })}]}}), True)
+    expect("discovered refs that found no caller",
+           grade_discovered_refs({"result": {"content": [{"type": "text", "text": json.dumps({
+               "focal_entity": {"name": SEEDED_NAME}, "references": [],
+           })}]}}), True)
+    expect("discovered refs on an RPC error",
+           grade_discovered_refs({"error": {"code": -32602}}), True)
     for index in range(3):
         broken = list(dispatch_frames)
         broken[index] = {"result": {"content": []}}
@@ -1751,12 +2015,20 @@ def self_test():
     # ── the routed surface ──────────────────────────────────────────────────
     routed_listing = {"tools": [{"name": ROUTED_TOOL_NAME, "description": "d" * 400,
                                  "inputSchema": {"properties": {"command": {}, "args": {}}}}]}
-    routed_search = {"result": {"content": [{"type": "text", "text": "hello in probe.py"}]}}
+    routed_search = seeded_reply()
     routed_describe = {"result": {"content": [{"type": "text", "text": json.dumps(
-        {"command": "search", "variants": [{"args_schema": {"type": "object"}}]})}]}}
+        {"command": "locate", "args_schema": {"type": "object"}})}]}}
     expect("routed profile on a good surface",
            grade_routed_profile(routed_listing, routed_search, routed_describe), False)
-    two_tools = {"tools": routed_listing["tools"] + [{"name": "semantic_locate"}]}
+    routed_variants = {"result": {"content": [{"type": "text", "text": json.dumps(
+        {"command": "search", "variants": [{"args_schema": {"type": "object"}}]})}]}}
+    expect("routed profile describing a command that runs several tools",
+           grade_routed_profile(routed_listing, routed_search, routed_variants), False)
+    schemaless = {"result": {"content": [{"type": "text", "text": json.dumps(
+        {"command": "locate"})}]}}
+    expect("routed profile when describe carried no schema",
+           grade_routed_profile(routed_listing, routed_search, schemaless), True)
+    two_tools = {"tools": routed_listing["tools"] + [{"name": "locate"}]}
     expect("routed profile when a second tool rides beside the router",
            grade_routed_profile(two_tools, routed_search, routed_describe), True)
     heavy = {"tools": [dict(routed_listing["tools"][0], description="d" * 4_000)]}
@@ -1777,46 +2049,45 @@ def self_test():
             result["isError"] = True
         return {"result": result}
 
-    session = "3f0c7a52-1111-4222-8333-944445555666"
     body = 'def hello(name):\n    return "hi " + name'
     write_frames = [
-        answer({"session_id": session, "status": "active"}),
         answer({"status": "committed"}),
         answer({"name": "hello", "body": body}),
         answer({"message": "Session not found: 1. It was ended."}, is_error=True),
     ]
     disk_text = "x\n" + body + "\n"
     expect("write family on a good run",
-           grade_write_family("routed", write_frames, session, body, disk_text), False)
+           grade_write_family("routed", write_frames, body, disk_text), False)
     for label, index, frame in (
-        ("a refused session", 0, answer({"message": "no"}, is_error=True)),
-        ("a session under another id", 0, answer({"session_id": "other"})),
-        ("a refused mutate", 1, answer({"message": "no"}, is_error=True)),
-        ("a staged but uncommitted mutate", 1, answer({"status": "staged"})),
-        ("a numbered body on a write surface", 2,
+        ("a mutate refused for naming no session", 0,
+         answer({"message": "Missing required parameter: 'session_id'."}, is_error=True)),
+        ("a staged but uncommitted mutate", 0, answer({"status": "staged"})),
+        ("a numbered body on a write surface", 1,
          answer({"body": "+0\tdef hello(name):\n+1\t    return \"hi \" + name",
                  "about_body": "note"})),
-        ("an old body", 2, answer({"body": "def hello(name):\n    return 1"})),
-        ("an unopened session that was accepted", 3, answer({"status": "committed"})),
-        ("an unopened session refused by routing", 3,
+        ("an old body", 1, answer({"body": "def hello(name):\n    return 1"})),
+        ("an unopened session that was accepted", 2, answer({"status": "committed"})),
+        ("an unopened session refused by routing", 2,
          answer({"message": "Commands: locate, search."}, is_error=True)),
     ):
         broken = list(write_frames)
         broken[index] = frame
         expect("write family on %s" % label,
-               grade_write_family("routed", broken, session, body, disk_text), True)
+               grade_write_family("routed", broken, body, disk_text), True)
     expect("write family when the file kept the old text",
-           grade_write_family("routed", write_frames, session, body, "x\n"), True)
+           grade_write_family("routed", write_frames, body, "x\n"), True)
     expect("write family on a missing frame",
-           grade_write_family("routed", write_frames[:3], session, body, disk_text), True)
+           grade_write_family("routed", write_frames[:2], body, disk_text), True)
 
     refusal = answer({"message": "mutate writes, and this connection serves the read-only "
                                  "agent-routed-query profile. " + ROUTED_WRITE_REFUSAL},
                      is_error=True)
     numbered = "\n".join("+%d\t%s" % (index, line) for index, line in enumerate(body.split("\n")))
+    no_exec = answer({"message": ROUTED_NO_EXEC + " Commands: locate, context."},
+                     is_error=True)
     read_only_frames = [
         answer({"body": numbered, NUMBERING_KEY: "Each body line starts with +N."}),
-        refusal, refusal, refusal,
+        refusal, no_exec, refusal,
     ]
     expect("read-only routed on a good run",
            grade_read_only_routed(read_only_frames, body, disk_text, disk_text), False)
@@ -1828,9 +2099,10 @@ def self_test():
         ("a numbered body of other text", 0,
          answer({"body": "+0\tdef other():", NUMBERING_KEY: "note"})),
         ("an accepted mutate", 1, answer({"status": "committed"})),
-        ("a session refused without naming the write profile", 2,
+        ("an exec refused without saying the router has no such command", 2,
          answer({"message": "refused"}, is_error=True)),
-        ("an accepted call of kin_mutate", 3, answer({"status": "committed"})),
+        ("an exec the router carried", 2, answer({"status": "ran"})),
+        ("an accepted call of mutate", 3, answer({"status": "committed"})),
     ):
         broken = list(read_only_frames)
         broken[index] = frame
@@ -1874,6 +2146,13 @@ def main(argv):
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     opts = parser.parse_args(argv)
+
+    if CEILING_READ_ERRORS:
+        # A ceiling this file cannot read is a gate with no number behind it,
+        # and grading against a remembered copy is what this replaced.
+        for reason in CEILING_READ_ERRORS:
+            sys.stderr.write("mcp surface contract: %s\n" % reason)
+        return 3
 
     if opts.self_test:
         return self_test()

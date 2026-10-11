@@ -1,4 +1,4 @@
-# Durable `kin_mutate` requests
+# Durable `mutate` requests
 
 Pass a nonblank opaque UTF-8 `request_id` of at most 256 bytes to an authenticated,
 supporting local daemon. Kin reserves one transaction before beginning the mutation.
@@ -14,7 +14,7 @@ An expired session may retrieve a previously published receipt, but cannot resum
 unpublished work without a live authorized registration. Runtime registrations
 may be absent after a daemon restart. In that case pending work first refuses;
 the authenticated owner can register the original caller-allocated session UUID
-through `kin_session_start` (forwarded to authenticated `POST /session`) before
+through `session` (forwarded to authenticated `POST /session`) before
 retrying the same bound request. Receipt retrieval
 requires no re-registration and never refreshes an expired lease.
 

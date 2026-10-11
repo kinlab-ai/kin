@@ -7,9 +7,9 @@ use kin_blobs::BlobStore;
 use kin_db::{InMemoryGraph, SnapshotManager};
 use kin_index::FileEvent;
 use kin_model::{
-    ArtifactId, Entity, EntityStore, FilePathId, GraphNodeId, Hash256, LocatedEntry, Relation,
-    RelationDelta, RelationId, RelationKind, RelationOrigin, RepoPath, TransactionDelta, TreeDelta,
-    TreeEntry,
+    ArtifactId, Entity, EntityKind, EntityStore, FilePathId, GraphNodeId, Hash256, LocatedEntry,
+    Relation, RelationDelta, RelationId, RelationKind, RelationOrigin, RepoPath, TransactionDelta,
+    TreeDelta, TreeEntry,
 };
 use kin_reconcile::Reconciler;
 
@@ -126,13 +126,48 @@ fn arrival_preserves_internal_identity(cold: bool) {
     let mut repo = fixture();
     let caller = repo.entity("Database.ingest_dir");
     let before = repo.storage_parser_relations();
-    assert_eq!(
-        before
+    let module = repo.entity("storage");
+    let class = repo.entity("Database");
+    assert_eq!(module.kind, EntityKind::Module);
+    assert_eq!(class.kind, EntityKind::Class);
+    let expected_contains = [
+        (&module, &class, "module_contains"),
+        (
+            &class,
+            &repo.entity("Database.__init__"),
+            "lexical_contains",
+        ),
+        (
+            &class,
+            &repo.entity("Database.ingest_note"),
+            "lexical_contains",
+        ),
+        (&class, &caller, "lexical_contains"),
+        (
+            &class,
+            &repo.entity("Database.all_notes"),
+            "lexical_contains",
+        ),
+    ];
+    let contains: Vec<_> = before
+        .iter()
+        .filter(|r| r.kind == RelationKind::Contains)
+        .collect();
+    assert_eq!(contains.len(), expected_contains.len());
+    for (parent, child, rule) in expected_contains {
+        let matching: Vec<_> = contains
             .iter()
-            .filter(|r| r.kind == RelationKind::Contains)
-            .count(),
-        4
-    );
+            .filter(|r| {
+                r.src == GraphNodeId::Entity(parent.id) && r.dst == GraphNodeId::Entity(child.id)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "one lexical edge for {}", child.name);
+        let records = kin_index::occurrence::original_evidence(matching[0]).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].parser_rule.as_deref(), Some(rule));
+        assert_eq!(records[0].source_span.as_ref(), child.span.as_ref());
+        assert!(records[0].source_span.is_some());
+    }
     assert_eq!(
         before
             .iter()

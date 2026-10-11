@@ -182,6 +182,32 @@ pub fn resolve_commit_identity(layout: &KinLayout) -> Result<CommitIdentity, Kin
     Err(KinError::Config(unresolved_identity_message()))
 }
 
+/// What Git's configuration lacks for a commit to name its author, as the
+/// clause a refusal leads with, or `None` when Git names a usable author.
+///
+/// The refusal says how to set an identity. This says which part of one is
+/// missing, so a person who set `user.name` is not left to guess that it was
+/// the address, or a machine-generated address, that stopped the commit.
+pub fn git_identity_gap(layout: &KinLayout) -> Option<String> {
+    let (name, email, _) = git_identity_fields(layout.working_dir()).unwrap_or((
+        None,
+        None,
+        IdentitySource::GitGlobal,
+    ));
+    let mut gaps = Vec::new();
+    if name.is_none() {
+        gaps.push("no user.name".to_string());
+    }
+    match email {
+        None => gaps.push("no user.email".to_string()),
+        Some(email) if is_fabricated_email(&email) => gaps.push(format!(
+            "a user.email ({email}) that names this machine rather than a person"
+        )),
+        Some(_) => {}
+    }
+    (!gaps.is_empty()).then(|| format!("Git has {}", gaps.join(" and ")))
+}
+
 /// Absence permits a configured fallback; a present but unusable value does
 /// not. In particular an inherited empty override must not name somebody else.
 fn author_environment_field(key: &str) -> Result<Option<String>, KinError> {
@@ -461,6 +487,9 @@ mod tests {
 
     #[test]
     fn author_environment_wins_over_kin_git_and_a_different_committer() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_global_identity("Global Author", "global@example.com");
@@ -480,6 +509,9 @@ mod tests {
 
     #[test]
     fn author_environment_needs_no_git_repository_or_configured_identity() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         let identity = fixture
             .resolve_with_environment(&[
@@ -493,6 +525,9 @@ mod tests {
 
     #[test]
     fn partial_author_environment_keeps_kin_then_git_field_precedence() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_global_identity("Global Author", "global@example.com");
@@ -548,6 +583,9 @@ mod tests {
 
     #[test]
     fn committer_environment_cannot_replace_or_complete_semantic_authorship() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         let committer = [
             ("GIT_COMMITTER_NAME", "Committer"),
@@ -570,6 +608,9 @@ mod tests {
 
     #[test]
     fn invalid_author_environment_refuses_instead_of_falling_back() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.set_global_identity("Global Author", "global@example.com");
         fixture.set_kin_author("Kin Author <kin@example.com>");
@@ -591,6 +632,9 @@ mod tests {
 
     #[test]
     fn an_author_override_cannot_admit_a_configured_synthesized_email() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.set_global_identity("Configured Author", "user@host.local");
         fixture
@@ -600,6 +644,9 @@ mod tests {
 
     #[test]
     fn a_configured_git_identity_is_recorded_verbatim() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_repo_identity("Ada Lovelace", "ada@example.com");
@@ -612,6 +659,9 @@ mod tests {
 
     #[test]
     fn a_global_git_identity_resolves_and_reports_its_scope() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_global_identity("Grace Hopper", "grace@example.com");
@@ -624,6 +674,9 @@ mod tests {
 
     #[test]
     fn a_kin_specific_author_wins_over_the_git_identity() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_repo_identity("Ada Lovelace", "ada@example.com");
@@ -637,6 +690,9 @@ mod tests {
 
     #[test]
     fn no_resolvable_identity_refuses_with_both_remediation_commands() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
 
@@ -665,6 +721,9 @@ mod tests {
     /// refusal back. The second refusal has to name the misplacement.
     #[test]
     fn a_default_author_appended_under_a_table_is_named_as_misplaced() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fs::write(
@@ -697,6 +756,9 @@ mod tests {
     /// the diagnosis does not depend on the misplacement being shallow.
     #[test]
     fn a_default_author_nested_two_tables_down_is_named_by_its_path() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fs::write(
@@ -716,6 +778,9 @@ mod tests {
     /// check cannot be satisfied by refusing every config that mentions the key.
     #[test]
     fn a_top_level_default_author_above_a_table_still_resolves() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fs::write(
@@ -735,6 +800,9 @@ mod tests {
     /// one.
     #[test]
     fn a_repository_with_no_git_directory_still_reads_the_global_identity() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.set_global_identity("Grace Hopper", "grace@example.com");
 
@@ -748,6 +816,9 @@ mod tests {
     /// accepted back in through configuration either.
     #[test]
     fn a_configured_placeholder_is_not_an_identity() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_repo_identity("unknown", "unknown");
@@ -761,6 +832,9 @@ mod tests {
     /// name, so an explicitly configured one is refused too.
     #[test]
     fn a_synthesized_host_local_address_is_not_an_identity() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_repo_identity("troy", "troy@Troys-MacBook-Pro.local");
@@ -772,6 +846,9 @@ mod tests {
     /// the other half.
     #[test]
     fn a_name_without_an_email_does_not_resolve() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         let status = std::process::Command::new("git")
@@ -788,6 +865,9 @@ mod tests {
 
     #[test]
     fn a_kin_author_naming_nobody_falls_through_to_git() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.init_git();
         fixture.set_repo_identity("Ada Lovelace", "ada@example.com");

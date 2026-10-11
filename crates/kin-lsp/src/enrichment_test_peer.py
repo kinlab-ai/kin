@@ -38,6 +38,14 @@ while True:
         sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
         sys.stdout.buffer.flush()
     if reply.get("hold"):
+        if reply.get("clock_hold"):
+            # A controlled-clock test advances only after this process has
+            # actually received the request it is timing out.
+            notice = json.dumps({"jsonrpc": "2.0", "method": "$/progress", "params": {
+                "token": message["id"], "value": {"kind": "begin", "title": "held request"}
+            }}).encode()
+            sys.stdout.buffer.write(f"Content-Length: {len(notice)}\r\n\r\n".encode() + notice)
+            sys.stdout.buffer.flush()
         continue
     reply = {key: value for key, value in reply.items() if key != "before"}
     payload = json.dumps({"jsonrpc": "2.0", "id": message["id"], **reply}).encode()

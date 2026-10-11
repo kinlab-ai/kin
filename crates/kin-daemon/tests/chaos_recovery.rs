@@ -12,7 +12,8 @@ use tokio::process::Command;
 mod common;
 
 use common::{
-    isolate_daemon_test_command, spawn_daemon_test_command, terminate_daemon, DaemonChild,
+    initialize_native_repository, isolate_daemon_test_command, spawn_daemon_test_command,
+    terminate_daemon, DaemonChild, NativeDaemonRepository,
 };
 
 /// Readiness budget for a daemon to come up. Generous enough that two CI runs
@@ -38,12 +39,12 @@ fn assert_child_alive(child: &mut DaemonChild, port: u16, what: &str) {
     }
 }
 
-/// Wait for the daemon to publish its OS-assigned port to `.kin/daemon.port`
+/// Wait for the daemon to publish its OS-assigned port to its store's `daemon.port`
 /// and return it. Spawning with `--port 0` lets the daemon own port selection
 /// and advertise the real bound port here — the same handshake the CLI uses —
 /// so a kill/restart never depends on reusing one port's teardown timing.
-async fn read_published_port(child: &mut DaemonChild, repo_root: &Path) -> u16 {
-    let port_file = repo_root.join(".kin/daemon.port");
+async fn read_published_port(child: &mut DaemonChild, kin_dir: &Path) -> u16 {
+    let port_file = kin_dir.join("daemon.port");
     // Share the readiness budget rather than keeping a tighter one of its own.
     // Publishing the port is part of the same startup this file already grants
     // READINESS_TIMEOUT for, and a 30s cap here made a healthy daemon on a
@@ -93,29 +94,29 @@ async fn read_published_port(child: &mut DaemonChild, repo_root: &Path) -> u16 {
     }
 }
 
-fn init_repo(root: &Path) {
-    kin_core::init(root).unwrap();
+async fn init_repo(root: &Path) -> NativeDaemonRepository {
+    initialize_native_repository(root).await
 }
 
-fn spawn_daemon(repo_root: &Path, port: u16) -> DaemonChild {
-    spawn_daemon_with_env(repo_root, port, &[])
+fn spawn_daemon(layout: &NativeDaemonRepository, port: u16) -> DaemonChild {
+    spawn_daemon_with_env(layout, port, &[])
 }
 
-fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> DaemonChild {
+fn spawn_daemon_with_env(
+    layout: &NativeDaemonRepository,
+    port: u16,
+    envs: &[(&str, &str)],
+) -> DaemonChild {
     let bin = env!("CARGO_BIN_EXE_kin-daemon");
     let mut cmd = Command::new(bin);
     isolate_daemon_test_command(&mut cmd);
+    // Initialization can place the store outside the working tree. Bind every
+    // start and restart to that exact admitted store after authority isolation.
+    layout.bind(&mut cmd);
     cmd.arg("--repo")
-        .arg(repo_root)
+        .arg(layout.working_dir())
         .arg("--port")
         .arg(port.to_string())
-        // Daemon startup inspects the registry to pin sibling repository
-        // authority. A scratch daemon must never enumerate the developer's
-        // real registry while doing so.
-        .env(
-            "KIN_REGISTRY_PATH",
-            repo_root.join(".kin/test-runtime/registry.toml"),
-        )
         // These recovery tests exercise daemon lifecycle and graph durability,
         // not host language-server discovery.
         .env("KIN_DAEMON_DISABLE_LSP", "1")
@@ -240,7 +241,7 @@ async fn wait_for_path_removed(path: &Path, what: &str, timeout: Duration) {
     }
 }
 
-async fn record_graph_mutation(repo_root: &Path, port: u16, action: &str) {
+async fn record_graph_mutation(kin_dir: &Path, port: u16, action: &str) {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/graph/mutations");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -252,7 +253,7 @@ async fn record_graph_mutation(repo_root: &Path, port: u16, action: &str) {
         // token provisioning) instead of assuming one happens before the
         // other, and self-heals if the file is not there yet on an early
         // retry.
-        let token = std::fs::read_to_string(repo_root.join(".kin/daemon.token"))
+        let token = std::fs::read_to_string(kin_dir.join("daemon.token"))
             .ok()
             .map(|contents| contents.trim().to_string())
             .filter(|token| !token.is_empty());
@@ -284,7 +285,7 @@ async fn record_graph_mutation(repo_root: &Path, port: u16, action: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_recovers_after_process_kill_and_restart() {
     let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
+    let layout = init_repo(repo.path()).await;
 
     // Bind an OS-assigned port (`--port 0`) and discover it from the handshake
     // file the daemon publishes, rather than pre-reserving an explicit port.
@@ -293,8 +294,8 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     // kill/restart, which races the kernel's socket teardown on macOS
     // (EADDRINUSE). The product bind path additionally retries EADDRINUSE, so a
     // real same-port restart also recovers.
-    let mut child = spawn_daemon(repo.path(), 0);
-    let port = read_published_port(&mut child, repo.path()).await;
+    let mut child = spawn_daemon(&layout, 0);
+    let port = read_published_port(&mut child, layout.root()).await;
 
     let first = wait_for_health(&mut child, port).await;
     assert_eq!(first.status, "ok");
@@ -310,10 +311,10 @@ async fn daemon_recovers_after_process_kill_and_restart() {
 
     // A SIGKILL leaves the dead daemon's port file behind; remove it so the read
     // below observes the restarted daemon's freshly published port.
-    let _ = std::fs::remove_file(repo.path().join(".kin/daemon.port"));
+    let _ = std::fs::remove_file(layout.root().join("daemon.port"));
 
-    let mut restarted = spawn_daemon(repo.path(), 0);
-    let restarted_port = read_published_port(&mut restarted, repo.path()).await;
+    let mut restarted = spawn_daemon(&layout, 0);
+    let restarted_port = read_published_port(&mut restarted, layout.root()).await;
     let second = wait_for_health(&mut restarted, restarted_port).await;
     assert_eq!(second.status, "ok");
     assert!(second.uptime_seconds < 20);
@@ -326,30 +327,35 @@ async fn daemon_recovers_after_process_kill_and_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
+    let layout = init_repo(repo.path()).await;
 
-    // A generous idle window (rather than a few seconds) keeps the daemon alive
-    // long enough to deterministically observe the endpoint files on a loaded CI
-    // runner before the idle timer fires and removes them.
-    let idle_timeout = Duration::from_secs(15);
+    // The endpoint files are observed straight after a health request, which
+    // is client activity and restarts the idle clock, so the window only has to
+    // outlast two file reads rather than the whole startup. Three seconds keeps
+    // that deterministic on a loaded runner without waiting fifteen for the
+    // exit.
+    let idle_timeout = Duration::from_secs(3);
     let idle_secs = idle_timeout.as_secs().to_string();
 
     // Keep port selection atomic with the daemon's bind. Pre-selecting a free
     // port and releasing it creates a TOCTOU window under parallel CI load.
     let mut child = spawn_daemon_with_env(
-        repo.path(),
+        &layout,
         0,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
             ("KIN_DAEMON_IDLE_TIMEOUT_SECS", idle_secs.as_str()),
         ],
     );
-    let port = read_published_port(&mut child, repo.path()).await;
+    let port = read_published_port(&mut child, layout.root()).await;
 
     wait_for_serving(&mut child, port).await;
+    // A health read is a client request, so the idle window restarts here and
+    // not at whenever startup began monitoring.
+    assert_eq!(wait_for_health(&mut child, port).await.status, "ok");
 
-    let daemon_port = repo.path().join(".kin/daemon.port");
-    let daemon_pid = repo.path().join(".kin/daemon.pid");
+    let daemon_port = layout.root().join("daemon.port");
+    let daemon_pid = layout.root().join("daemon.pid");
     // read_published_port already observed daemon.port. Poll both endpoint
     // files here so this test keeps asserting the complete publication contract
     // before the idle timer removes them.
@@ -443,25 +449,25 @@ fn remove_live_control_dir(kin_dir: &std::path::Path) {
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
+    let layout = init_repo(repo.path()).await;
 
     // Keep port selection atomic with the daemon's bind. The published-port
     // handshake identifies this child, so readiness cannot be satisfied by an
     // unrelated listener that won a pre-selected port.
     let mut child = spawn_daemon_with_env(
-        repo.path(),
+        &layout,
         0,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
             ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "30"),
         ],
     );
-    let port = read_published_port(&mut child, repo.path()).await;
+    let port = read_published_port(&mut child, layout.root()).await;
 
     wait_for_serving(&mut child, port).await;
-    record_graph_mutation(repo.path(), port, "dirty-before-delete").await;
+    record_graph_mutation(layout.root(), port, "dirty-before-delete").await;
 
-    remove_live_control_dir(&repo.path().join(".kin"));
+    remove_live_control_dir(layout.root());
 
     let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
@@ -481,15 +487,10 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
 /// Compared whole so a test can assert that a file was not merely present
 /// afterwards but untouched: a refusing starter that rewrote the incumbent's
 /// port with its own would leave both paths existing.
-fn endpoint_snapshot(repo_root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+fn endpoint_snapshot(kin_dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
     ["daemon.pid", "daemon.port", "daemon.owner"]
         .into_iter()
-        .map(|name| {
-            (
-                name.to_string(),
-                std::fs::read(repo_root.join(".kin").join(name)).ok(),
-            )
-        })
+        .map(|name| (name.to_string(), std::fs::read(kin_dir.join(name)).ok()))
         .collect()
 }
 
@@ -499,26 +500,26 @@ async fn a_refused_second_daemon_leaves_the_incumbent_serving() {
     // lost the repo singleton and refused, and the incumbent it lost to died
     // moments later with its endpoint files gone. A refusal must be inert.
     let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
+    let layout = init_repo(repo.path()).await;
 
     let mut incumbent = spawn_daemon_with_env(
-        repo.path(),
+        &layout,
         0,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
             ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "600"),
         ],
     );
-    let port = read_published_port(&mut incumbent, repo.path()).await;
+    let port = read_published_port(&mut incumbent, layout.root()).await;
     assert_eq!(wait_for_health(&mut incumbent, port).await.status, "ok");
 
-    let before = endpoint_snapshot(repo.path());
+    let before = endpoint_snapshot(layout.root());
     assert!(
         before.iter().all(|(_, bytes)| bytes.is_some()),
         "the incumbent must have published an attributed endpoint: {before:?}"
     );
 
-    let mut refused = spawn_daemon_with_env(repo.path(), 0, &[("KIN_DAEMON_DISABLE_LSP", "1")]);
+    let mut refused = spawn_daemon_with_env(&layout, 0, &[("KIN_DAEMON_DISABLE_LSP", "1")]);
     let exit = match tokio::time::timeout(Duration::from_secs(120), refused.wait()).await {
         Ok(result) => result.expect("second kin-daemon wait failed"),
         Err(_) => {
@@ -532,7 +533,7 @@ async fn a_refused_second_daemon_leaves_the_incumbent_serving() {
     );
 
     assert_eq!(
-        endpoint_snapshot(repo.path()),
+        endpoint_snapshot(layout.root()),
         before,
         "a refused start must leave the incumbent's endpoint byte-identical"
     );
@@ -553,21 +554,28 @@ async fn a_deleted_endpoint_is_republished_instead_of_ending_the_daemon() {
     // on endpoint files it did not verify it owned. Deleting them must be
     // repaired by the daemon that still holds the repo, not obeyed.
     let repo = tempfile::tempdir().unwrap();
-    init_repo(repo.path());
+    let layout = init_repo(repo.path()).await;
 
+    // The idle monitor is also what repairs the endpoint, and it checks every
+    // quarter of the idle window, capped at five seconds. An eight-second
+    // window has it look every two seconds instead of every five, while the
+    // health read below restarts the idle clock, so the daemon still has
+    // eight seconds of quiet to wait out before it could idle away, against
+    // one repair tick of at most two.
     let mut child = spawn_daemon_with_env(
-        repo.path(),
+        &layout,
         0,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
-            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "600"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "8"),
         ],
     );
-    let port = read_published_port(&mut child, repo.path()).await;
+    let port = read_published_port(&mut child, layout.root()).await;
     wait_for_serving(&mut child, port).await;
+    assert_eq!(wait_for_health(&mut child, port).await.status, "ok");
 
-    let daemon_pid = repo.path().join(".kin/daemon.pid");
-    let daemon_port = repo.path().join(".kin/daemon.port");
+    let daemon_pid = layout.root().join("daemon.pid");
+    let daemon_port = layout.root().join("daemon.port");
     wait_for_path(
         &daemon_pid,
         "daemon did not write pid file",

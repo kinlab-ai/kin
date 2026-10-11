@@ -16,18 +16,18 @@ use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    check_git_admission_blockers, plan_semantic_git_import, preflight_git_migration,
-    reprove_git_migration, reprove_git_migration_after_publication,
-    seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
-    GitMigrationPreflightProof, LosslessGitRepository, ProvedImportClosure,
-    SealedContentObservation, SealedContentSource, SemanticGitImportPlan,
+    capture_lossless_git_repository_scoped, check_git_admission_blockers, plan_semantic_git_import,
+    preflight_git_migration, reprove_git_migration, reprove_git_migration_after_publication,
+    seal_all_content_observation_observed, AdmittedContentClosure, CaptureScope,
+    GitLocalIgnoreSourceKind, GitMigrationPreflightProof, LosslessGitRepository,
+    ProvedImportClosure, SealedContentObservation, SealedContentSource, SemanticGitImportPlan,
 };
 use kin_model::{
     compute_resolved_tree_hash, AdmissionCase, AuthorId, ChangeStore,
     EffectiveAdmissionPolicyStamp, EntityId, ExternalObjectId, ExternalObjectKind,
     FrozenLocalOverlay, FrozenLocalOverlayDelta, GitExternalAuthorityDelta, GitMaterialHead,
     Hash256, LocalAdmissionRuleSource, LocalAdmissionRuleSourceKind, LocatedEntry, OperationId,
-    RepositoryId, RepositoryTransaction, SemanticChange, SemanticChangeId, TreeDelta,
+    RefTarget, RepositoryId, RepositoryTransaction, SemanticChange, SemanticChangeId, TreeDelta,
     WorkspaceExpectation, WorkspaceMutation, WorkspaceSemanticDelta,
 };
 use tracing::{info, info_span};
@@ -41,9 +41,15 @@ use crate::init::{
     prepare_repository_layout_with_origin, publish_repository_layout_linearized, GraphOwnedContent,
     InitResult, RepositoryIdentityOrigin,
 };
-use crate::init_progress::{PhaseProgress, GIT_ADMISSION_PHASES};
+use crate::init_progress::{PhaseProgress, CURRENT_COMMIT_ADMISSION_PHASES, GIT_ADMISSION_PHASES};
 use crate::layout::KinLayout;
 use crate::manifest::KinManifest;
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 // Gated on unix as well as test because exact Git admission is unix-only, so
 // the tests that drive this injection are too. Leaving it on every test build
@@ -217,19 +223,128 @@ fn init_from_git_with_hooks(
     before_final_source_proof: impl FnOnce(),
     after_repository_publication: impl FnOnce(),
 ) -> Result<InitResult> {
-    let source = canonical_new_repository_root(working_dir)?;
+    admit_complete_git_history(
+        working_dir,
+        adopted,
+        &LadderTarget::NewStore,
+        before_final_source_proof,
+        after_repository_publication,
+    )
+}
+
+/// Admit the complete Git history of a repository whose store holds only its
+/// checked-out commit, into a staged store beside it.
+///
+/// The whole [`init_from_git`] ladder, with every proof it runs, adopting the
+/// partial store's repository identity so the staged store is the same
+/// repository. Two things differ, and both follow from the partial store
+/// already being there and serving. The complete store is published into
+/// `<stage_parent>/.kin` instead of the worktree, because the worktree's `.kin`
+/// is taken. And every source proof leaves the partial store's directory out of
+/// its worktree walk, exactly as the post-publication proof of a new store
+/// leaves out the `.kin` it just published: a daemon writes into it while this
+/// runs, and it is Kin's own directory, not source.
+///
+/// The partial store is not touched. Replacing it with the staged store is
+/// [`crate::history_attach`]'s job, and it happens only with no daemon on it.
+pub fn derive_complete_history_into_stage(
+    working_dir: &Path,
+    existing_kin_dir: &Path,
+    repository_id: &RepositoryId,
+    stage_parent: &Path,
+) -> Result<InitResult> {
+    admit_complete_git_history(
+        working_dir,
+        Some(repository_id.clone()),
+        &LadderTarget::HistoryStage {
+            existing_kin_dir: existing_kin_dir.to_path_buf(),
+            stage_parent: stage_parent.to_path_buf(),
+        },
+        || {},
+        || {},
+    )
+}
+
+/// Where a complete Git admission publishes the store it builds.
+enum LadderTarget {
+    /// A new store at the worktree's own `.kin`, which must not exist yet.
+    NewStore,
+    /// A complete store published as `<stage_parent>/.kin` while the partial
+    /// store at `existing_kin_dir` keeps serving the worktree.
+    HistoryStage {
+        existing_kin_dir: std::path::PathBuf,
+        stage_parent: std::path::PathBuf,
+    },
+}
+
+impl LadderTarget {
+    /// The worktree's own store, which every source proof leaves out of its
+    /// walk, when one is already there.
+    fn existing_store(&self) -> Option<&Path> {
+        match self {
+            Self::NewStore => None,
+            Self::HistoryStage {
+                existing_kin_dir, ..
+            } => Some(existing_kin_dir),
+        }
+    }
+}
+
+fn admit_complete_git_history(
+    working_dir: &Path,
+    adopted: Option<RepositoryId>,
+    target: &LadderTarget,
+    before_final_source_proof: impl FnOnce(),
+    after_repository_publication: impl FnOnce(),
+) -> Result<InitResult> {
+    let source = match target {
+        LadderTarget::NewStore => canonical_new_repository_root(working_dir)?,
+        LadderTarget::HistoryStage {
+            existing_kin_dir, ..
+        } => {
+            let source = working_dir
+                .canonicalize()
+                .map_err(|error| KinError::io(working_dir, error))?;
+            let existing = existing_kin_dir
+                .canonicalize()
+                .map_err(|error| KinError::io(existing_kin_dir, error))?;
+            if existing != crate::layout::store_root_for(&source) {
+                return Err(KinError::Other(format!(
+                    "history derivation stages beside the store at {}, which is not the store \
+                     serving this worktree",
+                    existing.display()
+                )));
+            }
+            source
+        }
+    };
+    // A git import is an ingestion boundary over the repository it reads.
+    let source_root = kin_io::WorktreeRoot::new(&source, &kin_io::Grant::ambient());
+    let excluded_store = target.existing_store().and_then(|store| {
+        crate::layout::is_in_tree_store_root(&source, store).then(|| source.join(".kin"))
+    });
     require_git_boundary(&source)?;
-    let source_parent = source.parent().ok_or_else(|| {
-        KinError::Other(format!(
-            "repository root has no parent for isolated Git capture: {}",
-            source.display()
-        ))
-    })?;
-    let final_kin_dir = source.join(".kin");
+    let final_kin_dir = match target {
+        LadderTarget::NewStore => crate::layout::reserve_store_root(&source)?,
+        LadderTarget::HistoryStage { stage_parent, .. } => {
+            let stage_parent = stage_parent
+                .canonicalize()
+                .map_err(|error| KinError::io(stage_parent, error))?;
+            stage_parent.join(".kin")
+        }
+    };
+    let source_parent =
+        crate::layout::store_staging_parent(&source, &final_kin_dir).ok_or_else(|| {
+            KinError::Other(format!(
+                "repository root has no parent for isolated Git capture: {}",
+                source.display()
+            ))
+        })?;
+    let source_parent = source_parent.as_path();
     // Before the post-mortem read and the admission checks, so a repository in
     // a directory this user cannot write is told why in one sentence instead
     // of reaching a raw error on the first staging create.
-    crate::init_staging::require_writable_init_directories(source_parent, &source)?;
+    crate::init_staging::require_writable_init_directories(source_parent, &final_kin_dir)?;
 
     // Ahead of the ladder, because a conversion the kernel killed says nothing
     // for itself: `SIGKILL` runs no destructor and prints no error, so the only
@@ -247,7 +362,8 @@ fn init_from_git_with_hooks(
     progress.begin("check admission blockers");
     {
         let _span = info_span!("kin.init.check_admission_blockers").entered();
-        check_git_admission_blockers(&source)
+        wait_out_git_gc(&source_root);
+        check_git_admission_blockers(&source_root)
             .map_err(|error| git_boundary_error("admit this Git repository", error))?;
     }
 
@@ -341,7 +457,7 @@ fn init_from_git_with_hooks(
     progress.begin("capture Git repository");
     let snapshot = {
         let _span = info_span!("kin.init.capture_git_repository").entered();
-        capture_lossless_git_repository(&source, repository_id, &capture_store)
+        capture_lossless_git_repository(&source_root, repository_id, &capture_store)
             .map_err(|error| git_boundary_error("capture exact Git repository", error))?
     };
     park_at_capture_barrier(capture_dir.path());
@@ -415,7 +531,7 @@ fn init_from_git_with_hooks(
     // conversion that looks wedged and one whose remaining work an operator can
     // estimate.
     progress.detail(format_args!(
-        "re-deriving {} commits",
+        "re-checking {} commits",
         semantic_plan.changes.len()
     ));
     let admitted = {
@@ -438,13 +554,24 @@ fn init_from_git_with_hooks(
     // other two reuse rather than repeat.
     progress.begin("prove Git source");
     progress.detail(format_args!(
-        "re-deriving {} commits",
+        "re-checking {} commits",
         semantic_plan.changes.len()
     ));
     let source_proof = {
         let _span = info_span!("kin.init.source_proof_staged").entered();
-        preflight_git_migration(&source, &snapshot, &semantic_plan, &capture_store)
-            .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?
+        match &excluded_store {
+            None => {
+                preflight_git_migration(&source_root, &snapshot, &semantic_plan, &capture_store)
+            }
+            Some(existing) => kin_git::preflight_git_migration_after_publication(
+                &source_root,
+                existing,
+                &snapshot,
+                &semantic_plan,
+                &capture_store,
+            ),
+        }
+        .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?
     };
 
     // Proof 1 is the last reader of a change's BODY. Everything after it reads
@@ -487,6 +614,7 @@ fn init_from_git_with_hooks(
             identity_origin,
         )?
     };
+    crate::layout::stage_store_placement(&staging_dir, &final_kin_dir, &source)?;
 
     progress.begin("copy Git objects");
     {
@@ -603,13 +731,23 @@ fn init_from_git_with_hooks(
         progress.begin("re-prove Git source");
         {
             let _span = info_span!("kin.init.source_proof_final").entered();
-            reprove_git_migration(
-                &source,
-                &source_proof,
-                &snapshot,
-                &semantic_plan,
-                &capture_store,
-            )
+            match &excluded_store {
+                None => reprove_git_migration(
+                    &source_root,
+                    &source_proof,
+                    &snapshot,
+                    &semantic_plan,
+                    &capture_store,
+                ),
+                Some(existing) => reprove_git_migration_after_publication(
+                    &source_root,
+                    existing,
+                    &source_proof,
+                    &snapshot,
+                    &semantic_plan,
+                    &capture_store,
+                ),
+            }
             .map_err(|error| git_boundary_error("repeat final Git source proof", error))?
         };
         progress.begin("publish repository");
@@ -634,9 +772,12 @@ fn init_from_git_with_hooks(
         progress.begin("prove Git source after publication");
         {
             let _span = info_span!("kin.init.source_proof_published").entered();
+            // A staged store is published outside the worktree, so the
+            // directory this proof leaves out is the partial store that was
+            // already there, not the one just published.
             reprove_git_migration_after_publication(
-                &source,
-                published.path(),
+                &source_root,
+                excluded_store.as_deref().unwrap_or(published.path()),
                 &source_proof,
                 &snapshot,
                 &semantic_plan,
@@ -668,7 +809,7 @@ fn init_from_git_with_hooks(
                     .to_string(),
             ));
         }
-        progress.finish("admitted exact Git repository");
+        progress.finish("imported the Git repository");
         Ok(())
     })?;
     // Exact Git refs intentionally retain external-object targets, so the
@@ -727,8 +868,8 @@ fn init_from_git_with_hooks(
     // Measured on a full-history conversion under contention that stretch was
     // 3.1 to 3.4 seconds with no phase open, flat across a 2x range of init
     // totals, and an unnamed stretch is memory a profile charges to no phase
-    // (FIR-2980; the guard's own message records a 6,733-commit measurement
-    // discarded for exactly that).
+    // (the guard's own message records a 6,733-commit measurement discarded
+    // for exactly that).
     //
     // The expensive one is `capture_dir`: `GitCaptureStaging::drop` calls
     // `remove_staging_tree`, a `remove_dir_all` with retries over the whole Git
@@ -749,6 +890,873 @@ fn init_from_git_with_hooks(
     }
 
     Ok(result)
+}
+
+/// Admit the checked-out commit of one clean Git worktree as a new store, and
+/// none of its history.
+///
+/// This is [`init_from_git`] over a [`CaptureScope::CheckedOutCommit`]
+/// capture: the commit `HEAD` resolves to, its tree closure, and the branch
+/// `HEAD` names. Every step that is not about history is the same step, run
+/// the same way: the admission blockers, the budget and disk checks, the
+/// semantic derivation of the tree, the admission policy, all three source
+/// proofs, the staged copy and both content seals. What differs is what the
+/// store is allowed to claim.
+///
+/// The store holds one native root change, the snapshot, whose tree is the
+/// checked-out tree and whose semantics are the ones a complete admission
+/// derives for that tree. It holds no Git-origin change, no commit alias and no
+/// Git external authority, because each of those is a claim about Git history
+/// this conversion did not read. The [`crate::history_state`] record written
+/// into the staged layout says what was admitted and where it stops, and it is
+/// published in the same rename as the store, so no reader ever sees this store
+/// without it.
+///
+/// An unborn `HEAD`, or a root commit on the only branch with no other refs,
+/// has no history to defer. It is admitted by the complete ladder instead and
+/// gets no partial-history record. Its Git-tracked paths remain verified Git
+/// authority, including committed files excluded by ignore rules.
+///
+/// # Errors
+///
+/// Every refusal [`init_from_git`] raises, except that a shallow clone is
+/// admitted: nothing past the checked-out commit is read.
+pub fn init_current_commit_from_git(
+    working_dir: &Path,
+    adopted: Option<&RepositoryId>,
+    mode: crate::history_state::HistoryMode,
+) -> Result<InitResult> {
+    init_current_commit_from_git_with_hooks(working_dir, adopted.cloned(), mode, || {}, || {})
+}
+
+fn init_current_commit_from_git_with_hooks(
+    working_dir: &Path,
+    adopted: Option<RepositoryId>,
+    mode: crate::history_state::HistoryMode,
+    before_final_source_proof: impl FnOnce(),
+    after_repository_publication: impl FnOnce(),
+) -> Result<InitResult> {
+    if !mode.starts_partial() {
+        return Err(KinError::Other(
+            "the full history mode admits complete history; use init_from_git".to_string(),
+        ));
+    }
+    let source = canonical_new_repository_root(working_dir)?;
+    // A git import is an ingestion boundary over the repository it reads.
+    let source_root = kin_io::WorktreeRoot::new(&source, &kin_io::Grant::ambient());
+    require_git_boundary(&source)?;
+    // No history is deferred by a single root commit with no other refs.
+    // Preserve verified Git tracking rather than making its tree Native.
+    if checked_out_commit_is_entire_repository(&source) {
+        return init_from_git_with_hooks(
+            working_dir,
+            adopted,
+            before_final_source_proof,
+            after_repository_publication,
+        );
+    }
+
+    let final_kin_dir = crate::layout::reserve_store_root(&source)?;
+    let source_parent =
+        crate::layout::store_staging_parent(&source, &final_kin_dir).ok_or_else(|| {
+            KinError::Other(format!(
+                "repository root has no parent for isolated Git capture: {}",
+                source.display()
+            ))
+        })?;
+    let source_parent = source_parent.as_path();
+    crate::init_staging::require_writable_init_directories(source_parent, &final_kin_dir)?;
+
+    let leftovers = crate::init_attempt::abandoned_init_attempts(source_parent).unwrap_or_default();
+    crate::init_attempt::report_previous_attempts(&leftovers, &source);
+
+    let mut progress = PhaseProgress::new(CURRENT_COMMIT_ADMISSION_PHASES);
+
+    progress.begin("check admission blockers");
+    {
+        let _span = info_span!("kin.init.check_admission_blockers").entered();
+        wait_out_git_gc(&source_root);
+        check_git_admission_blockers(&source_root)
+            .map_err(|error| git_boundary_error("admit this Git repository", error))?;
+    }
+
+    let (manifest, identity_origin) = match &adopted {
+        Some(adopted) => (
+            KinManifest::adopting(adopted.as_str()),
+            RepositoryIdentityOrigin::Adopted,
+        ),
+        None => (KinManifest::new(), RepositoryIdentityOrigin::Minted),
+    };
+    let repository_id = RepositoryId::new(manifest.repo_id.clone())
+        .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
+    let capture_dir = crate::init_staging::GitCaptureStaging::claim(source_parent)?;
+    let reclaimed = crate::init::recover_orphaned_repository_stages(source_parent, &final_kin_dir)
+        .unwrap_or_default();
+    crate::init_attempt::report_reclaimed_stages(reclaimed.recovered, reclaimed.retained);
+    crate::init_attempt::report_reclaimed(&leftovers);
+
+    // The forecast for this conversion is the checked-out tree's, and the walk
+    // that takes it counts the commits `HEAD` reaches on the way, which the
+    // store records as the denominator of its partial history.
+    let (budget, reachable_commits) = crate::init_budget::assess_checked_out_commit(&source);
+    if budget.refuses() {
+        for line in budget.refusal_lines() {
+            crate::init_attempt::disclose_line(&line);
+        }
+        return Err(KinError::ConversionBudgetExceeded);
+    }
+    if let Some(line) = budget.advisory_line() {
+        crate::init_attempt::disclose_line(&line);
+    }
+    let disk = crate::init_disk::assess(
+        &source,
+        source_parent,
+        budget.survey().map(|survey| survey.history_bytes),
+    );
+    if disk.refuses() {
+        for line in disk.refusal_lines() {
+            crate::init_attempt::disclose_line(&line);
+        }
+        return Err(KinError::ConversionDiskExceeded);
+    }
+    if let Some(line) = disk.advisory_line() {
+        crate::init_attempt::disclose_line(&line);
+    }
+
+    let journal = std::sync::Arc::new(crate::init_attempt::InitAttemptJournal::open(
+        capture_dir.path(),
+        &source,
+        &final_kin_dir,
+        CURRENT_COMMIT_ADMISSION_PHASES,
+    ));
+    progress.attach_journal(journal);
+    let capture_store = BlobStore::new_ephemeral(capture_dir.path().join("objects"))
+        .map_err(|error| git_boundary_error("create capture CAS", error))?;
+
+    progress.begin("capture checked-out commit");
+    let snapshot = {
+        let _span = info_span!("kin.init.capture_checked_out_commit").entered();
+        capture_lossless_git_repository_scoped(
+            &source_root,
+            repository_id,
+            &capture_store,
+            CaptureScope::CheckedOutCommit,
+        )
+        .map_err(|error| git_boundary_error("capture the checked-out Git commit", error))?
+    };
+    if !snapshot
+        .objects
+        .iter()
+        .any(|record| record.object.kind == ExternalObjectKind::Commit)
+    {
+        // An unborn branch: there is no history to defer, and the complete
+        // ladder admits it without reading any.
+        drop(capture_store);
+        drop(capture_dir);
+        drop(progress);
+        return init_from_git_with_hooks(
+            working_dir,
+            adopted,
+            before_final_source_proof,
+            after_repository_publication,
+        );
+    }
+    let shallow_source = source_is_shallow(&source);
+
+    progress.begin("plan semantic import");
+    let semantic_plan = {
+        let _span = info_span!("kin.init.plan_semantic_import").entered();
+        let plan = plan_semantic_git_import(&snapshot, &capture_store).map_err(|error| {
+            git_boundary_error("derive the checked-out commit's semantic import", error)
+        })?;
+        verify_checked_out_workspace_seed(&plan)?;
+        plan
+    };
+    {
+        let survey = import_survey(&snapshot, &semantic_plan);
+        progress.detail(format_args!("{} files, 1 commit", survey.head_artifacts));
+        let projection = crate::init_budget::project_import(survey);
+        if projection.refuses() {
+            for line in projection.refusal_lines() {
+                crate::init_attempt::disclose_line(&line);
+            }
+            return Err(KinError::ConversionBudgetExceeded);
+        }
+    }
+
+    progress.begin("derive semantic history");
+    let semantic_plan = {
+        let _span = info_span!("kin.init.bind_historical_semantics", changes = 1).entered();
+        bind_historical_semantics(semantic_plan, &capture_store)?
+    };
+
+    progress.begin("apply admission policy");
+    let admitted = {
+        let _span = info_span!("kin.init.admit_semantic_import").entered();
+        admit_semantic_git_import(&semantic_plan, &capture_store).map_err(|error| {
+            git_boundary_error("derive the checked-out commit's admission policy", error)
+        })?
+    };
+
+    progress.begin("prove Git source");
+    let source_proof = {
+        let _span = info_span!("kin.init.source_proof_staged").entered();
+        preflight_git_migration(&source_root, &snapshot, &semantic_plan, &capture_store)
+            .map_err(|error| git_boundary_error("prove mutable Git workspace", error))?
+    };
+    let semantic_plan = ProvedImportClosure::from_proved_plan(semantic_plan);
+
+    let staging_dir = source_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+    if let Some(journal) = progress.journal() {
+        journal.record_stage_path(&staging_dir);
+    }
+    let config = config_for_source(&snapshot, &source_proof.remote_mapping)?;
+
+    progress.begin("stage repository layout");
+    let mut prepared = {
+        let _span = info_span!("kin.init.prepare_layout").entered();
+        prepare_repository_layout_with_origin(
+            &staging_dir,
+            &final_kin_dir,
+            config,
+            manifest,
+            identity_origin,
+        )?
+    };
+
+    progress.begin("copy Git objects");
+    {
+        let _span = info_span!(
+            "kin.init.copy_captured_authority",
+            objects = snapshot.objects.len()
+        )
+        .entered();
+        copy_captured_authority(
+            &prepared,
+            &snapshot,
+            &capture_store,
+            &source_proof,
+            &mut progress,
+        )?;
+    }
+
+    progress.begin("seal staged content");
+    let sealed_observation = {
+        let _span = info_span!("kin.init.seal_staged_content").entered();
+        seal_observed_content(&admitted, &prepared, &mut progress)
+            .map_err(|error| git_boundary_error("seal all-content observation", error))?
+    };
+
+    crate::layout::stage_store_placement(&staging_dir, &final_kin_dir, &source)?;
+
+    let admitted_tracked_artifacts = admitted.workspace_seed.base_tree.len() as u64;
+    progress.begin("build bootstrap transaction");
+    let (transaction, snapshot_change_id, source_commit) = {
+        let _span = info_span!("kin.init.build_snapshot_transaction").entered();
+        snapshot_bootstrap_transaction(admitted, &capture_store, &prepared, &source_proof)?
+    };
+
+    progress.begin("commit bootstrap transaction");
+    {
+        let _span = info_span!("kin.init.commit_bootstrap_transaction").entered();
+        prepared.commit_repository_bootstrap(transaction)?;
+    }
+    // Into the staged layout, after the bootstrap commit named the snapshot
+    // and before the rename that publishes the store, so the store is never
+    // visible without the record that says its history is partial.
+    {
+        let boundary_parents = snapshot_boundary_parents(&snapshot, &capture_store, source_commit)?;
+        let underivable = shallow_source.then(|| {
+            "this is a shallow clone, so its earlier commits are not here to derive; run              `git fetch --unshallow` first"
+                .to_string()
+        });
+        let source_ref = match &snapshot.head {
+            kin_model::WorkspaceHead::Symbolic { target } => {
+                Some(String::from_utf8_lossy(target.as_bytes()).into_owned())
+            }
+            kin_model::WorkspaceHead::Detached { .. } => None,
+        };
+        let record = crate::history_state::HistoryStateRecord::new(
+            mode,
+            source_commit.to_string(),
+            source_ref,
+            snapshot_change_id.to_string(),
+            boundary_parents,
+            reachable_commits,
+            underivable,
+        );
+        crate::history_state::stamp_staged(prepared.layout(), &record).map_err(|error| {
+            KinError::io(crate::history_state::record_path(prepared.layout()), error)
+        })?;
+    }
+
+    let mut result = publish_repository_layout_linearized(prepared, |publication| {
+        before_final_source_proof();
+        progress.begin("re-prove Git source");
+        {
+            let _span = info_span!("kin.init.source_proof_final").entered();
+            reprove_git_migration(
+                &source_root,
+                &source_proof,
+                &snapshot,
+                &semantic_plan,
+                &capture_store,
+            )
+            .map_err(|error| git_boundary_error("repeat final Git source proof", error))?
+        };
+        progress.begin("publish repository");
+        let published = {
+            let _span = info_span!("kin.init.publish_repository").entered();
+            publication.publish()?
+        };
+        after_repository_publication();
+        progress.begin("prove Git source after publication");
+        {
+            let _span = info_span!("kin.init.source_proof_published").entered();
+            reprove_git_migration_after_publication(
+                &source_root,
+                published.path(),
+                &source_proof,
+                &snapshot,
+                &semantic_plan,
+                &capture_store,
+            )
+            .map_err(|error| git_boundary_error("prove Git source after publication", error))?
+        };
+        progress.begin("seal published content");
+        let published_observation = {
+            let _span = info_span!("kin.init.seal_published_content").entered();
+            seal_published_content_observation(published.path(), &semantic_plan, &mut progress)?
+        };
+        if published_observation.fingerprint != sealed_observation.fingerprint {
+            return Err(KinError::Other(
+                "sealed all-content observation changed across repository publication; published \
+                 authority is not safe to use without recovery"
+                    .to_string(),
+            ));
+        }
+        progress.finish("admitted the checked-out commit");
+        Ok(())
+    })?;
+    result.authority.initial_change_id = Some(snapshot_change_id);
+    result
+        .workspace_divergence
+        .clone_from(&source_proof.workspace_divergence);
+    if result.workspace_divergence.is_empty() {
+        let _span = info_span!("kin.init.record_complete_admission").entered();
+        crate::last_admission::record(&result.layout, admitted_tracked_artifacts);
+    }
+
+    info!(
+        path = %source.display(),
+        repository = %result.repository_id,
+        workspace = %result.workspace_id,
+        snapshot = %snapshot_change_id,
+        commit = %source_commit,
+        "admitted the checked-out Git commit as a partial-history Kin store"
+    );
+    {
+        let _span = info_span!("kin.init.release_capture_staging").entered();
+        drop(capture_store);
+        drop(capture_dir);
+    }
+    Ok(result)
+}
+
+/// Conservatively recognize an entire one-root repository. Complete admission
+/// still captures and proves it; this grants no transaction-level exemption.
+fn checked_out_commit_is_entire_repository(source: &Path) -> bool {
+    if source_is_shallow(source) {
+        return false;
+    }
+    let options = gix::open::Options::isolated().strict_config(true);
+    let Ok(repo) = gix::open_opts(source, options) else {
+        return false;
+    };
+    let Ok(commit) = repo.head_commit() else {
+        return false;
+    };
+    if commit.parent_ids().next().is_some() {
+        return false;
+    }
+    let Ok(Some(head_ref)) = repo.head_ref() else {
+        return false;
+    };
+    let Ok(platform) = repo.references() else {
+        return false;
+    };
+    let Ok(refs) = platform.all() else {
+        return false;
+    };
+    let mut count = 0;
+    for reference in refs {
+        let Ok(reference) = reference else {
+            return false;
+        };
+        count += 1;
+        if count > 1
+            || reference.name() != head_ref.name()
+            || reference.target().try_id() != Some(commit.id.as_ref())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether Git reports this source as a shallow clone.
+fn source_is_shallow(source: &Path) -> bool {
+    let options = gix::open::Options::isolated().strict_config(true);
+    gix::open_opts(source, options)
+        .ok()
+        .and_then(|repo| repo.shallow_commits().ok())
+        .is_some_and(|commits| commits.is_some_and(|commits| !commits.is_empty()))
+}
+
+/// The one rule a checked-out-commit plan must meet before anything is built
+/// from it: exactly one commit, admitted as a root, and it is the commit the
+/// workspace seed peels to.
+fn verify_checked_out_workspace_seed(plan: &SemanticGitImportPlan) -> Result<()> {
+    let seed = &plan.workspace_seed;
+    let Some(commit_oid) = seed.base_commit_oid else {
+        return Err(KinError::Other(
+            "checked-out commit admission requires a born HEAD".to_string(),
+        ));
+    };
+    let material_target = RefTarget::external_object(ExternalObjectId::new(
+        ExternalObjectKind::Commit,
+        commit_oid,
+    ));
+    let exact_head = match &seed.head {
+        kin_model::WorkspaceHead::Symbolic { .. } => true,
+        kin_model::WorkspaceHead::Detached { target } => target == &material_target,
+    };
+    let only_commit = plan.aliases.len() == 1
+        && plan
+            .aliases
+            .first()
+            .is_some_and(|alias| alias.oid == commit_oid)
+        && plan.changes.len() == 1;
+    if !exact_head
+        || seed.base_target.as_ref() != Some(&material_target)
+        || seed.base_tree_hash.is_none()
+        || !only_commit
+        || plan.is_complete_history()
+    {
+        return Err(KinError::Other(
+            "checked-out commit import does not admit exactly the commit HEAD names".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The parents the snapshot's source commit has in Git and the store does not.
+fn snapshot_boundary_parents(
+    snapshot: &LosslessGitRepository,
+    capture_store: &BlobStore,
+    source_commit: kin_model::GitObjectId,
+) -> Result<Vec<String>> {
+    if !snapshot.history_boundary.contains(&source_commit) {
+        return Ok(Vec::new());
+    }
+    let record = snapshot
+        .objects
+        .iter()
+        .find(|record| {
+            record.object.kind == ExternalObjectKind::Commit && record.object.oid == source_commit
+        })
+        .ok_or_else(|| {
+            KinError::Other(format!(
+                "checked-out commit {source_commit} is missing from its own capture"
+            ))
+        })?;
+    let body = capture_store
+        .read(&kin_blobs::Hash256::from_bytes(
+            *record.body_hash.as_bytes(),
+        ))
+        .map_err(|error| git_boundary_error("read the checked-out commit", error))?;
+    let hash_kind = match source_commit {
+        kin_model::GitObjectId::Sha1(_) => gix::hash::Kind::Sha1,
+        kin_model::GitObjectId::Sha256(_) => gix::hash::Kind::Sha256,
+    };
+    let commit = gix::objs::CommitRef::from_bytes(&body, hash_kind)
+        .map_err(|error| git_boundary_error("decode the checked-out commit", error))?;
+    Ok(commit.parents().map(|parent| parent.to_string()).collect())
+}
+
+/// An approval for every file of the checked-out tree that the sensitive-content
+/// scan would refuse as new input, naming the commit it was committed in.
+fn committed_sensitive_allowances(
+    tree: &kin_model::ResolvedTree,
+    capture_store: &BlobStore,
+    commit_oid: kin_model::GitObjectId,
+) -> Result<Vec<kin_model::SensitiveArtifactAllowance>> {
+    let mut allowances = Vec::new();
+    for artifact in tree.artifacts() {
+        let (hash, kind) = match artifact.entry {
+            kin_model::TreeEntry::Blob { hash, executable } => {
+                (hash, kin_model::SensitiveArtifactKind::Blob { executable })
+            }
+            kin_model::TreeEntry::Symlink { target_blob } => {
+                (target_blob, kin_model::SensitiveArtifactKind::Symlink)
+            }
+            kin_model::TreeEntry::Gitlink { .. } => continue,
+        };
+        let body = capture_store
+            .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+            .map_err(|error| {
+                git_boundary_error(format!("read committed file {}", artifact.path), error)
+            })?;
+        match kin_db::admission::enforce_sensitive_admission(
+            &artifact.path,
+            hash,
+            kind,
+            &body,
+            false,
+            &[],
+        ) {
+            Ok(()) => {}
+            Err(kin_db::admission::SensitiveAdmissionError::Blocked { .. }) => {
+                allowances.extend(committed_allowance(artifact, commit_oid));
+            }
+            Err(error) => {
+                return Err(KinError::Other(format!(
+                    "scan committed file {}: {error}",
+                    artifact.path
+                )))
+            }
+        }
+    }
+    Ok(allowances)
+}
+
+/// The approval for one file of the checked-out tree, by its exact path, digest
+/// and entry kind, naming the commit it was committed in. A gitlink names no
+/// content and gets none.
+fn committed_allowance(
+    artifact: &kin_model::ResolvedArtifact,
+    commit_oid: kin_model::GitObjectId,
+) -> Option<kin_model::SensitiveArtifactAllowance> {
+    let (content_hash, kind) = match artifact.entry {
+        kin_model::TreeEntry::Blob { hash, executable } => {
+            (hash, kin_model::SensitiveArtifactKind::Blob { executable })
+        }
+        kin_model::TreeEntry::Symlink { target_blob } => {
+            (target_blob, kin_model::SensitiveArtifactKind::Symlink)
+        }
+        kin_model::TreeEntry::Gitlink { .. } => return None,
+    };
+    Some(kin_model::SensitiveArtifactAllowance {
+        path: artifact.path.clone(),
+        content_hash,
+        kind,
+        approved_by: AuthorId::new("kin-git-import"),
+        reason: format!(
+            "committed in Git commit {commit_oid}, which this store admitted as its checked-out \
+             snapshot"
+        ),
+    })
+}
+
+/// The exact raw-object closure of one checked-out commit. Parent commit
+/// edges are a history boundary, not permission to capture or claim ancestry.
+/// Extra objects in the admitted plan are not snapshot authority.
+fn snapshot_external_objects(
+    records: &[kin_model::ExternalObjectRecord],
+    capture_store: &BlobStore,
+    source_commit: kin_model::GitObjectId,
+) -> Result<Vec<kin_model::ExternalObjectRecord>> {
+    use kin_model::{decode_git_external_object, GitObjectDependencyKind, GitObjectFormat};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut by_id = BTreeMap::new();
+    for record in records {
+        if by_id.insert(record.object, record).is_some() {
+            return Err(KinError::Other(
+                "snapshot capture repeats an external object identity".to_string(),
+            ));
+        }
+    }
+    let source = ExternalObjectId::new(ExternalObjectKind::Commit, source_commit);
+    let format = GitObjectFormat::from_oid(source_commit);
+    let mut selected = BTreeSet::new();
+    let mut pending = vec![source];
+    while let Some(object) = pending.pop() {
+        if !selected.insert(object) {
+            continue;
+        }
+        let record = by_id.get(&object).ok_or_else(|| {
+            KinError::Other(format!("snapshot capture is missing object {}", object.oid))
+        })?;
+        let body = capture_store
+            .read(&kin_blobs::Hash256::from_bytes(
+                *record.body_hash.as_bytes(),
+            ))
+            .map_err(|error| git_boundary_error("read snapshot object", error))?;
+        let decoded = decode_git_external_object(format, record, &body)
+            .map_err(|error| git_boundary_error("verify snapshot object", error))?;
+        for dependency in decoded.dependencies {
+            match dependency.kind {
+                GitObjectDependencyKind::CommitParent { .. } if object == source => {}
+                GitObjectDependencyKind::CommitTree if object == source => {
+                    pending.push(dependency.target);
+                }
+                GitObjectDependencyKind::TreeEntry { mode, .. }
+                    if object.kind == ExternalObjectKind::Tree =>
+                {
+                    if mode == kin_model::GitTreeEntryMode::Gitlink {
+                        return Err(KinError::Other(
+                            "a snapshot proof cannot authorize a gitlink".to_string(),
+                        ));
+                    }
+                    pending.push(dependency.target);
+                }
+                _ => {
+                    return Err(KinError::Other(
+                        "unexpected dependency in the snapshot object closure".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(selected
+        .into_iter()
+        .map(|object| (*by_id[&object]).clone())
+        .collect())
+}
+
+/// The bootstrap of a partial-history store: the checked-out commit's admitted
+/// change, re-identified as a native snapshot, and a workspace on it.
+///
+/// Everything in the change except its origin and identity is exactly what the
+/// admitted plan derived for that commit as a root: its tree deltas, its
+/// historical semantics and its admission policy. The origin becomes native
+/// because the store holds no Git authority to project a Git-origin change
+/// through, and a Git-origin change is a claim that it does. No alias or Git
+/// history authority is created. A separate proof retains just this commit's
+/// raw commit/tree/blob closure and binds it to the native snapshot's identity;
+/// storage independently verifies that proof before granting admission.
+///
+/// Answers the transaction, the snapshot's identity, and the Git commit it was
+/// taken from.
+fn snapshot_bootstrap_transaction(
+    admitted: kin_git::AdmittedSemanticGitImportPlan,
+    capture_store: &BlobStore,
+    prepared: &crate::init::PreparedRepositoryInit,
+    proof: &GitMigrationPreflightProof,
+) -> Result<(
+    RepositoryTransaction,
+    SemanticChangeId,
+    kin_model::GitObjectId,
+)> {
+    if admitted.is_complete_history() || admitted.changes.len() != 1 {
+        return Err(KinError::Other(
+            "a snapshot bootstrap admits exactly one checked-out commit".to_string(),
+        ));
+    }
+    if prepared.initial_roots().generation != 0
+        || &admitted.repository_id != prepared.repository_id()
+    {
+        return Err(KinError::Other(
+            "a snapshot proof requires its own generation-zero repository".to_string(),
+        ));
+    }
+    let seed = &admitted.workspace_seed;
+    if proof.head != seed.head
+        || proof.base_target != seed.base_target
+        || proof.base_commit_oid != seed.base_commit_oid
+        || proof.base_tree_hash != seed.base_tree_hash
+    {
+        return Err(KinError::Other(
+            "Git preflight is not bound to the admitted workspace seed".to_string(),
+        ));
+    }
+    let commit_oid = seed.base_commit_oid.ok_or_else(|| {
+        KinError::Other("a snapshot bootstrap requires a born checked-out commit".to_string())
+    })?;
+    let mut change = admitted
+        .changes
+        .read_at(0)
+        .map_err(|error| git_boundary_error("read the admitted checked-out commit", error))?
+        .ok_or_else(|| KinError::Other("admitted checked-out commit is missing".to_string()))?;
+    let origin_is_source = matches!(
+        change.origin,
+        kin_model::ChangeOrigin::GitCommit { oid } if oid == commit_oid
+    );
+    let expected_policy =
+        kin_model::AdmissionPolicyDelta::initialize(admitted.workspace_policy.clone());
+    if !origin_is_source
+        || !change.parents.is_empty()
+        || change.admission_policy_delta.as_ref() != Some(&expected_policy)
+    {
+        return Err(KinError::Other(
+            "admitted checked-out commit is not a root carrying its own admission policy"
+                .to_string(),
+        ));
+    }
+    // Keep the existing committed-sensitive-content treatment. Ignore-only
+    // exclusions are admitted by the verified snapshot proof, never by
+    // manufacturing a sensitive-content approval for an ordinary path.
+    let workspace_id = prepared.workspace_id();
+    let local_overlay = frozen_local_overlay(workspace_id, proof)?;
+    let policy = {
+        let allowances =
+            committed_sensitive_allowances(&seed.base_tree, capture_store, commit_oid)?;
+        if allowances.is_empty() {
+            admitted.workspace_policy.clone()
+        } else {
+            kin_model::SharedAdmissionPolicy::new(
+                admitted.workspace_policy.generation,
+                admitted.workspace_policy.sources.clone(),
+                allowances,
+            )
+            .map_err(|error| KinError::Other(error.to_string()))?
+        }
+    };
+    change.admission_policy_delta =
+        Some(kin_model::AdmissionPolicyDelta::initialize(policy.clone()));
+    change.origin = kin_model::ChangeOrigin::Native;
+    change.id = SemanticChangeId::from_hash(Hash256::from_bytes([0; 32]));
+    change.id = crate::compute_semantic_change_id(&change)?;
+    kin_model::validate_semantic_change_id(&change)
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    let snapshot_id = change.id;
+    let external_objects =
+        snapshot_external_objects(&admitted.external_objects, capture_store, commit_oid)?;
+    let snapshot_proof = kin_model::GitSnapshotProof {
+        repository_id: prepared.repository_id().clone(),
+        snapshot_change_id: snapshot_id,
+        source_commit: commit_oid,
+        objects: external_objects
+            .iter()
+            .map(|record| record.object)
+            .collect(),
+    };
+    snapshot_proof
+        .validate_for_repository(prepared.repository_id())
+        .map_err(|error| git_boundary_error("bind snapshot proof", error))?;
+
+    // The snapshot's own tree must be the checked-out tree, which is the
+    // equality that lets the workspace sit on it clean.
+    let tree = kin_model::ResolvedTree::default()
+        .apply(&change.tree_deltas)
+        .map_err(|error| KinError::Other(error.to_string()))?;
+    let tree_hash =
+        compute_resolved_tree_hash(&tree).map_err(|error| KinError::Other(error.to_string()))?;
+    if Some(tree_hash) != seed.base_tree_hash
+        || compute_resolved_tree_hash(&seed.base_tree)
+            .map_err(|error| KinError::Other(error.to_string()))?
+            != tree_hash
+    {
+        return Err(KinError::Other(
+            "snapshot tree does not equal the checked-out commit's tree".to_string(),
+        ));
+    }
+
+    let effective_policy = EffectiveAdmissionPolicyStamp {
+        shared: policy.stamp(),
+        local: local_overlay.stamp(),
+    };
+    let semantic_delta = {
+        let _span = info_span!("kin.init.derive_workspace_semantics").entered();
+        let history = [change.clone()];
+        let target = BootstrapHistoryView::new(&history)
+            .resolve_graph_at(&snapshot_id)
+            .map_err(|error| {
+                KinError::Other(format!("resolve snapshot workspace semantics: {error}"))
+            })?;
+        crate::diff_workspace_semantics(
+            &Default::default(),
+            &Default::default(),
+            &target.entities,
+            &target.relations,
+        )
+        .map_err(|error| KinError::Other(format!("derive snapshot workspace semantics: {error}")))?
+    };
+    let snapshot_target = RefTarget::change(snapshot_id);
+    let head = match &seed.head {
+        kin_model::WorkspaceHead::Symbolic { target } => kin_model::WorkspaceHead::Symbolic {
+            target: target.clone(),
+        },
+        kin_model::WorkspaceHead::Detached { .. } => kin_model::WorkspaceHead::Detached {
+            target: snapshot_target.clone(),
+        },
+    };
+    let tree_deltas = seed
+        .base_tree
+        .artifacts()
+        .map(|artifact| TreeDelta::Added {
+            artifact_id: artifact.artifact_id,
+            new: LocatedEntry::new(artifact.path.clone(), artifact.entry),
+        })
+        .collect::<Vec<_>>();
+
+    // The refs `HEAD` named, each moved from the Git commit to the snapshot.
+    // A symbolic ref in the chain stays symbolic.
+    let material_target = RefTarget::external_object(ExternalObjectId::new(
+        ExternalObjectKind::Commit,
+        commit_oid,
+    ));
+    let ref_mutations = admitted
+        .ref_mutations
+        .iter()
+        .map(|mutation| {
+            let new_target = match &mutation.new_target {
+                Some(target) if target == &material_target => Some(snapshot_target.clone()),
+                Some(target @ RefTarget::Symbolic { .. }) => Some(target.clone()),
+                _ => {
+                    return Err(KinError::Other(format!(
+                        "ref {} does not resolve to the checked-out commit",
+                        mutation.name
+                    )))
+                }
+            };
+            Ok(kin_model::RefMutation {
+                name: mutation.name.clone(),
+                expected: kin_model::RefExpectation::MustNotExist,
+                new_target,
+                policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let transaction = RepositoryTransaction {
+        schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::new(),
+        repository_id: prepared.repository_id().clone(),
+        expected_generation: 0,
+        expected_roots: prepared.initial_roots().clone(),
+        actor: AuthorId::new("kin-git-import"),
+        reason: "admit the checked-out Git commit as a snapshot".to_string(),
+        external_objects,
+        git_snapshot_proofs: vec![snapshot_proof],
+        changes: vec![change],
+        aliases: Vec::new(),
+        git_authority_delta: None,
+        ref_mutations,
+        default_ref_mutation: Some(kin_model::DefaultRefMutation {
+            expected: kin_model::DefaultRefExpectation::MustBeUnset,
+            new_default: Some(prepared.default_ref().clone()),
+        }),
+        workspace_mutation: Some(WorkspaceMutation {
+            workspace_id,
+            expected: WorkspaceExpectation::MustNotExist,
+            new_generation: 0,
+            new_head: head,
+            new_base_target: Some(snapshot_target),
+            new_base_tree_hash: seed.base_tree_hash,
+            tree_deltas,
+            new_tree_hash: tree_hash,
+            semantic_delta,
+            new_shared_admission_policy: policy,
+            new_admission_policy: effective_policy,
+        }),
+        local_overlay_delta: Some(FrozenLocalOverlayDelta::initialize(local_overlay)),
+        merge_transaction_delta: None,
+        sealed_observation: None,
+        collaboration_delta: None,
+    };
+    Ok((transaction, snapshot_id, commit_oid))
 }
 
 /// What the plan says this conversion is about to derive, counted from what
@@ -850,7 +1858,7 @@ fn canonical_new_repository_root(working_dir: &Path) -> Result<std::path::PathBu
     let source = working_dir
         .canonicalize()
         .map_err(|error| KinError::io(working_dir, error))?;
-    let kin_dir = source.join(".kin");
+    let kin_dir = crate::layout::store_root_for(&source);
     match std::fs::symlink_metadata(&kin_dir) {
         Ok(_) => return Err(KinError::AlreadyInitialized(source.display().to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -890,6 +1898,25 @@ fn config_for_source(
     config.git = map_git_coexistence_config(remote_mapping)?;
     config.validate()?;
     Ok(config)
+}
+
+/// Rewrite the Git coexistence section of `layout`'s configuration from the
+/// checkout at `working_dir`, exactly as an admission of that checkout records
+/// it.
+///
+/// For a store reused beside another checkout: its history is the checkout's
+/// own, and its remotes and branch tracking must be too, not the ones of the
+/// checkout it was prepared beside.
+pub fn refresh_git_coexistence_config(layout: &KinLayout, working_dir: &Path) -> Result<()> {
+    let facts = kin_git::git_remote_mapping_facts(&kin_io::WorktreeRoot::new(
+        working_dir,
+        &kin_io::Grant::ambient(),
+    ))
+    .map_err(|error| git_boundary_error("read this checkout's Git remotes", error))?;
+    let mut config = KinConfig::load(&layout.config_path())?;
+    config.git = map_git_coexistence_config(&facts)?;
+    config.validate()?;
+    config.save(&layout.config_path())
 }
 
 fn map_git_coexistence_config(
@@ -1303,6 +2330,43 @@ fn frozen_local_overlay(
         .map_err(|error| KinError::Other(error.to_string()))
 }
 
+/// Wait out a garbage collection Git is running against the source, saying so.
+///
+/// `git commit` starts `git gc --auto` in the background, so a repository made
+/// and committed to by a script a moment ago can still be collecting when
+/// `kin init` reads it. Reading objects a live collection is repacking is the
+/// race the in-progress check exists to avoid, so the conversion waits rather
+/// than refusing at once, and the admission check that follows names the
+/// collection if it is still running. A record left by a collection that is no
+/// longer running is not waited on at all; see [`kin_git::gc_lock`].
+fn wait_out_git_gc(source_root: &kin_io::WorktreeRoot) {
+    let started = std::time::Instant::now();
+    let mut waited_on = None;
+    let mut announce = |running: &kin_git::RunningGitGc| {
+        waited_on = Some(running.pid);
+        crate::init_attempt::disclose_line(&format!(
+            "{}; waiting up to {} s for it to finish before reading this repository's history",
+            running.sentence(),
+            kin_git::GIT_GC_WAIT.as_secs()
+        ));
+    };
+    match kin_git::wait_for_running_git_gc(source_root, kin_git::GIT_GC_WAIT, &mut announce) {
+        Ok(None) => {
+            if let Some(pid) = waited_on {
+                crate::init_attempt::disclose_line(&format!(
+                    "Git garbage collection (pid {pid}) finished after {:.1} s; continuing",
+                    started.elapsed().as_secs_f64()
+                ));
+            }
+        }
+        // Still running: the admission check below refuses and names it.
+        Ok(Some(_)) => {}
+        // The admission check below opens the same repository and reports
+        // whatever stopped this read.
+        Err(error) => tracing::debug!(%error, "could not read Git's garbage collection record"),
+    }
+}
+
 fn git_boundary_error(context: impl std::fmt::Display, error: impl std::fmt::Display) -> KinError {
     KinError::Other(format!("{context}: {error}"))
 }
@@ -1351,13 +2415,10 @@ fn bind_historical_semantics(
 ///
 /// The kill point belongs to the child, not to a parent guessing at it from
 /// outside. A parent that polls the capture directory and signals once it looks
-/// full enough is signalling a live writer, and removing a tree a writer is
-/// still extending is allowed to fail: `remove_staging_tree` retries a bounded
-/// number of times and then leaves the directory carrying its lease for the
-/// next init to reap. The interrupted-init test asserts the directory is gone,
-/// which is the stronger of the two outcomes, so guessing the moment made the
-/// assertion a coin flip and ejected merge-queue batches that had touched no
-/// Rust at all.
+/// full enough may signal an empty capture or a live writer. The barrier proves
+/// this was a real captured closure. Signal cleanup has a bounded deadline even
+/// for a settled tree, so the interrupted-init test also proves that a leased
+/// remainder is reclaimed by the next init's actual staging claim.
 ///
 /// Parking here settles it. The capture holds the entire object closure by this
 /// point and nothing writes into it again, so the signal path's removal is the
@@ -1384,19 +2445,82 @@ fn park_at_capture_barrier(capture: &Path) {
 fn park_at_capture_barrier(_capture: &Path) {}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     use super::*;
 
+    /// Each import gets its own machine, including the subprocess an interrupted
+    /// import starts. Changing this process's environment would leak placement
+    /// into unrelated tests, while sharing a central home lets one fixture survey
+    /// or reclaim another fixture's staging directories.
+    pub(crate) fn run_in_isolated_store(test: &str, placements: &[&str]) -> bool {
+        const CHILD: &str = "KIN_GIT_INIT_LAYOUT_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            let expected = if std::env::var_os("KIN_STORE_LAYOUT").is_some() {
+                crate::layout::StorePlacement::InTree
+            } else {
+                crate::layout::StorePlacement::Central
+            };
+            assert_eq!(crate::layout::default_store_placement(), expected);
+            eprintln!("KIN_GIT_INIT_LAYOUT_EXECUTED={test}");
+            return false;
+        }
+        for placement in placements {
+            let machine = tempfile::tempdir().unwrap();
+            let home = machine.path().join("kin-home");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, test)
+                .env("KIN_HOME", &home)
+                .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
+                .env_remove("KIN_STORE")
+                .env_remove("KIN_ALLOW_PARENT_STORE")
+                .env_remove("KIN_INIT_INTERRUPTED_TEST_SOURCE")
+                .env_remove("KIN_INIT_INTERRUPTED_TEST_BARRIER")
+                .env_remove("KIN_INIT_STAGE_CREATION_TEST_BARRIER");
+            match *placement {
+                "central" => command.env_remove("KIN_STORE_LAYOUT"),
+                "in-tree" => command.env("KIN_STORE_LAYOUT", "in-tree"),
+                other => panic!("unknown fixture placement {other}"),
+            };
+            let output = command.output().expect("run the isolated layout fixture");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{test} ({placement}): {}\n{}\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                stderr.contains(&format!("KIN_GIT_INIT_LAYOUT_EXECUTED={test}")),
+                "the isolated fixture must actually execute: {test} ({placement})"
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{stderr}");
+        }
+        true
+    }
+
+    fn staging_parent(source: &Path) -> std::path::PathBuf {
+        let store = crate::layout::store_root_for(source);
+        crate::layout::store_staging_parent(source, &store).unwrap()
+    }
+
     #[test]
     fn exact_remote_configuration_is_sealed_in_local_kin_config() {
+        if run_in_isolated_store(
+            "git_init::tests::exact_remote_configuration_is_sealed_in_local_kin_config",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         git(
             &source,
             ["remote", "add", "origin", "https://example.invalid/kin.git"],
@@ -1482,13 +2606,18 @@ mod tests {
     /// wrong reason.
     #[test]
     fn source_blockers_are_reported_before_any_history_is_derived() {
+        if run_in_isolated_store(
+            "git_init::tests::source_blockers_are_reported_before_any_history_is_derived",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         let head = git_stdout(&source, ["rev-parse", "HEAD"]);
         std::fs::write(source.join(".git/shallow"), format!("{}\n", head.trim())).unwrap();
         git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
@@ -1500,20 +2629,25 @@ mod tests {
             !error.contains("shallow"),
             "capture must not have run yet: {error}"
         );
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(root.path());
     }
 
     /// One refusal carries every blocker, each with the way out.
     #[test]
     fn every_source_blocker_reaches_the_operator_together() {
+        if run_in_isolated_store(
+            "git_init::tests::every_source_blocker_reaches_the_operator_together",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         git(&source, ["config", "remote.origin.tagOpt", "--tags"]);
         git(&source, ["config", "branch.main.pushRemoteRef", "main"]);
         git(&source, ["config", "filter.demo.clean", "external-clean"]);
@@ -1530,7 +2664,7 @@ mod tests {
             !error.contains("vscode-merge-base"),
             "a classified key must not reach the refusal: {error}"
         );
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(root.path());
     }
 
@@ -1543,14 +2677,16 @@ mod tests {
     /// authority, plus the disclosure that says where the delta went.
     #[test]
     fn a_worked_in_repository_initializes_and_discloses_what_it_did_not_admit() {
+        if run_in_isolated_store("git_init::tests::a_worked_in_repository_initializes_and_discloses_what_it_did_not_admit", &["central"]) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
         std::fs::write(source.join("kept.txt"), b"committed\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         let committed_tree = git_stdout(&source, ["rev-parse", "HEAD^{tree}"]);
 
         std::fs::write(source.join("README.md"), b"edited after the commit\n").unwrap();
@@ -1620,17 +2756,22 @@ mod tests {
     /// than "some file appeared": it has to be the tree the publication admitted.
     #[test]
     fn a_clean_conversion_records_the_complete_admission_it_performed() {
+        if run_in_isolated_store(
+            "git_init::tests::a_clean_conversion_records_the_complete_admission_it_performed",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
         std::fs::write(source.join("kept.txt"), b"committed\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
 
         assert!(
-            !source.join(".kin").exists(),
+            !crate::layout::store_root_for(&source).exists(),
             "the marker lives inside the published store, so there must be none before the \
              conversion or a marker afterwards proves nothing"
         );
@@ -1670,14 +2811,19 @@ mod tests {
     /// working copy.
     #[test]
     fn a_conversion_with_an_uncommitted_change_records_no_admission() {
+        if run_in_isolated_store(
+            "git_init::tests::a_conversion_with_an_uncommitted_change_records_no_admission",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
         std::fs::write(source.join("kept.txt"), b"committed\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         // One modification to a tracked file, which is the smallest thing that
         // makes the admitted committed tree differ from the working copy.
         std::fs::write(source.join("README.md"), b"edited after the commit\n").unwrap();
@@ -1701,22 +2847,27 @@ mod tests {
         );
     }
 
-    /// An init killed mid-capture leaves neither `.kin` nor a capture directory.
+    /// An init killed mid-capture publishes nothing and leaves no stranded
+    /// capture after the next init's staging claim.
     ///
     /// The reported failure was exactly this: a `SIGTERM` left no `.kin`, so
     /// the store stayed atomic, and stranded the whole captured object closure
     /// beside the repository where nothing named it for a day.
     ///
-    /// The child picks the moment. It captures the whole source, publishes the
-    /// directory it staged, and blocks there, so the signal always lands on a
-    /// capture tree that is complete and settled. Guessing that moment from
-    /// outside was the flake: a parent polling for "enough files" signalled a
-    /// live writer, and removal against a live writer may give up and leave the
-    /// directory leased for the next init's reap, which is weaker than what
-    /// this test asserts.
+    /// The child captures the whole source and parks on a complete, settled
+    /// tree. Cleanup may spend its two-second budget under contention, so both
+    /// allowed outcomes are checked: immediate removal or a disclosed capture
+    /// whose released lease lets the next init reclaim it. Neither may publish
+    /// a partial store or change the source.
     #[cfg(unix)]
     #[test]
     fn an_init_killed_mid_capture_leaves_no_kin_and_no_capture_directory() {
+        if run_in_isolated_store(
+            "git_init::tests::an_init_killed_mid_capture_leaves_no_kin_and_no_capture_directory",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -1731,13 +2882,14 @@ mod tests {
             )
             .unwrap();
         }
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
+        let original_head = git_stdout(&source, ["rev-parse", "HEAD"]);
 
         let barrier = root.path().join("capture-barrier");
         let mut child = ParkedChild::spawn(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("git_init::tests::interrupted_init_subprocess")
+                .arg("--exact")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
                 .env("KIN_INIT_INTERRUPTED_TEST_SOURCE", &source)
@@ -1768,15 +2920,57 @@ mod tests {
             "the interrupted init must still die of its signal: {status:?}"
         );
         assert!(
-            !source.join(".kin").exists(),
+            !crate::layout::store_root_for(&source).exists(),
             "an interrupted init must publish nothing"
         );
+        let diagnostics = child.diagnostics();
+        assert!(diagnostics.contains("kin init: stopped by SIGTERM"));
+        if staged.exists() {
+            assert_eq!(
+                crate::init_staging::capture_lease_is_abandoned(&staged),
+                Ok(true),
+                "a capture left by signal cleanup must have a valid, released lease\n\
+                 child stderr:\n{diagnostics}"
+            );
+            assert!(
+                diagnostics.contains(&format!(
+                    "left {} for the next kin init to remove because ",
+                    staged.display()
+                )),
+                "a leftover capture must be named with its actual cleanup refusal:\n{diagnostics}"
+            );
+        } else {
+            assert!(diagnostics.contains("removed its Git capture directory"));
+        }
+        // This is the recovery boundary every real init enters before capturing
+        // anything. Repeating the entire conversion would add no recovery proof.
+        let next = crate::init_staging::GitCaptureStaging::claim(staged.parent().unwrap())
+            .expect("the next init reclaims abandoned captures before claiming its own");
         assert!(
             !staged.exists(),
-            "{} survived the interrupted init",
-            staged.display()
+            "{} survived the next init's recovery\nchild stderr:\n{diagnostics}",
+            staged.display(),
         );
+        assert_eq!(
+            crate::init_staging::capture_lease_is_abandoned(next.path()),
+            Ok(false),
+            "the next init owns its new capture"
+        );
+        drop(next);
         assert_no_staging_directories(root.path());
+        assert!(
+            !crate::layout::store_root_for(&source).exists(),
+            "recovery must publish nothing"
+        );
+        assert_eq!(git_stdout(&source, ["rev-parse", "HEAD"]), original_head);
+        assert!(git_stdout(&source, ["status", "--porcelain"]).is_empty());
+        for index in 0..400 {
+            assert_eq!(
+                std::fs::read(source.join(format!("body-{index:04}.txt"))).unwrap(),
+                format!("exact source body {index}\n").repeat(64).as_bytes(),
+                "interruption and recovery must preserve source body {index}"
+            );
+        }
     }
 
     /// An init subprocess killed when it goes out of scope.
@@ -1787,17 +2981,23 @@ mod tests {
     /// out, so a reaped process is never signalled again under a pid something
     /// else has since been given.
     #[cfg(unix)]
-    struct ParkedChild(Option<std::process::Child>);
+    struct ParkedChild(Option<std::process::Child>, tempfile::NamedTempFile);
 
     #[cfg(unix)]
     impl ParkedChild {
         fn spawn(command: &mut std::process::Command) -> Self {
+            let diagnostics = tempfile::NamedTempFile::new().expect("create child diagnostic log");
             let child = command
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(diagnostics.reopen().expect("open child diagnostic log"))
                 .spawn()
                 .expect("spawn the interrupted init");
-            Self(Some(child))
+            Self(Some(child), diagnostics)
+        }
+
+        fn diagnostics(&self) -> String {
+            std::fs::read_to_string(self.1.path())
+                .unwrap_or_else(|error| format!("child diagnostic log unavailable: {error}"))
         }
 
         fn live(&mut self) -> &mut std::process::Child {
@@ -1910,6 +3110,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_init_killed_before_stage_owner_publication_is_reclaimed() {
+        if run_in_isolated_store(
+            "git_init::tests::an_init_killed_before_stage_owner_publication_is_reclaimed",
+            &["central"],
+        ) {
+            return;
+        }
         use std::os::unix::process::ExitStatusExt;
 
         let held = tempfile::tempdir().unwrap();
@@ -1919,8 +3125,7 @@ mod tests {
         initialize_git(&source);
         let original = b"exact source survives interrupted staging\n";
         std::fs::write(source.join("README.md"), original).unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
 
         let barrier = root.join("stage-created");
         let mut child = ParkedChild::spawn(
@@ -1950,14 +3155,15 @@ mod tests {
         );
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
         assert_eq!(child.wait().signal(), Some(libc::SIGKILL));
-        assert!(!source.join(".kin").exists());
-        let attempts = crate::init_attempt::abandoned_init_attempts(&root).unwrap();
+        assert!(!crate::layout::store_root_for(&source).exists());
+        let attempts =
+            crate::init_attempt::abandoned_init_attempts(&staging_parent(&source)).unwrap();
         assert_eq!(attempts.len(), 1);
         let record = attempts[0].record.as_ref().unwrap();
         assert_eq!(record.phase_index, 8);
         init_from_git(&source).unwrap();
         assert_eq!(std::fs::read(source.join("README.md")).unwrap(), original);
-        assert!(source.join(".kin").exists());
+        assert!(crate::layout::store_root_for(&source).exists());
         eprintln!(
             "after the next init: stage_exists={} owner_exists={}",
             stage.exists(),
@@ -1993,6 +3199,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_live_init_between_its_stage_and_its_owner_record_is_not_reclaimed() {
+        if run_in_isolated_store(
+            "git_init::tests::a_live_init_between_its_stage_and_its_owner_record_is_not_reclaimed",
+            &["central"],
+        ) {
+            return;
+        }
         use std::os::unix::process::ExitStatusExt;
 
         let held = tempfile::tempdir().unwrap();
@@ -2001,8 +3213,7 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"a live init holds its lock\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
 
         let barrier = root.join("stage-created");
         let mut child = ParkedChild::spawn(
@@ -2062,6 +3273,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_init_the_kernel_kills_leaves_a_phase_the_next_run_can_read() {
+        if run_in_isolated_store(
+            "git_init::tests::an_init_the_kernel_kills_leaves_a_phase_the_next_run_can_read",
+            &["central"],
+        ) {
+            return;
+        }
         let held = tempfile::tempdir().unwrap();
         // Canonical throughout, because init canonicalizes its source before it
         // records anything and a test comparing `/var` against `/private/var`
@@ -2071,8 +3288,7 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
 
         let barrier = root.join("capture-barrier");
         let mut child = ParkedChild::spawn(
@@ -2095,7 +3311,7 @@ mod tests {
             "the child must have died of the signal, not finished: {status:?}"
         );
         assert!(
-            !source.join(".kin").exists(),
+            !crate::layout::store_root_for(&source).exists(),
             "the fixture is the killed case only if no repository was published"
         );
         assert!(
@@ -2104,7 +3320,8 @@ mod tests {
              possible and is the disk this fix reclaims"
         );
 
-        let abandoned = crate::init_attempt::abandoned_init_attempts(&root).unwrap();
+        let abandoned =
+            crate::init_attempt::abandoned_init_attempts(&staging_parent(&source)).unwrap();
         assert_eq!(
             abandoned.len(),
             1,
@@ -2152,9 +3369,9 @@ mod tests {
 
         // The next init reclaims what the kill stranded and converts anyway.
         init_from_git(&source).unwrap();
-        assert!(source.join(".kin").exists());
+        assert!(crate::layout::store_root_for(&source).exists());
         assert!(
-            crate::init_attempt::abandoned_init_attempts(&root)
+            crate::init_attempt::abandoned_init_attempts(&staging_parent(&source))
                 .unwrap()
                 .is_empty(),
             "the re-run must leave no interrupted attempt behind"
@@ -2166,14 +3383,21 @@ mod tests {
     /// by the next real init rather than accumulating beside the repository.
     #[test]
     fn a_stale_capture_directory_is_reaped_by_the_next_init() {
+        if run_in_isolated_store(
+            "git_init::tests::a_stale_capture_directory_is_reaped_by_the_next_init",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
-        let stale = root.path().join(".kin-git-capture-Stranded");
+        commit_all(&source, "initial");
+        let staging_parent = staging_parent(&source);
+        std::fs::create_dir_all(&staging_parent).unwrap();
+        let stale = staging_parent.join(".kin-git-capture-Stranded");
         std::fs::create_dir(&stale).unwrap();
         std::fs::write(stale.join("capture.lease"), b"").unwrap();
         std::fs::create_dir(stale.join("objects")).unwrap();
@@ -2181,7 +3405,7 @@ mod tests {
 
         init_from_git(&source).unwrap();
 
-        assert!(source.join(".kin").exists());
+        assert!(crate::layout::store_root_for(&source).exists());
         assert!(
             !stale.exists(),
             "an abandoned capture directory must not survive the next init"
@@ -2231,19 +3455,19 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         source
     }
 
-    /// A repository under a directory this user cannot write, which is how
-    /// `/workspaces/<name>` and `/app` look to a non-root user in the common
-    /// devcontainer and Docker layouts, is turned away by name before any
-    /// work, rather than by a raw `Permission denied` on the first staging
-    /// create.
+    /// In-tree placement needs to stage beside the checkout and refuses a
+    /// read-only parent by name. Default central placement stages in its own
+    /// writable home and must still admit the same checkout.
     #[cfg(unix)]
     #[test]
     fn a_repository_under_a_read_only_parent_is_refused_by_name_before_any_work() {
+        if run_in_isolated_store("git_init::tests::a_repository_under_a_read_only_parent_is_refused_by_name_before_any_work", &["central", "in-tree"]) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("workspaces");
         std::fs::create_dir(&parent).unwrap();
@@ -2253,7 +3477,21 @@ mod tests {
             return;
         };
 
-        let error = init_from_git(&source).unwrap_err().to_string();
+        let admission = init_from_git(&source);
+        if crate::layout::default_store_placement() == crate::layout::StorePlacement::Central {
+            let result = admission.expect("central storage does not write the source parent");
+            assert_eq!(result.layout.root(), crate::layout::store_root_for(&source));
+            assert!(result.layout.root().is_dir());
+            assert!(!source.join(".kin").exists());
+            assert_eq!(
+                std::fs::read(source.join("README.md")).unwrap(),
+                b"exact source\n"
+            );
+            assert!(git_stdout(&source, ["status", "--porcelain"]).is_empty());
+            assert_no_staging_directories(&parent);
+            return;
+        }
+        let error = admission.unwrap_err().to_string();
 
         let parent_shown = parent.canonicalize().unwrap().display().to_string();
         assert!(error.contains("kin init cannot start"), "{error}");
@@ -2270,15 +3508,22 @@ mod tests {
             !error.starts_with("IO error"),
             "a raw filesystem error is what this replaces: {error}"
         );
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(&parent);
     }
 
-    /// The publication half: a repository root that refuses new entries used
-    /// to run the whole conversion and fail only at the final rename.
+    /// The in-tree publication half refuses before conversion if its destination
+    /// cannot accept a store. Default central publication writes outside that
+    /// read-only checkout and must succeed without changing it.
     #[cfg(unix)]
     #[test]
     fn a_read_only_repository_root_is_refused_before_the_conversion_runs() {
+        if run_in_isolated_store(
+            "git_init::tests::a_read_only_repository_root_is_refused_before_the_conversion_runs",
+            &["central", "in-tree"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = committed_source(root.path());
         let Some(_read_only) = ReadOnlyDirectory::hold(&source) else {
@@ -2286,7 +3531,21 @@ mod tests {
             return;
         };
 
-        let error = init_from_git(&source).unwrap_err().to_string();
+        let admission = init_from_git(&source);
+        if crate::layout::default_store_placement() == crate::layout::StorePlacement::Central {
+            let result = admission.expect("central storage does not write the source root");
+            assert_eq!(result.layout.root(), crate::layout::store_root_for(&source));
+            assert!(result.layout.root().is_dir());
+            assert!(!source.join(".kin").exists());
+            assert_eq!(
+                std::fs::read(source.join("README.md")).unwrap(),
+                b"exact source\n"
+            );
+            assert!(git_stdout(&source, ["status", "--porcelain"]).is_empty());
+            assert_no_staging_directories(root.path());
+            return;
+        }
+        let error = admission.unwrap_err().to_string();
 
         let store = source.canonicalize().unwrap().join(".kin");
         assert!(error.contains("kin init cannot start"), "{error}");
@@ -2301,13 +3560,18 @@ mod tests {
     /// An ambiguous source still refuses, and says so before deriving anything.
     #[test]
     fn an_in_progress_git_operation_still_refuses() {
+        if run_in_isolated_store(
+            "git_init::tests::an_in_progress_git_operation_still_refuses",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         let head = git_stdout(&source, ["rev-parse", "HEAD"]);
         std::fs::write(source.join(".git/MERGE_HEAD"), format!("{}\n", head.trim())).unwrap();
 
@@ -2318,19 +3582,24 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("finish or abort"), "{error}");
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(root.path());
     }
 
     #[test]
     fn unsafe_remote_configuration_fails_before_staging_without_disclosure() {
+        if run_in_isolated_store(
+            "git_init::tests::unsafe_remote_configuration_fails_before_staging_without_disclosure",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         git(
             &source,
             [
@@ -2345,19 +3614,24 @@ mod tests {
 
         assert!(error.contains("safe exact subset"), "{error}");
         assert!(!error.contains("super-secret"), "{error}");
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(root.path());
     }
 
     #[test]
     fn same_count_remote_url_drift_at_final_proof_blocks_publication() {
+        if run_in_isolated_store(
+            "git_init::tests::same_count_remote_url_drift_at_final_proof_blocks_publication",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
         git(
             &source,
             ["remote", "add", "origin", "https://example.invalid/kin.git"],
@@ -2380,7 +3654,7 @@ mod tests {
 
         assert!(error.contains("source proof changed"), "{error}");
         assert!(!error.contains("changed.example.invalid"), "{error}");
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(root.path());
     }
 
@@ -2402,13 +3676,21 @@ mod tests {
     /// the rest of the suite is the one it is testing and no wider.
     #[test]
     fn a_moving_ambient_git_scope_does_not_move_the_admission_proof() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
+        if run_in_isolated_store(
+            "git_init::tests::a_moving_ambient_git_scope_does_not_move_the_admission_proof",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
 
         let elsewhere = tempfile::tempdir().unwrap();
         let global_config = elsewhere.path().join("global.gitconfig");
@@ -2427,7 +3709,7 @@ mod tests {
         drop(ambient);
 
         result.unwrap();
-        assert!(source.join(".kin").is_dir());
+        assert!(crate::layout::store_root_for(&source).is_dir());
         assert_no_staging_directories(root.path());
     }
 
@@ -2439,13 +3721,18 @@ mod tests {
     /// assertion names the sentence the comparison produces.
     #[test]
     fn source_drift_immediately_after_publication_is_detected_fail_loud() {
+        if run_in_isolated_store(
+            "git_init::tests::source_drift_immediately_after_publication_is_detected_fail_loud",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"exact source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "initial"]);
+        commit_all(&source, "initial");
 
         let source_for_hook = source.clone();
         let error = init_from_git_with_hooks(
@@ -2468,12 +3755,18 @@ mod tests {
                 .contains("changed across repository publication"),
             "{error}"
         );
-        assert!(source.join(".kin").is_dir());
+        assert!(crate::layout::store_root_for(&source).is_dir());
         assert_no_staging_directories(root.path());
     }
 
     #[test]
     fn pristine_unborn_repository_without_an_index_initializes_atomically() {
+        if run_in_isolated_store(
+            "git_init::tests::pristine_unborn_repository_without_an_index_initializes_atomically",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -2485,12 +3778,18 @@ mod tests {
         assert_eq!(result.authority.receipt.generation, 1);
         assert!(result.authority.workspace.base_target.is_none());
         assert!(result.authority.workspace.base_tree_hash.is_none());
-        assert!(source.join(".kin").is_dir());
+        assert!(crate::layout::store_root_for(&source).is_dir());
         assert_no_staging_directories(root.path());
     }
 
     #[test]
     fn born_empty_commit_keeps_a_present_empty_tree_identity() {
+        if run_in_isolated_store(
+            "git_init::tests::born_empty_commit_keeps_a_present_empty_tree_identity",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -2520,6 +3819,9 @@ mod tests {
 
     #[test]
     fn detached_annotated_tag_keeps_raw_tag_authority_and_seeds_the_peeled_commit() {
+        if run_in_isolated_store("git_init::tests::detached_annotated_tag_keeps_raw_tag_authority_and_seeds_the_peeled_commit", &["central"]) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -2576,6 +3878,9 @@ mod tests {
 
     #[test]
     fn symbolic_annotated_tag_keeps_raw_ref_authority_and_seeds_the_peeled_commit() {
+        if run_in_isolated_store("git_init::tests::symbolic_annotated_tag_keeps_raw_ref_authority_and_seeds_the_peeled_commit", &["central"]) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -2640,6 +3945,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn byte_symbolic_git_head_is_reported_exactly_without_inventing_main() {
+        if run_in_isolated_store(
+            "git_init::tests::byte_symbolic_git_head_is_reported_exactly_without_inventing_main",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -2675,6 +3986,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn private_git_repository_keeps_staged_and_published_authority_owner_only() {
+        if run_in_isolated_store("git_init::tests::private_git_repository_keeps_staged_and_published_authority_owner_only", &["central"]) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -2683,10 +3997,9 @@ mod tests {
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
         initialize_git(&source);
         std::fs::write(source.join("README.md"), b"private source\n").unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "private history"]);
+        commit_all(&source, "private history");
 
-        let staging_parent = root.path().to_path_buf();
+        let staging_parent = staging_parent(&source);
         let result = init_from_git_with_hook(&source, None, move || {
             let staging = std::fs::read_dir(&staging_parent)
                 .unwrap()
@@ -2724,6 +4037,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exact_git_init_admits_polyglot_non_code_and_opaque_history_atomically() {
+        if run_in_isolated_store("git_init::tests::exact_git_init_admits_polyglot_non_code_and_opaque_history_atomically", &["central"]) {
+            return;
+        }
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         use std::os::unix::fs::{symlink, PermissionsExt};
@@ -2765,8 +4081,7 @@ mod tests {
             // pretending the local checkout can materialize it.
             None
         };
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "mixed exact tree"]);
+        commit_all(&source, "mixed exact tree");
 
         std::fs::create_dir_all(source.join("containers")).unwrap();
         git(&source, ["mv", "Dockerfile", "containers/Dockerfile"]);
@@ -2775,8 +4090,7 @@ mod tests {
             b"services:\n  api:\n    build:\n      context: .\n",
         )
         .unwrap();
-        git(&source, ["add", "--all"]);
-        git(&source, ["commit", "-m", "move build artifact"]);
+        commit_all(&source, "move build artifact");
         std::fs::write(source.join("scratch.tmp"), b"ignored local state\n").unwrap();
 
         let result = init_from_git(&source).unwrap();
@@ -2784,7 +4098,7 @@ mod tests {
         assert_eq!(result.authority.receipt.generation, 1);
         assert!(result.authority.initial_change_id.is_some());
         assert!(!result.authority.workspace.is_dirty());
-        assert!(source.join(".kin").is_dir());
+        assert!(crate::layout::store_root_for(&source).is_dir());
         assert_no_staging_directories(root.path());
 
         let backend = Arc::new(LocalFileBackend::new(result.layout.kindb_dir()));
@@ -2877,19 +4191,20 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
         symlink("src/lib.rs", source.join("source-link")).unwrap();
-        git(source, ["add", "--all"]);
-        git(source, ["commit", "-m", "exact tree with every shape"]);
+        commit_all(source, "exact tree with every shape");
 
         // A second revision so a body that no longer appears at the workspace
         // head still belongs to the admitted closure.
         std::fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 43 }\n").unwrap();
-        git(source, ["add", "--all"]);
-        git(source, ["commit", "-m", "second revision"]);
+        commit_all(source, "second revision");
     }
 
     #[cfg(unix)]
     #[test]
     fn admitted_repository_owns_every_historical_body_without_the_source_git_repository() {
+        if run_in_isolated_store("git_init::tests::admitted_repository_owns_every_historical_body_without_the_source_git_repository", &["central"]) {
+            return;
+        }
         use std::sync::Arc;
 
         use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
@@ -2972,6 +4287,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admission_fails_closed_when_a_body_never_reaches_graph_storage() {
+        if run_in_isolated_store(
+            "git_init::tests::admission_fails_closed_when_a_body_never_reaches_graph_storage",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -2995,13 +4316,16 @@ mod tests {
             "the failure must name the unsealed path, got: {message}"
         );
         // Fail closed means nothing was published.
-        assert!(!source.join(".kin").exists());
+        assert!(!crate::layout::store_root_for(&source).exists());
         assert_no_staging_directories(root.path());
     }
 
     #[cfg(unix)]
     #[test]
     fn a_body_lost_across_publication_is_refused_before_the_published_seal_reads_it() {
+        if run_in_isolated_store("git_init::tests::a_body_lost_across_publication_is_refused_before_the_published_seal_reads_it", &["central"]) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -3022,7 +4346,7 @@ mod tests {
             _ => panic!("fixture Git returned an unsupported object ID algorithm"),
         };
         let external_object = ExternalObjectId::new(ExternalObjectKind::Blob, external_oid);
-        let published_kin_dir = source.join(".kin");
+        let published_kin_dir = crate::layout::store_root_for(&source);
         let error = init_from_git_with_hooks(
             &source,
             None,
@@ -3054,13 +4378,19 @@ mod tests {
             error,
             KinError::RepositoryPublishedButUncertain { .. }
         ));
-        assert!(source.join(".kin").is_dir());
+        assert!(crate::layout::store_root_for(&source).is_dir());
         assert_no_staging_directories(root.path());
     }
 
     #[cfg(unix)]
     #[test]
     fn published_closure_divergence_fails_loud_as_published_but_uncertain() {
+        if run_in_isolated_store(
+            "git_init::tests::published_closure_divergence_fails_loud_as_published_but_uncertain",
+            &["central"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -3085,7 +4415,7 @@ mod tests {
             error,
             KinError::RepositoryPublishedButUncertain { .. }
         ));
-        assert!(source.join(".kin").is_dir());
+        assert!(crate::layout::store_root_for(&source).is_dir());
         assert_no_staging_directories(root.path());
     }
 
@@ -3126,6 +4456,12 @@ mod tests {
 
     #[test]
     fn enrichment_summary_reads_spooled_history_without_materializing_it() {
+        if run_in_isolated_store(
+            "git_init::tests::enrichment_summary_reads_spooled_history_without_materializing_it",
+            &["central"],
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -3174,6 +4510,9 @@ mod tests {
     /// of it and nothing more, which is the gap the phase-4 refusal closes.
     #[test]
     fn the_capture_takes_every_ref_and_the_phase_one_survey_walks_head_alone() {
+        if run_in_isolated_store("git_init::tests::the_capture_takes_every_ref_and_the_phase_one_survey_walks_head_alone", &["central"]) {
+            return;
+        }
         use std::collections::BTreeSet;
 
         let root = tempfile::tempdir().unwrap();
@@ -3252,7 +4591,7 @@ mod tests {
 
         let store = BlobStore::new_ephemeral(root.path().join("capture")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &source,
+            &worktree(&source),
             RepositoryId::new("ref-universe").unwrap(),
             &store,
         )
@@ -3332,12 +4671,513 @@ mod tests {
         assert!(captured.commits > head.commits && captured.object_bytes > head.history_bytes);
     }
 
+    /// Open a published store's authority, for a test to read what it holds.
+    fn published_authority(
+        layout: &KinLayout,
+        repository_id: &RepositoryId,
+    ) -> RepositoryAuthorityManager<LocalFileBackend> {
+        crate::repository_authority::open_persisted_local_repository_authority(
+            repository_id.clone(),
+            Arc::new(LocalFileBackend::new(layout.kindb_dir())),
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn a_checked_out_commit_store_derives_and_attaches_its_complete_history() {
+        if run_in_isolated_store(
+            "git_init::tests::a_checked_out_commit_store_derives_and_attaches_its_complete_history",
+            &["central"],
+        ) {
+            return;
+        }
+        use crate::history_state::{self, HistoryMode, HistoryStanding};
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("a.py"), b"def a():\n    return 1\n").unwrap();
+        // A committed test key, the kind of file a complete admission trusts
+        // because Git holds it and a native snapshot would otherwise refuse.
+        std::fs::create_dir(source.join("certs")).unwrap();
+        std::fs::write(source.join("certs/test.key"), b"fixture key material\n").unwrap();
+        commit_all(&source, "first");
+        let first = git_stdout(&source, ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        std::fs::write(
+            source.join("b.py"),
+            b"from a import a\n\ndef b():\n    return a()\n",
+        )
+        .unwrap();
+        commit_all(&source, "second");
+        let head = git_stdout(&source, ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+
+        let partial = init_current_commit_from_git(&source, None, HistoryMode::Background).unwrap();
+
+        // One snapshot, a workspace sitting on it clean, and a record that says
+        // exactly where the admitted history stops.
+        let HistoryStanding::Partial { record, .. } = history_state::standing(&partial.layout)
+        else {
+            panic!("a checked-out-commit store must record partial history");
+        };
+        assert_eq!(record.mode, HistoryMode::Background);
+        assert_eq!(record.source_commit, head);
+        assert_eq!(record.boundary_parents, vec![first]);
+        assert_eq!(record.reachable_commits, Some(2));
+        assert_eq!(record.source_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            partial.authority.semantic_enrichment.semantic_change_count,
+            1
+        );
+        assert!(partial.workspace_divergence.is_empty());
+        assert_eq!(
+            Some(record.snapshot_change.clone()),
+            partial.authority.initial_change_id.map(|id| id.to_string())
+        );
+        {
+            // No Git history is claimed: no Git authority, no alias, and the
+            // one change is native.
+            let authority = published_authority(&partial.layout, &partial.repository_id);
+            let lease = authority.read_authority();
+            assert!(lease.metadata().git_external_authority.is_none());
+            assert!(lease.metadata().aliases.is_empty());
+            let ids = lease.snapshot().changes.change_ids().unwrap();
+            let change = lease
+                .snapshot()
+                .changes
+                .read_change(&ids[0])
+                .unwrap()
+                .unwrap();
+            assert_eq!(change.origin, kin_model::ChangeOrigin::Native);
+            assert!(change.parents.is_empty());
+            // The committed key is approved by its exact path, naming the commit.
+            let workspace = &lease.metadata().workspaces[0];
+            let allowances = &workspace.shared_admission_policy.sensitive_allowances;
+            assert_eq!(allowances.len(), 1, "{allowances:?}");
+            assert_eq!(allowances[0].path.to_string(), "certs/test.key");
+            assert!(allowances[0].reason.contains(&head));
+        }
+
+        // A store holding stashes would lose them, so it is not replaced.
+        let stage =
+            crate::history_attach::new_stage_parent(&source, partial.repository_id.as_str())
+                .unwrap();
+        let complete = derive_complete_history_into_stage(
+            &source,
+            partial.layout.root(),
+            &partial.repository_id,
+            &stage,
+        )
+        .unwrap();
+        assert_eq!(complete.repository_id, partial.repository_id);
+        assert_eq!(
+            complete.authority.semantic_enrichment.semantic_change_count,
+            2
+        );
+        // The checked-out tree means the same thing to both stores.
+        assert_eq!(
+            complete.authority.semantic_enrichment.entity_count,
+            partial.authority.semantic_enrichment.entity_count
+        );
+        assert_eq!(
+            complete.authority.semantic_enrichment.relation_count,
+            partial.authority.semantic_enrichment.relation_count
+        );
+        assert!(history_state::standing(&complete.layout).is_complete());
+
+        std::fs::write(partial.layout.stashes_dir().join("held"), b"stash").unwrap();
+        let refused =
+            crate::history_attach::attach_staged_history(&partial.layout, &stage).unwrap_err();
+        assert!(refused.to_string().contains("stashes"), "{refused}");
+        assert!(!history_state::standing(&partial.layout).is_complete());
+        std::fs::remove_file(partial.layout.stashes_dir().join("held")).unwrap();
+
+        assert_eq!(
+            crate::history_attach::attach_staged_history(&partial.layout, &stage).unwrap(),
+            crate::history_attach::AttachOutcome::Attached
+        );
+        assert!(history_state::standing(&partial.layout).is_complete());
+        assert!(!stage.exists());
+        let authority = published_authority(&partial.layout, &partial.repository_id);
+        let lease = authority.read_authority();
+        assert_eq!(lease.snapshot().changes.len(), 2);
+        assert!(lease.metadata().git_external_authority.is_some());
+        assert_eq!(lease.metadata().aliases.len(), 2);
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn a_root_commit_keeps_git_tracked_ignored_paths_without_extra_history() {
+        if run_in_isolated_store(
+            "git_init::tests::a_root_commit_keeps_git_tracked_ignored_paths_without_extra_history",
+            &["central"],
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::create_dir_all(source.join("compiler/apps/.vscode")).unwrap();
+        std::fs::write(source.join("compiler/.gitignore"), b".vscode\n").unwrap();
+        std::fs::write(
+            source.join("compiler/apps/.vscode/extensions.json"),
+            b"{}\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("a.py"), b"def a():\n    return 1\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(
+            &source,
+            ["add", "-f", "compiler/apps/.vscode/extensions.json"],
+        );
+        git(&source, ["commit", "-m", "tracked ignored fixture"]);
+        assert!(checked_out_commit_is_entire_repository(&source));
+        git(&source, ["branch", "other"]);
+        assert!(!checked_out_commit_is_entire_repository(&source));
+        git(&source, ["branch", "-D", "other"]);
+        git(&source, ["tag", "extra"]);
+        assert!(!checked_out_commit_is_entire_repository(&source));
+        git(&source, ["tag", "-d", "extra"]);
+        git(&source, ["checkout", "--detach"]);
+        assert!(!checked_out_commit_is_entire_repository(&source));
+        git(&source, ["checkout", "main"]);
+        let result =
+            init_current_commit_from_git(&source, None, crate::history_state::HistoryMode::None)
+                .unwrap();
+        assert!(crate::history_state::standing(&result.layout).is_complete());
+        let authority = published_authority(&result.layout, &result.repository_id);
+        let lease = authority.read_authority();
+        assert_eq!(lease.snapshot().changes.len(), 1);
+        assert!(lease.metadata().git_external_authority.is_some());
+        assert!(lease.metadata().workspaces[0]
+            .tree
+            .artifacts()
+            .any(|artifact| {
+                artifact.path.to_string() == "compiler/apps/.vscode/extensions.json"
+            }));
+        assert!(lease.metadata().workspaces[0]
+            .shared_admission_policy
+            .sources
+            .iter()
+            .any(|rule| rule.path.to_string() == "compiler/.gitignore"));
+    }
+
+    /// A clone with history takes the snapshot path, which makes the checked-out
+    /// commit a native change. Ignore rules bind only untracked paths, as in
+    /// Git, so a committed file under an ignored directory is still admitted
+    /// by the exact snapshot proof; the committed key keeps exactly the
+    /// sensitive allowance it had; and the store holds the commit's
+    /// tree, path for path and byte for byte. React's
+    /// `compiler/apps/playground/.vscode/extensions.json` is this case.
+    #[test]
+    fn a_snapshot_keeps_committed_files_under_ignored_directories() {
+        if run_in_isolated_store(
+            "git_init::tests::a_snapshot_keeps_committed_files_under_ignored_directories",
+            &["central"],
+        ) {
+            return;
+        }
+        use crate::history_state::{self, HistoryMode, HistoryStanding};
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("a.py"), b"def a():\n    return 1\n").unwrap();
+        std::fs::create_dir(source.join("certs")).unwrap();
+        std::fs::write(source.join("certs/test.key"), b"fixture key material\n").unwrap();
+        commit_all(&source, "first");
+        std::fs::create_dir_all(source.join("compiler/apps/playground/.vscode")).unwrap();
+        std::fs::write(source.join("compiler/.gitignore"), b".vscode\n").unwrap();
+        let committed = b"{\"recommendations\": []}\n";
+        std::fs::write(
+            source.join("compiler/apps/playground/.vscode/extensions.json"),
+            committed,
+        )
+        .unwrap();
+        let local_rules = b"local-cache/\n";
+        std::fs::write(source.join(".git/info/exclude"), local_rules).unwrap();
+        std::fs::create_dir(source.join("local-cache")).unwrap();
+        std::fs::write(source.join("local-cache/config.json"), b"{}\n").unwrap();
+        std::fs::write(source.join("local-cache/untracked.json"), b"untracked\n").unwrap();
+        git(&source, ["add", "--all"]);
+        git(
+            &source,
+            [
+                "add",
+                "-f",
+                "compiler/apps/playground/.vscode/extensions.json",
+                "local-cache/config.json",
+            ],
+        );
+        git(&source, ["commit", "-m", "second"]);
+        let head = git_stdout(&source, ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert!(!checked_out_commit_is_entire_repository(&source));
+        let parent = git_stdout(&source, ["rev-parse", "HEAD^"])
+            .trim()
+            .to_string();
+        let mut expected_objects: std::collections::BTreeSet<String> =
+            git_stdout(&source, ["ls-tree", "-r", "-t", "HEAD"])
+                .lines()
+                .map(|line| line.split_whitespace().nth(2).unwrap().to_string())
+                .collect();
+        expected_objects.insert(head.clone());
+        expected_objects.insert(
+            git_stdout(&source, ["rev-parse", "HEAD^{tree}"])
+                .trim()
+                .to_string(),
+        );
+
+        let result = init_current_commit_from_git(&source, None, HistoryMode::None).unwrap();
+        assert!(matches!(
+            history_state::standing(&result.layout),
+            HistoryStanding::Partial { .. }
+        ));
+        let authority = published_authority(&result.layout, &result.repository_id);
+        let lease = authority.read_authority();
+        let ids = lease.snapshot().changes.change_ids().unwrap();
+        let change = lease
+            .snapshot()
+            .changes
+            .read_change(&ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(change.origin, kin_model::ChangeOrigin::Native);
+        assert!(change.parents.is_empty());
+        assert!(lease.metadata().git_external_authority.is_none());
+        assert!(lease.metadata().aliases.is_empty());
+        let snapshot_proof = lease
+            .metadata()
+            .git_snapshot_proofs
+            .first()
+            .unwrap()
+            .clone();
+        assert_eq!(lease.metadata().git_snapshot_proofs.len(), 1);
+        assert_eq!(snapshot_proof.repository_id, result.repository_id);
+        assert_eq!(snapshot_proof.snapshot_change_id, change.id);
+        assert_eq!(snapshot_proof.source_commit.to_string(), head);
+        snapshot_proof
+            .validate_for_repository(&result.repository_id)
+            .unwrap();
+        let retained = &lease.metadata().external_objects;
+        assert_eq!(
+            snapshot_proof
+                .objects
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            retained
+                .iter()
+                .map(|record| record.object)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let retained_ids: std::collections::BTreeSet<_> = retained
+            .iter()
+            .map(|record| record.object.oid.to_string())
+            .collect();
+        assert_eq!(retained_ids, expected_objects);
+        assert!(
+            !retained_ids.contains(&parent),
+            "a snapshot must not claim parent closure"
+        );
+        for record in retained {
+            let body = authority
+                .load_source_blob(record.body_hash)
+                .unwrap()
+                .unwrap();
+            record.validate_raw(&body).unwrap();
+        }
+        let local_rule_hash = Hash256::from_bytes(kin_blobs::digest_bytes(local_rules));
+        assert!(lease.metadata().local_overlays.iter().any(|overlay| {
+            overlay.sources.iter().any(|source| {
+                source.kind == LocalAdmissionRuleSourceKind::GitInfoExclude
+                    && source.body_hash == local_rule_hash
+            })
+        }));
+        assert_eq!(
+            authority
+                .load_source_blob(local_rule_hash)
+                .unwrap()
+                .unwrap(),
+            local_rules
+        );
+
+        // The store holds exactly what Git tracks, byte for byte.
+        let workspace = &lease.metadata().workspaces[0];
+        let held: std::collections::BTreeMap<String, kin_model::TreeEntry> = workspace
+            .tree
+            .artifacts()
+            .map(|artifact| (artifact.path.to_string(), artifact.entry))
+            .collect();
+        let tracked: std::collections::BTreeSet<String> = git_stdout(&source, ["ls-files", "-z"])
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            held.keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            tracked
+        );
+        let kin_model::TreeEntry::Blob { hash, .. } =
+            held["compiler/apps/playground/.vscode/extensions.json"]
+        else {
+            panic!("the committed file is a blob");
+        };
+        assert_eq!(
+            hash,
+            Hash256::from_bytes(kin_blobs::digest_bytes(committed))
+        );
+
+        // Ignore-only paths get no sensitive approval. The committed key's
+        // original path/digest/kind-bound approval is unchanged.
+        let allowances = &workspace.shared_admission_policy.sensitive_allowances;
+        assert_eq!(allowances.len(), 1, "{allowances:?}");
+        assert_eq!(allowances[0].path.to_string(), "certs/test.key");
+        for allowance in allowances {
+            assert!(allowance.reason.contains(&head), "{allowance:?}");
+            assert_eq!(allowance.content_hash, {
+                let kin_model::TreeEntry::Blob { hash, .. } = held[&allowance.path.to_string()]
+                else {
+                    panic!("an allowance names a blob");
+                };
+                hash
+            });
+        }
+        drop(lease);
+        drop(authority);
+
+        // Reopening proves the authority owns the raw proof and the frozen
+        // local rules: neither Git's objects nor its current info/exclude is
+        // available to this read.
+        let parked_git = root.path().join("parked-git");
+        std::fs::rename(source.join(".git"), &parked_git).unwrap();
+        let reopened = published_authority(&result.layout, &result.repository_id);
+        {
+            let lease = reopened.read_authority();
+            assert_eq!(lease.metadata().git_snapshot_proofs, vec![snapshot_proof]);
+            assert_eq!(
+                lease.metadata().workspaces[0].tree.artifacts().count(),
+                held.len()
+            );
+            assert_eq!(
+                reopened.load_source_blob(local_rule_hash).unwrap().unwrap(),
+                local_rules
+            );
+        }
+        drop(reopened);
+        std::fs::rename(&parked_git, source.join(".git")).unwrap();
+
+        // Later full-history attachment remains a separate operation. The
+        // staged complete store independently admits the same committed tree.
+        let stage = crate::history_attach::new_stage_parent(&source, result.repository_id.as_str())
+            .unwrap();
+        let complete = derive_complete_history_into_stage(
+            &source,
+            result.layout.root(),
+            &result.repository_id,
+            &stage,
+        )
+        .unwrap();
+        assert_eq!(
+            complete.authority.semantic_enrichment.semantic_change_count,
+            2
+        );
+        assert_eq!(
+            crate::history_attach::attach_staged_history(&result.layout, &stage).unwrap(),
+            crate::history_attach::AttachOutcome::Attached
+        );
+        assert!(history_state::standing(&result.layout).is_complete());
+        let complete_authority = published_authority(&result.layout, &result.repository_id);
+        let lease = complete_authority.read_authority();
+        assert!(lease.metadata().git_external_authority.is_some());
+        assert_eq!(lease.snapshot().changes.len(), 2);
+        let complete_tree: std::collections::BTreeMap<_, _> = lease.metadata().workspaces[0]
+            .tree
+            .artifacts()
+            .map(|artifact| (artifact.path.to_string(), artifact.entry))
+            .collect();
+        assert_eq!(complete_tree, held);
+        assert_no_staging_directories(root.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_requires_the_staged_raw_commit_body_before_publication() {
+        if run_in_isolated_store(
+            "git_init::tests::a_snapshot_requires_the_staged_raw_commit_body_before_publication",
+            &["central"],
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+        std::fs::write(source.join("a.py"), b"def a():\n    return 1\n").unwrap();
+        commit_all(&source, "first");
+        std::fs::write(source.join("a.py"), b"def a():\n    return 2\n").unwrap();
+        commit_all(&source, "second");
+        let raw_commit = git_stdout(&source, ["cat-file", "commit", "HEAD"]);
+        let hash = Hash256::from_bytes(kin_blobs::digest_bytes(raw_commit.as_bytes()));
+        withhold_staged_body(hash);
+        let result =
+            init_current_commit_from_git(&source, None, crate::history_state::HistoryMode::None);
+        clear_withheld_staged_body();
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("body"), "{error}");
+        assert!(!crate::layout::store_root_for(&source).exists());
+        assert_no_staging_directories(root.path());
+    }
+
+    #[test]
+    fn an_unborn_branch_is_admitted_whole_by_the_checked_out_commit_path() {
+        if run_in_isolated_store(
+            "git_init::tests::an_unborn_branch_is_admitted_whole_by_the_checked_out_commit_path",
+            &["central"],
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        initialize_git(&source);
+
+        let result =
+            init_current_commit_from_git(&source, None, crate::history_state::HistoryMode::None)
+                .unwrap();
+        assert!(crate::history_state::standing(&result.layout).is_complete());
+    }
+
+    /// One launch for the whole seed. Every fixture Git launch starts its own
+    /// process-group guardian first, so five configuration commands launched
+    /// one at a time cost five guardians; the batch runs the same commands in
+    /// the same order inside one.
     fn initialize_git(source: &Path) {
-        git(source, ["init", "--initial-branch=main"]);
-        git(source, ["config", "user.email", "kin@example.invalid"]);
-        git(source, ["config", "user.name", "Kin Test"]);
-        pin_default_hook_surface(source);
-        pin_resolved_global_excludes(source);
+        let mut batch = kin_git::test_support::FixtureGitBatch::new();
+        batch
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "user.name", "Kin Test"]);
+        pin_default_hook_surface(&mut batch, source);
+        pin_resolved_global_excludes(&mut batch, source);
+        batch.run_in(source);
+        // Written once `git init` has made `.git`, before anything reads them.
+        std::fs::create_dir_all(source.join(".git/hooks")).unwrap();
+        std::fs::write(fixture_global_excludes(source), b"").unwrap();
+    }
+
+    fn fixture_global_excludes(source: &Path) -> std::path::PathBuf {
+        source.join(".git/kin-fixture-global-excludes")
     }
 
     /// Bind a fixture's resolved global excludes to a file it owns.
@@ -3352,13 +5192,12 @@ mod tests {
     /// refuses a source nothing wrote to. Repository scope outranks both the
     /// host and that sibling, so pinning it here makes the observation depend on
     /// the fixture alone.
-    fn pin_resolved_global_excludes(source: &Path) {
-        let excludes = source.join(".git/kin-fixture-global-excludes");
-        std::fs::write(&excludes, b"").unwrap();
-        git(
-            source,
-            ["config", "core.excludesFile", excludes.to_str().unwrap()],
-        );
+    fn pin_resolved_global_excludes(
+        batch: &mut kin_git::test_support::FixtureGitBatch,
+        source: &Path,
+    ) {
+        let excludes = fixture_global_excludes(source);
+        batch.git(["config", "core.excludesFile", excludes.to_str().unwrap()]);
     }
 
     /// Bind a fixture's hook surface to its own `.git/hooks`.
@@ -3367,33 +5206,37 @@ mod tests {
     /// is not the isolated Git child a fixture launches, so a developer host
     /// that sets `core.hooksPath` globally would redirect every fixture at once
     /// and refuse them all. Repository scope outranks the host.
-    fn pin_default_hook_surface(source: &Path) {
+    fn pin_default_hook_surface(batch: &mut kin_git::test_support::FixtureGitBatch, source: &Path) {
         let hooks = source.join(".git/hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        git(
-            source,
-            ["config", "core.hooksPath", hooks.to_str().unwrap()],
-        );
+        batch.git(["config", "core.hooksPath", hooks.to_str().unwrap()]);
     }
 
     fn initialize_annotated_tag_source(source: &Path) {
         initialize_git(source);
         std::fs::write(source.join("README.md"), b"annotated tag source\n").unwrap();
-        git(source, ["add", "--all"]);
-        git(source, ["commit", "-m", "tagged commit"]);
+        commit_all(source, "tagged commit");
         git(source, ["tag", "--annotate", "release", "-m", "release"]);
     }
 
     fn assert_no_staging_directories(parent: &Path) {
-        let leftovers = std::fs::read_dir(parent)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| {
-                name.to_string_lossy().starts_with(".kin.init-")
-                    || name.to_string_lossy().starts_with(".kin-git-capture-")
-            })
-            .collect::<Vec<_>>();
-        assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+        // The checkout parent remains a negative control: central admission
+        // must neither stage there nor strand anything in its real destination.
+        let central = crate::layout::stores_dir();
+        for directory in [parent, central.as_path()] {
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("cannot inspect staging at {}: {error}", directory.display()),
+            };
+            let leftovers = entries
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    name.starts_with(".kin.init-") || name.starts_with(".kin-git-capture-")
+                })
+                .collect::<Vec<_>>();
+            assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+        }
     }
 
     fn fixture_git(repository: &Path) -> kin_git::test_support::FixtureGitCommand {
@@ -3434,6 +5277,12 @@ mod tests {
     /// calls `init_from_git` and its finalizer calls `init`.
     #[test]
     fn every_creation_door_publishes_a_readable_creation_record() {
+        if run_in_isolated_store(
+            "git_init::tests::every_creation_door_publishes_a_readable_creation_record",
+            &["central"],
+        ) {
+            return;
+        }
         use crate::hydration_semantics::{self, HydrationStanding};
 
         let adopted = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
@@ -3466,8 +5315,7 @@ mod tests {
             b"def door():\n    return 1\n",
         )
         .unwrap();
-        git(git_source.path(), ["add", "--all"]);
-        git(git_source.path(), ["commit", "-m", "creation door"]);
+        commit_all(git_source.path(), "creation door");
         let git_layout = init_from_git(git_source.path()).unwrap().layout;
 
         let git_adopting_source = tempfile::tempdir().unwrap();
@@ -3477,8 +5325,7 @@ mod tests {
             b"def adopted_door():\n    return 2\n",
         )
         .unwrap();
-        git(git_adopting_source.path(), ["add", "--all"]);
-        git(git_adopting_source.path(), ["commit", "-m", "adopted door"]);
+        commit_all(git_adopting_source.path(), "adopted door");
         let git_adopting_layout = init_from_git_adopting(git_adopting_source.path(), &adopted)
             .unwrap()
             .layout;
@@ -3564,6 +5411,9 @@ mod tests {
     /// operation identities, so its receipt is compared to the pre-commit input.
     #[test]
     fn removing_the_discarded_validation_pass_does_not_move_admitted_identity() {
+        if run_in_isolated_store("git_init::tests::removing_the_discarded_validation_pass_does_not_move_admitted_identity", &["central"]) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -3610,40 +5460,41 @@ mod tests {
             seal.to_string(),
             "9a9c56b8193d5bffdd4f5a8488a345b2624feb1c5d9376aab21717134d796ff1"
         );
+        // The change identities moved once, on purpose, when import began
+        // recording a commit's author as Git names one, `Name <email>`, rather
+        // than its whole author line with the time and offset. A change's
+        // identity hashes its author, so every imported change was renamed;
+        // the content seal, which covers no author, did not move. Stores an
+        // earlier import wrote keep their identities and export proves them
+        // under the rule they were written with.
         assert_eq!(
             result.authority.initial_change_id.unwrap().to_string(),
-            "2f5b60b25a36cba3a9b10022fc006ff01f8481de7b342886a7e23c5e26339b37"
+            "1d0e2ad3b2db6003520df2af9bbdb5984bb9d90c8587e3bc71b19ec40cfce593"
         );
         assert_eq!(
             ids,
             [
-                "2f5b60b25a36cba3a9b10022fc006ff01f8481de7b342886a7e23c5e26339b37",
-                "7df071acd75aa91c22fcd0517200af76b97e256b31d7e27a12aa6bacece5a7bb",
-                "8b41366e341722bf4257ce4456fc5e38368c24e049625b9a3d99c0766095322a",
+                "1d0e2ad3b2db6003520df2af9bbdb5984bb9d90c8587e3bc71b19ec40cfce593",
+                "48d9d2802dbdf106502f2862d76ee72f5a3f8a80ade491ffb38d748c39439897",
+                "c27f77d79356bcf16d6dd83769f10f1e5aef84f2945d75e35befb137dd5f2f1a",
             ]
         );
     }
 
+    /// `git add --all` then `git commit -m message`, as one fixture launch.
+    fn commit_all(repository: &Path, message: &str) {
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["add", "--all"])
+            .git(["commit", "-m", message])
+            .run_in(repository);
+    }
+
     fn commit_all_at(repository: &Path, message: &str, stamp: &str) {
-        let output = fixture_git(repository)
-            .args(["add", "--all"])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git add --all failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = fixture_git(repository)
-            .args(["commit", "-m", message])
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["add", "--all"])
+            .git(["commit", "-m", message])
             .author_date(stamp)
             .committer_date(stamp)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run_in(repository);
     }
 }

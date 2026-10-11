@@ -25,11 +25,12 @@
 //! absent rather than listed as a negative.
 //!
 //! One measurement in this file constrains the whole rule, and it is why the
-//! tier is narrower than "the sibling exists". None of Java, C#, Kotlin, Swift
-//! or C++ records a receiver for `h.b()` either: every one of them emits the
-//! same relation for an object call as for a bare call. Only Python and Rust
-//! separate the two shapes at extraction time, and neither is a language where
-//! a bare call reaches a sibling. So the linker cannot ask whether a receiver
+//! tier is narrower than "the sibling exists". None of C#, Swift or C++ records
+//! a receiver for `h.b()` either, and Java and Kotlin record one only when the
+//! adapter's value-origin facts type `h`: otherwise they emit the same relation
+//! for an object call as for a bare call. Only Python and Rust separate the two
+//! shapes at extraction time, and neither is a language where a bare call
+//! reaches a sibling. So the linker cannot ask whether a receiver
 //! was written, and the tier stands on uniqueness instead: it binds only when
 //! the leaf names exactly one owner-qualified entity in the whole universe and
 //! no unqualified one, which is the ticket's own framing of a bare call whose
@@ -59,12 +60,14 @@ use kin_model::{
 };
 use kin_parser::{
     CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter, JavaScriptAdapter, KotlinAdapter,
-    LanguageAdapter, PhpAdapter, PythonAdapter, RustAdapter, SwiftAdapter, TypeScriptAdapter,
+    LanguageAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter, SwiftAdapter,
+    TypeScriptAdapter,
 };
 
 fn adapter_for(language: &str) -> Box<dyn LanguageAdapter> {
     match language {
         "java" => Box::new(JavaAdapter),
+        "ruby" => Box::new(RubyAdapter),
         "csharp" => Box::new(CSharpAdapter),
         "cpp" => Box::new(CppAdapter),
         "kotlin" => Box::new(KotlinAdapter),
@@ -509,7 +512,10 @@ fn an_object_call_does_not_bind_to_the_callers_own_member() {
     // is that `Helper.b` is in the graph, which makes the leaf mean more than one
     // thing. That is the whole load the uniqueness rule carries, and this is the
     // case that proves it carries it.
-    let source = "class Helper {\n    void b() { }\n}\nclass Foo {\n    Helper h;\n    void a() { h.b(); }\n    void b() { }\n}\n";
+    // `h` is a local whose initializer no value-origin fact reads, so the
+    // adapter records no receiver for the call through it. A declared type
+    // would type it, and the call would carry `h` to the receiver-origin tier.
+    let source = "class Helper {\n    void b() { }\n}\nclass Foo {\n    void a() { var h = make(); h.b(); }\n    void b() { }\n}\n";
     let files = vec![parse("java", "Sample.java", source)];
     // The control. If the adapter had recorded a receiver, this case would be
     // graded by a different rule than the one it names.
@@ -653,4 +659,77 @@ fn a_free_function_in_the_file_is_not_treated_as_an_owner_sibling() {
         !calls_from(&relations, caller).contains(&member),
         "a free function's bare call must not reach a class member it never named"
     );
+}
+
+#[test]
+fn explicit_self_owners_disambiguate_same_file_siblings_in_both_linkers() {
+    for (language, path, source, caller, target) in [
+        ("java", "Self.java", "class Owner { void ping() {} void run() { this.ping(); } } class Decoy { void ping() {} }", "Owner.run", "Owner.ping"),
+        ("kotlin", "Self.kt", "class Owner { fun ping() {}\nfun run() { this.ping() }\n}\nclass Decoy { fun ping() {}\n}", "Owner.run", "Owner.ping"),
+        ("csharp", "Self.cs", "namespace App { class Owner { void Ping() {} void Run() { this.Ping(); } } class Decoy { void Ping() {} } }", "App.Owner.Run", "App.Owner.Ping"),
+        ("ruby", "self.rb", "module App\nclass Owner\ndef ping(); end\ndef run(); self.ping(); end\nend\nclass Decoy\ndef ping(); end\nend\nend\n", "App.Owner.run", "App.Owner.ping"),
+        ("ruby", "bare.rb", "module App\nmodule Owner\ndef self.ping(value); value; end\ndef self.run(values); values.sum { |value| ping(value) }; end\nend\nmodule Decoy\ndef self.ping(value); value; end\nend\nend\n", "App.Owner.run", "App.Owner.ping"),
+    ] {
+        let files = vec![parse(language, path, source)];
+        assert!(files[0].relations.iter().any(|relation| relation.kind == RelationKind::Calls && relation.src_name == caller && relation.dst_name == target), "{language}: {:?}", files[0].relations);
+        let relations = link_both(&files);
+        let reached = calls_from(&relations, entity_id(&files, path, caller));
+        assert!(reached.contains(&entity_id(&files, path, target)), "{language}: {relations:?}");
+        let decoys: HashSet<_> = files[0].entities.iter().filter(|entity| entity.name.contains("Decoy")).map(|entity| entity.id).collect();
+        assert!(reached.iter().all(|id| !decoys.contains(id)), "{language}: {relations:?}");
+    }
+}
+
+#[test]
+fn typescript_namespace_owners_keep_equal_leaves_distinct_in_both_linkers() {
+    let path = "scopes.ts";
+    let files = vec![parse(
+        "typescript",
+        path,
+        r#"
+        namespace Alpha {
+            export function helper() {}
+            export function run() { helper(); }
+            export function shadow({ helper }: { helper: () => void }) { helper(); }
+            export function recover() { try {} catch (helper) { helper(); } }
+            export class Inner { ping() {} run() { this.ping(); } }
+        }
+        namespace Beta {
+            export function helper() {}
+            export function run() { helper(); }
+            export class Inner { ping() {} run() { this.ping(); } }
+        }
+    "#,
+    )];
+    let relations = link_both(&files);
+    for (caller, target) in [
+        ("Alpha.run", "Alpha.helper"),
+        ("Beta.run", "Beta.helper"),
+        ("Alpha.Inner.run", "Alpha.Inner.ping"),
+        ("Beta.Inner.run", "Beta.Inner.ping"),
+    ] {
+        assert_eq!(
+            calls_from(&relations, entity_id(&files, path, caller)),
+            vec![entity_id(&files, path, target)],
+            "{caller}: {relations:?}"
+        );
+    }
+    for caller in ["Alpha.shadow", "Alpha.recover"] {
+        assert!(
+            files[0]
+                .relations
+                .iter()
+                .any(|relation| relation.src_name == caller && relation.dst_name == "helper"),
+            "the shadowed call must still be extracted"
+        );
+        let reached = calls_from(&relations, entity_id(&files, path, caller));
+        assert!(
+            !reached.contains(&entity_id(&files, path, "Alpha.helper")),
+            "{caller}: {relations:?}"
+        );
+        assert!(
+            !reached.contains(&entity_id(&files, path, "Beta.helper")),
+            "{caller}: {relations:?}"
+        );
+    }
 }

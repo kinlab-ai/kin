@@ -1637,7 +1637,7 @@ fn write_vector_index_metadata(
                 tmp_path.display()
             ))
         })?;
-        tmp.sync_all().map_err(|err| {
+        kin_blobs::durable::sync_all(&tmp).map_err(|err| {
             KinDbError::StorageError(format!(
                 "failed to fsync vector index metadata {}: {err}",
                 tmp_path.display()
@@ -1673,11 +1673,14 @@ fn current_embedding_runtime_fields(
     ),
     KinDbError,
 > {
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     {
         let runtime = match graph.and_then(InMemoryGraph::loaded_embedding_runtime) {
             Some(runtime) => runtime,
-            None => crate::embed::resolved_embedding_runtime()?,
+            None if crate::embed::embedding_slot_enabled() => {
+                crate::embed::resolved_embedding_runtime()?
+            }
+            None => return Ok((None, None, None, None, None)),
         };
         return Ok((
             Some(runtime.provider),
@@ -1688,10 +1691,29 @@ fn current_embedding_runtime_fields(
         ));
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
     {
         let _ = graph;
         Ok((None, None, None, None, None))
+    }
+}
+
+/// The HNSW topology a vector sidecar save writes for `graph`.
+///
+/// While vectors are still owed, a save is a checkpoint of an index that is
+/// filling: it writes the graph the incremental inserts and removals built,
+/// with no canonical rebuild. An embed pass checkpoints as it goes, and the
+/// rebuild re-inserts every vector on one core, which on a large repository
+/// was most of the time each batch took. The save that finds nothing owed,
+/// which ends every embed pass, rebuilds once, so a settled index is written
+/// in canonical order, a pure function of its vectors, exactly as before, and
+/// the links the batched inserts could not make are restored.
+#[cfg(feature = "vector")]
+fn vector_save_topology(graph: &InMemoryGraph) -> crate::vector::PersistTopology {
+    if graph.pending_embeddings() > 0 || graph.pending_artifact_embeddings() > 0 {
+        crate::vector::PersistTopology::AsIs
+    } else {
+        crate::vector::PersistTopology::Canonical
     }
 }
 
@@ -1820,8 +1842,25 @@ fn classify_vector_sidecar(
     graph_root_hash: [u8; 32],
     expected_embedder_identity: Option<&str>,
 ) -> SidecarVerdict {
-    #[cfg(feature = "embeddings")]
-    {
+    classify_vector_sidecar_for_selection(
+        metadata,
+        graph_root_hash,
+        expected_embedder_identity,
+        crate::embed::embedding_slot_enabled(),
+    )
+}
+
+#[cfg(feature = "vector")]
+fn classify_vector_sidecar_for_selection(
+    metadata: &VectorIndexMetadata,
+    graph_root_hash: [u8; 32],
+    expected_embedder_identity: Option<&str>,
+    enforce_model_space: bool,
+) -> SidecarVerdict {
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
+    let _ = enforce_model_space;
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
+    if enforce_model_space {
         let runtime = match crate::embed::resolved_embedding_runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -2249,10 +2288,31 @@ impl SnapshotManager {
             return Ok(());
         };
 
-        let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
+        let (mut provider, mut model_id, mut revision, mut pipeline_epoch, runtime_dimensions) =
             current_embedding_runtime_fields(Some(graph))?;
         let stored_descriptor = graph.vector_index_descriptor();
-        #[cfg(feature = "embeddings")]
+        let mut retained_identity = None;
+        // Selecting none does not change the coordinates of prepared vectors.
+        // Retain their attested space when publishing graph-driven retirements.
+        if provider.is_none() {
+            if let VectorIndexMetadataRead::Current(previous) =
+                read_vector_index_metadata_for_load(&vector_index_metadata_path_for(&vector_path))?
+            {
+                if stored_descriptor
+                    .as_ref()
+                    .and_then(|descriptor| descriptor.model_id.as_deref())
+                    == Some(previous.embedding_model_id.as_str())
+                    && index_stats.is_some_and(|(dimensions, _)| dimensions == previous.dimensions)
+                {
+                    retained_identity = Some(previous.embedder_identity);
+                    provider = Some(previous.embedding_provider);
+                    model_id = Some(previous.embedding_model_id);
+                    revision = Some(previous.embedding_model_revision);
+                    pipeline_epoch = Some(previous.embedding_pipeline_epoch);
+                }
+            }
+        }
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         if model_id
             .as_deref()
             .is_some_and(crate::embed::is_local_content_identity)
@@ -2267,7 +2327,7 @@ impl SnapshotManager {
                     .into(),
             ));
         }
-        #[cfg(feature = "embeddings")]
+        #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
         if let (Some(current), Some(stored)) = (
             model_id.as_deref(),
             stored_descriptor
@@ -2302,7 +2362,8 @@ impl SnapshotManager {
                     "vector sidecar embedder identity cannot be empty".to_string(),
                 ))
             }
-            None => format!("{provider}:{model_id}:{revision}:{pipeline_epoch}"),
+            None => retained_identity
+                .unwrap_or_else(|| format!("{provider}:{model_id}:{revision}:{pipeline_epoch}")),
         };
 
         let descriptor = crate::vector::IndexDescriptor {
@@ -2311,9 +2372,10 @@ impl SnapshotManager {
         };
 
         let metadata_path = vector_index_metadata_path_for(path);
-        graph.save_vector_index_with_provenance(
+        graph.save_vector_index_with_provenance_as(
             &vector_path,
             Some(descriptor),
+            vector_save_topology(graph),
             |receipt| {
                 if let Some(configured) = runtime_dimensions {
                     if configured != receipt.dimensions {
@@ -3989,6 +4051,40 @@ mod tests {
             },
             index_binding_sha256: hex::encode([9u8; 32]),
         }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn model_slots_none_preserves_prepared_sidecar_model_space() {
+        let root = [8u8; 32];
+        let mut metadata = current_vector_metadata(root, 2, 1, "prepared-identity");
+        metadata.embedding_provider = "local".into();
+        metadata.embedding_model_id = "prepared-model".into();
+        metadata.embedding_model_revision = "prepared-revision".into();
+        metadata.embedding_pipeline_epoch = "prepared-pipeline".into();
+        let before = serde_json::to_value(&metadata).unwrap();
+        assert!(matches!(
+            classify_vector_sidecar_for_selection(&metadata, root, None, false),
+            SidecarVerdict::Exact
+        ));
+        assert_eq!(before, serde_json::to_value(&metadata).unwrap());
+        assert!(matches!(
+            classify_vector_sidecar_for_selection(
+                &metadata,
+                root,
+                Some("different-identity"),
+                false
+            ),
+            SidecarVerdict::Refuse {
+                check: "embedder_identity",
+                ..
+            }
+        ));
+        metadata.graph_root_hash = hex::encode([0u8; 32]);
+        assert!(matches!(
+            classify_vector_sidecar_for_selection(&metadata, root, None, false),
+            SidecarVerdict::Refuse { .. }
+        ));
     }
 
     #[cfg(feature = "vector")]
@@ -6025,6 +6121,16 @@ mod tests {
     #[test]
     #[cfg(feature = "vector")]
     fn save_writes_vector_index_metadata() {
+        // With the built-in provider selected, the sidecar records it. Without
+        // the `embeddings` feature no provider is selected, and the label is
+        // the external fallback.
+        #[cfg(feature = "embeddings")]
+        if !crate::embed::in_built_in_embeddings_child(
+            "storage::snapshot::tests::save_writes_vector_index_metadata",
+            true,
+        ) {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
@@ -6488,6 +6594,27 @@ mod tests {
         assert!(
             !vector_path.exists(),
             "an immediate follow-up flush must be throttled, not re-serialize the index"
+        );
+    }
+
+    /// A sidecar save is an as-is checkpoint exactly while embeddings are
+    /// owed, and canonical once nothing is.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn a_vector_save_skips_the_canonical_rebuild_only_while_embeddings_are_owed() {
+        let graph = InMemoryGraph::new();
+        let pending = test_entity("topology_pending");
+        assert_eq!(graph.pending_embeddings(), 0);
+        assert_eq!(graph.pending_artifact_embeddings(), 0);
+        assert_eq!(
+            vector_save_topology(&graph),
+            crate::vector::PersistTopology::Canonical
+        );
+        graph.queue_for_embedding(&[pending.id]);
+        assert_eq!(graph.pending_embeddings(), 1);
+        assert_eq!(
+            vector_save_topology(&graph),
+            crate::vector::PersistTopology::AsIs
         );
     }
 
@@ -7906,6 +8033,12 @@ mod tests {
     #[test]
     #[cfg(all(feature = "vector", feature = "embeddings"))]
     fn metadata_model_mismatch_refuses_in_place_and_requeues() {
+        if !crate::embed::in_built_in_embeddings_child(
+            "storage::snapshot::tests::metadata_model_mismatch_refuses_in_place_and_requeues",
+            true,
+        ) {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
@@ -7936,6 +8069,144 @@ mod tests {
             "a foreign-space sidecar is preserved in place"
         );
         assert!(!archived_sidecar_path(&vector_path).exists());
+    }
+
+    /// Selecting CodeRankEmbed in place of the default model is a model
+    /// identity change, so a store the default model embedded re-embeds: its
+    /// vectors stay on disk, are refused for this runtime, and every entity is
+    /// queued. Reopening reads identity from configuration, not weights, so
+    /// nothing is downloaded, and the child runs with the hub offline to prove
+    /// it. Back on the default model the same vectors serve again.
+    #[test]
+    #[cfg(all(feature = "vector", feature = "embeddings"))]
+    fn selecting_coderankembed_re_embeds_a_store_the_default_model_embedded() {
+        if !crate::embed::in_built_in_embeddings_child(
+            "storage::snapshot::tests::selecting_coderankembed_re_embeds_a_store_the_default_model_embedded",
+            true,
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&path);
+        let metadata_path = vector_index_metadata_path_for(&path);
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("coderank_swap_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let index = VectorIndex::new(4).unwrap();
+        index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(&graph, &index, &vector_path);
+        mgr.save().unwrap();
+        let metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        assert!(
+            metadata
+                .embedding_model_id
+                .contains("nomic-ai/nomic-embed-text-v1.5"),
+            "the store was embedded by the default model: {}",
+            metadata.embedding_model_id
+        );
+        drop(graph);
+        drop(mgr);
+
+        std::env::set_var("KIN_EMBED_MODEL_ID", crate::embed::CODERANKEMBED_MODEL_ID);
+        let swapped = SnapshotManager::open(&path).unwrap();
+        assert_eq!(swapped.graph().embedding_status().indexed, 0);
+        assert_eq!(swapped.graph().pending_embeddings(), 1);
+        assert!(
+            vector_path.exists(),
+            "the default model's vectors are kept in place"
+        );
+        drop(swapped);
+
+        std::env::remove_var("KIN_EMBED_MODEL_ID");
+        let restored = SnapshotManager::open(&path).unwrap();
+        assert_eq!(
+            restored.graph().embedding_status().indexed,
+            1,
+            "the default model's own vectors serve again once it is selected"
+        );
+    }
+
+    /// The default model's vectors from before it was served as its card
+    /// says, with CLS pooling and CodeRankEmbed's query instruction, were
+    /// stored under the pipeline epoch below. The serving changed, so that
+    /// identity no longer matches this runtime: the store keeps those vectors
+    /// on disk, refuses them through the model identity check, and queues
+    /// every entity to re-embed rather than mixing old vectors with new ones.
+    /// The same pair served again once its identity is current, so nothing
+    /// but the serving epoch decided the refusal.
+    #[test]
+    #[cfg(all(feature = "vector", feature = "embeddings"))]
+    fn a_store_the_default_model_embedded_under_its_old_serving_is_re_queued() {
+        const OLD_SERVING_EPOCH: &str = "embed-pipeline-2026-05-31-swerank";
+        if !crate::embed::in_built_in_embeddings_child(
+            "storage::snapshot::tests::a_store_the_default_model_embedded_under_its_old_serving_is_re_queued",
+            true,
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&path);
+        let metadata_path = vector_index_metadata_path_for(&path);
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let entity = test_entity("old_serving_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let index = VectorIndex::new(4).unwrap();
+        index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(&graph, &index, &vector_path);
+        mgr.save().unwrap();
+        let current = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        assert!(current
+            .embedding_model_id
+            .contains("nomic-ai/nomic-embed-text-v1.5"));
+        assert_ne!(current.embedding_pipeline_epoch, OLD_SERVING_EPOCH);
+        drop(graph);
+        drop(mgr);
+
+        // The same vectors, as the previous serving labelled them. The index
+        // bytes and their binding are untouched, so the pair is coherent and
+        // only its identity differs.
+        let mut old = current.clone();
+        old.embedding_pipeline_epoch = OLD_SERVING_EPOCH.to_string();
+        old.embedder_identity = format!(
+            "{}:{}:{}:{}",
+            old.embedding_provider,
+            old.embedding_model_id,
+            old.embedding_model_revision,
+            old.embedding_pipeline_epoch
+        );
+        write_vector_index_metadata(&metadata_path, &old).unwrap();
+        match classify_vector_sidecar(&old, [0; 32], None) {
+            SidecarVerdict::Refuse {
+                check,
+                stored,
+                current: now,
+            } => {
+                assert_eq!(check, "embedding_pipeline_epoch");
+                assert_eq!(stored, OLD_SERVING_EPOCH);
+                assert_eq!(now, current.embedding_pipeline_epoch);
+            }
+            _ => panic!("vectors from the old serving must be refused"),
+        }
+        let old_index = std::fs::read(&vector_path).unwrap();
+
+        let reopened = SnapshotManager::open(&path).unwrap();
+        assert_eq!(reopened.graph().embedding_status().indexed, 0);
+        assert_eq!(reopened.graph().pending_embeddings(), 1);
+        assert_eq!(
+            std::fs::read(&vector_path).unwrap(),
+            old_index,
+            "the refused vectors stay on disk untouched"
+        );
+        drop(reopened);
+
+        write_vector_index_metadata(&metadata_path, &current).unwrap();
+        let restored = SnapshotManager::open(&path).unwrap();
+        assert_eq!(restored.graph().embedding_status().indexed, 1);
+        assert_eq!(restored.graph().pending_embeddings(), 0);
     }
 
     /// Exercise the persisted product path without loading inference. The

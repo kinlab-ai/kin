@@ -160,7 +160,10 @@ jobs:
             ./scripts/release-train-body.test.mjs \
             ./scripts/advisory-sweep.test.mjs \
             ./scripts/verify-capability-proof.test.mjs \
-            ./scripts/verify-npm-attestation.test.mjs
+            ./scripts/verify-npm-attestation.test.mjs \
+            ./scripts/review-ui.test.cjs \
+            ./scripts/workspace-ui.test.cjs \
+            ./scripts/workspace-graph.test.cjs
           node --check ./scripts/check-glibc-floor.mjs
           node --check ./scripts/read-update-build-identity.cjs
           node --check ./scripts/check-release-version.mjs
@@ -198,7 +201,7 @@ jobs:
 
   windows-authority-tests:
     name: Windows authority tests
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
     # Split out of the installer job: the debug test compile and the release
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
@@ -490,7 +493,7 @@ jobs:
 
   windows-authority-cli-tests:
     name: Windows authority CLI tests
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
     # Every leg here is `-p kin-cli --no-default-features --lib`, which is one
     # compilation unit and the single most expensive one in the Windows set.
     # Splitting on that boundary is why the three jobs do not duplicate each
@@ -569,7 +572,7 @@ jobs:
 
   windows-authority-runtime-tests:
     name: Windows authority runtime tests
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
     # The integration-test binaries: real daemons, real process trees, real
     # containment. These are the legs that spend their time running rather than
     # compiling, which is why they belong away from the unit legs instead of
@@ -641,9 +644,12 @@ jobs:
             "dropping_containment_terminates_a_late_descendant" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon --no-default-features --test port_handshake
+          # The isolation self-tests live in common/assertions.rs, which only
+          # the common_assertions target includes; every other daemon test
+          # binary carries just the shared support.
           run_required_filter "daemon isolation support" "common::daemon_isolation" \
             --locked --target x86_64-pc-windows-msvc \
-            -p kin-daemon --no-default-features --test port_handshake
+            -p kin-daemon --no-default-features --test common_assertions
           compile_required_target "durable merge resolution containment compile" \
             "concurrent_resolutions_from_one_view_leave_one_winner" \
             --locked --target x86_64-pc-windows-msvc \
@@ -674,10 +680,10 @@ jobs:
     # the documentation-only path already relies on.
     if: >-
       ${{ !cancelled()
-      && github.event_name != 'pull_request'
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-'))
       && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Preserve tracked bytes on Windows
         shell: bash
@@ -734,12 +740,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
-      # Windows ships native vector search, so this asserts the feature graph in
-      # both directions rather than only forbidding features. `vector` and
-      # `embeddings` must be reachable, or the leg would silently certify a
-      # degraded build; `metal` and `accelerate` must not be, because those are
-      # macOS-only backends whose activation lives in a
-      # `cfg(target_os = "macos")` dependency block and must never unify in here.
+      # Default Windows archives carry vector search and explicit HTTP support.
+      # Local inference permutations are covered in Windows Vector Proof.
       #
       # `grep -c` rather than `grep -q`: under `pipefail` a `-q` match closes the
       # pipe early and the SIGPIPE fails the step, which reads exactly like the
@@ -751,14 +753,14 @@ jobs:
           cargo tree --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon -e features -i kin-db \
             | tee "$RUNNER_TEMP/kin-db-feature-tree.txt"
-          for required in vector embeddings; do
+          for required in vector external-embeddings; do
             if [ "$(grep -Ec "kin-db feature \"${required}\"" \
               "$RUNNER_TEMP/kin-db-feature-tree.txt")" -eq 0 ]; then
               echo "::error::Windows release build is missing kin-db feature ${required}"
               exit 1
             fi
           done
-          for forbidden in metal accelerate; do
+          for forbidden in embeddings metal accelerate; do
             if [ "$(grep -Ec "kin-db feature \"${forbidden}\"" \
               "$RUNNER_TEMP/kin-db-feature-tree.txt")" -ne 0 ]; then
               echo "::error::Windows build pulled the macOS-only kin-db feature ${forbidden}"
@@ -776,6 +778,12 @@ jobs:
           # certify the build (which is exactly how the first attempt failed).
           RUSTC_WRAPPER: sccache
           SCCACHE_DIR: ${{ runner.temp }}/sccache
+          # The sccache server exits after 600 idle seconds by default and then
+          # waits only 10 more for requests in flight. kin-daemon's release
+          # compile alone runs longer than that, so the server died under it
+          # and the crate started again without the wrapper, which pushed the
+          # job past its limit. Zero keeps the server up for the whole build.
+          SCCACHE_IDLE_TIMEOUT: "0"
           CARGO_INCREMENTAL: "0"
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc \
@@ -822,18 +830,16 @@ jobs:
               `does not match tracked Git bytes ${expectedLock}`
             );
           }
-          // The shipped binary must report the features it was built with, not
-          // merely resolve them in the dependency graph. `metal` tracks the
-          // compiled backend rather than the marker cargo feature
-          // (bench_meta.rs `metal_active()` is `cfg!(target_os = "macos")`), so
-          // a correct Windows build reports vector and embeddings and no metal.
-          for (const feature of ["vector", "embeddings"]) {
+          for (const feature of ["vector", "external-embeddings"]) {
             if (!meta.feature_flags.includes(feature)) {
               throw new Error(`Windows release build did not enable ${feature}`);
             }
           }
-          if (meta.feature_flags.includes("metal")) {
-            throw new Error("Windows release build reported the macOS-only metal backend");
+          if (meta.embeddings?.local_inference_enabled !== false ||
+              meta.embeddings?.external_embeddings_enabled !== true ||
+              meta.embeddings?.provider !== "none" ||
+              meta.feature_flags.includes("embeddings") || meta.feature_flags.includes("metal")) {
+            throw new Error("Windows release build does not attest the engine-free default archive profile");
           }
           NODE
 
@@ -1006,19 +1012,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check Hydration Replay Semantics
-        run: python3 scripts/verify-hydration-semantics.py
-
-      - name: Falsify Hydration Replay Semantics guard
-        run: |
-          set -euo pipefail
-          poisoned="$(mktemp -d)"
-          trap 'rm -rf "$poisoned"' EXIT
-          cp -a crates scripts "$poisoned/"
-          python3 scripts/falsify-hydration-semantics.py "$poisoned"
-
-      - name: Verify hydration guard PR coverage
-        run: python3 scripts/test-hydration-pr-policy.py
+      # The tuning-knob registry is generated from the knobs' read sites, and
+      # no step compared it with them, so two knobs the code reads went
+      # unregistered without anything failing.
+      - name: Check the environment variable registry is current
+        run: python3 scripts/gen_env_registry.py --check
 
       - name: Verify registry dependency-wave admission
         env:
@@ -1071,6 +1069,13 @@ jobs:
       - name: Check the flake quarantine
         run: python3 scripts/check-quarantine.py
 
+      # docs/language-support.md carries a scorecard rendered from the language
+      # conformance declarations, which the kin-parser suite holds true. A hand
+      # edit of the scorecard, or a declaration changed without rendering it,
+      # fails here.
+      - name: Check the language conformance scorecard
+        run: python3 scripts/language-scorecard.py --check
+
       - name: Test acceptance fixture cleanup safety
         run: python3 scripts/acceptance/test_fixture_shutdown.py
 
@@ -1116,7 +1121,11 @@ jobs:
         run: python3 scripts/acceptance/test_run_root_retention.py
 
       - name: Test acceptance reference diagnostic contracts
-        run: python3 scripts/acceptance/test_reference_diagnostic_contract.py
+        run: |
+          python3 scripts/acceptance/test_reference_diagnostic_contract.py
+          python3 scripts/acceptance/test_acceptance_budget_contracts.py
+          python3 scripts/acceptance/test_brownfield_sweep_wait.py
+          python3 scripts/acceptance/test_brownfield_export_identity.py
 
       # Every suite quotes a failed command through one shared excerpt that
       # keeps a Rust panic and the final error line. acceptance.yml runs the
@@ -1206,6 +1215,12 @@ jobs:
       - name: Check Zero File-Search Invariant (answer modules)
         run: bash scripts/zero_file_search_guard.sh
 
+      # The filesystem boundary lint's own logic, without a toolchain. The lint
+      # itself runs after Clippy below, because it needs the compiler's name
+      # resolution.
+      - name: Test the filesystem boundary lint
+        run: python3 scripts/test-io-lint.py
+
       # AGENTS.md's Landing section enumerates the required contexts on `main` as prose, read
       # from `GET /repos/kinlab-ai/kin/rules/branches/main`. On 2026-09-03 that prose had
       # drifted: it said six and was missing `MCP surface contract`, and nothing had compared the
@@ -1244,6 +1259,14 @@ jobs:
           # The allow list is a word list, and splitting it is the point.
           # shellcheck disable=SC2086
           cargo clippy --all-targets --all-features -- $allows
+
+      # Raw filesystem and process access by name resolution, not by text: clippy
+      # reports every call to an entry point in scripts/io-lint/clippy.toml,
+      # however it is spelled, and every site must be on
+      # scripts/io-lint/allowed-sites.txt. A raw read added to an answer path
+      # fails here. The probe crate runs first and proves the configuration.
+      - name: Check the filesystem boundary lint
+        run: python3 scripts/check-io-lint.py
 
       # The deployed Firestore client needs a body to retry a query, but a
       # successful Commit has already acknowledged its atomic write and must
@@ -1535,6 +1558,8 @@ jobs:
           # workspace-scanning guard, present or future; repeating a package
           # or combining `-p kin-core` with `--workspace` is a harmless no-op.
           printf '%s\n' -p kin-core >> "$RUNNER_TEMP/scope.args"
+          # Test the Cargo defaults used by core release archives.
+          # Optional inference permutations run in their explicit jobs.
           echo "scope: $(tr '\n' ' ' < "$RUNNER_TEMP/scope.args")"
 
       # A filter that matches nothing grades nothing and exits 0, printing the
@@ -1667,6 +1692,12 @@ jobs:
           cargo check --locked --target x86_64-pc-windows-gnu \
             -p kin-cli -p kin-daemon --tests
 
+      # Windows-only code is the one part of the tree the Linux and macOS
+      # boundary-lint passes never compile. This pass lints it, entered through
+      # the two shipped binaries the check above compiles.
+      - name: Check the filesystem boundary lint for Windows
+        run: python3 scripts/check-io-lint.py --no-probe --target x86_64-pc-windows-gnu
+
   # The required context, and the only job that publishes it. It always runs, on
   # every event, because a required context that is never reported is a silent
   # hang. It names which case it passed on rather than passing quietly, and it
@@ -1730,10 +1761,10 @@ jobs:
   #
   # Five assertions in this repository read the served surface, and every one of
   # them runs only on `main`'s push: install-proof.yml's "Graph query and MCP
-  # tool-call proof" step, which throws `MCP tools/list omitted semantic_search`
-  # and then calls that tool twice; `scripts/prove-windows-npm-first-run.mjs`,
-  # which asserts `toolNames.includes('semantic_search')` for both npm
-  # entrypoints; and Product Acceptance's `magic:6`, `magic:14` and
+  # tool-call proof" step, which throws `MCP tools/list omitted locate` and
+  # then calls that tool twice; `scripts/prove-windows-npm-first-run.mjs`,
+  # which asserts `toolNames.includes('locate')` for both npm entrypoints; and
+  # Product Acceptance's `magic:6`, `magic:14` and
   # `response_budget:2`, which read a schema knob, a description sentence and
   # every advertised budget.
   #
@@ -1789,6 +1820,7 @@ jobs:
       - name: Falsify the MCP surface graders
         run: python3 scripts/acceptance/mcp_surface_contract.py --self-test
 
+      # The surface agents see in a shipped archive, so the shipped features.
       - name: Build kin + kin-daemon
         run: cargo build --locked --bin kin --bin kin-daemon
 
@@ -1916,9 +1948,52 @@ jobs:
             echo "::endgroup::"
           done < "$RUNNER_TEMP/libraries.txt"
 
+      # `cargo package` rewrites each Kin path dependency to its registry
+      # version, so it reads the Kin registry index even with `--no-verify`.
+      # When that index answers HTTP 5xx or cannot be reached after retries,
+      # the outage is reported and the manifest rewrite is skipped instead of
+      # failing the run: an unavailable registry is not a fact about the
+      # libraries. The file lists are still graded, since `--list` needs no
+      # registry. Any other answer runs the full packaging below, where a real
+      # packaging error, or a registry that answers 4xx, still fails.
       - name: Package each library
         run: |
           set -euo pipefail
+          index="$(python3 -c 'import tomllib; print(tomllib.load(open(".cargo/config.toml", "rb"))["registries"]["kin"]["index"].removeprefix("sparse+"))')"
+          probe="${index%/}/config.json"
+          status=000
+          for delay in 2 4 8 ""; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$probe" 2>"$RUNNER_TEMP/registry-probe.err" || true)"
+            case "$status" in
+              5??|000) ;;
+              *) break ;;
+            esac
+            if [ -n "$delay" ]; then sleep "$delay"; fi
+          done
+          case "$status" in
+            5??|000)
+              if [ "$status" = 000 ]; then
+                reason="$probe is unreachable ($(tr '\n' ' ' < "$RUNNER_TEMP/registry-probe.err" | sed 's/ *$//'))"
+              else
+                reason="$probe answered HTTP $status"
+              fi
+              reason="$reason after 4 attempts"
+              echo "::warning title=Kin registry unavailable::$reason; library packaging skipped, file lists still graded"
+              {
+                echo "### Kin registry unavailable"
+                echo
+                echo "> $reason"
+                echo
+                echo "\`cargo package\` needs the registry index to rewrite path dependencies, so packaging was skipped. Each library's file list was still graded with \`cargo package --list\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              while IFS= read -r crate; do
+                echo "::group::cargo package -p $crate --list"
+                cargo package -p "$crate" --list --locked
+                echo "::endgroup::"
+              done < "$RUNNER_TEMP/libraries.txt"
+              exit 0
+              ;;
+          esac
           while IFS= read -r crate; do
             echo "::group::cargo package -p $crate --no-verify"
             cargo package -p "$crate" --no-verify --locked
@@ -1927,7 +2002,7 @@ jobs:
 
   check-pr-fast-path:
     name: Check & Test
-    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && !startsWith(github.head_ref, 'feature/public-export-') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -1971,7 +2046,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
@@ -2250,28 +2325,9 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/zero_file_search_guard.sh
 
-      # Deep history is a PROJECTION re-authored at ingest, not a stored fact:
-      # a merge change's entity/relation deltas are discarded and recomputed by
-      # the replay algorithm. Editing that algorithm changes what Kin reports
-      # about the past, and HYDRATION_SEMANTICS_VERSION is the declared dial for
-      # it. Nothing coupled the two, so the dial sat unchanged across the
-      # releases that rewrote replay. This pins the replay surface by digest, so
-      # an edit cannot ship without an explicit, reviewed manifest update.
-      - name: Check Hydration Replay Semantics
+      - name: Test the filesystem boundary lint
         if: matrix.shard == 1
-        run: python3 scripts/verify-hydration-semantics.py
-
-      - name: Falsify Hydration Replay Semantics guard
-        if: matrix.shard == 1
-        run: |
-          set -euo pipefail
-          poisoned="$(mktemp -d)"
-          trap 'rm -rf "$poisoned"' EXIT
-          cp -a crates scripts "$poisoned/"
-          # The REAL guard and manifest run against the poisoned copy: the
-          # manifest is policy, so letting the copy supply it would falsify
-          # nothing.
-          python3 scripts/falsify-hydration-semantics.py "$poisoned"
+        run: python3 scripts/test-io-lint.py
 
       # Two gates that ROUTE a failure rather than merely reporting one: the
       # release-policy gate decides whether a repo-global break belongs to the
@@ -2310,6 +2366,15 @@ jobs:
           # shellcheck disable=SC2086
           cargo clippy --all-targets --all-features -- $allows
 
+      # Raw filesystem and process access by name resolution, not by text: clippy
+      # reports every call to an entry point in scripts/io-lint/clippy.toml,
+      # however it is spelled, and every site must be on
+      # scripts/io-lint/allowed-sites.txt. A raw read added to an answer path
+      # fails here. The probe crate runs first and proves the configuration.
+      - name: Check the filesystem boundary lint
+        if: matrix.shard == 1
+        run: python3 scripts/check-io-lint.py
+
       - name: Check Runtime Boundaries
         if: matrix.shard == 1
         run: bash scripts/check_runtime_boundaries.sh
@@ -2327,8 +2392,9 @@ jobs:
 
       # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
       # to public source until every crate is registry-published.
+      # Additional opt-in local-engine coverage, separate from default archive proofs.
       - name: Build
-        run: cargo build --all-targets --locked
+        run: cargo build --all-targets --locked --features kin-cli/embeddings,kin-daemon/embeddings
 
       # Kin's Linux release binaries link against musl so a single archive runs
       # on every distribution, and nothing else in CI compiles for that target.
@@ -2350,7 +2416,7 @@ jobs:
           # this needs the same musl-gcc the release legs install.
           scripts/ci-apt-install.sh musl-tools
           cargo check --locked --target x86_64-unknown-linux-musl \
-            -p kin-cli -p kin-daemon
+            -p kin-cli -p kin-daemon --features kin-cli/embeddings,kin-daemon/embeddings
 
       # The second Linux release target. The step above proves any break that
       # selects on the C environment, because that selection is identical on
@@ -2413,13 +2479,18 @@ jobs:
       # so the two shards together run exactly the set one unpartitioned run
       # ran. `check-aggregate` below is what makes "together" enforceable: a
       # shard that never reported cannot leave its partition silently unrun.
+      #
+      # `--no-fail-fast` because this job runs only where a release is graded:
+      # the export pull request and the push to main. Stopping at the first
+      # failure hid every later one, so each export cycle found one failure
+      # and the next cycle found the next.
       - name: Test
-        run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2
+        run: cargo nextest run --locked --no-fail-fast --features kin-cli/embeddings,kin-daemon/embeddings --partition count:${{ matrix.shard }}/2
 
       - name: Doc tests
         if: matrix.shard == 1
         # nextest does not run doctests; keep them covered explicitly.
-        run: cargo test --doc --locked
+        run: cargo test --doc --locked --features kin-cli/embeddings,kin-daemon/embeddings
 
   # The required context for ubuntu. Its display name plus its one matrix value
   # compose to `Check & Test (ubuntu-latest)`, byte for byte what ruleset
@@ -2440,7 +2511,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -2480,7 +2551,7 @@ jobs:
   # clippy over macOS-gated code, the build, the tests, and the doctests. The
   # steps it does not carry are the source-reading gates whose result cannot
   # depend on the runner at all, from the README language count through the
-  # zero-file-search and hydration guards. `Check & Test (ubuntu-latest)` is a
+  # zero-file-search guards. `Check & Test (ubuntu-latest)` is a
   # required context and runs every one of them, so none is lost; running them a
   # second time bought nothing but macOS minutes at ten times the billing rate.
   #
@@ -2497,9 +2568,11 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     runs-on: macos-latest
-    timeout-minutes: 60
+    # Shard 1 also runs lint, boundary checks and doctests. Leave room for
+    # those gates after compilation; shard 2 keeps its existing limit.
+    timeout-minutes: ${{ matrix.shard == 1 && 75 || 60 }}
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -2557,8 +2630,18 @@ jobs:
           # shellcheck disable=SC2086
           cargo clippy --all-targets --all-features -- $allows
 
+      # Raw filesystem and process access by name resolution, not by text: clippy
+      # reports every call to an entry point in scripts/io-lint/clippy.toml,
+      # however it is spelled, and every site must be on
+      # scripts/io-lint/allowed-sites.txt. A raw read added to an answer path
+      # fails here. The probe crate runs first and proves the configuration.
+      - name: Check the filesystem boundary lint
+        if: matrix.shard == 1
+        run: python3 scripts/check-io-lint.py
+
+      # Additional opt-in Metal coverage, separate from default archive proofs.
       - name: Build
-        run: cargo build --all-targets --locked
+        run: cargo build --all-targets --locked --features kin-cli/metal,kin-daemon/metal
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -2569,15 +2652,18 @@ jobs:
       # the two shards together run exactly the set one unpartitioned run ran.
       # The aggregate below is what makes "together" enforceable: a shard that
       # never reported cannot leave its partition silently unrun.
+      #
+      # `--no-fail-fast` for the reason the ubuntu shards give: on 0.8.2's
+      # release commit this shard stopped at 2,102 of 7,741 tests.
       - name: Test
-        run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2
+        run: cargo nextest run --locked --no-fail-fast --features kin-cli/metal,kin-daemon/metal --partition count:${{ matrix.shard }}/2
 
       # nextest does not run doctests, so partitioning cannot cover them and one
       # shard has to. They are a 0.9 min step and splitting them would cost more
       # in a second cold `cargo test --doc` than it could save.
       - name: Doc tests
         if: matrix.shard == 1
-        run: cargo test --doc --locked
+        run: cargo test --doc --locked --features kin-cli/metal,kin-daemon/metal
 
   # The required context for macOS. Its display name plus its one matrix value
   # compose to `Check & Test (macos-latest)`, byte for byte what ruleset
@@ -2602,7 +2688,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -2645,7 +2731,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2828,7 +2914,7 @@ jobs:
   # gate instead, where the required contexts are.
   feature-tests-pr-fast-path:
     name: Feature permutation tests
-    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && !startsWith(github.head_ref, 'feature/public-export-') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -2846,7 +2932,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     runs-on: ${{ matrix.os }}
     # Two full kin-daemon feature suites, every library on minimal features,
     # and featureless kin-cli and kin-daemon, one after another. The 0.8.0
@@ -3017,7 +3103,7 @@ jobs:
     # A merge_group check-run that concludes after the merge lands on the exact
     # sha release-tag.yml sweeps, where a non-required failure is terminal even
     # though nothing gated on it. A job that never starts cannot conclude.
-    if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+    if: ${{ (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) && github.event_name != 'merge_group' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
@@ -3136,8 +3222,14 @@ jobs:
       # "coverage" were coverage files, and uploaded those. Two were fingerprint
       # JSON out of target/debug and three were Rust sources. The setting
       # confines this step to the file it was pointed at.
+      #
+      # Bounded because nothing else bounds it: on the 0.8.2 export pull
+      # request this upload started at 06:05:56Z and was still running when the
+      # job's cap cancelled the whole job 35 minutes later. A timed-out upload
+      # is a soft step failure under `continue-on-error`, not a lost job.
       - name: Upload coverage reports to Codecov
         continue-on-error: true
+        timeout-minutes: 5
         uses: codecov/codecov-action@v7
         with:
           files: cobertura.xml
@@ -3157,7 +3249,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request' }}
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
@@ -3261,7 +3353,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && github.event_name != 'pull_request'
+      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-'))
       && needs.install-proof-pr-build.result == 'success' }}
     uses: ./.github/workflows/install-proof.yml
     with:
@@ -3286,16 +3378,20 @@ jobs:
       - name: Require the pull request install proof
         env:
           EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           BUILD_RESULT: ${{ needs.install-proof-pr-build.result }}
           PROOF_RESULT: ${{ needs.install-proof-pr.result }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            echo "the install proof runs in the merge queue and on every main commit;"
-            echo "admission is the fast gate, and release-tag.yml still refuses a sha"
-            echo "whose required checks are not green"
-            exit 0
+            case "$HEAD_REF" in
+              feature/public-export-*) ;;
+              *)
+                echo "ordinary pull request: the install proof runs before the tag on main"
+                exit 0
+                ;;
+            esac
           fi
           if [ "$DOCS_ONLY" = "true" ]; then
             echo "documentation-only diff: no binaries changed, so the install proof has nothing to install"

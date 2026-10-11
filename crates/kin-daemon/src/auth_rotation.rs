@@ -1018,7 +1018,7 @@ fn write_window_record(record_path: &Path, record: &WindowRecord) -> std::io::Re
     let write_result = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
         std::fs::rename(&tmp, record_path)?;
         if let Some(parent) = record_path.parent() {
             crate::state::sync_directory_metadata(parent)?;

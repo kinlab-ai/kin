@@ -14,6 +14,7 @@ fn nested_repository_without_own_store() -> (TempDir, PathBuf) {
     let parent = temp.path().join("parent");
     let child = parent.join("child");
     std::fs::create_dir_all(parent.join(".kin")).expect("create parent store marker");
+    std::fs::write(parent.join(".kin/version"), "2").expect("mark recognized parent store");
     std::fs::create_dir_all(&child).expect("create nested repository");
 
     let output = Command::new("git")
@@ -60,7 +61,7 @@ fn top_level_help_and_version_skip_parent_store_boundary_warning() {
 }
 
 #[test]
-fn subcommand_help_still_runs_repository_boundary_check() {
+fn subcommand_help_does_not_announce_a_store_beyond_the_repository_boundary() {
     let (_temp, child) = nested_repository_without_own_store();
 
     let output = Command::new(env!("CARGO_BIN_EXE_kin"))
@@ -76,7 +77,20 @@ fn subcommand_help_still_runs_repository_boundary_check() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("refusing to bind the parent store"),
-        "non-bare help should preserve the repository boundary warning: {stderr}"
+        !stderr.contains("parent store"),
+        "discovery must not announce a store beyond the nested repository boundary: {stderr}"
     );
+
+    // Silence must not mean the parent graph was bound: the public resolver
+    // independently refuses this nested repository, which has no store.
+    let lookup = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["store", "path", "--json"])
+        .current_dir(&child)
+        .output()
+        .expect("resolve nested repository");
+    assert!(
+        !lookup.status.success(),
+        "nested repository bound the parent store"
+    );
+    assert!(String::from_utf8_lossy(&lookup.stderr).contains("not a Kin repository"));
 }

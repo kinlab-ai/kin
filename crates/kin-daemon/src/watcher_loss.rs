@@ -370,7 +370,7 @@ pub fn write(layout: &kin_core::KinLayout, recorded: &WatcherLoss) -> std::io::R
     {
         let mut file = std::fs::File::create(&staged)?;
         file.write_all(&body)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
     }
     if let Err(error) = std::fs::rename(&staged, &path) {
         let _ = std::fs::remove_file(&staged);

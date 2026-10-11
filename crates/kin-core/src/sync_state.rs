@@ -35,9 +35,9 @@ impl SyncStateStore {
     /// doesn't exist or is unreadable.
     pub fn load(layout: &KinLayout) -> Self {
         let path = layout.sync_state_path();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+        match crate::store_records::read(layout.root(), &path) {
+            Ok(Some(content)) => serde_json::from_slice(&content).unwrap_or_default(),
+            _ => Self::default(),
         }
     }
 
@@ -46,7 +46,8 @@ impl SyncStateStore {
         let path = layout.sync_state_path();
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| crate::KinError::io(&path, std::io::Error::other(e)))?;
-        std::fs::write(&path, json).map_err(|e| crate::KinError::io(&path, e))
+        crate::store_records::write(layout.root(), &path, json.as_bytes())
+            .map_err(|e| crate::KinError::io(&path, e))
     }
 
     /// Get the sync state for a remote, if any.
