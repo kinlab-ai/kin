@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::{CallSite, CallSiteLedger, CallSiteState, Entity, EntityId, EntityKind, LanguageId};
-use crate::{ResolutionRecordId, ServerFailure, UnresolvedReason};
+use crate::{EscapeResidue, ResolutionRecordId, ServerFailure, UnresolvedReason};
 
 /// Verdict clause: a site in scope belongs to a caller whose sites the graph
 /// has not settled yet, because its derivation or its enrichment is owed and
@@ -60,6 +60,86 @@ pub const PROOF_CONTEXT_UNVERIFIED: &str = "proof_context_unverified";
 /// Verdict clause: a site in scope calls through a value binding, which
 /// proves no target.
 pub const BINDING_UNPROVEN: &str = "binding_unproven";
+/// Verdict clause: call sites whose callee or caller body spells a call name
+/// of the focal are not proven, and every one of them is listed in the answer
+/// beside its rows. The answer is complete except those listed sites.
+pub const NAMED_LEFTOVERS: &str = "named_leftovers";
+/// Verdict clause: unsettled call sites that never spell a call name of the
+/// focal could reach it only if it is held as a value, and the escape census
+/// could not rule that out. They are counted once, with the census reason,
+/// rather than listed.
+pub const VALUE_CALLS_UNMEASURED: &str = "value_calls_unmeasured";
+/// Verdict clause: the escape census lists sites that could reach the focal
+/// without a call that spells its call names. The answer is complete except
+/// those listed sites.
+pub const ESCAPE_RESIDUE_LISTED: &str = "escape_residue_listed";
+
+/// Verdict clause: lookups by a name computed at run time could reach the
+/// focal only the way they could reach any declaration their receiver holds:
+/// no record says anything about the name they look up, and none spells a
+/// call name (see [`crate::EscapeResidue::unkeyed_lookups`]). Every reader
+/// that does not run the program shares that blind spot, so the answer counts
+/// them in one sentence rather than listing them as sites to check. It never
+/// licenses an absence.
+pub const UNKEYED_LOOKUPS_COUNTED: &str = "unkeyed_lookups_counted";
+
+/// Verdict clause: a reference answer that asks for non-call relations left
+/// out non-call reads of the focal's name that could read the focal and that
+/// no stored row of a requested kind carries. The escape census lists each one
+/// by file and line under `residue.mentions.unmatched` (see
+/// [`crate::MentionResidue`]), so the answer is complete except those sites.
+pub const REFERENCE_MENTIONS_UNMATCHED: &str = "reference_mentions_unmatched";
+
+/// Verdict clause: completion of the requested non-call relations is not
+/// measured, because the escape census took no mention reading, or took one
+/// over records that predate it or regions no record covers.
+pub const REFERENCE_COMPLETION_UNMEASURED: &str = "reference_completion_unmeasured";
+
+/// Verdict clause: reference sites a language server left undecided on
+/// repeated passes over unchanged code are served as references but proven by
+/// nothing, and the answer lists every one with its caller and line under
+/// [`UNDECIDED_REFERENCE_SITES_KEY`], so it is complete except those sites.
+pub const REFERENCE_SITES_UNDECIDED_LISTED: &str = "reference_sites_undecided_listed";
+
+/// Verdict clause: reference sites a language server left undecided on
+/// repeated passes over unchanged code are counted rather than listed, so
+/// usages there may be missing and the answer is partial.
+pub const REFERENCE_SITES_UNDECIDED: &str = "reference_sites_undecided";
+
+/// The reply block that counts and lists undecided reference sites:
+/// `{"count": N, "sites": [{"caller", "caller_name", "line", "unit"}]}`.
+pub const UNDECIDED_REFERENCE_SITES_KEY: &str = "undecided_reference_sites";
+
+/// Verdict clause: a method may run without a call that spells its name only
+/// through the decorators it is declared under (see
+/// [`member_dispatch_decorators`]). Each receives the method and its result is
+/// what a call spelling the name runs, so the answer lists every one and is
+/// complete except what those decorators do with the method.
+pub const DECORATOR_DISPATCH_LISTED: &str = "decorator_dispatch_listed";
+
+/// The clause codes that describe a residue an answer lists or counts in full
+/// rather than a gap it cannot see: an answer whose every refusing clause is
+/// one of these is complete except that residue.
+pub const RESIDUE_CODES: [&str; 7] = [
+    NAMED_LEFTOVERS,
+    VALUE_CALLS_UNMEASURED,
+    ESCAPE_RESIDUE_LISTED,
+    UNKEYED_LOOKUPS_COUNTED,
+    REFERENCE_MENTIONS_UNMATCHED,
+    DECORATOR_DISPATCH_LISTED,
+    REFERENCE_SITES_UNDECIDED_LISTED,
+];
+
+/// The per-site verdict codes a scan over one focal's named sites replaces with
+/// [`NAMED_LEFTOVERS`], because it lists every such site instead of counting
+/// it: each of these states says where one call goes is not known, and a site
+/// that is listed by its caller and its line is a residue a reader can check.
+pub const LISTED_SITE_CODES: [&str; 4] = [
+    BINDING_UNPROVEN,
+    CALL_SITES_NOT_IN_BUILD,
+    CALL_SITES_SERVER_FAILED,
+    CALL_SITES_UNRESOLVED,
+];
 
 /// What a reader serves for one call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -69,6 +149,7 @@ pub enum SiteStateKind {
     ProvenExternal,
     ProvenOutside,
     ProvenDeclaration,
+    ProvenStatic,
     Binding,
     NotInBuild,
     ServerFailed,
@@ -82,11 +163,12 @@ pub enum SiteStateKind {
 
 impl SiteStateKind {
     /// Every kind, in the order payloads list them.
-    pub const ALL: [SiteStateKind; 13] = [
+    pub const ALL: [SiteStateKind; 14] = [
         Self::ProvenTarget,
         Self::ProvenExternal,
         Self::ProvenOutside,
         Self::ProvenDeclaration,
+        Self::ProvenStatic,
         Self::Binding,
         Self::NotInBuild,
         Self::ServerFailed,
@@ -115,6 +197,7 @@ impl SiteStateKind {
             CallSiteState::ProvenExternal { .. } => Self::ProvenExternal,
             CallSiteState::ProvenOutside => Self::ProvenOutside,
             CallSiteState::ProvenDeclaration { .. } => Self::ProvenDeclaration,
+            CallSiteState::ProvenStatic { .. } => Self::ProvenStatic,
             CallSiteState::Binding { .. } => Self::Binding,
             CallSiteState::NotInBuild { .. } => Self::NotInBuild,
             CallSiteState::ServerFailed { .. } => Self::ServerFailed,
@@ -129,6 +212,7 @@ impl SiteStateKind {
             Self::ProvenExternal => "proven_external",
             Self::ProvenOutside => "proven_outside",
             Self::ProvenDeclaration => "proven_declaration",
+            Self::ProvenStatic => "proven_static",
             Self::Binding => "binding",
             Self::NotInBuild => "not_in_build",
             Self::ServerFailed => "server_failed",
@@ -142,7 +226,8 @@ impl SiteStateKind {
     }
 
     /// Whether a site read as this kind is settled: a resolver proved where
-    /// the call goes, inside the repository or out of it.
+    /// the call goes, inside the repository or out of it, or a sound static
+    /// tier proved it where the resolver could not.
     pub fn is_settled(self) -> bool {
         matches!(
             self,
@@ -150,6 +235,7 @@ impl SiteStateKind {
                 | Self::ProvenExternal
                 | Self::ProvenOutside
                 | Self::ProvenDeclaration
+                | Self::ProvenStatic
         )
     }
 
@@ -160,7 +246,8 @@ impl SiteStateKind {
             Self::ProvenTarget
             | Self::ProvenExternal
             | Self::ProvenOutside
-            | Self::ProvenDeclaration => None,
+            | Self::ProvenDeclaration
+            | Self::ProvenStatic => None,
             Self::Binding => Some(BINDING_UNPROVEN),
             Self::NotInBuild => Some(CALL_SITES_NOT_IN_BUILD),
             Self::ServerFailed => Some(CALL_SITES_SERVER_FAILED),
@@ -185,6 +272,11 @@ pub enum NoResolver {
     /// Language-server enrichment is switched off for the process serving the
     /// graph, so no language server is consulted for any language.
     EnrichmentOff,
+    /// Language-server enrichment is off for this repository by its own
+    /// setting, which `kin daemon sweep --enable` turns on. Kept apart from
+    /// [`Self::EnrichmentOff`] because the way out is the repository's, not
+    /// the process's.
+    EnrichmentOffForRepository,
     /// No language server for the language is installed, or this build wires
     /// none for it.
     NoLanguageServer,
@@ -198,6 +290,7 @@ impl NoResolver {
     pub fn wire(&self) -> &'static str {
         match self {
             Self::EnrichmentOff => "enrichment_off",
+            Self::EnrichmentOffForRepository => "enrichment_off_for_repository",
             Self::NoLanguageServer => "no_language_server",
             Self::ServerCannotStart { .. } => "server_cannot_start",
         }
@@ -206,12 +299,22 @@ impl NoResolver {
     /// Why, as a clause fragment about `language`. It never holds the `"; "`
     /// that separates verdict clauses, and a server's own reason is cut to a
     /// bounded length.
+    ///
+    /// A long reason keeps its beginning and its end. A start failure reads
+    /// "`<server>` did not answer initialize: it exited with code 3. Its last
+    /// stderr: ...", so the first words say what happened and the last
+    /// say why, and keeping only the first cut the why away.
     pub fn sentence(&self, language: LanguageId) -> String {
-        const REASON_MAX_CHARS: usize = 160;
+        const REASON_HEAD_CHARS: usize = 160;
+        const REASON_TAIL_CHARS: usize = 320;
         match self {
             Self::EnrichmentOff => {
                 format!("{language}: language-server enrichment is switched off")
             }
+            Self::EnrichmentOffForRepository => format!(
+                "{language}: language-server enrichment is off for this repository until \
+                 `kin daemon sweep --enable` turns it on"
+            ),
             Self::NoLanguageServer => {
                 format!("{language}: no language server for it is installed or wired")
             }
@@ -221,8 +324,11 @@ impl NoResolver {
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                if reason.chars().count() > REASON_MAX_CHARS {
-                    reason = reason.chars().take(REASON_MAX_CHARS).collect::<String>() + "...";
+                let count = reason.chars().count();
+                if count > REASON_HEAD_CHARS + REASON_TAIL_CHARS {
+                    let head: String = reason.chars().take(REASON_HEAD_CHARS).collect();
+                    let tail: String = reason.chars().skip(count - REASON_TAIL_CHARS).collect();
+                    reason = format!("{} ... {}", head.trim_end(), tail.trim_start());
                 }
                 format!("{language}: its language server cannot start ({reason})")
             }
@@ -434,6 +540,193 @@ pub const REACH_NAME_UNKNOWN: &str = "focal name unknown";
 /// `handlers[key]`, `eval`), which can reach any focal without spelling it.
 pub const REACH_DYNAMIC_ACCESS: &str = "dynamic reflective access";
 
+/// Whether a kept site's reason ties it to the focal by name: its callee or
+/// its caller's body spells a call name, its text was not read in a caller
+/// that could spell one, or the focal has no call name to rule it out by.
+/// Such a site is a named leftover, listed in full. Every other reason keeps a
+/// site only because the focal may be held as a value or reached through
+/// dynamic access, and those are counted as value calls.
+pub fn reach_is_named(reason: &str) -> bool {
+    matches!(
+        reason,
+        REACH_CALLEE_SPELLS | REACH_BODY_SPELLS | REACH_TEXT_UNKNOWN | REACH_NAME_UNKNOWN
+    )
+}
+
+/// Member names a language runs without any call spelling them: protocol
+/// hooks a statement or an operator invokes (`next` behind a loop, `close`
+/// behind a resource block, `then` behind an await), and the conversions a
+/// runtime calls on its own. Read together with the shapes
+/// [`member_may_dispatch_without_its_name`] checks.
+const IMPLICIT_HOOK_MEMBERS: [&str; 17] = [
+    "then",
+    "toString",
+    "valueOf",
+    "toJSON",
+    "next",
+    "drop",
+    "deref",
+    "deref_mut",
+    "fmt",
+    "iterator",
+    "close",
+    "Dispose",
+    "GetEnumerator",
+    "String",
+    "Error",
+    "equals",
+    "hashCode",
+];
+
+/// Whether a method may be reached with no call expression spelling its name,
+/// so a reading of the sites that spell it cannot be the whole set of its
+/// callers: a member wrapped in double underscores (a protocol hook), an
+/// operator overload, an accessor or a decorated declaration (a property is
+/// read, not called), or a member a language runs on its own
+/// ([`IMPLICIT_HOOK_MEMBERS`]). Leans toward yes: a false yes only keeps an
+/// answer from certifying.
+pub fn member_may_dispatch_without_its_name(focal: &Entity) -> bool {
+    let Some(member) = focal
+        .name
+        .split(['.', ':'])
+        .rfind(|segment| !segment.is_empty())
+    else {
+        return true;
+    };
+    let signature = focal.signature.trim_start();
+    // An accessor declaration opens with `get` or `set`, after any modifiers,
+    // and names the member after it: `get size()`, `static set mode(value)`.
+    let accessor = signature
+        .split_whitespace()
+        .skip_while(|word| {
+            matches!(
+                *word,
+                "static" | "public" | "private" | "protected" | "override" | "readonly"
+            )
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    let is_accessor = matches!(accessor.as_slice(), [keyword, rest]
+        if matches!(*keyword, "get" | "set") && !rest.starts_with('('));
+    member_name_may_dispatch_implicitly(member)
+        || is_accessor
+        || signature.starts_with('@')
+        || signature.contains("\n@")
+}
+
+/// Decorators that make a Python member an attribute: a read of the name runs
+/// it, with no call at all, so no listing of the decorator accounts for it.
+const ACCESSOR_DECORATORS: [&str; 4] = ["setter", "getter", "deleter", "cached_property"];
+
+/// Python's own decorators that leave a method reached through its name and
+/// nothing else: `staticmethod` and `classmethod` change only what it is bound
+/// to, `abc.abstractmethod` marks it, and `typing.overload`, `override` and
+/// `final` are read by type checkers alone.
+const NAME_PRESERVING_DECORATORS: [&str; 8] = [
+    "staticmethod",
+    "classmethod",
+    "abstractmethod",
+    "abstractclassmethod",
+    "abstractstaticmethod",
+    "overload",
+    "override",
+    "final",
+];
+
+/// The decorators a method may run through without a call that spells its
+/// name, when they are the only way it can: `Some` with every decorator on the
+/// declaration that is not one of Python's name-preserving ones, `None` when
+/// something else could run it (a protocol or hook name, an operator, an
+/// accessor, a property-style decorator) or when the declaration does not read
+/// as decorators over a `def`.
+///
+/// `@d def m` binds `d(m)` to the name `m`, so every call that spells `m` runs
+/// what `d` returned, and `m` itself runs elsewhere only if `d` keeps it and
+/// calls it from somewhere else. A reading of the call sites that spell `m`
+/// is therefore whole except what each listed decorator does with it, which is
+/// a short list a reader can check, where the bare gate said only that the
+/// callers might be anywhere. An empty list means only name-preserving
+/// decorators were found, so the method runs through its name alone.
+///
+/// Python only, read from the signature the Python adapter writes: one
+/// `@name` per decorator ahead of `def`. A signature in any other shape
+/// returns `None`, so another language keeps the gate.
+pub fn member_dispatch_decorators(focal: &Entity) -> Option<Vec<String>> {
+    if focal.language != LanguageId::Python || focal.kind != EntityKind::Method {
+        return None;
+    }
+    let member = focal
+        .name
+        .split(['.', ':'])
+        .rfind(|segment| !segment.is_empty())?;
+    if member_name_may_dispatch_implicitly(member) {
+        return None;
+    }
+    let mut rest = focal.signature.trim_start();
+    let mut decorators: Vec<&str> = Vec::new();
+    while let Some(after) = rest.strip_prefix('@') {
+        let end = after.find(char::is_whitespace)?;
+        let name = &after[..end];
+        if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+            return None;
+        }
+        decorators.push(name);
+        rest = after[end..].trim_start();
+    }
+    if decorators.is_empty() || !(rest.starts_with("def ") || rest.starts_with("async def ")) {
+        return None;
+    }
+    if decorators
+        .iter()
+        .any(|name| ACCESSOR_DECORATORS.contains(name) || name.ends_with("property"))
+    {
+        return None;
+    }
+    Some(
+        decorators
+            .into_iter()
+            .filter(|name| !NAME_PRESERVING_DECORATORS.contains(name))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Whether a method may run without a call that spells its name only because
+/// it is a constructor (`__init__`, `__new__`): a construction spells its
+/// type, which [`focal_call_names`] follows, and what no name shows is a
+/// construction of a subclass that defines no constructor of its own, or one
+/// through `cls`, `type(self)` or `self.__class__`. A decorated constructor
+/// could run another way too, and reads `false`.
+pub fn member_dispatches_by_construction(focal: &Entity) -> bool {
+    if focal.kind != EntityKind::Method {
+        return false;
+    }
+    let Some(member) = focal
+        .name
+        .split(['.', ':'])
+        .rfind(|segment| !segment.is_empty())
+    else {
+        return false;
+    };
+    let signature = focal.signature.trim_start();
+    matches!(member, "__init__" | "__new__")
+        && !signature.starts_with('@')
+        && !signature.contains("\n@")
+}
+
+/// Whether a member of this name may be run with no call spelling it: a name
+/// wrapped in double underscores (a protocol hook), an operator overload, a
+/// computed key, or a member a language runs on its own
+/// ([`IMPLICIT_HOOK_MEMBERS`]). The name-only half of
+/// [`member_may_dispatch_without_its_name`], for a reader that holds a call's
+/// member name rather than a declaration.
+pub fn member_name_may_dispatch_implicitly(member: &str) -> bool {
+    (member.len() > 4 && member.starts_with("__") && member.ends_with("__"))
+        || member.starts_with("operator")
+        || member.starts_with('[')
+        || IMPLICIT_HOOK_MEMBERS.contains(&member)
+}
+
 /// Member names that make a method a constructor, which a call reaches by
 /// spelling its type: `HTTPAdapter(...)` reaches `HTTPAdapter.__init__`.
 const CONSTRUCTOR_MEMBERS: [&str; 6] = [
@@ -499,6 +792,33 @@ fn is_identifier(text: &str) -> bool {
             .all(|character| character.is_alphanumeric() || character == '_' || character == '$')
 }
 
+/// Whether `text` spells `name` as a whole identifier: an occurrence of
+/// `name` that no identifier character touches on either side.
+///
+/// A call's callee token is one identifier, so text that holds `name` only
+/// inside a longer identifier, `advanceTimersByTime` for `advanceTimers`, holds
+/// no token a call to `name` could spell. A plain substring test read every
+/// unresolved call in a body that named the longer identifier as a possible
+/// call to the shorter one: on React it put 172,165 test-file calls on one
+/// function's frontier. The identifier characters are the ones
+/// [`is_identifier`] accepts, which covers Python and JavaScript; a character
+/// outside them, such as `.` or `#`, bounds a match, so `obj.name` and
+/// `#name` still spell `name`.
+pub fn spells_identifier(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let part =
+        |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+    let starts_inside = name.chars().next().is_some_and(part);
+    let ends_inside = name.chars().next_back().is_some_and(part);
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        !(starts_inside && before.is_some_and(part) || ends_inside && after.is_some_and(part))
+    })
+}
+
 /// The text at `site` inside `caller_text`, the caller's exact own text from
 /// its first byte, which is what a ledger keys its sites against. `None` when
 /// the key falls outside that text or off a character boundary.
@@ -560,8 +880,8 @@ pub fn site_could_call(
 /// 6. A placeable site whose token the reader holds and that spells none of
 ///    `names` cannot be one.
 /// 7. A placeable site whose token the reader does not hold could be one when
-///    the body spells a name, since its token might, and is kept when the
-///    body is not known either.
+///    the body spells a name as a whole identifier ([`spells_identifier`]),
+///    since its token might, and is kept when the body is not known either.
 pub fn site_could_call_at(
     site: &CallSite,
     site_text: Option<&str>,
@@ -621,7 +941,7 @@ pub fn site_could_call_at(
     if token.is_some() {
         return None;
     }
-    match caller_body.map(|body| names.iter().any(|name| body.contains(name))) {
+    match caller_body.map(|body| names.iter().any(|name| spells_identifier(body, name))) {
         Some(true) => Some(REACH_BODY_SPELLS),
         Some(false) => None,
         None => Some(REACH_TEXT_UNKNOWN),
@@ -997,16 +1317,25 @@ pub fn calling_languages(language: LanguageId) -> Vec<LanguageId> {
     }
 }
 
+/// The most files a residue list is grouped into in a payload, those holding
+/// the most sites first (see [`FocalEscape::summary_json`]).
+pub const RESIDUE_FILES_MAX: usize = 20;
+
+/// The most lines a residue list names for one file in a payload.
+pub const RESIDUE_FILE_LINES_MAX: usize = 3;
+
 /// Whether a focal can be held as a value, so a call that never spells its
 /// name may still reach it: the `focal_escapes` every predicate above takes.
 ///
 /// Proven, never assumed. A reference edge is no proof either way: a
 /// references pass can fail and leave none, a ledger censuses only call
-/// expressions, so `handler = target` is recorded nowhere else, and a stale
-/// reference can be retracted because a pass did not reproduce it. So the
-/// focal is contained only when a census of its call names over the store's
-/// text accounts for every occurrence, and anything unproven reads as
-/// escaping.
+/// expressions, and a stale reference can be retracted because a pass did
+/// not reproduce it. So the answer comes from the parse-time records every
+/// file of the focal's calling languages carries (see
+/// [`crate::value_escape`]): each non-call use of a call name, each
+/// reflective site and each protocol-dispatch site that could reach the
+/// focal is listed in its [`EscapeResidue`], and anything the records cannot
+/// speak for reads as unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "escape", rename_all = "snake_case")]
 pub enum FocalEscape {
@@ -1016,24 +1345,224 @@ pub enum FocalEscape {
         reason: &'static str,
         entities_checked: usize,
     },
-    /// Some occurrence of the focal's name is not a call: it may be held as a
-    /// value.
-    Escapes { reason: &'static str },
-    /// Every occurrence of the focal's call names in the store is a
-    /// declaration of that name, an import binding it as itself, or a
-    /// recorded call site's callee.
-    Contained { entities_checked: usize },
+    /// Some use of the focal's name holds it as a value: `residue.values`
+    /// lists every one, beside the rest of the residue.
+    Escapes {
+        reason: &'static str,
+        residue: EscapeResidue,
+    },
+    /// No use holds the focal as a value. Calls spelling a name in
+    /// `residue.alias_names` are calls to it too, and the rest of the residue
+    /// lists every site that could still reach it without such a call.
+    Contained {
+        entities_checked: usize,
+        residue: EscapeResidue,
+    },
     /// Could not be proven either way; consumers treat it as escaping.
     Unknown { reason: &'static str },
 }
 
 impl FocalEscape {
-    /// Whether the focal may be held as a value: anything but a proven
-    /// containment.
+    /// A containment with nothing listed.
+    pub fn contained(entities_checked: usize) -> Self {
+        Self::Contained {
+            entities_checked,
+            residue: EscapeResidue::default(),
+        }
+    }
+
+    /// Whether the focal may be held as a value, or reached without a call
+    /// that spells [`focal_call_names`]: anything but a proven containment
+    /// that lists nothing. A reader that serves the residue, and calls
+    /// spelling its alias names, asks [`Self::may_escape_unlisted`] instead.
     pub fn may_escape(&self) -> bool {
-        !matches!(self, Self::Contained { .. } | Self::NonCallable { .. })
+        match self {
+            Self::NonCallable { .. } => false,
+            Self::Contained { residue, .. } => !residue.is_empty(),
+            Self::Escapes { .. } | Self::Unknown { .. } => true,
+        }
+    }
+
+    /// Whether the focal may be held as a value in a way the census did not
+    /// list, for a reader that already reads calls spelling `names` and
+    /// serves the residue: unknown and escaping foci may, a containment may
+    /// only when an alias name is missing from `names`.
+    pub fn may_escape_unlisted(&self, names: &[String]) -> bool {
+        match self {
+            Self::NonCallable { .. } => false,
+            Self::Contained { residue, .. } => residue
+                .alias_names
+                .iter()
+                .any(|alias| !names.contains(alias)),
+            Self::Escapes { .. } | Self::Unknown { .. } => true,
+        }
+    }
+
+    /// Whether the census judged every lookup by a computed name in the
+    /// domain against the focal, called on the spot or not, and listed in
+    /// `residue.reflective` each one that could fetch it. A call whose callee
+    /// is such a lookup (`handlers[key]()`, `getattr(obj, name)()`) then
+    /// reaches the focal only if the residue lists it, so a reading that
+    /// serves the residue does not keep the call as dynamic access as well.
+    /// True for a census that read every file's record, never for an unknown
+    /// answer.
+    pub fn judged_dynamic_access(&self) -> bool {
+        matches!(self, Self::Contained { .. } | Self::Escapes { .. })
+    }
+
+    /// The census's listed residue, when it took one.
+    pub fn residue(&self) -> Option<&EscapeResidue> {
+        match self {
+            Self::Escapes { residue, .. } | Self::Contained { residue, .. } => Some(residue),
+            Self::NonCallable { .. } | Self::Unknown { .. } => None,
+        }
+    }
+
+    /// The names a call to `focal` is spelled with: [`focal_call_names`] and
+    /// the aliases the census found.
+    pub fn call_names(&self, focal: &Entity) -> Vec<String> {
+        let mut names = focal_call_names(focal);
+        for alias in self
+            .residue()
+            .map_or(&[][..], |residue| &residue.alias_names)
+        {
+            if !names.contains(alias) {
+                names.push(alias.clone());
+            }
+        }
+        names
+    }
+
+    /// A bounded rendering for a payload: the answer, every alias name, and
+    /// each residue list counted with at most `sample` of its sites. A list
+    /// longer than `sample` is also grouped by file: how many files it spans,
+    /// and for the [`RESIDUE_FILES_MAX`] files holding the most sites, each
+    /// file's count and first [`RESIDUE_FILE_LINES_MAX`] lines, so a long
+    /// residue reads as a short list of places.
+    pub fn summary_json(&self, sample: usize) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("a focal escape serializes");
+        let Some(residue) = self.residue() else {
+            return value;
+        };
+        let listed = |sites: &[crate::ResidueSite]| {
+            let mut entry = serde_json::json!({
+                "count": sites.len(),
+                "sites": sites.iter().take(sample).collect::<Vec<_>>(),
+            });
+            if sites.len() > sample {
+                let mut files: Vec<(&str, Vec<u32>)> = Vec::new();
+                for site in sites {
+                    match files.iter_mut().find(|(file, _)| *file == site.file) {
+                        Some((_, lines)) => lines.push(site.line),
+                        None => files.push((site.file.as_str(), vec![site.line])),
+                    }
+                }
+                entry["files"] = serde_json::json!(files.len());
+                files.sort_by(|(left_file, left), (right_file, right)| {
+                    right.len().cmp(&left.len()).then(left_file.cmp(right_file))
+                });
+                entry["by_file"] = serde_json::json!(files
+                    .iter()
+                    .take(RESIDUE_FILES_MAX)
+                    .map(|(file, lines)| serde_json::json!({
+                        "file": file,
+                        "count": lines.len(),
+                        "lines": lines.iter().take(RESIDUE_FILE_LINES_MAX).collect::<Vec<_>>(),
+                    }))
+                    .collect::<Vec<_>>());
+                if files.len() > RESIDUE_FILES_MAX {
+                    entry["files_omitted"] = serde_json::json!(files.len() - RESIDUE_FILES_MAX);
+                }
+            }
+            entry
+        };
+        let mut summary = serde_json::Map::new();
+        if !residue.alias_names.is_empty() {
+            summary.insert("alias_names".into(), serde_json::json!(residue.alias_names));
+            summary.insert("alias_sites".into(), listed(&residue.alias_sites));
+        }
+        for (key, sites) in [
+            ("values", &residue.values),
+            ("bindings", &residue.bindings),
+            ("implicit_calls", &residue.implicit_calls),
+            ("reflective", &residue.reflective),
+            ("unkeyed_lookups", &residue.unkeyed_lookups),
+            ("unrecorded", &residue.unrecorded),
+        ] {
+            if !sites.is_empty() {
+                summary.insert(key.into(), listed(sites));
+            }
+        }
+        if let Some(protocol) = &residue.protocol {
+            let mut entry = serde_json::json!({"dispatch": protocol.dispatch});
+            if let Some(through) = &protocol.through {
+                entry["through"] = serde_json::json!(through);
+            }
+            if !protocol.sites.is_empty() {
+                entry["sites"] = listed(&protocol.sites);
+            }
+            summary.insert("protocol".into(), entry);
+        }
+        if !residue.outside_receivers.is_empty() {
+            summary.insert(
+                OUTSIDE_RECEIVERS_KEY.into(),
+                serde_json::json!(residue.outside_receivers),
+            );
+        }
+        if !residue.outside_values.is_empty() {
+            summary.insert(
+                OUTSIDE_VALUES_KEY.into(),
+                serde_json::json!(residue.outside_values),
+            );
+        }
+        if !residue.unrelated_receivers.is_empty() {
+            summary.insert(
+                UNRELATED_RECEIVERS_KEY.into(),
+                serde_json::json!(residue.unrelated_receivers),
+            );
+        }
+        let mentions = &residue.mentions;
+        if mentions.taken {
+            let mut entry = serde_json::json!({"measured": mentions.measured});
+            if let Some(reason) = mentions.reason {
+                entry["reason"] = serde_json::json!(reason);
+            }
+            if let Some(reason) = mentions.references_unmeasured {
+                entry["references_unmeasured"] = serde_json::json!(reason);
+            }
+            if mentions.measured {
+                entry["count"] = serde_json::json!(mentions.count());
+                entry["matched"] = serde_json::json!(mentions.matched);
+                if !mentions.unmatched.is_empty() {
+                    entry["unmatched"] = listed(&mentions.unmatched);
+                }
+            }
+            summary.insert(MENTIONS_KEY.into(), entry);
+        }
+        value["residue"] = serde_json::Value::Object(summary);
+        value
     }
 }
+
+/// Where a census residue counts the reads of a followed name on a receiver
+/// imported from outside the repository (see [`crate::OutsideReceiver`]):
+/// `[{"receiver", "module", "name", "reads"}]`.
+pub const OUTSIDE_RECEIVERS_KEY: &str = "outside_receivers";
+
+/// Where a census residue counts the reads of a followed name on a receiver
+/// whose value is proved to be of a type outside the repository (see
+/// [`crate::OutsideValueRead`]): `[{"receiver", "owner", "name", "reads"}]`.
+pub const OUTSIDE_VALUES_KEY: &str = "outside_values";
+
+/// Where a census residue counts the reads of a followed member name on a
+/// receiver whose class shares no instance with the focal's owner (see
+/// [`crate::UnrelatedReceiver`]): `[{"receiver", "class", "name", "reads"}]`.
+pub const UNRELATED_RECEIVERS_KEY: &str = "unrelated_receivers";
+
+/// Where a census residue lists the focal's non-call reads (see
+/// [`crate::MentionResidue`]): `{"measured", "reason"?, "count", "matched":
+/// {kind: count}, "unmatched"?: {"count", "sites", "files"?, "by_file"?}}`.
+pub const MENTIONS_KEY: &str = "mentions";
 
 impl CallerSites {
     /// This reading with only the sites `keep` admits in its ledger. A
@@ -1258,7 +1787,9 @@ impl CallSiteTally {
             }
             let why = match code {
                 BINDING_UNPROVEN => "call through a value binding, which proves no target",
-                CALL_SITES_NOT_IN_BUILD => "sit in a file no build of the repository compiles",
+                CALL_SITES_NOT_IN_BUILD => {
+                    "sit in a source unit no build of the repository compiles"
+                }
                 CALL_SITES_SERVER_FAILED => {
                     "got no answer because the resolver timed out, crashed or broke protocol"
                 }
@@ -1314,6 +1845,168 @@ mod tests {
         Hash256, SemanticFingerprint, SourceSpan, Visibility,
     };
     use uuid::Uuid;
+
+    /// A long residue reads as a short list of places: its count, how many
+    /// files it spans, and the files holding the most sites with their first
+    /// lines.
+    #[test]
+    fn a_long_residue_is_grouped_by_file() {
+        let site = |file: &str, line: u32| crate::ResidueSite {
+            file: file.into(),
+            line,
+            kind: "computed_member",
+            name: None,
+            detail: Some(format!("obj[key] {line}")),
+        };
+        let mut reflective = Vec::new();
+        for line in 1..=5 {
+            reflective.push(site("a.js", line));
+        }
+        reflective.push(site("b.js", 7));
+        for index in 0..RESIDUE_FILES_MAX + 2 {
+            reflective.push(site(&format!("z{index:02}.js"), 1));
+        }
+        let escape = FocalEscape::Contained {
+            entities_checked: 3,
+            residue: EscapeResidue {
+                reflective,
+                ..EscapeResidue::default()
+            },
+        };
+        let summary = escape.summary_json(5);
+        let listed = &summary["residue"]["reflective"];
+        assert_eq!(listed["count"], 6 + RESIDUE_FILES_MAX + 2);
+        assert_eq!(listed["sites"].as_array().unwrap().len(), 5);
+        assert_eq!(listed["files"], RESIDUE_FILES_MAX + 4);
+        let by_file = listed["by_file"].as_array().unwrap();
+        assert_eq!(by_file.len(), RESIDUE_FILES_MAX);
+        assert_eq!(
+            by_file[0],
+            serde_json::json!({"file": "a.js", "count": 5, "lines": [1, 2, 3]})
+        );
+        assert_eq!(by_file[1]["file"], "b.js");
+        assert_eq!(listed["files_omitted"], 4);
+        // A short list is served whole, without the grouping.
+        let short = FocalEscape::Contained {
+            entities_checked: 1,
+            residue: EscapeResidue {
+                reflective: vec![site("a.js", 1)],
+                ..EscapeResidue::default()
+            },
+        };
+        let summary = short.summary_json(5);
+        assert!(summary["residue"]["reflective"].get("by_file").is_none());
+    }
+
+    #[test]
+    fn a_member_run_without_a_call_spelling_it_is_told_apart() {
+        let member = |name: &str, signature: &str| {
+            let mut entity = caller(1, true);
+            entity.kind = EntityKind::Method;
+            entity.name = name.to_string();
+            entity.signature = signature.to_string();
+            entity
+        };
+        for (name, signature) in [
+            (
+                "AppContext.__exit__",
+                "def __exit__(self, exc_type, exc, tb)",
+            ),
+            ("Vector.operator+", "Vector operator+(const Vector& other)"),
+            ("Store.size", "get size()"),
+            ("Store.mode", "static set mode(value)"),
+            ("Config.debug", "@property def debug(self)"),
+            ("Deferred.then", "then(onFulfilled)"),
+            ("Iter.next", "fn next(&mut self) -> Option<Item>"),
+        ] {
+            assert!(
+                member_may_dispatch_without_its_name(&member(name, signature)),
+                "{name}: {signature}"
+            );
+        }
+        for (name, signature) in [
+            ("AppContext.pop", "def pop(self, exc=_sentinel)"),
+            (
+                "Store.containsElement",
+                "containsElement(id: number): boolean",
+            ),
+            (
+                "SessionInterface.open_session",
+                "def open_session(self, app, request)",
+            ),
+            ("Store.get", "get(key)"),
+        ] {
+            assert!(
+                !member_may_dispatch_without_its_name(&member(name, signature)),
+                "{name}: {signature}"
+            );
+        }
+    }
+
+    /// The decorators a Python method may run through without a call that
+    /// spells its name are listed only when nothing else could run it, and
+    /// never Python's name-preserving ones.
+    #[test]
+    fn a_method_run_only_through_its_decorators_lists_them() {
+        let member = |name: &str, signature: &str| {
+            let mut entity = caller(1, true);
+            entity.kind = EntityKind::Method;
+            entity.language = LanguageId::Python;
+            entity.name = name.to_string();
+            entity.signature = signature.to_string();
+            entity
+        };
+        let listed =
+            |name: &str, signature: &str| member_dispatch_decorators(&member(name, signature));
+        assert_eq!(
+            listed(
+                "App.add_template_filter",
+                "@setupmethod def add_template_filter(self, f, name=None) -> None"
+            ),
+            Some(vec!["setupmethod".to_string()])
+        );
+        assert_eq!(
+            listed(
+                "Scaffold.route",
+                "@setupmethod @staticmethod def route(rule, **options)"
+            ),
+            Some(vec!["setupmethod".to_string()])
+        );
+        assert_eq!(
+            listed("Loader.fetch", "@abstractmethod async def fetch(self)"),
+            Some(Vec::new())
+        );
+        for (name, signature) in [
+            // Not decorated, a hook, an accessor, or not read as decorators.
+            ("AppContext.pop", "def pop(self, exc=_sentinel)"),
+            ("Config.__init__", "@setupmethod def __init__(self)"),
+            ("Config.debug", "@property def debug(self)"),
+            ("Config.name", "@cached_property def name(self)"),
+            ("Config.mode", "@setter def mode(self, value)"),
+            ("Config.view", "@hybrid_property def view(self)"),
+            ("Config.odd", "@register(\"x\") def odd(self)"),
+        ] {
+            assert_eq!(listed(name, signature), None, "{name}: {signature}");
+        }
+        let mut typescript = member("Store.save", "@setupmethod def save(self)");
+        typescript.language = LanguageId::TypeScript;
+        assert_eq!(member_dispatch_decorators(&typescript), None);
+    }
+
+    #[test]
+    fn named_reasons_are_the_ones_that_tie_a_site_to_the_name() {
+        for reason in [
+            REACH_CALLEE_SPELLS,
+            REACH_BODY_SPELLS,
+            REACH_TEXT_UNKNOWN,
+            REACH_NAME_UNKNOWN,
+        ] {
+            assert!(reach_is_named(reason), "{reason}");
+        }
+        for reason in [REACH_FOCAL_ESCAPES, REACH_DYNAMIC_ACCESS] {
+            assert!(!reach_is_named(reason), "{reason}");
+        }
+    }
 
     fn caller(id: u128, spanned: bool) -> Entity {
         Entity {
@@ -1509,6 +2202,31 @@ mod tests {
         );
     }
 
+    /// A long start-failure reason keeps what happened and why: its first
+    /// words and the end of the server's stderr, with the middle elided.
+    #[test]
+    fn a_long_cannot_start_reason_keeps_its_beginning_and_its_stderr_tail() {
+        let reason = format!(
+            "`typescript-language-server` did not answer initialize: it exited with code 3. \
+             Its last stderr: {}Error: Cannot find module 'typescript'",
+            "at Module._resolveFilename (node:internal/modules/cjs/loader:1145:15) ".repeat(12)
+        );
+        let sentence = NoResolver::ServerCannotStart { reason }.sentence(LanguageId::TypeScript);
+        assert!(
+            sentence.starts_with(
+                "typescript: its language server cannot start (`typescript-language-server` \
+                 did not answer initialize: it exited with code 3"
+            ),
+            "{sentence}"
+        );
+        assert!(
+            sentence.ends_with("Error: Cannot find module 'typescript')"),
+            "{sentence}"
+        );
+        assert!(sentence.contains(" ... "), "{sentence}");
+        assert!(!sentence.contains("; "), "{sentence}");
+    }
+
     /// A caller with no ledger reads as owed while a resolver can still prove
     /// its sites, and as unproven for want of a resolver when none can on this
     /// host now: its own clause, naming why, and never `call_sites_owed`. A
@@ -1522,6 +2240,11 @@ mod tests {
             (
                 NoResolver::EnrichmentOff,
                 "python: language-server enrichment is switched off",
+            ),
+            (
+                NoResolver::EnrichmentOffForRepository,
+                "python: language-server enrichment is off for this repository until `kin daemon \
+                 sweep --enable` turns it on",
             ),
             (
                 NoResolver::NoLanguageServer,
@@ -2131,6 +2854,47 @@ mod tests {
             Some(REACH_NAME_UNKNOWN),
             "a focal with no call name rules nothing out"
         );
+    }
+
+    /// A body that holds the focal's name only inside a longer identifier
+    /// holds no token a call to the focal could spell. Measured on React: a
+    /// substring test kept every unresolved call in every test file that calls
+    /// `jest.advanceTimersByTime` as a possible call to `advanceTimers`, and
+    /// put 172,165 of them on one walk's frontier.
+    #[test]
+    fn a_name_inside_a_longer_identifier_does_not_spell_it() {
+        let timers = vec!["advanceTimers".to_string()];
+        let unknown = site_at("callback", unresolved(UnresolvedReason::NoAnswer));
+        assert_eq!(
+            site_could_call(
+                &unknown,
+                &timers,
+                Some("it(() => { jest.advanceTimersByTime(10); act(cb) })"),
+                false
+            ),
+            None,
+            "advanceTimersByTime does not spell advanceTimers"
+        );
+        for body in [
+            "advanceTimers(now)",
+            "Scheduler.advanceTimers(now)",
+            "x = advanceTimers",
+            "#advanceTimers()",
+        ] {
+            assert_eq!(
+                site_could_call(&unknown, &timers, Some(body), false),
+                Some(REACH_BODY_SPELLS),
+                "{body}"
+            );
+        }
+        assert!(spells_identifier("a.pop()", "pop"));
+        assert!(spells_identifier("pop", "pop"));
+        assert!(!spells_identifier("popitem()", "pop"));
+        assert!(!spells_identifier("_pop()", "pop"));
+        assert!(!spells_identifier("$pop()", "pop"));
+        assert!(!spells_identifier("pop2()", "pop"));
+        assert!(spells_identifier("x.popitem(); pop()", "pop"));
+        assert!(!spells_identifier("anything", ""));
     }
 
     #[test]

@@ -129,7 +129,59 @@ fn initialize_kin_repo(
 ) -> kin_core::KinLayout {
     let init = run_kin(runtime, repo, &["init", ".", "--json"]);
     ok(&init, "kin init");
-    kin_core::KinLayout::discover(repo).expect("discover exact layout")
+    runtime.layout_for(repo)
+}
+
+/// How a template's `kin init` ran: as [`initialize_kin_repo`] runs it, or
+/// with the enrichment sweep off, as [`run_kin_without_enrichment`] runs it.
+#[derive(Clone, Copy)]
+enum Init {
+    Default,
+    WithoutEnrichment,
+}
+
+/// This test's own copy of `fixture`, converted by `kin init` once per test
+/// binary rather than once per test.
+///
+/// No test here is about the conversion, and it was most of what each one
+/// spent. `kin init` stops the daemon it started, so a test's first command
+/// starts a daemon over the copy exactly as it would have over a store it had
+/// just converted itself. `name` must be the fixture's own name: the template
+/// is keyed by it and by `init`. Declare the result before the test's runtime,
+/// so the runtime stops its daemons before the copy is removed.
+fn prepare(
+    name: &str,
+    fixture: fn(&Path) -> std::path::PathBuf,
+    init: Init,
+) -> common::PreparedRepository {
+    let key = match init {
+        Init::Default => format!("{name}-init"),
+        Init::WithoutEnrichment => format!("{name}-init-without-enrichment"),
+    };
+    common::prepared_repository(&key, |root| {
+        let repo = fixture(root);
+        let runtime = common::IsolatedDaemonRuntime::new(&repo);
+        // This cache copies the whole repository, including its store, and
+        // deliberately exercises the supported self-contained legacy layout.
+        // Fresh conversions elsewhere in this suite retain the central default.
+        let mut command = runtime.kin_command();
+        command
+            .args(["init", ".", "--json"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+            .env("KIN_STORE_LAYOUT", "in-tree")
+            .current_dir(&repo);
+        if matches!(init, Init::WithoutEnrichment) {
+            command
+                .env("KIN_DAEMON_DISABLE_LSP", "1")
+                .env("KIN_EMBED_BACKEND", "cpu");
+        }
+        ok(
+            &command.output().expect("initialize copied fixture"),
+            "kin init",
+        );
+        repo
+    })
 }
 
 fn repository_id(layout: &kin_core::KinLayout) -> RepositoryId {
@@ -270,6 +322,7 @@ fn publish_non_user_semantic_move(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     drop(lease);
     manager
@@ -452,10 +505,10 @@ fn artifacts_at_path(
 /// conflicts, still in progress.
 #[test]
 fn a_parked_merge_survives_a_daemon_restart() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -490,10 +543,10 @@ fn a_parked_merge_survives_a_daemon_restart() {
 /// identity the record actually has.
 #[test]
 fn resolving_against_a_stale_record_identity_is_refused() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -537,10 +590,10 @@ fn resolving_against_a_stale_record_identity_is_refused() {
 /// loser is refused rather than silently rebased onto the winner's record.
 #[test]
 fn concurrent_resolutions_from_one_view_leave_one_winner() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -618,10 +671,10 @@ fn concurrent_resolutions_from_one_view_leave_one_winner() {
 /// ref, and terminates the record as committed.
 #[test]
 fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
@@ -701,10 +754,10 @@ fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref()
 /// would pass a success-only test and lose their work.
 #[test]
 fn aborting_a_merge_from_a_moved_workspace_abandons_it_and_restores_nothing() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -764,10 +817,10 @@ fn aborting_a_merge_from_a_moved_workspace_abandons_it_and_restores_nothing() {
 /// from durable authority rather than from a manager held across the move.
 #[test]
 fn aborting_after_a_non_user_semantic_move_does_not_wedge() {
-    let root = tempdir().expect("temp root");
-    let repo = shifting_span_repository(root.path());
+    let prepared = prepare("shifting_span", shifting_span_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -829,10 +882,10 @@ fn aborting_after_a_non_user_semantic_move_does_not_wedge() {
 /// moves no ref, and frees the workspace for the next merge.
 #[test]
 fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
@@ -890,10 +943,10 @@ fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
 /// every resolution already settled against it.
 #[test]
 fn a_second_merge_while_one_is_in_progress_is_refused() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -929,15 +982,13 @@ fn a_second_merge_while_one_is_in_progress_is_refused() {
 /// this is the arm that runs with no language server on the host.
 #[test]
 fn a_merge_that_cannot_enrich_says_the_merged_graph_was_not_converged() {
-    let root = tempdir().expect("temp root");
-    let repo = disjoint_repository(root.path());
+    let prepared = prepare("disjoint", disjoint_repository, Init::WithoutEnrichment);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    // The daemon serving every call below is the one this init starts, and it
-    // captures the enrichment lever at process start, so the lever goes here.
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "kin init",
-    );
+    // The template's `kin init` ran with the enrichment sweep off and stopped
+    // its daemon. The daemon serving every call below is the one the merge
+    // starts, and it captures the enrichment lever at process start, so the
+    // merge carries the lever too.
 
     let merged = ok(
         &run_kin_without_enrichment(&runtime, &repo, &["merge", "feature"]),
@@ -948,7 +999,7 @@ fn a_merge_that_cannot_enrich_says_the_merged_graph_was_not_converged() {
         "the fixture has to publish rather than park, or the line below proves nothing: {merged}"
     );
     assert!(
-        merged.contains("Cross-file enrichment did not run for this merge"),
+        merged.contains("Language-server enrichment did not run for this merge"),
         "a merge that could not converge its own graph has to say so: {merged}"
     );
     assert!(
@@ -962,10 +1013,10 @@ fn a_merge_that_cannot_enrich_says_the_merged_graph_was_not_converged() {
 /// restore point stale and strand every resolution already carried by it.
 #[test]
 fn a_commit_while_a_merge_is_in_progress_is_refused_before_admission() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -1023,10 +1074,10 @@ fn a_commit_while_a_merge_is_in_progress_is_refused_before_admission() {
 /// refused rather than quietly settling the wrong conflict.
 #[test]
 fn settling_one_named_conflict_leaves_the_others_outstanding() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -1083,10 +1134,9 @@ fn settling_one_named_conflict_leaves_the_others_outstanding() {
 /// both, because a record commits the resolutions it already carries.
 #[test]
 fn settling_and_publishing_cannot_be_one_request() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
+    let prepared = prepare("conflicting", conflicting_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    initialize_kin_repo(&runtime, &repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
@@ -1111,10 +1161,10 @@ fn settling_and_publishing_cannot_be_one_request() {
 /// collided on a path could only be abandoned.
 #[test]
 fn a_contested_path_settles_from_the_identity_the_record_reports() {
-    let root = tempdir().expect("temp root");
-    let repo = path_colliding_repository(root.path());
+    let prepared = prepare("path_colliding", path_colliding_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -1184,10 +1234,10 @@ fn a_contested_path_settles_from_the_identity_the_record_reports() {
 /// selector to pass to `--keep-path`.
 #[test]
 fn a_contested_path_listing_names_its_claimants() {
-    let root = tempdir().expect("temp root");
-    let repo = path_colliding_repository(root.path());
+    let prepared = prepare("path_colliding", path_colliding_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -1383,10 +1433,10 @@ fn entity_span(state: &kin_model::graph::ResolvedGraphState, name: &str) -> (Str
 /// settled, and nothing warned.
 #[test]
 fn a_bulk_artifact_settle_does_not_override_a_named_entity_settle() {
-    let root = tempdir().expect("temp root");
-    let repo = shifting_span_repository(root.path());
+    let prepared = prepare("shifting_span", shifting_span_repository, Init::Default);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -1505,13 +1555,15 @@ fn container_settle_repository(root: &Path) -> std::path::PathBuf {
 /// disables the container split, was green all the way across.
 #[test]
 fn a_container_settle_does_not_override_a_settle_inside_it() {
-    let root = tempdir().expect("temp root");
-    let repo = container_settle_repository(root.path());
+    let prepared = prepare(
+        "container_settle",
+        container_settle_repository,
+        Init::WithoutEnrichment,
+    );
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    // This one call starts the daemon, so it is where the lever belongs.
-    let init = run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]);
-    ok(&init, "kin init");
-    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
 
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -1563,10 +1615,14 @@ fn a_container_settle_does_not_override_a_settle_inside_it() {
 /// than honouring one of them in silence.
 #[test]
 fn contradictory_settlements_inside_one_artifact_refuse_and_name_both() {
-    let root = tempdir().expect("temp root");
-    let repo = opposed_entities_repository(root.path());
+    let prepared = prepare(
+        "opposed_entities",
+        opposed_entities_repository,
+        Init::Default,
+    );
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     let main_before = branch_change(&layout, "main");
     parked_merge(
@@ -1601,10 +1657,11 @@ fn contradictory_settlements_inside_one_artifact_refuse_and_name_both() {
         String::from_utf8_lossy(&refused.stderr),
         String::from_utf8_lossy(&refused.stdout)
     );
-    // Both decisions, by name, and the file they disagree about.
+    // Both decisions, by name, and the unit they disagree about, by its kind
+    // and name rather than where it is projected.
     assert!(
-        said.contains("src/lib.rs"),
-        "the refusal names the file: {said}"
+        said.contains("source `lib.rs`") && !said.contains("src/lib.rs"),
+        "the refusal names the unit by kind and name: {said}"
     );
     assert!(
         said.contains("alpha") && said.contains("beta"),
@@ -1691,12 +1748,15 @@ fn entity_named(state: &kin_model::graph::ResolvedGraphState, name: &str) -> kin
 /// admitted trees. Every other metadata and entity field must remain equal.
 #[test]
 fn an_untouched_entity_differs_between_branches_only_in_its_span_and_source_digest() {
-    let root = tempdir().expect("temp root");
-    let repo = container_settle_repository(root.path());
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let init = run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]);
-    ok(&init, "kin init");
-    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+    let prepared = prepare(
+        "container_settle",
+        container_settle_repository,
+        Init::WithoutEnrichment,
+    );
+    let repo = prepared.repo().to_path_buf();
+    // The template's `kin init` ran with the enrichment sweep off. Nothing
+    // below starts a process, so this test needs no runtime of its own.
+    let layout = kin_core::KinLayout::discover(&repo).expect("copied in-tree store");
 
     let ours = graph_at(&layout, &branch_change(&layout, "main"));
     let theirs = graph_at(&layout, &branch_change(&layout, "feature"));
@@ -1747,14 +1807,15 @@ fn an_untouched_entity_differs_between_branches_only_in_its_span_and_source_dige
 
 #[test]
 fn authored_merge_body_survives_restart_and_rebuilds_added_and_removed_declarations() {
-    let root = tempdir().expect("temp root");
-    let repo = opposed_entities_repository(root.path());
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init",
+    let prepared = prepare(
+        "opposed_entities",
+        opposed_entities_repository,
+        Init::WithoutEnrichment,
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let repo = prepared.repo().to_path_buf();
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
     let ours = branch_change(&layout, "main");
     let theirs = branch_change(&layout, "feature");
     let before = fs::read(repo.join("src/lib.rs")).unwrap();
@@ -1765,7 +1826,7 @@ fn authored_merge_body_survives_restart_and_rebuilds_added_and_removed_declarati
     let report = conflicts_report(&runtime, &repo);
     let expected = record_hash(&report);
     let body = b"pub fn alpha(value: i32, count: u64) -> u64 { gamma(value) + count }\npub fn gamma(value: i32) -> u64 { value as u64 }\n";
-    let input = root.path().join("resolved=source.rs");
+    let input = prepared.root().join("resolved=source.rs");
     fs::write(&input, body).unwrap();
     let settled = run_kin(
         &runtime,
@@ -1856,20 +1917,21 @@ fn authored_merge_body_survives_restart_and_rebuilds_added_and_removed_declarati
 
 #[test]
 fn authored_merge_body_refuses_stale_and_competing_choices_without_partial_settlement() {
-    let root = tempdir().expect("temp root");
-    let repo = opposed_entities_repository(root.path());
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init",
+    let prepared = prepare(
+        "opposed_entities",
+        opposed_entities_repository,
+        Init::WithoutEnrichment,
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let repo = prepared.repo().to_path_buf();
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park merge",
     );
     let initial = persisted_record(&layout).unwrap();
-    let input = root.path().join("resolution.rs");
+    let input = prepared.root().join("resolution.rs");
     fs::write(&input, b"pub fn alpha() {}\npub fn gamma() {}\n").unwrap();
     let competing = run_kin(
         &runtime,
@@ -1943,21 +2005,22 @@ fn authored_merge_body_refuses_stale_and_competing_choices_without_partial_settl
 
 #[test]
 fn authored_merge_accepts_exact_non_source_bytes_and_refuses_invalid_source_atomically() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init",
+    let prepared = prepare(
+        "conflicting",
+        conflicting_repository,
+        Init::WithoutEnrichment,
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let repo = prepared.repo().to_path_buf();
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park merge",
     );
     let initial = persisted_record(&layout).unwrap();
-    let source = root.path().join("source.rs");
-    let opaque = root.path().join("opaque.dat");
+    let source = prepared.root().join("source.rs");
+    let opaque = prepared.root().join("opaque.dat");
     let mut raw = vec![0xff; 700 * 1024];
     raw[0] = 0;
     fs::write(&opaque, &raw).unwrap();
@@ -2028,9 +2091,19 @@ fn authored_merge_keeps_the_unchanged_callers_lost_binding_in_committed_history(
     exercise_authored_cross_file_resolution(false, true);
 }
 
-fn exercise_authored_cross_file_resolution(separate_requests: bool, unchanged_caller: bool) {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
+/// Two Python files linked by an import, edited differently on each branch.
+fn cross_file_repository(root: &Path) -> std::path::PathBuf {
+    cross_file_fixture(root, false)
+}
+
+/// [`cross_file_repository`] with a third file whose call the merge leaves
+/// unchanged.
+fn cross_file_with_unchanged_caller_repository(root: &Path) -> std::path::PathBuf {
+    cross_file_fixture(root, true)
+}
+
+fn cross_file_fixture(root: &Path, unchanged_caller: bool) -> std::path::PathBuf {
+    let repo = root.join("repo");
     initialize_git_repo(&repo);
     fs::write(
         repo.join("a.py"),
@@ -2073,18 +2146,28 @@ fn exercise_authored_cross_file_resolution(separate_requests: bool, unchanged_ca
     .unwrap();
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main edits"]);
+    repo
+}
+
+fn exercise_authored_cross_file_resolution(separate_requests: bool, unchanged_caller: bool) {
+    let prepared = if unchanged_caller {
+        prepare(
+            "cross_file_with_unchanged_caller",
+            cross_file_with_unchanged_caller_repository,
+            Init::WithoutEnrichment,
+        )
+    } else {
+        prepare("cross_file", cross_file_repository, Init::WithoutEnrichment)
+    };
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init",
-    );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park merge",
     );
-    let a = root.path().join("a-resolution.py");
-    let b = root.path().join("b-resolution.py");
+    let a = prepared.root().join("a-resolution.py");
+    let b = prepared.root().join("b-resolution.py");
     fs::write(
         &a,
         b"from b import gamma\n\ndef run(value):\n    return gamma(value) + 3\n",
@@ -2204,14 +2287,15 @@ fn authored_merge_backend_refuses_raw_input_over_the_limit_before_record_or_blob
     use kin_cli::commands::resolve::{
         ResolveAction, ResolveChoice, ResolveDirective, ResolveRequest, MAX_RESOLVE_FILE_BYTES,
     };
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init",
+    let prepared = prepare(
+        "conflicting",
+        conflicting_repository,
+        Init::WithoutEnrichment,
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let repo = prepared.repo().to_path_buf();
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park merge",
@@ -2308,7 +2392,7 @@ fn authored_destination_file_preserves_an_incoming_relation_conflict() {
         &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
         "init",
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let layout = runtime.layout_for(&repo);
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park merge",
@@ -2393,7 +2477,7 @@ fn authored_merge_accepts_in_place_input_and_preserves_unrelated_or_later_edits(
         &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
         "init",
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let layout = runtime.layout_for(&repo);
     let head = branch_change(&layout, "main");
     parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
@@ -2484,14 +2568,11 @@ fn authored_merge_accepts_in_place_input_and_preserves_unrelated_or_later_edits(
 /// can move either side.
 #[test]
 fn a_published_merge_records_the_census_of_the_graph_it_finalized() {
-    let root = tempdir().expect("temp root");
-    let repo = disjoint_repository(root.path());
+    let prepared = prepare("disjoint", disjoint_repository, Init::WithoutEnrichment);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "kin init",
-    );
-    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
     assert!(
         kin_core::relation_census::read(&layout)
             .recorded()
@@ -2545,14 +2626,15 @@ fn a_published_merge_records_the_census_of_the_graph_it_finalized() {
 /// the lock that keeps it green.
 #[test]
 fn a_parked_merge_records_no_census_because_it_published_no_merged_graph() {
-    let root = tempdir().expect("temp root");
-    let repo = conflicting_repository(root.path());
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "kin init",
+    let prepared = prepare(
+        "conflicting",
+        conflicting_repository,
+        Init::WithoutEnrichment,
     );
-    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+    let repo = prepared.repo().to_path_buf();
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // The template's `kin init` ran with the enrichment sweep off.
+    let layout = runtime.layout_for(&repo);
     assert!(
         kin_core::relation_census::read(&layout)
             .recorded()
@@ -2595,20 +2677,37 @@ fn authored_parent_old_path_reuse_preserves_unrelated_artifact() {
     exercise_authored_parent_rename(false, false, true);
 }
 
-fn exercise_authored_parent_rename(retain_extra: bool, incoming: bool, reuse_path: bool) {
-    let root = tempdir().unwrap();
-    let repo = root.path().join("repo");
+/// The declaration every parent-rename case starts from.
+const PARENT_RENAME_BASE: &str = "def keep(value):\n    first = value + 1\n    second = first * 2\n    third = second + 3\n    return third\n";
+
+/// One committed Python declaration, the base every parent-rename case edits.
+fn parent_rename_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
     initialize_git_repo(&repo);
-    let base = "def keep(value):\n    first = value + 1\n    second = first * 2\n    third = second + 3\n    return third\n";
-    fs::write(repo.join("a.py"), base).unwrap();
+    fs::write(repo.join("a.py"), PARENT_RENAME_BASE).unwrap();
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "shared declaration"]);
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init rename fixture",
+    repo
+}
+
+/// The repository [`initialize_git_repo`] commits, under the name a template
+/// needs.
+fn base_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    initialize_git_repo(&repo);
+    repo
+}
+
+fn exercise_authored_parent_rename(retain_extra: bool, incoming: bool, reuse_path: bool) {
+    let prepared = prepare(
+        "parent_rename",
+        parent_rename_repository,
+        Init::WithoutEnrichment,
     );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let repo = prepared.repo().to_path_buf();
+    let base = PARENT_RENAME_BASE;
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = runtime.layout_for(&repo);
     ok(
         &run_kin(&runtime, &repo, &["branch", "create", "feature"]),
         "create native feature",
@@ -2699,7 +2798,7 @@ fn exercise_authored_parent_rename(retain_extra: bool, incoming: bool, reuse_pat
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park renamed artifact conflict",
     );
-    let input = root.path().join("authored.py");
+    let input = prepared.root().join("authored.py");
     let mut body = base.replace("value + 1", "value + 9");
     if retain_extra {
         body.push_str("\ndef extra(value):\n    return value - 1\n");
@@ -2884,9 +2983,8 @@ fn authored_parent_all_prior_debt_clears_with_swapped_removed_occurrences() {
 }
 
 fn exercise_authored_parent_debt(swap_parents: bool, remove_all: bool) {
-    let root = tempdir().unwrap();
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
+    let prepared = prepare("base", base_repository, Init::WithoutEnrichment);
+    let repo = prepared.repo().to_path_buf();
     let both = "from left import alpha\nfrom right import beta\n\ndef run(value):\n    return alpha(value) + beta(value)\n";
     let only_a = "from left import alpha\n\ndef run(value):\n    return alpha(value) + 1\n";
     let only_b = "from right import beta\n\ndef run(value):\n    return beta(value) + 2\n";
@@ -2896,11 +2994,7 @@ fn exercise_authored_parent_debt(swap_parents: bool, remove_all: bool) {
         (only_a, only_b, "alpha", "beta")
     };
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    ok(
-        &run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]),
-        "init debt fixture",
-    );
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let layout = runtime.layout_for(&repo);
     for (file, body) in [
         ("left.py", "def alpha(value):\n    return value\n"),
         ("right.py", "def beta(value):\n    return value\n"),
@@ -2997,7 +3091,7 @@ fn exercise_authored_parent_debt(swap_parents: bool, remove_all: bool) {
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "park caller conflict",
     );
-    let input = root.path().join("authored.py");
+    let input = prepared.root().join("authored.py");
     let body = if remove_all {
         "def run(value):\n    return value + 9\n".to_string()
     } else {
@@ -3067,4 +3161,125 @@ fn exercise_authored_parent_debt(swap_parents: bool, remove_all: bool) {
     assert!(ingestion.exists(&hash).unwrap());
     stop_daemon(&runtime, &repo);
     assert_eq!(caller_debt(&graph_at(&layout, &merged_id)), debt);
+}
+
+/// What a store's published `main` and `feature` hold, without the identities
+/// a conversion allocates: each entity's kind, name, file and signature, and
+/// each tree leaf's path and exact entry.
+fn identity_free_branches(layout: &kin_core::KinLayout) -> Vec<(Vec<String>, Vec<String>)> {
+    ["main", "feature"]
+        .into_iter()
+        .map(|branch| {
+            let state = graph_at(layout, &branch_change(layout, branch));
+            let mut entities = state
+                .entities
+                .values()
+                .map(|entity| {
+                    format!(
+                        "{:?} {} {:?} {}",
+                        entity.kind, entity.name, entity.file_origin, entity.signature
+                    )
+                })
+                .collect::<Vec<_>>();
+            entities.sort();
+            let mut leaves = state
+                .tree
+                .artifacts()
+                .map(|artifact| format!("{} {:?}", artifact.path, artifact.entry))
+                .collect::<Vec<_>>();
+            leaves.sort();
+            (entities, leaves)
+        })
+        .collect()
+}
+
+fn frozen_roots(layout: &kin_core::KinLayout) -> kin_model::RootBundle {
+    kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
+        .expect("bind the store's authority")
+        .freeze_existing_read_only(std::time::Duration::from_secs(10))
+        .expect("open the store's authority read-only")
+        .roots()
+        .clone()
+}
+
+/// The templates every test above starts from are the store a fresh `kin init`
+/// makes, at the location each test copies them to.
+///
+/// Two copies of one template open with the same manifest, roots and graph,
+/// and that graph holds exactly what a fresh conversion of the same fixture
+/// holds, apart from the identities a conversion allocates. A copy carries
+/// none of its builder's daemon state, a daemon started over it serves it
+/// from where it is, and what a test does to its copy reaches no other copy.
+///
+/// Falsify by dropping `leave_donor_runtime_behind` from the template build:
+/// the copy then carries the builder's `daemon.*` files and fails the first
+/// check. Copying only `.kin` into a fresh checkout, or building the template
+/// from a different fixture under this name, fails the graph comparison.
+#[test]
+fn a_prepared_copy_opens_as_the_store_a_fresh_init_makes() {
+    let fresh_root = tempdir().expect("temp root");
+    let fresh = conflicting_repository(fresh_root.path());
+    // Keep the runtime's private central store alive through the comparison.
+    let fresh_runtime = common::IsolatedDaemonRuntime::new(&fresh);
+    let fresh_layout = initialize_kin_repo(&fresh_runtime, &fresh);
+    let first = prepare("conflicting", conflicting_repository, Init::Default);
+    let second = prepare("conflicting", conflicting_repository, Init::Default);
+    let first_layout = kin_core::KinLayout::discover(first.repo()).expect("copied in-tree store");
+    let second_layout = kin_core::KinLayout::discover(second.repo()).expect("copied in-tree store");
+
+    for copy in [first.repo(), second.repo()] {
+        let leftovers = fs::read_dir(copy.join(".kin"))
+            .expect("read the copied store")
+            .map(|entry| entry.expect("read a store entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with("daemon"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "a copy carries none of its builder's daemon state: {leftovers:?}"
+        );
+    }
+    assert_ne!(first.repo(), second.repo(), "every test gets its own copy");
+
+    let manifest = |repo: &Path| {
+        let manifest = kin_core::KinManifest::load(&repo.join(".kin/manifest.json"))
+            .expect("read the copied manifest");
+        (manifest.repo_id, manifest.workspace_id)
+    };
+    assert_eq!(manifest(first.repo()), manifest(second.repo()));
+    assert_eq!(frozen_roots(&first_layout), frozen_roots(&second_layout));
+    let copied = identity_free_branches(&first_layout);
+    assert_eq!(copied, identity_free_branches(&second_layout));
+    assert_eq!(
+        copied,
+        identity_free_branches(&fresh_layout),
+        "a copy holds what a fresh conversion of the same fixture holds"
+    );
+    assert!(
+        copied
+            .iter()
+            .all(|(entities, leaves)| !entities.is_empty() && !leaves.is_empty()),
+        "the comparison is over a converted graph, not two empty ones: {copied:?}"
+    );
+
+    let runtime = common::IsolatedDaemonRuntime::new(first.repo());
+    parked_merge(
+        &run_kin(&runtime, first.repo(), &["merge", "feature"]),
+        "kin merge in a copy",
+    );
+    assert!(
+        matches!(
+            common::probe_recorded_daemon_endpoint(first_layout.root()),
+            common::RecordedDaemonEndpoint::Listening { .. }
+        ),
+        "a daemon serves the copy from where it is"
+    );
+    assert!(persisted_record(&first_layout).is_some());
+    assert!(
+        persisted_record(&second_layout).is_none(),
+        "a merge parked in one copy must not reach another"
+    );
+    assert_eq!(
+        fs::read(second.repo().join("shared.txt")).unwrap(),
+        b"main shared\n"
+    );
 }

@@ -35,6 +35,9 @@ enum StorageMode {
 
 struct Args {
     repo: PathBuf,
+    /// The store directory, when it is kept outside the working tree `repo`
+    /// names. `repo` stays the working tree and the routing identity.
+    store: Option<PathBuf>,
     port: u16,
     storage: StorageMode,
     /// Repo identifier for StorageBackend (defaults to the manifest repo_id).
@@ -47,13 +50,17 @@ struct Args {
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n  {program} --supervisor [--port <port>]\n  {program} --compat-json\n\n\
+        "Usage:\n  {program} [--repo <path>] [--store <dir>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n  {program} --supervisor [--port <port>]\n  {program} --compat-json\n\n\
          Defaults:\n  --repo     current working directory\n  --port     4219\n  --storage  local (or KIN_STORAGE env var)\n  --repo-id  repo_id from --repo/.kin/manifest.json"
     );
     eprintln!(
         "\nEnvironment:\n  KIN_DAEMON_BIND_HOST   daemon bind address (default 127.0.0.1)\n  KIN_DAEMON_AUTH_TOKEN  bearer token required for non-public daemon routes\n  KIN_REPO_ID            explicit repo_id override for tests/bench flows"
     );
     eprintln!("  KIN_DAEMON_IDLE_TIMEOUT_SECS  optional idle shutdown timeout; 0 disables");
+    eprintln!(
+        "  KIN_DAEMON_SESSION_SWEEP_SECS  how often sessions whose client exited are reaped \
+         (default 30, at least 1)"
+    );
     eprintln!(
         "  KIN_SUPERVISOR_IDLE_TIMEOUT_SECS  optional supervisor idle shutdown timeout; 0 disables"
     );
@@ -64,6 +71,7 @@ fn usage(program: &str) {
 
 fn parse_args() -> Result<Args, String> {
     let mut repo = env::current_dir().map_err(|error| error.to_string())?;
+    let mut store: Option<PathBuf> = None;
     let mut port = 4219_u16;
     let mut storage_str: Option<String> = None;
     let mut repo_id: Option<String> = None;
@@ -84,6 +92,12 @@ fn parse_args() -> Result<Args, String> {
                     .next()
                     .ok_or_else(|| "--repo requires a path".to_string())?;
                 repo = PathBuf::from(value);
+            }
+            "--store" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--store requires a path".to_string())?;
+                store = Some(PathBuf::from(value));
             }
             "--port" => {
                 let value = args
@@ -147,6 +161,7 @@ fn parse_args() -> Result<Args, String> {
 
     Ok(Args {
         repo,
+        store,
         port,
         storage,
         repo_id,
@@ -423,22 +438,59 @@ fn apply_repository_resource_profile() {
     let Ok(args) = parse_args() else {
         return;
     };
+    if let Err(error) = apply_repository_profile_from_args(&args) {
+        eprintln!("invalid repository model configuration: {error}");
+        process::exit(1);
+    }
+}
+
+fn apply_repository_profile_from_args(args: &Args) -> kin_core::Result<()> {
     if args.supervisor || args.compat_json {
-        return;
+        return Ok(());
     }
     // The same helper the CLI calls, so the two processes can never drift apart
     // on this variable and produce a behavior-env divergence nobody can clear.
-    // `--repo` may name a `.kin` directory directly, which discovery does not
-    // walk up from, so the resolved layout's working directory is what is
-    // handed over rather than the raw argument.
-    let Some(layout) = resolve_layout(&args.repo) else {
-        return;
+    // Keep the selected store: rediscovering its working tree could select a
+    // different store through the ambient registry or miss the explicit store.
+    let Some(layout) = resolve_layout(&args.repo, args.store.as_deref()) else {
+        return Ok(());
     };
-    kin_cli::resource_profile::apply_repository_profile_at(layout.working_dir());
+    kin_cli::resource_profile::apply_repository_profile_for_layout(&layout);
+    // The `[retrieval]` table under the same rule and at the same point, so a
+    // daemon and the CLI that spawned it serve one retrieval arm.
+    kin_cli::retrieval_arm::apply_repository_retrieval_for_layout(&layout);
+    kin_core::models::apply_repository_models_for_layout(&layout)
 }
 
-fn resolve_layout(path: &Path) -> Option<KinLayout> {
-    if path.file_name().and_then(|name| name.to_str()) == Some(".kin") && path.is_dir() {
+/// The store this daemon serves.
+///
+/// `--store` names it outright when it is kept outside the working tree, and
+/// it must record the working tree `--repo` names: a store serving another
+/// tree is refused rather than served under this tree's route. Without it,
+/// `--repo` may name a store directly, which is not walked up from, or a path
+/// inside a working tree, which discovery resolves in the tree or through the
+/// store index.
+fn resolve_layout(path: &Path, store: Option<&Path>) -> Option<KinLayout> {
+    if let Some(store) = store {
+        let layout = KinLayout::new(store.to_path_buf());
+        let same_tree = match (layout.working_dir().canonicalize(), path.canonicalize()) {
+            (Ok(served), Ok(named)) => served == named,
+            _ => false,
+        };
+        if !same_tree {
+            eprintln!(
+                "kin-daemon: the store at {} serves {}, not {}",
+                store.display(),
+                layout.working_dir().display(),
+                path.display()
+            );
+            return None;
+        }
+        return Some(layout);
+    }
+    let names_store = path.file_name().and_then(|name| name.to_str()) == Some(".kin")
+        || kin_core::layout::read_working_tree_record(path).is_some();
+    if names_store && path.is_dir() {
         return Some(KinLayout::new(path.to_path_buf()));
     }
     KinLayout::discover(path)
@@ -490,6 +542,10 @@ fn embed_batch_size_from_env() -> Result<Option<usize>, String> {
 }
 
 fn main() {
+    // First, while the process is still single-threaded: nothing the daemon
+    // or the supervisor creates may be group or world writable, whatever
+    // umask started it. The CLI does the same. See `kin_core::umask`.
+    kin_core::umask::withhold_shared_write();
     match kin_daemon_spawn::run_process_group_guardian_if_requested() {
         Ok(true) => return,
         Ok(false) => {}
@@ -599,6 +655,12 @@ fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(daemon_env_filter())
         .with_writer(std::io::stderr)
+        // Colour codes only on a terminal. A spawned daemon's stderr is its
+        // `daemon.log`, and every reader of that log is something other than a
+        // terminal: an operator's pager, a support bundle, and the startup
+        // failure a command quotes back to its caller, which `kin init --json`
+        // used to carry into its document as escape bytes.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 }
 
@@ -684,7 +746,7 @@ async fn async_main() -> i32 {
         return 0;
     }
 
-    let layout = match resolve_layout(&args.repo) {
+    let layout = match resolve_layout(&args.repo, args.store.as_deref()) {
         Some(layout) => layout,
         None => {
             eprintln!(
@@ -788,6 +850,10 @@ async fn async_main() -> i32 {
             // runs to completion while readiness answers warming with its
             // progress.
             if matches!(storage, StorageMode::Local) {
+                // A history a background derivation staged is attached first,
+                // while no daemon serves the store, so everything after it
+                // opens the complete store.
+                kin_daemon::history_schedule::before_open(&bind_layout);
                 kin_daemon::startup_requalification::before_open(&bind_layout, &progress);
             }
             // A failed open drops both handles here, which closes the socket. No
@@ -818,6 +884,41 @@ async fn async_main() -> i32 {
             process::exit(1);
         }
     };
+
+    // A local store that still serves exactly the Git state it was admitted
+    // from is a prepared store for that state, and a later checkout of the
+    // same state reuses it rather than deriving it again. Recorded off the
+    // startup path and never fatal: the catalog is discovery only, and a reuse
+    // checks the store again before it copies anything.
+    {
+        let layout = state.layout.clone();
+        std::thread::spawn(move || {
+            if let Err(reason) = kin_core::prepared_store::record_store(&layout, None) {
+                tracing::debug!(%reason, "this store was not recorded as a prepared store");
+            }
+        });
+    }
+
+    // A daemon whose description queries run the cards retrieval arm, because
+    // an operator named it or because the store has no search vectors to use,
+    // builds its entity cards once the graph has loaded, so the first
+    // description query reads a held index instead of paying for the build.
+    // Off the startup path: a failure here costs that first query the build and
+    // nothing else.
+    {
+        let graph = std::sync::Arc::clone(&state.graph);
+        std::thread::spawn(move || {
+            if kin_cli::commands::locate::description_query_arm(&graph).uses_embeddings() {
+                return;
+            }
+            match kin_cli::commands::locate::warm_entity_cards(&graph) {
+                Ok(cards) => {
+                    tracing::info!(cards, "built entity cards for the cards retrieval arm")
+                }
+                Err(error) => tracing::warn!(%error, "could not build entity cards at startup"),
+            }
+        });
+    }
 
     // The batch size an operator recorded for this repository, which is what
     // has to survive the restart an OOM forces (FIR-2504). Read from the state
@@ -874,10 +975,27 @@ async fn async_main() -> i32 {
                 process::exit(1);
             }
         },
+        // A daemon's tests set this low so a client that exits is reaped in a
+        // second rather than at the production cadence.
+        sweep_interval: match kin_daemon::daemon::session_sweep_interval(
+            env::var(kin_daemon::daemon::SESSION_SWEEP_INTERVAL_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            Ok(interval) => interval,
+            Err(error) => {
+                eprintln!("kin-daemon: {error}");
+                process::exit(1);
+            }
+        },
         embed_batch_size,
         embed_pipeline_overlap,
         ..DaemonConfig::default()
     };
+
+    if matches!(args.storage, StorageMode::Local) {
+        kin_daemon::history_schedule::spawn_scheduler(state.layout.clone());
+    }
 
     if let Err(error) = kin_daemon::daemon::run_with_authority_on(
         state,
@@ -911,6 +1029,93 @@ mod tests {
     /// the process's stdout/stderr to.
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    #[test]
+    fn explicit_store_config_survives_a_foreign_registry() {
+        const WORKER: &str = "KIN_TEST_EXPLICIT_STORE_CONFIG_WORKER";
+        if env::var_os(WORKER).is_none() {
+            let machine = tempfile::tempdir().unwrap();
+            let mut command = process::Command::new(env::current_exe().unwrap());
+            // Keep platform runtime settings while isolating Kin configuration.
+            for (key, _) in env::vars_os() {
+                if key
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("KIN_")
+                {
+                    command.env_remove(key);
+                }
+            }
+            let output = command
+                .args([
+                    "--exact",
+                    "tests::explicit_store_config_survives_a_foreign_registry",
+                    "--nocapture",
+                ])
+                .env(WORKER, "1")
+                .env("HOME", machine.path())
+                .env("USERPROFILE", machine.path())
+                .env("KIN_REGISTRY_PATH", machine.path().join("registry.toml"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "selected-store configuration worker failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        kin_core::layout::write_working_tree_record(store.path(), repo.path()).unwrap();
+        let layout = KinLayout::new(store.path().to_path_buf());
+        std::fs::write(
+            layout.config_path(),
+            "[resources]\nprofile = 'throughput'\n\
+             [retrieval]\narm = 'cards'\n\
+             [models.embeddings]\nprovider = 'built-in'\nmodel = 'selected-model'\n",
+        )
+        .unwrap();
+        let args = Args {
+            repo: repo.path().to_path_buf(),
+            store: Some(store.path().to_path_buf()),
+            port: 0,
+            storage: StorageMode::Local,
+            repo_id: None,
+            supervisor: false,
+            compat_json: false,
+        };
+        assert!(
+            KinLayout::discover(&args.repo).is_none(),
+            "the foreign registry must not discover the explicit store"
+        );
+        apply_repository_profile_from_args(&args).unwrap();
+        assert_eq!(
+            env::var("KIN_RESOURCE_PROFILE").as_deref(),
+            Ok("throughput")
+        );
+        assert_eq!(env::var("KIN_LOCATE_ARM").as_deref(), Ok("cards"));
+        assert_eq!(
+            env::var("KIN_MODEL_EMBEDDINGS_MODEL").as_deref(),
+            Ok("selected-model")
+        );
+
+        // Loading validates the selected config before applying environment
+        // precedence, even with model values adopted by the previous call.
+        std::fs::write(
+            layout.config_path(),
+            "[models.embeddings]\nprovider = 'external'\n",
+        )
+        .unwrap();
+        let error = apply_repository_profile_from_args(&args).unwrap_err();
+        assert!(
+            error.to_string().contains("requires model and base_url"),
+            "invalid selected-store model config must refuse startup: {error}"
+        );
+    }
 
     #[test]
     fn singleton_authority_is_acquired_before_state_construction() {

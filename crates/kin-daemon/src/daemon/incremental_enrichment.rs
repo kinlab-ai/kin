@@ -98,7 +98,10 @@ struct Answers {
     /// What the file's call-site ledgers need beyond the answers, as the
     /// sweep hands them over (see [`LedgerRequest`]).
     unproven: Vec<kin_lsp::call_sites::UnprovenSite>,
-    produced_references: HashSet<kin_model::RelationId>,
+    produced_references: Vec<kin_model::Relation>,
+    /// The type answers the entity passes disproved, for the settlement to
+    /// retire the evidence an earlier build minted from them.
+    disproved_type_uses: Vec<kin_lsp::enrichment::DisprovedTypeUse>,
     ending: PassEnding,
     not_in_build: bool,
     /// Whether every pass over the file finished, so a proof its ledgers do
@@ -199,7 +202,8 @@ pub(crate) async fn enrich_changed_file(
     // What the definitions pass asked and could not prove, and the references
     // the passes produce, for the file's call-site ledgers.
     let unproven = std::mem::take(&mut result.unproven_sites);
-    let mut produced_references = super::produced_reference_ids(&result.relations);
+    let mut produced_references = super::produced_reference_sites(&result.relations);
+    let mut disproved_type_uses = Vec::new();
     let mut unprovable =
         super::file_pass_unprovable(std::mem::take(&mut result.unprovable), &declarations);
     let mut relations = result.relations;
@@ -232,7 +236,8 @@ pub(crate) async fn enrich_changed_file(
         }
         sites.extend(kin_lsp::call_sites::call_hierarchy_answers(&derived));
         hierarchy_outside.extend(outcomes.outside_sites);
-        produced_references.extend(super::produced_reference_ids(&derived));
+        disproved_type_uses.extend(outcomes.disproved_type_uses);
+        produced_references.extend(super::produced_reference_sites(&derived));
         relations.extend(derived);
     }
     // A call the calls arm resolved outside the repository refutes the guesses
@@ -259,6 +264,7 @@ pub(crate) async fn enrich_changed_file(
     // this one back too.
     let nothing_answered = super::declined_everything(
         tally.query_declines,
+        tally.query_refusals,
         server.client.answered() - answered_before,
     );
     let disconnected = server.is_disconnected();
@@ -291,6 +297,7 @@ pub(crate) async fn enrich_changed_file(
         completed: super::file_passes_completed(&tally, 0, 0),
         unproven,
         produced_references,
+        disproved_type_uses,
         ending,
         not_in_build: server.in_no_build(&root.join(file)),
         retract,
@@ -337,10 +344,13 @@ struct Request<'a> {
 /// it was taken.
 ///
 /// A pass over the whole file settles it as the sweep does, through
-/// [`QueryInputs::settle_file`], which also gives every caller in the file its
-/// call-site ledger and makes the file's proofs agree with them. A pass over
-/// part of the file knows only some of its sites, so it settles the guesses
-/// its answers contradict and writes no ledger.
+/// [`super::lsp_publication::UnitWrite::settle_file`], which also gives every
+/// caller in the file its call-site ledger and makes the file's proofs agree
+/// with them. A pass over part of the file knows only some of its sites, so it
+/// settles the guesses its answers contradict and writes no ledger.
+///
+/// The relations and the settlement land in one write turn, as the sweep's
+/// do, so a live read sees none of them or all of them.
 async fn write(
     state: &DaemonState,
     asked: &QueryInputs,
@@ -357,69 +367,65 @@ async fn write(
     } = *request;
     let mut written = EnrichmentWrite::default();
     let mut pending = PendingEnrichment::default();
-    let mut refused = capture
-        .absorb(state, &mut pending, answers.relations.clone())
-        .await
-        .map(|batch| written += batch)
-        .err();
-    if refused.is_none() {
-        refused = capture
-            .flush(state, &mut pending)
-            .await
+    let entities: Vec<&kin_model::Entity> = capture
+        .entities
+        .iter()
+        .filter(|entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .is_some_and(|origin| origin.0 == file)
+        })
+        .collect();
+    let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
+    let mut refused = {
+        let unit = capture.write_unit(state).await;
+        let mut refused = unit
+            .absorb(&mut pending, answers.relations.clone())
             .map(|batch| written += batch)
             .err();
-    }
-    if refused.is_none() && pass.whole_file {
-        let entities: Vec<&kin_model::Entity> = capture
-            .entities
-            .iter()
-            .filter(|entity| {
-                entity
-                    .file_origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.0 == file)
-            })
-            .collect();
-        let uri = kin_lsp::protocol::path_to_uri(&root.join(file));
-        refused = capture
-            .settle_file(
-                state,
-                text,
-                &answers.sites,
-                &answers.names,
-                &answers.context,
-                LedgerRequest {
+        if refused.is_none() {
+            refused = unit.flush(&mut pending).map(|batch| written += batch).err();
+        }
+        if refused.is_none() && pass.whole_file {
+            capture.note_disproved_type_uses(answers.disproved_type_uses.iter().cloned());
+            refused = unit
+                .settle_file(
+                    text,
+                    &answers.sites,
+                    &answers.names,
+                    &answers.context,
+                    LedgerRequest {
+                        file,
+                        uri: &uri,
+                        index,
+                        entities: &entities,
+                        unproven: &answers.unproven,
+                        produced_references: &answers.produced_references,
+                        ending: answers.ending,
+                        not_in_build: answers.not_in_build,
+                        retract: answers.retract,
+                    },
+                )
+                .map(|(batch, ledgers)| {
+                    written += batch;
+                    pass.ledgers = ledgers;
+                })
+                .err();
+        } else if refused.is_none() {
+            refused = unit
+                .settle(
                     file,
-                    uri: &uri,
-                    index,
-                    entities: &entities,
-                    unproven: &answers.unproven,
-                    produced_references: &answers.produced_references,
-                    ending: answers.ending,
-                    not_in_build: answers.not_in_build,
-                    retract: answers.retract,
-                },
-            )
-            .await
-            .map(|(batch, ledgers)| {
-                written += batch;
-                pass.ledgers = ledgers;
-            })
-            .err();
-    } else if refused.is_none() {
-        refused = capture
-            .settle(
-                state,
-                file,
-                text,
-                &answers.sites,
-                &answers.names,
-                Some(&answers.context),
-            )
-            .await
-            .map(|batch| written += batch)
-            .err();
-    }
+                    text,
+                    &answers.sites,
+                    &answers.names,
+                    Some(&answers.context),
+                )
+                .map(|batch| written += batch)
+                .err();
+        }
+        refused
+    };
     if refused.is_none()
         && pass.whole_file
         && answers.completed
@@ -450,6 +456,7 @@ fn unsettled_calls(
     text: &str,
     callers: &[EntityId],
 ) -> BTreeSet<(EntityId, usize)> {
+    let tree = crate::call_site_ledger::source_tree(file, text);
     let in_repository: HashSet<EntityId> = inputs
         .entities
         .iter()
@@ -500,7 +507,11 @@ fn unsettled_calls(
                 .filter_map(|evidence| evidence.source_span.as_ref())
                 .filter(|span| span.file.0 == file)
             {
-                let Some(token) = kin_lsp::call_sites::callee_token(file, text, span) else {
+                let Some(token) = tree
+                    .as_ref()
+                    .and_then(|tree| kin_lsp::call_sites::callee_token_in_tree(tree, text, span))
+                    .or_else(|| kin_lsp::call_sites::callee_token(file, text, span))
+                else {
                     continue;
                 };
                 let confirmed = proven
@@ -582,7 +593,7 @@ mod tests {
         ));
         let names = std::mem::take(&mut result.external_names);
         let unproven = std::mem::take(&mut result.unproven_sites);
-        let mut produced = super::super::produced_reference_ids(&result.relations);
+        let mut produced = super::super::produced_reference_sites(&result.relations);
         let mut relations = std::mem::take(&mut result.relations);
         let entities: Vec<&Entity> = inputs
             .entities
@@ -614,7 +625,7 @@ mod tests {
             )
             .await;
             answers.extend(kin_lsp::call_sites::call_hierarchy_answers(&derived));
-            produced.extend(super::super::produced_reference_ids(&derived));
+            produced.extend(super::super::produced_reference_sites(&derived));
             relations.extend(derived);
         }
         server.shutdown().await.unwrap();
@@ -1223,7 +1234,10 @@ mod tests {
         )
         .await;
         assert_eq!(pass.refused, None);
-        assert_eq!(pass.revalidated, 1);
+        // The capture sees that the write left its tree and entities as they
+        // were and takes the moved epoch as its own, so the pass writes
+        // through it without a recapture.
+        assert_eq!(pass.revalidated, 0);
         assert!(pass.marked, "the whole file was answered");
         assert_eq!(
             fixture.guesses(run, alpha_close),

@@ -10,10 +10,11 @@
 //! an idle floor, the daemon exited on its own window between two calls, and
 //! the next call found nothing listening.
 //!
-//! The window here is compressed to a few seconds so the test runs in well
-//! under a minute; everything else is the production path: a real daemon
-//! process, and tool calls forwarded through the same `kin_mcp` delegate a
-//! `kin mcp start` session uses, which holds and renews the floor itself.
+//! The window here is compressed to the smallest one the daemon takes, one
+//! second, so the whole test costs a few seconds of waiting; everything else is
+//! the production path: a real daemon process, and tool calls forwarded through
+//! the same `kin_mcp` delegate a `kin mcp start` session uses, which holds and
+//! renews the floor itself.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -30,26 +31,28 @@ use common::{
 const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The daemon's own window: the stand-in for the CLI's sixty seconds.
-const OWN_WINDOW: Duration = Duration::from_secs(3);
+///
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` counts whole seconds, so one second is the
+/// shortest window the daemon can be given. Its idle monitor checks a window
+/// this short every quarter of it, 250 ms.
+const OWN_WINDOW: Duration = Duration::from_secs(1);
 
 /// The gap between two tool calls, longer than the daemon's own window by
 /// more than the idle monitor's check interval, so a daemon holding only its
-/// own window provably exits inside every gap.
-const CALL_GAP: Duration = Duration::from_secs(6);
+/// own window provably exits inside every gap: it decides to stop between
+/// 1.0 and 1.25 seconds after the last call, well before the next one.
+const CALL_GAP: Duration = Duration::from_secs(2);
 
 const TOKEN: &str = "mcp-session-idle-floor-test-token";
 
-fn spawn_daemon(repo_root: &Path) -> DaemonChild {
+fn spawn_daemon(repository: &common::NativeDaemonRepository) -> DaemonChild {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
     isolate_daemon_test_command(&mut cmd);
+    repository.bind(&mut cmd);
     cmd.arg("--repo")
-        .arg(repo_root)
+        .arg(repository.layout.working_dir())
         .arg("--port")
         .arg("0")
-        .env(
-            "KIN_REGISTRY_PATH",
-            repo_root.join(".kin/test-runtime/registry.toml"),
-        )
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_AUTO_EMBED", "0")
         .env(
@@ -63,8 +66,8 @@ fn spawn_daemon(repo_root: &Path) -> DaemonChild {
         .expect("failed to spawn contained kin-daemon")
 }
 
-async fn published_port(child: &mut DaemonChild, repo_root: &Path) -> u16 {
-    let port_file = repo_root.join(".kin/daemon.port");
+async fn published_port(child: &mut DaemonChild, kin_root: &Path) -> u16 {
+    let port_file = kin_root.join("daemon.port");
     let deadline = Instant::now() + READINESS_TIMEOUT;
     loop {
         if let Some(port) = std::fs::read_to_string(&port_file)
@@ -127,9 +130,9 @@ async fn graph_status_call() -> Result<(), String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_mcp_session_keeps_a_short_window_daemon_alive_until_it_ends() {
     let repo = tempfile::tempdir().unwrap();
-    kin_core::init(repo.path()).unwrap();
-    let mut child = spawn_daemon(repo.path());
-    let port = published_port(&mut child, repo.path()).await;
+    let repository = common::initialize_native_repository(repo.path()).await;
+    let mut child = spawn_daemon(&repository);
+    let port = published_port(&mut child, repository.layout.root()).await;
     let base = format!("http://127.0.0.1:{port}");
     wait_until_ready(&mut child, &base).await;
 

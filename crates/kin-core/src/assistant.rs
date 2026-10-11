@@ -878,11 +878,9 @@ pub fn generate_assistant_prompt(
     out.push_str("The graph is authority; files are the projection and execution surface. ");
     out.push_str("Use Kin tools instead of grep/find/cat for code discovery.\n\n");
     out.push_str("## Quick Start\n");
-    out.push_str("1. MCP: `semantic_locate` to find the right entity by meaning\n");
-    out.push_str("2. MCP: `get_context_pack` to load the focused neighborhood\n");
-    out.push_str(
-        "3. MCP: `trace_data_flow` when lineage or cross-file dependency direction matters\n",
-    );
+    out.push_str("1. MCP: `locate` to find the right entity by name or by meaning\n");
+    out.push_str("2. MCP: `context` to load the focused neighborhood\n");
+    out.push_str("3. MCP: `trace` when lineage or cross-file dependency direction matters\n");
     out.push_str("4. CLI: `kin overview --compact` to get codebase orientation\n");
     out.push_str("5. CLI: `kin trace <ExactName> --compact` to resolve one entity and print the focused neighborhood\n");
     out.push_str(
@@ -1000,13 +998,11 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
     out.push_str("# Kin-Native Repository\n\n");
     out.push_str("This repo uses Kin as the semantic system of record. Start with Kin graph tools, not broad filesystem discovery.\n\n");
     out.push_str("## Workflow\n");
-    out.push_str("1. If MCP is connected, start with `semantic_locate` to find the right entity by meaning\n");
     out.push_str(
-        "2. Use `get_context_pack` for an entity's exact code and its focused neighborhood\n",
+        "1. If MCP is connected, start with `locate` to find the right entity by name or by meaning\n",
     );
-    out.push_str(
-        "3. Use `trace_data_flow` when lineage or cross-file dependency direction matters\n",
-    );
+    out.push_str("2. Use `context` for an entity's exact code and its focused neighborhood\n");
+    out.push_str("3. Use `trace` when lineage or cross-file dependency direction matters\n");
     out.push_str(
         "4. Use `kin overview --compact` only for broad architecture/orientation questions\n",
     );
@@ -1018,7 +1014,7 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
     out.push_str("## Rules\n");
     out.push_str("- Prefer exact names like `parseStrict`, `parse`, or `$MyType`\n");
     out.push_str("- Avoid broad shotgun searches\n");
-    out.push_str("- Change code through `kin_mutate` on entity ids; the shell is for building and running tests\n");
+    out.push_str("- Change code through `mutate` on entity ids; the shell is for building and running tests\n");
     out.push_str("- Legacy docs live under `.kin/docs/imported/`\n\n");
 
     out.push_str(&format!("## For {}\n", assistant_name));
@@ -1069,8 +1065,8 @@ fn generate_agents_md() -> String {
      Use `kin context <entity_name>` to get a token-budgeted context pack.\n\
      This gives you precise, relevant code — not entire files.\n\n\
      ### Making Changes\n\n\
-     1. Read the entity you are changing with `get_entity_source`, which returns its `source_base`\n\
-     2. Open a session with `kin_session_start`, then change the entity by id with `kin_mutate`\n\
+     1. Read the entity you are changing with `source`, which returns its `source_base`\n\
+     2. Open a session with `session`, then change the entity by id with `mutate`\n\
      3. Check impact with `kin review` before committing\n\n\
      These are Kin's MCP tools; without MCP, `kin call <tool> '<json>'` runs the same ones.\n\
      Kin tracks changes at the entity level (functions, classes, etc.).\n\n\
@@ -1457,7 +1453,8 @@ mod tests {
         let hooks_snippet = &snippets[1];
         assert_eq!(hooks_snippet.filename, "settings.json");
         assert!(hooks_snippet.content.contains("hooks"));
-        assert!(hooks_snippet.content.contains("kin review"));
+        // The prompt hook: Kin's answer before the model's first turn.
+        assert!(hooks_snippet.content.contains("kin ask --hook claude"));
         assert!(hooks_snippet.target_path.contains(".claude/settings.json"));
     }
 
@@ -1704,9 +1701,9 @@ mod tests {
         );
 
         assert!(prompt.contains("# Kin - Native Semantic Repository"));
-        assert!(prompt.contains("semantic_locate"));
-        assert!(prompt.contains("get_context_pack"));
-        assert!(prompt.contains("trace_data_flow"));
+        assert!(prompt.contains("`locate`"));
+        assert!(prompt.contains("`context`"));
+        assert!(prompt.contains("`trace`"));
         assert!(prompt.contains("kin overview --compact"));
         assert!(prompt.contains("kin trace <ExactName>"));
         assert!(prompt.contains("kin search <name> --show-body --limit 5"));
@@ -1763,8 +1760,8 @@ mod tests {
         assert!(prompt.contains("Reading Code (use Kin instead"));
         // Should contain MCP mapping (Claude is MCP-capable)
         assert!(prompt.contains("MCP Tools"));
-        assert!(prompt.contains("semantic_locate"));
-        assert!(prompt.contains("get_context_pack"));
+        assert!(prompt.contains("`locate`"));
+        assert!(prompt.contains("`context`"));
         // Should contain Claude-specific tips
         assert!(prompt.contains("## Claude Code Tips"));
         assert!(prompt.contains("CLAUDE.md is managed by Kin"));
@@ -1873,9 +1870,9 @@ mod tests {
 
         let doc = generate_bootstrap_docs(&layout, AssistantKind::ClaudeCode);
         assert!(doc.contains("Kin-Native Repository"));
-        assert!(doc.contains("semantic_locate"));
-        assert!(doc.contains("get_context_pack"));
-        assert!(doc.contains("trace_data_flow"));
+        assert!(doc.contains("`locate`"));
+        assert!(doc.contains("`context`"));
+        assert!(doc.contains("`trace`"));
         assert!(doc.contains("kin overview --compact"));
         assert!(doc.contains("kin trace <ExactName>"));
         assert!(doc.contains("kin context <entity>"));

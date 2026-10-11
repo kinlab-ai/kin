@@ -26,8 +26,28 @@ use kin_model::{Hash256, LanguageId, ProofContext};
 use crate::adapters::ServerLaunch;
 
 /// Domain of a proof context's configuration hash. The second version adds
-/// the resolver's content identity.
-const CONFIGURATION_DOMAIN: &str = "kin.proof-context.configuration.v2";
+/// the resolver's content identity, and the third Kin's own enrichment
+/// producer identity ([`ENRICHMENT_PRODUCER_IDENTITY`]).
+const CONFIGURATION_DOMAIN: &str = "kin.proof-context.configuration.v3";
+
+/// The content identity of Kin's own enrichment producer code in this build:
+/// the sources of this crate that decide what a proof says and, inside Kin's
+/// workspace, the daemon's call-site ledger, each without its tests.
+/// `build/producer_identity.rs` names every source file of this crate as
+/// deciding or not, with the reason, and the build fails on one it does not
+/// name.
+///
+/// Part of every configuration hash, because a proof is made by the resolver
+/// and by the Kin code that asked it and recorded what it answered. When that
+/// code changes, a proof an earlier build recorded is not what this build
+/// would record, so its context is no longer current and the sweep asks its
+/// call sites again, including those an earlier build recorded as
+/// `no_answer`, rather than serving the old proofs as current. The hand-kept
+/// proof mark version does not move on every change inside one release; this
+/// does. It does not move for a test, or for code that decides no proof, such
+/// as how long the startup probe waits: moving it asks about every stored
+/// proof again, which only a change to what a proof says is worth.
+pub const ENRICHMENT_PRODUCER_IDENTITY: &str = env!("KIN_ENRICHMENT_PRODUCER_IDENTITY");
 
 /// What a configuration hash records for a resolver whose executable cannot be
 /// identified by content: a shim that picks a program at run time, a script
@@ -213,16 +233,23 @@ pub fn running_resolver_identity(pid: i32) -> Option<String> {
             .filter(|script| script.is_absolute())?;
         return resolver_content_identity(&script);
     }
-    const INTERPRETERS: &[&str] = &[
-        "sh", "bash", "zsh", "dash", "fish", "env", "python", "ruby", "perl", "java", "deno", "bun",
-    ];
-    let interpreter = INTERPRETERS
-        .iter()
-        .any(|interpreter| name == *interpreter || name.starts_with(&format!("{interpreter}3")));
-    if interpreter {
+    if is_interpreter_name(&name) {
         return None;
     }
     resolver_content_identity(&executable)
+}
+
+#[cfg(unix)]
+fn is_interpreter_name(name: &str) -> bool {
+    // Framework Python on macOS runs as `Python`. Its capitalization does not
+    // make the interpreter's bytes identify the script it runs.
+    let name = name.to_ascii_lowercase();
+    const INTERPRETERS: &[&str] = &[
+        "sh", "bash", "zsh", "dash", "fish", "env", "python", "ruby", "perl", "java", "deno", "bun",
+    ];
+    INTERPRETERS
+        .iter()
+        .any(|interpreter| name == *interpreter || name.starts_with(&format!("{interpreter}3")))
 }
 
 #[cfg(not(unix))]
@@ -332,6 +359,24 @@ fn launch_hashes(
     command: &str,
     resolver_identity: Option<&str>,
 ) -> (Hash256, Hash256) {
+    launch_hashes_under(
+        ENRICHMENT_PRODUCER_IDENTITY,
+        launch,
+        workspace_root,
+        command,
+        resolver_identity,
+    )
+}
+
+/// [`launch_hashes`] for an explicit enrichment producer identity, so a test
+/// can move it.
+fn launch_hashes_under(
+    producer: &str,
+    launch: &ServerLaunch,
+    workspace_root: &Path,
+    command: &str,
+    resolver_identity: Option<&str>,
+) -> (Hash256, Hash256) {
     let placeholders = Placeholders::new(workspace_root);
     let json = |value: &Option<serde_json::Value>| {
         value
@@ -359,6 +404,7 @@ fn launch_hashes(
     let configuration_hash = kin_model::proof_context_digest(
         CONFIGURATION_DOMAIN,
         &[
+            producer.as_bytes(),
             resolver_identity.map_or(UNIDENTIFIED_RESOLVER, str::as_bytes),
             label.as_bytes(),
             initialization.as_bytes(),
@@ -473,6 +519,30 @@ mod tests {
             })),
             label: "rust-analyzer, all features".to_string(),
             ..ServerLaunch::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpreter_names_refuse_identity_regardless_of_capitalization() {
+        for name in [
+            "python",
+            "Python",
+            "python3.12",
+            "Python3.12",
+            "bash",
+            "Bash",
+        ] {
+            assert!(
+                is_interpreter_name(name),
+                "{name} still runs another program"
+            );
+        }
+        for name in ["node", "sleep", "rust-analyzer", "python-language-server"] {
+            assert!(
+                !is_interpreter_name(name),
+                "{name} is not an unidentified interpreter"
+            );
         }
     }
 
@@ -671,5 +741,36 @@ mod tests {
         kin_model::ResolutionRecord::ProofContext(context)
             .validate()
             .unwrap();
+    }
+
+    /// Kin's own enrichment code is part of what made a proof, so another
+    /// build of it is another configuration, and a proof the earlier build
+    /// recorded is asked about again rather than served as current.
+    #[test]
+    fn another_enrichment_producer_is_another_configuration() {
+        let root = Path::new("/work/a/axum");
+        let this = launch_hashes_under("sha256:11", &launch(root), root, "ra", Some("sha256:aa"));
+        assert_eq!(
+            this,
+            launch_hashes_under("sha256:11", &launch(root), root, "ra", Some("sha256:aa"))
+        );
+        let other = launch_hashes_under("sha256:22", &launch(root), root, "ra", Some("sha256:aa"));
+        assert_ne!(this.0, other.0, "the producer moves the configuration hash");
+        assert_eq!(this.1, other.1, "the environment is the environment");
+        assert!(
+            ENRICHMENT_PRODUCER_IDENTITY.starts_with("sha256:")
+                && ENRICHMENT_PRODUCER_IDENTITY.len() == 71,
+            "{ENRICHMENT_PRODUCER_IDENTITY}"
+        );
+        assert_eq!(
+            launch_hashes(&launch(root), root, "ra", Some("sha256:aa")),
+            launch_hashes_under(
+                ENRICHMENT_PRODUCER_IDENTITY,
+                &launch(root),
+                root,
+                "ra",
+                Some("sha256:aa")
+            )
+        );
     }
 }

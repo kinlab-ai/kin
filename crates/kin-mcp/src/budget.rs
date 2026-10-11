@@ -101,6 +101,10 @@ pub const RESPONSE_DISCLOSURE_RESERVE_CHARS: usize = 1_500;
 /// cuts first.
 pub const RESPONSE_ENVELOPE_RESERVE_CHARS: usize = 2_000;
 
+/// The degradation a context reply carries when it ships over its token budget
+/// because nothing more could be withheld without removing the answer.
+pub const OVER_TOKEN_BUDGET_REASON: &str = "response_over_token_budget";
+
 /// The size contract one tool call is served under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseBudget {
@@ -216,6 +220,44 @@ impl ResponseBudget {
             ..self
         }
     }
+}
+
+/// Refuse an oversized final presentation without cutting records or advancing
+/// its continuation. The caller supplies the finalized effective ceiling and
+/// invokes this after every representation rewrite, with no later envelope.
+pub(crate) fn enforce_final_content_ceiling(result: &mut Value, max_chars: usize) {
+    let bytes = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .fold(0usize, |sum, text| sum.saturating_add(text.len()));
+    if bytes <= max_chars {
+        return;
+    }
+    let mut refusal = json!({"error": {
+        "code": "response_budget_exceeded",
+        "max_output_bytes": max_chars,
+        "message": "No answer or page was emitted because it exceeds the response byte budget. Retry the same request or incoming cursor with a larger advertised response budget if available."
+    }});
+    let mut text = refusal.to_string();
+    if text.len() > max_chars {
+        // Admitted ceilings are at least 2,000 bytes. Even malformed accounting
+        // must fail closed instead of returning the oversized answer.
+        refusal["error"]
+            .as_object_mut()
+            .expect("refusal object")
+            .remove("message");
+        text = refusal.to_string();
+        if text.len() > max_chars {
+            text.clear();
+        }
+    }
+    // Replace the entire result: the refused page's next cursor and any earlier
+    // structuredContent must not survive beside an error about that page.
+    *result = serde_json::to_value(crate::ToolCallResult::error(text))
+        .expect("response budget refusal serializes");
 }
 
 /// What the budget did to one response. Carried on the `_kin` envelope under
@@ -489,16 +531,46 @@ pub fn record_elision_for(
 /// them.
 pub(crate) const JSON_FORMAT_KEY: &str = "_kin_json_format";
 
+/// Whether [`render`] emits `value` compact, which it does exactly when the
+/// value carries the private format marker set to `compact`.
+fn renders_compact(value: &Value) -> bool {
+    value.get(JSON_FORMAT_KEY).and_then(Value::as_str) == Some("compact")
+}
+
 /// Serialize in the budget-selected format without emitting its control field.
 pub fn render(value: &Value) -> serde_json::Result<String> {
-    if value.get(JSON_FORMAT_KEY).and_then(Value::as_str) == Some("compact") {
+    if renders_compact(value) {
         let mut emitted = value.clone();
         if let Some(object) = emitted.as_object_mut() {
             object.remove(JSON_FORMAT_KEY);
         }
-        serde_json::to_string(&emitted)
+        rendered(&emitted, false)
     } else {
-        serde_json::to_string_pretty(value)
+        rendered(value, true)
+    }
+}
+
+/// The string `serde_json::to_string` returns, or `to_string_pretty` when
+/// `pretty`, byte for byte.
+///
+/// Written through the `Display` impl [`serialized_size`] counts with, which
+/// runs those same serializers but is compiled with `serde_json`'s optimization
+/// settings, so a build that optimizes dependencies but not the workspace
+/// renders a large reply at the optimized speed. The serializer only fails on
+/// input a `Value` cannot hold; that error, if it ever came, is the one
+/// `serde_json` itself reports.
+fn rendered(value: &Value, pretty: bool) -> serde_json::Result<String> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let written = if pretty {
+        write!(text, "{value:#}")
+    } else {
+        write!(text, "{value}")
+    };
+    match written {
+        Ok(()) => Ok(text),
+        Err(_) if pretty => serde_json::to_string_pretty(value),
+        Err(_) => serde_json::to_string(value),
     }
 }
 
@@ -514,16 +586,84 @@ pub fn render_in_format_of(value: &Value, previous: &str) -> serde_json::Result<
     if let Some(object) = emitted.as_object_mut() {
         object.remove(JSON_FORMAT_KEY);
     }
-    if previous.contains('\n') {
-        serde_json::to_string_pretty(&emitted)
-    } else {
-        serde_json::to_string(&emitted)
-    }
+    rendered(&emitted, previous.contains('\n'))
 }
 
 /// Serialized size of the exact response every emitter sends.
+///
+/// Counted rather than rendered. The budget measures a reply dozens of times on
+/// its way to fitting, and each [`render`] of a compact reply cloned the whole
+/// payload to drop one key and then built the string only to read its length.
+/// The count runs the same serializer and formatter [`render`] does (see
+/// `serialized_size`), so it is the length of the string [`render`] returns,
+/// byte for byte, and `measure_counts_exactly_what_render_emits` holds it there.
 pub fn measure(value: &Value) -> usize {
-    render(value).map_or(usize::MAX, |json| json.len())
+    if rendering_every_probe() {
+        return render(value).map_or(usize::MAX, |json| json.len());
+    }
+    let compact = renders_compact(value);
+    let Some((bytes, _)) = serialized_size(value, !compact) else {
+        return usize::MAX;
+    };
+    if !compact {
+        return bytes;
+    }
+    // Counted with the marker in place, and `render` emits it without: its key,
+    // its colon and its value, and the comma that joined it to a neighbour when
+    // it had one.
+    let key = serialized_size(&Value::from(JSON_FORMAT_KEY), false).map_or(0, |(len, _)| len);
+    let marker = serialized_size(&value[JSON_FORMAT_KEY], false).map_or(0, |(len, _)| len);
+    let comma = usize::from(value.as_object().map_or(0, Map::len) > 1);
+    bytes - key - 1 - marker - comma
+}
+
+/// Bytes a serializer writes, counted and dropped rather than kept.
+struct ByteCount {
+    bytes: usize,
+    /// Raw newlines among them, counted only when asked for. Only the pretty
+    /// layout writes one, because serde escapes every newline inside a string.
+    newlines: usize,
+    count_newlines: bool,
+}
+
+impl std::fmt::Write for ByteCount {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.bytes += text.len();
+        if self.count_newlines {
+            self.newlines += text.bytes().filter(|byte| *byte == b'\n').count();
+        }
+        Ok(())
+    }
+}
+
+/// The length `value` serializes to compact, counted as [`serialized_size`]
+/// counts it, or `None` when the serializer fails.
+pub(crate) fn compact_len(value: &Value) -> Option<usize> {
+    serialized_size(value, false).map(|(bytes, _)| bytes)
+}
+
+/// The length `value` serializes to, and the raw newlines in it when `pretty`,
+/// without building the string.
+///
+/// `serde_json`'s `Display` for `Value` runs the serializer `to_string` runs,
+/// compact for `{}` and with `to_string_pretty`'s two-space formatter for `{:#}`,
+/// so the count is exactly the length of the string either returns. That impl is
+/// not generic, so it is compiled with `serde_json`'s optimization settings
+/// rather than this crate's, and a build that optimizes dependencies but not the
+/// workspace measures at the optimized speed.
+fn serialized_size(value: &Value, pretty: bool) -> Option<(usize, usize)> {
+    use std::fmt::Write as _;
+    let mut count = ByteCount {
+        bytes: 0,
+        newlines: 0,
+        count_newlines: pretty,
+    };
+    let written = if pretty {
+        write!(count, "{value:#}")
+    } else {
+        write!(count, "{value}")
+    };
+    written.ok().map(|()| (count.bytes, count.newlines))
 }
 
 fn compact_json_under_pressure(payload: &mut Value, budget: &ResponseBudget) {
@@ -968,13 +1108,23 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
         },
         // Literal continuation is bound to matching stored contents. The
         // rebase arm preserves that binding when budget pressure withholds rows.
+        //
+        // A hit's excerpt is its matching line, the one thing a text search is
+        // read for, so it is never shed on its own: the placement fields go
+        // first, and past them whole hits are withheld behind the cursor.
         crate::handlers::lexical::TOOL_NAME => ResponseShape {
             collections: &["hits"],
-            body_keys: &["excerpt"],
+            body_keys: &[],
             explain_keys: &[],
             top_explain_keys: &[],
             duplicate_keys: &[],
-            bulk_keys: &[],
+            bulk_keys: &[
+                "language",
+                "line_confidence",
+                "score",
+                "start_line",
+                "end_line",
+            ],
             narrow_param: "limit",
         },
         // `clipped_steps` sheds before `chain`, because the ladder trims from
@@ -1118,7 +1268,9 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
         //
         // The four blast-radius buckets come next, in the order kin#1062 fixed
         // them in: callers before dependents, dependents before contract
-        // consumers, tests last of the four.
+        // consumers, tests last of the four. Overrides, the methods that may
+        // implement an interface method, and same-name implementations sit
+        // beside the callers, the rest of the direct answer.
         //
         // Then the governance and input echoes. `unreviewed_agent_changes` is a
         // judgment a caller cannot reconstruct; `changed_ids` is the target the
@@ -1135,6 +1287,11 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
             collections: &[
                 "entity_impacts",
                 "affected_callers",
+                "affected_overrides",
+                crate::impact_sections::INTERFACE_IMPLEMENTATIONS_KEY,
+                crate::handlers::implementation_family::OVERRIDE_CALLERS_KEY,
+                crate::handlers::implementation_family::OVERRIDE_CALLER_CANDIDATES_KEY,
+                crate::impact_sections::SAME_NAME_KEY,
                 "affected_dependents",
                 "affected_contract_consumers",
                 "affected_tests",
@@ -1302,6 +1459,11 @@ pub(crate) fn governed_collections(tool: &str) -> &'static [&'static str] {
 /// through `get_entity_source`. Only then are hits themselves withheld, from the
 /// tail of the least important array first, which is the only cut that removes
 /// an answer rather than a description of one.
+///
+/// The whole reply is held to its `token_budget` and to `max_chars` at once
+/// ([`context_reply_fits`]), and its metadata is made compact first
+/// ([`compact_context_reply`]), so the tokens a caller budgeted go to code
+/// rather than to descriptions of it.
 pub fn fit_context_payload(payload: &mut Value, tool: &str, budget: &ResponseBudget) -> bool {
     if !matches!(tool, "get_context_pack" | "trace_computation") {
         return true;
@@ -1309,35 +1471,741 @@ pub fn fit_context_payload(payload: &mut Value, tool: &str, budget: &ResponseBud
     let Some(limit) = payload.get("token_budget").and_then(Value::as_u64) else {
         return true;
     };
+    compact_context_reply(payload);
+    fit_context_within(payload, budget, limit, ContextFit::WholeReply)
+}
+
+/// Fit a context pack's answer to its `token_budget` alone, with no byte
+/// ceiling and no compaction: what a pack's own builder asks while it decides
+/// which rows to admit, before any reply exists to bound.
+pub fn fit_context_answer_tokens(payload: &mut Value) -> bool {
+    let Some(limit) = payload.get("token_budget").and_then(Value::as_u64) else {
+        return true;
+    };
+    fit_context_within(
+        payload,
+        &ResponseBudget {
+            max_chars: usize::MAX,
+            ..ResponseBudget::default()
+        },
+        limit,
+        ContextFit::AnswerOnly,
+    )
+}
+
+/// What a context fit holds to the token budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextFit {
+    /// The code the pack serves, as the builder measures it while admitting.
+    AnswerOnly,
+    /// The whole reply, metadata included, as a client receives it.
+    WholeReply,
+}
+
+/// Whether a rendered context reply is inside its ceilings.
+///
+/// How a context pack's whole reply is held to its request:
+///
+/// `token_budget` bounds the whole reply a client receives, metadata included,
+/// by kin's own estimator ([`kin_context::estimate_tokens`]), and `max_chars`
+/// bounds its characters; both hold at once. The pack's builder fits the code
+/// it serves (`answer_tokens`) to the token budget first, and the final fit
+/// then sheds call-site evidence rows, neighbour bodies and neighbour rows until
+/// the whole reply fits too, naming everything it withheld by id. Before this
+/// only the code was held to the token budget and the metadata beside it grew
+/// without bound: on the 0.8.3 pilot, packs asked for 3,000 tokens shipped
+/// 21,677 to 27,394 bytes and served no body at all.
+///
+/// The one thing the fit never withholds for the token budget is the body of
+/// the highest-ranked focal while the answer is inside that budget: a reply
+/// whose readings outgrow the budget withholds everything else it may, serves
+/// that body over the budget and says so ([`OVER_TOKEN_BUDGET_REASON`]), rather
+/// than trading the answer for the description of it. The byte ceiling is the
+/// client's own limit and holds for every body.
+pub(crate) fn context_reply_fits(
+    rendered: &str,
+    answer: usize,
+    limit: usize,
+    max_chars: usize,
+    fit: ContextFit,
+) -> Result<(), &'static str> {
+    if rendered.len() > max_chars {
+        return Err(ELISION_REASON_BUDGET);
+    }
+    let tokens = match fit {
+        ContextFit::AnswerOnly => answer,
+        ContextFit::WholeReply => kin_context::estimate_tokens(rendered),
+    };
+    if tokens > limit {
+        return Err(ELISION_REASON_TOKEN_BUDGET);
+    }
+    Ok(())
+}
+
+fn fit_context_within(
+    payload: &mut Value,
+    budget: &ResponseBudget,
+    limit: u64,
+    fit: ContextFit,
+) -> bool {
     loop {
-        let mut settled = false;
-        for _ in 0..16 {
-            let tokens =
-                kin_context::estimate_tokens(&render(payload).expect("JSON serialization"));
-            if payload.get("tokens_used").and_then(Value::as_u64) == Some(tokens as u64) {
-                settled = true;
-                break;
-            }
-            payload["tokens_used"] = json!(tokens);
-        }
-        if !settled {
+        // Every field this pass writes is written before `tokens_used` is
+        // settled, so the count describes the bytes that ship.
+        summarize_context_withheld(payload);
+        let answer = context_answer_tokens(payload);
+        payload[CONTEXT_ANSWER_TOKENS_KEY] = json!(answer);
+        if !settle_context_tokens_used(payload) {
             return false;
         }
         let output = render(payload).expect("JSON serialization");
-        if output.len() <= budget.max_chars
-            && kin_context::estimate_tokens(&output) <= limit as usize
-        {
-            return true;
-        }
-        let reason = if output.len() > budget.max_chars {
-            ELISION_REASON_BUDGET
-        } else {
-            ELISION_REASON_TOKEN_BUDGET
+        let Err(reason) =
+            context_reply_fits(&output, answer, limit as usize, budget.max_chars, fit)
+        else {
+            clear_residual(payload);
+            if fit == ContextFit::WholeReply {
+                disclose_context_over_token_budget(payload, limit as usize);
+            }
+            return settle_context_tokens_used(payload);
         };
         if !trim_context_output_once(payload, reason) {
-            return false;
+            // Nothing left to shed without removing the answer itself. What
+            // fits is served, over its ceiling, and says so: a refusal here
+            // returned nothing at all for a pack whose rows were there.
+            summarize_context_withheld(payload);
+            disclose_context_over_budget(payload, budget);
+            if fit == ContextFit::WholeReply {
+                disclose_context_over_token_budget(payload, limit as usize);
+            }
+            return settle_context_tokens_used(payload);
         }
     }
+}
+
+/// Say, on a context reply the fit could shed nothing more from, that it ships
+/// over its token budget, and withdraw the note from one that now fits.
+pub fn disclose_context_over_token_budget(payload: &mut Value, limit: usize) {
+    let tokens = kin_context::estimate_tokens(&render(payload).expect("JSON serialization"));
+    if tokens <= limit {
+        clear_token_residual(payload);
+        return;
+    }
+    let entry = json!({
+        "component": "response_budget",
+        "reason": OVER_TOKEN_BUDGET_REASON,
+        "token_budget": limit,
+        "detail": format!(
+            "the reply did not reach its {limit}-token budget: the focal's own body and the \
+             readings that qualify it are all that is left, and they do not fit. Read what it \
+             ships at from `tokens_used`"
+        ),
+        "remediation": "raise token_budget, or read the neighbours named under `withheld` by id",
+    });
+    match payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    {
+        Some(existing) => {
+            existing.retain(|prior| {
+                prior.get("reason").and_then(Value::as_str) != Some(OVER_TOKEN_BUDGET_REASON)
+            });
+            existing.push(entry);
+        }
+        None => payload["degradations"] = Value::Array(vec![entry]),
+    }
+}
+
+/// Withdraw a token-budget residual note from a reply that now fits.
+fn clear_token_residual(payload: &mut Value) {
+    let Some(entries) = payload
+        .get_mut("degradations")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    entries.retain(|entry| {
+        entry.get("reason").and_then(Value::as_str) != Some(OVER_TOKEN_BUDGET_REASON)
+    });
+    if entries.is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("degradations");
+        }
+    }
+}
+
+/// Stamp `tokens_used` with the estimate of the payload as it will be rendered.
+///
+/// Inserting the number changes the JSON, which changes the estimate, so this
+/// repeats until the stamp and the render agree. `answer_tokens` and the
+/// withheld summary have to be on the payload first: a stamp taken before
+/// them counts a reply the caller does not receive.
+fn settle_context_tokens_used(payload: &mut Value) -> bool {
+    for _ in 0..16 {
+        let tokens = kin_context::estimate_tokens(&render(payload).expect("JSON serialization"));
+        if payload.get("tokens_used").and_then(Value::as_u64) == Some(tokens as u64) {
+            return true;
+        }
+        payload["tokens_used"] = json!(tokens);
+    }
+    false
+}
+
+/// Say, on a context pack the ladder could shed nothing more from, that it
+/// ships over its byte ceiling. A pack that fits carries no such note.
+pub fn disclose_context_over_budget(payload: &mut Value, budget: &ResponseBudget) {
+    if measure(payload) > budget.max_chars {
+        disclose_residual(payload, budget);
+    } else {
+        clear_residual(payload);
+    }
+}
+
+/// The key a context pack reports its answer's token cost under.
+pub const CONTEXT_ANSWER_TOKENS_KEY: &str = "answer_tokens";
+
+/// The collections a context pack serves its answer rows in: the single-focal
+/// shape's sections and the multi-focal shape's `entities`.
+const CONTEXT_ANSWER_COLLECTIONS: [&str; 6] = [
+    "entities",
+    "dependencies",
+    "dependents",
+    "transitive_deps",
+    "tests",
+    "contracts",
+];
+
+/// What a context pack's answer costs against its `token_budget`: the code it
+/// serves, and nothing else.
+///
+/// A row costs its body when it carries one, its header and member signatures
+/// when it is a container's shape, and its signature otherwise. The envelope,
+/// the verdict and its readings, the call-site ledger, coverage, method and
+/// accounting fields are metadata about the answer: the pack's builder admits
+/// code against this number, and the final fit holds the whole reply,
+/// metadata included, to the same budget ([`context_reply_fits`]).
+pub fn context_answer_tokens(payload: &Value) -> usize {
+    let mut tokens = payload.get("focal_entity").map_or(0, context_row_tokens);
+    for key in CONTEXT_ANSWER_COLLECTIONS {
+        if let Some(rows) = payload.get(key).and_then(Value::as_array) {
+            tokens += rows.iter().map(context_row_tokens).sum::<usize>();
+        }
+    }
+    tokens
+}
+
+fn context_row_tokens(row: &Value) -> usize {
+    let Some(object) = row.as_object() else {
+        return 0;
+    };
+    if let Some(body) = object.get("body").and_then(Value::as_str) {
+        return kin_context::estimate_tokens(body);
+    }
+    if object.contains_key("header") || object.contains_key("members") {
+        return crate::container_shape::shape_tokens(object);
+    }
+    if object.get("projection").and_then(Value::as_str) == Some("NameAndKind") {
+        return object
+            .get("name")
+            .and_then(Value::as_str)
+            .map_or(0, kin_context::estimate_tokens)
+            + 1;
+    }
+    object
+        .get("signature")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("content").and_then(Value::as_str))
+        .map_or(0, kin_context::estimate_tokens)
+}
+
+/// The key summarizing omitted context: listed entity IDs and distinct counts.
+pub const CONTEXT_WITHHELD_KEY: &str = "withheld";
+
+/// The most withheld rows a pack names by id. Past this it counts them.
+///
+/// Each listed row is one id, about forty bytes and fourteen estimated tokens,
+/// and a reply whose whole size follows its `token_budget` cannot spend a
+/// tenth of it naming rows it did not serve, so the list stops at sixteen and
+/// `rows_total` says how many there were.
+pub const CONTEXT_WITHHELD_LISTED_MAX: usize = 16;
+
+/// Whether the omission ledger actually supplies an entity handle to read.
+/// Counts and explanatory text are not handles, and a capped list need not
+/// identify every omitted row.
+pub(crate) fn context_withheld_has_ids(withheld: &Value) -> bool {
+    let id = |value: &Value| value.as_str().is_some_and(|id| !id.trim().is_empty());
+    withheld
+        .get("bodies")
+        .and_then(Value::as_array)
+        .is_some_and(|ids| ids.iter().any(id))
+        || match withheld.get("rows") {
+            Some(Value::Object(groups)) => groups
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .any(id),
+            Some(Value::Array(rows)) => rows.iter().any(|row| {
+                row.get("entity_id")
+                    .or_else(|| row.get("id"))
+                    .is_some_and(id)
+            }),
+            _ => false,
+        }
+}
+
+/// A withheld row as an earlier pass listed it: by id under its group, or, in
+/// the shape before ids were grouped, as an object carrying both.
+fn earlier_withheld_rows(payload: &Value) -> Vec<(String, String)> {
+    match payload.pointer("/withheld/rows") {
+        Some(Value::Object(groups)) => groups
+            .iter()
+            .flat_map(|(group, ids)| {
+                ids.as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(move |id| (id.to_string(), group.clone()))
+            })
+            .collect(),
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    row.get("id")?.as_str()?.to_string(),
+                    row.get("group")?.as_str()?.to_string(),
+                ))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Summarize bodies the pack served as signatures and rows it dropped. Listed
+/// entity IDs are recoverable handles; capped and transitive omissions can be
+/// counts only, which must not promise those handles.
+///
+/// Derived from the rows themselves after every cut, so the list is the one
+/// the reader receives: a body the byte ceiling stripped after the token
+/// budget kept it is on it, and a row put back is not. Rows the builder
+/// dropped before rendering arrive in `withheld_rows` and are merged in.
+/// Recomputed from scratch on every call.
+///
+/// The list is ids and nothing else. A body the budget withheld belongs to a
+/// row the reply still carries, with its name and signature, so repeating the
+/// name here would restate it; a dropped row is listed under its group, which
+/// is the one fact about it the reply no longer carries.
+pub fn summarize_context_withheld(payload: &mut Value) {
+    let mut bodies: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut visit_row = |row: &Value, bodies: &mut Vec<String>| {
+        let Some(object) = row.as_object() else {
+            return;
+        };
+        let withheld = object
+            .get("body_elided")
+            .and_then(Value::as_array)
+            .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("body")));
+        if !withheld {
+            return;
+        }
+        let Some(id) = object.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if seen.insert(id.to_string()) {
+            bodies.push(id.to_string());
+        }
+    };
+    if let Some(focal) = payload.get("focal_entity") {
+        visit_row(focal, &mut bodies);
+    }
+    for key in CONTEXT_ANSWER_COLLECTIONS {
+        if let Some(rows) = payload.get(key).and_then(Value::as_array) {
+            for row in rows {
+                visit_row(row, &mut bodies);
+            }
+        }
+    }
+    let present: std::collections::HashSet<String> = std::iter::once(payload.get("focal_entity"))
+        .flatten()
+        .chain(
+            CONTEXT_ANSWER_COLLECTIONS
+                .iter()
+                .filter_map(|key| payload.get(*key).and_then(Value::as_array))
+                .flatten(),
+        )
+        .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    // Rows already named by an earlier pass, then any the builder or a later
+    // cut added since, each once and only while it is still out of the pack.
+    let earlier = earlier_withheld_rows(payload);
+    let added: Vec<(String, String)> = payload
+        .get("withheld_rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("withheld").and_then(Value::as_str) == Some("row"))
+        .filter_map(|row| {
+            Some((
+                row.get("entity_id")?.as_str()?.to_string(),
+                row.get("group")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    // Two-hop rows are counted, not listed: each is a name and a kind, and
+    // the rows a caller reads next are the direct ones.
+    let mut transitive = payload
+        .pointer("/withheld/transitive_rows")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rows: Vec<(String, String)> = earlier
+        .into_iter()
+        .chain(added)
+        .filter(|(id, _)| !present.contains(id) && listed.insert(id.clone()))
+        .filter(|(_, group)| {
+            let two_hop = group == kin_context::group::TRANSITIVE_DEPS;
+            transitive += usize::from(two_hop);
+            !two_hop
+        })
+        .collect();
+    // A focal the reply dropped is the answer coming back narrower than the
+    // question, so it is listed ahead of every neighbour the list may cut.
+    rows.sort_by_key(|(_, group)| group != "focal");
+    let rows_total = rows.len().max(
+        payload
+            .pointer("/withheld/rows_total")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+    );
+    let bodies_total = bodies.len();
+    bodies.truncate(CONTEXT_WITHHELD_LISTED_MAX);
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("withheld_rows");
+    }
+    if bodies_total == 0 && rows_total == 0 && transitive == 0 {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove(CONTEXT_WITHHELD_KEY);
+        }
+        return;
+    }
+    let mut withheld = json!({});
+    if bodies_total > 0 {
+        withheld["bodies"] = json!(bodies);
+        if bodies_total > CONTEXT_WITHHELD_LISTED_MAX {
+            withheld["bodies_total"] = json!(bodies_total);
+        }
+    }
+    if rows_total > 0 {
+        let mut groups: Map<String, Value> = Map::new();
+        for (id, group) in rows.into_iter().take(CONTEXT_WITHHELD_LISTED_MAX) {
+            match groups.get_mut(&group).and_then(Value::as_array_mut) {
+                Some(ids) => ids.push(json!(id)),
+                None => {
+                    groups.insert(group, json!([id]));
+                }
+            }
+        }
+        withheld["rows"] = Value::Object(groups);
+        if rows_total > CONTEXT_WITHHELD_LISTED_MAX {
+            withheld["rows_total"] = json!(rows_total);
+        }
+    }
+    if transitive > 0 {
+        withheld["transitive_rows"] = json!(transitive);
+    }
+    withheld["how"] = json!(if context_withheld_has_ids(&withheld) {
+        "read the listed entity IDs with get_entity_source; counts may include other rows whose IDs are not listed"
+    } else {
+        "these counts describe omitted rows; their entity IDs are not listed"
+    });
+    payload[CONTEXT_WITHHELD_KEY] = withheld;
+}
+
+#[cfg(test)]
+mod context_omission_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn counted_transitive_omissions_have_no_id_recovery_instruction() {
+        let mut payload = json!({"withheld_rows":[
+            {"entity_id":"a", "group":kin_context::group::TRANSITIVE_DEPS,"withheld":"row"},
+            {"entity_id":"b", "group":kin_context::group::TRANSITIVE_DEPS,"withheld":"row"}
+        ]});
+        summarize_context_withheld(&mut payload);
+        assert_eq!(payload["withheld"]["transitive_rows"], 2);
+        assert!(!context_withheld_has_ids(&payload["withheld"]));
+        let how = payload["withheld"]["how"].as_str().unwrap();
+        assert!(how.contains("IDs are not listed"), "{payload}");
+        assert!(!how.contains("get_entity_source"), "{payload}");
+        let once = payload.clone();
+        summarize_context_withheld(&mut payload);
+        assert_eq!(payload, once);
+    }
+
+    #[test]
+    fn capped_named_rows_and_counted_rows_keep_distinct_recovery() {
+        let mut rows: Vec<_> = (0..20)
+            .map(|n| {
+                json!({"entity_id":format!("row-{n}"),
+            "group":"dependencies","withheld":"row"})
+            })
+            .collect();
+        rows.push(json!({"entity_id":"transitive", "group":kin_context::group::TRANSITIVE_DEPS,"withheld":"row"}));
+        let mut payload = json!({"withheld_rows":rows});
+        summarize_context_withheld(&mut payload);
+        assert_eq!(
+            payload["withheld"]["rows"]["dependencies"]
+                .as_array()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(payload["withheld"]["rows_total"], 20);
+        assert_eq!(payload["withheld"]["transitive_rows"], 1);
+        assert!(context_withheld_has_ids(&payload["withheld"]));
+        assert!(payload["withheld"]["how"]
+            .as_str()
+            .unwrap()
+            .contains("listed entity IDs"));
+        assert!(payload["withheld"]["how"]
+            .as_str()
+            .unwrap()
+            .contains("other rows"));
+    }
+
+    #[test]
+    fn empty_or_malformed_lists_are_not_entity_handles() {
+        for withheld in [
+            json!({"rows_total":8}),
+            json!({"bodies":["",null,3]}),
+            json!({"rows":{"dependencies":[]}}),
+            json!({"rows":[{"group":"dependencies"}]}),
+        ] {
+            assert!(!context_withheld_has_ids(&withheld), "{withheld}");
+        }
+        for withheld in [
+            json!({"bodies":["body"]}),
+            json!({"rows":{"dependencies":["row"]}}),
+            json!({"rows":[{"id":"older","group":"dependencies"}]}),
+            json!({"rows":[{"entity_id":"new","group":"dependencies"}]}),
+        ] {
+            assert!(context_withheld_has_ids(&withheld), "{withheld}");
+        }
+    }
+}
+
+/// Row fields a compact context reply folds into its one provenance line.
+///
+/// Every row restated where its span came from: the artifact, its tree entry,
+/// the change that admitted it, a materialized path and whether the span was
+/// checked. On one pack those were identical on every row, and they cost more
+/// than the rows' signatures. The line keeps each distinct value once.
+pub(crate) const CONTEXT_ROW_PROVENANCE_KEYS: [&str; 7] = [
+    "artifact_entry",
+    "artifact_id",
+    "read_path",
+    "source",
+    "source_change_id",
+    "source_state",
+    "span_coherence",
+];
+
+/// Top-level context fields that restate what the tool description says.
+const CONTEXT_RESTATED_KEYS: [&str; 2] = ["measurement_scope", "projection_measurement_scope"];
+
+/// The per-focal fields a compact reply keeps: which entity, how it was
+/// resolved, and what the pack served for it. The rest (file, kind, line and
+/// token arithmetic) is on the focal's own row or in `measured_tokens`.
+const CONTEXT_FOCAL_KEYS: [&str; 4] = ["entity_id", "name", "projection", "resolution"];
+
+/// The key a compact context reply carries its rows' provenance line under,
+/// until the envelope folds it into `_kin.provenance`.
+pub const CONTEXT_PROVENANCE_KEY: &str = "provenance";
+
+fn context_rows_mut(payload: &mut Value) -> Vec<&mut Map<String, Value>> {
+    let Some(object) = payload.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<&mut Map<String, Value>> = Vec::new();
+    for (key, value) in object.iter_mut() {
+        if key == "focal_entity" {
+            if let Some(row) = value.as_object_mut() {
+                rows.push(row);
+            }
+        } else if CONTEXT_ANSWER_COLLECTIONS.contains(&key.as_str()) {
+            if let Some(list) = value.as_array_mut() {
+                rows.extend(list.iter_mut().filter_map(Value::as_object_mut));
+            }
+        }
+    }
+    rows
+}
+
+/// A context reply with its metadata made compact: every row's provenance
+/// folded into one line, each focal named by id and resolution, each route as
+/// its ends, the entities between them and one rendered line of its edges, the
+/// method as one short line, and no field that restates the tool description.
+///
+/// A presentation of the same answer. It removes nothing any verdict input
+/// reads and no row, body or id, so it runs before a reply is measured and on
+/// every pass, and running it twice changes nothing.
+pub fn compact_context_reply(payload: &mut Value) {
+    let mut sources: BTreeSet<String> = BTreeSet::new();
+    let mut states: BTreeSet<String> = BTreeSet::new();
+    let mut changes: BTreeSet<String> = BTreeSet::new();
+    let mut coherence: BTreeMap<String, usize> = BTreeMap::new();
+    let mut folded = false;
+    for row in context_rows_mut(payload) {
+        for key in CONTEXT_ROW_PROVENANCE_KEYS {
+            let Some(value) = row.remove(key) else {
+                continue;
+            };
+            folded = true;
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            match key {
+                "source" => {
+                    sources.insert(text.to_string());
+                }
+                "source_state" => {
+                    states.insert(text.to_string());
+                }
+                "source_change_id" => {
+                    changes.insert(text.chars().take(12).collect());
+                }
+                "span_coherence" => *coherence.entry(text.to_string()).or_default() += 1,
+                _ => {}
+            }
+        }
+    }
+    if folded {
+        let mut parts: Vec<String> = Vec::new();
+        if !sources.is_empty() {
+            parts.push(format!(
+                "rows served from {}",
+                sources.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !changes.is_empty() {
+            parts.push(format!(
+                "at change {}",
+                changes.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !states.is_empty() {
+            parts.push(format!(
+                "({})",
+                states.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !coherence.is_empty() {
+            parts.push(format!(
+                "spans {}",
+                coherence
+                    .into_iter()
+                    .map(|(state, count)| format!("{state} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !parts.is_empty() {
+            payload[CONTEXT_PROVENANCE_KEY] = json!(parts.join(" "));
+        }
+    }
+
+    if let Some(focals) = payload.get_mut("focals").and_then(Value::as_array_mut) {
+        for focal in focals.iter_mut().filter_map(Value::as_object_mut) {
+            focal.retain(|key, _| CONTEXT_FOCAL_KEYS.contains(&key.as_str()));
+        }
+    }
+    if let Some(routes) = payload.get_mut("routes").and_then(Value::as_array_mut) {
+        for route in routes.iter_mut().filter_map(Value::as_object_mut) {
+            // A route whose edges render as one line carries that line in their
+            // place. One that does not keeps its edges and its ends as they are.
+            let path = route
+                .get("edges")
+                .cloned()
+                .and_then(|edges| {
+                    serde_json::from_value::<Vec<kin_context::RouteEdgeReport>>(edges).ok()
+                })
+                .map(|edges| kin_context::render_route_edges(&edges))
+                .filter(|path| !path.is_empty());
+            let Some(path) = path else {
+                continue;
+            };
+            route.insert("path".to_string(), json!(path));
+            // The path names both ends, and each end is a focal the reply
+            // lists by id, so the ends are not repeated as ids here.
+            for key in [
+                "edges",
+                "from",
+                "to",
+                "from_name",
+                "to_name",
+                "via_names",
+                "tokens",
+                "hops",
+            ] {
+                route.remove(key);
+            }
+            if route.get("withheld").and_then(Value::as_u64) == Some(0) {
+                route.remove("withheld");
+            }
+        }
+    }
+    if payload.get("method").is_some() {
+        if let Some(line) = compact_method_line(payload) {
+            payload["method"] = json!(line);
+        }
+    }
+    if let Some(object) = payload.as_object_mut() {
+        for key in CONTEXT_RESTATED_KEYS {
+            object.remove(key);
+        }
+    }
+}
+
+/// The method of a pack built from several focals, in one short line: how
+/// many focals, which, and what the served code measured against its budget.
+fn compact_method_line(payload: &Value) -> Option<String> {
+    let focals = payload.get("focals")?.as_array()?;
+    let names: Vec<&str> = focals
+        .iter()
+        .filter_map(|focal| focal.get("name").and_then(Value::as_str))
+        .collect();
+    let carried = focals
+        .iter()
+        .filter(|focal| focal.get("projection").and_then(Value::as_str) != Some("elided"))
+        .count();
+    let count = if carried == focals.len() {
+        format!(
+            "{} focal{}",
+            focals.len(),
+            if focals.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("{carried} of {} focals carried", focals.len())
+    };
+    let routes = if payload
+        .get("routes")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| !routes.is_empty())
+    {
+        "routes between them first, "
+    } else {
+        ""
+    };
+    Some(format!(
+        "{count} ({}), {routes}neighbourhoods water-filled, {} of {} tokens",
+        names.join(", "),
+        payload
+            .get("measured_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        payload
+            .get("token_budget")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    ))
 }
 
 pub(crate) fn trim_context_output_once(payload: &mut Value, reason: &str) -> bool {
@@ -1346,6 +2214,10 @@ pub(crate) fn trim_context_output_once(payload: &mut Value, reason: &str) -> boo
         return false;
     }
     mark_context_cut(payload, before);
+    // Each cut is named by id at once, in the listing's own compact form, so
+    // the next measurement charges the reply for the list it will ship rather
+    // than for a staging record several times its size.
+    summarize_context_withheld(payload);
     true
 }
 
@@ -1416,8 +2288,27 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
         let Some(index) = index else {
             continue;
         };
-        rows.remove(index);
+        let removed = rows.remove(index);
         let kept = rows.len();
+        // An answer row that leaves is named by id, so the reader can read
+        // it; a block of external calls or metadata is counted only.
+        if CONTEXT_ANSWER_COLLECTIONS.contains(&key) {
+            if let Some(id) = removed.get("id").and_then(Value::as_str) {
+                let group = removed
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key)
+                    .to_string();
+                let entry = json!({"entity_id": id, "group": group, "withheld": "row"});
+                match payload
+                    .get_mut("withheld_rows")
+                    .and_then(Value::as_array_mut)
+                {
+                    Some(existing) => existing.push(entry),
+                    None => payload["withheld_rows"] = json!([entry]),
+                }
+            }
+        }
         record_elision_for(payload, key, kept, 1, reason);
         let count = payload
             .get(format!("{key}_withheld"))
@@ -1437,9 +2328,295 @@ fn trim_context_output_inner(payload: &mut Value, reason: &str) -> bool {
         payload["projection_measurement_scope"] = json!("focal and neighborhood contributions describe admission before final response cuts; elisions report withheld output rows");
         return true;
     }
-    // The core's whole bodies go only after its optional neighborhood. Identity
-    // and route rows remain, and an impossible metadata floor still refuses.
-    trim_context_bodies(payload, reason, false)
+    // A route whose material another route already put in the pack restates
+    // a path the reply shows; it goes, from the last, before any focal's body.
+    if trim_restated_route(payload, reason) {
+        return true;
+    }
+    // A container's member list goes before any focal's body: each member is
+    // one read by id away, and a method body is the answer itself.
+    if trim_shape_members(payload, reason) {
+        return true;
+    }
+    // Under the token budget, a lower-ranked focal that has already lost its
+    // body goes before a higher-ranked one loses its own: the bodies are the
+    // answer, and a focal's signature is one read by id away.
+    if reason == ELISION_REASON_TOKEN_BUDGET && drop_bodiless_focal(payload, reason) {
+        return true;
+    }
+    // The core's whole bodies go only after its optional neighborhood, one at
+    // a time and lowest-ranked first, so the focals a question ranked highest
+    // keep theirs longest. Identity and route rows remain.
+    trim_one_core_body(payload, reason)
+}
+
+/// Drop the lowest-ranked focal row whose body this reply already withheld,
+/// never the highest-ranked focal, and name it by id as a withheld focal.
+fn drop_bodiless_focal(payload: &mut Value, reason: &str) -> bool {
+    let is_focal = |row: &Value| row.get("section").and_then(Value::as_str) == Some("focal");
+    let lost_body = |row: &Value| {
+        row.get(BODY_ELIDED_KEY)
+            .and_then(Value::as_array)
+            .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("body")))
+    };
+    let Some(rows) = payload.get("entities").and_then(Value::as_array) else {
+        return false;
+    };
+    let top = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| is_focal(row))
+        .max_by(|(left_index, left), (right_index, right)| {
+            core_body_rank(payload, left)
+                .total_cmp(&core_body_rank(payload, right))
+                .then(right_index.cmp(left_index))
+        })
+        .map(|(index, _)| index);
+    let target = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| Some(*index) != top && is_focal(row) && lost_body(row))
+        .min_by(|(left_index, left), (right_index, right)| {
+            core_body_rank(payload, left)
+                .total_cmp(&core_body_rank(payload, right))
+                .then(right_index.cmp(left_index))
+        })
+        .map(|(index, _)| index);
+    let Some(index) = target else {
+        return false;
+    };
+    let removed = payload["entities"]
+        .as_array_mut()
+        .expect("entities checked above")
+        .remove(index);
+    let id = removed.get("id").cloned().unwrap_or(Value::Null);
+    if let Some(focal) = payload
+        .get_mut("focals")
+        .and_then(Value::as_array_mut)
+        .and_then(|focals| {
+            focals
+                .iter_mut()
+                .find(|focal| focal.get("entity_id") == Some(&id))
+        })
+    {
+        focal["projection"] = json!("elided");
+    }
+    let entry = json!({"entity_id": id, "group": "focal", "withheld": "row"});
+    match payload
+        .get_mut("withheld_rows")
+        .and_then(Value::as_array_mut)
+    {
+        Some(existing) => existing.push(entry),
+        None => payload["withheld_rows"] = json!([entry]),
+    }
+    let kept = payload["entities"]
+        .as_array()
+        .map_or(0, |rows| rows.iter().filter(|row| is_focal(row)).count());
+    record_elision_for(payload, kin_context::FOCAL_GROUP, kept, 1, reason);
+    true
+}
+
+/// Drop the last route that admitted no material of its own, when the pack
+/// carries more than one route. Its entities are in the pack through another
+/// route or named as withheld, and `route_search` still counts the pair.
+fn trim_restated_route(payload: &mut Value, reason: &str) -> bool {
+    let Some(routes) = payload.get_mut("routes").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if routes.len() <= 1 {
+        return false;
+    }
+    let Some(index) = routes.iter().rposition(|route| {
+        route
+            .get("via")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    }) else {
+        return false;
+    };
+    routes.remove(index);
+    let kept = routes.len();
+    record_elision_for(payload, "routes", kept, 1, reason);
+    true
+}
+
+/// Withhold a single-focal pack's focal body.
+fn trim_focal_entity_body(payload: &mut Value, reason: &str) -> bool {
+    let Some(map) = payload
+        .get_mut("focal_entity")
+        .and_then(Value::as_object_mut)
+        .filter(|map| map.get("body").is_some_and(Value::is_string))
+    else {
+        return false;
+    };
+    map.insert("body".to_string(), Value::Null);
+    if map.get("projection").and_then(Value::as_str) == Some("FullBody") {
+        map.insert("projection".into(), json!("SignatureOnly"));
+        map.insert("projection_downgraded_from".into(), json!("FullBody"));
+    }
+    map.insert("body_complete".into(), json!(false));
+    map.insert(BODY_ELIDED_KEY.to_string(), json!(["body"]));
+    let shape = shape_for("get_context_pack").expect("context shape");
+    let kept = rows_carrying(payload, &shape, shape.body_keys);
+    record_elision_for(payload, "body", kept, 1, reason);
+    true
+}
+
+/// How strongly a pack wants to keep one core row's body: a route row's body
+/// least, then each focal by its resolution, with a focal the caller named or
+/// addressed by id above every focal a ranking picked.
+fn core_body_rank(payload: &Value, row: &Value) -> f64 {
+    if row.get("section").and_then(Value::as_str) == Some("route") {
+        return f64::NEG_INFINITY;
+    }
+    let id = row.get("id").and_then(Value::as_str);
+    let resolution = payload
+        .get("focals")
+        .and_then(Value::as_array)
+        .and_then(|focals| {
+            focals
+                .iter()
+                .find(|focal| focal.get("entity_id").and_then(Value::as_str) == id)
+        })
+        .and_then(|focal| focal.get("resolution"));
+    match resolution
+        .and_then(|resolution| resolution.get("route"))
+        .and_then(Value::as_str)
+    {
+        Some("question") => resolution
+            .and_then(|resolution| resolution.get("score"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        _ => f64::INFINITY,
+    }
+}
+
+/// Withhold the body of the one core row the pack least wants to keep, and
+/// say so the way every other body cut does.
+///
+/// The highest-ranked focal's body is never withheld for the token budget while
+/// the answer is inside that budget. It is the answer, the pack's builder
+/// already held it to the token budget, and a reply that sheds it to make room
+/// for the metadata describing it is the reply the 0.8.3 pilot measured: every
+/// body withheld and the bytes spent on readings. The byte ceiling is the
+/// client's own limit and can still take it.
+fn trim_one_core_body(payload: &mut Value, reason: &str) -> bool {
+    let carries = |row: &Value| row.get("body").is_some_and(Value::is_string);
+    let carried = payload
+        .get("entities")
+        .and_then(Value::as_array)
+        .map_or(0, |rows| rows.iter().filter(|row| carries(row)).count());
+    let within_answer_budget = payload
+        .get("token_budget")
+        .and_then(Value::as_u64)
+        .is_some_and(|limit| context_answer_tokens(payload) as u64 <= limit);
+    // The byte ceiling is the client's and is never overrun for a body; the
+    // token budget never takes the last body the answer can hold.
+    if carried <= 1 && within_answer_budget && reason == ELISION_REASON_TOKEN_BUDGET {
+        return false;
+    }
+    if carried == 0 {
+        // A single-focal pack whose one body is over its own token budget:
+        // the answer cannot fit, so the body goes, as the builder would have
+        // served it had it measured the same.
+        return trim_focal_entity_body(payload, reason);
+    }
+    let target = payload
+        .get("entities")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| carries(row))
+                // Later rows go first among equals, which keeps the
+                // pack's own order as the tie-break.
+                .min_by(|(left_index, left), (right_index, right)| {
+                    core_body_rank(payload, left)
+                        .total_cmp(&core_body_rank(payload, right))
+                        .then(right_index.cmp(left_index))
+                })
+                .map(|(index, _)| index)
+        });
+    let row = match target {
+        Some(index) => &mut payload["entities"][index],
+        None => return false,
+    };
+    let Some(map) = row.as_object_mut() else {
+        return false;
+    };
+    map.insert("body".to_string(), Value::Null);
+    if map.get("projection").and_then(Value::as_str) == Some("FullBody") {
+        map.insert("projection".into(), json!("SignatureOnly"));
+        map.insert("projection_downgraded_from".into(), json!("FullBody"));
+    }
+    map.insert("body_complete".into(), json!(false));
+    map.insert(BODY_ELIDED_KEY.to_string(), json!(["body"]));
+    let id = map.get("id").cloned();
+    if let Some(focal) = payload
+        .get_mut("focals")
+        .and_then(Value::as_array_mut)
+        .and_then(|focals| {
+            focals
+                .iter_mut()
+                .find(|focal| focal.get("entity_id") == id.as_ref())
+        })
+    {
+        if focal.get("projection").and_then(Value::as_str) == Some("full_body") {
+            focal["projection"] = json!("header_and_signature");
+        }
+    }
+    let shape = shape_for("get_context_pack").expect("context shape");
+    let kept = rows_carrying(payload, &shape, shape.body_keys)
+        + usize::from(payload.get("focal_entity").is_some_and(carries));
+    record_elision_for(payload, "body", kept, 1, reason);
+    true
+}
+
+/// Cut the largest member list a container shape carries down to its count.
+/// The header stays, and the shape says how many members it no longer lists.
+fn trim_shape_members(payload: &mut Value, reason: &str) -> bool {
+    let mut largest: Option<(usize, &'static str, Option<usize>)> = None;
+    let mut consider = |bytes: usize, key: &'static str, index: Option<usize>| {
+        if bytes > largest.map_or(0, |(size, _, _)| size) {
+            largest = Some((bytes, key, index));
+        }
+    };
+    if let Some(members) = payload
+        .pointer("/focal_entity/members")
+        .and_then(Value::as_array)
+        .filter(|members| !members.is_empty())
+    {
+        consider(
+            measure(&Value::Array(members.clone())),
+            "focal_entity",
+            None,
+        );
+    }
+    for key in CONTEXT_ANSWER_COLLECTIONS {
+        if let Some(rows) = payload.get(key).and_then(Value::as_array) {
+            for (index, row) in rows.iter().enumerate() {
+                if let Some(members) = row
+                    .get("members")
+                    .and_then(Value::as_array)
+                    .filter(|members| !members.is_empty())
+                {
+                    consider(measure(&Value::Array(members.clone())), key, Some(index));
+                }
+            }
+        }
+    }
+    let Some((_, key, index)) = largest else {
+        return false;
+    };
+    let row = match index {
+        Some(index) => &mut payload[key][index],
+        None => &mut payload[key],
+    };
+    let count = row["members"].as_array().map_or(0, Vec::len);
+    row["members"] = json!([]);
+    row["members_withheld"] = json!(count);
+    record_elision_for(payload, "members", 0, count, reason);
+    true
 }
 
 /// The name the focal's call-site rows are cut under, in `elisions`.
@@ -1951,6 +3128,7 @@ fn run_ladder(
     if matches!(tool, "get_context_pack" | "trace_computation")
         && payload.get("token_budget").is_some()
     {
+        summarize_context_withheld(payload);
         while measure(payload) > budget.max_chars
             && trim_context_output_once(payload, ELISION_REASON_BUDGET)
         {
@@ -2092,6 +3270,10 @@ fn run_ladder(
     let mut withheld_any = false;
     let mut primary_withheld = 0usize;
     let mut cursor_rebased = false;
+    // What the payload measured the last time anything in it changed. Each cut
+    // below starts from it rather than rendering the same payload again, and it
+    // is measured afresh after every change.
+    let mut size_now = answer_floor;
     for key in shape.collections.iter().rev() {
         // The reserve estimates disclosure size. Once every lower-priority
         // reference sample is at its floor, measure the actual disclosure
@@ -2150,7 +3332,7 @@ fn run_ladder(
         let mut withheld = 0usize;
         let mut cut_shape = CutShape::Suffix;
         loop {
-            let (more, shape_now) = trim_collection(payload, key, target, min_keep);
+            let (more, shape_now) = trim_collection(payload, key, target, min_keep, size_now);
             if more == 0 {
                 break;
             }
@@ -2165,7 +3347,8 @@ fn run_ladder(
                 // that describe its spine may not.
                 restate_trace_spine(payload, &walk_clips);
             }
-            if measure(payload) <= target {
+            size_now = measure(payload);
+            if size_now <= target {
                 break;
             }
         }
@@ -2188,8 +3371,10 @@ fn run_ladder(
                 cursor_rebased =
                     repage_primary_after_cut(payload, tool, locate_cursor.as_mut(), withheld, kept);
             }
+            size_now = measure(payload);
         }
-        if measure(payload) <= target {
+        // A list that gave up nothing left the payload as it was measured.
+        if carried_size(payload, size_now) <= target {
             break;
         }
     }
@@ -2298,6 +3483,41 @@ pub(crate) fn point_restated_limiting_factor(
     pointed
 }
 
+/// Point `negative.advice`'s restated limiting factor at `negative.trust_reason`
+/// whatever the reply's size, for a reply whose documented shape is compact.
+///
+/// The same lossless rewrite [`point_restated_limiting_factor`] makes under
+/// pressure. It is the reply's shape rather than a cut, so it is not disclosed
+/// as one.
+pub(crate) fn point_negative_advice(payload: &mut Value) {
+    let Some(canonical) = payload
+        .pointer("/negative/trust_reason")
+        .and_then(Value::as_str)
+        .map(|text| text.trim_end_matches('.').to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let Some(text) = payload
+        .pointer("/negative/advice")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(at) = text.rfind(LIMITING_FACTOR_JOIN) else {
+        return;
+    };
+    if text[at + LIMITING_FACTOR_JOIN.len()..].trim_end_matches('.') != canonical {
+        return;
+    }
+    let punctuation = &text[text.trim_end_matches('.').len()..];
+    payload["negative"]["advice"] = Value::String(format!(
+        "{}{LIMITING_FACTOR_JOIN}see `negative.trust_reason`{punctuation}",
+        &text[..at]
+    ));
+}
+
 /// Replace a verbatim restatement of the limiting factor with a pointer to it,
 /// in the fields that carry one, only on a response over its ceiling.
 ///
@@ -2363,6 +3583,48 @@ fn shed_restated_limiting_factor(payload: &mut Value, budget: &ResponseBudget) -
             pointed += 1;
         }
     }
+    if measure(payload) > budget.max_chars {
+        if payload
+            .pointer("/negative/coverage_basis")
+            .and_then(Value::as_str)
+            == Some("graph_structure")
+            && payload.get("edge_coverage").is_some_and(Value::is_object)
+        {
+            // Match the producer's exact prose, so custom advice keeps every
+            // word of its own. The complete observation remains in the reply.
+            let coverage = crate::negative::structural_coverage_clause(
+                payload,
+                &crate::envelope::Envelope::daemon(),
+            );
+            let restated = format!(" with {coverage} and ");
+            if let Some(advice) = payload.pointer("/negative/advice").and_then(Value::as_str) {
+                let shortened =
+                    advice.replacen(&restated, " with coverage (see `edge_coverage`) and ", 1);
+                if shortened.len() < advice.len() {
+                    payload["negative"]["advice"] = Value::String(shortened);
+                    pointed += 1;
+                }
+            }
+        }
+        if let (Some(subject), Some(advice)) = (
+            payload.pointer("/negative/subject").and_then(Value::as_str),
+            payload.pointer("/negative/advice").and_then(Value::as_str),
+        ) {
+            // The exact leading subject is already recorded next to this
+            // advice. Preserve its unique tail and point to the subject before
+            // withholding answer rows to pay for a verbatim repetition.
+            if let Some(tail) = advice
+                .strip_prefix(subject)
+                .filter(|tail| !subject.is_empty() && tail.starts_with(", against"))
+            {
+                let shortened = format!("see `negative.subject`{tail}");
+                if shortened.len() < advice.len() {
+                    payload["negative"]["advice"] = Value::String(shortened);
+                    pointed += 1;
+                }
+            }
+        }
+    }
     pointed
 }
 
@@ -2375,6 +3637,8 @@ fn shed_restated_limiting_factor(payload: &mut Value, budget: &ResponseBudget) -
 fn disclose_restatements_pointed(payload: &mut Value) {
     let mut owners = Vec::new();
     for (pointer, owner) in [
+        ("/negative/advice", "edge_coverage"),
+        ("/negative/advice", "negative.subject"),
         ("/_kin/verdict/note", "_kin.verdict.limiting_factor"),
         ("/negative/advice", "negative.trust_reason"),
         ("/_kin/completeness/note", "_kin.verdict.limiting_factor"),
@@ -2900,11 +4164,20 @@ fn collection_floor(payload: &Value, key: &str) -> usize {
 /// Returns the count withheld and whether it was narrowed, so the caller can say
 /// which cut a reader received rather than reporting every cut as an end-of-list
 /// one.
+///
+/// `rendered` is what the payload measures as it stands, which the caller has
+/// always just measured. The cut point is found from each entry's serialized
+/// size, taken once, rather than by rendering the whole payload at every probe
+/// (see [`RowSizes`]), and the cut it finds is rendered once to prove it. A
+/// render that disagrees with the arithmetic sends the cut back through
+/// [`trim_collection_by_render`], so the result never rests on the arithmetic
+/// alone.
 fn trim_collection(
     payload: &mut Value,
     key: &str,
     target: usize,
     min_keep: usize,
+    rendered: usize,
 ) -> (usize, CutShape) {
     let Some(full) = collection_of(payload, key)
         .and_then(Value::as_array)
@@ -2912,11 +4185,31 @@ fn trim_collection(
     else {
         return (0, CutShape::Suffix);
     };
-    if full.len() <= min_keep || measure(payload) <= target {
+    if full.len() <= min_keep || carried_size(payload, rendered) <= target {
         return (0, CutShape::Suffix);
     }
-    if let Some((withheld, held)) = trim_parented_collection(payload, key, target, min_keep, &full)
-    {
+    if let Some(cut) = trim_collection_metered(payload, key, target, min_keep, &full, rendered) {
+        return cut;
+    }
+    trim_collection_by_render(payload, key, target, min_keep, &full)
+}
+
+/// The cut [`trim_collection`] makes, found by installing each candidate and
+/// rendering the whole payload, which is how every cut was found before entries
+/// were metered.
+///
+/// Kept whole for two readers. [`trim_collection`] falls back to it when a
+/// metered cut disagrees with its render, and the equivalence tests hold the
+/// metered cut to it. It installs a candidate before every measure, so whatever
+/// candidate a failed metered attempt left in place is never what it measures.
+fn trim_collection_by_render(
+    payload: &mut Value,
+    key: &str,
+    target: usize,
+    min_keep: usize,
+    full: &[Value],
+) -> (usize, CutShape) {
+    if let Some((withheld, held)) = trim_parented_collection(payload, key, target, min_keep, full) {
         return (
             withheld,
             if held {
@@ -2947,6 +4240,240 @@ fn trim_collection(
         record_withheld(payload, key, withheld);
     }
     (withheld, CutShape::Suffix)
+}
+
+/// What each entry of one collection adds to the rendered payload, taken once so
+/// a cut point is found by arithmetic instead of by rendering the whole payload
+/// again at every probe.
+///
+/// Exact, not estimated. A compact entry renders inside its array byte for byte
+/// as it renders alone, so its share is its own length and one comma. A pretty
+/// entry also carries the array's indentation, once before its first line and
+/// once more on every line after, and that indentation depends only on how deep
+/// the array sits. The brackets cost the same around any non-empty run of
+/// entries. So the payload holding any subset of the entries, in their order,
+/// renders to the payload without the array plus a sum over the entries kept.
+struct RowSizes {
+    /// Bytes each entry adds to its array, its separator included.
+    rows: Vec<usize>,
+    /// Bytes a non-empty array adds beyond what its entries count.
+    frame: usize,
+    /// Bytes the payload renders to without the array's own bytes.
+    rest: usize,
+}
+
+impl RowSizes {
+    /// Sizes for `full`, the entries of the collection at `key`, while the
+    /// payload holds every one of them and renders to `rendered` bytes.
+    ///
+    /// `None` when an entry does not serialize or the entries outweigh the
+    /// payload holding them. Either means the arithmetic cannot be trusted, and
+    /// the caller cuts by rendering instead.
+    fn of(payload: &Value, key: &str, full: &[Value], rendered: usize) -> Option<Self> {
+        let pretty = !renders_compact(payload);
+        // Levels of indentation an entry starts at: the payload object, the
+        // array, and the block a nested list sits inside. The pretty formatter
+        // writes two spaces per level.
+        let depth = 2 + usize::from(split_collection(key).0.is_some());
+        let indent = 2 * depth;
+        let mut rows = Vec::with_capacity(full.len());
+        for entry in full {
+            let (bytes, newlines) = serialized_size(entry, pretty)?;
+            rows.push(if pretty {
+                // Its comma and newline, its first line's indentation, the
+                // entry, and the same indentation on each further line.
+                2 + indent + bytes + indent * newlines
+            } else {
+                bytes + 1
+            });
+        }
+        let mut sizes = Self {
+            rows,
+            frame: if pretty { indent } else { 1 },
+            rest: 0,
+        };
+        sizes.rest = rendered.checked_sub(sizes.array_len(0..full.len()))?;
+        Some(sizes)
+    }
+
+    /// Bytes the array renders to holding the entries at `kept`.
+    fn array_len(&self, kept: impl IntoIterator<Item = usize>) -> usize {
+        let mut kept = kept.into_iter().peekable();
+        if kept.peek().is_none() {
+            // `[]`, in either layout.
+            return 2;
+        }
+        kept.map(|index| self.rows[index]).sum::<usize>() + self.frame
+    }
+
+    /// Bytes the payload renders to holding the entries at `kept`.
+    fn payload_len(&self, kept: impl IntoIterator<Item = usize>) -> usize {
+        self.rest + self.array_len(kept)
+    }
+}
+
+/// The cut [`trim_collection_by_render`] makes, chosen from [`RowSizes`] and
+/// proved by one render of the payload it leaves.
+///
+/// Every decision is the one the render path makes, taken in the same order
+/// against sizes that are exact: the same branch narrowing over the same drop
+/// order, then the same bisection over the same suffixes. Only the chosen cut is
+/// rendered, and it has to measure exactly what the arithmetic said it would.
+/// Every entry the cut withheld is in that comparison, so a sizing rule that is
+/// wrong for entries at all shows up there, and
+/// `row_sizes_predict_every_subset_the_payload_can_hold` holds the rule to the
+/// render for any subset.
+///
+/// `None` when the sizes cannot be taken or the render disagrees, and in the
+/// equivalence tests' render-every-probe mode. Nothing has been recorded then,
+/// and the array may hold a candidate the fallback replaces before it measures.
+fn trim_collection_metered(
+    payload: &mut Value,
+    key: &str,
+    target: usize,
+    min_keep: usize,
+    full: &[Value],
+    rendered: usize,
+) -> Option<(usize, CutShape)> {
+    if rendering_every_probe() {
+        return None;
+    }
+    let sizes = RowSizes::of(payload, key, full, rendered)?;
+    let (kept, shape) = match narrow_parented_metered(payload, target, full, &sizes) {
+        Some((kept, held)) if kept.len() >= min_keep => (
+            kept,
+            if held {
+                CutShape::BranchesKeepingTarget
+            } else {
+                CutShape::Branches
+            },
+        ),
+        _ => {
+            let fits = |count: usize| sizes.payload_len(0..count) <= target;
+            // The render path's bisection, step for step.
+            let mut kept = min_keep;
+            let mut low = min_keep;
+            let mut high = full.len();
+            while low <= high {
+                let mid = (low + high) / 2;
+                if fits(mid) {
+                    kept = mid;
+                    low = mid + 1;
+                } else if mid == min_keep {
+                    break;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            ((0..kept).collect(), CutShape::Suffix)
+        }
+    };
+    let predicted = sizes.payload_len(kept.iter().copied());
+    let rows: Vec<Value> = kept.iter().map(|index| full[*index].clone()).collect();
+    set_collection(payload, key, Value::Array(rows));
+    if measure(payload) != predicted {
+        return None;
+    }
+    let withheld = full.len() - kept.len();
+    if withheld > 0 {
+        record_withheld(payload, key, withheld);
+    }
+    Some((withheld, shape))
+}
+
+/// [`trim_parented_collection`]'s narrowing, run over entry positions and sized
+/// by [`RowSizes`] rather than by installing and rendering each candidate.
+///
+/// Returns the positions kept, in order, and whether the named target is still
+/// among them. `None` exactly where the render path's narrowing gives `None`:
+/// the collection is not parented, or no amount of narrowing fits. The
+/// `min_keep` floor is the caller's to apply, as the render path applies it
+/// after narrowing.
+fn narrow_parented_metered(
+    payload: &Value,
+    target: usize,
+    full: &[Value],
+    sizes: &RowSizes,
+) -> Option<(Vec<usize>, bool)> {
+    let parented = full.iter().all(|entry| {
+        entry.get("step").and_then(Value::as_u64).is_some()
+            && entry.get("parent_step").and_then(Value::as_u64).is_some()
+    });
+    if !parented {
+        return None;
+    }
+    let named = payload.get("target_name").and_then(Value::as_str);
+    let names = |entry: &Value| {
+        named.is_some_and(|name| entry.get("entity_name").and_then(Value::as_str) == Some(name))
+    };
+    let reached = full.iter().any(|entry| names(entry));
+    let positions: Vec<usize> = (0..full.len()).collect();
+    let kept = narrow_fanout_to_fit(
+        &positions,
+        &|at: &usize| full[*at]["step"].as_u64().unwrap_or(0),
+        &|at: &usize| full[*at]["parent_step"].as_u64(),
+        &|at: &usize| names(&full[*at]),
+        &mut |candidate: &[usize]| sizes.payload_len(candidate.iter().copied()) <= target,
+    )?;
+    let held = reached && kept.iter().any(|at| names(&full[*at]));
+    Some((kept, held))
+}
+
+/// Whether this thread measures and cuts the way the budget did before entries
+/// were metered: every size rendered, and every probe of a cut rendered. Only the
+/// equivalence tests turn it on.
+#[cfg(test)]
+fn rendering_every_probe() -> bool {
+    test_support::rendering_every_probe()
+}
+
+/// Never outside the equivalence tests.
+#[cfg(not(test))]
+fn rendering_every_probe() -> bool {
+    false
+}
+
+/// A size carried forward from the last measure of a payload nothing has changed
+/// since. Rendering it again would read the same number, which the equivalence
+/// tests do, and they require the two to agree.
+fn carried_size(payload: &Value, carried: usize) -> usize {
+    if rendering_every_probe() {
+        assert_eq!(
+            measure(payload),
+            carried,
+            "a carried size no longer describes the payload it was carried for"
+        );
+    }
+    carried
+}
+
+/// Lets the equivalence tests run the budget the way it ran before entries were
+/// metered. Thread-local, so it holds for the test that set it whether the suite
+/// runs threaded or one process per test.
+#[cfg(test)]
+mod test_support {
+    thread_local! {
+        static RENDER_EVERY_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn rendering_every_probe() -> bool {
+        RENDER_EVERY_PROBE.with(std::cell::Cell::get)
+    }
+
+    /// Restores the previous mode on drop, including on unwind.
+    pub(super) struct RenderEveryProbeGuard(bool);
+
+    impl Drop for RenderEveryProbeGuard {
+        fn drop(&mut self) {
+            RENDER_EVERY_PROBE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    /// Render every size and every probe of a cut for the rest of this scope.
+    #[must_use = "binding the guard is what keeps the mode in force"]
+    pub(super) fn scoped_render_every_probe() -> RenderEveryProbeGuard {
+        RenderEveryProbeGuard(RENDER_EVERY_PROBE.with(|slot| slot.replace(true)))
+    }
 }
 
 /// Add to the `<collection>_withheld` scalar beside one cut list.
@@ -3111,15 +4638,15 @@ pub(crate) fn record_trace_unproven_steps(payload: &mut Value) {
     }
 }
 
-/// Present, and `true`, when a trace reply's `spine_dropped_crossing_file` counts
+/// Present, and `true`, when a trace reply's `spine_dropped_crossing_unit` counts
 /// only some of its spine nodes, because the clip records of the others never
 /// reached the pass that restated it. The count is then a floor.
-pub(crate) const CROSSING_FLOOR_KEY: &str = "spine_dropped_crossing_file_is_floor";
+pub(crate) const CROSSING_FLOOR_KEY: &str = "spine_dropped_crossing_unit_is_floor";
 
 /// Restate what a `trace_data_flow` reply says about the clipped nodes its
 /// chain continues beneath, from the chain it now ships.
 ///
-/// The walk writes `spine_clipped_steps`, `spine_dropped_crossing_file`, each
+/// The walk writes `spine_clipped_steps`, `spine_dropped_crossing_unit`, each
 /// clip record's `continued_below`, the `fanout_cap` / `spine_clipped`
 /// degradation and, through the negative, the `trace_spine_clipped` clause,
 /// all for the chain it handed over. A cut made here used to leave every one
@@ -3133,11 +4660,11 @@ pub(crate) const CROSSING_FLOOR_KEY: &str = "spine_dropped_crossing_file_is_floo
 /// own cut. `walk_clips` are the clip records the walk handed this pass, in the
 /// order it wrote them, so each node is read from its own record even when this
 /// pass withholds that record: what the node dropped, and how many of those
-/// lived outside its file. A clipped chain step with no record at all is read
+/// lived outside its source unit. A clipped chain step with no record at all is read
 /// from the step, whose `fanout_truncated` and `fanout_dropped` say the cap cut
 /// it, and its crossing count is then unknown. From those nodes the spine count
 /// is restated, each shipped clip record's `continued_below` says whether a
-/// shipped step sits beneath it, and `spine_dropped_crossing_file` sums the
+/// shipped step sits beneath it, and `spine_dropped_crossing_unit` sums the
 /// nodes' module-crossing drops, marked a floor under [`CROSSING_FLOOR_KEY`]
 /// when a node's is unknown. The disclosure is rebuilt by the producer both
 /// walks use and states its crossing count only when every node's is known.
@@ -3202,7 +4729,7 @@ fn restate_trace_spine(payload: &mut Value, walk_clips: &[Value]) {
             entity_id: text(record, "entity_id"),
             entity_name: text(record, "entity_name"),
             dropped: count(record, "dropped_callees") + count(record, "dropped_callers"),
-            dropped_crossing_file: Some(count(record, "dropped_crossing_file")),
+            dropped_crossing_unit: Some(count(record, "dropped_crossing_unit")),
             limit_per_step: record
                 .get("limit_per_step")
                 .and_then(Value::as_u64)
@@ -3223,7 +4750,7 @@ fn restate_trace_spine(payload: &mut Value, walk_clips: &[Value]) {
             entity_id: text(step, "entity_id"),
             entity_name: text(step, "entity_name"),
             dropped: count(step, "fanout_dropped"),
-            dropped_crossing_file: None,
+            dropped_crossing_unit: None,
             limit_per_step: walk_limit,
         });
     }
@@ -3241,16 +4768,16 @@ fn restate_trace_spine(payload: &mut Value, walk_clips: &[Value]) {
     }
     let crossing: usize = nodes
         .iter()
-        .filter_map(|node| node.dropped_crossing_file)
+        .filter_map(|node| node.dropped_crossing_unit)
         .sum();
     // Stated in words only when it covers every node the spine count covers.
     let crossing_exact: Option<u64> = nodes
         .iter()
-        .map(|node| node.dropped_crossing_file.map(|crossing| crossing as u64))
+        .map(|node| node.dropped_crossing_unit.map(|crossing| crossing as u64))
         .sum();
     for (key, value) in [
         ("spine_clipped_steps", nodes.len()),
-        ("spine_dropped_crossing_file", crossing),
+        ("spine_dropped_crossing_unit", crossing),
     ] {
         if value > 0 {
             payload[key] = json!(value);
@@ -4075,9 +5602,10 @@ mod tests {
             })
             .collect();
         let mut payload = json!({"chain": entries});
-        let target = measure(&payload) / 2;
+        let rendered = measure(&payload);
+        let target = rendered / 2;
 
-        let (withheld, shape) = trim_collection(&mut payload, "chain", target, 1);
+        let (withheld, shape) = trim_collection(&mut payload, "chain", target, 1, rendered);
 
         assert_eq!(
             shape,
@@ -4108,9 +5636,10 @@ mod tests {
             .map(|index| json!({"name": format!("hit_{index}"), "pad": "p".repeat(400)}))
             .collect();
         let mut payload = json!({"entities": entries});
-        let target = measure(&payload) / 2;
+        let rendered = measure(&payload);
+        let target = rendered / 2;
 
-        let (withheld, shape) = trim_collection(&mut payload, "entities", target, 1);
+        let (withheld, shape) = trim_collection(&mut payload, "entities", target, 1, rendered);
 
         assert!(withheld > 0, "the fixture must reach the cut");
         assert_eq!(
@@ -4205,6 +5734,60 @@ mod tests {
         for file in payload["files"].as_array().unwrap() {
             assert!(file.get("explain").is_none());
         }
+    }
+
+    #[test]
+    fn repeated_negative_observations_yield_before_known_reference_rows() {
+        let subject = "The observed reference answer ".repeat(60);
+        let reason = "reference_completion_unmeasured: non-call completion is unmeasured";
+        let mut payload = json!({
+            "references": [{"name":"first"}, {"name":"second"}],
+            "total_upstream": 2,
+            "edge_coverage": {"language":"Python", "classes":{"calls":"present",
+                "references":"present"}, "reference_enrichment":"available"},
+            "negative": {"subject":subject, "trust_reason":reason,
+                "coverage_basis":"graph_structure", "result_count":2},
+        });
+        let coverage = crate::negative::structural_coverage_clause(
+            &payload,
+            &crate::envelope::Envelope::daemon(),
+        );
+        payload["negative"]["advice"] = json!(format!(
+            "{subject}, against graph generation 12 with {coverage} and no degraded signals. \
+             Preserve this unique instruction. Limiting factor: {reason}"
+        ));
+        let rows = payload["references"].clone();
+        let observation = payload["edge_coverage"].clone();
+        let budget = ResponseBudget {
+            max_chars: 2_800,
+            ..ResponseBudget::default()
+        };
+        assert!(measure(&payload) > budget.max_chars);
+        enforce(&mut payload, "find_references", &budget).unwrap();
+        assert!(measure(&payload) <= budget.max_chars, "{payload}");
+        assert_eq!(payload["references"], rows);
+        assert!(payload.get("references_withheld").is_none(), "{payload}");
+        assert_eq!(payload["edge_coverage"], observation);
+        assert_eq!(payload["negative"]["subject"], subject);
+        assert_eq!(payload["negative"]["trust_reason"], reason);
+        let advice = payload["negative"]["advice"].as_str().unwrap();
+        assert!(advice.contains("see `negative.subject`"), "{advice}");
+        assert!(advice.contains("see `edge_coverage`"), "{advice}");
+        assert!(
+            advice.contains("Preserve this unique instruction."),
+            "{advice}"
+        );
+
+        // Advice with its own subject and coverage wording is not a verbatim
+        // restatement. No pressure permits replacing those unique facts.
+        let unique = "A different subject, against different coverage. Preserve it.";
+        payload["negative"]["advice"] = json!(unique);
+        let tiny = ResponseBudget {
+            max_chars: 100,
+            ..budget
+        };
+        point_restated_limiting_factor(&mut payload, &tiny);
+        assert_eq!(payload["negative"]["advice"], unique);
     }
 
     #[test]
@@ -4333,7 +5916,7 @@ mod tests {
                         "step": index,
                         "limit_per_step": 12,
                         "dropped_callees": 7,
-                        "dropped_crossing_file": 3,
+                        "dropped_crossing_unit": 3,
                         "note": "n".repeat(300),
                     })
                 })
@@ -6053,7 +7636,7 @@ mod tests {
                 json!({
                     "step": step, "entity_id": format!("id-{step}"), "entity_name": name,
                     "dropped_callees": dropped, "dropped_callers": 0,
-                    "dropped_crossing_file": crossing, "continued_below": true,
+                    "dropped_crossing_unit": crossing, "continued_below": true,
                     "limit_per_step": 3,
                 })
             })
@@ -6257,7 +7840,7 @@ mod tests {
 
         assert_eq!(payload["spine_clipped_steps"], json!(2), "{payload}");
         assert_eq!(
-            payload["spine_dropped_crossing_file"],
+            payload["spine_dropped_crossing_unit"],
             json!(2),
             "node_1's record measured two crossing drops, and node_1 still ships: {payload}"
         );
@@ -6273,14 +7856,14 @@ mod tests {
             detail.starts_with(
                 "the walk continued beneath 2 node(s) whose fan-out limit_per_step 3 had already \
                  cut, dropping 5 neighbor(s) that were never followed, 2 of which lived outside \
-                 the file of the node that offered them; the widest was 'node_1'"
+                 the module of the node that offered them; the widest was 'node_1'"
             ),
             "{detail}"
         );
         let reason = payload["negative"]["trust_reason"].as_str().unwrap();
         assert!(reason.contains("beneath 2 nodes whose"), "{reason}");
         assert!(
-            reason.contains(", 2 of the dropped neighbours lived outside the file"),
+            reason.contains(", 2 of the dropped neighbours lived outside the module"),
             "{reason}"
         );
     }
@@ -6300,7 +7883,7 @@ mod tests {
 
         assert_eq!(payload["spine_clipped_steps"], json!(2), "{payload}");
         assert_eq!(
-            payload["spine_dropped_crossing_file"],
+            payload["spine_dropped_crossing_unit"],
             json!(1),
             "{payload}"
         );
@@ -6577,7 +8160,9 @@ mod tests {
                 assert_eq!(served["tokens_used"], kin_context::estimate_tokens(&text));
                 assert_eq!(text.contains('\n'), !compact);
                 assert!(served.get(JSON_FORMAT_KEY).is_none());
-                served.as_object_mut().unwrap().remove("tokens_used");
+                let served_object = served.as_object_mut().unwrap();
+                served_object.remove("tokens_used");
+                served_object.remove(CONTEXT_ANSWER_TOKENS_KEY);
                 assert_eq!(served, original, "{tool}, compact={compact}");
             }
         }
@@ -6717,8 +8302,14 @@ mod tests {
         assert_ne!(result.is_error, Some(true), "{result:?}");
         let crate::types::ContentBlock::Text { text } = &result.content[0];
         let served: Value = serde_json::from_str(text).unwrap();
-        assert!(kin_context::estimate_tokens(text) <= 2500);
-        assert!(text.len() <= 9000);
+        let tokens = kin_context::estimate_tokens(text);
+        assert!(
+            tokens <= 2500,
+            "{tokens} tokens in {} bytes, elisions {}",
+            text.len(),
+            served.get("elisions").unwrap_or(&serde_json::Value::Null)
+        );
+        assert!(text.len() <= 9000, "{} bytes", text.len());
         assert_eq!(served["tokens_used"], kin_context::estimate_tokens(text));
         assert_eq!(served["routes"], payload["routes"]);
         assert_eq!(served["focals"], payload["focals"]);
@@ -7586,8 +9177,10 @@ mod tests {
     #[test]
     fn bookkeeping_for_a_cut_list_never_costs_a_row_of_the_answer() {
         let mut violations = Vec::new();
+        // Built once: every budget in the sweep cuts its own copy of one reply.
+        let reply = references_payload(3, 100, 116);
         for max_chars in (RESPONSE_MIN_MAX_CHARS..RESPONSE_MAX_MAX_CHARS).step_by(211) {
-            let mut payload = references_payload(3, 100, 116);
+            let mut payload = reply.clone();
             let budget = ResponseBudget {
                 max_chars,
                 ..ResponseBudget::default()
@@ -7648,5 +9241,395 @@ mod tests {
             enforce(&mut payload, "find_references", &budget).expect("find_references is budgeted");
         assert_eq!(accounting.primary_collection.as_deref(), Some("references"));
         assert_eq!(accounting.primary_rows, Some(3));
+    }
+
+    // Metered cuts, held to the budget that rendered every probe.
+
+    /// Deterministic draws for the equivalence tests below, so a failure
+    /// reproduces from its seed. SplitMix64.
+    struct Draw(u64);
+
+    impl Draw {
+        fn bits(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut mixed = self.0;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            mixed ^ (mixed >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.bits() % bound.max(1) as u64) as usize
+        }
+    }
+
+    /// Text that exercises every way serde spells a string: escapes, control
+    /// characters, multi-byte characters, and raw newlines it has to escape.
+    fn drawn_text(draw: &mut Draw) -> String {
+        const PIECES: [&str; 11] = [
+            "plain",
+            "",
+            "quote \" and back\\slash",
+            "line\nbreak\ttab\r",
+            "\u{1}\u{1f}\u{7f}",
+            "史記",
+            "crab 🦀",
+            "\u{2028}\u{2029}",
+            "</script>",
+            "{\"looks\": [\"like\", \"json\"]}",
+            "x",
+        ];
+        (0..1 + draw.below(3))
+            .map(|_| PIECES[draw.below(PIECES.len())])
+            .collect()
+    }
+
+    fn drawn_number(draw: &mut Draw) -> Value {
+        match draw.below(10) {
+            0 => json!(0),
+            1 => json!(-1),
+            2 => json!(u64::MAX),
+            3 => json!(i64::MIN),
+            4 => json!(0.1),
+            5 => json!(1e300),
+            6 => json!(-2.5e-8),
+            7 => json!(1.0),
+            8 => json!(123_456.789),
+            _ => json!(draw.below(100_000)),
+        }
+    }
+
+    fn drawn_value(draw: &mut Draw, depth: usize) -> Value {
+        let choices = if depth == 0 { 6 } else { 8 };
+        match draw.below(choices) {
+            0 => Value::Null,
+            1 => Value::Bool(draw.below(2) == 0),
+            2 => drawn_number(draw),
+            3..=5 => Value::String(drawn_text(draw)),
+            6 => Value::Array(
+                (0..draw.below(4))
+                    .map(|_| drawn_value(draw, depth - 1))
+                    .collect(),
+            ),
+            _ => Value::Object(
+                (0..draw.below(4))
+                    .map(|_| (drawn_text(draw), drawn_value(draw, depth - 1)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The count is the render's length, byte for byte, including the marker
+    /// `render` drops, the comma it drops with it, and a marker it leaves alone
+    /// because it is nested or not `compact`.
+    #[test]
+    fn measure_counts_exactly_what_render_emits() {
+        let mut draw = Draw(0x6b69_6e2d_6d63_7001);
+        let mut values: Vec<Value> = vec![
+            json!({}),
+            json!([]),
+            json!(null),
+            json!("史"),
+            json!({ JSON_FORMAT_KEY: "compact" }),
+            json!({ JSON_FORMAT_KEY: "compact", "a": 1 }),
+            json!({ JSON_FORMAT_KEY: "compact", "a": [], "Z": { "b": null } }),
+            json!({ JSON_FORMAT_KEY: "pretty", "a": 1 }),
+            json!({ JSON_FORMAT_KEY: 7, "a": 1 }),
+            json!({ "outer": { JSON_FORMAT_KEY: "compact", "a": 1 } }),
+            json!([{ JSON_FORMAT_KEY: "compact" }]),
+        ];
+        for _ in 0..300 {
+            let value = drawn_value(&mut draw, 4);
+            if let Some(map) = value.as_object() {
+                let mut compact = map.clone();
+                compact.insert(JSON_FORMAT_KEY.to_string(), json!("compact"));
+                values.push(Value::Object(compact));
+            }
+            values.push(value);
+        }
+        for value in &values {
+            let rendered = render(value).expect("a Value always serializes");
+            assert_eq!(measure(value), rendered.len(), "{rendered}");
+            for pretty in [false, true] {
+                let whole = if pretty {
+                    serde_json::to_string_pretty(value)
+                } else {
+                    serde_json::to_string(value)
+                }
+                .expect("a Value always serializes");
+                let newlines = if pretty {
+                    whole.matches('\n').count()
+                } else {
+                    0
+                };
+                assert_eq!(
+                    serialized_size(value, pretty),
+                    Some((whole.len(), newlines)),
+                    "{whole}"
+                );
+                assert_eq!(super::rendered(value, pretty).unwrap(), whole);
+            }
+        }
+    }
+
+    /// The sizes predict what the payload renders to holding any subset of its
+    /// entries, in either layout, at either depth a collection can sit, and with
+    /// entries of every shape.
+    #[test]
+    fn row_sizes_predict_every_subset_the_payload_can_hold() {
+        let mut draw = Draw(0x6b69_6e2d_6d63_7002);
+        for case in 0..48 {
+            let key = if case % 2 == 0 { "rows" } else { "block.rows" };
+            let rows: Vec<Value> = (0..draw.below(12))
+                .map(|_| drawn_value(&mut draw, 3))
+                .collect();
+            let mut payload = json!({
+                "query": drawn_text(&mut draw),
+                "block": { "status": "held", "detail": drawn_value(&mut draw, 2) },
+                "after": [1, 2, 3],
+            });
+            if case % 4 < 2 {
+                payload[JSON_FORMAT_KEY] = json!("compact");
+            }
+            set_collection(&mut payload, key, Value::Array(rows.clone()));
+            let rendered = render(&payload).expect("renders").len();
+            let sizes = RowSizes::of(&payload, key, &rows, rendered).expect("the sizes add up");
+            let mut subsets: Vec<Vec<usize>> =
+                (0..=rows.len()).map(|count| (0..count).collect()).collect();
+            for _ in 0..6 {
+                subsets.push((0..rows.len()).filter(|_| draw.below(2) == 0).collect());
+            }
+            for subset in subsets {
+                let mut probe = payload.clone();
+                let kept = subset.iter().map(|at| rows[*at].clone()).collect();
+                set_collection(&mut probe, key, Value::Array(kept));
+                assert_eq!(
+                    sizes.payload_len(subset.iter().copied()),
+                    render(&probe).expect("renders").len(),
+                    "case {case}, {key}, entries {subset:?}"
+                );
+            }
+        }
+    }
+
+    /// One collection for the cut equivalence: flat, a parented walk that can
+    /// narrow, a straight chain that cannot, or a walk only partly parented.
+    fn drawn_cut_payload(draw: &mut Draw, case: usize) -> (Value, &'static str) {
+        let key = if case % 3 == 2 { "walk.chain" } else { "chain" };
+        let len = draw.below(18);
+        let family = case % 4;
+        let rows: Vec<Value> = (1..=len)
+            .map(|step| {
+                let mut row = json!({
+                    "entity_name": format!("hop_{step}"),
+                    "pad": "p".repeat(draw.below(160)),
+                    "note": drawn_value(draw, 1),
+                });
+                let parent = match family {
+                    0 => None,
+                    1 => Some(draw.below(step)),
+                    2 => Some(step - 1),
+                    _ => (step % 3 != 0).then(|| draw.below(step)),
+                };
+                if family != 0 {
+                    row["step"] = json!(step);
+                }
+                if let Some(parent) = parent {
+                    row["parent_step"] = json!(parent);
+                }
+                row
+            })
+            .collect();
+        let mut payload = json!({
+            "focal_name": "Session.send",
+            "untrimmable": "f".repeat(draw.below(300)),
+            "walk": { "depth": 3 },
+        });
+        match draw.below(3) {
+            0 => {}
+            1 => payload["target_name"] = json!(format!("hop_{}", 1 + draw.below(len.max(1)))),
+            _ => payload["target_name"] = json!("hop_unreached"),
+        }
+        if case % 2 == 0 {
+            payload[JSON_FORMAT_KEY] = json!("compact");
+        }
+        set_collection(&mut payload, key, Value::Array(rows));
+        (payload, key)
+    }
+
+    /// The metered cut is the cut rendering every probe makes, at every ceiling
+    /// that separates one kept entry from the next and at a spread in between,
+    /// with the floor rotating through zero, one and more, and the metered path
+    /// answers each of them itself rather than falling back to rendering.
+    #[test]
+    fn a_metered_cut_is_the_cut_rendering_every_probe_makes() {
+        let mut draw = Draw(0x6b69_6e2d_6d63_7003);
+        let mut metered_cuts = 0usize;
+        for case in 0..32 {
+            let (payload, key) = drawn_cut_payload(&mut draw, case);
+            let rendered = render(&payload).expect("renders").len();
+            let full = collection_of(&payload, key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            // Every ceiling at which one more suffix entry would or would not fit.
+            let mut targets: Vec<usize> = vec![0, rendered, rendered + 1];
+            for count in 0..=full.len() {
+                let mut prefix = payload.clone();
+                set_collection(&mut prefix, key, Value::Array(full[..count].to_vec()));
+                let size = render(&prefix).expect("renders").len();
+                targets.extend([size.saturating_sub(1), size]);
+            }
+            targets.extend((1..8).map(|step| rendered * step / 8));
+            for (index, &target) in targets.iter().enumerate() {
+                let min_keep = [1, 0, 2, 1, 4][index % 5];
+                let mut by_render = payload.clone();
+                let want = {
+                    let _every_probe = test_support::scoped_render_every_probe();
+                    trim_collection(&mut by_render, key, target, min_keep, rendered)
+                };
+                let mut metered = payload.clone();
+                let got = trim_collection(&mut metered, key, target, min_keep, rendered);
+                let context = format!("case {case}, {key}, target {target}, floor {min_keep}");
+                assert_eq!(got, want, "{context}");
+                assert_eq!(metered, by_render, "{context}");
+                if full.len() > min_keep && rendered > target {
+                    let mut direct = payload.clone();
+                    let cut = trim_collection_metered(
+                        &mut direct,
+                        key,
+                        target,
+                        min_keep,
+                        &full,
+                        rendered,
+                    );
+                    assert_eq!(cut, Some(want), "the metered path fell back: {context}");
+                    assert_eq!(direct, by_render, "{context}");
+                    metered_cuts += 1;
+                }
+            }
+        }
+        assert!(
+            metered_cuts > 300,
+            "the draws must reach the cut often: {metered_cuts}"
+        );
+    }
+
+    /// Runs one budget both ways and requires the same reply and accounting.
+    fn assert_enforce_matches_rendering_every_probe(
+        tool: &str,
+        payload: &Value,
+        budget: ResponseBudget,
+        finalizing: bool,
+    ) {
+        let run = |every_probe: bool| {
+            let _mode = every_probe.then(test_support::scoped_render_every_probe);
+            let mut bounded = payload.clone();
+            let accounting = if finalizing {
+                enforce_final(&mut bounded, tool, &budget)
+            } else {
+                enforce(&mut bounded, tool, &budget)
+            };
+            let rendered = render(&bounded).expect("a bounded reply renders");
+            (accounting, rendered, bounded)
+        };
+        let (accounting, rendered, bounded) = run(false);
+        let (want_accounting, want_rendered, want_bounded) = run(true);
+        assert_eq!(accounting, want_accounting, "{tool} under {budget:?}");
+        assert_eq!(rendered, want_rendered, "{tool} under {budget:?}");
+        assert_eq!(bounded, want_bounded, "{tool} under {budget:?}");
+    }
+
+    /// Ceilings from a tight floor to past the whole reply, at an odd stride so
+    /// a sweep lands each cut at a different offset from the rows.
+    fn swept_ceilings(payload: &Value, points: usize) -> Vec<usize> {
+        let whole = measure(payload);
+        let mut ceilings = vec![600, RESPONSE_MIN_MAX_CHARS];
+        ceilings.extend((1..=points).map(|step| whole * step / points + 37 * step));
+        ceilings
+    }
+
+    /// The whole ladder, metered, against the same ladder rendering every size
+    /// and every probe. The fixtures are the ones the tests above pin behaviour
+    /// with: every budgeted shape they cover, the call-site sample whose floor
+    /// is zero, the dispatch block present and absent, `answer_only`, the
+    /// finalizer's preview, branch narrowing with the target held and
+    /// unreached, the entry floor over its ceiling, repaged cursors, and the
+    /// bookkeeping sweep's own reply.
+    #[test]
+    fn enforce_matches_the_budget_that_rendered_every_probe() {
+        let default = ResponseBudget::default();
+        let fixtures: Vec<(&str, Value)> = vec![
+            ("find_references", references_payload(3, 20, 24)),
+            ("find_references", references_payload(3, 30, 0)),
+            ("find_references", references_with_call_site_sample(2)),
+            ("semantic_locate", locate_payload(10, 200)),
+            ("semantic_locate", cosine_locate_payload(8)),
+            ("semantic_locate", file_locate_payload(6, 4)),
+            ("trace_data_flow", floor_case_payload(8, 300, 800)),
+            ("trace_data_flow", targeted_chain_payload(14, 9)),
+            ("trace_data_flow", targeted_chain_payload(12, 99)),
+            (FILE_ENTITIES_TOOL, file_entities_final_page(20, 0, 20, 150)),
+            ("impact_analysis", impact_payload(4)),
+            ("entity_history", focal_history_page(3, 40)),
+        ];
+        for (tool, payload) in &fixtures {
+            for max_chars in swept_ceilings(payload, 9) {
+                let budget = ResponseBudget {
+                    max_chars,
+                    ..default
+                };
+                assert_enforce_matches_rendering_every_probe(tool, payload, budget, false);
+            }
+            let loose = ResponseBudget {
+                max_chars: measure(payload) / 3,
+                compact: false,
+                envelope_reserve: RESPONSE_ENVELOPE_RESERVE_CHARS,
+                ..default
+            };
+            assert_enforce_matches_rendering_every_probe(tool, payload, loose, false);
+        }
+        let references = references_payload(3, 20, 24);
+        for max_chars in swept_ceilings(&references, 5) {
+            let budget = ResponseBudget {
+                max_chars,
+                ..default
+            };
+            assert_enforce_matches_rendering_every_probe(
+                "find_references",
+                &references,
+                budget,
+                true,
+            );
+            let answer_only = ResponseBudget {
+                answer_only: true,
+                ..budget
+            };
+            assert_enforce_matches_rendering_every_probe(
+                "find_references",
+                &references,
+                answer_only,
+                false,
+            );
+        }
+        // The bookkeeping sweep's reply and the floor test's, at a few ceilings.
+        let study = references_payload(3, 100, 116);
+        for max_chars in [RESPONSE_MIN_MAX_CHARS, 12_000, 20_000, 31_013] {
+            let budget = ResponseBudget {
+                max_chars,
+                ..default
+            };
+            assert_enforce_matches_rendering_every_probe("find_references", &study, budget, false);
+        }
+        let floor = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..default
+        };
+        assert_enforce_matches_rendering_every_probe(
+            "find_references",
+            &references_payload(40, 100, 116),
+            floor,
+            false,
+        );
     }
 }

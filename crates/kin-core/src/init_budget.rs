@@ -62,6 +62,7 @@
 //! spends it.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::init_attempt::human_bytes;
 use crate::memory_pressure;
@@ -74,6 +75,38 @@ use crate::memory_pressure;
 /// who has judged the forecast wrong for their repository needs a way past the
 /// refusal that does not mean editing the binary.
 pub const INIT_MEMORY_CEILING_ENV: &str = "KIN_INIT_MEMORY_CEILING_BYTES";
+
+/// The share of the machine a background history derivation may spend, as a
+/// divisor: a third, so the derivation, the repository daemon it feeds and the
+/// operator's own work all fit beside one another.
+pub const BACKGROUND_SHARE_DIVISOR: u64 = 3;
+
+/// The share of the machine this process's conversions may spend, as a
+/// divisor. One is the whole machine, which is what a conversion a person is
+/// waiting on gets.
+static SHARE_DIVISOR: AtomicU64 = AtomicU64::new(1);
+
+/// Judge every conversion this process runs against `1 / divisor` of the
+/// machine it measures, rather than the whole of it.
+///
+/// Set once by a process whose whole job is a background derivation, the way
+/// that process also lowers its own priority. Not an environment variable, on
+/// purpose. The share used to travel to the worker as
+/// [`INIT_MEMORY_CEILING_ENV`], which put two different numbers behind one
+/// name: an operator's statement of what the machine has, and Kin's own
+/// allowance of a part of it. The arithmetic for the first is wrong for the
+/// second (see `headroom_for`), and setting the variable on the worker also
+/// overwrote any value the operator had set themselves.
+///
+/// An operator's [`INIT_MEMORY_CEILING_ENV`] still wins over the share.
+pub fn spend_a_share_of_the_machine(divisor: u64) {
+    SHARE_DIVISOR.store(divisor.max(1), Ordering::Relaxed);
+}
+
+/// `limit_bytes` divided into this process's share, and at least one byte.
+fn share_of(limit_bytes: u64, divisor: u64) -> u64 {
+    (limit_bytes / divisor.max(1)).max(1)
+}
 
 /// Bytes a conversion holds for each commit, whatever its trees are like.
 ///
@@ -581,9 +614,15 @@ fn measured_source() -> memory_pressure::PressureSource {
 }
 
 /// Where the ceiling came from, or why there is none to judge against.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Ceiling {
-    /// A usable ceiling, from the operator or from the machine.
-    Bytes(u64),
+    /// The operator named it, and it is taken at their word: it is what the
+    /// machine has, and what is already in use is charged against it.
+    Operator(u64),
+    /// Read from this machine or container: the limit it reports, and the
+    /// part of that limit this process may spend. The two are equal unless
+    /// this process runs a background derivation.
+    Measured { limit_bytes: u64, share_bytes: u64 },
     /// The operator named one this cannot read.
     Invalid(String),
     /// Nothing named one, and the machine could not be measured.
@@ -602,12 +641,15 @@ fn ceiling() -> Ceiling {
     if let Ok(raw) = std::env::var(INIT_MEMORY_CEILING_ENV) {
         let trimmed = raw.trim();
         return match trimmed.parse::<u64>() {
-            Ok(bytes) if bytes > 0 => Ceiling::Bytes(bytes),
+            Ok(bytes) if bytes > 0 => Ceiling::Operator(bytes),
             _ => Ceiling::Invalid(trimmed.to_string()),
         };
     }
     match memory_pressure::ceiling_bytes() {
-        Some(bytes) if bytes > 0 => Ceiling::Bytes(bytes),
+        Some(bytes) if bytes > 0 => Ceiling::Measured {
+            limit_bytes: bytes,
+            share_bytes: share_of(bytes, SHARE_DIVISOR.load(Ordering::Relaxed)),
+        },
         _ => Ceiling::Unreadable(
             "no memory ceiling could be read for this machine, so this conversion's peak was not \
              forecast"
@@ -756,10 +798,80 @@ fn reachable_history_bytes(
     Ok(bytes)
 }
 
+/// Survey a conversion that admits the checked-out commit alone.
+///
+/// The same three numbers [`survey_history`] reads, for the one commit such a
+/// conversion derives: one commit, the index's width, and the bytes of the
+/// checked-out tree rather than of every tree in history. Also answers how many
+/// commits `HEAD` reaches, counted from commit headers without reading a tree,
+/// because the store records that count as the denominator of its partial
+/// history. A count that cannot be taken is `None` and never a refusal.
+pub fn survey_checked_out_commit(source: &Path) -> Result<(HistorySurvey, Option<u64>), String> {
+    let options = gix::open::Options::isolated()
+        .strict_config(true)
+        .config_overrides(["core.useReplaceRefs=true"]);
+    let repo = gix::open_opts(source, options)
+        .map_err(|error| format!("open {}: {error}", source.display()))?;
+    let head = repo
+        .head_id()
+        .map_err(|error| format!("resolve HEAD: {error}"))?
+        .detach();
+    let history_bytes = reachable_history_bytes(&repo, &[head])?;
+    let reachable_commits = repo
+        .rev_walk([head])
+        .all()
+        .ok()
+        .and_then(|mut walk| walk.try_fold(0_u64, |count, step| step.ok().map(|_| count + 1)));
+
+    let index_path = repo.git_dir().join("index");
+    let index = gix::index::File::at_or_default(
+        &index_path,
+        repo.object_hash(),
+        false,
+        gix::index::decode::Options::default(),
+    )
+    .map_err(|error| format!("open Git index: {error}"))?;
+    Ok((
+        HistorySurvey {
+            commits: 1,
+            tracked_artifacts: index.entries().len() as u64,
+            history_bytes,
+        },
+        reachable_commits,
+    ))
+}
+
+/// [`assess`] for a conversion that admits the checked-out commit alone, and
+/// the reachable-commit count [`survey_checked_out_commit`] took on the way.
+pub fn assess_checked_out_commit(source: &Path) -> (BudgetVerdict, Option<u64>) {
+    let ceiling_bytes = match ceiling() {
+        Ceiling::Operator(bytes)
+        | Ceiling::Measured {
+            share_bytes: bytes, ..
+        } => bytes,
+        Ceiling::Invalid(raw) => return (BudgetVerdict::InvalidCeilingOverride { raw }, None),
+        Ceiling::Unreadable(reason) => return (BudgetVerdict::Unmeasured { reason }, None),
+    };
+    let (survey, reachable_commits) = match survey_checked_out_commit(source) {
+        Ok(surveyed) => surveyed,
+        Err(reason) => return (BudgetVerdict::Unmeasured { reason }, None),
+    };
+    let allowance_bytes = memory_pressure::FootprintBudget::resolve(Some(ceiling_bytes))
+        .map(|budget| budget.bytes)
+        .unwrap_or_else(|| memory_pressure::FootprintBudget::derived_from(ceiling_bytes));
+    (
+        verdict_for_with_allowance_under(survey, ceiling_bytes, allowance_bytes, measured_source()),
+        reachable_commits,
+    )
+}
+
 /// Decide, before any capture, whether this conversion fits.
 pub fn assess(source: &Path) -> BudgetVerdict {
     let ceiling_bytes = match ceiling() {
-        Ceiling::Bytes(bytes) => bytes,
+        Ceiling::Operator(bytes)
+        | Ceiling::Measured {
+            share_bytes: bytes, ..
+        } => bytes,
         Ceiling::Invalid(raw) => return BudgetVerdict::InvalidCeilingOverride { raw },
         Ceiling::Unreadable(reason) => return BudgetVerdict::Unmeasured { reason },
     };
@@ -1072,7 +1184,8 @@ pub fn project_import(survey: ImportSurvey) -> ImportProjection {
 /// that arithmetic is `limit_bytes - used_bytes`, which is exactly what
 /// [`memory_pressure::MemoryReading::available_bytes`] returns, so an
 /// unoverridden conversion is judged against the number it was judged against
-/// before.
+/// before. A background derivation's share is the exception that
+/// [`headroom_for`] explains.
 fn headroom_bytes() -> Result<u64, String> {
     let charged_bytes = memory_pressure::read()
         .reading()
@@ -1082,11 +1195,26 @@ fn headroom_bytes() -> Result<u64, String> {
 
 /// The same arithmetic over values, so the override's effect is testable
 /// without a process-wide environment variable.
+///
+/// `charged_bytes` is everything in use on the machine, not only this
+/// process. That is the right thing to subtract from the machine's whole
+/// limit, or from an operator's statement of it, and the wrong thing to
+/// subtract from a share of it. A background derivation is allowed a third of
+/// the machine, and a third of a 16 GiB laptop less the 11 GiB that laptop
+/// already has in use is nothing at all, so every background derivation on
+/// such a machine was refused before it derived a commit, whatever its size: a
+/// 677-commit history projected at 452.6 MiB was refused against "about 0
+/// bytes free" on a 128 GiB machine that had 54 GiB free. A share is spent out
+/// of what is free, so the headroom it leaves is the smaller of the two.
 fn headroom_for(ceiling: Ceiling, charged_bytes: u64) -> Result<u64, String> {
     match ceiling {
         // Saturating, so a machine already charged past its own ceiling
         // projects against nothing left rather than wrapping to everything.
-        Ceiling::Bytes(bytes) => Ok(bytes.saturating_sub(charged_bytes)),
+        Ceiling::Operator(bytes) => Ok(bytes.saturating_sub(charged_bytes)),
+        Ceiling::Measured {
+            limit_bytes,
+            share_bytes,
+        } => Ok(share_bytes.min(limit_bytes.saturating_sub(charged_bytes))),
         // Unreachable inside a conversion: phase 1 refuses an override it
         // cannot parse and never reaches this phase. Answered rather than
         // asserted, so a future caller that arrives here earlier is left
@@ -1343,14 +1471,14 @@ mod tests {
     #[test]
     fn a_raised_ceiling_is_what_this_projection_is_judged_against() {
         let survey = snapshot(18_508, 531_828_795);
-        let machine = headroom_for(Ceiling::Bytes(16 * 1000 * 1000 * 1000), 0)
+        let machine = headroom_for(whole_machine(16 * 1000 * 1000 * 1000), 0)
             .expect("a readable ceiling has a headroom");
         assert!(
             projection_for(survey, machine).refuses(),
             "this subject has to be short against the machine before an override can matter"
         );
         let raised = headroom_for(
-            Ceiling::Bytes(64 * 1024 * 1024 * 1024),
+            Ceiling::Operator(64 * 1024 * 1024 * 1024),
             8 * 1024 * 1024 * 1024,
         )
         .expect("an operator's ceiling has a headroom");
@@ -1369,12 +1497,172 @@ mod tests {
     #[test]
     fn the_headroom_is_the_ceiling_less_what_is_already_charged() {
         assert_eq!(
-            headroom_for(Ceiling::Bytes(16_000_000_000), 15_000_000_000),
+            headroom_for(whole_machine(16_000_000_000), 15_000_000_000),
+            Ok(1_000_000_000)
+        );
+        assert_eq!(
+            headroom_for(Ceiling::Operator(16_000_000_000), 15_000_000_000),
             Ok(1_000_000_000)
         );
         // A machine charged past its own ceiling has nothing left rather than
         // everything, which is what a wrapping subtraction would report.
-        assert_eq!(headroom_for(Ceiling::Bytes(8), 9), Ok(0));
+        assert_eq!(headroom_for(whole_machine(8), 9), Ok(0));
+        assert_eq!(headroom_for(Ceiling::Operator(8), 9), Ok(0));
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A machine read whole, as a conversion a person is waiting on reads it.
+    fn whole_machine(limit_bytes: u64) -> Ceiling {
+        Ceiling::Measured {
+            limit_bytes,
+            share_bytes: limit_bytes,
+        }
+    }
+
+    /// The same machine as a background derivation reads it.
+    fn background_share(limit_bytes: u64) -> Ceiling {
+        Ceiling::Measured {
+            limit_bytes,
+            share_bytes: share_of(limit_bytes, BACKGROUND_SHARE_DIVISOR),
+        }
+    }
+
+    /// A background share is spent out of what is free, not out of what is
+    /// left of the share once everything in use on the machine is taken from
+    /// it.
+    ///
+    /// The second arithmetic is what the worker used to get, because its share
+    /// arrived as an operator's ceiling: a third of a 16 GiB laptop less the
+    /// 11 GiB that laptop has in use is nothing.
+    #[test]
+    fn a_background_share_is_spent_out_of_what_is_free() {
+        let third = share_of(16 * GIB, BACKGROUND_SHARE_DIVISOR);
+        // Busy: 5 GiB free is less than the share, so the free memory decides.
+        assert_eq!(
+            headroom_for(background_share(16 * GIB), 11 * GIB),
+            Ok(5 * GIB)
+        );
+        // Quiet: 12 GiB free is more than the share, so the share decides.
+        assert_eq!(headroom_for(background_share(16 * GIB), 4 * GIB), Ok(third));
+        // What the worker computed before, from the same reading.
+        assert_eq!(headroom_for(Ceiling::Operator(third), 11 * GIB), Ok(0));
+    }
+
+    /// An ordinary full clone on a busy 16 GiB laptop, through every memory
+    /// check the default `kin init` and its background derivation take.
+    ///
+    /// The numbers are pallets/itsdangerous: 677 commits from HEAD and 678
+    /// across its 36 refs, 50 tracked artifacts, 282,547 bytes in the
+    /// checked-out tree, 5,122,223 blob bytes reachable from HEAD and
+    /// 6,052,866 bytes of captured objects. Its background derivation was
+    /// refused against "about 0 bytes free" on a 128 GiB machine that had
+    /// 54 GiB free, and once admitted it peaked at 685 MB of resident set.
+    #[test]
+    fn an_ordinary_full_clone_is_admitted_beside_a_busy_16_gib_laptop() {
+        let limit = 16 * GIB;
+        let in_use = 11 * GIB;
+
+        // `kin init` admits the checked-out commit against the whole machine.
+        let checked_out = history(1, 50, 282_547);
+        assert!(matches!(
+            verdict_for(checked_out, limit),
+            BudgetVerdict::Fits { .. }
+        ));
+        let checked_out_capture = ImportSurvey {
+            commits: 1,
+            head_artifacts: 50,
+            object_bytes: 282_547,
+            refs: 36,
+        };
+        let whole = headroom_for(whole_machine(limit), in_use).unwrap();
+        assert!(!projection_for(checked_out_capture, whole).refuses());
+
+        // The background derivation forecasts against its share before capture
+        let share = share_of(limit, BACKGROUND_SHARE_DIVISOR);
+        let derivation = history(677, 50, 5_122_223);
+        assert!(matches!(
+            verdict_for(derivation, share),
+            BudgetVerdict::Fits { .. }
+        ));
+
+        // and projects what it captured against the share it can still spend.
+        let captured = ImportSurvey {
+            commits: 678,
+            head_artifacts: 50,
+            object_bytes: 6_052_866,
+            refs: 36,
+        };
+        let headroom = headroom_for(background_share(limit), in_use).unwrap();
+        let projection = projection_for(captured, headroom);
+        assert!(
+            matches!(projection, ImportProjection::Fits { .. }),
+            "an ordinary history was refused beside a busy 16 GiB laptop: {projection:?}"
+        );
+
+        // The arithmetic this replaces refused the same history on that laptop.
+        let before = headroom_for(Ceiling::Operator(share), in_use).unwrap();
+        assert!(projection_for(captured, before).refuses());
+    }
+
+    /// A share never spends memory the machine does not have free.
+    ///
+    /// Spending the share out of what is free must not turn into spending the
+    /// share regardless. psf/requests, 6,493 commits measured at 4.8 GB, still
+    /// does not start beside a laptop with 1 GiB free.
+    #[test]
+    fn a_background_share_never_spends_more_than_is_free() {
+        let headroom = headroom_for(background_share(16 * GIB), 15 * GIB).unwrap();
+        assert_eq!(headroom, GIB);
+        let requests = ImportSurvey {
+            commits: 6_493,
+            head_artifacts: 130,
+            object_bytes: 112_474_615,
+            refs: 1,
+        };
+        assert!(projection_for(requests, headroom).refuses());
+    }
+
+    /// Admitting the checked-out commit is charged that commit's tree, not
+    /// the history behind it.
+    ///
+    /// The fixture's first commit carries a blob larger than everything else
+    /// in it, and the second commit deletes it, so a survey that walked parents
+    /// or charged every reachable blob would count it.
+    #[test]
+    fn the_checked_out_commit_is_charged_its_own_tree() {
+        const KEPT: &str = "the one artifact the checked-out commit still has\n";
+        let deleted = "an artifact only the first commit has, ".repeat(256);
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("source");
+        std::fs::create_dir(&repo).unwrap();
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "user.name", "Kin Test"])
+            .run_in(&repo);
+        std::fs::write(repo.join("kept.txt"), KEPT).unwrap();
+        std::fs::write(repo.join("deleted.txt"), &deleted).unwrap();
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["add", "kept.txt", "deleted.txt"])
+            .git(["commit", "-m", "one"])
+            .git(["rm", "-q", "deleted.txt"])
+            .git(["commit", "-m", "two"])
+            .run_in(&repo);
+
+        let (checked_out, reachable) = survey_checked_out_commit(&repo).unwrap();
+        assert_eq!(checked_out.commits, 1);
+        assert_eq!(checked_out.tracked_artifacts, 1);
+        assert_eq!(checked_out.history_bytes, KEPT.len() as u64);
+        assert_eq!(reachable, Some(2));
+
+        let whole_history = survey_history(&repo).unwrap();
+        assert_eq!(whole_history.commits, 2);
+        assert_eq!(
+            whole_history.history_bytes,
+            (KEPT.len() + deleted.len()) as u64
+        );
     }
 
     /// A ceiling this module cannot read projects nothing and says nothing.
@@ -1661,9 +1949,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("source");
         std::fs::create_dir(&repo).unwrap();
-        git(&repo, ["init", "--initial-branch=main"]);
-        git(&repo, ["config", "user.email", "kin@example.invalid"]);
-        git(&repo, ["config", "user.name", "Kin Test"]);
+        // Consecutive Git commands that take no input run as one fixture
+        // launch, in the same order, since every launch starts a guardian.
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "user.name", "Kin Test"])
+            .run_in(&repo);
 
         // One commit, one blob, two paths, plus a symbolic link whose blob is
         // its target string.
@@ -1674,35 +1966,34 @@ mod tests {
             ["hash-object", "-w", "--stdin"],
             LINK_TARGET.as_bytes(),
         );
-        git(&repo, ["add", "a.txt", "b.txt"]);
-        git(
-            &repo,
-            [
+        let first = kin_git::test_support::FixtureGitBatch::new()
+            .git(["add", "a.txt", "b.txt"])
+            .git([
                 "update-index",
                 "--add",
                 "--cacheinfo",
                 &format!("120000,{link_blob},link"),
-            ],
-        );
-        git(&repo, ["commit", "-m", "one"]);
-        let first = git(&repo, ["rev-parse", "HEAD"]);
+            ])
+            .git(["commit", "-m", "one"])
+            .git_stdout(["rev-parse", "HEAD"])
+            .run_in(&repo);
+        let first = String::from_utf8(first).unwrap().trim().to_string();
 
         // A second commit that changes one path, adds a nested one, and carries
         // a gitlink pointing at the commit above.
         std::fs::write(repo.join("a.txt"), CHANGED).unwrap();
         std::fs::create_dir(repo.join("sub")).unwrap();
         std::fs::write(repo.join("sub/c.txt"), NESTED).unwrap();
-        git(&repo, ["add", "a.txt", "sub/c.txt"]);
-        git(
-            &repo,
-            [
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["add", "a.txt", "sub/c.txt"])
+            .git([
                 "update-index",
                 "--add",
                 "--cacheinfo",
                 &format!("160000,{first},vendor/mod"),
-            ],
-        );
-        git(&repo, ["commit", "-m", "two"]);
+            ])
+            .git(["commit", "-m", "two"])
+            .run_in(&repo);
 
         // A commit HEAD cannot reach, published through a branch and an
         // annotated tag, with every ref then packed.
@@ -1714,9 +2005,11 @@ mod tests {
             format!("100644 blob {off_head_blob}\tonly-on-side.txt\n").as_bytes(),
         );
         let side_commit = git_with_input(&repo, ["commit-tree", &side_tree], b"off head\n");
-        git(&repo, ["update-ref", "refs/heads/side", &side_commit]);
-        git(&repo, ["tag", "-a", "v1", &side_commit, "-m", "annotated"]);
-        git(&repo, ["pack-refs", "--all"]);
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["update-ref", "refs/heads/side", &side_commit])
+            .git(["tag", "-a", "v1", &side_commit, "-m", "annotated"])
+            .git(["pack-refs", "--all"])
+            .run_in(&repo);
         assert!(
             repo.join(".git/packed-refs").exists(),
             "this fixture is meant to carry a packed ref"

@@ -78,7 +78,7 @@ pub fn unapproved_changes<G: GraphStore>(
         if !change.parents.is_empty() && !is_approved {
             unapproved.push(UnapprovedChange {
                 change_id: change.id,
-                author: change.author.0.clone(),
+                author: change.author.name().into_owned(),
             });
         }
 

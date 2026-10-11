@@ -758,7 +758,7 @@ jobs:
                 --retry 5 \
                 --retry-all-errors \
                 --retry-delay 2 \
-                'https://ghcr.io/token?scope=repository%3Afirelock-ai%2Fkin%3Apull' \
+                'https://ghcr.io/token?scope=repository%3Akinlab-ai%2Fkin%3Apull' \
                 | jq -er .token)"
               manifest_digest() {
                 local image_tag="$1"
@@ -769,7 +769,7 @@ jobs:
                   --retry-delay 2 \
                   -H "Authorization: Bearer ${registry_token}" \
                   -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-                  "https://ghcr.io/v2/firelock-ai/kin/manifests/${image_tag}" \
+                  "https://ghcr.io/v2/kinlab-ai/kin/manifests/${image_tag}" \
                   | tr -d '\r')"
                 awk -F': ' \
                   'tolower($1) == "docker-content-digest" {print $2}' \
@@ -782,7 +782,7 @@ jobs:
               [ "$ghcr_latest" = "$ghcr_version" ]
               [ "$ghcr_latest" = "$ghcr_tag" ]
               gh attestation verify \
-                "oci://ghcr.io/firelock-ai/kin@${ghcr_latest}" \
+                "oci://ghcr.io/kinlab-ai/kin@${ghcr_latest}" \
                 --repo "$REPO" \
                 --bundle-from-oci \
                 --predicate-type https://slsa.dev/provenance/v1 \
@@ -1030,7 +1030,9 @@ jobs:
                 app_id: (.app.id // 0),
                 app_slug: (.app.slug // ""),
                 check_suite_id: .check_suite.id,
-                head_sha: .head_sha
+                head_sha: .head_sha,
+                started_at: .started_at,
+                completed_at: .completed_at
               }' \
               > check_runs.ndjson || { echo "::error::failed to fetch check-runs for $SHA"; exit 1; }
             gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
@@ -1165,6 +1167,36 @@ jobs:
           unwaited = []
           corroborated = []
           corroboration_unwaited = []
+          retried = []
+
+          def settled_retry(pairs):
+              # A job rerun publishes a second check-run under the same name in
+              # the same check suite. Admit it only in its narrowest shape: one
+              # workflow run, the first attempt completed as a failure or a
+              # timeout, and the second started after it and passed. A third
+              # attempt, a pass then a fail, or copies from two runs stay
+              # ambiguous. select-release-candidate.py applies the same rule.
+              first, second = sorted(
+                  pairs, key=lambda pair: str(pair[0].get("started_at") or "")
+              )
+              suite = first[0].get("check_suite_id")
+              if suite is None or suite != second[0].get("check_suite_id"):
+                  return None
+              if (
+                  first[0].get("status") != "completed"
+                  or first[0].get("conclusion") not in ("failure", "timed_out")
+              ):
+                  return None
+              if (
+                  second[0].get("status") != "completed"
+                  or second[0].get("conclusion") != "success"
+              ):
+                  return None
+              finished = first[0].get("completed_at")
+              restarted = second[0].get("started_at")
+              if not finished or not restarted or str(restarted) < str(finished):
+                  return None
+              return second
 
           if required != list(expected_provenance):
               errors.append("required check order does not match its provenance contract")
@@ -1409,6 +1441,11 @@ jobs:
                       f"{off_admitted_builds} produced off the admitted builds)"
                   )
                   continue
+              if len(matching_runs) == 2:
+                  settled = settled_retry(matching_runs)
+                  if settled is not None:
+                      matching_runs = [settled]
+                      retried.append(name)
               if len(matching_runs) != 1:
                   errors.append(
                       f"ambiguous required check: {name} "
@@ -1654,6 +1691,11 @@ jobs:
                           else "it has no admitted build at this sha"
                       )
                   )
+          for name in retried:
+              announcements.append(
+                  f"required check passed on its one admitted retry: {name}; "
+                  "the failed attempt is a flake to fix"
+              )
           for line in announcements:
               print(f"::warning::{line}")
           not_waited = []

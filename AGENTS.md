@@ -9,15 +9,17 @@ storage and retrieval live in the bundled `crates/kin-db`. Hosted collaboration 
 ## The graph is the authority
 
 Runtime query paths answer from the graph. They never grep, walk or rank raw filesystem contents,
-and `scripts/zero_file_search_guard.sh` enforces that. When the graph cannot produce an answer,
+and `scripts/zero_file_search_guard.sh` and `scripts/check-io-lint.py` enforce that. The second
+finds raw filesystem and process calls by name resolution and holds them to
+`scripts/io-lint/allowed-sites.txt`. New boundary code takes its access from the `kin-io` crate's
+capabilities. When the graph cannot produce an answer,
 return an error or report the gap rather than falling back to raw file search. Ingestion, import,
 reconcile, migration, projection, config and test IO may read files as explicit boundaries.
 
 When the Kin MCP server is available, use it to read this repository. Find an entity with
-`semantic_search` when you know its name or `semantic_locate` when you know only the behaviour,
-then take `get_context_pack` on the best hit, and `find_references` or `impact_analysis` before
-changing shared code. Read the `_kin` envelope on every answer, since an empty result is
-trustworthy only when its `negative.safe_to_conclude_absent` says so.
+`locate`, by its name or by the behaviour, then take `context` on the best hit, and `refs` or
+`impact` before changing shared code. Read `_kin.verdict` and `_kin.meaning` on every answer: an
+empty result proves an absence only when the verdict is `complete`.
 [docs/gemini-extension-context.md](docs/gemini-extension-context.md) is the full tool guide, and
 the Gemini CLI extension loads it as context.
 
@@ -33,6 +35,7 @@ cargo nextest run --locked --partition count:<n>/3   # three shards
 cargo test --doc --locked                            # nextest does not run doctests
 python3 scripts/check-quarantine.py
 bash scripts/zero_file_search_guard.sh
+python3 scripts/check-io-lint.py                     # after clippy; needs the toolchain
 ```
 
 Run targeted crate tests for a behaviour change, and leave the full-workspace run to CI. Set
@@ -67,11 +70,16 @@ neither is 1.
 working directory, then the client's workspace roots. A bare `kin` resolves against the caller's
 PATH, which inside a container carries neither `~/.kin/bin` nor an npm prefix.
 
-**Trace response limits page the answer.** Repeat the same `trace_data_flow` query with its
-`next_cursor` as `cursor`, or pass `kin trace --cursor`. Preserve absolute hop/parent ids across
-pages. An oversized semantic field uses `record_fragment`; concatenate its UTF-8 fragments
-before reading that field. A partial page never proves absence, and a stale/evicted cursor
-requires a fresh query. Source bodies and safety readings remain semantic records, never files.
+**Trace response limits page the answer.** Send its `next_cursor` back as `cursor`, alone or with
+a new byte budget, or pass `kin trace --cursor`. A cursor is a handle on the frozen answer, so a
+continuation need not repeat the query, and one that names its target must repeat the whole
+query. `find_references` and `impact_analysis` pages work the same way, and so does a
+machine `semantic_locate` answer too large for its budget, whose last page hands back the
+ranking's own `next_cursor` among its readings. Preserve absolute
+hop/parent ids across pages. An oversized semantic field uses `record_fragment`; concatenate
+its UTF-8 fragments before reading that field. A partial page never proves absence, and a
+stale/evicted cursor requires a fresh query. Source bodies and safety readings remain semantic
+records, never files.
 
 **The release version lives in several files at once.** `scripts/release-intent.mjs` and
 `scripts/check-release-version.mjs` keep them in lockstep. The `Release version gate` job runs

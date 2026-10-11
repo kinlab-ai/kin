@@ -74,6 +74,16 @@ fn run_kin(dir: &Path, registry: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("KIN_REGISTRY_PATH", registry)
+        .env(
+            "KIN_HOME",
+            registry
+                .parent()
+                .expect("private registry parent")
+                .join("kin-home"),
+        )
+        .env_remove("KIN_STORE")
+        .env_remove("KIN_DIR")
+        .env_remove("KIN_STORE_LAYOUT")
         .output()
         .expect("run kin binary")
 }
@@ -87,6 +97,30 @@ fn run_kin_ok(dir: &Path, registry: &Path, args: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+fn admitted_store(repo: &Path, registry: &Path) -> PathBuf {
+    let output = run_kin_ok(repo, registry, &["store", "path", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("store path JSON");
+    assert_eq!(value["external"], true, "exercise default central storage");
+    assert_eq!(
+        Path::new(value["working_dir"].as_str().expect("working tree")),
+        repo.canonicalize().unwrap()
+    );
+    let store = PathBuf::from(value["store"].as_str().expect("actual store"));
+    assert!(store.is_dir());
+    assert!(!repo.join(".kin").exists());
+    store
+}
+
+fn assert_ejected(repo: &Path, registry: &Path, store: &Path) {
+    assert!(!store.exists(), "the actual central store must be archived");
+    assert!(!repo.join(".kin").exists());
+    let result = run_kin(repo, registry, &["store", "path", "--json"]);
+    assert!(
+        !result.status.success(),
+        "ejected tree must have no discoverable store"
+    );
 }
 
 fn seed_git_repo(repo: &Path) {
@@ -293,15 +327,16 @@ fn brownfield_eject_preserves_exact_files_and_git_with_recoverable_metadata() {
     let tracked_before = tracked_state(&repo);
 
     run_kin_ok(&repo, &registry, &["init", "."]);
-    assert!(repo.join(".kin").is_dir());
+    let store = admitted_store(&repo, &registry);
+    assert!(store.is_dir());
     assert!(
-        !repo.join(".kin/snapshot").exists(),
+        !store.join("snapshot").exists(),
         "graph-first init must not retain a raw filesystem snapshot"
     );
 
     run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
-    assert!(!repo.join(".kin").exists());
+    assert_ejected(&repo, &registry, &store);
     assert_eq!(tracked_state(&repo), tracked_before);
     assert_eq!(git_head(&repo), head_before);
     assert_eq!(
@@ -348,6 +383,7 @@ fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
     seed_git_repo(&repo);
     let original = fs::read(repo.join("compose.yaml")).unwrap();
     run_kin_ok(&repo, &registry, &["init", "."]);
+    let store = admitted_store(&repo, &registry);
 
     fs::write(
         repo.join("compose.yaml"),
@@ -356,7 +392,7 @@ fn eject_refuses_a_projection_that_differs_from_current_graph_ref() {
     .unwrap();
     let output = run_kin(&repo, &registry, &["eject", "--yes"]);
     assert_refused(&output, "exact projection");
-    assert!(repo.join(".kin").exists());
+    assert!(store.exists());
     assert_eq!(
         fs::read(repo.join("compose.yaml")).unwrap(),
         b"services:\n  unexpected:\n    image: local-only\n"
@@ -382,6 +418,7 @@ fn git_export_reads_repository_authority_when_working_files_drift() {
     let expected = tracked_state(&repo);
     let head = git_head(&repo);
     run_kin_ok(&repo, &registry, &["init", "."]);
+    admitted_store(&repo, &registry);
 
     fs::write(
         repo.join("compose.yaml"),
@@ -421,6 +458,7 @@ fn git_export_refuses_to_publish_inside_the_kin_working_repository() {
     let registry = root.path().join("registry.toml");
     seed_git_repo(&repo);
     run_kin_ok(&repo, &registry, &["init", "."]);
+    admitted_store(&repo, &registry);
     fs::create_dir(repo.join("nested")).unwrap();
 
     let output = run_kin(
@@ -440,9 +478,10 @@ fn native_unborn_repository_ejects_to_an_unborn_ordinary_git_repository() {
     fs::create_dir(&repo).unwrap();
 
     run_kin_ok(&repo, &registry, &["init", "."]);
+    let store = admitted_store(&repo, &registry);
     run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
-    assert!(!repo.join(".kin").exists());
+    assert_ejected(&repo, &registry, &store);
     assert!(repo.join(".git").is_dir());
     assert_eq!(
         String::from_utf8(git(&repo, &["symbolic-ref", "HEAD"]).stdout)
@@ -500,9 +539,10 @@ fn exact_git_repo_ejects_without_language_support() {
         .collect::<BTreeMap<_, _>>();
 
     run_kin_ok(&repo, &registry, &["init", "."]);
+    let store = admitted_store(&repo, &registry);
     run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
-    assert!(!repo.join(".kin").exists());
+    assert_ejected(&repo, &registry, &store);
     assert!(repo.join(".git").exists());
     let archives = metadata_archives(&repo);
     assert_eq!(archives.len(), 1);
@@ -539,6 +579,7 @@ fn eject_preserves_gitlink_pointer_and_independently_owned_directory() {
     let head_before = git_head(&repo);
 
     run_kin_ok(&repo, &registry, &["init", "."]);
+    let store = admitted_store(&repo, &registry);
     fs::create_dir(dependency.join("nested")).unwrap();
     fs::write(
         dependency.join("owned.txt"),
@@ -578,7 +619,7 @@ fn eject_preserves_gitlink_pointer_and_independently_owned_directory() {
 
     run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
-    assert!(!repo.join(".kin").exists());
+    assert_ejected(&repo, &registry, &store);
     let installed_git = fs::symlink_metadata(repo.join(".git")).unwrap();
     assert!(
         installed_git.is_dir() && !installed_git.file_type().is_symlink(),
@@ -654,6 +695,7 @@ fn eject_preserves_host_unrepresentable_byte_path_in_exact_git_history() {
     };
 
     run_kin_ok(&repo, &registry, &["init", "."]);
+    let store = admitted_store(&repo, &registry);
     run_kin_ok(
         &repo,
         &registry,
@@ -681,7 +723,7 @@ fn eject_preserves_host_unrepresentable_byte_path_in_exact_git_history() {
 
     run_kin_ok(&repo, &registry, &["eject", "--yes"]);
 
-    assert!(!repo.join(".kin").exists());
+    assert_ejected(&repo, &registry, &store);
     assert!(repo.join(".git").is_dir());
     assert_eq!(git_head(&repo), head_before);
     let installed_tree = git(&repo, &["ls-tree", "-rz", "HEAD"]);
@@ -703,14 +745,15 @@ fn legacy_snapshot_restore_flag_is_not_a_product_surface() {
     let registry = root.path().join("registry.toml");
     seed_git_repo(&repo);
     run_kin_ok(&repo, &registry, &["init", "."]);
+    let store = admitted_store(&repo, &registry);
 
     let output = run_kin(&repo, &registry, &["eject", "--revert-files", "--yes"]);
     assert_refused(&output, "unexpected argument");
-    assert!(repo.join(".kin").exists());
+    assert!(store.exists());
 
     let output = run_kin(&repo, &registry, &["eject", "--purge-metadata", "--yes"]);
     assert_refused(&output, "unexpected argument");
-    assert!(repo.join(".kin").exists());
+    assert!(store.exists());
     assert!(metadata_archives(&repo).is_empty());
 
     run_kin_ok(&repo, &registry, &["eject", "--yes"]);

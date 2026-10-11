@@ -117,10 +117,15 @@ fn a_fresh_init_leaves_no_graph_body_gap_for_locate() {
         payload["degradations"]
     );
 
+    // With bodies whole, only search vectors can hold coverage back, and only
+    // when the search reads them. A store with no vectors is searched by the
+    // cards arm, which reports its embeddings as not used.
     let embedded = coverage["indexed"] == coverage["total"] && coverage["pending"] == 0;
+    let expected = coverage["embedding_state"] == "not_used" || embedded;
     assert_eq!(
         coverage["complete"].as_bool(),
-        Some(embedded),
-        "complete must be decided by the embedding counters alone once bodies are whole: {coverage}"
+        Some(expected),
+        "complete must be decided by the embedding counters alone once bodies are whole, \
+         and only when the search reads embeddings: {coverage}"
     );
 }

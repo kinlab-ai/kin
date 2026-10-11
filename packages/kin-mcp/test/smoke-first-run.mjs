@@ -6,7 +6,7 @@
 // Stages release `kin` + `kin-daemon` binaries into a wrapper-style cache (no
 // pre-existing daemon, no dev PATH state), initializes a throwaway repo, runs
 // the wrapper, and drives the MCP stdio protocol far enough to call one safe
-// Kin semantic tool (`kin_graph_status`). Exits non-zero on any failure.
+// Kin semantic tool (`status`). Exits non-zero on any failure.
 //
 // Usage:
 //   node test/smoke-first-run.mjs                 # auto-locate target/release
@@ -507,8 +507,8 @@ async function main() {
     const tools = listResponse.result?.tools ?? [];
     const toolNames = tools.map(tool => tool.name).sort();
     log(`tools/list returned ${toolNames.length} tools (agent-default profile expected)`);
-    if (!toolNames.includes('kin_graph_status')) {
-      throw new Error(`kin_graph_status missing from tools/list: ${toolNames.join(', ')}`);
+    if (!toolNames.includes('status')) {
+      throw new Error(`status missing from tools/list: ${toolNames.join(', ')}`);
     }
     const registry = await toolNamesForProfile(
       cachedKin,
@@ -537,18 +537,18 @@ async function main() {
     );
 
     child.stdin.write(
-      framedRequest(3, 'tools/call', { name: 'kin_graph_status', arguments: {} })
+      framedRequest(3, 'tools/call', { name: 'status', arguments: {} })
     );
     const callResponse = await reader.await(3, timeoutMs);
     if (callResponse.error) {
-      throw new Error(`kin_graph_status failed: ${JSON.stringify(callResponse.error)}`);
+      throw new Error(`status failed: ${JSON.stringify(callResponse.error)}`);
     }
     const content = callResponse.result?.content ?? [];
     const text = content.map(part => part.text ?? '').join('\n');
     if (callResponse.result?.isError) {
-      throw new Error(`kin_graph_status returned an error result: ${text}`);
+      throw new Error(`status returned an error result: ${text}`);
     }
-    log('tools/call kin_graph_status ok');
+    log('tools/call status ok');
     log(`status payload (first 400 chars): ${text.slice(0, 400)}`);
 
     process.stdout.write('SMOKE PASS: kin-mcp first-run reached a safe semantic tool\n');

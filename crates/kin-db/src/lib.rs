@@ -17,8 +17,8 @@ pub mod types;
 pub mod vector;
 
 pub use call_site_escape::{
-    focal_escape_evidence, focal_escape_evidence_batch, focal_escape_evidence_in, CensusFile,
-    EscapeCensusGraph, StoreCensus,
+    focal_escape_evidence, focal_escape_evidence_batch, focal_escape_evidence_batch_scoped,
+    focal_escape_evidence_in, CensusFile, EscapeCensusGraph, StoreCensus, StoredUse,
 };
 pub use embed::{
     install_model_fetch_gate, CodeEmbedder, EmbeddingProducer, EmbeddingProducerSet,
@@ -30,8 +30,9 @@ pub use engine::{
     EmbeddingStatus, EnrichmentContextStatus, EnrichmentStatusError, EnrichmentStatusFacts,
     FileEnrichmentStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
     ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
-    SourceDerivationLimit, SourceDerivationLimits, SourceDerivationUnavailable,
-    SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact, SourceReservedRelation,
+    SourceDerivationItem, SourceDerivationLimit, SourceDerivationLimits,
+    SourceDerivationUnavailable, SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact,
+    SourceReservedRelation,
 };
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;

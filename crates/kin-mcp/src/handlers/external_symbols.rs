@@ -41,7 +41,8 @@ use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::{ExternalReference, ExternalReferenceId, ExternalSymbol};
 
 use super::common::{
-    read_entity_source_exact_at, EntitySourceScope, HeldSourceAuthority, LAST_READ_SOURCE,
+    bounded_module_site_body, quote_caller_body, read_entity_source_exact_at, CallerBody,
+    EntitySourceScope, HeldSourceAuthority, LAST_READ_SOURCE,
 };
 use crate::error::{McpError, Result};
 use crate::types::ToolCallResult;
@@ -498,11 +499,16 @@ pub fn quote_site(
         .ok_or("site_outside_caller")
 }
 
+enum CalleeBody {
+    Entity(std::result::Result<String, &'static str>),
+    ModuleSites(CallerBody),
+}
+
 /// The text at a caller's sites, read from the caller's graph-owned body, each
 /// caller's body once and no more than [`CALLEE_TEXT_READS_MAX`] of them.
 pub struct CalleeText<'held, 'store, G: GraphStore> {
     held: &'held HeldSourceAuthority<'store, G>,
-    bodies: RefCell<HashMap<EntityId, std::result::Result<String, &'static str>>>,
+    bodies: RefCell<HashMap<EntityId, CalleeBody>>,
     reads_max: usize,
     scope: EntitySourceScope,
 }
@@ -549,6 +555,18 @@ impl<G: GraphStore> SiteText for CalleeText<'_, '_, G> {
         {
             return Err("site_outside_caller");
         }
+        // A structural body request performs no read, even after a module's
+        // sites have been cached. Only a proper, nonempty site inside an
+        // independently sourced module may use the site-only authority path.
+        let sites_only = kin_model::require_targeted_source(caller).is_err();
+        if sites_only
+            && (!kin_model::is_module_container(caller)
+                || !matches!(kin_model::entity_derivation(caller), Ok(None))
+                || site.start_byte == site.end_byte
+                || (site.start_byte == span.start_byte && site.end_byte == span.end_byte))
+        {
+            return Err("caller_source_unavailable");
+        }
         let mut bodies = self.bodies.borrow_mut();
         if !bodies.contains_key(&caller.id) {
             if bodies.len() >= self.reads_max {
@@ -558,21 +576,33 @@ impl<G: GraphStore> SiteText for CalleeText<'_, '_, G> {
             // surrounding answer may already have taken for its own body, so
             // it is put back as this read found it.
             let prior = LAST_READ_SOURCE.with(|cell| cell.get());
-            let body = match read_entity_source_exact_at(
-                self.held,
-                caller,
-                CALLER_BODY_MAX_BYTES,
-                self.scope,
-            ) {
-                Ok(Some(source)) => Ok(source.body),
-                Ok(None) | Err(_) => Err("caller_source_unavailable"),
+            let body = if sites_only {
+                CalleeBody::ModuleSites(bounded_module_site_body(
+                    self.held,
+                    caller,
+                    self.scope,
+                    CALLER_BODY_MAX_BYTES,
+                ))
+            } else {
+                CalleeBody::Entity(
+                    match read_entity_source_exact_at(
+                        self.held,
+                        caller,
+                        CALLER_BODY_MAX_BYTES,
+                        self.scope,
+                    ) {
+                        Ok(Some(source)) => Ok(source.body),
+                        Ok(None) | Err(_) => Err("caller_source_unavailable"),
+                    },
+                )
             };
             LAST_READ_SOURCE.with(|cell| cell.set(prior));
             bodies.insert(caller.id, body);
         }
         match &bodies[&caller.id] {
-            Ok(body) => quote_site(caller, site, body, span.start_byte),
-            Err(reason) => Err(reason),
+            CalleeBody::Entity(Ok(body)) => quote_site(caller, site, body, span.start_byte),
+            CalleeBody::Entity(Err(reason)) => Err(reason),
+            CalleeBody::ModuleSites(body) => quote_caller_body(caller, site, Some(body)),
         }
     }
 }
@@ -952,7 +982,7 @@ pub fn external_references_reply_quoted<G: GraphStore, T: SiteText + ?Sized>(
             "component": "external_callers",
             "reason": "proven_calls_only",
             "detail": "Only calls a language server proved into this symbol are recorded, \
-                       so a caller in a file no resolver answered for is not listed and \
+                       so a caller in a source unit no resolver answered for is not listed and \
                        this list is a floor.",
         }],
     }))
@@ -1153,6 +1183,8 @@ pub fn external_trace_record<T: SiteText + ?Sized>(
     );
     record.insert("entity_role".into(), serde_json::json!("external"));
     record.insert("entity_file".into(), serde_json::Value::Null);
+    // No module of the repository declares it.
+    record.insert("entity_module".into(), serde_json::Value::Null);
     record.insert("external".into(), serde_json::json!(true));
     for key in [
         "start_line",

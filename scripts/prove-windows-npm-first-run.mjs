@@ -59,6 +59,16 @@ const compatibilityMcpLauncher = path.join(
 );
 const commandTimeoutMs = 180_000;
 
+// Whether a reply row anywhere in `value` names `name` in `module`.
+function holdsEntity(value, name, module) {
+  if (Array.isArray(value)) return value.some((item) => holdsEntity(item, name, module));
+  if (value && typeof value === 'object') {
+    if (value.name === name && value.module === module) return true;
+    return Object.values(value).some((item) => holdsEntity(item, name, module));
+  }
+  return false;
+}
+
 function log(message) {
   process.stderr.write(`[windows-npm-proof] ${message}\n`);
 }
@@ -419,18 +429,30 @@ async function proveMcp({ launcher, repoDir, env, label }) {
     request(child, 2, 'tools/list', {});
     const listed = await reader.await(2, commandTimeoutMs);
     const toolNames = (listed.result?.tools || []).map((tool) => tool.name);
-    assert.ok(toolNames.includes('semantic_search'), `${label}: semantic_search is missing`);
+    assert.ok(toolNames.includes('locate'), `${label}: locate is missing`);
 
     request(child, 3, 'tools/call', {
-      name: 'semantic_search',
-      arguments: { query: 'greet', compact: true, limit: 5 },
+      name: 'locate',
+      arguments: { query: 'greet', mode: 'name', compact: true, limit: 5 },
     });
     const searched = await reader.await(3, commandTimeoutMs);
-    assert.equal(searched.error, undefined, `${label}: semantic_search returned an RPC error`);
-    assert.notEqual(searched.result?.isError, true, `${label}: semantic_search returned isError`);
+    assert.equal(searched.error, undefined, `${label}: locate returned an RPC error`);
+    assert.notEqual(searched.result?.isError, true, `${label}: locate returned isError`);
     const rendered = JSON.stringify(searched.result || {});
-    assert.match(rendered, /greet/i, `${label}: semantic_search omitted greet`);
-    assert.match(rendered, /main\.rs/i, `${label}: semantic_search omitted main.rs`);
+    assert.match(rendered, /greet/i, `${label}: locate omitted greet`);
+    // A reply names an entity by its name and the module that holds it, never
+    // by a file, so the committed function is found as `greet` in the crate root.
+    const replies = (searched.result?.content || []).flatMap((block) => {
+      try {
+        return [JSON.parse(block?.text)];
+      } catch {
+        return [];
+      }
+    });
+    assert.ok(
+      holdsEntity(replies, 'greet', 'crate'),
+      `${label}: locate did not return greet in module crate: ${rendered.slice(0, 500)}`,
+    );
 
     child.stdin.end();
     const exited = await waitForExit(child, 30_000);
@@ -440,7 +462,7 @@ async function proveMcp({ launcher, repoDir, env, label }) {
           `stdout:\n${stdout}\nstderr:\n${stderr}`,
       );
     }
-    log(`${label}: real semantic_search returned the committed greet entity`);
+    log(`${label}: real locate by name returned the committed greet entity`);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');

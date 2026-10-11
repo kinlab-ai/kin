@@ -9,7 +9,8 @@
 #![cfg(feature = "metal")]
 
 use crate::gpu::{
-    EmbeddingPrelude, GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig, LayerTensors, PoolingMode,
+    DecoderPrefill, EmbeddingPrelude, GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig,
+    LayerTensors, PoolingMode,
 };
 use crate::InferError;
 use metal::{
@@ -23,6 +24,8 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod decoder_prefill;
 
 // ---------------------------------------------------------------------------
 // Host-stall profiling (opt-in, zero-overhead when off)
@@ -2991,6 +2994,8 @@ pub struct MetalCompute {
     /// when the device lacks stage-boundary counter sampling. Never touched on
     /// the production (profiling-off) path.
     phase_timestamp_sampler: Option<PhaseTimestampSampler>,
+    /// Kernels, fp16 weights and scratch of the GPU-resident decoder prefill.
+    decoder_prefill: decoder_prefill::DecoderPrefillState,
 }
 
 impl MetalCompute {
@@ -3327,6 +3332,7 @@ impl MetalCompute {
             pool,
             resident_stack_memory,
             phase_timestamp_sampler,
+            decoder_prefill: Default::default(),
         })
     }
 
@@ -3456,6 +3462,14 @@ impl MetalCompute {
     /// Get or create a cached buffer for persistent data (weight matrices).
     /// Keyed by [`Self::weight_cache_key`] — weight Array2 data pointers are stable
     /// across forward passes, so this hits on every call after the first.
+    ///
+    /// Only for slices that stay alive and unchanged for as long as this backend,
+    /// which a model's own weights do: each model owns its `MetalCompute`, so the
+    /// cache dies with the weights it describes. Never pass a slice computed for
+    /// one call. Its address is handed to later allocations, so caching it leaks
+    /// a device buffer per call and can serve a later slice with the same address,
+    /// length and end values the earlier slice's contents. Upload per-call data
+    /// through the pool instead (`buf_slice_pooled`).
     fn buf_cached(&self, data: &[f32]) -> Result<Buffer, InferError> {
         let key = Self::weight_cache_key(data);
         let mut cache = self.weight_cache.lock();
@@ -4046,6 +4060,45 @@ impl MetalCompute {
         let tg = MTLSize::new(128, 1, 1);
         enc.dispatch_thread_groups(groups, tg);
         enc.end_encoding();
+    }
+
+    /// C = A × B^T against an already uploaded `B`, read back to the host. The
+    /// weight and per-call entry points differ only in how `B` reaches the
+    /// device, so both run exactly these kernels.
+    fn matmul_against(
+        &self,
+        a: &[f32],
+        buf_b: &Buffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        op: &str,
+    ) -> Result<Vec<f32>, InferError> {
+        let buf_a = self.buf_slice_pooled(a)?;
+        let buf_c = self.buf_zeros_pooled(m * n)?;
+        let buf_m = self.buf_u32(m as u32)?;
+        let buf_n = self.buf_u32(n as u32)?;
+        let buf_k = self.buf_u32(k as u32)?;
+
+        let bufs = [
+            buf_a.buffer(),
+            buf_b,
+            buf_c.buffer(),
+            &buf_m,
+            &buf_n,
+            &buf_k,
+        ];
+        time_phase(Phase::Matmul, || {
+            if use_mma(m, n, k) {
+                self.dispatch_mma("matmul_transb_simdgroup", &bufs, m, n, k, 1);
+            } else {
+                self.dispatch_2d("matmul_transb", &bufs, n, m);
+            }
+        });
+
+        let out = Self::read_buf(buf_c.buffer(), m * n);
+        Self::count_nonfinite(&format!("{op} m={m} n={n} k={k}"), &out);
+        Ok(out)
     }
 
     /// Dispatch a standalone MMA GEMM through the bounded submitter, syncing
@@ -5223,6 +5276,21 @@ impl MetalCompute {
 }
 
 impl GpuCompute for MetalCompute {
+    fn decoder_prefill_last_hidden(
+        &self,
+        input: &DecoderPrefill<'_>,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        self.run_decoder_prefill(input, 1)
+    }
+
+    fn decoder_prefill_tail_hidden(
+        &self,
+        input: &DecoderPrefill<'_>,
+        tail: usize,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        self.run_decoder_prefill(input, tail)
+    }
+
     fn forward_layer_batched(
         &self,
         hidden: &[f32],
@@ -5557,33 +5625,27 @@ impl GpuCompute for MetalCompute {
         k: usize,
     ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!("kin_infer.metal.matmul", m = m, n = n, k = k).entered();
-        let buf_a = self.buf_slice_pooled(a)?;
-        // Cache B (weight matrix): stable pointers across forward passes
+        // B is a model weight (the trait's contract), so it stays on the device
+        // across calls.
         let buf_b = self.buf_cached(b)?;
-        let buf_c = self.buf_zeros_pooled(m * n)?;
-        let buf_m = self.buf_u32(m as u32)?;
-        let buf_n = self.buf_u32(n as u32)?;
-        let buf_k = self.buf_u32(k as u32)?;
+        self.matmul_against(a, &buf_b, m, n, k, "matmul")
+    }
 
-        let bufs = [
-            buf_a.buffer(),
-            &buf_b,
-            buf_c.buffer(),
-            &buf_m,
-            &buf_n,
-            &buf_k,
-        ];
-        time_phase(Phase::Matmul, || {
-            if use_mma(m, n, k) {
-                self.dispatch_mma("matmul_transb_simdgroup", &bufs, m, n, k, 1);
-            } else {
-                self.dispatch_2d("matmul_transb", &bufs, n, m);
-            }
-        });
-
-        let out = Self::read_buf(buf_c.buffer(), m * n);
-        Self::count_nonfinite(&format!("matmul m={m} n={n} k={k}"), &out);
-        Ok(out)
+    fn matmul_activations(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, InferError> {
+        let _span = tracing::info_span!("kin_infer.metal.matmul_activations", m = m, n = n, k = k)
+            .entered();
+        // B was computed for this call, so it goes through the pool like A and
+        // recycles after the readback. The weight cache keys on the slice's
+        // address, which the allocator gives to later slices.
+        let buf_b = self.buf_slice_pooled(b)?;
+        self.matmul_against(a, buf_b.buffer(), m, n, k, "matmul_activations")
     }
 
     fn matmul_many(
@@ -6055,8 +6117,11 @@ impl GpuCompute for MetalCompute {
         let buf_gateup = self.buf_zeros_pooled(rows * 2 * inter)?;
         let buf_act = self.buf_zeros_pooled(rows * inter)?;
         let buf_out = self.buf_zeros_pooled(rows * hidden)?;
-        let buf_gamma = self.buf_cached(gamma)?;
-        let buf_beta = self.buf_cached(beta)?;
+        // The norm's `[hidden]` vectors are uploaded per call: a caller may build
+        // them for this call (a zero bias for a model without one), and the
+        // weight cache must only ever hold slices that outlive the backend.
+        let buf_gamma = self.buf_slice_pooled(gamma)?;
+        let buf_beta = self.buf_slice_pooled(beta)?;
         let buf_rows = self.buf_u32(rows as u32)?;
         let buf_inter = self.buf_u32(inter as u32)?;
         let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
@@ -6183,8 +6248,8 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(ln);
                 enc.set_buffer(0, Some(buf_out.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_gamma), 0);
-                enc.set_buffer(2, Some(&buf_beta), 0);
+                enc.set_buffer(1, Some(buf_gamma.buffer()), 0);
+                enc.set_buffer(2, Some(buf_beta.buffer()), 0);
                 enc.set_buffer(3, Some(&buf_hidden), 0);
                 enc.set_buffer(4, Some(&buf_eps), 0);
                 let tw = ln.thread_execution_width();
@@ -6233,8 +6298,9 @@ impl GpuCompute for MetalCompute {
         let buf_w = self.buf_cached(weight)?;
         let buf_residual = self.buf_slice_pooled(residual)?;
         let buf_proj = self.buf_zeros_pooled(rows * hidden)?;
-        let buf_gamma = self.buf_cached(gamma)?;
-        let buf_beta = self.buf_cached(beta)?;
+        // Per-call upload for the same reason as `fused_ffn_swiglu_add_norm`.
+        let buf_gamma = self.buf_slice_pooled(gamma)?;
+        let buf_beta = self.buf_slice_pooled(beta)?;
         let buf_rows = self.buf_u32(rows as u32)?;
         let buf_hidden = self.buf_u32(hidden as u32)?;
         let buf_cols = self.buf_u32(cols as u32)?;
@@ -6305,8 +6371,8 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(ln);
                 enc.set_buffer(0, Some(buf_proj.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_gamma), 0);
-                enc.set_buffer(2, Some(&buf_beta), 0);
+                enc.set_buffer(1, Some(buf_gamma.buffer()), 0);
+                enc.set_buffer(2, Some(buf_beta.buffer()), 0);
                 enc.set_buffer(3, Some(&buf_hidden), 0);
                 enc.set_buffer(4, Some(&buf_eps), 0);
                 let tw = ln.thread_execution_width();
@@ -7817,6 +7883,131 @@ mod tests {
         assert!((c[1] - 68.0).abs() < 1e-3, "got {}", c[1]);
         assert!((c[2] - 122.0).abs() < 1e-3, "got {}", c[2]);
         assert!((c[3] - 167.0).abs() < 1e-3, "got {}", c[3]);
+    }
+
+    fn assert_all_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-3, "{what}: [{i}] got {g}, want {w}");
+        }
+    }
+
+    /// `matmul`'s weight cache keys B on the slice's address, its length and
+    /// its first and last values, which is sound only for a model weight.
+    /// Rewriting the middle of one allocation reproduces what a per-call operand
+    /// meets when the allocator reuses an address: `matmul` keeps serving the
+    /// first upload. `matmul_activations` reads each call's data and adds nothing
+    /// to the cache. Runs one shape on the MMA kernel and one on the scalar one.
+    #[test]
+    fn matmul_activations_reads_the_operand_a_reused_address_gets_stale_from_the_weight_cache() {
+        let Some(metal) = get_metal() else { return };
+        let cpu = crate::gpu::CpuCompute;
+        for &(m, n, k) in &[(40usize, 48usize, 32usize), (3, 5, 4)] {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+            let mut b: Vec<f32> = (0..n * k).map(|i| ((i % 7) as f32 - 3.0) * 0.2).collect();
+            let last = b.len() - 1;
+            let first_product = cpu.matmul(&a, &b, m, n, k).unwrap();
+            let cached_before = metal.weight_cache.lock().len();
+            assert_all_close(
+                &metal.matmul(&a, &b, m, n, k).unwrap(),
+                &first_product,
+                "matmul, first upload",
+            );
+
+            // Same address, length, first and last values; new contents.
+            b[1..last].iter_mut().for_each(|x| *x += 1.0);
+            let second_product = cpu.matmul(&a, &b, m, n, k).unwrap();
+            assert_all_close(
+                &metal.matmul(&a, &b, m, n, k).unwrap(),
+                &first_product,
+                "matmul serves the cached first upload",
+            );
+            let cached = metal.weight_cache.lock().len();
+            assert_eq!(cached, cached_before + 1);
+
+            assert_all_close(
+                &metal.matmul_activations(&a, &b, m, n, k).unwrap(),
+                &second_product,
+                "matmul_activations, second contents",
+            );
+            b[1..last].iter_mut().for_each(|x| *x -= 2.0);
+            assert_all_close(
+                &metal.matmul_activations(&a, &b, m, n, k).unwrap(),
+                &cpu.matmul(&a, &b, m, n, k).unwrap(),
+                "matmul_activations, third contents",
+            );
+            assert_eq!(metal.weight_cache.lock().len(), cached);
+        }
+    }
+
+    /// The fused add-norm ops upload `gamma` and `beta` per call, so a norm
+    /// vector a caller builds for the call (a zero bias for a model without one)
+    /// is read fresh even when it reuses an earlier vector's address, length and
+    /// end values, and never enters the weight cache.
+    #[test]
+    fn fused_add_norm_reads_per_call_norm_vectors_fresh() {
+        let Some(metal) = get_metal() else { return };
+        let cpu = crate::gpu::CpuCompute;
+        let (rows, cols, hidden, inter) = (3usize, 8usize, 8usize, 16usize);
+        let x: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.37).sin()).collect();
+        let weight: Vec<f32> = (0..hidden * cols)
+            .map(|i| (i as f32 * 0.11).cos() * 0.3)
+            .collect();
+        let w_gate: Vec<f32> = (0..inter * hidden)
+            .map(|i| (i as f32 * 0.07).sin() * 0.2)
+            .collect();
+        let w_up: Vec<f32> = (0..inter * hidden)
+            .map(|i| (i as f32 * 0.05).cos() * 0.2)
+            .collect();
+        let w_down: Vec<f32> = (0..hidden * inter)
+            .map(|i| (i as f32 * 0.03).sin() * 0.2)
+            .collect();
+        let residual: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i as f32 * 0.23).cos())
+            .collect();
+        let gamma = vec![1.0f32; hidden];
+        let mut beta = vec![0.0f32; hidden];
+        let eps = 1e-5;
+
+        for round in 0..2 {
+            if round == 1 {
+                // Same allocation, same first and last values, new middle.
+                beta[1..hidden - 1].iter_mut().for_each(|b| *b = 0.5);
+            }
+            let cached_before = metal.weight_cache.lock().len();
+            assert_all_close(
+                &metal
+                    .fused_linear_add_norm(
+                        &x, &weight, &residual, &gamma, &beta, rows, cols, hidden, eps,
+                    )
+                    .unwrap(),
+                &cpu.fused_linear_add_norm(
+                    &x, &weight, &residual, &gamma, &beta, rows, cols, hidden, eps,
+                )
+                .unwrap(),
+                "fused_linear_add_norm",
+            );
+            assert_all_close(
+                &metal
+                    .fused_ffn_swiglu_add_norm(
+                        &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter,
+                        eps,
+                    )
+                    .unwrap(),
+                &cpu.fused_ffn_swiglu_add_norm(
+                    &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
+                )
+                .unwrap(),
+                "fused_ffn_swiglu_add_norm",
+            );
+            // Only the matrices are cached, and only on their first use.
+            let expected = if round == 0 {
+                cached_before + 2
+            } else {
+                cached_before
+            };
+            assert_eq!(metal.weight_cache.lock().len(), expected);
+        }
     }
 
     #[test]

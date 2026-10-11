@@ -88,14 +88,24 @@ pub enum DaemonSpine<'a> {
     /// reason a drained writer does not change. Carries the reason the daemon
     /// recorded, which opens with [`SPINE_CANDIDATE_REPRESENTATION_GAP`].
     Refused(&'a str),
+    /// A [`Self::Refused`] spine on a daemon that registers no other
+    /// repository for it to federate. A spine there would have held this
+    /// repository alone, so the refusal hides no reference from another one:
+    /// it is a fact about the install, not a gap in an answer. Carries the
+    /// reason the daemon recorded.
+    RefusedWithoutPeers(&'a str),
     /// No spine and none pending: the spine is switched off.
     Absent,
 }
 
-/// The code a daemon opens its recorded reason with when the spine refuses a
-/// graph that holds an inferred member, whose candidate authority the spine
-/// format cannot carry. The refusal stands for as long as the graph holds the
-/// member.
+/// The code a daemon opens its recorded reason with when its spine refuses a
+/// graph over a member it cannot represent. The refusal stands for as long as
+/// the graph holds the member.
+///
+/// An inferred member no longer raises it: the local spine registers the member
+/// as a candidate ([`crate::RepoGraphFacts`]), and a durable publication
+/// withholds that member alone. A daemon that still records this code is one
+/// built before either, and a reader classifies its reason the same way.
 pub const SPINE_CANDIDATE_REPRESENTATION_GAP: &str = "spine_candidate_representation_gap";
 
 impl<'a> DaemonSpine<'a> {
@@ -119,6 +129,20 @@ impl<'a> DaemonSpine<'a> {
             (None, None) => Self::Absent,
         }
     }
+
+    /// [`Self::from_read`] for a daemon that knows how many other
+    /// repositories its spine would federate: a standing refusal with none of
+    /// them is [`Self::RefusedWithoutPeers`].
+    pub fn from_read_among(
+        backend: Option<&'a dyn crate::SpineBackend>,
+        reason: Option<&'a str>,
+        peer_repositories: usize,
+    ) -> Self {
+        match Self::from_read(backend, reason) {
+            Self::Refused(reason) if peer_repositories == 0 => Self::RefusedWithoutPeers(reason),
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +164,29 @@ mod tests {
         ));
         assert!(matches!(
             DaemonSpine::from_read(None, None),
+            DaemonSpine::Absent
+        ));
+    }
+
+    #[test]
+    fn a_refusal_with_no_peer_repository_is_told_apart_from_one_with_peers() {
+        let refusal = "spine_candidate_representation_gap: repo r contains inferred member m";
+        assert!(matches!(
+            DaemonSpine::from_read_among(None, Some(refusal), 0),
+            DaemonSpine::RefusedWithoutPeers(reason) if reason == refusal
+        ));
+        assert!(matches!(
+            DaemonSpine::from_read_among(None, Some(refusal), 2),
+            DaemonSpine::Refused(reason) if reason == refusal
+        ));
+        // Only a standing refusal changes: a deferral and an absent spine read
+        // the same whatever the daemon registers.
+        assert!(matches!(
+            DaemonSpine::from_read_among(None, Some("a writer held graph authority"), 0),
+            DaemonSpine::Deferred(_)
+        ));
+        assert!(matches!(
+            DaemonSpine::from_read_among(None, None, 0),
             DaemonSpine::Absent
         ));
     }

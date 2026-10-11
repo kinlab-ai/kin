@@ -36,7 +36,8 @@ pub(crate) enum ServerCommand {
     /// daemon logs so a reader can tell which binary ran.
     Resolved { program: PathBuf, chosen: String },
     /// Nothing by the adapter's command name is on this daemon's `PATH`.
-    NotInstalled,
+    /// `searched` names the directories it looked in.
+    NotInstalled { searched: String },
     /// Something by that name is on `PATH` and nothing it leads to can serve.
     /// `reason` names what was tried and what would repair it.
     Unresolvable { reason: String },
@@ -47,6 +48,10 @@ pub(crate) enum ServerCommand {
 pub(crate) trait ToolchainHost {
     /// Where `binary` resolves on this process's `PATH`.
     fn find_on_path(&self, binary: &str) -> Option<PathBuf>;
+
+    /// The directories [`Self::find_on_path`] searches, as a reason names
+    /// them.
+    fn searched(&self) -> String;
 
     /// The rustup executable behind `program` when `program` is one of
     /// rustup's proxies, and `None` when it is a server binary of its own.
@@ -82,7 +87,9 @@ pub(crate) fn resolve_server_command(
     host: &dyn ToolchainHost,
 ) -> ServerCommand {
     let Some(found) = host.find_on_path(binary) else {
-        return ServerCommand::NotInstalled;
+        return ServerCommand::NotInstalled {
+            searched: host.searched(),
+        };
     };
     let Some(rustup) = host.rustup_behind(&found) else {
         return ServerCommand::Resolved {
@@ -170,6 +177,10 @@ const RUSTUP_QUERY_BUDGET: Duration = Duration::from_secs(10);
 impl ToolchainHost for SystemToolchainHost {
     fn find_on_path(&self, binary: &str) -> Option<PathBuf> {
         which::which(binary).ok()
+    }
+
+    fn searched(&self) -> String {
+        kin_lsp::discovery::searched_on_this_path()
     }
 
     fn rustup_behind(&self, program: &Path) -> Option<PathBuf> {
@@ -375,6 +386,10 @@ mod tests {
             self.on_path.get(binary).cloned()
         }
 
+        fn searched(&self) -> String {
+            "/fake/bin, /usr/bin".to_string()
+        }
+
         fn rustup_behind(&self, program: &Path) -> Option<PathBuf> {
             self.proxies.get(program).cloned()
         }
@@ -573,7 +588,9 @@ mod tests {
     fn nothing_on_path_is_not_installed() {
         assert_eq!(
             resolve_server_command("gopls", Path::new(WORKSPACE), &FakeHost::default()),
-            ServerCommand::NotInstalled
+            ServerCommand::NotInstalled {
+                searched: "/fake/bin, /usr/bin".to_string()
+            }
         );
     }
 

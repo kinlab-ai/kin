@@ -14,6 +14,7 @@ repository = "https://github.com/firelock-ai/kin-search"
 doctest = false
 
 [dependencies]
+kin-blobs = { workspace = true }
 parking_lot = "0.12"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

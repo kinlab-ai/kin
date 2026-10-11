@@ -63,6 +63,11 @@ import tempfile
 import time
 import uuid
 
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
+
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -278,6 +283,27 @@ def rendered_remedy(line):
     return printed[:-1]
 
 
+def standing_sentence_problems(text, standing):
+    """Grade direction and provenance; legacy epoch values stay on the wire."""
+    expected = {
+        "current": "creation derivation that matches this build of Kin",
+        "behind": "records an earlier derivation at creation",
+        "ahead": "records a newer derivation at creation",
+        "absent": "records no derivation provenance",
+        "unreadable": "derivation record could not be read",
+    }[standing]
+    problems = []
+    if expected not in text:
+        problems.append("the sentence does not disclose %s provenance" % standing)
+    if standing == "behind" and "cannot certify" not in text:
+        problems.append("a behind store does not disclose the certification gap")
+    if standing == "ahead" and "predates" not in text:
+        problems.append("an ahead store does not say the binary predates it")
+    if "hydration semantics version" in text:
+        problems.append("the sentence presents a frozen epoch as a product version")
+    return problems
+
+
 def status_problems(text, standing, created_under=None, derives=None):
     """Return problems in one ``kin graph status`` rendering."""
     lines = [line.strip() for line in (text or "").splitlines()]
@@ -288,21 +314,7 @@ def status_problems(text, standing, created_under=None, derives=None):
         return ["expected one hydration-semantics warning, got %d" % len(hits)]
     line = hits[0]
     problems = []
-    if standing == "absent":
-        if "records no hydration semantics version" not in line:
-            problems.append("an unstamped store is not named as unstamped")
-    elif standing == "unreadable":
-        if "hydration semantics record could not be read" not in line:
-            problems.append("an unreadable record is not named as unreadable")
-    else:
-        if "records hydration semantics version %d at creation" % created_under not in line:
-            problems.append("the warning does not name recorded version %d" % created_under)
-        if standing == "behind" and "cannot certify" not in line:
-            problems.append("a behind store does not disclose the certification gap")
-        if standing == "ahead" and "this binary predates the store's recorded semantics" not in line:
-            problems.append("an ahead store does not say the binary predates it")
-    if derives is not None and str(derives) not in line:
-        problems.append("the warning does not name binary version %d" % derives)
+    problems.extend(standing_sentence_problems(line, standing))
 
     expected = CANONICAL_REMEDY[standing]
     printed = rendered_remedy(line)
@@ -333,23 +345,7 @@ def doctor_problems(report, standing, created_under=None, derives=None):
         problems.append("status is %r, wanted %r" % (row.get("status"), wanted))
     detail = row.get("detail") or ""
     fix = row.get("manual_fix")
-    if standing == "absent":
-        if "records no hydration semantics version" not in detail:
-            problems.append("an unstamped row is not named as unstamped")
-    elif standing == "unreadable":
-        if "record could not be read" not in detail:
-            problems.append("an unreadable row is not named as unreadable")
-    elif standing != "current":
-        if created_under is None or str(created_under) not in detail:
-            problems.append("detail does not name recorded version %r" % created_under)
-        elif "records hydration semantics version %d at creation" % created_under not in detail:
-            problems.append("detail does not identify the number as a creation-time record")
-        if standing == "behind" and "cannot certify" not in detail:
-            problems.append("a behind row does not disclose the certification gap")
-        if standing == "ahead" and "predates" not in detail:
-            problems.append("an ahead row does not say the binary predates the record")
-    if derives is not None and str(derives) not in detail:
-        problems.append("detail does not name binary version %d" % derives)
+    problems.extend(standing_sentence_problems(detail, standing))
 
     expected = CANONICAL_REMEDY[standing]
     if expected is None:
@@ -634,10 +630,15 @@ class Suite(object):
         self.kin_home = os.path.join(workdir, "kin-home")
         os.makedirs(self.kin_home, exist_ok=True)
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = self.kin_home
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:
@@ -664,7 +665,11 @@ class Suite(object):
 
     def mcp(self, tool, args, timeout=300, repo=None):
         repo = repo or self.repo
+        # A reference probe that reads the detailed blocks is served by `full`;
+        # the agent profiles always answer references answer-only.
         env = dict(self.env)
+        if tool in ("find_references", "refs") and args.get("answer_only") is False:
+            env["KIN_MCP_TOOL_PROFILE"] = "full"
         env["KIN_MCP_REPO"] = repo
         proc = subprocess.Popen(
             [self.kin, "mcp", "start", "--repo", repo],
@@ -1498,24 +1503,23 @@ def self_test():
 
     current_line = "Graph healthy\n"
     behind_line = status_line(
-        "this store records hydration semantics version 9 at creation and this build derives "
-        "version 10, so the store cannot certify that the state it serves reflects this build's "
-        "replay semantics until `kin upgrade` re-derives it",
+        "this store records an earlier derivation at creation, so it cannot certify that "
+        "the state it serves reflects this build of Kin until `kin upgrade` re-derives it",
         REMEDY_BEHIND,
     )
     ahead_line = status_line(
-        "this store records hydration semantics version 11 at creation and this build derives "
-        "the older version 10, so this binary predates the store's recorded semantics",
+        "this store records a newer derivation at creation, so this binary predates the "
+        "store's recorded semantics",
         REMEDY_AHEAD,
     )
     absent_line = status_line(
-        "this store records no hydration semantics version, so its persisted history cannot be "
-        "shown to match the version 10 this build derives",
+        "this store records no derivation provenance, so its persisted history cannot be "
+        "shown to match what this build of Kin derives",
         REMEDY_UNSTAMPED,
     )
     unreadable_line = status_line(
-        "this store's hydration semantics record could not be read (future schema), so its "
-        "creation-time version cannot be shown to match the version 10 this build derives",
+        "this store's derivation record could not be read (future schema), so its "
+        "recorded derivation cannot be shown to match this build of Kin",
         REMEDY_UNREADABLE,
     )
     expect("status current", status_problems(current_line, "current", 10, 10), [])
@@ -1549,6 +1553,9 @@ def self_test():
                 line.replace(CANONICAL_REMEDY[standing], wrong), standing, recorded, 10
             ),
         )
+
+    rejects("status wrong derivation direction", status_problems(behind_line.replace("earlier", "newer"), "behind", 9, 10))
+    rejects("status frozen epoch in product text", status_problems(behind_line.replace("at creation", "at creation (hydration semantics version 9)"), "behind", 9, 10))
 
     # The mixed safe-plus-unsafe arms. Each begins with the exact canonical
     # advice and then contradicts it, which is what a prefix or substring grader
@@ -1608,34 +1615,19 @@ def self_test():
         }
 
     current_row = doctor_row(
-        "current",
-        "this store records hydration semantics version 10 at creation, matching the version "
-        "this build derives",
-        None,
+        "current", "this store records a creation derivation that matches this build of Kin", None,
     )
     behind_row = doctor_row(
-        "behind",
-        "this store records hydration semantics version 9 at creation and this build derives "
-        "version 10, so the store cannot certify its persisted history",
-        REMEDY_BEHIND,
+        "behind", "this store records an earlier derivation at creation, so it cannot certify its served state", REMEDY_BEHIND,
     )
     ahead_row = doctor_row(
-        "ahead",
-        "this store records hydration semantics version 11 at creation and this build derives "
-        "the older version 10, so this binary predates the record",
-        REMEDY_AHEAD,
+        "ahead", "this store records a newer derivation at creation, so this binary predates the record", REMEDY_AHEAD,
     )
     absent_row = doctor_row(
-        "absent",
-        "this store records no hydration semantics version, so its persisted history cannot be "
-        "shown to match the version 10 this build derives",
-        REMEDY_UNSTAMPED,
+        "absent", "this store records no derivation provenance, so its persisted history cannot be shown to match this build", REMEDY_UNSTAMPED,
     )
     unreadable_row = doctor_row(
-        "unreadable",
-        "this store's hydration semantics record could not be read (future schema), so its "
-        "creation-time version cannot be shown to match version 10",
-        REMEDY_UNREADABLE,
+        "unreadable", "this store's derivation record could not be read (future schema), so its recorded derivation cannot be shown to match this build", REMEDY_UNREADABLE,
     )
     expect("doctor current", doctor_problems(current_row, "current", 10, 10), [])
     expect("doctor behind", doctor_problems(behind_row, "behind", 9, 10), [])

@@ -1072,7 +1072,8 @@ fn replay_repository_workspace_transaction_and_recover_projection_with_hooks(
 ) -> Result<(RepositoryCommitReceipt, LocalRepositoryAuthorityFreeze)> {
     #[cfg(any(unix, windows))]
     {
-        let projection_freeze = ExactProjectionFreeze::acquire_existing_for_replay_recovery(root)?;
+        let projection_freeze =
+            ExactProjectionFreeze::acquire_existing_for_replay_recovery(root, authority)?;
         after_projection_freeze();
 
         let transaction_hash = transaction
@@ -1360,7 +1361,7 @@ pub fn verify_unchanged_source_tree_and_commit_repository_transaction<'a>(
 
     #[cfg(any(unix, windows))]
     {
-        let freeze = ExactProjectionFreeze::acquire_existing(root)?;
+        let freeze = ExactProjectionFreeze::acquire_existing_for_authority(root, authority)?;
         let entry_refs = entries.iter().collect::<Vec<_>>();
         let identities = freeze
             .projection
@@ -1434,7 +1435,7 @@ pub fn verify_observed_target_tree_and_commit_repository_transaction<'a, 'b>(
 
     #[cfg(any(unix, windows))]
     {
-        let freeze = ExactProjectionFreeze::acquire_existing(root)?;
+        let freeze = ExactProjectionFreeze::acquire_existing_for_authority(root, authority)?;
         let entry_refs = entries.iter().collect::<Vec<_>>();
         let identities = freeze
             .projection
@@ -2114,7 +2115,12 @@ impl ExactProjectionGitStage {
         #[cfg(unix)]
         {
             let mut stage = Self::open_and_seal(path)?;
-            kin_git::verify_repository_git_export(path, proof, expected_tree).map_err(|error| {
+            kin_git::verify_repository_git_export(
+                &kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient()),
+                proof,
+                expected_tree,
+            )
+            .map_err(|error| {
                 KinError::Other(format!(
                     "verify staged Git repository against repository-v6 export proof: {error}"
                 ))
@@ -2261,10 +2267,31 @@ impl ExactProjectionFreeze {
     /// Acquire the existing projection lock without creating `.kin`, its
     /// reconciliation directory, lock file, or authority key.
     pub fn acquire_existing(root: &Path) -> Result<Self> {
+        Self::acquire_existing_with_authority(root, None)
+    }
+
+    /// Acquire projection custody from the caller's already-selected local
+    /// authority, without rediscovering a store through process configuration.
+    pub fn acquire_existing_for_authority(
+        root: &Path,
+        authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    ) -> Result<Self> {
+        Self::acquire_existing_with_authority(root, Some(authority))
+    }
+
+    fn acquire_existing_with_authority(
+        root: &Path,
+        authority: Option<&RepositoryAuthorityManager<LocalFileBackend>>,
+    ) -> Result<Self> {
         #[cfg(any(unix, windows))]
         {
-            let projection =
-                ProjectionRoot::open_existing_for_freeze(root, PROJECTION_LOCK_WAIT_DEADLINE)?;
+            let projection = ProjectionRoot::open_existing_with_authority_and_custody(
+                root,
+                authority,
+                PROJECTION_LOCK_WAIT_DEADLINE,
+                ExistingReconciliationDisposition::Refuse,
+                &mut None::<()>,
+            )?;
             let root_identity = tracked_open_directory_identity(&projection.root)
                 .map_err(|error| KinError::io(root, error))?;
             let freeze = Self {
@@ -2276,7 +2303,7 @@ impl ExactProjectionFreeze {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = root;
+            let _ = (root, authority);
             Err(unsupported_safe_projection_error())
         }
     }
@@ -2325,9 +2352,12 @@ impl ExactProjectionFreeze {
     ) -> Result<Self> {
         #[cfg(any(unix, windows))]
         {
-            let projection = ProjectionRoot::open_existing_for_replay_recovery(
+            let projection = ProjectionRoot::open_existing_with_authority_and_custody(
                 root,
+                Some(authority),
                 PROJECTION_LOCK_WAIT_DEADLINE,
+                ExistingReconciliationDisposition::Retain,
+                &mut None::<()>,
             )?;
             let root_identity = tracked_open_directory_identity(&projection.root)
                 .map_err(|error| KinError::io(root, error))?;
@@ -2364,12 +2394,18 @@ impl ExactProjectionFreeze {
     ///
     /// Replay recovery must freeze repository authority only after this guard
     /// exists, then finalize the retained WAL while both guards are alive.
-    fn acquire_existing_for_replay_recovery(root: &Path) -> Result<Self> {
+    fn acquire_existing_for_replay_recovery(
+        root: &Path,
+        authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    ) -> Result<Self> {
         #[cfg(any(unix, windows))]
         {
-            let projection = ProjectionRoot::open_existing_for_replay_recovery(
+            let projection = ProjectionRoot::open_existing_with_authority_and_custody(
                 root,
+                Some(authority),
                 PROJECTION_LOCK_WAIT_DEADLINE,
+                ExistingReconciliationDisposition::Retain,
+                &mut None::<()>,
             )?;
             let root_identity = tracked_open_directory_identity(&projection.root)
                 .map_err(|error| KinError::io(root, error))?;
@@ -2382,7 +2418,7 @@ impl ExactProjectionFreeze {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = root;
+            let _ = (root, authority);
             Err(unsupported_safe_projection_error())
         }
     }
@@ -2950,6 +2986,15 @@ impl ExactProjectionFreeze {
         target.revalidate()?;
         staged_git.revalidate_named()?;
         self.validate_distinct_eject_capabilities(&staged_git, target)?;
+        // The control namespace may be the central store, outside the working
+        // tree. Retain its actual parent and name before any Git mutation;
+        // rollback must restore that exact namespace rather than invent `.kin`.
+        let control_source = self.retain_control_namespace()?;
+        if control_source.identity.device != target.identity.device {
+            return Err(KinError::Other(
+                "exact eject cannot archive a store across filesystems; no repository namespace was changed".to_string(),
+            ));
+        }
 
         let previous_git = self.projection.open_optional_retained_git_entry(
             std::ffi::OsStr::new(".git"),
@@ -2983,6 +3028,7 @@ impl ExactProjectionFreeze {
             self.revalidate_resolved_tree_from_blobs(verification, tree, blobs)?;
             target.revalidate()?;
             staged_git.revalidate_named()?;
+            control_source.revalidate()?;
             if let Some(previous) = previous_git.as_ref() {
                 self.projection.validate_retained_git_entry_at(
                     previous,
@@ -3063,12 +3109,13 @@ impl ExactProjectionFreeze {
             eject_journal.phase = ExactEjectJournalPhase::DetachPending;
             self.projection
                 .persist_exact_eject_journal(&eject_journal, false)?;
+            control_source.revalidate()?;
             kin_detached = true;
             self.projection
                 .move_open_directory_from_expected_source_exact(
                     NamedEntryLocation {
-                        parent: &self.projection.root,
-                        name: std::ffi::OsStr::new(".kin"),
+                        parent: &control_source.parent,
+                        name: &control_source.name,
                     },
                     NamedEntryLocation {
                         parent: &target.directory,
@@ -3076,7 +3123,7 @@ impl ExactProjectionFreeze {
                     },
                     &self.projection.kin_control,
                     self.projection.kin_control_identity,
-                    &self.projection.display_root.join(".kin"),
+                    &self.projection.display_projection_control,
                 )?;
             hook(ExactProjectionEjectHookPoint::AfterKinDetached);
 
@@ -3105,6 +3152,7 @@ impl ExactProjectionFreeze {
                 archived_kin_name,
                 archived_git_name,
                 previous_git.as_ref(),
+                &control_source,
                 kin_detached,
                 staged_git_installed,
                 previous_git_archived,
@@ -3300,7 +3348,10 @@ impl ExactProjectionFreeze {
         }
         if let (Some(proof), Some(expected_tree)) = (&staged_git.proof, &staged_git.expected_tree) {
             kin_git::verify_repository_git_export(
-                &self.projection.display_root.join(".git"),
+                &kin_io::WorktreeRoot::new(
+                    self.projection.display_root.join(".git"),
+                    &kin_io::Grant::ambient(),
+                ),
                 proof,
                 expected_tree,
             )
@@ -3356,6 +3407,7 @@ impl ExactProjectionFreeze {
         archived_kin_name: &std::ffi::OsStr,
         archived_git_name: &std::ffi::OsStr,
         previous_git: Option<&RetainedGitEntry>,
+        control_source: &ExactProjectionDetachTarget,
         kin_detached: bool,
         staged_git_installed: bool,
         previous_git_archived: bool,
@@ -3370,12 +3422,12 @@ impl ExactProjectionFreeze {
                         name: archived_kin_name,
                     },
                     NamedEntryLocation {
-                        parent: &self.projection.root,
-                        name: std::ffi::OsStr::new(".kin"),
+                        parent: &control_source.parent,
+                        name: &control_source.name,
                     },
                     &self.projection.kin_control,
                     self.projection.kin_control_identity,
-                    &self.projection.display_root.join(".kin"),
+                    &self.projection.display_projection_control,
                 )
             {
                 rollback_errors.push(format!("restore `.kin`: {rollback}"));
@@ -3500,6 +3552,20 @@ impl ExactProjectionFreeze {
     }
 
     #[cfg(any(unix, windows))]
+    fn retain_control_namespace(&self) -> Result<ExactProjectionDetachTarget> {
+        let source = ExactProjectionDetachTarget::open_existing(
+            &self.projection.display_projection_control,
+        )?;
+        if source.identity != self.projection.kin_control_identity {
+            return Err(KinError::Other(
+                "Kin control namespace changed identity before detach".to_string(),
+            ));
+        }
+        source.revalidate()?;
+        Ok(source)
+    }
+
+    #[cfg(any(unix, windows))]
     fn detach_after_revalidation(
         self,
         target: &ExactProjectionDetachTarget,
@@ -3526,11 +3592,12 @@ impl ExactProjectionFreeze {
         }
         target.revalidate()?;
         self.revalidate_namespace()?;
+        let control_source = self.retain_control_namespace()?;
         self.projection
             .move_open_directory_from_expected_source_exact(
                 NamedEntryLocation {
-                    parent: &self.projection.root,
-                    name: std::ffi::OsStr::new(".kin"),
+                    parent: &control_source.parent,
+                    name: &control_source.name,
                 },
                 NamedEntryLocation {
                     parent: &target.directory,
@@ -3538,7 +3605,7 @@ impl ExactProjectionFreeze {
                 },
                 &self.projection.kin_control,
                 self.projection.kin_control_identity,
-                &self.projection.display_root.join(".kin"),
+                &self.projection.display_projection_control,
             )?;
         post_move_hook();
         let post_move = self
@@ -3554,12 +3621,12 @@ impl ExactProjectionFreeze {
                         name: destination_name,
                     },
                     NamedEntryLocation {
-                        parent: &self.projection.root,
-                        name: std::ffi::OsStr::new(".kin"),
+                        parent: &control_source.parent,
+                        name: &control_source.name,
                     },
                     &self.projection.kin_control,
                     self.projection.kin_control_identity,
-                    &self.projection.display_root.join(".kin"),
+                    &self.projection.display_projection_control,
                 );
             return match restoration {
                 Ok(()) => Err(error),
@@ -5355,6 +5422,30 @@ struct ProjectionRoot {
     kin_control_identity: TrackedEntryIdentity,
     control_identity: TrackedEntryIdentity,
     authority_key: [u8; 32],
+    /// The store directory serving as this projection's control directory
+    /// when the store is kept outside the working tree. The control plane is
+    /// then opened, and revalidated, by that path, and nothing is created in
+    /// the tree. `None` for the tree's own `.kin` and for session projections.
+    external_control: Option<PathBuf>,
+}
+
+/// The store kept outside the working tree at `root`, when `root` has no `.kin`
+/// of its own and its store is external. Its projection control plane lives in
+/// that store rather than in a `.kin` the projection would otherwise create.
+#[cfg(any(unix, windows))]
+fn external_projection_control(
+    root: &Path,
+    projection_control_name: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    if projection_control_name != std::ffi::OsStr::new(".kin") {
+        return None;
+    }
+    if std::fs::symlink_metadata(root.join(".kin")).is_ok() {
+        return None;
+    }
+    crate::layout::locate_store(root)
+        .filter(crate::layout::KinLayout::is_external)
+        .map(|layout| layout.root().to_path_buf())
 }
 
 #[cfg(any(unix, windows))]
@@ -5676,6 +5767,13 @@ fn tracked_open_file_identity(metadata: &std::fs::Metadata) -> TrackedEntryIdent
         device: metadata.dev(),
         inode: metadata.ino(),
     }
+}
+
+/// Flush a capability-opened file. cap-std wraps a standard library `File`,
+/// and kin_blobs::durable flushes that handle, borrowed here without a copy.
+pub(crate) fn sync_capability_file(file: &cap_std::fs::File) -> std::io::Result<()> {
+    use cap_std::io_lifetimes::AsFilelike;
+    kin_blobs::durable::sync_all(&file.as_filelike_view::<std::fs::File>())
 }
 
 #[cfg(windows)]
@@ -6168,8 +6266,7 @@ fn seal_exact_git_directory_recursive(
                 })?;
                 content_digest.update(&buffer[..read]);
             }
-            file.sync_all()
-                .map_err(|error| KinError::io(&child_display, error))?;
+            sync_capability_file(&file).map_err(|error| KinError::io(&child_display, error))?;
             let revalidated = file
                 .metadata()
                 .map_err(|error| KinError::io(&child_display, error))?;
@@ -6468,7 +6565,7 @@ fn load_or_create_reconciliation_authority_key(
                             |error| KinError::io(display_control.join(&temporary), error.into()),
                         )?;
                         file.write_all(&key)
-                            .and_then(|()| file.sync_all())
+                            .and_then(|()| sync_capability_file(&file))
                             .map_err(|error| {
                                 KinError::io(display_control.join(&temporary), error)
                             })?;
@@ -6476,7 +6573,7 @@ fn load_or_create_reconciliation_authority_key(
                             control.hard_link(&temporary, control, RECONCILIATION_AUTHORITY_FILE);
                         match publication {
                             Ok(()) => {
-                                file.sync_all().map_err(|error| {
+                                sync_capability_file(&file).map_err(|error| {
                                     KinError::io(
                                         display_control.join(RECONCILIATION_AUTHORITY_FILE),
                                         error,
@@ -6913,12 +7010,18 @@ impl ProjectionRoot {
         projection_control_name: &std::ffi::OsStr,
         lock_deadline: std::time::Duration,
     ) -> Result<Self> {
-        let display_projection_control = root.join(projection_control_name);
-        let kin_control = open_or_create_private_directory(
-            &capability,
-            projection_control_name,
-            &display_projection_control,
-        )?;
+        let external_control = external_projection_control(root, projection_control_name);
+        let display_projection_control = external_control
+            .clone()
+            .unwrap_or_else(|| root.join(projection_control_name));
+        let kin_control = match &external_control {
+            Some(store) => open_projection_root_nofollow(store)?,
+            None => open_or_create_private_directory(
+                &capability,
+                projection_control_name,
+                &display_projection_control,
+            )?,
+        };
         let kin_control_identity = tracked_open_directory_identity(&kin_control)
             .map_err(|error| KinError::io(&display_projection_control, error))?;
         let control = open_or_create_private_directory(
@@ -6949,6 +7052,7 @@ impl ProjectionRoot {
             kin_control_identity,
             control_identity,
             authority_key,
+            external_control,
         };
         #[cfg(unix)]
         projection.recover_exact_eject()?;
@@ -6957,16 +7061,10 @@ impl ProjectionRoot {
     }
 
     fn retarget_display_root(&mut self, display_root: PathBuf) {
-        self.display_projection_control = display_root.join(&self.projection_control_name);
+        if self.external_control.is_none() {
+            self.display_projection_control = display_root.join(&self.projection_control_name);
+        }
         self.display_root = display_root;
-    }
-
-    fn open_existing_for_freeze(root: &Path, lock_deadline: std::time::Duration) -> Result<Self> {
-        Self::open_existing_with_reconciliation_disposition(
-            root,
-            lock_deadline,
-            ExistingReconciliationDisposition::Refuse,
-        )
     }
 
     #[cfg(test)]
@@ -6981,6 +7079,7 @@ impl ProjectionRoot {
         )
     }
 
+    #[cfg(test)]
     fn open_existing_for_replay_recovery(
         root: &Path,
         lock_deadline: std::time::Duration,
@@ -6992,24 +7091,78 @@ impl ProjectionRoot {
         )
     }
 
+    #[cfg(test)]
     fn open_existing_with_reconciliation_disposition(
         root: &Path,
         lock_deadline: std::time::Duration,
         disposition: ExistingReconciliationDisposition,
     ) -> Result<Self> {
-        Self::open_existing_with_custody(root, lock_deadline, disposition, &mut None::<()>)
+        Self::open_existing_with_authority_and_custody(
+            root,
+            None,
+            lock_deadline,
+            disposition,
+            &mut None::<()>,
+        )
     }
 
-    fn open_existing_with_custody<C>(
+    fn open_existing_with_authority_and_custody<C>(
         root: &Path,
+        authority: Option<&RepositoryAuthorityManager<LocalFileBackend>>,
         lock_deadline: std::time::Duration,
         disposition: ExistingReconciliationDisposition,
         custody: &mut Option<C>,
     ) -> Result<Self> {
         let capability = open_projection_root_nofollow(root)?;
-        let display_projection_control = root.join(".kin");
-        let kin_control = open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
-            .map_err(|error| KinError::io(&display_projection_control, error))?;
+        let external_control = match authority {
+            Some(authority) => {
+                // Kin's local backend lives in the selected store's kindb
+                // directory. Keep that selection through projection recovery
+                // and publication instead of consulting an ambient registry.
+                let storage = authority.local_storage_path();
+                if storage.file_name() != Some(std::ffi::OsStr::new("kindb")) {
+                    return Err(KinError::Other(format!(
+                        "selected local authority {} is not in a store's kindb directory",
+                        storage.display()
+                    )));
+                }
+                let store = storage.parent().ok_or_else(|| {
+                    KinError::Other("selected local authority has no store parent".to_string())
+                })?;
+                let selected = crate::KinLayout::new(store.to_path_buf());
+                if !selected.is_external() && !crate::layout::is_in_tree_store_root(root, store) {
+                    return Err(KinError::Other(format!(
+                        "selected projection store {} has no working-tree record and is not the tree's .kin directory",
+                        store.display()
+                    )));
+                }
+                let recorded = selected
+                    .working_dir()
+                    .canonicalize()
+                    .map_err(|error| KinError::io(selected.working_dir(), error))?;
+                let working = root
+                    .canonicalize()
+                    .map_err(|error| KinError::io(root, error))?;
+                if recorded != working {
+                    return Err(KinError::Other(format!(
+                        "selected projection store {} serves {}, not {}",
+                        store.display(),
+                        recorded.display(),
+                        working.display()
+                    )));
+                }
+                selected.is_external().then(|| store.to_path_buf())
+            }
+            None => external_projection_control(root, std::ffi::OsStr::new(".kin")),
+        };
+        let display_projection_control = external_control
+            .clone()
+            .unwrap_or_else(|| root.join(".kin"));
+        let kin_control = match &external_control {
+            Some(store) => open_projection_root_nofollow(store)?,
+            None => open_directory_nofollow(&capability, std::ffi::OsStr::new(".kin"))
+                .map_err(|error| KinError::io(&display_projection_control, error))?,
+        };
         let kin_control_identity = tracked_open_directory_identity(&kin_control)
             .map_err(|error| KinError::io(&display_projection_control, error))?;
         let display_control = display_projection_control.join(RECONCILIATION_CONTROL_DIRECTORY);
@@ -7043,6 +7196,7 @@ impl ProjectionRoot {
             kin_control_identity,
             control_identity,
             authority_key,
+            external_control,
         };
         let acquired = ProjectionAcquisition::new(custody, projection);
         let projection = acquired.held();
@@ -7143,7 +7297,7 @@ impl ProjectionRoot {
             .map_err(|error| KinError::io(&display, error.into()))?;
         if let Err(error) = file
             .write_all(&bytes)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_capability_file(&file))
             .map_err(|error| KinError::io(&display, error))
         {
             drop(file);
@@ -7168,8 +7322,7 @@ impl ProjectionRoot {
             let _ = self.control.remove_file(&temporary);
             return Err(KinError::io(&display, error));
         }
-        file.sync_all()
-            .map_err(|error| KinError::io(&display, error))?;
+        sync_capability_file(&file).map_err(|error| KinError::io(&display, error))?;
         sync_directory_capability(&self.control, &display)?;
         if create_new {
             self.control
@@ -7947,7 +8100,7 @@ impl ProjectionRoot {
         rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
             .map_err(|error| KinError::io(&display, error.into()))?;
         file.write_all(metadata)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_capability_file(&file))
             .map_err(|error| KinError::io(&display, error))?;
         sync_directory_capability(&self.kin_control, &self.display_projection_control)?;
         self.revalidate_projection_lock()
@@ -7958,8 +8111,11 @@ impl ProjectionRoot {
         // the control directory here would be vetoed on Windows by a live
         // graph-store handle under a primary `.kin`, and is unnecessary for
         // the session-owned `.kin-session` control plane.
-        let named_kin = open_directory_nofollow(&self.root, &self.projection_control_name)
-            .map_err(|error| KinError::io(&self.display_projection_control, error))?;
+        let named_kin = match &self.external_control {
+            Some(store) => open_projection_root_nofollow(store)?,
+            None => open_directory_nofollow(&self.root, &self.projection_control_name)
+                .map_err(|error| KinError::io(&self.display_projection_control, error))?,
+        };
         if tracked_open_directory_identity(&named_kin)
             .map_err(|error| KinError::io(&self.display_projection_control, error))?
             != self.kin_control_identity
@@ -8158,7 +8314,7 @@ impl ProjectionRoot {
             .map_err(|error| KinError::io(&display, error.into()))?;
         if let Err(error) = file
             .write_all(&bytes)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_capability_file(&file))
             .map_err(|error| KinError::io(&display, error))
         {
             drop(file);
@@ -8311,7 +8467,7 @@ impl ProjectionRoot {
             .map_err(|error| KinError::io(&display, error.into()))?;
         let write_result = file
             .write_all(&bytes)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_capability_file(&file))
             .map_err(|error| KinError::io(step("write-temp"), error));
         if let Err(error) = write_result {
             drop(file);
@@ -8342,8 +8498,7 @@ impl ProjectionRoot {
                 "injected manifest error after successful replacement".into(),
             ));
         }
-        file.sync_all()
-            .map_err(|error| KinError::io(step("sync-final"), error))?;
+        sync_capability_file(&file).map_err(|error| KinError::io(step("sync-final"), error))?;
         drop(file);
         sync_directory_capability(&transaction.directory, &display)?;
         Ok(())
@@ -8425,7 +8580,7 @@ impl ProjectionRoot {
             .map_err(|error| KinError::io(&display, error.into()))?;
         if let Err(error) = file
             .write_all(&bytes)
-            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_capability_file(&file))
             .map_err(|error| KinError::io(&display, error))
         {
             drop(file);
@@ -8441,8 +8596,7 @@ impl ProjectionRoot {
             let _ = transaction.directory.remove_file(&temporary);
             return Err(error);
         }
-        file.sync_all()
-            .map_err(|error| KinError::io(&display, error))?;
+        sync_capability_file(&file).map_err(|error| KinError::io(&display, error))?;
         sync_directory_capability(&transaction.directory, &display)?;
         transaction
             .directory
@@ -9581,7 +9735,7 @@ impl ProjectionRoot {
                     rustix::fs::Mode::from_raw_mode(if executable { 0o755 } else { 0o644 }),
                 )
                 .map_err(|error| KinError::io(&display, error.into()))?;
-                file.sync_all()
+                kin_blobs::durable::sync_all(&file)
                     .map_err(|error| KinError::io(&display, error))?;
                 let metadata = file
                     .metadata()
@@ -9641,8 +9795,7 @@ impl ProjectionRoot {
             .map_err(|error| KinError::io(&display, error))?;
         file.write_all(entry.content)
             .map_err(|error| KinError::io(&display, error))?;
-        file.sync_all()
-            .map_err(|error| KinError::io(&display, error))?;
+        sync_capability_file(&file).map_err(|error| KinError::io(&display, error))?;
         tracked_open_file_identity(&file).map_err(|error| KinError::io(&display, error))
     }
 
@@ -13263,6 +13416,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
 
         let error = validate_repository_projection_transaction(
@@ -14434,6 +14588,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let marker = ReconciliationAuthorityCommit {
             repository_id: transaction.repository_id.clone(),
@@ -14494,7 +14649,7 @@ mod tests {
         )
         .unwrap_err();
         let target_after_rejection = std::fs::read(root.path().join("compose.yaml")).unwrap();
-        let wal_retained = std::fs::read_dir(root.path().join(".kin/reconciliation"))
+        let wal_retained = std::fs::read_dir(initialized.layout.root().join("reconciliation"))
             .unwrap()
             .any(|entry| {
                 entry
@@ -14571,6 +14726,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let marker = ReconciliationAuthorityCommit {
             repository_id: transaction.repository_id.clone(),
@@ -14613,13 +14769,15 @@ mod tests {
             std::fs::read(root.path().join("compose.yaml")).unwrap(),
             b"services:\n  target: {}\n"
         );
-        assert!(std::fs::read_dir(root.path().join(".kin/reconciliation"))
-            .unwrap()
-            .any(|entry| entry
+        assert!(
+            std::fs::read_dir(initialized.layout.root().join("reconciliation"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("tx-")));
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tx-"))
+        );
 
         let acquisition_order = std::cell::RefCell::new(Vec::new());
         let (receipt, authority_freeze) =
@@ -14642,13 +14800,15 @@ mod tests {
             std::fs::read(root.path().join("compose.yaml")).unwrap(),
             b"services:\n  target: {}\n"
         );
-        assert!(std::fs::read_dir(root.path().join(".kin/reconciliation"))
-            .unwrap()
-            .all(|entry| !entry
+        assert!(
+            std::fs::read_dir(initialized.layout.root().join("reconciliation"))
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("tx-")));
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("tx-"))
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -14714,6 +14874,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         let competing_transaction = RepositoryTransaction {
             operation_id: OperationId::new(),
@@ -15659,6 +15820,275 @@ mod tests {
             std::fs::read(fixture.root.join("compose.yaml")).unwrap(),
             b"services:\n  api:\n    image: scratch\n"
         );
+    }
+
+    #[cfg(unix)]
+    fn central_eject_freeze(fixture: &ExactEjectFixture) -> (ExactProjectionFreeze, PathBuf) {
+        let mut freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let central = fixture.root.parent().unwrap().join("central-store");
+        std::fs::rename(fixture.root.join(".kin"), &central).unwrap();
+        // Bind the already-retained control capability to its external namespace.
+        // Public central-store discovery is covered by the CLI round trips.
+        freeze.projection.external_control = Some(central.clone());
+        freeze.projection.display_projection_control = central.clone();
+        freeze.revalidate_namespace().unwrap();
+        (freeze, central)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_archives_the_retained_external_control_namespace() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::Directory);
+        let (freeze, central) = central_eject_freeze(&fixture);
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+        let outcome = freeze
+            .replace_git_and_detach_verified_to_from_blobs(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+            )
+            .unwrap();
+        assert!(outcome.had_previous_git);
+        assert!(outcome.retained_journal.is_none());
+        assert!(!central.exists());
+        assert!(!fixture.root.join(".kin").exists());
+        assert!(fixture
+            .archive
+            .join("kin/reconciliation/projection.lock")
+            .is_file());
+        assert!(!fixture
+            .archive
+            .join("kin/reconciliation/exact-eject-journal.json")
+            .exists());
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
+            b"prepared Git"
+        );
+        assert_eq!(
+            std::fs::read(fixture.archive.join("previous-git/legacy-marker")).unwrap(),
+            b"legacy Git"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_refuses_replaced_external_control_before_git_mutation() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::Directory);
+        let (freeze, central) = central_eject_freeze(&fixture);
+        let displaced = central.with_file_name("displaced-central-store");
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+        freeze
+            .replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if matches!(
+                        point,
+                        ExactProjectionEjectHookPoint::BeforeNamespaceMutation
+                    ) {
+                        std::fs::rename(&central, &displaced).unwrap();
+                        std::fs::create_dir(&central).unwrap();
+                        std::fs::write(central.join("replacement-marker"), b"replacement").unwrap();
+                    }
+                },
+            )
+            .expect_err("a replacement central store must not authorize a namespace move");
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/legacy-marker")).unwrap(),
+            b"legacy Git"
+        );
+        assert!(fixture.staged_git.join("stage-marker").is_file());
+        assert!(displaced.join("reconciliation/projection.lock").is_file());
+        assert_eq!(
+            std::fs::read(central.join("replacement-marker")).unwrap(),
+            b"replacement"
+        );
+        assert!(!fixture.archive.join("kin").exists());
+        assert!(!fixture.archive.join("previous-git").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_rolls_external_control_back_to_its_original_namespace() {
+        let fixture = exact_eject_fixture(ExistingGitFixture::Directory);
+        let (freeze, central) = central_eject_freeze(&fixture);
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+        let error = freeze
+            .replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if matches!(point, ExactProjectionEjectHookPoint::AfterKinDetached) {
+                        std::fs::rename(&fixture.archive, &fixture.displaced_archive).unwrap();
+                        std::fs::create_dir(&fixture.archive).unwrap();
+                    }
+                },
+            )
+            .expect_err("a replaced archive must roll back the central-store transaction");
+        assert!(
+            !error.to_string().contains("rollback also failed"),
+            "{error}"
+        );
+        assert!(central.join("reconciliation/projection.lock").is_file());
+        assert!(!fixture.root.join(".kin").exists());
+        assert!(!fixture.displaced_archive.join("kin").exists());
+        assert!(!central
+            .join("reconciliation/exact-eject-journal.json")
+            .exists());
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/legacy-marker")).unwrap(),
+            b"legacy Git"
+        );
+        assert!(fixture.staged_git.join("stage-marker").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_eject_central_store_crash_boundaries_reopen_through_discovery() {
+        if !crate::test_env::alone_in_process() {
+            return;
+        }
+        let machine = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            machine.path().join("registry.toml"),
+        )
+        .with("KIN_HOME", machine.path().join("kin-home"))
+        .without(crate::layout::KIN_STORE_ENV)
+        .without(crate::layout::KIN_STORE_LAYOUT_ENV)
+        .without("KIN_DIR")
+        .without("KIN_ALLOW_PARENT_STORE");
+
+        for crash_at in [
+            ExactProjectionEjectHookPoint::AfterStagedGitInstalled,
+            ExactProjectionEjectHookPoint::AfterKinDetached,
+        ] {
+            let fixture = exact_eject_fixture(ExistingGitFixture::Directory);
+            let central = crate::layout::register_external_store(
+                &fixture.root,
+                &fixture.root.parent().unwrap().join("central-store"),
+            )
+            .unwrap();
+            std::fs::rename(fixture.root.join(".kin"), &central).unwrap();
+            crate::layout::write_working_tree_record(&central, &fixture.root).unwrap();
+            let layout = crate::layout::KinLayout::discover(&fixture.root)
+                .expect("the registered central store is discoverable before eject");
+            assert!(layout.is_external());
+            assert_eq!(layout.root(), central);
+            let freeze = ExactProjectionFreeze::acquire_existing(layout.working_dir()).unwrap();
+            let verification = freeze
+                .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+                .unwrap();
+            let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+            let stage =
+                ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+                    .unwrap();
+
+            let mut reached_crash_boundary = false;
+            let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = freeze.replace_git_and_detach_verified_to_from_blobs_with_hook(
+                    &verification,
+                    &fixture.tree,
+                    &fixture.blobs,
+                    stage,
+                    &target,
+                    std::ffi::OsStr::new("kin"),
+                    std::ffi::OsStr::new("previous-git"),
+                    |point| {
+                        if point == crash_at {
+                            reached_crash_boundary = true;
+                            panic!("simulated central-store process death at {point:?}");
+                        }
+                    },
+                );
+            }));
+            assert!(reached_crash_boundary, "eject never reached {crash_at:?}");
+            assert!(killed.is_err(), "eject did not stop at {crash_at:?}");
+            assert_eq!(
+                std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
+                b"prepared Git"
+            );
+            assert!(!fixture.staged_git.exists());
+            assert_eq!(
+                std::fs::read(fixture.archive.join("previous-git/legacy-marker")).unwrap(),
+                b"legacy Git"
+            );
+
+            if crash_at == ExactProjectionEjectHookPoint::AfterStagedGitInstalled {
+                let journal = central.join("reconciliation/exact-eject-journal.json");
+                assert!(journal.is_file());
+                let reopened_layout = crate::layout::KinLayout::discover(&fixture.root)
+                    .expect("the still-attached central store is discoverable after the crash");
+                assert_eq!(reopened_layout.root(), central);
+                let recovered =
+                    ExactProjectionFreeze::acquire_existing(reopened_layout.working_dir())
+                        .expect("reopening the discovered central store replays its eject journal");
+                recovered
+                    .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(fixture.root.join(".git/legacy-marker")).unwrap(),
+                    b"legacy Git"
+                );
+                assert_eq!(
+                    std::fs::read(fixture.staged_git.join("stage-marker")).unwrap(),
+                    b"prepared Git"
+                );
+                assert!(central.join("reconciliation/projection.lock").is_file());
+                assert!(!journal.exists());
+                assert!(!fixture.archive.join("previous-git").exists());
+                assert!(!fixture.archive.join("kin").exists());
+            } else {
+                assert!(!central.exists());
+                assert!(
+                    crate::layout::KinLayout::discover(&fixture.root).is_none(),
+                    "a stale index entry must not rediscover the detached store"
+                );
+                assert!(ExactProjectionFreeze::acquire_existing(&fixture.root).is_err());
+                assert!(fixture
+                    .archive
+                    .join("kin/reconciliation/projection.lock")
+                    .is_file());
+                assert!(fixture
+                    .archive
+                    .join("kin/reconciliation/exact-eject-journal.json")
+                    .is_file());
+            }
+            assert!(!fixture.root.join(".kin").exists());
+            assert_eq!(
+                std::fs::read(fixture.root.join("compose.yaml")).unwrap(),
+                b"services:\n  api:\n    image: scratch\n"
+            );
+        }
     }
 
     #[cfg(unix)]

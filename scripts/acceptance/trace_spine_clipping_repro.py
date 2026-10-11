@@ -44,8 +44,9 @@ Eight checks, on one seeded repository:
      pages too, so response sizing cannot discard discovered evidence
   6  callee steps carry the exact 1-based call sites from their parent files,
      including the cross-module hop and the next step beyond it
-  7  the cross-file `send_via_adapter` edge walked backwards reports `send` as
-     a caller and carries that caller's exact site from `sessions.py`
+  7  the cross-module `send_via_adapter` edge walked backwards reports `send` as
+     a caller in the `sessions` module, beside a focal in the `adapters` module,
+     and carries that caller's exact site from its own unit
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -163,6 +164,10 @@ ELISION_TARGET = "cert_verify"
 CALLER_ENTITY = "send"
 SESSIONS_FILE = "sessions.py"
 ADAPTERS_FILE = "adapters.py"
+# The modules Kin's graph names for those two source units. A reply places an
+# entity by the module it is declared in, never by a coordinate.
+SESSIONS_MODULE = "sessions"
+ADAPTERS_MODULE = "adapters"
 # Small enough to force branch narrowing on this body-free fixture, while still
 # leaving room for the protected two-hop branch plus the bounder's disclosure.
 # Calibrated against the built binaries on 2026-08-28 by sweeping 3000 to 11000: below 4500
@@ -206,7 +211,7 @@ ELISION_LIMIT = 25
 # last kept slot, so at a cap of 3 or more send_via_adapter always survives, the
 # walk reports no module-crossing loss at all, and checks 1 and 2 have no loss
 # to classify or recover. At 1 and 2 the crossing hop is genuinely dropped and
-# spine_dropped_crossing_file reads 1. Two is chosen over one because it leaves
+# spine_dropped_crossing_unit reads 1. Two is chosen over one because it leaves
 # a three-step chain rather than a two-step one, and it sits one step from the
 # promotion boundary, so a ranking drift shows up here first.
 SPINE_CLIP_LIMIT = 2
@@ -350,7 +355,7 @@ def grade_separates_the_class_of_loss(payload):
     on_spine = [clip for clip in clips if isinstance(clip, dict) and clip.get("continued_below")]
     if not on_spine:
         return FAIL, "no clip reports continued_below, so no loss is attributable to the spine"
-    crossing = sum(clip.get("dropped_crossing_file") or 0 for clip in on_spine)
+    crossing = sum(clip.get("dropped_crossing_unit") or 0 for clip in on_spine)
     dropped = sum(
         (clip.get("dropped_callees") or 0) + (clip.get("dropped_callers") or 0)
         for clip in on_spine
@@ -363,10 +368,10 @@ def grade_separates_the_class_of_loss(payload):
             "class of hop the question is about is indistinguishable from same-file breadth"
             % (dropped,)
         )
-    if payload.get("spine_dropped_crossing_file") != crossing:
+    if payload.get("spine_dropped_crossing_unit") != crossing:
         return FAIL, (
-            "the top-level spine_dropped_crossing_file (%r) disagrees with the clips (%d)"
-            % (payload.get("spine_dropped_crossing_file"), crossing)
+            "the top-level spine_dropped_crossing_unit (%r) disagrees with the clips (%d)"
+            % (payload.get("spine_dropped_crossing_unit"), crossing)
         )
     return PASS, "%d of %d spine losses are reported as module-crossing" % (crossing, dropped)
 
@@ -414,7 +419,7 @@ def grade_a_complete_walk_is_not_qualified(payload):
     if spine_disclosure(payload) is not None:
         return FAIL, "a walk no cap cut carries a spine_clipped disclosure"
     present = [
-        key for key in ("spine_clipped_steps", "spine_dropped_crossing_file", "clipped_steps")
+        key for key in ("spine_clipped_steps", "spine_dropped_crossing_unit", "clipped_steps")
         if key in payload
     ]
     if present:
@@ -907,24 +912,30 @@ def grade_caller_call_site(payload):
         return FAIL, problem
     if step.get("role") != "caller":
         return FAIL, "%s role=%r, wanted caller" % (CALLER_ENTITY, step.get("role"))
-    if payload.get("focal_file") != ADAPTERS_FILE:
-        return FAIL, "caller focal_file=%r, wanted %s" % (
-            payload.get("focal_file"), ADAPTERS_FILE,
+    # The focal is placed the way every step is, by the module its record names.
+    focal_record = payload.get("focal_entity")
+    focal_module = focal_record.get("entity_module") if isinstance(focal_record, dict) else None
+    if focal_module != ADAPTERS_MODULE:
+        return FAIL, "caller focal_entity.entity_module=%r, wanted %s" % (
+            focal_module, ADAPTERS_MODULE,
         )
-    if step.get("entity_file") != SESSIONS_FILE:
-        return FAIL, "%s entity_file=%r, wanted %s" % (
-            CALLER_ENTITY, step.get("entity_file"), SESSIONS_FILE,
+    if step.get("entity_module") != SESSIONS_MODULE:
+        return FAIL, "%s entity_module=%r, wanted %s" % (
+            CALLER_ENTITY, step.get("entity_module"), SESSIONS_MODULE,
         )
-    if step.get("entity_file") == payload.get("focal_file"):
-        return FAIL, "the caller and focal are in one file, so role-based file selection is untested"
+    if step.get("entity_module") == focal_module:
+        return FAIL, (
+            "the caller and focal are in one module, so role-based selection of the "
+            "caller's own unit is untested"
+        )
     if step["reference_lines"] != [SESSION_ADAPTER_CALL_LINE]:
         return FAIL, "%s caller reference_lines=%r, wanted [%d]" % (
             CALLER_ENTITY, step["reference_lines"], SESSION_ADAPTER_CALL_LINE,
         )
     if step["reference_lines_absent_reason"] is not None:
         return FAIL, "%s carries an absent reason beside a known caller site" % CALLER_ENTITY
-    return PASS, "%s walked as caller reports sessions.py line %d from a different file" % (
-        CALLER_ENTITY, SESSION_ADAPTER_CALL_LINE,
+    return PASS, "%s walked as caller reports line %d of the %s module, not the focal's %s" % (
+        CALLER_ENTITY, SESSION_ADAPTER_CALL_LINE, SESSIONS_MODULE, ADAPTERS_MODULE,
     )
 
 
@@ -937,10 +948,15 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
@@ -963,7 +979,7 @@ class Suite(object):
         path = os.path.join(self.workdir, "sessions")
         os.makedirs(path)
         self.owned_repos.add(path)
-        for rel, body in (("sessions.py", SESSIONS_SRC), ("adapters.py", ADAPTERS_SRC)):
+        for rel, body in ((SESSIONS_FILE, SESSIONS_SRC), (ADAPTERS_FILE, ADAPTERS_SRC)):
             with open(os.path.join(path, rel), "w") as handle:
                 handle.write(body)
         self.git(["init", "-q", "."], path)
@@ -1217,10 +1233,10 @@ CHECKS = [
 CLIPPED = {
     "chain": [{"entity_name": "get_adapter", "parent_step": 0}],
     "spine_clipped_steps": 1,
-    "spine_dropped_crossing_file": 1,
+    "spine_dropped_crossing_unit": 1,
     "clipped_steps": [{
         "step": 0, "entity_name": "send", "dropped_callees": 7, "dropped_callers": 0,
-        "dropped_crossing_file": 1, "continued_below": True, "limit_per_step": 3,
+        "dropped_crossing_unit": 1, "continued_below": True, "limit_per_step": 3,
     }],
     "degradations": [{
         "component": "fanout_cap", "reason": "spine_clipped",
@@ -1328,14 +1344,14 @@ CALLER_SITE = {
     "limit_per_step": ELISION_LIMIT,
     "max_response_chars": WIDE_RESPONSE_BUDGET,
     "bodies_included": False,
-    "focal_file": ADAPTERS_FILE,
+    "focal_entity": {"entity_name": CROSSING_HOP, "entity_module": ADAPTERS_MODULE},
     "chain": [
         {
             "step": 1,
             "parent_step": 0,
             "entity_id": "entity-send",
             "entity_name": CALLER_ENTITY,
-            "entity_file": SESSIONS_FILE,
+            "entity_module": SESSIONS_MODULE,
             "role": "caller",
             "reference_lines": [SESSION_ADAPTER_CALL_LINE],
             "reference_lines_absent_reason": None,
@@ -1398,8 +1414,8 @@ def self_test():
     expect("1 passes a clip that separates the class",
            grade_separates_the_class_of_loss(CLIPPED), PASS)
     blind = json.loads(json.dumps(CLIPPED))
-    blind["clipped_steps"][0]["dropped_crossing_file"] = 0
-    blind["spine_dropped_crossing_file"] = 0
+    blind["clipped_steps"][0]["dropped_crossing_unit"] = 0
+    blind["spine_dropped_crossing_unit"] = 0
     expect("1 fails a clip that reports no module-crossing loss",
            grade_separates_the_class_of_loss(blind), FAIL)
     offspine = json.loads(json.dumps(CLIPPED))
@@ -1407,7 +1423,7 @@ def self_test():
     expect("1 fails when no clip is attributable to the spine",
            grade_separates_the_class_of_loss(offspine), FAIL)
     disagreeing = json.loads(json.dumps(CLIPPED))
-    disagreeing["spine_dropped_crossing_file"] = 9
+    disagreeing["spine_dropped_crossing_unit"] = 9
     expect("1 fails when the top-level total disagrees with the clips",
            grade_separates_the_class_of_loss(disagreeing), FAIL)
 
@@ -1736,16 +1752,25 @@ def self_test():
     expect("6 fails a chain row that omits one uniform site key",
            grade_callee_call_sites(missing_line_key), FAIL)
 
-    expect("7 passes the exact caller site in the caller's own file",
+    expect("7 passes the exact caller site in the caller's own module",
            grade_caller_call_site(CALLER_SITE), PASS)
     wrong_caller_line = json.loads(json.dumps(CALLER_SITE))
     wrong_caller_line["chain"][0]["reference_lines"] = [ADAPTER_CERT_CALL_LINE]
-    expect("7 fails when the caller receives a line from the focal file",
+    expect("7 fails when the caller receives a line from the focal's unit",
            grade_caller_call_site(wrong_caller_line), FAIL)
-    same_file_caller = json.loads(json.dumps(CALLER_SITE))
-    same_file_caller["chain"][0]["entity_file"] = ADAPTERS_FILE
-    expect("7 fails a fixture whose caller does not cross away from the focal file",
-           grade_caller_call_site(same_file_caller), FAIL)
+    expect("7 fails a focal record that names no module",
+           grade_caller_call_site(_without(CALLER_SITE, "focal_entity", "entity_module")), FAIL,
+           "focal_entity.entity_module=None")
+    expect("7 cannot place a caller reply with no focal record",
+           grade_caller_call_site(_without(CALLER_SITE, "focal_entity")), FAIL,
+           "focal_entity.entity_module=None")
+    expect("7 fails a caller step that names no module",
+           grade_caller_call_site(_without(CALLER_SITE, "chain", 0, "entity_module")), FAIL,
+           "entity_module=None")
+    same_module_caller = json.loads(json.dumps(CALLER_SITE))
+    same_module_caller["chain"][0]["entity_module"] = ADAPTERS_MODULE
+    expect("7 fails a fixture whose caller does not cross away from the focal module",
+           grade_caller_call_site(same_module_caller), FAIL)
     wrong_caller_role = json.loads(json.dumps(CALLER_SITE))
     wrong_caller_role["chain"][0]["role"] = "callee"
     expect("7 fails when the reverse step reports the wrong role",

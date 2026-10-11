@@ -210,7 +210,7 @@ fn acquire_supervisor_lifecycle_guard_until(
     dir: &Path,
     deadline: Instant,
 ) -> std::io::Result<std::fs::File> {
-    std::fs::create_dir_all(dir)?;
+    kin_core::registry::create_kin_dir_all(dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -1179,7 +1179,7 @@ fn ensure_loopback_token(dir: &Path) -> std::io::Result<String> {
     }
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        kin_core::registry::create_kin_dir_all(parent)?;
     }
     std::fs::write(&path, &token)?;
     #[cfg(unix)]
@@ -1922,6 +1922,9 @@ struct DaemonObservation {
     #[cfg(unix)]
     pid: u32,
     repo_root: String,
+    /// The daemon's store directory, in or outside its working tree.
+    #[cfg(unix)]
+    store_root: String,
     /// Reparented to init (ppid == 1): its launching CLI has exited.
     orphaned: bool,
     health: DaemonHealth,
@@ -2129,6 +2132,11 @@ struct DiscoveredDaemon {
     pid: u32,
     ppid: Option<u32>,
     repo_root: String,
+    /// The daemon's store: its `--store` argument when the store is kept
+    /// outside the working tree, else `<repo_root>/.kin`. Read from the
+    /// daemon's own arguments, so the supervisor needs no store lookup of its
+    /// own, whichever managed home the daemon was started under.
+    store_root: String,
     port: Option<u16>,
     cpu_usage: f32,
     /// Process start time, seconds since the Unix epoch.
@@ -2194,7 +2202,7 @@ async fn reaper_sweep(
     // first sighting of a pid only records a baseline length (no stall counted yet).
     stalled_sweeps.retain(|pid, _| live_pids.contains(pid));
     for daemon in &discovered {
-        let log_len = daemon_log_len(&daemon.repo_root);
+        let log_len = daemon_log_len(&daemon.store_root);
         match stalled_sweeps.get_mut(&daemon.pid) {
             Some((last_len, no_growth)) => {
                 if log_len > *last_len {
@@ -2251,6 +2259,7 @@ async fn reaper_sweep(
         let observation = DaemonObservation {
             pid: daemon.pid,
             repo_root: daemon.repo_root.clone(),
+            store_root: daemon.store_root.clone(),
             orphaned: daemon.ppid == Some(1),
             health,
             cpu_pinned_sweeps: pinned_sweeps.get(&daemon.pid).copied().unwrap_or(0),
@@ -2260,8 +2269,8 @@ async fn reaper_sweep(
                 .unwrap_or(0),
             registry: registry_relation,
             stale_binary,
-            transaction: crate::commit_liveness::transaction_liveness(
-                Path::new(&daemon.repo_root),
+            transaction: crate::commit_liveness::transaction_liveness_in_store(
+                Path::new(&daemon.store_root),
                 daemon.pid,
             ),
         };
@@ -2392,10 +2401,14 @@ fn enumerate_repo_daemons(sys: &mut sysinfo::System, self_pid: u32) -> Vec<Disco
             continue;
         };
         let port = arg_value(&args, "--port").and_then(|value| value.parse::<u16>().ok());
+        let store_root = arg_value(&args, "--store")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(repo_root).join(".kin"));
         found.push(DiscoveredDaemon {
             pid,
             ppid: process.parent().map(|parent| parent.as_u32()),
             repo_root: canonical_path_string(Path::new(repo_root)),
+            store_root: store_root.display().to_string(),
             port,
             cpu_usage: process.cpu_usage(),
             start_time: process.start_time(),
@@ -2453,11 +2466,11 @@ fn same_binary(a: Option<&std::path::Path>, b: Option<&std::path::Path>) -> bool
 
 /// Size in bytes of a repo daemon's persisted activity log — the reaper's
 /// persisted-progress signal. A daemon doing real work grows
-/// `<repo_root>/.kin/daemon.log`; a missing or unreadable log reads as 0 so a
+/// `<store>/daemon.log`; a missing or unreadable log reads as 0 so a
 /// daemon that has simply never written one never looks like it is "shrinking".
 #[cfg(unix)]
-fn daemon_log_len(repo_root: &str) -> u64 {
-    let log_path = Path::new(repo_root).join(".kin").join("daemon.log");
+fn daemon_log_len(store_root: &str) -> u64 {
+    let log_path = Path::new(store_root).join("daemon.log");
     std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
 }
 
@@ -2505,7 +2518,13 @@ async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealt
 /// window. Shared by reaping (misbehaving daemons) and redeploy (stale idle
 /// daemons that respawn on demand). `action` names the intent for the logs.
 #[cfg(unix)]
-async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &str) {
+async fn graceful_terminate(
+    pid: u32,
+    repo_root: &str,
+    store_root: &str,
+    action: &str,
+    reason: &str,
+) {
     warn!(
         pid,
         repo = %repo_root,
@@ -2517,8 +2536,8 @@ async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &st
     // `.kin/daemon.log`. Without this the daemon's log just stops: a SIGKILL
     // prints nothing, and the daemon's own SIGTERM handler is a tokio arm a
     // saturated runtime never polls, so neither signal leaves a trace there.
-    let kin_root = Path::new(repo_root).join(".kin");
-    let in_flight = match crate::commit_liveness::transaction_liveness(Path::new(repo_root), pid) {
+    let kin_root = Path::new(store_root).to_path_buf();
+    let in_flight = match crate::commit_liveness::transaction_liveness_in_store(&kin_root, pid) {
         crate::commit_liveness::TransactionLiveness::Open(summary)
         | crate::commit_liveness::TransactionLiveness::Stale(summary) => Some(summary.to_string()),
         crate::commit_liveness::TransactionLiveness::None => None,
@@ -2638,6 +2657,7 @@ async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
     graceful_terminate(
         observation.pid,
         &observation.repo_root,
+        &observation.store_root,
         "reaping misbehaving repo daemon",
         &context,
     )
@@ -2651,6 +2671,7 @@ async fn redeploy_daemon(observation: &DaemonObservation, reason: RedeployReason
     graceful_terminate(
         observation.pid,
         &observation.repo_root,
+        &observation.store_root,
         "redeploying stale repo daemon",
         &format!("{reason:?}"),
     )
@@ -3119,6 +3140,8 @@ mod tests {
             #[cfg(unix)]
             pid: 4242,
             repo_root: "/tmp/demo".to_string(),
+            #[cfg(unix)]
+            store_root: "/tmp/demo/.kin".to_string(),
             orphaned,
             health,
             cpu_pinned_sweeps: 0,
@@ -4217,6 +4240,9 @@ mod tests {
     /// where the code never looks would survive on the broken code too.
     #[tokio::test]
     async fn building_a_supervisor_router_leaves_the_rotation_window_record_intact() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let _env = env_test_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let _registry = kin_core::test_env::EnvVarGuard::set(

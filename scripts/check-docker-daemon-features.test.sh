@@ -39,4 +39,11 @@ if "${guard}" "${fixture_dir}/extra.Dockerfile" >/dev/null 2>&1; then
   exit 1
 fi
 
+sed 's/,kin-daemon\/embeddings//g' \
+  "${repo_root}/Dockerfile" >"${fixture_dir}/no-embeddings.Dockerfile"
+if "${guard}" "${fixture_dir}/no-embeddings.Dockerfile" >/dev/null 2>&1; then
+  echo "docker feature contract test: no-embeddings mutant escaped" >&2
+  exit 1
+fi
+
 echo "docker feature contract tests: PASS"

@@ -61,7 +61,13 @@ async fn external_edit_source(
     .await;
     assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
     let source = tool_result_payload(&result);
-    assert_eq!(source["source_base"]["schema"], "kin.entity.source_base.v1");
+    assert!(
+        kin_mcp::source_ticket::is_ticket(&source["source_base"]),
+        "{source}"
+    );
+    let ticket = kin_mcp::source_ticket::parse(source["source_base"]["ticket"].as_str().unwrap())
+        .expect("public source read must issue a valid source-base ticket");
+    assert_eq!(ticket.entity_id, id.to_string(), "{source}");
     source
 }
 
@@ -240,10 +246,15 @@ async fn external_target_entity_body_still_refuses_new_source_declarations() {
     .await;
     assert_eq!(result.is_error, Some(true), "{}", mcp_result_text(&result));
     assert!(
-        mcp_result_text(&result).contains("would create or remove source entities"),
+        mcp_result_text(&result).contains(
+            "this edit of run would also add function added beside it, and an edit changes only \
+             the declaration it names. Send the code of run alone, and add added with the \
+             create verb (payload EntityCreate)"
+        ),
         "{}",
         mcp_result_text(&result)
     );
+    assert!(!mcp_result_text(&result).contains(EXTERNAL_EDIT_FILE));
     assert_eq!(source_base_roots(&state), before);
     assert_eq!(
         std::fs::read_to_string(state.layout.working_dir().join(EXTERNAL_EDIT_FILE)).unwrap(),
@@ -484,14 +495,13 @@ async fn external_target_cold_rename_uses_real_startup_coverage() {
     let layout = state.layout.clone();
     drop(state);
     let state = Arc::new(DaemonState::open(layout).unwrap());
-    assert_eq!(
+    assert!(
         state
             .graph
             .get_file_layout(&kin_model::FilePathId::new(EXTERNAL_EDIT_FILE))
             .unwrap()
             .is_some(),
-        cfg!(feature = "embeddings"),
-        "embedding startup restores canonical source layouts before validating vectors"
+        "canonical source layouts hydrate independently of the embedding model slot"
     );
     let request = kin_cli::commands::rename::RenameRequest {
         symbol: "run".into(),
@@ -516,27 +526,20 @@ async fn external_target_cold_rename_uses_real_startup_coverage() {
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
-    if cfg!(feature = "embeddings") {
-        // Coverage is restored during open, so a cold rename can use it before
-        // the background loop runs. The loop must not repeat this publication.
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        let cold: kin_cli::commands::rename::RenameResponse =
-            serde_json::from_slice(&body).unwrap();
-        let report = cold.report.unwrap();
-        assert_eq!(report.entity_id, id);
-        assert!(!report.idempotent);
-        external_edit_assert_published(
-            &state,
-            id,
-            "external-one",
-            &original.replace("function run()", "function cold_run()"),
-        );
-    } else {
-        // Without embedding startup, the background loop still owns layout
-        // restoration. A populated snapshot alone cannot authorize the edit.
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(String::from_utf8_lossy(&body).contains("no graph-owned file layout"));
-    }
+    // Canonical CAS coverage is restored during open independently of models,
+    // so a cold rename can publish before the background loop runs. The loop
+    // must not repeat that publication.
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let cold: kin_cli::commands::rename::RenameResponse = serde_json::from_slice(&body).unwrap();
+    let report = cold.report.unwrap();
+    assert_eq!(report.entity_id, id);
+    assert!(!report.idempotent);
+    external_edit_assert_published(
+        &state,
+        id,
+        "external-one",
+        &original.replace("function run()", "function cold_run()"),
+    );
     external_edit_initialize(&state).await;
     assert!(
         state
@@ -548,7 +551,7 @@ async fn external_target_cold_rename_uses_real_startup_coverage() {
     );
     let report = external_edit_rename(&state, &request).await.report.unwrap();
     assert_eq!(report.entity_id, id);
-    assert_eq!(report.idempotent, cfg!(feature = "embeddings"));
+    assert!(report.idempotent);
     external_edit_assert_published(
         &state,
         id,
@@ -617,11 +620,9 @@ async fn external_target_broken_admission_refuses_rename_and_recovers_after_cold
     let entity = external_edit_entity(&state, "run");
     let target = external_edit_assert_published(&state, entity.id, "external-one", original);
     assert!(external_edit_has_full_certificate(&state));
-    assert!(
-        kin_review::impact::LiveGraph(state.graph.as_ref())
-            .call_shape_parse_coverage_complete()
-            .unwrap()
-    );
+    assert!(kin_review::impact::LiveGraph(state.graph.as_ref())
+        .call_shape_parse_coverage_complete()
+        .unwrap());
 
     // Exercise the same explicit file-admission route as an editor between
     // keystrokes. The semantic graph must retain useful last-known-good work
@@ -632,17 +633,13 @@ async fn external_target_broken_admission_refuses_rename_and_recovers_after_cold
     assert_eq!(admitted["report"]["admitted"], true, "{admitted}");
     assert_eq!(admitted["report"]["tree_moved"], true, "{admitted}");
     assert!(!external_edit_has_full_certificate(&state));
-    assert!(
-        !kin_review::impact::LiveGraph(state.graph.as_ref())
-            .call_shape_parse_coverage_complete()
-            .unwrap()
-    );
+    assert!(!kin_review::impact::LiveGraph(state.graph.as_ref())
+        .call_shape_parse_coverage_complete()
+        .unwrap());
     assert_eq!(external_edit_entity(&state, "run"), entity);
-    assert!(
-        kin_core::retained_parse::read(&state.layout)
-            .errors_for(EXTERNAL_EDIT_FILE)
-            .is_some_and(|errors| errors > 0)
-    );
+    assert!(kin_core::retained_parse::read(&state.layout)
+        .errors_for(EXTERNAL_EDIT_FILE)
+        .is_some_and(|errors| errors > 0));
     commit_through_api(
         &router(Arc::clone(&state)),
         kin_model::OperationId::new(),
@@ -656,11 +653,9 @@ async fn external_target_broken_admission_refuses_rename_and_recovers_after_cold
     let state = Arc::new(DaemonState::open(layout).unwrap());
     external_edit_initialize(&state).await;
     assert!(!external_edit_has_full_certificate(&state));
-    assert!(
-        !kin_review::impact::LiveGraph(state.graph.as_ref())
-            .call_shape_parse_coverage_complete()
-            .unwrap()
-    );
+    assert!(!kin_review::impact::LiveGraph(state.graph.as_ref())
+        .call_shape_parse_coverage_complete()
+        .unwrap());
     let before = source_base_roots(&state);
     let request = kin_cli::commands::rename::RenameRequest {
         symbol: "run".into(),
@@ -709,11 +704,9 @@ async fn external_target_broken_admission_refuses_rename_and_recovers_after_cold
     )
     .await;
     assert!(external_edit_has_full_certificate(&state));
-    assert!(
-        kin_review::impact::LiveGraph(state.graph.as_ref())
-            .call_shape_parse_coverage_complete()
-            .unwrap()
-    );
+    assert!(kin_review::impact::LiveGraph(state.graph.as_ref())
+        .call_shape_parse_coverage_complete()
+        .unwrap());
     assert_eq!(
         kin_core::retained_parse::read(&state.layout).errors_for(EXTERNAL_EDIT_FILE),
         None

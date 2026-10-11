@@ -33,6 +33,10 @@ fn kin(runtime: &common::IsolatedDaemonRuntime, repo: &Path, args: &[&str]) -> O
         .env("KIN_DAEMON_BIN", runtime.daemon_bin())
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "60")
+        // The worker notices its client left when the session sweeper reaps
+        // that client's session. At the production cadence that is up to 30 s
+        // of this test spent waiting on a timer.
+        .env("KIN_DAEMON_SESSION_SWEEP_SECS", "1")
         .output()
         .expect("run kin")
 }
@@ -81,8 +85,18 @@ fn a_stop_when_unused_leaves_a_daemon_its_client_still_needs() {
     let root = tempfile::tempdir().expect("temp root");
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    kin_core::init(&repo).expect("init scratch repo");
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // Initialize under the same private store authority every later command
+    // receives, and retain the actual control directory the CLI admitted.
+    let initialized = stdout_json(
+        &kin(&runtime, &repo, &["init", ".", "--json"]),
+        "init scratch repo",
+    );
+    let kin_root = Path::new(
+        initialized["kin_dir"]
+            .as_str()
+            .expect("init reports its control directory"),
+    );
     let runtime_root = runtime
         .registry_path()
         .parent()
@@ -96,7 +110,6 @@ fn a_stop_when_unused_leaves_a_daemon_its_client_still_needs() {
         String::from_utf8_lossy(&up.stdout),
         String::from_utf8_lossy(&up.stderr)
     );
-    let kin_root = repo.join(".kin");
     let worker_pid = read_number(&kin_root.join("daemon.pid")).expect("worker pid");
     let port = read_number(&kin_root.join("daemon.port")).expect("worker port") as u16;
     let supervisor_pid = read_number(&runtime_root.join("supervisor.pid"));

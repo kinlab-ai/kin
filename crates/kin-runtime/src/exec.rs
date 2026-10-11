@@ -2,7 +2,6 @@
 // Copyright 2026 Firelock, LLC
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
 
 use tracing::info;
@@ -30,8 +29,9 @@ pub struct ExecContext {
 }
 
 impl ExecContext {
-    /// Run the command in the materialized workspace directory.
-    pub fn run(&self) -> Result<ExecResult> {
+    /// Run the command in the materialized workspace directory, started by
+    /// `spawner`.
+    pub fn run(&self, spawner: &kin_io::Spawner) -> Result<ExecResult> {
         self.workspace
             .revalidate()
             .map_err(|error| RuntimeError::Other(format!("revalidate exact workspace: {error}")))?;
@@ -51,13 +51,13 @@ impl ExecContext {
 
         #[cfg(target_os = "windows")]
         let mut command = {
-            let mut command = Command::new("cmd");
+            let mut command = spawner.command("cmd");
             command.args(["/C", &full_command]);
             command
         };
         #[cfg(not(target_os = "windows"))]
         let mut command = {
-            let mut command = Command::new("sh");
+            let mut command = spawner.command("sh");
             command.args(["-c", &full_command]);
             command
         };
@@ -134,7 +134,9 @@ mod tests {
             args: vec!["-1".to_string()],
         };
 
-        let result = ctx.run().unwrap();
+        let result = ctx
+            .run(&kin_io::Spawner::new(&kin_io::Grant::ambient()))
+            .unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("a.txt"));
         assert!(result.stdout.contains("b.txt"));
@@ -150,7 +152,9 @@ mod tests {
             args: Vec::new(),
         };
 
-        let result = ctx.run().unwrap();
+        let result = ctx
+            .run(&kin_io::Spawner::new(&kin_io::Grant::ambient()))
+            .unwrap();
         assert_eq!(result.strategy_used, MaterializeStrategy::Copy);
     }
 
@@ -160,7 +164,7 @@ mod tests {
         let (_repository, workspace) = exact_workspace(&[("marker.txt", b"authority\n")]);
         let display_root = workspace.root().to_path_buf();
         let parked = display_root.with_extension("retained");
-        let mut command = Command::new("sh");
+        let mut command = std::process::Command::new("sh");
         command.args(["-c", "cat marker.txt"]);
         workspace
             .configure_command_current_dir(&mut command)

@@ -135,6 +135,9 @@ fn split(files: &[FileParseData], mode: &str) -> (Option<ReferenceRow>, Option<R
         .flat_map(|edge| edge.lines.iter().copied())
         .collect();
     let row = ReferenceRow {
+        recorded_owners: kin_mcp::semantic_owners::RecordedOwners::unavailable(),
+        repo_id: None,
+        foreign_entity_id: None,
         entity_id: Some(caller.id.to_string()),
         name: caller.name.clone(),
         kind: Some("Function".into()),

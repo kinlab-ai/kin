@@ -1581,16 +1581,23 @@ mod tests {
         );
     }
 
+    /// Reads only `pid`. A whole-table snapshot with every counter sampled
+    /// answered the same question at the cost of a full process scan, once per
+    /// poll in the parent-death case.
     fn process_is_live(pid: u32) -> bool {
-        let system = sysinfo::System::new_all();
-        system
-            .process(sysinfo::Pid::from_u32(pid))
-            .is_some_and(|process| {
-                !matches!(
-                    process.status(),
-                    sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
-                )
-            })
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        system.process(pid).is_some_and(|process| {
+            !matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+            )
+        })
     }
 
     #[cfg(unix)]

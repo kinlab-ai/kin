@@ -309,6 +309,17 @@ pub fn abandoned_init_attempts(parent: &Path) -> Result<Vec<AbandonedInit>> {
         Err(error) => return Err(KinError::io(parent, error)),
     };
     let mut entries = entries
+        .filter_map(|entry| match entry {
+            Ok(entry)
+                if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(crate::init_staging::GIT_CAPTURE_PREFIX)
+                }) =>
+            {
+                Some(Ok(entry))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| KinError::io(parent, error))?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -443,7 +454,7 @@ fn read_attempt_record(capture: &Path) -> (Option<InitAttemptRecord>, Option<Str
 /// reads as the part that could. This is disclosure of disk usage at an IO
 /// boundary, not an answer about repository content, and nothing semantic is
 /// derived from it.
-fn directory_bytes(root: &Path) -> u64 {
+pub fn directory_bytes(root: &Path) -> u64 {
     let mut total = 0_u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {

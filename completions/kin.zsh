@@ -14,7 +14,7 @@
 _kin() {
     local -a commands
     commands=(
-        'init:Initialize a new Kin repository'
+        'init:Start Kin in a repository, new or existing'
         'status:Show working copy status'
         'commit:Create a semantic commit'
         'log:Show semantic change log'
@@ -41,7 +41,7 @@ _kin() {
         'remote:Manage remotes'
         'push:Push to remote'
         'pull:Pull changes from remote'
-        'clone:Clone a repository'
+        'clone:Clone a repository into Kin'
         'import:Import a repository into Kin'
         'checkout:Restore a file from a specific change'
         'verify:Verify test coverage'
@@ -72,7 +72,7 @@ _kin() {
         'completions:Generate shell completions'
         'update:Update Kin to the latest release'
         'registry:Manage the global repository registry'
-        'setup:First-time setup and health checks'
+        'setup:Connect AI clients and add kin to your shell'
     )
 
     _describe -t commands 'kin command' commands

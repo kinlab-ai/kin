@@ -26,7 +26,8 @@ the decision rests on and answers one of four things:
               already, and stranger.env is what would let the release claim
               first-contact coverage; run the three-arm stranger on that archive
   refuse      no reviewed main commit carrying the version qualifies, named sha
-              by sha with the context that disqualified it
+              by sha with the context that disqualified it; a hold, reported as
+              a warning with exit 0 (only an unreadable read exits non-zero)
 
 The rule, in the order it is applied:
 
@@ -569,6 +570,7 @@ def grade_sha(sha: str, check_run_pages: Any, workflow_run_pages: Any) -> dict[s
     workflow_runs = flatten_pages(workflow_run_pages, "workflow_runs")
     dead: list[str] = []
     pending: list[str] = []
+    retries: list[str] = []
 
     by_suite: dict[Any, list[dict[str, Any]]] = {}
     for run in workflow_runs:
@@ -645,10 +647,15 @@ def grade_sha(sha: str, check_run_pages: Any, workflow_run_pages: Any) -> dict[s
                 f"({len(by_name.get(name, []))} same-named check-runs, none under push provenance)"
             )
             continue
+        if len(admitted) == 2:
+            retried = settled_retry(admitted)
+            if retried is not None:
+                admitted = [retried]
+                retries.append(name)
         if len(admitted) != 1:
             dead.append(
                 f"ambiguous required check: {name} ({len(admitted)} check-runs under one "
-                "provenance; a rerun is what makes a sha unmintable)"
+                "provenance; only one retry of a failed attempt is admitted)"
             )
             continue
         check = admitted[0]
@@ -660,7 +667,35 @@ def grade_sha(sha: str, check_run_pages: Any, workflow_run_pages: Any) -> dict[s
             dead.append(f"required check not green: {name} (conclusion={check.get('conclusion')})")
 
     verdict = DEAD if dead else (PENDING if pending else GREEN)
-    return {"sha": sha, "verdict": verdict, "dead": dead, "pending": pending}
+    return {"sha": sha, "verdict": verdict, "dead": dead, "pending": pending, "retried": retries}
+
+
+def settled_retry(checks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the passing attempt when two check-runs are one job retried once.
+
+    A job rerun publishes a second check-run under the same name in the same
+    check suite. Before this, any second copy made the sha unmintable, so one
+    flaky attempt on the single public main commit of a release cost a whole
+    export cycle. The retry is admitted only in its narrowest shape: both
+    attempts belong to one workflow run, the first completed as a failure or a
+    timeout, and the second started after it and passed. Anything else, a
+    third attempt, a pass followed by a fail, or two copies from different
+    runs, stays ambiguous. release-tag.yml applies the same rule, and the
+    retried contexts are reported so a flaky job stays visible.
+    """
+
+    first, second = sorted(checks, key=lambda check: str(check.get("started_at") or ""))
+    suite = lambda check: (check.get("check_suite") or {}).get("id")
+    if suite(first) is None or suite(first) != suite(second):
+        return None
+    if first.get("status") != "completed" or first.get("conclusion") not in {"failure", "timed_out"}:
+        return None
+    if second.get("status") != "completed" or second.get("conclusion") != "success":
+        return None
+    finished, restarted = first.get("completed_at"), second.get("started_at")
+    if not finished or not restarted or str(restarted) < str(finished):
+        return None
+    return second
 
 
 def grade_live(fetch: Fetch, repository: str, sha: str) -> dict[str, Any]:
@@ -937,13 +972,15 @@ def judge(snapshot: dict[str, Any], grade: Grader) -> Decision:
             return Decision(
                 ARM,
                 f"{sha} is the newest reviewed {BASE_BRANCH} commit carrying {version} whose push "
-                "runs concluded success with every required context present exactly once",
+                "runs concluded success with every required context present exactly once "
+                "or retried once after a failure",
                 version,
                 branch,
                 candidate=sha,
                 move=move,
                 details={
                     "notes": notes,
+                    "retried": list(grade_of.get("retried", [])),
                     "skipped_pending": pending,
                     "disqualified": disqualified,
                     "previous_candidate": candidate,
@@ -1056,8 +1093,12 @@ def _emit(decision: Decision) -> int:
                 handle.write(f"{key}={'' if value is None else value}\n")
             handle.write(f"reason={decision.reason.replace(chr(10), ' ')}\n")
     if decision.decision == REFUSE:
-        print(f"::error title=Release cut refused::{decision.reason}", file=sys.stderr)
-        return 1
+        # A refusal is a release hold, not a broken run: no candidate qualifies
+        # yet, and the next cycle re-judges. It is surfaced as a warning and in
+        # the published decision artifact; a hold that persists is what
+        # release-hold-alarm.mjs exists to raise. Failing the run here turned
+        # every scheduled cycle into a failure notification while the hold lasted.
+        print(f"::warning title=Release cut refused::{decision.reason}", file=sys.stderr)
     return 0
 
 

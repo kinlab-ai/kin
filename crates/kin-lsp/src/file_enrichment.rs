@@ -130,7 +130,7 @@ fn unproven_by_error(error: &LspError) -> crate::call_sites::UnprovenAnswer {
     match error.class() {
         QueryErrorClass::SessionEnded => UnprovenAnswer::Crash,
         QueryErrorClass::TimedOut => UnprovenAnswer::Timeout,
-        QueryErrorClass::Declined => UnprovenAnswer::Refused,
+        QueryErrorClass::Declined => UnprovenAnswer::Declined,
         QueryErrorClass::Failed if error.is_refusal() => UnprovenAnswer::Refused,
         QueryErrorClass::Failed => UnprovenAnswer::ProtocolError,
     }
@@ -328,14 +328,16 @@ pub(crate) fn identifier_positions_in_line(line_text: &str) -> Vec<u32> {
             continue;
         }
 
-        if ch.is_alphabetic() || ch == '_' {
-            let is_word_start =
-                col == 0 || (!chars[col - 1].is_alphanumeric() && chars[col - 1] != '_');
+        if ch.is_alphabetic() || matches!(ch, '_' | '$') {
+            let is_word_start = col == 0
+                || (!chars[col - 1].is_alphanumeric() && !matches!(chars[col - 1], '_' | '$'));
             if is_word_start {
                 positions.push(col as u32);
             }
 
-            while col < chars.len() && (chars[col].is_alphanumeric() || chars[col] == '_') {
+            while col < chars.len()
+                && (chars[col].is_alphanumeric() || matches!(chars[col], '_' | '$'))
+            {
                 col += 1;
             }
             continue;
@@ -355,7 +357,7 @@ fn identifier_at(line_text: &str, col: u32) -> String {
     line_text
         .chars()
         .skip(col as usize)
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .take_while(|c| c.is_alphanumeric() || matches!(*c, '_' | '$'))
         .collect()
 }
 
@@ -642,7 +644,7 @@ fn opens_a_call(line_text: &str, col: u32) -> bool {
         return true;
     }
     let mut at = start;
-    while at < chars.len() && (chars[at].is_alphanumeric() || chars[at] == '_') {
+    while at < chars.len() && (chars[at].is_alphanumeric() || matches!(chars[at], '_' | '$')) {
         at += 1;
     }
     let skip_spaces = |mut at: usize| {
@@ -682,7 +684,7 @@ fn opens_a_call(line_text: &str, col: u32) -> bool {
         };
         at = skip_spaces(after);
     }
-    chars.get(at) == Some(&'(')
+    matches!(chars.get(at), Some('(' | '`'))
 }
 
 /// The name a TypeScript or JavaScript declaration line declares, when it
@@ -832,6 +834,8 @@ struct Placed<'i> {
     target: Option<crate::call_sites::SiteTarget>,
     /// The entity and edge key a `References` edge goes to.
     reference: Option<(&'i EntityRef, &'static str)>,
+    /// The location lies in equally innermost admitted declarations.
+    ambiguous: bool,
     /// Whether `target` came from an overload signature.
     overload: bool,
 }
@@ -874,12 +878,14 @@ impl<'i> Asked<'_, 'i> {
                     })
                 }),
                 reference: None,
+                ambiguous: self.index.find_all_at(target_uri, target_line).len() > 1,
                 overload: false,
             });
         };
         let mut placed = Placed {
             target: None,
             reference: None,
+            ambiguous: false,
             overload: false,
         };
         if self.source.id == dst.id {
@@ -960,6 +966,20 @@ impl<'i> Asked<'_, 'i> {
                 placed.overload = true;
             }
         }
+        // An answer naming an entity that only declares, such as a Python
+        // `@overload` stub, is about the definition that follows it under
+        // the same name: the code the call runs. Pyright answers a call of
+        // Flask's `locate_app` with both stubs and the implementation, and
+        // read as three declarations the answers disagreed, so the site
+        // proved nothing.
+        if placed.target == Some(crate::call_sites::SiteTarget::Entity(dst.id)) && dst.declares_only
+        {
+            if let Some(definition) = self.index.definition_of(dst) {
+                placed.target = Some(crate::call_sites::SiteTarget::Entity(definition.id));
+                placed.reference = placed.reference.map(|(_, kind)| (definition, kind));
+                placed.overload = true;
+            }
+        }
         Ok(placed)
     }
 }
@@ -970,6 +990,84 @@ struct Planned {
     col: u32,
     /// Whether it opens a call, which puts it ahead of the others.
     call: bool,
+    /// Whether it is the receiver of a member expression, which is asked
+    /// through [`crate::enrichment::locations_at`] rather than with the
+    /// pass's own two-second bound.
+    receiver: bool,
+    /// Where it is asked, in the server's units. `None` when its column does
+    /// not fall on its line, which the fold reports as the pass's error when
+    /// it reaches the identifier, where the sequential pass reported it.
+    asked_at: Option<protocol::Position>,
+}
+
+/// The first question the pass asks about one identifier, which goes out
+/// ahead of the fold: its definition, or its receiver's.
+enum FirstAnswer {
+    /// A member expression's receiver, decoded.
+    Receiver(Result<Vec<protocol::Location>>),
+    /// The identifier's own definition, as the server sent it.
+    Definition(Result<serde_json::Value>),
+    /// Not asked: the identifier's position could not be read.
+    NotAsked,
+}
+
+impl crate::concurrency::Answer for FirstAnswer {
+    fn under_load(&self) -> bool {
+        match self {
+            Self::Receiver(answer) => answer.under_load(),
+            Self::Definition(answer) => answer.under_load(),
+            Self::NotAsked => false,
+        }
+    }
+
+    fn answered(&self) -> bool {
+        matches!(self, Self::Receiver(Ok(_)) | Self::Definition(Ok(_)))
+    }
+}
+
+/// Ask the first question about `planned`, exactly as the sequential pass
+/// asked it, stamped with the documents the pass had opened when it went out.
+async fn ask_first(
+    server: &LspServer,
+    uri: &str,
+    planned: &Planned,
+    opened: &std::sync::atomic::AtomicU64,
+) -> crate::concurrency::Stamped<FirstAnswer> {
+    crate::concurrency::stamped(opened, async {
+        let Some(asked_at) = &planned.asked_at else {
+            return FirstAnswer::NotAsked;
+        };
+        if planned.receiver {
+            return FirstAnswer::Receiver(
+                crate::enrichment::locations_at(
+                    server,
+                    "textDocument/definition",
+                    uri,
+                    planned.line,
+                    asked_at.character,
+                )
+                .await,
+            );
+        }
+        // The pass's own two-second allowance, which the server's pace
+        // stretches when it is falling behind (see [`crate::pace`]).
+        FirstAnswer::Definition(
+            server
+                .client
+                .request_within(
+                    "textDocument/definition",
+                    protocol::TextDocumentPositionParams {
+                        text_document: protocol::TextDocumentIdentifier {
+                            uri: uri.to_string(),
+                        },
+                        position: asked_at.clone(),
+                    },
+                    std::time::Duration::from_secs(2),
+                )
+                .await,
+        )
+    })
+    .await
 }
 
 /// A `References` edge the pass minted, with the earliest position that
@@ -1114,6 +1212,40 @@ struct QueryCounts {
     union_receivers: usize,
 }
 
+impl QueryCounts {
+    /// Add what one follow-up question counted.
+    fn absorb(&mut self, other: &Self) {
+        self.asked += other.asked;
+        self.saved += other.saved;
+        self.call_sites += other.call_sites;
+        self.hops_asked += other.hops_asked;
+        self.hops += other.hops;
+        self.hop_slots += other.hop_slots;
+        self.overloads += other.overloads;
+        self.receiver_types_asked += other.receiver_types_asked;
+        self.member_types_asked += other.member_types_asked;
+        self.union_receivers += other.union_receivers;
+    }
+}
+
+/// What a follow-up question the fold asks came to, and whether a failure
+/// that more load can cause decided it (see [`LspError::under_load`]). One
+/// that did, asked beside other questions, is asked again alone.
+struct FollowUp<T> {
+    value: T,
+    under_load: bool,
+}
+
+impl<T> FollowUp<T> {
+    /// A value no failure under load decided.
+    fn settled(value: T) -> Self {
+        Self {
+            value,
+            under_load: false,
+        }
+    }
+}
+
 /// Enrich a file by asking `textDocument/definition` at its identifiers.
 ///
 /// Every identifier inside an entity's lines is asked, except one whose
@@ -1150,6 +1282,29 @@ pub async fn enrich_file_definitions(
 /// holds. Each identifier asked is asked as the whole-file pass asks it, and
 /// `call_hierarchy_complete` speaks for the callers `scope` holds whole.
 pub async fn enrich_file_definitions_in(
+    server: &LspServer,
+    file_path: &Path,
+    file_content: &str,
+    entity_index: &EntityIndex,
+    workspace_root: &Path,
+    documents: Option<crate::enrichment::DocumentProvider<'_>>,
+    scope: &FileScope,
+) -> Result<FileEnrichmentResult> {
+    // On the heap: the pass holds its questions in flight, and every caller
+    // that awaits it would otherwise carry all of that in its own future.
+    Box::pin(definitions_pass(
+        server,
+        file_path,
+        file_content,
+        entity_index,
+        workspace_root,
+        documents,
+        scope,
+    ))
+    .await
+}
+
+async fn definitions_pass(
     server: &LspServer,
     file_path: &Path,
     file_content: &str,
@@ -1232,13 +1387,35 @@ pub async fn enrich_file_definitions_in(
                         line,
                         col,
                         call: opens_a_call(line_text, col),
+                        receiver: crate::enrichment::member_expression_at(line_text, col)
+                            .is_some(),
+                        asked_at: positions.scalar_position(line, col).ok(),
                     });
                 }
             }
             plan.sort_by_key(|planned| (!planned.call, planned.line, planned.col));
             counts.call_sites = plan.iter().filter(|planned| planned.call).count();
 
-            'plan: for planned in &plan {
+            // The first question about each identifier goes out ahead of the
+            // fold, at most the server's window at a time, and its answer
+            // comes back in plan order (see [`crate::concurrency`]). The fold
+            // below is the one the sequential pass ran, reading each first
+            // answer where it once awaited it, so what it proves, counts and
+            // stops on does not depend on the order the server answers in.
+            let window = server.in_flight();
+            let opened = scoped_documents.opened();
+            let mut asks = crate::concurrency::Ordered::new(
+                plan.iter().enumerate(),
+                |(index, planned)| {
+                    let (uri, opened) = (&uri, &opened);
+                    async move { (index, ask_first(server, uri, planned, opened).await) }
+                },
+                window.ceiling(),
+            );
+
+            'plan: while let Some(issued) = asks.next(window).await {
+                let index = issued.answer.0;
+                let planned = &plan[index];
                 let (line, col) = (planned.line, planned.col);
                 let line_text = lines[line as usize];
                 let Some(source) = entity_index.find_at(&uri, line) else {
@@ -1246,6 +1423,16 @@ pub async fn enrich_file_definitions_in(
                 };
                 let queried = identifier_at(line_text, col);
                 let asked_at = positions.scalar_position(line, col)?;
+                let mut first = Some(
+                    crate::concurrency::settle(
+                        window,
+                        &opened,
+                        &mut asks,
+                        issued.map(|(_, first)| first),
+                        || ask_first(server, &uri, planned, &opened),
+                    )
+                    .await,
+                );
 
                 // A member expression on a MODULE receiver is answered by its
                 // member. Asked at the receiver, the server returns the
@@ -1267,15 +1454,13 @@ pub async fn enrich_file_definitions_in(
                     crate::enrichment::member_expression_at(line_text, col)
                 {
                     counts.asked += 1;
-                    let receiver_definitions = match crate::enrichment::locations_at(
-                        server,
-                        "textDocument/definition",
-                        &uri,
-                        line,
-                        asked_at.character,
-                    )
-                    .await
-                    {
+                    let receiver = match first.take() {
+                        Some(FirstAnswer::Receiver(answer)) => answer,
+                        _ => Err(LspError::Protocol(
+                            "a receiver's definition was not asked ahead of the fold".into(),
+                        )),
+                    };
+                    let receiver_definitions = match receiver {
                         Ok(locations) => {
                             refusals.answered();
                             locations
@@ -1339,20 +1524,47 @@ pub async fn enrich_file_definitions_in(
                         // arm uses supplies the right edge: two independently
                         // proven server answers naming the same place, never a
                         // name match.
-                        let bindings = match crate::enrichment::member_export_bindings(
-                            server,
-                            entity_index,
-                            workspace_root,
-                            &mut scoped_documents,
-                            &rel_path,
-                            &uri,
-                            line,
-                            asked_at.character,
-                            positions.scalar_position(line, member_col)?.character,
-                            &member_name,
-                        )
-                        .await
+                        let member_at = positions.scalar_position(line, member_col)?.character;
+                        let joined = asks
+                            .beside(
+                                window,
+                                crate::enrichment::member_export_bindings(
+                                    server,
+                                    entity_index,
+                                    workspace_root,
+                                    &mut scoped_documents,
+                                    &rel_path,
+                                    &uri,
+                                    line,
+                                    asked_at.character,
+                                    member_at,
+                                    &member_name,
+                                ),
+                            )
+                            .await;
+                        let mut bindings = joined.output;
+                        if joined.overlapped
+                            && bindings.as_ref().is_err_and(LspError::under_load)
                         {
+                            // Asked again alone, as the sequential pass asked
+                            // it, before its failure counts.
+                            window.congested();
+                            asks.drain().await;
+                            bindings = crate::enrichment::member_export_bindings(
+                                server,
+                                entity_index,
+                                workspace_root,
+                                &mut scoped_documents,
+                                &rel_path,
+                                &uri,
+                                line,
+                                asked_at.character,
+                                member_at,
+                                &member_name,
+                            )
+                            .await;
+                        }
+                        let bindings = match bindings {
                             Ok(bindings) => {
                                 refusals.answered();
                                 // A candidate whose declaration line does not
@@ -1415,23 +1627,13 @@ pub async fn enrich_file_definitions_in(
                     }
                     None => {
                         counts.asked += 1;
-                        let def_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            server.client.request(
-                                "textDocument/definition",
-                                protocol::TextDocumentPositionParams {
-                                    text_document: protocol::TextDocumentIdentifier {
-                                        uri: uri.clone(),
-                                    },
-                                    position: asked_at.clone(),
-                                },
-                            ),
-                        )
-                        .await;
-                        // The pass's own two-second bound is a timeout like
-                        // the client's, and both go through the one
-                        // classification.
-                        let value = match def_result.unwrap_or(Err(LspError::Timeout)) {
+                        let def_result = match first.take() {
+                            Some(FirstAnswer::Definition(answer)) => answer,
+                            _ => Err(LspError::Protocol(
+                                "a definition was not asked ahead of the fold".into(),
+                            )),
+                        };
+                        let value = match def_result {
                             Ok(value) => {
                                 refusals.answered();
                                 value
@@ -1472,9 +1674,11 @@ pub async fn enrich_file_definitions_in(
                 let mut verdict = DefinitionVerdict::default();
                 let mut overload = false;
                 let mut placed_any = false;
+                let mut ambiguous_location = false;
                 for location in &locations {
                     let placed = asked.place(location, &mut texts)?;
-                    placed_any |= placed.target.is_some();
+                    placed_any |= placed.target.is_some() || placed.ambiguous;
+                    ambiguous_location |= placed.ambiguous;
                     verdict.observe(placed.target);
                     overload |= placed.overload;
                     if let Some((dst, kind)) = placed.reference {
@@ -1493,18 +1697,43 @@ pub async fn enrich_file_definitions_in(
                 let mut decided = verdict.decided().map(|target| (target, crate::call_sites::DEFINITION_RULE));
                 let hop_slots_before = counts.hop_slots;
                 let mut union_receiver = false;
-                if decided.is_none() && planned.call {
-                    decided = alias_hop(
-                        server,
-                        &asked,
-                        &locations,
-                        (&uri, &asked_at),
-                        &mut scoped_documents,
-                        &mut texts,
-                        &mut counts,
-                    )
-                    .await?
-                    .map(|target| (target, crate::call_sites::DEFINITION_ALIAS_RULE));
+                if decided.is_none() && planned.call && !ambiguous_location {
+                    let mut hop_counts = QueryCounts::default();
+                    let hopped = asks
+                        .beside(
+                            window,
+                            alias_hop(
+                                server,
+                                &asked,
+                                &locations,
+                                (&uri, &asked_at),
+                                &mut scoped_documents,
+                                &mut texts,
+                                &mut hop_counts,
+                            ),
+                        )
+                        .await;
+                    let mut hop = hopped.output?;
+                    if hopped.overlapped && hop.under_load {
+                        // Asked again alone, as the sequential pass asked it.
+                        window.congested();
+                        asks.drain().await;
+                        hop_counts = QueryCounts::default();
+                        hop = alias_hop(
+                            server,
+                            &asked,
+                            &locations,
+                            (&uri, &asked_at),
+                            &mut scoped_documents,
+                            &mut texts,
+                            &mut hop_counts,
+                        )
+                        .await?;
+                    }
+                    counts.absorb(&hop_counts);
+                    decided = hop
+                        .value
+                        .map(|target| (target, crate::call_sites::DEFINITION_ALIAS_RULE));
                 } else if decided.is_some() && overload {
                     counts.overloads += 1;
                 }
@@ -1516,26 +1745,48 @@ pub async fn enrich_file_definitions_in(
                 // `(driver as AbstractSqliteDriver | ReactNativeDriver)
                 // .wrapWithJsonFunction(..)` answered with one class's method
                 // in one session and the other's in the next. Such a call
-                // proves no single declaration.
-                let proven_entity = decided
+                // proves no single declaration. The same rule applies to
+                // external methods: Map and WeakMap are distinct targets too.
+                let proven_target = decided
                     .as_ref()
-                    .and_then(|(targets, _)| match targets.first() {
-                        Some(crate::call_sites::SiteTarget::Entity(entity)) => Some(*entity),
-                        _ => None,
-                    })
-                    .filter(|_| planned.call && lexicon == Lexicon::Script);
-                let may_be_a_union = match proven_entity {
+                    .and_then(|(targets, _)| targets.first())
+                    .filter(|_| planned.call && lexicon == Lexicon::Script)
+                    .cloned();
+                let may_be_a_union = match proven_target {
                     Some(proven) => {
-                        receiver_may_be_a_union(
-                            server,
-                            &uri,
-                            &positions,
-                            &lines,
-                            (line, col),
-                            (entity_index, proven),
-                            &mut counts,
-                        )
-                        .await?
+                        let mut union_counts = QueryCounts::default();
+                        let checked = asks
+                            .beside(
+                                window,
+                                receiver_may_be_a_union(
+                                    server,
+                                    &uri,
+                                    &positions,
+                                    &lines,
+                                    (line, col),
+                                    (entity_index, &proven),
+                                    &mut union_counts,
+                                ),
+                            )
+                            .await;
+                        let mut check = checked.output?;
+                        if checked.overlapped && check.under_load {
+                            window.congested();
+                            asks.drain().await;
+                            union_counts = QueryCounts::default();
+                            check = receiver_may_be_a_union(
+                                server,
+                                &uri,
+                                &positions,
+                                &lines,
+                                (line, col),
+                                (entity_index, &proven),
+                                &mut union_counts,
+                            )
+                            .await?;
+                        }
+                        counts.absorb(&union_counts);
+                        check.value
                     }
                     None => false,
                 };
@@ -1611,26 +1862,49 @@ pub async fn enrich_file_definitions_in(
         let mut call_hierarchy_complete = !timed_out;
         if server.has_call_hierarchy() && !timed_out {
             refusals.answered();
-            for entity in entity_index
+            // Each caller's call hierarchy goes out ahead of the fold, as the
+            // identifiers' definitions did, and comes back in the order the
+            // file declares its callers. A caller whose hierarchy failed
+            // under load beside others is asked again alone before its
+            // failure counts.
+            let own_text = |file: &str| {
+                if file == rel_path {
+                    Some(file_content.to_owned())
+                } else {
+                    documents.and_then(|provider| provider(file))
+                }
+            };
+            let own_text: crate::enrichment::DocumentProvider<'_> = &own_text;
+            let callers: Vec<&EntityRef> = entity_index
                 .entities_in_file(&rel_path)
                 .into_iter()
                 .filter(|entity| scope.asks_hierarchy(entity.id))
-            {
-                match enrich_entity_calls(
-                    server,
-                    entity,
-                    entity_index,
-                    workspace_root,
-                    Some(&|file| {
-                        if file == rel_path {
-                            Some(file_content.to_owned())
-                        } else {
-                            documents.and_then(|provider| provider(file))
-                        }
-                    }),
-                )
-                .await
-                {
+                .collect();
+            let window = server.in_flight();
+            let mut asks = crate::concurrency::Ordered::new(
+                callers.iter().copied(),
+                |entity| async move {
+                    let calls =
+                        enrich_entity_calls(server, entity, entity_index, workspace_root, Some(own_text))
+                            .await;
+                    (entity, calls)
+                },
+                window.ceiling(),
+            );
+            while let Some(issued) = asks.next(window).await {
+                let alone = issued.alone();
+                let (entity, mut answer) = issued.answer;
+                if !alone && answer.as_ref().is_err_and(LspError::under_load) {
+                    window.congested();
+                    asks.drain().await;
+                    answer =
+                        enrich_entity_calls(server, entity, entity_index, workspace_root, Some(own_text))
+                            .await;
+                }
+                if answer.is_ok() {
+                    window.answered();
+                }
+                match answer {
                     Ok(calls) => {
                         refusals.answered();
                         if calls.unproven_calls > 0 {
@@ -1860,17 +2134,17 @@ async fn receiver_may_be_a_union(
     positions: &crate::source_positions::SourcePositions<'_>,
     lines: &[&str],
     (line, col): (u32, u32),
-    (index, proven): (&EntityIndex, EntityId),
+    (index, proven): (&EntityIndex, &crate::call_sites::SiteTarget),
     counts: &mut QueryCounts,
-) -> Result<bool> {
+) -> Result<FollowUp<bool>> {
     let Some((receiver_line, receiver)) = receiver_before(lines, (line, col)) else {
-        return Ok(false);
+        return Ok(FollowUp::settled(false));
     };
     let chars: Vec<char> = receiver.chars().collect();
     let identifier = |c: &char| c.is_alphanumeric() || *c == '_' || *c == '$';
     if !chars.last().is_some_and(identifier) {
         if chars.last() == Some(&')') && casts_to_a_union(lines, receiver_line, &receiver) {
-            return Ok(true);
+            return Ok(FollowUp::settled(true));
         }
         return member_type_leaves_the_receiver_open(
             server,
@@ -1882,7 +2156,7 @@ async fn receiver_may_be_a_union(
         .await;
     }
     if !server.has_type_definition() {
-        return Ok(true);
+        return Ok(FollowUp::settled(true));
     }
     let start = chars
         .iter()
@@ -1890,33 +2164,35 @@ async fn receiver_may_be_a_union(
         .map_or(0, |at| at + 1);
     let position = positions.scalar_position(receiver_line, start as u32)?;
     counts.receiver_types_asked += 1;
-    let answer = tokio::time::timeout(
+    let answer = crate::enrichment::locations_within(
+        server,
+        "textDocument/typeDefinition",
+        uri,
+        receiver_line,
+        position.character,
         std::time::Duration::from_secs(2),
-        crate::enrichment::locations_at(
-            server,
-            "textDocument/typeDefinition",
-            uri,
-            receiver_line,
-            position.character,
-        ),
     )
-    .await
-    .unwrap_or(Err(LspError::Timeout));
+    .await;
     match answer {
-        Ok(types) => Ok(types
-            .iter()
-            .map(|location| {
-                (
-                    location.uri.as_str(),
-                    location.range.start.line,
-                    location.range.start.character,
-                )
-            })
-            .collect::<BTreeSet<_>>()
-            .len()
-            >= 2),
+        Ok(types) => Ok(FollowUp::settled(
+            types
+                .iter()
+                .map(|location| {
+                    (
+                        location.uri.as_str(),
+                        location.range.start.line,
+                        location.range.start.character,
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+                .len()
+                >= 2,
+        )),
         Err(error) if error.ends_the_session() => Err(error),
-        Err(_) => Ok(true),
+        Err(error) => Ok(FollowUp {
+            value: true,
+            under_load: error.under_load(),
+        }),
     }
 }
 
@@ -1950,30 +2226,32 @@ async fn member_type_leaves_the_receiver_open(
     server: &LspServer,
     uri: &str,
     member: protocol::Position,
-    (index, proven): (&EntityIndex, EntityId),
+    (index, proven): (&EntityIndex, &crate::call_sites::SiteTarget),
     counts: &mut QueryCounts,
-) -> Result<bool> {
+) -> Result<FollowUp<bool>> {
     if !server.has_type_definition() {
-        return Ok(true);
+        return Ok(FollowUp::settled(true));
     }
     counts.member_types_asked += 1;
-    let answer = tokio::time::timeout(
+    let answer = crate::enrichment::locations_within(
+        server,
+        "textDocument/typeDefinition",
+        uri,
+        member.line,
+        member.character,
         std::time::Duration::from_secs(2),
-        crate::enrichment::locations_at(
-            server,
-            "textDocument/typeDefinition",
-            uri,
-            member.line,
-            member.character,
-        ),
     )
-    .await
-    .unwrap_or(Err(LspError::Timeout));
+    .await;
     let declarations = match answer {
         Ok(declarations) if !declarations.is_empty() => declarations,
-        Ok(_) => return Ok(true),
+        Ok(_) => return Ok(FollowUp::settled(true)),
         Err(error) if error.ends_the_session() => return Err(error),
-        Err(_) => return Ok(true),
+        Err(error) => {
+            return Ok(FollowUp {
+                value: true,
+                under_load: error.under_load(),
+            })
+        }
     };
     let mut names_proven = false;
     let mut positions = BTreeSet::new();
@@ -1983,12 +2261,17 @@ async fn member_type_leaves_the_receiver_open(
             location.range.start.line,
             location.range.start.character,
         ));
-        if index
-            .find_at(&location.uri, location.range.start.line)
-            .is_some_and(|entity| entity.id == proven)
-        {
-            names_proven = true;
-        }
+        let names_target = match proven {
+            crate::call_sites::SiteTarget::Entity(entity) => index
+                .find_at(&location.uri, location.range.start.line)
+                .is_some_and(|found| found.id == *entity),
+            crate::call_sites::SiteTarget::Outside(target) => {
+                protocol::same_file_uri(&location.uri, &target.uri)
+                    && location.range.start.line == target.range.start_line
+                    && location.range.start.character == target.range.start_character
+            }
+        };
+        names_proven |= names_target;
     }
     // `find_at` is a line index, so two constituent methods written on the
     // same line can both land on `proven`. It is only a conservative test of
@@ -1996,7 +2279,7 @@ async fn member_type_leaves_the_receiver_open(
     // declarations are that member too. Count their full positions instead:
     // two columns are two declarations, while an inherited member repeated
     // at the exact same position is still one.
-    Ok(names_proven && positions.len() > 1)
+    Ok(FollowUp::settled(names_proven && positions.len() > 1))
 }
 
 /// What a call site's callee names when its definition answer is a binding
@@ -2018,16 +2301,16 @@ async fn alias_hop(
     documents: &mut crate::enrichment::ScopedDocuments<'_>,
     texts: &mut TargetTexts<'_>,
     counts: &mut QueryCounts,
-) -> Result<Option<Vec<crate::call_sites::SiteTarget>>> {
+) -> Result<FollowUp<Option<Vec<crate::call_sites::SiteTarget>>>> {
     let [binding] = locations else {
-        return Ok(None);
+        return Ok(FollowUp::settled(None));
     };
     if asked.index.outside_repository(&binding.uri)
         || (protocol::same_file_uri(&binding.uri, uri)
             && (binding.range.start.line, binding.range.start.character)
                 == (asked_at.line, asked_at.character))
     {
-        return Ok(None);
+        return Ok(FollowUp::settled(None));
     }
     // The file the graph holds there, through a workspace package's link
     // when the server named it that way, else the path below the root.
@@ -2040,32 +2323,32 @@ async fn alias_hop(
             })
             .and_then(|relative| relative.to_str().map(|file| file.replace('\\', "/")))
     }) else {
-        return Ok(None);
+        return Ok(FollowUp::settled(None));
     };
     let binding_uri = protocol::path_to_uri(&asked.workspace_root.join(&file));
     if file != asked.rel_path && !documents.ensure_open(&file, &binding_uri).await? {
-        return Ok(None);
+        return Ok(FollowUp::settled(None));
     }
     counts.asked += 1;
     counts.hops_asked += 1;
-    let answer = tokio::time::timeout(
+    let answer = crate::enrichment::locations_within(
+        server,
+        "textDocument/definition",
+        &binding_uri,
+        binding.range.start.line,
+        binding.range.start.character,
         std::time::Duration::from_secs(2),
-        crate::enrichment::locations_at(
-            server,
-            "textDocument/definition",
-            &binding_uri,
-            binding.range.start.line,
-            binding.range.start.character,
-        ),
     )
-    .await
-    .unwrap_or(Err(LspError::Timeout));
+    .await;
     let second = match answer {
         Ok(second) => second,
         Err(error) if error.ends_the_session() => return Err(error),
         Err(error) => {
             tracing::debug!(%error, "a call site's alias hop got no answer; the site stays unproven");
-            return Ok(None);
+            return Ok(FollowUp {
+                value: None,
+                under_load: error.under_load(),
+            });
         }
     };
     let mut verdict = DefinitionVerdict::default();
@@ -2097,7 +2380,7 @@ async fn alias_hop(
     if decided.is_some() {
         counts.hops += 1;
     }
-    Ok(decided)
+    Ok(FollowUp::settled(decided))
 }
 
 /// Whether the declaration an alias hop landed on is a slot a value flows
@@ -2349,6 +2632,7 @@ mod tests {
                 name_line: 0,
                 name_col: 3,
                 declares_name: true,
+                declares_only: false,
                 kind: kin_model::EntityKind::Function,
             },
             EntityRef {
@@ -2361,6 +2645,7 @@ mod tests {
                 name_line: 20,
                 name_col: 3,
                 declares_name: true,
+                declares_only: false,
                 kind: kin_model::EntityKind::Function,
             },
         ];
@@ -2414,6 +2699,7 @@ mod tests {
             name_line: 3,
             name_col,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
         let member = EntityRef {
@@ -2426,6 +2712,7 @@ mod tests {
             name_line: 12,
             name_col: 2,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
 
@@ -2492,6 +2779,7 @@ mod tests {
             name_line: 15,
             name_col: 13,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
         assert!(
@@ -2561,6 +2849,31 @@ mod tests {
         let generic = "  add(method: string, path: string, handler: T) {";
         let t_col = generic.find("T)").expect("type parameter") as u32;
         assert_eq!(super::identifier_at(generic, t_col), "T");
+    }
+
+    #[test]
+    fn dollar_named_calls_are_asked_and_recorded_at_the_complete_token() {
+        let line = "db.$with('q'); db.$dynamic(); sql<string>`select ${format(value)}`";
+        let scanned = identifier_positions_in_line(line);
+        for name in ["$with", "$dynamic", "sql", "format"] {
+            let at = line.find(name).unwrap() as u32;
+            assert!(
+                scanned.contains(&at),
+                "{name}: ask at the exact callee start"
+            );
+            assert_eq!(super::identifier_at(line, at), name);
+            assert!(
+                super::opens_a_call(line, at),
+                "{name}: templates are calls too"
+            );
+            let positions = crate::source_positions::SourcePositions::new("run.ts", line);
+            let token = positions.token(0, at).unwrap();
+            assert_eq!(&line[token.start_byte..token.end_byte], name);
+        }
+        assert!(
+            !scanned.contains(&(line.find("$with").unwrap() as u32 + 1)),
+            "never ask again at a suffix of one identifier"
+        );
     }
 
     #[test]
@@ -2753,6 +3066,7 @@ mod scope_tests {
             name_line: start,
             name_col: 4,
             declares_name: true,
+            declares_only: false,
             kind: kin_model::EntityKind::Function,
         };
         let a = entity("a", "source.py", 0, 1);

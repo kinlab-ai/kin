@@ -23,6 +23,15 @@ fn parse(path: &str, source: &str) -> FileParseData {
         })
         .collect();
     attach_go_package_metadata(&tree, source.as_bytes(), &mut entities);
+    // The adapter types a call's receiver from the facts it records, and
+    // ingest always attaches those facts beside the relations that use them.
+    kin_parser::value_origins::attach_value_origins(
+        &tree,
+        source.as_bytes(),
+        adapter.language_id(),
+        path,
+        &mut entities,
+    );
     FileParseData {
         file_path: path.into(),
         entities,
@@ -407,10 +416,11 @@ fn a_shadowed_receiver_cannot_become_an_import_or_free_function() {
         .find(|e| e.name == "prepare")
         .unwrap()
         .id;
+    // The unit's module contains the free function; no call reaches it.
     assert!(!indexed
         .relations
         .iter()
-        .any(|r| r.dst.as_entity() == Some(free)));
+        .any(|r| r.kind != RelationKind::Contains && r.dst.as_entity() == Some(free)));
 }
 
 /// One file, two methods of one type calling a third through their receiver,

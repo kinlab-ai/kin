@@ -69,10 +69,11 @@ mod tests {
         let parsed = adapter
             .extract(&adapter.parse(source).unwrap(), source, &file)
             .unwrap();
+        // The declared `mod`, not the unit's own module beside it.
         let module = parsed
             .entities
             .into_iter()
-            .find(|e| e.kind == EntityKind::Module)
+            .find(|e| e.kind == EntityKind::Module && e.declaration_line.is_some())
             .unwrap()
             .into_entity_with_source(LanguageId::Rust, &file, Some(source));
         validate_module_source_span(&module, source).unwrap();
@@ -96,7 +97,7 @@ mod tests {
         let module = parsed
             .entities
             .into_iter()
-            .find(|e| e.kind == EntityKind::Module)
+            .find(|e| e.kind == EntityKind::Module && e.declaration_line.is_some())
             .unwrap()
             .into_entity(LanguageId::Rust, &file);
         assert_eq!(module.span.as_ref().unwrap().end_byte, standalone.len());

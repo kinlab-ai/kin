@@ -33,8 +33,12 @@ pub async fn authority(json: bool, fix: bool, initialize: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        for path in repaired {
-            println!("Repaired mode to 0600: {}", path.display());
+        for repair in repaired {
+            println!(
+                "Repaired mode to {:04o}: {}",
+                repair.mode,
+                repair.path.display()
+            );
         }
         for path in initialized {
             println!("Initialized private authority: {}", path.display());

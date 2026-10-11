@@ -541,13 +541,124 @@ impl fmt::Display for EvidenceId {
 }
 
 /// Author identifier (human or assistant).
+///
+/// A person is recorded the way Git names an author, `Name <email>`: a native
+/// change records it from the configured identity, and an imported commit from
+/// the commit's author, its time going to the change's own timestamp. An
+/// assistant session records its actor label. Earlier imports recorded an
+/// imported commit's whole author line, with the seconds since 1970 and the
+/// offset after the address; [`Self::name`] and [`Self::email`] read
+/// that form too, so no history has to be rewritten to be read correctly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct AuthorId(pub String);
+
+/// How an earlier import recorded an imported commit's author line that was
+/// not UTF-8: this prefix and the line's bytes in hexadecimal.
+const LEGACY_GIT_AUTHOR_HEX_PREFIX: &str = "git-author-v1:";
 
 impl AuthorId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
+
+    /// An author as Git names one, from its name and address.
+    ///
+    /// `Name <email>`, the form a native change records from Git's
+    /// configuration. A missing address records the name alone, and a missing
+    /// name records the address in brackets, so neither half is invented.
+    pub fn from_name_and_email(name: &str, email: &str) -> Self {
+        let (name, email) = (name.trim(), email.trim());
+        match (name.is_empty(), email.is_empty()) {
+            (_, true) => Self(name.to_string()),
+            (true, false) => Self(format!("<{email}>")),
+            (false, false) => Self(format!("{name} <{email}>")),
+        }
+    }
+
+    /// Who made the change, as a person reads it: the name, or the address
+    /// when the record holds no name, or the recorded label when it is neither.
+    ///
+    /// Every surface that shows an author shows this. It reads `Name <email>`,
+    /// an actor label, and the whole Git author line older stores recorded for
+    /// an imported commit, dropping that line's time and offset.
+    pub fn name(&self) -> std::borrow::Cow<'_, str> {
+        match self.parts() {
+            Some(Identity { name, .. }) if !name.is_empty() => name,
+            Some(Identity { email, .. }) if !email.is_empty() => email,
+            _ => std::borrow::Cow::Borrowed(self.0.trim()),
+        }
+    }
+
+    /// The author's address, when the record holds one.
+    pub fn email(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.parts()
+            .map(|identity| identity.email)
+            .filter(|email| !email.is_empty())
+    }
+
+    /// The author as Git names them, `Name <email>`, for a surface that hands
+    /// the author to a program rather than a person: the time and offset an
+    /// earlier import recorded after the address are dropped, and an actor
+    /// label is returned as recorded.
+    pub fn identity(&self) -> Self {
+        match self.parts() {
+            Some(Identity { name, email }) if !(name.is_empty() && email.is_empty()) => {
+                Self::from_name_and_email(&name, &email)
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// The name and address this record carries, in any form a store holds.
+    fn parts(&self) -> Option<Identity<'_>> {
+        let recorded = self.0.trim();
+        if let Some(hex) = recorded.strip_prefix(LEGACY_GIT_AUTHOR_HEX_PREFIX) {
+            let bytes = hex::decode(hex).ok()?;
+            let line = String::from_utf8_lossy(&bytes).into_owned();
+            let identity = split_identity(&line)?;
+            return Some(Identity {
+                name: std::borrow::Cow::Owned(identity.0.to_string()),
+                email: std::borrow::Cow::Owned(identity.1.to_string()),
+            });
+        }
+        split_identity(recorded).map(|(name, email)| Identity {
+            name: std::borrow::Cow::Borrowed(name),
+            email: std::borrow::Cow::Borrowed(email),
+        })
+    }
+}
+
+struct Identity<'a> {
+    name: std::borrow::Cow<'a, str>,
+    email: std::borrow::Cow<'a, str>,
+}
+
+/// Split `Name <email>`, or a whole Git author line `Name <email> <seconds>
+/// <offset>`, into its trimmed name and address. Anything else after the
+/// address means the text is not an identity, and it is read as a label.
+fn split_identity(text: &str) -> Option<(&str, &str)> {
+    let open = text.find('<')?;
+    let close = open + text[open..].find('>')?;
+    let rest = text[close + 1..].trim();
+    if !rest.is_empty() && !is_git_time(rest) {
+        return None;
+    }
+    Some((text[..open].trim(), text[open + 1..close].trim()))
+}
+
+/// Whether `text` is a Git signature's time: seconds since 1970 and a `+hhmm`
+/// or `-hhmm` offset.
+fn is_git_time(text: &str) -> bool {
+    let mut parts = text.split_whitespace();
+    let (Some(seconds), Some(offset), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let seconds = seconds.strip_prefix('-').unwrap_or(seconds);
+    !seconds.is_empty()
+        && seconds.bytes().all(|byte| byte.is_ascii_digit())
+        && offset.len() == 5
+        && matches!(offset.as_bytes()[0], b'+' | b'-')
+        && offset.bytes().skip(1).all(|byte| byte.is_ascii_digit())
 }
 
 impl fmt::Display for AuthorId {
@@ -577,22 +688,7 @@ pub enum LanguageId {
 
 impl fmt::Display for LanguageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LanguageId::TypeScript => write!(f, "typescript"),
-            LanguageId::JavaScript => write!(f, "javascript"),
-            LanguageId::Python => write!(f, "python"),
-            LanguageId::Go => write!(f, "go"),
-            LanguageId::Java => write!(f, "java"),
-            LanguageId::Rust => write!(f, "rust"),
-            LanguageId::C => write!(f, "c"),
-            LanguageId::Cpp => write!(f, "cpp"),
-            LanguageId::CSharp => write!(f, "csharp"),
-            LanguageId::Ruby => write!(f, "ruby"),
-            LanguageId::Php => write!(f, "php"),
-            LanguageId::Swift => write!(f, "swift"),
-            LanguageId::Kotlin => write!(f, "kotlin"),
-            LanguageId::Hcl => write!(f, "hcl"),
-        }
+        f.write_str(self.profile().wire_name)
     }
 }
 
@@ -687,6 +783,82 @@ impl fmt::Display for ConflictId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An author is read the way Git names one, whatever form the store holds:
+    /// what a native change and a current import record, an actor label, and
+    /// the whole author line older stores recorded for an imported commit.
+    #[test]
+    fn an_author_reads_as_its_name_in_every_recorded_form() {
+        let cases = [
+            (
+                "Ada Lovelace <ada@example.com>",
+                "Ada Lovelace",
+                Some("ada@example.com"),
+            ),
+            (
+                "David Lord <davidism@gmail.com> 1749933342 -0700",
+                "David Lord",
+                Some("davidism@gmail.com"),
+            ),
+            (
+                "Old Epoch <old@example.com> -5 +0000",
+                "Old Epoch",
+                Some("old@example.com"),
+            ),
+            (
+                "<only@example.com>",
+                "only@example.com",
+                Some("only@example.com"),
+            ),
+            ("anthropic/claude-code", "anthropic/claude-code", None),
+            ("Ada Lovelace", "Ada Lovelace", None),
+            // Text after the address that is not a Git time is no identity.
+            (
+                "Ada <ada@example.com> and friends",
+                "Ada <ada@example.com> and friends",
+                None,
+            ),
+        ];
+        for (recorded, name, email) in cases {
+            let author = AuthorId::new(recorded);
+            assert_eq!(author.name(), name, "{recorded}");
+            assert_eq!(author.email().as_deref(), email, "{recorded}");
+        }
+        assert_eq!(
+            AuthorId::new("David Lord <davidism@gmail.com> 1749933342 -0700").identity(),
+            AuthorId::new("David Lord <davidism@gmail.com>"),
+            "a program is handed the author as Git names them, never the whole line"
+        );
+        for kept in [
+            "Ada Lovelace <ada@example.com>",
+            "anthropic/claude-code",
+            "Ada Lovelace",
+        ] {
+            assert_eq!(AuthorId::new(kept).identity(), AuthorId::new(kept));
+        }
+
+        // A line that was not UTF-8 was recorded as hexadecimal.
+        let line = b"Ren\xe9 Dupont <rene@example.com> 1700000000 +0100";
+        let legacy = AuthorId::new(format!("git-author-v1:{}", hex::encode(line)));
+        assert_eq!(legacy.name(), "Ren\u{fffd} Dupont");
+        assert_eq!(legacy.email().as_deref(), Some("rene@example.com"));
+    }
+
+    #[test]
+    fn an_author_from_a_name_and_address_is_written_the_way_git_names_one() {
+        assert_eq!(
+            AuthorId::from_name_and_email(" Ada Lovelace ", "ada@example.com"),
+            AuthorId::new("Ada Lovelace <ada@example.com>")
+        );
+        assert_eq!(
+            AuthorId::from_name_and_email("Ada Lovelace", ""),
+            AuthorId::new("Ada Lovelace")
+        );
+        assert_eq!(
+            AuthorId::from_name_and_email("", "ada@example.com"),
+            AuthorId::new("<ada@example.com>")
+        );
+    }
 
     #[test]
     fn hash256_hex_roundtrip() {

@@ -462,44 +462,102 @@ pub fn install_plugin(
 /// Source file extensions, in the order a source entry is looked for.
 const SOURCE_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".d.ts"];
 
+/// JavaScript source extensions, in the order Node and TypeScript try them.
+/// A JavaScript package has no TypeScript source to find, and tsserver
+/// analyses its JavaScript with `allowJs`, as it does the importing file.
+const JAVASCRIPT_EXTENSIONS: &[&str] = &[".js", ".jsx", ".mjs", ".cjs"];
+
 /// Build output directories a manifest's entry points into, which the
 /// source mirrors without them.
 const BUILD_DIRS: &[&str] = &["dist", "build", "lib", "out", "esm", "cjs"];
 
-/// The source file an entry a manifest names (`./dist/index.d.ts`,
-/// `./index.cjs`) corresponds to in an unbuilt package, when there is one:
-/// the entry's stem, with and without its build directory, under `src` and
-/// the package itself, as a file or a directory's index.
-fn source_of(dir: &Path, entry: &str) -> Option<PathBuf> {
+/// The entry's path inside its package without a leading `./`, and without
+/// the extension a manifest names it with.
+fn entry_stem(entry: &str) -> String {
     let entry = entry.trim_start_matches("./");
-    let mut stem = entry.to_string();
     for extension in [
         ".d.ts", ".d.mts", ".d.cts", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".jsx",
     ] {
-        if let Some(stripped) = stem.strip_suffix(extension) {
-            stem = stripped.to_string();
-            break;
+        if let Some(stripped) = entry.strip_suffix(extension) {
+            return stripped.to_string();
         }
     }
+    entry.to_string()
+}
+
+/// The entry's path with its build directory taken off, when it starts with
+/// one: `dist/index` is `index` in the source it was built from.
+fn without_build_dir(stem: &str) -> Option<&str> {
+    let (first, rest) = stem.split_once('/')?;
+    BUILD_DIRS.contains(&first).then_some(rest)
+}
+
+/// The first of `candidate` with each of `extensions`, and then of
+/// `candidate/index` with each, that is a file.
+fn first_file(candidate: &Path, extensions: &[&str]) -> Option<PathBuf> {
+    [candidate.to_path_buf(), candidate.join("index")]
+        .into_iter()
+        .flat_map(|base| {
+            extensions
+                .iter()
+                .map(move |extension| PathBuf::from(format!("{}{extension}", base.display())))
+        })
+        .find(|file| file.is_file())
+}
+
+/// The source file an entry a manifest names (`./dist/index.d.ts`,
+/// `./index.cjs`, `./index.js`) corresponds to, when there is one.
+///
+/// TypeScript source first: the entry's stem, with and without its build
+/// directory, under `src` and the package itself, as a file or a directory's
+/// index. Then JavaScript, as Node resolves it: the entry itself when it is a
+/// JavaScript file that exists, the stem with each JavaScript extension or
+/// as a directory's index, and last, for an entry inside a build directory
+/// that is not built, the source that directory is built from. React's
+/// `react` names `./index.js`, and before JavaScript was looked for it had no
+/// entry at all, so `import {useContext} from 'react'` resolved to nothing
+/// and every value it returned was `any`.
+fn source_of(dir: &Path, entry: &str) -> Option<PathBuf> {
+    let stem = entry_stem(entry);
     let mut stems = vec![stem.clone()];
-    if let Some((first, rest)) = stem.split_once('/') {
-        if BUILD_DIRS.contains(&first) {
-            stems.push(rest.to_string());
-        }
+    if let Some(rest) = without_build_dir(&stem) {
+        stems.push(rest.to_string());
     }
-    for stem in stems {
+    for stem in &stems {
         for base in [dir.join("src"), dir.to_path_buf()] {
-            for candidate in [base.join(&stem), base.join(&stem).join("index")] {
-                for extension in SOURCE_EXTENSIONS {
-                    let file = PathBuf::from(format!("{}{extension}", candidate.display()));
-                    if file.is_file() {
-                        return Some(file);
-                    }
-                }
+            if let Some(file) = first_file(&base.join(stem), SOURCE_EXTENSIONS) {
+                return Some(file);
             }
         }
     }
-    None
+    let exact = dir.join(entry.trim_start_matches("./"));
+    if exact.is_file()
+        && JAVASCRIPT_EXTENSIONS
+            .iter()
+            .any(|extension| entry.ends_with(extension))
+    {
+        return Some(exact);
+    }
+    if let Some(file) = first_file(&dir.join(&stem), JAVASCRIPT_EXTENSIONS) {
+        return Some(file);
+    }
+    let rest = without_build_dir(&stem)?;
+    [dir.join("src").join(rest), dir.join(rest)]
+        .iter()
+        .find_map(|candidate| first_file(candidate, JAVASCRIPT_EXTENSIONS))
+}
+
+/// Whether a package's manifest names its entry points in build output that
+/// is not in the repository as source: an entry inside a build directory, or
+/// an entry file that does not exist. Such a package's other subpaths are
+/// found in its `src` mirror, as the entry's own source is. A package whose
+/// manifest names entries that exist, or names none, resolves subpaths the
+/// way Node does, from the package directory itself.
+fn entries_are_built(dir: &Path, entries: &[String]) -> bool {
+    entries.iter().any(|entry| {
+        let stem = entry_stem(entry);
+        without_build_dir(&stem).is_some() || !dir.join(entry.trim_start_matches("./")).exists()
+    })
 }
 
 /// The target an `exports` entry names for type information: the `types`
@@ -531,38 +589,67 @@ pub fn source_entries(package: &WorkspacePackage) -> Vec<(String, PathBuf)> {
         }
         other => export_target(other),
     });
-    let named = ["types", "typings", "module", "main"]
+    let named: Vec<String> = ["types", "typings", "module", "main"]
         .iter()
-        .filter_map(|field| manifest.get(*field)?.as_str().map(str::to_string));
-    let main = root_export
-        .into_iter()
-        .chain(named)
+        .filter_map(|field| manifest.get(*field)?.as_str().map(str::to_string))
+        .collect();
+    let declared: Vec<String> = root_export.into_iter().chain(named).collect();
+    let main = declared
+        .iter()
+        .cloned()
         .chain(std::iter::once("index".to_string()))
         .find_map(|entry| source_of(&package.dir, &entry));
+    let src = package.dir.join("src");
+    let mirrored = src.is_dir() && entries_are_built(&package.dir, &declared);
     let mut entries = Vec::new();
     if let Some(main) = main {
         entries.push((package.name.clone(), main));
     }
     if let Some(serde_json::Value::Object(map)) = exports {
         for (key, value) in map {
-            let Some(subpath) = key.strip_prefix("./").filter(|s| !s.contains('*')) else {
+            let Some(subpath) = key.strip_prefix("./") else {
                 continue;
             };
-            if let Some(file) =
-                export_target(value).and_then(|target| source_of(&package.dir, &target))
-            {
+            let Some(target) = export_target(value) else {
+                continue;
+            };
+            if subpath.contains('*') {
+                // A subpath pattern, `"./src/*": "./src/*"`: the pattern
+                // resolves where its target says, under the source mirror
+                // when the target is build output.
+                if let Some(under) = pattern_target(&package.dir, &target, mirrored) {
+                    entries.push((format!("{}/{subpath}", package.name), under));
+                }
+                continue;
+            }
+            if let Some(file) = source_of(&package.dir, &target) {
                 entries.push((format!("{}/{subpath}", package.name), file));
             }
         }
     }
-    let src = package.dir.join("src");
-    let under = if src.is_dir() {
-        src
-    } else {
-        package.dir.clone()
-    };
+    // Any other subpath resolves under the package, as Node resolves it, or
+    // under its source mirror when the package's entries are build output.
+    let under = if mirrored { src } else { package.dir.clone() };
     entries.push((format!("{}/*", package.name), under.join("*")));
     entries
+}
+
+/// Where an `exports` subpath pattern's target (`./src/*`, `./dist/*.js`)
+/// resolves in the repository: the target's directory with its `*`, under
+/// the source mirror when it is build output and the package is `mirrored`.
+/// The extension after the `*` is dropped, because the plugin finds a
+/// source file by its stem.
+fn pattern_target(dir: &Path, target: &str, mirrored: bool) -> Option<PathBuf> {
+    let target = target.trim_start_matches("./");
+    let (before, _) = target.split_once('*')?;
+    let before = match (mirrored, without_build_dir(target)) {
+        (true, Some(_)) => {
+            let rest = without_build_dir(before).unwrap_or("");
+            return Some(dir.join("src").join(format!("{rest}*")));
+        }
+        _ => before,
+    };
+    Some(dir.join(format!("{before}*")))
 }
 
 /// The project model of a JavaScript workspace: its declared packages, and
@@ -771,6 +858,146 @@ pub fn environment_with(root: &Path, model: &ProjectModel, host: &TsHost) -> Env
     }
 }
 
+/// A TypeScript installed outside the repository, which
+/// typescript-language-server can run when the workspace has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutsideTypeScript {
+    /// The package directory, holding `package.json` and `lib/tsserver.js`.
+    pub dir: PathBuf,
+    /// The version its `package.json` names, when it names one.
+    pub version: Option<String>,
+}
+
+impl OutsideTypeScript {
+    /// The tsserver typescript-language-server is pointed at.
+    pub fn tsserver(&self) -> PathBuf {
+        self.dir.join("lib/tsserver.js")
+    }
+
+    /// How a launch label names it.
+    fn describe(&self) -> String {
+        match &self.version {
+            Some(version) => format!("global TypeScript {version} from {}", self.dir.display()),
+            None => format!("global TypeScript from {}", self.dir.display()),
+        }
+    }
+}
+
+/// The first file named `name` in the directories of `path`.
+fn find_on_path(path: Option<&str>, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A `typescript` package directory that can serve tsserver: one whose
+/// `lib/tsserver.js` exists. TypeScript 7 ships none, and
+/// typescript-language-server cannot run it.
+fn valid_typescript(dir: &Path) -> Option<OutsideTypeScript> {
+    dir.join("lib/tsserver.js")
+        .is_file()
+        .then(|| OutsideTypeScript {
+            dir: dir.to_path_buf(),
+            version: package_version(dir),
+        })
+}
+
+/// Find a TypeScript outside the repository at `root` that
+/// typescript-language-server can run, or say where none was found.
+///
+/// typescript-language-server 5 looks in the workspace's
+/// `node_modules/typescript`, then at `tsserver.fallbackPath`, then for a
+/// `typescript` it can resolve from its own install, and refuses to
+/// initialize when none of them is there. A repository whose dependencies are
+/// not installed has none of the first, so this supplies the second: a
+/// `typescript` package beside the `typescript-language-server` on `PATH`
+/// (the same `node_modules` its symlink leads into, or its own nested one),
+/// then the package behind a `tsserver` or `tsc` on `PATH`. A candidate
+/// inside the repository is passed over, since the workspace's own TypeScript
+/// is already tried first, and so is one without `lib/tsserver.js`.
+///
+/// The `Err` is the sentence a start failure carries when no TypeScript runs.
+pub fn outside_typescript(root: &Path, host: &TsHost) -> Result<OutsideTypeScript, String> {
+    let path = host.vars.get("PATH").map(String::as_str);
+    // Candidates are followed through their symlinks, so the repository is
+    // compared by its real path too.
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let outside = |dir: &Path| !dir.starts_with(&root);
+    let mut looked: Vec<String> = Vec::new();
+
+    match find_on_path(path, "typescript-language-server") {
+        Some(server) => {
+            let real = std::fs::canonicalize(&server).unwrap_or(server.clone());
+            // The package directory is the ancestor that sits directly in a
+            // `node_modules`: `.../node_modules/typescript-language-server`.
+            let package = real.ancestors().find(|dir| {
+                dir.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "node_modules")
+            });
+            match package {
+                Some(package) => {
+                    let modules = package.parent().unwrap_or(package);
+                    for candidate in [
+                        modules.join("typescript"),
+                        package.join("node_modules/typescript"),
+                    ] {
+                        if !outside(&candidate) {
+                            continue;
+                        }
+                        if let Some(found) = valid_typescript(&candidate) {
+                            return Ok(found);
+                        }
+                    }
+                    looked.push(format!(
+                        "beside typescript-language-server in {}",
+                        modules.display()
+                    ));
+                }
+                None => looked.push(format!(
+                    "beside typescript-language-server, which is not installed in a \
+                     node_modules ({})",
+                    real.display()
+                )),
+            }
+        }
+        None => looked.push("beside typescript-language-server, which is not on PATH".into()),
+    }
+
+    for binary in ["tsserver", "tsc"] {
+        let Some(found) = find_on_path(path, binary) else {
+            continue;
+        };
+        let real = std::fs::canonicalize(&found).unwrap_or(found);
+        // `bin/tsc` and `bin/tsserver` sit one level inside the package.
+        let package = real.ancestors().skip(1).take(3).find(|dir| {
+            std::fs::read_to_string(dir.join("package.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .is_some_and(|json| json.get("name").and_then(|n| n.as_str()) == Some("typescript"))
+        });
+        if let Some(package) = package.filter(|dir| outside(dir)) {
+            if let Some(found) = valid_typescript(package) {
+                return Ok(found);
+            }
+            looked.push(format!(
+                "behind {binary} at {}, which has no lib/tsserver.js",
+                package.display()
+            ));
+        }
+    }
+    let home = host.home.as_deref();
+    looked.push(format!(
+        "for tsserver or tsc on PATH (looked in {})",
+        crate::discovery::describe_search_path(path.map(std::ffi::OsStr::new), home)
+    ));
+    Err(format!(
+        "No TypeScript with a lib/tsserver.js was found outside the repository: Kin looked {}",
+        looked.join(", and ")
+    ))
+}
+
 /// The launch for a repository, with the plugin kept under `cache`.
 pub fn launch_with(root: &Path, cache: &Path) -> ServerLaunch {
     let model = project_model(root);
@@ -791,17 +1018,29 @@ pub fn launch_with(root: &Path, cache: &Path) -> ServerLaunch {
 pub const TSSERVER_EXIT_REPORT: &str = "[tsserver] Exited";
 
 /// The launch for a model and an environment, with the plugin kept under
-/// `cache`.
+/// `cache`, on this process's host.
 pub fn configure_with(
     root: &Path,
     model: &ProjectModel,
     environment: &Environment,
     cache: &Path,
 ) -> ServerLaunch {
+    configure_on(root, model, environment, cache, &TsHost::current())
+}
+
+/// [`configure_with`] on a given host, whose `PATH` decides which TypeScript
+/// outside the repository the server is offered.
+pub fn configure_on(
+    root: &Path,
+    model: &ProjectModel,
+    environment: &Environment,
+    cache: &Path,
+    host: &TsHost,
+) -> ServerLaunch {
     ServerLaunch {
         backend_exit_report: Some(TSSERVER_EXIT_REPORT.to_string()),
         readiness: super::Readiness::PerDocument,
-        ..configure_server(root, model, environment, cache)
+        ..configure_server(root, model, environment, cache, host)
     }
 }
 
@@ -810,6 +1049,7 @@ fn configure_server(
     model: &ProjectModel,
     environment: &Environment,
     cache: &Path,
+    host: &TsHost,
 ) -> ServerLaunch {
     let mut options = base_options();
     let tsserver = environment
@@ -820,13 +1060,35 @@ fn configure_server(
     if let Some(tsserver) = &tsserver {
         options["tsserver"]["path"] = serde_json::json!(tsserver.display().to_string());
     }
-    let typescript = environment.toolchain.as_ref().map_or_else(
+    // With no TypeScript from the environment, the server is offered one
+    // from outside the repository as its fallback. The workspace's own
+    // `node_modules/typescript` still comes first, since the server tries it
+    // before the fallback.
+    let mut toolchain_gap = None;
+    let mut typescript = environment.toolchain.as_ref().map_or_else(
         || "bundled TypeScript".to_string(),
         |toolchain| match &toolchain.location {
             Some(_) => format!("TypeScript {}", toolchain.version),
             None => "bundled TypeScript".to_string(),
         },
     );
+    if tsserver.is_none() {
+        if let Some(own) = valid_typescript(&root.join("node_modules/typescript")) {
+            typescript = match own.version {
+                Some(version) => format!("the workspace's TypeScript {version}"),
+                None => "the workspace's TypeScript".to_string(),
+            };
+        } else {
+            match outside_typescript(root, host) {
+                Ok(found) => {
+                    options["tsserver"]["fallbackPath"] =
+                        serde_json::json!(found.tsserver().display().to_string());
+                    typescript = found.describe();
+                }
+                Err(looked) => toolchain_gap = Some(looked),
+            }
+        }
+    }
     let layout = match &environment.provider {
         Provider::KinAnalysisEnvironment { .. } if environment.pending.is_none() => environment
             .dependencies
@@ -844,7 +1106,9 @@ fn configure_server(
             "no dependencies until Kin's analysis environment is fetched".to_string()
         }
         (Provider::UserEnvironment { description, .. }, _) => description.clone(),
-        (Provider::Missing { .. }, _) => "no dependencies (environment missing)".to_string(),
+        (Provider::Missing { reason }, _) => {
+            format!("no dependencies (environment missing: {reason})")
+        }
     };
     let workspace = PluginWorkspace {
         packages: plugin_packages(model),
@@ -855,6 +1119,7 @@ fn configure_server(
         return ServerLaunch {
             initialization_options: Some(options),
             label: format!("typescript-language-server with {typescript}; {dependencies}"),
+            toolchain_gap,
             ..ServerLaunch::default()
         };
     }
@@ -876,6 +1141,7 @@ fn configure_server(
                      resolvable from source; {dependencies}",
                     workspace.packages.len()
                 ),
+                toolchain_gap,
                 ..ServerLaunch::default()
             }
         }
@@ -893,6 +1159,7 @@ fn configure_server(
                     "typescript-language-server with {typescript}, without the workspace-source \
                      plugin; {dependencies}"
                 ),
+                toolchain_gap,
                 ..ServerLaunch::default()
             }
         }
@@ -1206,6 +1473,199 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    /// A host whose `PATH` is `path` and nothing else.
+    fn host_with_path(cache: &Path, path: &str) -> TsHost {
+        TsHost {
+            vars: HashMap::from([("PATH".to_string(), path.to_string())]),
+            ..ts_host(cache, false)
+        }
+    }
+
+    /// A global npm prefix the way Homebrew lays one out: `bin/` holding a
+    /// symlink into `lib/node_modules/<package>`.
+    #[cfg(unix)]
+    fn npm_prefix(prefix: &Fixture, typescript: Option<(&str, bool)>) -> PathBuf {
+        prefix.write(
+            "lib/node_modules/typescript-language-server/lib/cli.mjs",
+            "#!/usr/bin/env node\n",
+        );
+        prefix.write(
+            "lib/node_modules/typescript-language-server/package.json",
+            "{\"name\": \"typescript-language-server\", \"version\": \"5.1.0\"}",
+        );
+        if let Some((version, tsserver)) = typescript {
+            prefix.write(
+                "lib/node_modules/typescript/package.json",
+                &format!("{{\"name\": \"typescript\", \"version\": \"{version}\"}}"),
+            );
+            prefix.write(
+                "lib/node_modules/typescript/bin/tsc",
+                "#!/usr/bin/env node\n",
+            );
+            if tsserver {
+                prefix.write("lib/node_modules/typescript/lib/tsserver.js", "");
+            }
+        }
+        let bin = prefix.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(
+            "../lib/node_modules/typescript-language-server/lib/cli.mjs",
+            bin.join("typescript-language-server"),
+        )
+        .unwrap();
+        bin
+    }
+
+    /// The field report: a repository with no node_modules. The server is
+    /// offered the TypeScript installed beside it, by symlink, as its
+    /// fallback, and the label says which TypeScript runs.
+    #[cfg(unix)]
+    #[test]
+    fn without_dependencies_the_server_is_offered_the_typescript_beside_it() {
+        let repo = Fixture::new("ts-outside-repo");
+        let cache = Fixture::new("ts-outside-cache");
+        let prefix = Fixture::new("ts-outside-prefix");
+        let bin = npm_prefix(&prefix, Some(("5.9.3", true)));
+        let host = host_with_path(&cache.root, &format!("/kin-test-nowhere:{}", bin.display()));
+
+        let found = outside_typescript(&repo.root, &host).expect("the sibling TypeScript");
+        let expected =
+            std::fs::canonicalize(prefix.root.join("lib/node_modules/typescript")).unwrap();
+        assert_eq!(found.dir, expected);
+        assert_eq!(found.version.as_deref(), Some("5.9.3"));
+
+        let model = project_model(&repo.root);
+        let environment = Environment::from_provider(
+            Provider::Missing {
+                reason: "no lockfile, and no node_modules".to_string(),
+            },
+            &["typescript", "missing"],
+        );
+        let launch = configure_on(&repo.root, &model, &environment, &cache.root, &host);
+        let options = launch.initialization_options.expect("options");
+        assert_eq!(
+            options["tsserver"]["fallbackPath"],
+            expected.join("lib/tsserver.js").display().to_string()
+        );
+        assert!(
+            options["tsserver"].get("path").is_none(),
+            "the workspace's own TypeScript still comes first"
+        );
+        assert!(
+            launch.label.contains(&format!(
+                "global TypeScript 5.9.3 from {}",
+                expected.display()
+            )),
+            "{}",
+            launch.label
+        );
+        assert!(
+            launch
+                .label
+                .contains("environment missing: no lockfile, and no node_modules"),
+            "the label names why dependencies are missing: {}",
+            launch.label
+        );
+        assert_eq!(launch.toolchain_gap, None);
+    }
+
+    /// TypeScript 7 ships no `lib/tsserver.js`, so one beside the server is
+    /// passed over, and a `tsc` on PATH leading to a valid package is used.
+    #[cfg(unix)]
+    #[test]
+    fn a_typescript_without_tsserver_is_passed_over_for_one_behind_tsc() {
+        let repo = Fixture::new("ts7-repo");
+        let cache = Fixture::new("ts7-cache");
+        let native = Fixture::new("ts7-prefix");
+        let native_bin = npm_prefix(&native, Some(("7.0.0", false)));
+        let classic = Fixture::new("ts5-prefix");
+        classic.write(
+            "lib/node_modules/typescript/package.json",
+            "{\"name\": \"typescript\", \"version\": \"5.8.2\"}",
+        );
+        classic.write(
+            "lib/node_modules/typescript/bin/tsc",
+            "#!/usr/bin/env node\n",
+        );
+        classic.write("lib/node_modules/typescript/lib/tsserver.js", "");
+        let classic_bin = classic.root.join("bin");
+        std::fs::create_dir_all(&classic_bin).unwrap();
+        std::os::unix::fs::symlink(
+            "../lib/node_modules/typescript/bin/tsc",
+            classic_bin.join("tsc"),
+        )
+        .unwrap();
+
+        let only_native = host_with_path(&cache.root, &native_bin.display().to_string());
+        let looked = outside_typescript(&repo.root, &only_native)
+            .expect_err("TypeScript 7 alone cannot serve tsserver");
+        assert!(
+            looked.contains("beside typescript-language-server in"),
+            "{looked}"
+        );
+        assert!(
+            looked.contains("for tsserver or tsc on PATH (looked in"),
+            "{looked}"
+        );
+
+        let both = host_with_path(
+            &cache.root,
+            &format!("{}:{}", native_bin.display(), classic_bin.display()),
+        );
+        let found = outside_typescript(&repo.root, &both).expect("the TypeScript behind tsc");
+        assert_eq!(found.version.as_deref(), Some("5.8.2"));
+        assert!(found.tsserver().is_file());
+    }
+
+    /// No TypeScript anywhere: the launch carries where Kin looked, so a
+    /// start that fails says it plainly, and nothing is offered.
+    #[cfg(unix)]
+    #[test]
+    fn with_no_typescript_anywhere_the_launch_says_where_kin_looked() {
+        let repo = Fixture::new("ts-none-repo");
+        let cache = Fixture::new("ts-none-cache");
+        let prefix = Fixture::new("ts-none-prefix");
+        let bin = npm_prefix(&prefix, None);
+        let host = host_with_path(&cache.root, &bin.display().to_string());
+        let model = project_model(&repo.root);
+        let environment = Environment::from_provider(
+            Provider::Missing {
+                reason: "no lockfile".to_string(),
+            },
+            &["typescript", "missing"],
+        );
+        let launch = configure_on(&repo.root, &model, &environment, &cache.root, &host);
+        let gap = launch.toolchain_gap.expect("no TypeScript is a named gap");
+        assert!(
+            gap.starts_with("No TypeScript with a lib/tsserver.js was found"),
+            "{gap}"
+        );
+        assert!(gap.contains(&bin.display().to_string()), "{gap}");
+        assert!(launch.initialization_options.unwrap()["tsserver"]
+            .get("fallbackPath")
+            .is_none());
+    }
+
+    /// A TypeScript inside the repository is never the fallback: the
+    /// workspace's own is already tried first, by the server itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_typescript_inside_the_repository_is_not_the_fallback() {
+        let repo = Fixture::new("ts-inside-repo");
+        let cache = Fixture::new("ts-inside-cache");
+        repo.write(
+            "tools/node_modules/typescript/package.json",
+            "{\"name\": \"typescript\", \"version\": \"5.4.0\"}",
+        );
+        repo.write("tools/node_modules/typescript/bin/tsc", "");
+        repo.write("tools/node_modules/typescript/lib/tsserver.js", "");
+        let bin = repo.root.join("tools/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../node_modules/typescript/bin/tsc", bin.join("tsc")).unwrap();
+        let host = host_with_path(&cache.root, &bin.display().to_string());
+        assert!(outside_typescript(&repo.root, &host).is_err());
+    }
+
     fn ts_host(cache: &Path, on: bool) -> TsHost {
         TsHost {
             vars: HashMap::new(),
@@ -1260,6 +1720,84 @@ mod tests {
                 .config,
             Some(repo.root.join("lib/tsconfig.json"))
         );
+    }
+
+    /// A JavaScript workspace package resolves as Node resolves it: its
+    /// entry is the JavaScript file its manifest names, an `exports` subpath
+    /// pattern resolves where its target says, and any other subpath resolves
+    /// under the package itself, not under a `src` mirror, because nothing
+    /// in its manifest is build output. A TypeScript package whose manifest
+    /// names build output keeps its `src` mirror. Falsify by looking only for
+    /// TypeScript source, or by mirroring every package with a `src`: React's
+    /// `react` had no entry, and `react-reconciler/src/X` resolved to
+    /// `react-reconciler/src/src/X`.
+    #[test]
+    fn a_javascript_workspace_package_resolves_as_node_resolves_it() {
+        let repo = Fixture::new("js-workspace-map");
+        repo.write(
+            "package.json",
+            "{\"private\": true, \"workspaces\": [\"packages/*\"]}",
+        );
+        repo.write(
+            "packages/react/package.json",
+            "{\"name\": \"react\", \"main\": \"index.js\", \"exports\": {\".\": {\"react-server\": \"./react.react-server.js\", \"default\": \"./index.js\"}, \"./jsx-runtime\": {\"default\": \"./jsx-runtime.js\"}, \"./src/*\": \"./src/*\", \"./package.json\": \"./package.json\"}}",
+        );
+        repo.write(
+            "packages/react/index.js",
+            "export * from './src/ReactClient';\n",
+        );
+        repo.write("packages/react/jsx-runtime.js", "");
+        repo.write("packages/react/src/ReactClient.js", "");
+        repo.write(
+            "packages/react-reconciler/package.json",
+            "{\"name\": \"react-reconciler\", \"main\": \"index.js\"}",
+        );
+        repo.write("packages/react-reconciler/index.js", "");
+        repo.write("packages/react-reconciler/src/ReactFiber.js", "");
+        repo.write(
+            "packages/shared/package.json",
+            "{\"name\": \"shared\", \"private\": true}",
+        );
+        repo.write("packages/shared/assign.js", "");
+        repo.write(
+            "packages/devtools/package.json",
+            "{\"name\": \"devtools\", \"private\": true}",
+        );
+        repo.write("packages/devtools/src/store.js", "");
+        repo.write(
+            "packages/built/package.json",
+            "{\"name\": \"built\", \"main\": \"./dist/index.js\", \"exports\": {\".\": \"./dist/index.js\", \"./features/*\": \"./dist/features/*.js\"}}",
+        );
+        repo.write("packages/built/src/index.js", "");
+        repo.write("packages/built/src/features/a.js", "");
+
+        let model = TypeScriptAdapter.project_model(&repo.root);
+        let map = &model.workspace_map;
+        let at = |path: &str| repo.root.join(path);
+        assert_eq!(map["react"], at("packages/react/index.js"));
+        assert_eq!(
+            map["react/jsx-runtime"],
+            at("packages/react/jsx-runtime.js")
+        );
+        assert_eq!(map["react/src/*"], at("packages/react/src/*"));
+        assert_eq!(map["react/*"], at("packages/react/*"));
+        assert!(!map.contains_key("react/package.json"));
+        assert_eq!(
+            map["react-reconciler"],
+            at("packages/react-reconciler/index.js")
+        );
+        assert_eq!(
+            map["react-reconciler/*"],
+            at("packages/react-reconciler/*"),
+            "`react-reconciler/src/ReactFiber` is the package's own src"
+        );
+        assert_eq!(map["shared/*"], at("packages/shared/*"));
+        assert!(!map.contains_key("shared"), "no entry file to name");
+        assert_eq!(map["devtools/*"], at("packages/devtools/*"));
+        // Build output that is not built resolves to its source.
+        assert_eq!(map["built"], at("packages/built/src/index.js"));
+        assert_eq!(map["built/*"], at("packages/built/src/*"));
+        assert_eq!(map["built/features/*"], at("packages/built/src/features/*"));
     }
 
     /// The repository's own node_modules serves when it holds the lock's

@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    # Hash256, its serialization and its text form: kin-model re-exports it,
+    # and every hash-based identity Kin derives is written through it.
+    "src/lib.rs",
+]
+
+[[excluded]]
+reason = "the durable fsync helper storage writes call; it writes bytes and decides no value"
+files = [
+    "src/durable.rs",
+]
+
+[[excluded]]
+reason = "error types; no error text is stored on a derived entity or relation"
+files = [
+    "src/error.rs",
+]
+
+[[excluded]]
+reason = "filesystem authority tokens carry caller-supplied roots and grant access at IO boundaries; they neither transform source nor decide hash values"
+files = ["src/authority.rs"]
+
+[dependencies]
+hex = { reason = "hexadecimal encoding fixed by its definition; a release changes no encoded value" }
+schemars = { reason = "describes the JSON schema of these types for tool surfaces; it serializes nothing a store keeps" }
+serde = { reason = "serialization through derived impls whose output this crate's own code fixes; a release changes no serialized value" }
+sha2 = { reason = "SHA-256, fixed by its specification; a release changes no digest" }
+thiserror = { reason = "error type derivation; no error text is stored" }
+tracing = { reason = "diagnostic logging only" }
+libc = { reason = "operating-system calls for durable writes; no derived value" }
+windows-sys = { reason = "operating-system calls for durable writes on Windows; no derived value" }

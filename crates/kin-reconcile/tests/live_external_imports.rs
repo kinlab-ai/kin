@@ -1210,3 +1210,36 @@ fn a_python_field_annotation_naming_an_imported_type_keeps_its_external_edge_and
     repo.graph.apply_transaction_delta(&result.delta).unwrap();
     assert!(file_external_edges(&repo, "client.py").is_empty());
 }
+
+/// An `Overrides` edge to a member of a base class from another package points
+/// at a placeholder derived from the import, and a store an older Kin build
+/// wrote holds neither that edge nor its placeholder. When a local destination
+/// arrives and the waiting source is re-read, the placeholder is not a cached
+/// destination the graph lacks, so the retirement of the proven call proceeds.
+#[test]
+fn an_external_override_placeholder_is_not_an_unadmitted_cached_target() {
+    let mut repo = Repo::new();
+    repo.edit(
+        "caller.py",
+        "from first import a\nfrom celery import Task\n\n\ndef run():\n    return a()\n\n\n\
+         class Job(Task):\n    def __call__(self):\n        return 1\n",
+    );
+    assert_eq!(repo.edges("caller.py").len(), 1);
+    // What a store an older build wrote holds: no override edge to the
+    // external base, and no placeholder for its member.
+    for entity in repo.graph.list_all_entities().unwrap() {
+        for relation in repo.graph.get_all_relations_for_entity(&entity.id).unwrap() {
+            if relation.kind == kin_model::RelationKind::Overrides
+                && kin_index::is_external_import_placeholder(&relation)
+            {
+                repo.graph.remove_relation(&relation.id).unwrap();
+                if let Some(target) = relation.dst.as_entity() {
+                    let _ = repo.graph.remove_entity(&target);
+                }
+            }
+        }
+    }
+    repo.edit("first.py", "def a():\n    return 1\n");
+    assert!(repo.edges("caller.py").is_empty());
+    assert_eq!(repo.outgoing_calls("caller.py").len(), 1);
+}

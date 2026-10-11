@@ -369,6 +369,8 @@ pub async fn push(
     json: bool,
 ) -> Result<()> {
     let layout = layout()?;
+    kin_core::history_state::require_complete_for(&layout, "kin push")
+        .map_err(anyhow::Error::msg)?;
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
     let response = daemon("kin push", &layout)
@@ -385,6 +387,8 @@ pub async fn pull(
     json: bool,
 ) -> Result<()> {
     let layout = layout()?;
+    kin_core::history_state::require_complete_for(&layout, "kin pull")
+        .map_err(anyhow::Error::msg)?;
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
     let response = daemon("kin pull", &layout)
@@ -401,6 +405,8 @@ pub async fn plan_push(
     json: bool,
 ) -> Result<()> {
     let layout = layout()?;
+    kin_core::history_state::require_complete_for(&layout, "kin remote plan-push")
+        .map_err(anyhow::Error::msg)?;
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
     let plan = daemon("kin remote plan-push", &layout)

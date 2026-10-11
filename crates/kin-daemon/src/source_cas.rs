@@ -122,6 +122,127 @@ pub(crate) fn read_publishable_source(
     }
 }
 
+/// A body read from the two stores a publication may find it in, or from
+/// staging alone when no authority is at hand, as `None` where neither holds
+/// it.
+pub(crate) fn source_reader<'a>(
+    blobs: &'a BlobStore,
+    authority: Option<&'a RepositoryAuthorityManager<LocalFileBackend>>,
+) -> impl Fn(Hash256) -> Option<Vec<u8>> + 'a {
+    move |hash| match authority {
+        Some(authority) => read_publishable_source(blobs, authority, hash)
+            .ok()
+            .map(|source| source.body().to_vec()),
+        None => blobs.read(&hash).ok(),
+    }
+}
+
+/// Copy into staging every body the manifests `tree` holds that an adapter
+/// names units from read, wherever staging lacks it, from repository CAS: a
+/// manifest's own body, and for one held as a link, each link in its chain and
+/// the body it leads to, whatever that target is named
+/// ([`kin_index::naming_manifest_bodies`]).
+///
+/// The units beneath such a manifest are named from it wherever they are
+/// parsed, and the daemon's own passes read every body from staging. Restoring
+/// the few naming manifests before such a pass makes a manifest staging lost
+/// fall back to authority, as a commit's source reads do, rather than refuse
+/// the units beneath it. Authority is opened only when staging lacks one, and
+/// a manifest neither store yields is left for the pass to refuse by name.
+/// Returns how many were restored.
+pub(crate) fn restage_naming_manifests(
+    state: &crate::state::DaemonState,
+    tree: &kin_model::ResolvedTree,
+) -> usize {
+    let staged = |hash: Hash256| state.blobs.read(&hash).ok();
+    let missing = |state: &crate::state::DaemonState| -> Vec<Hash256> {
+        kin_index::naming_manifest_bodies(tree, &staged)
+            .into_iter()
+            .filter(|hash| !state.blobs.exists(hash).unwrap_or(false))
+            .collect()
+    };
+    let mut wanted = missing(state);
+    if wanted.is_empty() {
+        return 0;
+    }
+    let authority =
+        match crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(|error| error.to_string())
+            .and_then(|context| context.open().map_err(|error| error.to_string()))
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(%error, "a naming manifest is missing from staging and repository authority could not be opened to restore it");
+                return 0;
+            }
+        };
+    let mut restored = 0;
+    let mut tried = std::collections::HashSet::new();
+    // A restored link can lead to a body staging also lacks, so the chains
+    // are followed again until nothing new is wanted.
+    while !wanted.is_empty() {
+        for hash in wanted {
+            if !tried.insert(hash) {
+                continue;
+            }
+            match authority.load_source_blob(hash) {
+                Ok(Some(body)) if state.blobs.write(&body).is_ok() => restored += 1,
+                Ok(_) | Err(_) => {
+                    tracing::warn!(%hash, "a naming manifest is in neither staging nor repository authority")
+                }
+            }
+        }
+        wanted = missing(state)
+            .into_iter()
+            .filter(|hash| !tried.contains(hash))
+            .collect();
+    }
+    restored
+}
+
+/// [`source_reader`] for a caller holding repository authority unopened:
+/// staging answers first, and authority is opened once, only when staging
+/// lacks a body, since opening it reads the whole persisted authority.
+pub(crate) fn source_reader_opening<'a>(
+    blobs: &'a BlobStore,
+    context: &'a crate::local_repository_authority::LocalRepositoryAuthorityContext,
+) -> impl Fn(Hash256) -> Option<Vec<u8>> + 'a {
+    let opened = std::cell::OnceCell::new();
+    move |hash| {
+        blobs.read(&hash).ok().or_else(|| {
+            opened
+                .get_or_init(|| context.open().ok())
+                .as_ref()
+                .and_then(|authority: &RepositoryAuthorityManager<LocalFileBackend>| {
+                    authority.load_source_blob(hash).ok().flatten()
+                })
+        })
+    }
+}
+
+/// The project manifests of `graph`'s tree, each read through
+/// [`source_reader`]. A manifest the tree holds whose body neither store
+/// yields cannot be read, and refuses the units beneath it rather than naming
+/// them as if it were absent; a link at a manifest path is followed inside the
+/// tree ([`kin_index::GraphProjectFiles`]).
+pub(crate) fn graph_manifests<'a, G: kin_model::GraphStore + ?Sized>(
+    graph: &'a G,
+    blobs: &'a BlobStore,
+    authority: Option<&'a RepositoryAuthorityManager<LocalFileBackend>>,
+) -> kin_index::GraphProjectFiles<'a, G, impl Fn(Hash256) -> Option<Vec<u8>> + 'a> {
+    kin_index::GraphProjectFiles::with_reader(graph, source_reader(blobs, authority))
+}
+
+/// The project manifests of one exact tree, each read through
+/// [`source_reader`].
+pub(crate) fn tree_manifests<'a>(
+    tree: &'a kin_model::ResolvedTree,
+    blobs: &'a BlobStore,
+    authority: Option<&'a RepositoryAuthorityManager<LocalFileBackend>>,
+) -> kin_index::TreeProjectFiles<'a, impl Fn(Hash256) -> Option<Vec<u8>> + 'a> {
+    kin_index::TreeProjectFiles::new(tree, source_reader(blobs, authority))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

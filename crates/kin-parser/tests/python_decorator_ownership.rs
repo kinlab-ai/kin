@@ -92,21 +92,25 @@ class Box:
             })
             .unwrap_or_else(|| panic!("no decorator call {src} -> {dst}"))
     };
-    for (src, dst, receiver) in [
-        ("create_item", "post", Some("app")),
-        ("create_item", "register", None),
-        ("test_value", "parametrize", Some("pytest.mark")),
-        ("Box.size", "property", None),
-        ("Box.size", "setter", Some("size")),
+    for (src, dst, receiver, import_source) in [
+        ("create_item", "post", Some("app"), None),
+        ("create_item", "register", None, Some("registry")),
+        (
+            "test_value",
+            "parametrize",
+            Some("pytest.mark"),
+            Some("pytest"),
+        ),
+        ("Box.size", "property", None, None),
+        ("Box.size", "setter", Some("size"), None),
     ] {
         let call = decorator_call(src, dst);
         assert_eq!(call.receiver.as_deref(), receiver, "{src} -> {dst}");
-        if receiver.is_some() {
-            assert_eq!(
-                call.import_source, None,
-                "a member call is not the local binding an import introduced"
-            );
-        }
+        assert_eq!(
+            call.import_source.as_deref(),
+            import_source,
+            "only a bare imported binding or claimed namespace supplies an import source"
+        );
     }
     assert_eq!(
         decorator_call("create_item", "register")

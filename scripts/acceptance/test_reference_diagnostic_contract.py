@@ -3,8 +3,8 @@
 # Copyright 2026 Firelock, LLC
 """Acceptance requests must ask for the diagnostics their assertions read."""
 import copy
-import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -136,28 +136,167 @@ class VerdictReaders(unittest.TestCase):
         self.assertEqual(brownfield.verdict_surfaces({}), {})
 
 
+class DeclarationVerdicts(unittest.TestCase):
+    def declaration_only(self):
+        payload = compact("certified", safe=True)
+        payload["edge_coverage"] = {
+            "classes": {"declarations": "complete"}, "scope": "absence_scope",
+            "scan": "skipped_no_edge_dependency", "requested_classes": [],
+            "cross_unit_classes": []}
+        return payload
+
+    def test_a_complete_declaration_filter_does_not_depend_on_an_edge_scan(self):
+        payload = self.declaration_only()
+        readings = brownfield.verdict_surfaces(payload)
+        self.assertEqual(readings["edge_coverage"][0], "certify")
+        self.assertEqual(brownfield.surface_conflict(readings), (None, None))
+
+    def test_skipped_scans_with_edge_or_unknown_scope_still_refuse(self):
+        for update in ({"requested_classes": ["calls"]},
+                       {"requested_classes": None}, {"requested_classes": {}},
+                       {"cross_unit_classes": ["references"]},
+                       {"cross_unit_classes": None},
+                       {"classes": {"references": "present"}},
+                       {"scope": "repository"}, {"scope": None},
+                       {"scan": "skipped_budget"}):
+            with self.subTest(update=update):
+                payload = self.declaration_only()
+                payload["edge_coverage"].update(update)
+                readings = brownfield.verdict_surfaces(payload)
+                self.assertEqual(readings["edge_coverage"][0], "refuse")
+                yes, no = brownfield.surface_conflict(readings)
+                self.assertIn("_kin.verdict", yes)
+                self.assertIn("edge_coverage", no)
+        for field in ("requested_classes", "cross_unit_classes", "scope"):
+            with self.subTest(missing=field):
+                payload = self.declaration_only()
+                del payload["edge_coverage"][field]
+                self.assertEqual(brownfield.verdict_surfaces(payload)["edge_coverage"][0], "refuse")
+
+    def test_declaration_states_are_closed_and_class_specific(self):
+        for state, missing in [("complete", []), ("complete_except", ["declarations"]),
+                               ("unmeasured", ["declarations"])]:
+            with self.subTest(state=state):
+                self.assertEqual(brownfield.class_shortfall(
+                    {"declarations": state}, "edge_coverage.classes"), missing)
+                with self.assertRaises(brownfield.UnknownClassState):
+                    brownfield.class_shortfall({"references": state}, "edge_coverage.classes")
+
+    def test_legacy_states_keep_their_original_meaning(self):
+        for name in ("declarations", "calls", "references"):
+            for state in ("present", "absent", "unknown", "unproduced"):
+                with self.subTest(name=name, state=state):
+                    self.assertEqual(brownfield.class_shortfall({name: state}, "classes"),
+                                     [] if state == "present" else [name])
+
+    def test_new_or_malformed_states_remain_unreadable(self):
+        for state in ("partial", "new_state", "", None, True, 0, [], {}):
+            with self.subTest(state=state):
+                with self.assertRaises(brownfield.UnknownClassState):
+                    brownfield.class_shortfall({"declarations": state}, "classes")
+        for classes in (None, [], {None: "complete"}, {"": "complete"}):
+            with self.subTest(classes=classes):
+                with self.assertRaises(brownfield.UnknownClassState):
+                    brownfield.class_shortfall(classes, "classes")
+
+    def test_residue_refuses_every_class_surface_and_exposes_false_certification(self):
+        for state in ("complete_except", "unmeasured"):
+            for surface in ("edge_coverage", "completeness"):
+                with self.subTest(state=state, surface=surface):
+                    payload = compact("inconclusive", factor="declaration_census_shortfall")
+                    classes = {"declarations": state}
+                    if surface == "completeness":
+                        payload["_kin"][surface] = {"status": "unknown", "bound": "at_least",
+                                                  "classes": classes}
+                        key = "completeness.classes"
+                    else:
+                        payload[surface] = {"classes": classes}
+                        key = surface
+                    readings = brownfield.verdict_surfaces(payload)
+                    self.assertEqual(readings[key][0], "refuse")
+                    self.assertEqual(brownfield.surface_conflict(readings), (None, None))
+                    payload["_kin"]["verdict"] = {"state": "certified",
+                        "safe_to_conclude_absent": True, "limiting_factor": None}
+                    yes, no = brownfield.surface_conflict(brownfield.verdict_surfaces(payload))
+                    self.assertIn("_kin.verdict", yes)
+                    self.assertIn(key, no)
+
+    def test_recorded_declaration_residue_stays_a_refusal(self):
+        fixture = Path(__file__).parents[2] / "crates/kin-mcp/src/testdata/plain_flask_locate_name_miss.json"
+        payload = json.loads(fixture.read_text())
+        self.assertEqual(payload["edge_coverage"]["classes"], {"declarations": "complete_except"})
+        self.assertEqual(brownfield.class_shortfall(payload["edge_coverage"]["classes"], "classes"),
+                         ["declarations"])
+        # The recorded census and qualified verdict agree about concrete residue.
+        self.assertTrue(payload["edge_coverage"]["declarations"]["matching_unadmitted"])
+        self.assertEqual(payload["_kin"]["verdict"]["state"], "certified_except")
+        self.assertIs(payload["_kin"]["verdict"]["safe_to_conclude_absent"], False)
+        readings = brownfield.verdict_surfaces(payload)
+        self.assertTrue(readings)
+        self.assertTrue(all(value[0] == "refuse" for value in readings.values()))
+        self.assertEqual(brownfield.surface_conflict(readings), (None, None))
+
+
+class QualifiedVerdicts(unittest.TestCase):
+    def test_a_named_remainder_does_not_certify_full_completeness(self):
+        payload = compact("certified_except", factor="named_leftovers")
+        readings = brownfield.verdict_surfaces(payload)
+        self.assertEqual(readings["_kin.verdict"][0], "refuse")
+        self.assertEqual(readings["_kin.verdict.limiting_factor"][0], "refuse")
+        self.assertEqual(brownfield.surface_conflict(readings), (None, None))
+
+    def test_a_qualified_verdict_requires_a_named_limiting_factor(self):
+        for factor in (None, "", " ", "\t\n"):
+            with self.subTest(factor=factor):
+                with self.assertRaises(brownfield.UnknownClassState):
+                    brownfield.verdict_surfaces(compact("certified_except", factor=factor))
+
+    def test_a_qualified_verdict_cannot_certify_absence(self):
+        readings = brownfield.verdict_surfaces(
+            compact("certified_except", safe=True, factor="named_leftovers"))
+        yes, no = brownfield.surface_conflict(readings)
+        self.assertIn("_kin.verdict.absence", yes)
+        self.assertIn("_kin.verdict", no)
+
+    def test_qualified_rows_cannot_claim_whole_counts(self):
+        for completeness in ({"status": "complete"}, {"bound": "exact"}):
+            with self.subTest(completeness=completeness):
+                payload = compact("certified_except", factor="named_leftovers")
+                payload["_kin"]["completeness"] = completeness
+                yes, no = brownfield.surface_conflict(brownfield.verdict_surfaces(payload))
+                self.assertIn("completeness", yes)
+                self.assertIn("_kin.verdict", no)
+
+    def test_new_verdict_words_stay_unreadable(self):
+        for state in ("complete_except", "certified_partial", "qualified"):
+            with self.subTest(state=state):
+                with self.assertRaises(brownfield.UnknownClassState):
+                    brownfield.verdict_surfaces(compact(state, factor="named_leftovers"))
+
+
 class AdmittedDurability(unittest.TestCase):
     def evidence(self):
+        """The status and the function source as served: by entity and module, no file."""
         status = {"_kin": {"runtime": "repo-daemon", "answered_by": {"repo_id": "repo"},
                   "freshness": {"state": "recorded", "at": "observed", "age_seconds": 0},
                   "durability": {"state": "live_uncommitted", "live_entities": 10,
                                  "durable_entities": 6, "live_only_entities": 4}}}
-        body = freshness.ADMITTED_FUNCTION_BODY.encode("utf-8")
-        start = freshness.LINKGRAPH_SRC.encode("utf-8").index(body)
-        end = start + len(body)
-        digest = hashlib.sha256(freshness.LINKGRAPH_SRC.encode("utf-8")).hexdigest()
         source = {"_kin": copy.deepcopy(status["_kin"]), "id": "function", "kind": "Function",
-                  "name": freshness.ADMITTED_FUNCTION_NAME,
-                  "file_path": "linkgraph/predicates.py", "body": freshness.ADMITTED_FUNCTION_BODY,
-                  "start_byte": start, "end_byte": end, "span_coherence": "digest_verified",
-                  "source_base": {"schema": "kin.entity.source_base.v1", "entity_id": "function",
-                                  "artifact_id": "artifact", "start_byte": start, "end_byte": end,
-                                  "body_hash": hashlib.sha256(body).hexdigest(), "source_blob_hash": digest,
-                                  "context": {"repository_id": "repo", "workspace_tree_hash": "tree"}}}
+                  "name": freshness.ADMITTED_FUNCTION_NAME, "module": freshness.ADMITTED_MODULE,
+                  "semantic_owners": [{"entity_id": "module", "kind": "module",
+                                       "name": "predicates",
+                                       "qualified_name": freshness.ADMITTED_MODULE,
+                                       "relationship": "Contains",
+                                       "resolution": "type_resolved"}],
+                  "body": freshness.ADMITTED_FUNCTION_BODY, "span_coherence": "digest_verified",
+                  "source_base": {"ticket": "sb2.function.3." + "3f" * 16},
+                  "source_identity": {"entity_id": "function", "repository_id": "repo",
+                                      "workspace_id": "workspace"}}
         return status, source
 
     def grade(self, status, source):
-        return freshness.grade_durability_after_admission(status, source, "linkgraph/predicates.py")[0]
+        return freshness.grade_durability_after_admission(
+            status, source, freshness.ADMITTED_MODULE)[0]
 
     def test_exact_admitted_graph_body_explains_missing_behind(self):
         status, source = self.evidence()
@@ -165,10 +304,10 @@ class AdmittedDurability(unittest.TestCase):
         self.assertEqual(self.grade(status, source), freshness.PASS)
 
     def test_missing_source_or_unbound_source_never_passes(self):
-        for key, value in [("body", "stale body"), ("file_path", "other.py"),
+        for key, value in [("body", "stale body"), ("module", "linkgraph.other"),
                            ("kind", "Module"), ("name", "another_function"),
                            ("span_coherence", "unverified"), ("source_base", {}),
-                           ("end_byte", 1)]:
+                           ("semantic_owners", []), ("source_identity", {}), ("id", "")]:
             with self.subTest(key=key):
                 status, source = self.evidence()
                 source[key] = value
@@ -188,24 +327,24 @@ class AdmittedDurability(unittest.TestCase):
                 change(status)
                 self.assertEqual(self.grade(status, source), freshness.FAIL)
 
-    def test_matching_but_wrong_digests_do_not_prove_fixture_admission(self):
-        status, source = self.evidence()
-        source["source_base"].update(body_hash="a" * 64, source_blob_hash="a" * 64)
-        self.assertEqual(self.grade(status, source), freshness.FAIL)
-
-    def test_artifact_and_entity_digest_checks_are_independent(self):
-        for field in ("body_hash", "source_blob_hash"):
-            with self.subTest(field=field):
+    def test_a_ticket_for_another_read_does_not_prove_admission(self):
+        for ticket in ("sb2.other.3." + "3f" * 16, "sb2.function.3.short", "sb2.invalid", None):
+            with self.subTest(ticket=ticket):
                 status, source = self.evidence()
-                source["source_base"][field] = "a" * 64
+                source["source_base"]["ticket"] = ticket
                 self.assertEqual(self.grade(status, source), freshness.FAIL)
 
-    def test_whole_file_module_cannot_substitute_for_targeted_function(self):
+    def test_module_placement_and_module_ownership_are_independent(self):
         status, source = self.evidence()
-        size = len(freshness.LINKGRAPH_SRC.encode("utf-8"))
-        digest = hashlib.sha256(freshness.LINKGRAPH_SRC.encode("utf-8")).hexdigest()
-        source.update(kind="Module", body=freshness.LINKGRAPH_SRC, start_byte=0, end_byte=size)
-        source["source_base"].update(start_byte=0, end_byte=size, body_hash=digest)
+        source["module"] = "linkgraph.other"
+        self.assertEqual(self.grade(status, source), freshness.FAIL)
+        status, source = self.evidence()
+        source["semantic_owners"][0]["qualified_name"] = "linkgraph.other"
+        self.assertEqual(self.grade(status, source), freshness.FAIL)
+
+    def test_whole_module_cannot_substitute_for_targeted_function(self):
+        status, source = self.evidence()
+        source.update(kind="Module", name="predicates", body=freshness.LINKGRAPH_SRC)
         self.assertEqual(self.grade(status, source), freshness.FAIL)
 
     def test_original_false_all_clear_does_not_retry_until_it_passes(self):

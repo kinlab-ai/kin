@@ -31,6 +31,8 @@ pub enum McpMutationPayload {
     EntityCreate(crate::entity_lifecycle::EntityCreate),
     /// Remove one exact declaration while preserving its source unit.
     EntityRemove(crate::entity_lifecycle::EntityRemove),
+    /// Give an entity Kin holds without parsing it content Kin already holds.
+    EntityContent(crate::artifact_entity::EntityContent),
     /// Add or remove imports on one source unit addressed by language identity.
     UnitImports(crate::source_unit::UnitImports),
     Entity(kin_model::Entity),
@@ -40,6 +42,145 @@ pub enum McpMutationPayload {
         kind: kin_model::relation::RelationKind,
     },
     Blob(Vec<u8>),
+}
+
+impl McpMutationPayload {
+    /// The variant's wire name: the one key its JSON object carries.
+    ///
+    /// Exhaustive on purpose. A payload added to this enum does not compile
+    /// until it is named here, and [`PAYLOAD_VARIANTS`] and
+    /// [`OPERATION_FORMS`] are held to this list by a test, so a new variant
+    /// cannot join the backend without the served operation schema, and the
+    /// check every call is held to, saying whether it is one an agent sends.
+    pub fn variant(&self) -> &'static str {
+        match self {
+            Self::EntitySourceBase(_) => "EntitySourceBase",
+            Self::EntitySourcePatch(_) => "EntitySourcePatch",
+            Self::EntityCreate(_) => "EntityCreate",
+            Self::EntityRemove(_) => "EntityRemove",
+            Self::EntityContent(_) => "EntityContent",
+            Self::UnitImports(_) => "UnitImports",
+            Self::Entity(_) => "Entity",
+            Self::Relation { .. } => "Relation",
+            Self::Blob(_) => "Blob",
+        }
+    }
+}
+
+/// Every [`McpMutationPayload`] variant, by wire name.
+pub const PAYLOAD_VARIANTS: [&str; 9] = [
+    "EntitySourceBase",
+    "EntitySourcePatch",
+    "EntityCreate",
+    "EntityRemove",
+    "EntityContent",
+    "UnitImports",
+    "Entity",
+    "Relation",
+    "Blob",
+];
+
+/// What an operation's `target` names in one form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormTarget {
+    /// The exact entity UUID its source base names.
+    EntityId,
+    /// The declared name (a unit-addressed create) or the anchor UUID (one
+    /// anchored beside a function).
+    DeclaredName,
+    /// The unit's package name.
+    Package,
+    /// An existing entity's UUID, or empty for a relation.
+    EntityOrEmpty,
+}
+
+/// One form an operation takes: the payload variant it carries, the verbs that
+/// variant pairs with, and what `target` and `body` must be.
+///
+/// The same pairing [`uncommittable_reason`] enforces at stage and commit,
+/// stated once as data, so the served operation schema, the check a call is
+/// held to before it runs, and the refusal all read the same table.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationForm {
+    pub payload: &'static str,
+    /// The verbs this payload pairs with, the served one first. The backend
+    /// reads a verb trimmed and lower-cased.
+    pub verbs: &'static [&'static str],
+    pub target: FormTarget,
+    /// Whether the operation carries `body`: the whole new source, for a
+    /// guarded update, and nothing on any other form.
+    pub body: bool,
+    /// Whether an agent profile serves this form. A structured `Entity` or
+    /// `Relation` payload is Kin's own record, served in full only.
+    pub agent: bool,
+}
+
+/// Every payload an operation may carry, as the backend commits it. `Blob` is
+/// in [`PAYLOAD_VARIANTS`] and not here: no route commits one.
+pub const OPERATION_FORMS: [OperationForm; 8] = [
+    OperationForm {
+        payload: "EntitySourcePatch",
+        verbs: &["patch"],
+        target: FormTarget::EntityId,
+        body: false,
+        agent: true,
+    },
+    OperationForm {
+        payload: "EntitySourceBase",
+        verbs: &["update", "modify"],
+        target: FormTarget::EntityId,
+        body: true,
+        agent: true,
+    },
+    OperationForm {
+        payload: "EntityCreate",
+        verbs: &["create"],
+        target: FormTarget::DeclaredName,
+        body: false,
+        agent: true,
+    },
+    OperationForm {
+        payload: "UnitImports",
+        verbs: &["update", "modify"],
+        target: FormTarget::Package,
+        body: false,
+        agent: true,
+    },
+    OperationForm {
+        payload: "EntityRemove",
+        verbs: &["remove"],
+        target: FormTarget::EntityId,
+        body: false,
+        agent: true,
+    },
+    OperationForm {
+        payload: "EntityContent",
+        verbs: &crate::artifact_entity::CONTENT_VERBS,
+        target: FormTarget::EntityId,
+        body: false,
+        agent: true,
+    },
+    OperationForm {
+        payload: "Relation",
+        verbs: &["create", "add", "upsert", "insert", "delete", "remove"],
+        target: FormTarget::EntityOrEmpty,
+        body: false,
+        agent: false,
+    },
+    OperationForm {
+        payload: "Entity",
+        verbs: &[
+            "create", "add", "upsert", "insert", "update", "modify", "delete", "remove",
+        ],
+        target: FormTarget::EntityOrEmpty,
+        body: false,
+        agent: false,
+    },
+];
+
+/// The form a payload variant takes, by wire name.
+pub fn operation_form(payload: &str) -> Option<&'static OperationForm> {
+    OPERATION_FORMS.iter().find(|form| form.payload == payload)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,9 +765,6 @@ pub enum WriteDoor {
     CliPush,
     /// `kin pull`, which admits a remote's history into this replica.
     CliPull,
-    /// `kin_session_exec`, whose toolchain run hands its manifests and
-    /// lockfiles back and records them as a change.
-    SessionExec,
 }
 
 impl WriteDoor {
@@ -641,7 +779,6 @@ impl WriteDoor {
             Self::CliReconcile => "kin reconcile",
             Self::CliPush => "kin push",
             Self::CliPull => "kin pull",
-            Self::SessionExec => "kin_session_exec",
         }
     }
 
@@ -650,7 +787,7 @@ impl WriteDoor {
     fn publishes(self) -> bool {
         matches!(
             self,
-            Self::Commit | Self::Mutate | Self::CliCommit | Self::CliPush | Self::SessionExec
+            Self::Commit | Self::Mutate | Self::CliCommit | Self::CliPush
         )
     }
 
@@ -687,9 +824,9 @@ pub fn read_only_session_refusal(door: WriteDoor, session: &AgentSession) -> Opt
         "The CLI names its session with KIN_SESSION_ID, so unset KIN_SESSION_ID and run this \
          again from your own shell."
     } else {
-        "To write, start a session with kin_session_start that declares can_write and \
-         can_commit, or declares no capabilities to take what this store permits. A bit its \
-         capability_policy reports as store is one this store refuses to every session."
+        "To write, send the call without session_id, so it runs in the connection's own \
+         session, which takes what this store permits. A bit its capability_policy reports as \
+         store is one this store refuses to every session."
     };
     Some(format!(
         "read_only_session: {} writes, and session {} may not: it started with {}, and a \
@@ -712,6 +849,21 @@ pub struct CoordinationWritePreflight {
     pub blocking_intents: Vec<IntentSummary>,
     pub capability_violations: Vec<String>,
     pub coverage: CoordinationSurfaceCoverage,
+}
+
+impl CoordinationWritePreflight {
+    /// Encode an already-refused write without mixing its semantic reason
+    /// with private scope details. Public presentation can project the typed
+    /// evidence while preserving caller, owner and capability explanations.
+    pub fn refusal(&self, message: &str) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&serde_json::json!({
+            "schema": "kin.coordination-refusal.v1",
+            "code": "coordination_write_refused",
+            "message": message,
+            "published": false,
+            "preflight": self,
+        }))
+    }
 }
 
 /// The mutation verbs the transaction commit path understands, listed for
@@ -873,7 +1025,11 @@ pub fn validate_semantic_operations(operations: &[McpMutationOperation]) -> Resu
             return Err(source_base_required(idx, operation));
         }
         let verb = operation.verb.trim().to_ascii_lowercase();
-        if matches!(verb.as_str(), "replace" | "overwrite" | "rename" | "move")
+        let content = matches!(
+            operation.payload,
+            Some(McpMutationPayload::EntityContent(_))
+        );
+        if (!content && matches!(verb.as_str(), "replace" | "overwrite" | "rename" | "move"))
             || operation.destination.is_some()
             || (operation.payload.is_none()
                 && matches!(
@@ -1015,6 +1171,21 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
                 remove.validate().err()
             }
         }
+        McpMutationPayload::EntityContent(content) => {
+            if !crate::artifact_entity::CONTENT_VERBS.contains(&verb.as_str())
+                || op.target != content.source_base.entity_id.to_string()
+                || op.body.is_some()
+                || op.destination.is_some()
+            {
+                Some(
+                    "EntityContent requires verb replace or create, the exact entity UUID its \
+                      source_base names as target, and no body or destination"
+                        .into(),
+                )
+            } else {
+                content.validate(&verb).err()
+            }
+        }
         McpMutationPayload::EntitySourcePatch(patch) => {
             if verb != "patch"
                 || op.target != patch.source_base.entity_id.to_string()
@@ -1092,11 +1263,12 @@ pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
 /// shape learns one missing field per attempt from a raw decode error, so it
 /// discovers the contract by looping on retries; naming the full schema once
 /// ends the loop on the first refusal.
-pub const ACCEPTED_OPERATION_SHAPES: &str = r#"each element of `operations` is one of these entity or relationship operations:
+const OPERATION_SHAPES_TEMPLATE: &str = r#"each element of `operations` is one of these entity or relationship operations:
   - declaration creation addressed to a unit (the form for an empty repository and for every
     Go declaration kind): verb create, the declared name as target, payload
     {"EntityCreate": {"repository_base": <repository_base from session, status or the last mutate>,
-    "unit": {"language": "go", "package": "." | <module-relative import path>, "name": <package name>,
+    "unit": {"language": {unit_languages}, "package": "." |
+    <the unit's package or directory in its project>, "name": <package or module name>,
     "role": "source" | "test"}, "name": <Name or Receiver.Method>, "kind": "function" | "method" |
     "struct" | "interface" | "type" | "const" | "var", "body": <exact declaration>,
     "imports": [<import path>, ...]}}; no outer body or destination;
@@ -1106,8 +1278,20 @@ pub const ACCEPTED_OPERATION_SHAPES: &str = r#"each element of `operations` is o
   - anchored function creation: verb create, anchor UUID target, payload
     {"EntityCreate": {"source_base": <anchor source_base>, "name": <identifier>,
     "kind": "function", "body": <exact function declaration>, "placement": "sibling_after" | "new_source_unit"}}; no outer body or destination;
-  - anchored function removal: verb remove, entity UUID target, payload
-    {"EntityRemove": {"source_base": <unchanged source_base>}}; no body or destination;
+  - a method or class beside or inside a current declaration: verb create, anchor UUID
+    target, payload {"EntityCreate": {"source_base": <anchor source_base>, "name": <identifier>,
+    "kind": "method" | "class", "body": <exact declaration>, "placement": "sibling_after" (after
+    a method of the same class, or after a top-level class or function) | "member" (the last
+    member of the anchor class)}}; no outer body or destination;
+  - anchored function or method removal: verb remove, entity UUID target, payload
+    {"EntityRemove": {"source_base": <unchanged source_base>}}; no body or destination; the
+    same removes an entity Kin holds without parsing it;
+  - content Kin already holds, for an entity it holds without parsing: verb replace, its UUID
+    target, payload {"EntityContent": {"source_base": <its source_base>, "content_of": <UUID or
+    module :: name of an unparsed entity>, "at": <change id, optional>}}; or verb create, the
+    UUID of an entity beside the new one as target, payload {"EntityContent": {"source_base":
+    <that entity's source_base>, "name": <new name>, "content_of": ..., "at": ...}}, or with
+    "text": <its whole text> in place of content_of; no body or destination;
   - an anchored entity patch: verb patch, exact entity UUID target, payload
     {"EntitySourcePatch": {"source_base": <unchanged source_base from get_entity_source>,
     "edits": [{"old_text": <unique exact anchor>, "new_text": <replacement>}]}}; no body;
@@ -1127,13 +1311,45 @@ Prefer a guarded entity patch for a targeted source change. Whole-file create, r
 delete and rename operations are not semantic agent operations. Conversion and
 materialization are separate boundaries."#;
 
+/// [`OPERATION_SHAPES_TEMPLATE`] with the languages Kin writes units in, as
+/// their adapters' registry states them.
+pub struct OperationShapes;
+
+/// The complete `operations` element schema, as [`OperationShapes`] writes it.
+pub const ACCEPTED_OPERATION_SHAPES: OperationShapes = OperationShapes;
+
+impl OperationShapes {
+    /// The schema's text.
+    pub fn text(&self) -> &'static str {
+        static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TEXT.get_or_init(|| {
+            let languages = kin_parser::unit_editor::unit_languages()
+                .into_iter()
+                .map(|language| format!("\"{}\"", language.profile().wire_name))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            OPERATION_SHAPES_TEMPLATE.replace("{unit_languages}", &languages)
+        })
+    }
+
+    pub fn contains(&self, part: &str) -> bool {
+        self.text().contains(part)
+    }
+}
+
+impl std::fmt::Display for OperationShapes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.text())
+    }
+}
+
 /// Every field an operation is allowed to carry.
 ///
 /// Serde drops keys it does not model, so an operation naming its source text
 /// anything other than `body` decodes cleanly with `body: None` and is planned
 /// as if no source had been sent. Checking the key set first is what turns that
 /// into a refusal the caller can act on.
-const OPERATION_FIELDS: [&str; 6] = [
+pub const OPERATION_FIELDS: [&str; 6] = [
     "verb",
     "target",
     "payload",
@@ -1193,6 +1409,7 @@ pub fn parse_staged_operations(
                 "EntitySourcePatch",
                 "EntityCreate",
                 "EntityRemove",
+                "EntityContent",
                 "UnitImports",
             ]
             .iter()
@@ -1200,7 +1417,7 @@ pub fn parse_staged_operations(
         }) && (fields.contains_key("body") || fields.contains_key("destination"))
         {
             return Err(format!(
-                "invalid operations: element #{idx}: EntitySourcePatch/EntityCreate/EntityRemove/UnitImports forbids body and destination, including null"
+                "invalid operations: element #{idx}: EntitySourcePatch/EntityCreate/EntityRemove/EntityContent/UnitImports forbids body and destination, including null"
             ));
         }
     }

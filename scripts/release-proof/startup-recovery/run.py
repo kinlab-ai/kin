@@ -71,7 +71,7 @@ def prepare(root, label, output, kin):
     env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home),
            "TMPDIR": str(home)}
     env.update(KIN_HOME=str(home), KIN_EMBED_BACKEND="cpu", KIN_DAEMON_AUTO_EMBED="false")
-    command = [str(kin), "init", str(fixture), "--no-enrich", "--json"]
+    command = [str(kin), "init", str(fixture), "--defer-enrich", "--json"]
     result = subprocess.run(command, env=env, capture_output=True, text=True)
     (output / (label + "-init.log")).write_text(result.stdout + result.stderr)
     assert result.returncode == 0, "candidate initialization failed"

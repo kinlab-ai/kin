@@ -91,6 +91,13 @@ pub struct NativeCommitPlan {
     /// because a planner cannot tell an unclaimed file from an authored one,
     /// and an unclaimed file must never be reported as carried on a guess.
     pub carried_pending_files: Vec<RepoPath>,
+    /// Sources whose semantics this change moves although the caller's own
+    /// operations wrote none of their bytes and no carried working-tree
+    /// content explains them: a re-derivation the workspace held ahead of
+    /// history, such as the one a daemon publishes when it starts on a store an
+    /// earlier build of Kin derived. Empty under the same rule as
+    /// [`Self::carried_pending_files`].
+    pub carried_semantic_files: Vec<RepoPath>,
     /// Entity scopes whose published history this transaction changes.
     pub entity_scope_ids: Vec<kin_model::EntityId>,
     previous_tree: kin_model::ResolvedTree,
@@ -135,6 +142,9 @@ pub struct NativeCommitBase {
     pub graph: kin_db::InMemoryGraph,
     pub roots: RootBundle,
     pub tree: kin_model::ResolvedTree,
+    /// The change the workspace's base names, where its history is read
+    /// from; `None` for a workspace with no change yet.
+    pub head: Option<SemanticChangeId>,
 }
 
 /// Result of durably admitting one exact working-tree transition.
@@ -262,28 +272,6 @@ pub(crate) fn authority_workspace_tree(
         })
 }
 
-/// One workspace's state as the authority the daemon already holds records
-/// it: generation, head, tree and base. Read from the held authority rather
-/// than an open of its own, so it costs no store read; it lives here for the
-/// same reason [`authority_workspace_tree`] does.
-pub(crate) fn held_authority_workspace(
-    authority: &RepositoryAuthorityManager<LocalFileBackend>,
-    workspace_id: WorkspaceId,
-) -> Result<kin_model::WorkspaceState> {
-    let lease = authority.read_authority();
-    lease
-        .metadata()
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.workspace_id == workspace_id)
-        .cloned()
-        .ok_or_else(|| {
-            invalid(format!(
-                "repository authority has no local workspace {workspace_id}"
-            ))
-        })
-}
-
 /// Admit `desired_tree` for a test by taking a real host walk first.
 ///
 /// `CompleteScanToken` cannot be minted outside `kin-index`, so a test cannot
@@ -296,9 +284,13 @@ pub(crate) fn admitted_workspace_tree_for_test(
     previous_tree: kin_model::ResolvedTree,
     desired_tree: kin_model::ResolvedTree,
 ) -> AdmittedWorkspaceTree {
-    let ignore = kin_index::RepositoryIgnore::load(working_dir).expect("load repository ignore");
-    let scan = kin_index::scan_repository(
+    let ignore = kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
         working_dir,
+        &kin_io::Grant::ambient(),
+    ))
+    .expect("load repository ignore");
+    let scan = kin_index::scan_repository(
+        &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
         &ignore,
         previous_tree
             .artifacts_by_path()
@@ -395,7 +387,8 @@ pub(crate) fn plan_session_workspace_admission(
     // queries with nothing on disk behind them.
     let vacated = VacatedPaths::from_deltas(&deltas);
     let moves = session_artifact_moves(&deltas);
-    let module_relocations = plan_session_module_relocations(blobs, &authority, &deltas)?;
+    let module_relocations =
+        plan_session_module_relocations(blobs, &authority, &base.source_workspace.tree, &deltas)?;
     let semantic_delta = if vacated.is_empty() && moves.is_empty() {
         WorkspaceSemanticDelta::default()
     } else {
@@ -521,6 +514,7 @@ pub(crate) fn plan_session_workspace_admission(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction.validate()?;
     let transaction_hash = transaction.transaction_hash()?;
@@ -594,17 +588,76 @@ pub(crate) struct SessionModuleRelocation {
     new_signature: String,
 }
 
-/// A file module's name can derive from its path. Parse the same immutable
-/// body at both locations and bind modules by exact kind, fingerprint and
+/// A file module's name can derive from its path, and a Rust crate root's
+/// from the manifests above it. Parse the same immutable body at both
+/// locations, each under the manifests of its own tree (`before`, and `before`
+/// with `deltas` applied), and bind modules by exact kind, fingerprint and
 /// source span, never by a guessed basename. This lets the subsequent ordinary
 /// reconciliation retain their IDs even when their parser-owned names change.
 pub(crate) fn plan_session_module_relocations(
     blobs: &kin_blobs::BlobStore,
     authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    before: &kin_model::ResolvedTree,
     deltas: &[kin_model::TreeDelta],
 ) -> Result<Vec<SessionModuleRelocation>> {
-    let pipeline = kin_index::IndexPipeline::new();
     let mut bindings = Vec::new();
+    for (_, named) in name_moved_modules(blobs, authority, before, deltas)? {
+        match named {
+            MovedModules::Unnamed => {}
+            MovedModules::Bound(bound) => bindings.extend(bound),
+            MovedModules::Unbound(reason) => return Err(invalid(reason)),
+        }
+    }
+    Ok(bindings)
+}
+
+/// What the parses of one moved body at its two paths say about its modules.
+pub(crate) enum MovedModules {
+    /// Nothing to name: the body is not entity source at both paths.
+    Unnamed,
+    /// Each module the body holds, bound to its exact-byte twin at the new
+    /// path, with the name and signature that parse gives it.
+    Bound(Vec<SessionModuleRelocation>),
+    /// The parses cannot name the body's modules: one is incomplete, the two
+    /// are in different languages, or a module has no single twin. Why.
+    Unbound(String),
+}
+
+/// The modules of every body `deltas` moves without changing it, named by
+/// parses of the body at both of its paths: at the old one under the
+/// manifests of `before`, at the new one under those of the tree `deltas`
+/// make. Keyed by each move's new path.
+///
+/// A body classified as something other than entity source by its old path is
+/// not read, and one that is read is parsed as source and nothing else.
+pub(crate) fn name_moved_modules(
+    blobs: &kin_blobs::BlobStore,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    before: &kin_model::ResolvedTree,
+    deltas: &[kin_model::TreeDelta],
+) -> Result<Vec<(kin_model::FilePathId, MovedModules)>> {
+    let mut named = Vec::new();
+    if !deltas.iter().any(|delta| {
+        matches!(delta, kin_model::TreeDelta::Updated { old, new, .. } if old.path != new.path)
+    }) {
+        return Ok(named);
+    }
+    let pipeline = kin_index::IndexPipeline::new();
+    let after = before
+        .apply(deltas)
+        .map_err(|error| invalid(format!("plan the moved tree: {error}")))?;
+    let manifests_before = crate::source_cas::tree_manifests(before, blobs, Some(authority));
+    let manifests_after = crate::source_cas::tree_manifests(&after, blobs, Some(authority));
+    let source = |path: &str, body: Option<&[u8]>| {
+        let path = std::path::Path::new(path);
+        matches!(
+            match body {
+                Some(body) => kin_index::FileClassifier::classify_with_content(path, body),
+                None => kin_index::FileClassifier::classify(path),
+            },
+            kin_index::FileClassification::EntitySource
+        )
+    };
     for delta in deltas {
         let kin_model::TreeDelta::Updated { old, new, .. } = delta else {
             continue;
@@ -618,74 +671,93 @@ pub(crate) fn plan_session_module_relocations(
         let (Some(from), Some(to)) = (old.path.as_utf8(), new.path.as_utf8()) else {
             continue;
         };
-        let from = kin_model::FilePathId::new(from);
-        let to = kin_model::FilePathId::new(to);
-        let body = read_publishable_source(blobs, authority, hash)?;
-        let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
-        let before = pipeline
-            .index_any_content(&from, body.body(), digest)
-            .map_err(|error| invalid(format!("parse moved source {from}: {error}")))?;
-        let after = pipeline
-            .index_any_content(&to, body.body(), digest)
-            .map_err(|error| invalid(format!("parse moved source {to}: {error}")))?;
-        let (
-            kin_index::IndexedAny::EntitySource(before),
-            kin_index::IndexedAny::EntitySource(after),
-        ) = (before, after)
-        else {
+        let (from, to) = (
+            kin_model::FilePathId::new(from),
+            kin_model::FilePathId::new(to),
+        );
+        if !source(&from.0, None) {
+            named.push((to, MovedModules::Unnamed));
             continue;
-        };
-        let mut claimed = std::collections::HashSet::new();
-        for old_module in before
+        }
+        let body = read_publishable_source(blobs, authority, hash)?;
+        if !source(&from.0, Some(body.body())) || !source(&to.0, Some(body.body())) {
+            named.push((to, MovedModules::Unnamed));
+            continue;
+        }
+        let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+        let parsed_before = pipeline
+            .index_file_content_in(&from, body.body(), digest, &manifests_before)
+            .map_err(|error| invalid(format!("parse moved source {from}: {error}")))?
+            .indexed_file;
+        let parsed_after = pipeline
+            .index_file_content_in(&to, body.body(), digest, &manifests_after)
+            .map_err(|error| invalid(format!("parse moved source {to}: {error}")))?
+            .indexed_file;
+        let modules = bind_moved_modules(&from, &to, &parsed_before, &parsed_after);
+        named.push((to, modules));
+    }
+    Ok(named)
+}
+
+/// Bind each module the parse at `from` holds to its exact-byte twin in the
+/// parse at `to`.
+fn bind_moved_modules(
+    from: &kin_model::FilePathId,
+    to: &kin_model::FilePathId,
+    before: &kin_index::IndexedFile,
+    after: &kin_index::IndexedFile,
+) -> MovedModules {
+    let mut bound = Vec::new();
+    let mut claimed = std::collections::HashSet::new();
+    for old_module in before
+        .entities
+        .iter()
+        .filter(|entity| entity.kind == kin_model::EntityKind::Module)
+    {
+        if before.language != after.language
+            || !matches!(before.parse_state, kin_model::ParseState::Valid)
+            || !matches!(after.parse_state, kin_model::ParseState::Valid)
+        {
+            return MovedModules::Unbound(format!(
+                "moved module in {from} requires complete parses in the same language at {to}"
+            ));
+        }
+        let matches = after
             .entities
             .iter()
-            .filter(|entity| entity.kind == kin_model::EntityKind::Module)
-        {
-            if before.language != after.language
-                || !matches!(before.parse_state, kin_model::ParseState::Valid)
-                || !matches!(after.parse_state, kin_model::ParseState::Valid)
-            {
-                return Err(invalid(format!(
-                    "moved module in {from} requires complete parses in the same language at {to}"
-                )));
-            }
-            let matches = after
-                .entities
-                .iter()
-                .filter(|entity| {
-                    let mut relocated_span = entity.span.clone();
-                    if let Some(span) = &mut relocated_span {
-                        span.file = from.clone();
-                    }
-                    entity.kind == old_module.kind
-                        && entity.fingerprint.algorithm == old_module.fingerprint.algorithm
-                        && entity.fingerprint.ast_hash == old_module.fingerprint.ast_hash
-                        && entity.fingerprint.behavior_hash == old_module.fingerprint.behavior_hash
-                        && relocated_span.is_some()
-                        && relocated_span == old_module.span
-                })
-                .collect::<Vec<_>>();
-            let [new_module] = matches.as_slice() else {
-                return Err(invalid(format!(
-                    "moved module in {from} has no unambiguous exact-byte identity at {to}"
-                )));
-            };
-            if !claimed.insert(new_module.id) {
-                return Err(invalid(format!(
-                    "moved modules in {from} share one exact-byte identity at {to}"
-                )));
-            }
-            bindings.push(SessionModuleRelocation {
-                from: from.clone(),
-                to: to.clone(),
-                old_name: old_module.name.clone(),
-                old_signature: old_module.signature.clone(),
-                new_name: new_module.name.clone(),
-                new_signature: new_module.signature.clone(),
-            });
+            .filter(|entity| {
+                let mut relocated_span = entity.span.clone();
+                if let Some(span) = &mut relocated_span {
+                    span.file = from.clone();
+                }
+                entity.kind == old_module.kind
+                    && entity.fingerprint.algorithm == old_module.fingerprint.algorithm
+                    && entity.fingerprint.ast_hash == old_module.fingerprint.ast_hash
+                    && entity.fingerprint.behavior_hash == old_module.fingerprint.behavior_hash
+                    && relocated_span.is_some()
+                    && relocated_span == old_module.span
+            })
+            .collect::<Vec<_>>();
+        let [new_module] = matches.as_slice() else {
+            return MovedModules::Unbound(format!(
+                "moved module in {from} has no unambiguous exact-byte identity at {to}"
+            ));
+        };
+        if !claimed.insert(new_module.id) {
+            return MovedModules::Unbound(format!(
+                "moved modules in {from} share one exact-byte identity at {to}"
+            ));
         }
+        bound.push(SessionModuleRelocation {
+            from: from.clone(),
+            to: to.clone(),
+            old_name: old_module.name.clone(),
+            old_signature: old_module.signature.clone(),
+            new_name: new_module.name.clone(),
+            new_signature: new_module.signature.clone(),
+        });
     }
-    Ok(bindings)
+    MovedModules::Bound(bound)
 }
 
 pub(crate) fn bind_session_module_relocations(
@@ -1363,7 +1435,8 @@ pub(crate) fn publish_workspace_tree(
     // refuses a stranded entity.
     let vacated = VacatedPaths::from_deltas(&tree_deltas);
     let moves = session_artifact_moves(&tree_deltas);
-    let module_relocations = plan_session_module_relocations(blobs, &authority, &tree_deltas)?;
+    let module_relocations =
+        plan_session_module_relocations(blobs, &authority, &workspace.tree, &tree_deltas)?;
     let semantic_delta =
         if let Some((observed, after)) = &admitted.observed_semantics {
             if observed.resolved_tree != workspace.tree || after.resolved_tree != *desired_tree {
@@ -1526,6 +1599,7 @@ pub(crate) fn publish_workspace_tree(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction.validate()?;
 
@@ -1816,6 +1890,29 @@ pub(crate) fn plan_native_commit_from_base_declaring_carry(
     )
 }
 
+/// The sources whose entities one change moves although its author's own
+/// operations wrote none of their bytes and the change carries none of their
+/// bytes in either: semantics the workspace held ahead of history.
+pub(crate) fn carried_semantic_paths(
+    entity_deltas: &[kin_model::EntityDelta],
+    authored: &BTreeSet<RepoPath>,
+    carried_pending: &[RepoPath],
+) -> Vec<RepoPath> {
+    let mut carried = entity_deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            kin_model::EntityDelta::Added { new }
+            | kin_model::EntityDelta::Modified { new, .. } => new.file_origin.as_ref(),
+            kin_model::EntityDelta::Removed { old } => old.file_origin.as_ref(),
+        })
+        .filter_map(|origin| RepoPath::from_utf8(origin.0.clone()).ok())
+        .filter(|path| !authored.contains(path) && !carried_pending.contains(path))
+        .collect::<Vec<_>>();
+    carried.sort();
+    carried.dedup();
+    carried
+}
+
 /// The paths one change publishes that its author's own operations did not
 /// write.
 ///
@@ -1985,10 +2082,112 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
     scope: SealedPathScope,
     changed_entities: &BTreeSet<kin_model::EntityId>,
 ) -> Result<Vec<RepoPath>> {
+    paths_whose_semantics_the_sealed_bytes_do_not_reproduce_reusing(
+        graph,
+        blobs,
+        authority,
+        tree_deltas,
+        scope,
+        changed_entities,
+        true,
+    )
+}
+
+/// The earlier bodies one sealed path's held declarations name, each read and
+/// indexed at most once while that path is checked.
+///
+/// A partial admission proves each declaration against the body it replaced,
+/// and the declarations one admission proved all name that same earlier body,
+/// so reading and indexing it per declaration repeats the same whole-file work
+/// once per declaration. The read is content addressed and the index is a
+/// function of the path and the bytes, so within one path the earlier digest is
+/// the whole key. A cache lives for one path of one check and is never shared.
+struct EarlierBodies<'a> {
+    blobs: &'a kin_blobs::BlobStore,
+    authority: &'a RepositoryAuthorityManager<LocalFileBackend>,
+    file_id: &'a kin_model::FilePathId,
+    /// Off only in the test that compares the two, where every lookup reads and
+    /// indexes afresh, as the check did before it reused them.
+    reuse: bool,
+    sources: std::collections::HashMap<Hash256, Option<crate::source_cas::PublishableSource>>,
+    entities: std::collections::HashMap<Hash256, Option<Vec<kin_model::Entity>>>,
+}
+
+impl<'a> EarlierBodies<'a> {
+    fn new(
+        blobs: &'a kin_blobs::BlobStore,
+        authority: &'a RepositoryAuthorityManager<LocalFileBackend>,
+        file_id: &'a kin_model::FilePathId,
+        reuse: bool,
+    ) -> Self {
+        Self {
+            blobs,
+            authority,
+            file_id,
+            reuse,
+            sources: std::collections::HashMap::new(),
+            entities: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The body stored under `hash`, or `None` when neither store holds it.
+    fn source(&mut self, hash: Hash256) -> Option<&crate::source_cas::PublishableSource> {
+        if !self.reuse || !self.sources.contains_key(&hash) {
+            let source = read_publishable_source(self.blobs, self.authority, hash).ok();
+            self.sources.insert(hash, source);
+        }
+        self.sources.get(&hash)?.as_ref()
+    }
+
+    /// The body stored under `hash` and the entities an index of it at this
+    /// path produces, or `None` when the body is missing or does not index.
+    fn indexed(
+        &mut self,
+        pipeline: &kin_index::IndexPipeline,
+        hash: Hash256,
+    ) -> Option<(&crate::source_cas::PublishableSource, &[kin_model::Entity])> {
+        self.source(hash)?;
+        if !self.reuse || !self.entities.contains_key(&hash) {
+            let entities = self
+                .sources
+                .get(&hash)
+                .and_then(Option::as_ref)
+                .and_then(|previous| {
+                    pipeline
+                        .index_file_content_with_tests(
+                            self.file_id,
+                            previous.body(),
+                            kin_blobs::digest(previous.body()),
+                        )
+                        .ok()
+                })
+                .map(|before| before.indexed_file.entities);
+            self.entities.insert(hash, entities);
+        }
+        let source = self.sources.get(&hash)?.as_ref()?;
+        let entities = self.entities.get(&hash)?.as_deref()?;
+        Some((source, entities))
+    }
+}
+
+/// [`paths_whose_semantics_the_sealed_bytes_do_not_reproduce`], with the reuse
+/// of earlier bodies across one path's declarations as a switch.
+fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce_reusing(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &kin_blobs::BlobStore,
+    authority: &RepositoryAuthorityManager<LocalFileBackend>,
+    tree_deltas: &[kin_model::TreeDelta],
+    scope: SealedPathScope,
+    changed_entities: &BTreeSet<kin_model::EntityId>,
+    reuse_earlier_bodies: bool,
+) -> Result<Vec<RepoPath>> {
     use kin_model::EntityStore;
 
     let mut behind = Vec::new();
     let pipeline = kin_index::IndexPipeline::new();
+    // The graph's own manifests named the entities it holds, so the parse
+    // they are compared with is named under them too.
+    let manifests = crate::source_cas::graph_manifests(graph, blobs, Some(authority));
     for delta in tree_deltas {
         // A removal seals no bytes, so it is never in scope.
         let new = match (scope, delta) {
@@ -2029,10 +2228,11 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
             continue;
         }
         let file_id = kin_model::FilePathId::new(path);
-        let Ok(indexed) = pipeline.index_file_content_with_tests(
+        let Ok(indexed) = pipeline.index_file_content_in(
             &file_id,
             content,
             kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+            &manifests,
         ) else {
             continue;
         };
@@ -2043,6 +2243,7 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
         })?;
         if let kin_model::ParseState::Incomplete { error_ranges } = &indexed.parse_state {
             let mut stale = false;
+            let mut earlier = EarlierBodies::new(blobs, authority, &file_id, reuse_earlier_bodies);
             for entity in &held {
                 if entity.kind == kin_model::EntityKind::Module {
                     continue;
@@ -2091,21 +2292,13 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
                         .and_then(|v| v.get("previous_blob_hash"))
                         .and_then(|v| v.as_str())
                         .and_then(|v| kin_model::Hash256::from_hex(v).ok());
-                    let verified = previous
-                        .and_then(|previous| {
-                            read_publishable_source(blobs, authority, previous).ok()
-                        })
-                        .and_then(|previous| {
-                            let before = pipeline
-                                .index_file_content_with_tests(
-                                    &file_id,
-                                    previous.body(),
-                                    kin_blobs::digest(previous.body()),
-                                )
-                                .ok()?;
+                    let earlier_body = match previous {
+                        Some(previous) => earlier.indexed(&pipeline, previous),
+                        None => None,
+                    };
+                    let verified = earlier_body
+                        .and_then(|(previous, before)| {
                             let originals: Vec<_> = before
-                                .indexed_file
-                                .entities
                                 .iter()
                                 .filter(|e| e.name == entity.name && e.kind == entity.kind)
                                 .collect();
@@ -2157,9 +2350,11 @@ pub(crate) fn paths_whose_semantics_the_sealed_bytes_do_not_reproduce(
                         .get("blob_hash")
                         .and_then(|v| v.as_str())
                         .and_then(|v| kin_model::Hash256::from_hex(v).ok());
-                    if let Some(previous) = previous.and_then(|previous| {
-                        read_publishable_source(blobs, authority, previous).ok()
-                    }) {
+                    let earlier_body = match previous {
+                        Some(previous) => earlier.source(previous),
+                        None => None,
+                    };
+                    if let Some(previous) = earlier_body {
                         let relations = kin_model::EntityStore::traverse(
                             graph,
                             &kin_model::GraphNodeId::Entity(entity.id),
@@ -2459,6 +2654,11 @@ fn plan_native_commit_inner(
     let carried_pending_files = authored_files
         .map(|authored| carried_pending_paths(&deltas.tree_deltas, authored))
         .unwrap_or_default();
+    let carried_semantic_files = authored_files
+        .map(|authored| {
+            carried_semantic_paths(&deltas.entity_deltas, authored, &carried_pending_files)
+        })
+        .unwrap_or_default();
     let message = match (amend, previous_change) {
         (Some(amend), Some(previous)) => amend
             .message
@@ -2589,6 +2789,7 @@ fn plan_native_commit_inner(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction.validate()?;
 
@@ -2632,6 +2833,7 @@ fn plan_native_commit_inner(
         relation_count,
         file_count,
         carried_pending_files,
+        carried_semantic_files,
         entity_scope_ids,
         previous_tree: workspace.tree,
         target_tree: deltas.expected_tree,
@@ -2687,6 +2889,12 @@ pub(crate) fn load_native_commit_base_from(
             ))
         })?;
     let tree = workspace.tree.clone();
+    // Read for what an operation names by change; a base that does not
+    // resolve leaves it unnamed rather than refusing the commit.
+    let head = workspace
+        .base_target
+        .as_ref()
+        .and_then(|target| lease.resolve_target_change_id(target).ok());
     let snapshot = lease
         .workspace_graph_snapshot(&workspace_id)?
         .ok_or_else(|| {
@@ -2697,7 +2905,12 @@ pub(crate) fn load_native_commit_base_from(
     let roots = lease.roots().clone();
     drop(lease);
     let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)?;
-    Ok(NativeCommitBase { graph, roots, tree })
+    Ok(NativeCommitBase {
+        graph,
+        roots,
+        tree,
+        head,
+    })
 }
 
 /// Load one immutable source body directly from repository-owned CAS.
@@ -4589,6 +4802,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         authority
             .commit_repository_transaction(transaction)
@@ -5992,6 +6206,128 @@ mod tests {
         assert_eq!(snapshot.entities, expected.entities);
         assert_eq!(snapshot.relations, expected.relations);
         assert_eq!(snapshot.resolved_tree, expected.resolved_tree);
+    }
+
+    /// Reusing an earlier body across one path's declarations answers exactly
+    /// as reading and indexing it afresh for each declaration does. Several
+    /// declarations are proved in one file, so one index serves more than one
+    /// of them, and two states have declarations naming different earlier
+    /// bodies, where a cache keyed by the path alone would judge one of them
+    /// against the other's body.
+    #[test]
+    fn reused_earlier_bodies_judge_every_declaration_as_fresh_reads_do() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent.path()).unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let before = "int one(void){int value=1;return value;}\n\
+                      int two(void){int value=2;return value;}\n\
+                      int three(void){int value=3;return value;}\n\
+                      int bad(void){test_cond(1)}\n";
+        let middle = before.replace("value", "middle");
+        let after = middle.replace("middle", "final_value");
+        let mut artifact = add_artifact(&graph, &blobs, b"test.c", before.as_bytes(), |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let introduced = artifact.entry;
+        let original = derive_entities_into_graph(&graph, &blobs, "test.c", before.as_bytes());
+        let mut reconciler = kin_reconcile::Reconciler::new(root.path().to_path_buf());
+        for body in [&middle, &after] {
+            let host = root.path().join("test.c");
+            std::fs::write(&host, body).unwrap();
+            artifact = update_artifact_bytes(&graph, &blobs, &artifact, body.as_bytes());
+            let result = reconciler
+                .reconcile_file_change(&kin_index::FileEvent::Changed(host), &blobs, &graph)
+                .unwrap();
+            assert!(
+                matches!(
+                    result.outcome,
+                    kin_reconcile::ReconcileOutcome::PartiallyUpdated { .. }
+                ),
+                "{:?}",
+                result.outcome
+            );
+            graph.apply_transaction_delta(&result.delta).unwrap();
+        }
+        let authority = reopen(&init);
+        let deltas = vec![TreeDelta::Updated {
+            artifact_id: artifact.artifact_id,
+            old: LocatedEntry::new(artifact.path.clone(), introduced),
+            new: LocatedEntry::new(artifact.path.clone(), artifact.entry),
+        }];
+        let verdict = || {
+            let judge = |reuse| {
+                paths_whose_semantics_the_sealed_bytes_do_not_reproduce_reusing(
+                    &graph,
+                    &blobs,
+                    &authority,
+                    &deltas,
+                    SealedPathScope::AddedAndUpdated,
+                    &BTreeSet::new(),
+                    reuse,
+                )
+                .unwrap()
+            };
+            let reused = judge(true);
+            assert_eq!(
+                reused,
+                judge(false),
+                "reusing earlier bodies changed the verdict"
+            );
+            reused
+        };
+        let owed = vec![artifact.path.clone()];
+        let proved: Vec<_> = ["one", "two", "three"]
+            .into_iter()
+            .map(|name| {
+                let id = original.iter().find(|e| e.name == name).unwrap().id;
+                graph.get_entity(&id).unwrap().unwrap()
+            })
+            .collect();
+        for entity in &proved {
+            assert_eq!(
+                entity.metadata.extra["partial_parse_admission"]["previous_blob_hash"],
+                serde_json::json!(kin_blobs::digest(middle.as_bytes()).to_string()),
+                "{} must be proved against the middle body",
+                entity.name
+            );
+        }
+        assert!(verdict().is_empty(), "every declaration is proved");
+
+        let two = &proved[1];
+        let mut from_before = two.clone();
+        from_before
+            .metadata
+            .extra
+            .get_mut("partial_parse_admission")
+            .unwrap()["previous_blob_hash"] =
+            serde_json::json!(kin_blobs::digest(before.as_bytes()).to_string());
+        graph.upsert_entity(&from_before).unwrap();
+        assert!(
+            verdict().is_empty(),
+            "a declaration proved from an older body is proved beside ones proved from a newer one"
+        );
+
+        let unproved = original.iter().find(|e| e.name == "two").unwrap();
+        graph.upsert_entity(unproved).unwrap();
+        assert_eq!(
+            verdict(),
+            owed,
+            "a declaration still at the oldest body beside proved ones is owed"
+        );
+
+        let mut missing = two.clone();
+        missing
+            .metadata
+            .extra
+            .get_mut("partial_parse_admission")
+            .unwrap()["previous_blob_hash"] =
+            serde_json::json!(Hash256::from_bytes([7; 32]).to_string());
+        graph.upsert_entity(&missing).unwrap();
+        assert_eq!(verdict(), owed, "a proof naming a body no store holds");
+        graph.upsert_entity(two).unwrap();
+        assert!(verdict().is_empty());
     }
 
     #[test]

@@ -216,9 +216,14 @@ fn render_annotation_rows(
     Ok(out)
 }
 
+/// Run one note request against `graph`.
+///
+/// `held` is the repository's pinned storage capability, passed through to
+/// the TODO import; see [`crate::commands::work::execute_work_request`].
 pub fn execute_note_request(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
+    held: Option<&kin_core::LocalRepositoryAuthorityBinding>,
     request: NoteRequest,
 ) -> Result<NoteExecution> {
     let mut mutated = false;
@@ -295,6 +300,7 @@ pub fn execute_note_request(
             let execution = crate::commands::work::execute_work_request(
                 layout,
                 graph,
+                held,
                 crate::commands::work::WorkRequest::TodoImport { path },
             )?;
             mutated = execution.mutated;
@@ -436,6 +442,7 @@ mod tests {
             let error = match execute_note_request(
                 &layout,
                 &store.graph,
+                None,
                 NoteRequest::List {
                     target: target.clone(),
                 },
@@ -464,6 +471,7 @@ mod tests {
             execute_note_request(
                 &layout,
                 &store.graph,
+                None,
                 NoteRequest::Add {
                     target,
                     kind: "warning".into(),

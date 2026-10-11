@@ -435,6 +435,11 @@ def free_port():
 
 def suite_env(home, daemon):
     env = {
+        # This witness reads the in-tree store directly. Central-store
+        # qualification runs separately; this preserves its original scope.
+        "KIN_STORE_LAYOUT": "in-tree",
+        # Written against a store that holds its complete history.
+        "KIN_INIT_HISTORY": "full",
         "HOME": str(home),
         "KIN_HOME": str(home),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),

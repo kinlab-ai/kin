@@ -565,6 +565,29 @@ impl GitCoexistenceConfig {
     }
 }
 
+/// The config document at `path`, read inside the directory that holds it.
+/// `Ok(None)` when there is none.
+fn read_config_text(path: &Path) -> Result<Option<String>> {
+    let directory = path.parent().ok_or_else(|| {
+        KinError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a config document needs a directory around it",
+            ),
+        )
+    })?;
+    match crate::store_records::read(directory, path).map_err(|e| KinError::io(path, e))? {
+        Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| {
+            KinError::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 fn validate_git_identifier(value: &str, label: &str) -> Result<()> {
     if value.is_empty()
         || value.starts_with('-')
@@ -699,6 +722,12 @@ pub struct LspProviderOverride {
 pub struct LspConfig {
     /// Whether LSP enrichment runs at all. Absent config means enabled with
     /// auto-detection of installed servers.
+    ///
+    /// Every daemon reads it when it starts, whoever starts it: with it false
+    /// the daemon queues no sweep, enriches no change and starts no language
+    /// server. `kin init --no-enrich` records false and
+    /// `kin daemon sweep --enable` records true; read and write it through
+    /// [`crate::enrichment_setting`].
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Proof posture for enrichment runs.
@@ -801,6 +830,116 @@ pub struct KinConfig {
     /// Resource knobs that must survive a daemon restart.
     #[serde(default)]
     pub resources: ResourcesConfig,
+
+    /// Which retrieval arm description queries run, and which embedding model
+    /// the repository embeds with. Absent means today's defaults: each query
+    /// runs the fused arm when it has search vectors to use and the cards arm
+    /// when it has none.
+    #[serde(default, skip_serializing_if = "RetrievalConfig::is_empty")]
+    pub retrieval: RetrievalConfig,
+
+    /// Optional graph model stages, with no model selected unless configured.
+    #[serde(default, skip_serializing_if = "crate::models::ModelsConfig::is_empty")]
+    pub models: crate::models::ModelsConfig,
+}
+
+/// The `[retrieval]` table: the switch a measurement flips to compare retrieval
+/// arms on one binary, recorded where it outlives the shell that set it.
+///
+/// Every field is optional and an explicit environment variable always wins:
+/// `arm` fills in for `KIN_LOCATE_ARM`, `scorer` for `KIN_LOCATE_SCORER`,
+/// `scorer_model` for `KIN_LOCATE_SCORER_MODEL` and `embed_model` for
+/// `KIN_EMBED_MODEL_ID`, adopted at process start by both the CLI and the
+/// daemon so the two agree.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetrievalConfig {
+    /// One of [`RETRIEVAL_ARM_NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm: Option<String>,
+    /// One of [`RETRIEVAL_SCORER_NAMES`]: what a bare `+scorer` arm runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<String>,
+    /// The decision model the `decision-engine` scorer runs: a Hugging Face
+    /// id, optionally `id@revision`, or a local model directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer_model: Option<String>,
+    /// A Hugging Face model id, a local model directory, or `coderankembed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_model: Option<String>,
+}
+
+/// Every arm `[retrieval] arm` and `KIN_LOCATE_ARM` accept. The CLI parses the
+/// same list, so a value this table admits is one the pipeline can run.
+pub const RETRIEVAL_ARM_NAMES: &[&str] = &[
+    "fused",
+    "cards",
+    "fused+scorer",
+    "cards+scorer",
+    "fused+cross-encoder",
+    "cards+cross-encoder",
+    "fused+decision-engine",
+    "cards+decision-engine",
+    "fused+external",
+    "cards+external",
+    "fused+none",
+    "cards+none",
+];
+
+/// Every scorer `[retrieval] scorer` and `KIN_LOCATE_SCORER` accept.
+pub const RETRIEVAL_SCORER_NAMES: &[&str] =
+    &["cross-encoder", "decision-engine", "external", "none"];
+
+impl RetrievalConfig {
+    /// Whether the table records nothing, so a config that never set it is
+    /// written back without an empty `[retrieval]` table.
+    pub fn is_empty(&self) -> bool {
+        self.arm.is_none()
+            && self.scorer.is_none()
+            && self.scorer_model.is_none()
+            && self.embed_model.is_none()
+    }
+
+    /// Reject an arm or scorer the pipeline cannot run, when it is written and
+    /// when it is loaded, rather than when a query would have used it.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(arm) = &self.arm {
+            let normalized = arm.trim().to_ascii_lowercase();
+            if !RETRIEVAL_ARM_NAMES.contains(&normalized.as_str()) {
+                return Err(KinError::Config(format!(
+                    "unknown retrieval arm '{arm}' in [retrieval] config (expected {})",
+                    RETRIEVAL_ARM_NAMES.join(", ")
+                )));
+            }
+        }
+        if let Some(scorer) = &self.scorer {
+            let normalized = scorer.trim().to_ascii_lowercase();
+            if !RETRIEVAL_SCORER_NAMES.contains(&normalized.as_str()) {
+                return Err(KinError::Config(format!(
+                    "unknown retrieval scorer '{scorer}' in [retrieval] config (expected {})",
+                    RETRIEVAL_SCORER_NAMES.join(", ")
+                )));
+            }
+        }
+        if self
+            .embed_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(KinError::Config(
+                "[retrieval] embed_model must name a model when it is set".to_string(),
+            ));
+        }
+        if self
+            .scorer_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(KinError::Config(
+                "[retrieval] scorer_model must name a model when it is set".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The two knobs an operator reaches for on a constrained host, recorded where
@@ -918,6 +1057,8 @@ impl Default for KinConfig {
             git: GitCoexistenceConfig::default(),
             lsp: LspConfig::default(),
             resources: ResourcesConfig::default(),
+            retrieval: RetrievalConfig::default(),
+            models: crate::models::ModelsConfig::default(),
         }
     }
 }
@@ -948,6 +1089,8 @@ impl KinConfig {
         self.lsp.validate()?;
         self.git.validate()?;
         self.resources.validate()?;
+        self.retrieval.validate()?;
+        self.models.validate()?;
         Ok(())
     }
 
@@ -955,7 +1098,12 @@ impl KinConfig {
     /// returned, so a contradictory config fails loud at load rather than
     /// silently degrading enrichment later.
     pub fn load(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;
+        let contents = read_config_text(path)?.ok_or_else(|| {
+            KinError::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no config at this path"),
+            )
+        })?;
         let config: Self = toml::from_str(&contents)?;
         config.validate()?;
         Ok(config)
@@ -963,10 +1111,13 @@ impl KinConfig {
 
     /// Load config or return defaults when the repo does not have a config yet.
     pub fn load_or_default(path: &Path) -> Result<Self> {
-        if path.exists() {
-            Self::load(path)
-        } else {
-            Ok(Self::default())
+        match read_config_text(path)? {
+            Some(contents) => {
+                let config: Self = toml::from_str(&contents)?;
+                config.validate()?;
+                Ok(config)
+            }
+            None => Ok(Self::default()),
         }
     }
 
@@ -983,7 +1134,7 @@ impl KinConfig {
     /// nothing, and the caller falls through to whatever it would have said
     /// without this diagnosis.
     pub fn misplaced_top_level_key(path: &Path, key: &str) -> Option<String> {
-        let contents = std::fs::read_to_string(path).ok()?;
+        let contents = read_config_text(path).ok()??;
         let document: toml::Table = toml::from_str(&contents).ok()?;
         fn find(table: &toml::Table, key: &str, prefix: &str) -> Option<String> {
             for (name, value) in table {
@@ -1129,7 +1280,8 @@ fn validated_config_authority_path(
     })?;
     match kind {
         ConfigAuthorityKind::PublishedRepository
-            if directory_path.file_name() != Some(std::ffi::OsStr::new(".kin")) =>
+            if directory_path.file_name() != Some(std::ffi::OsStr::new(".kin"))
+                && crate::layout::read_working_tree_record(directory_path).is_none() =>
         {
             return Err(KinError::Config(format!(
                 "repository config must be a direct child of .kin: {}",
@@ -1502,8 +1654,7 @@ fn save_config_atomically_scoped_with_hook(
         temp.file
             .write_all(&contents[split..])
             .map_err(|error| KinError::io(&temp.display_path, error))?;
-        temp.file
-            .sync_all()
+        kin_blobs::durable::sync_all(&temp.file)
             .map_err(|error| KinError::io(&temp.display_path, error))?;
         authority.require_named_identity(
             &temp.name,
@@ -1979,6 +2130,60 @@ mod tests {
         let bare = toml::to_string_pretty(&KinConfig::default()).unwrap();
         assert!(!bare.contains("profile"), "{bare}");
         assert!(!bare.contains("embed_batch_size"), "{bare}");
+    }
+
+    /// The retrieval switch loads from a hand-written table, an arm the
+    /// pipeline cannot run fails loud at load, and a config that records no
+    /// arm writes no `[retrieval]` table at all.
+    #[test]
+    fn the_retrieval_table_loads_refuses_unknown_arms_and_stays_absent_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            "[retrieval]\narm = \"cards+scorer\"\nscorer = \"none\"\nscorer_model = \"jaredpalmer/kev-0.6b\"\nembed_model = \"coderankembed\"\n",
+        )
+        .unwrap();
+        let loaded = KinConfig::load(&path).unwrap();
+        assert_eq!(loaded.retrieval.arm.as_deref(), Some("cards+scorer"));
+        assert_eq!(loaded.retrieval.scorer.as_deref(), Some("none"));
+        assert_eq!(
+            loaded.retrieval.scorer_model.as_deref(),
+            Some("jaredpalmer/kev-0.6b")
+        );
+        assert_eq!(
+            loaded.retrieval.embed_model.as_deref(),
+            Some("coderankembed")
+        );
+
+        std::fs::write(&path, "[retrieval]\narm = \"vectors-only\"\n").unwrap();
+        let error = KinConfig::load(&path).expect_err("an unknown arm must fail loud");
+        assert!(
+            error.to_string().contains("unknown retrieval arm"),
+            "{error}"
+        );
+
+        std::fs::write(&path, "[retrieval]\nscorer_model = \" \"\n").unwrap();
+        let error = KinConfig::load(&path).expect_err("an empty scorer model must fail loud");
+        assert!(error.to_string().contains("scorer_model"), "{error}");
+
+        std::fs::write(&path, "[retrieval]\nscorer = \"magic\"\n").unwrap();
+        let error = KinConfig::load(&path).expect_err("an unknown scorer must fail loud");
+        assert!(
+            error.to_string().contains("unknown retrieval scorer"),
+            "{error}"
+        );
+
+        // Control: every listed arm loads, so the refusals above are about the
+        // value and not about the table.
+        for arm in RETRIEVAL_ARM_NAMES {
+            std::fs::write(&path, format!("[retrieval]\narm = \"{arm}\"\n")).unwrap();
+            KinConfig::load(&path).unwrap_or_else(|error| panic!("{arm} must load: {error}"));
+        }
+
+        let bare = toml::to_string_pretty(&KinConfig::default()).unwrap();
+        assert!(!bare.contains("retrieval"), "{bare}");
     }
 
     /// A knob the runtime cannot act on is refused where the operator is

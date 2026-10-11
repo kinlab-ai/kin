@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Integration test: start rust-analyzer, query call hierarchy on a real Rust project.
+//! Integration test: start rust-analyzer, query definition and call hierarchy
+//! on a Rust project.
 //!
 //! Requires: rust-analyzer installed (`rustup component add rust-analyzer`).
 //! Skipped if rust-analyzer is not available.
 
 use std::path::Path;
+use std::time::Duration;
 
-use kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
+use kin_lsp::adapters::rust_analyzer::{cargo_layout, launch_for, RustAnalyzerAdapter};
 use kin_lsp::adapters::LspAdapter;
 use kin_lsp::lifecycle::LspServer;
 use kin_lsp::protocol;
+
+/// How long rust-analyzer is given to load the fixture crate, and then to
+/// answer about the document it was handed. Loading takes about three seconds,
+/// most of it the standard library; the bound is for a loaded host.
+const READY_BUDGET: Duration = Duration::from_secs(60);
 
 fn kin_workspace_root() -> Option<std::path::PathBuf> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -84,153 +91,91 @@ async fn start_and_initialize_rust_analyzer() {
     }
 }
 
-/// Test querying textDocument/definition on a known function.
-#[tokio::test]
-async fn query_definition_on_rust_file() {
-    if !has_rust_analyzer() {
-        eprintln!("SKIP: rust-analyzer not available");
-        return;
-    }
+/// A crate shaped like `kin-core`'s `init`, which calls `init_with_config`,
+/// which calls `build_genesis_change`.
+///
+/// The queries below used to run against the whole workspace this crate
+/// lives in, after fixed 10 s and 20 s sleeps. rust-analyzer takes close to
+/// two minutes to load that workspace (105 s on a loaded 18-core host), so
+/// both ran against a server still loading: the definition came back `null`,
+/// the enrichment produced no relations, and neither asserted anything. A
+/// crate this size loads in about three seconds, so the waits end on
+/// rust-analyzer's own signals and the answers are asserted.
+const FIXTURE_LIB: &str = "pub struct InitResult;
 
-    let Some(workspace) = kin_workspace_root() else {
-        eprintln!("SKIP: kin workspace not found");
-        return;
-    };
-
-    let adapter = RustAnalyzerAdapter;
-    let server = match LspServer::start(
-        adapter.server_command(),
-        &[],
-        &workspace,
-        adapter.initialization_options(&workspace),
-        None,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("SKIP: server start failed: {}", e);
-            return;
-        }
-    };
-
-    // Open a file so rust-analyzer knows about it.
-    let test_file = workspace.join("crates/kin-core/src/init.rs");
-    if !test_file.exists() {
-        eprintln!("SKIP: test file not found");
-        server.shutdown().await.ok();
-        return;
-    }
-
-    let file_content = std::fs::read_to_string(&test_file).unwrap();
-    let uri = protocol::path_to_uri(&test_file);
-
-    // Send textDocument/didOpen notification.
-    server
-        .client
-        .notify(
-            "textDocument/didOpen",
-            serde_json::json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "rust",
-                    "version": 1,
-                    "text": file_content,
-                }
-            }),
-        )
-        .await
-        .expect("didOpen failed");
-
-    // Wait for rust-analyzer to index (it needs time to load cargo metadata).
-    eprintln!("waiting for rust-analyzer to index...");
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-    // Query definition at the start of the `init` function.
-    // Find the line containing "pub fn init("
-    let init_line = file_content
-        .lines()
-        .enumerate()
-        .find(|(_, line)| line.contains("pub fn init(working_dir"))
-        .map(|(i, _)| i as u32);
-
-    if let Some(line) = init_line {
-        eprintln!("querying definition at line {}", line);
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            server.client.request(
-                "textDocument/definition",
-                protocol::TextDocumentPositionParams {
-                    text_document: protocol::TextDocumentIdentifier { uri: uri.clone() },
-                    position: protocol::Position {
-                        line,
-                        character: 10,
-                    },
-                },
-            ),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(value)) => {
-                eprintln!(
-                    "definition response: {}",
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                );
-            }
-            Ok(Err(e)) => {
-                eprintln!("definition request failed: {}", e);
-            }
-            Err(_) => {
-                eprintln!("definition request timed out (rust-analyzer may still be indexing)");
-            }
-        }
-    }
-
-    server.shutdown().await.ok();
-    eprintln!("test complete");
+pub fn init(working_dir: &str) -> InitResult {
+    init_with_config(working_dir, 0)
 }
 
-/// Test full call hierarchy enrichment: start server, build entity index,
-/// query outgoing calls, produce Relations.
+fn init_with_config(working_dir: &str, config: u32) -> InitResult {
+    let _ = (working_dir, config);
+    build_genesis_change()
+}
+
+fn build_genesis_change() -> InitResult {
+    InitResult
+}
+";
+
+/// The zero-based line in [`FIXTURE_LIB`] that contains `needle`.
+fn fixture_line(needle: &str) -> u32 {
+    FIXTURE_LIB
+        .lines()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("the fixture has a line containing {needle:?}")) as u32
+}
+
+/// Test querying textDocument/definition on a known call, then full call
+/// hierarchy enrichment (start server, build entity index, query outgoing
+/// calls, produce Relations), against one server. Both only read, so they
+/// share the one start and the one load.
 #[tokio::test]
-async fn enrich_call_hierarchy_produces_relations() {
+async fn query_definition_and_enrich_call_hierarchy_on_one_server() {
     use kin_lsp::enrichment::{enrich_entity_calls, EntityIndex, EntityRef};
-    use kin_model::EntityId;
+    use kin_model::{EntityId, GraphNodeId};
 
     if !has_rust_analyzer() {
         eprintln!("SKIP: rust-analyzer not available");
         return;
     }
 
-    let Some(workspace) = kin_workspace_root() else {
-        eprintln!("SKIP: kin workspace not found");
-        return;
-    };
+    let workspace = std::env::temp_dir().join(format!("kin-lsp-ra-init-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"init_shape\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let test_file = workspace.join("src/lib.rs");
+    std::fs::write(&test_file, FIXTURE_LIB).unwrap();
 
+    // Started the way the daemon starts it, which waits for rust-analyzer to
+    // report the crate loaded, then waited on until it reports itself indexed.
     let adapter = RustAnalyzerAdapter;
-    let server = match LspServer::start(
-        adapter.server_command(),
-        &[],
-        &workspace,
-        adapter.initialization_options(&workspace),
-        None,
+    let server = tokio::time::timeout(
+        READY_BUDGET,
+        LspServer::launch_settled(
+            adapter.server_command(),
+            &[],
+            &workspace,
+            &launch_for(cargo_layout(&workspace)),
+            None,
+        ),
     )
     .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("SKIP: server start failed: {}", e);
-            return;
-        }
-    };
+    .expect("rust-analyzer reports the fixture crate loaded within the budget")
+    .expect("rust-analyzer starts on the fixture crate");
+    let indexed = server.wait_until_indexed(READY_BUDGET).await;
+    assert_eq!(
+        indexed,
+        kin_lsp::lifecycle::Indexed::Quiescent,
+        "rust-analyzer says when it has finished loading, and the wait ends on that"
+    );
 
-    // Open init.rs so RA knows about it.
-    let test_file = workspace.join("crates/kin-core/src/init.rs");
-    let file_content = std::fs::read_to_string(&test_file).unwrap();
+    // Open lib.rs so RA knows about it, and wait until it answers about it.
+    let file_content = FIXTURE_LIB.to_string();
     let uri = protocol::path_to_uri(&test_file);
-
     server
         .client
         .notify(
@@ -246,61 +191,101 @@ async fn enrich_call_hierarchy_produces_relations() {
         )
         .await
         .expect("didOpen failed");
+    server
+        .wait_for_document(&uri, READY_BUDGET)
+        .await
+        .expect("rust-analyzer answers about a document it was just handed");
 
-    // Wait for indexing — RA needs time to load cargo metadata + type check.
-    eprintln!("waiting for rust-analyzer to index (20s)...");
-    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-
-    // Build a minimal entity index with the `init` function.
-    let init_line = file_content
+    // Query definition at the call `init` makes, on the line after its
+    // signature.
+    let init_line = fixture_line("pub fn init(working_dir");
+    let init_with_config_line = fixture_line("fn init_with_config(");
+    let call_line = init_line + 1;
+    let call_col = FIXTURE_LIB
         .lines()
-        .enumerate()
-        .find(|(_, line)| line.contains("pub fn init(working_dir"))
-        .map(|(i, _)| i as u32)
-        .expect("init function not found");
-
-    // Find the column of "init" in "pub fn init("
-    let init_col = file_content
-        .lines()
-        .nth(init_line as usize)
-        .and_then(|line| line.find("init"))
-        .unwrap_or(7) as u32;
-
-    let init_entity = EntityRef {
-        id: EntityId::new(),
-        name: "init".to_string(),
-        file_path: "crates/kin-core/src/init.rs".to_string(),
-        start_line: init_line,
-        start_col: 0,
-        end_line: init_line + 60,
-        name_line: init_line,
-        name_col: init_col,
-        declares_name: true,
-        kind: kin_model::EntityKind::Function,
+        .nth(call_line as usize)
+        .and_then(|line| line.find("init_with_config"))
+        .expect("init calls init_with_config") as u32;
+    eprintln!("querying definition at line {}", call_line);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        server.client.request(
+            "textDocument/definition",
+            protocol::TextDocumentPositionParams {
+                text_document: protocol::TextDocumentIdentifier { uri: uri.clone() },
+                position: protocol::Position {
+                    line: call_line,
+                    character: call_col + 2,
+                },
+            },
+        ),
+    )
+    .await;
+    let definition = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => panic!("definition request failed after rust-analyzer was ready: {e}"),
+        Err(_) => panic!("definition request timed out after rust-analyzer was ready"),
     };
+    eprintln!(
+        "definition response: {}",
+        serde_json::to_string_pretty(&definition).unwrap_or_default()
+    );
+    let landed: Vec<u64> = definition
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![definition.clone()])
+        .iter()
+        .filter_map(|location| {
+            let range = location
+                .get("targetSelectionRange")
+                .or(location.get("range"))?;
+            range["start"]["line"].as_u64()
+        })
+        .collect();
+    assert_eq!(
+        landed,
+        [u64::from(init_with_config_line)],
+        "the call in `init` resolves to `init_with_config`'s declaration: {definition}"
+    );
 
-    // Build index with some other entities that init() might call.
-    let build_genesis_line = file_content
-        .lines()
-        .enumerate()
-        .find(|(_, line)| line.contains("pub fn build_genesis_change"))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(30);
-
-    let genesis_entity = EntityRef {
-        id: EntityId::new(),
-        name: "build_genesis_change".to_string(),
-        file_path: "crates/kin-core/src/init.rs".to_string(),
-        start_line: build_genesis_line,
-        start_col: 0,
-        end_line: build_genesis_line + 20,
-        name_line: build_genesis_line,
-        name_col: 7,
-        declares_name: true,
-        kind: kin_model::EntityKind::Function,
+    // Build an entity index with `init` and the functions it might call.
+    let entity = |name: &str, line: u32, end_line: u32| {
+        let name_col = FIXTURE_LIB
+            .lines()
+            .nth(line as usize)
+            .and_then(|text| text.find(&format!("fn {name}")))
+            .map(|col| col + 3)
+            .expect("the entity is declared on its line") as u32;
+        EntityRef {
+            id: EntityId::new(),
+            name: name.to_string(),
+            file_path: "src/lib.rs".to_string(),
+            start_line: line,
+            start_col: 0,
+            end_line,
+            name_line: line,
+            name_col,
+            declares_name: true,
+            declares_only: false,
+            kind: kin_model::EntityKind::Function,
+        }
     };
-
-    let index = EntityIndex::new(vec![init_entity.clone(), genesis_entity], &workspace);
+    let genesis_line = fixture_line("fn build_genesis_change");
+    let init_entity = entity("init", init_line, init_line + 2);
+    let config_entity = entity(
+        "init_with_config",
+        init_with_config_line,
+        init_with_config_line + 3,
+    );
+    let genesis_entity = entity("build_genesis_change", genesis_line, genesis_line + 2);
+    let index = EntityIndex::new(
+        vec![
+            init_entity.clone(),
+            config_entity.clone(),
+            genesis_entity.clone(),
+        ],
+        &workspace,
+    );
 
     // Enrich: query call hierarchy for init() function.
     let result = tokio::time::timeout(
@@ -314,31 +299,36 @@ async fn enrich_call_hierarchy_produces_relations() {
         ),
     )
     .await;
-
-    match result {
-        Ok(Ok(calls)) => {
-            let relations = calls.relations;
-            eprintln!(
-                "enrichment produced {} relations from init()",
-                relations.len()
-            );
-            for rel in &relations {
-                eprintln!("  {:?} -> {:?}", rel.src, rel.dst);
-            }
-            // init() calls build_genesis_change() and init_graph() — we should
-            // get at least some relations if RA resolved the calls.
-            eprintln!(
-                "SUCCESS: LSP enrichment pipeline works end-to-end ({} relations)",
-                relations.len()
-            );
-        }
-        Ok(Err(e)) => {
-            eprintln!("enrichment failed: {}", e);
-        }
-        Err(_) => {
-            eprintln!("enrichment timed out (RA may still be indexing)");
-        }
-    }
-
     server.shutdown().await.ok();
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    let relations = match result {
+        Ok(Ok(calls)) => calls.relations,
+        Ok(Err(e)) => panic!("enrichment failed after rust-analyzer was ready: {e}"),
+        Err(_) => panic!("enrichment timed out after rust-analyzer was ready"),
+    };
+    eprintln!(
+        "enrichment produced {} relations from init()",
+        relations.len()
+    );
+    for rel in &relations {
+        eprintln!("  {:?} -> {:?}", rel.src, rel.dst);
+    }
+    let targets: Vec<GraphNodeId> = relations.iter().map(|relation| relation.dst).collect();
+    assert_eq!(
+        targets,
+        [GraphNodeId::Entity(config_entity.id)],
+        "init() calls init_with_config() and nothing else in the index; build_genesis_change() \
+         is called one hop further in"
+    );
+    assert!(
+        relations
+            .iter()
+            .all(|relation| relation.src == GraphNodeId::Entity(init_entity.id)),
+        "every edge starts at init(): {relations:?}"
+    );
+    eprintln!(
+        "SUCCESS: LSP enrichment pipeline works end-to-end ({} relations)",
+        relations.len()
+    );
 }
