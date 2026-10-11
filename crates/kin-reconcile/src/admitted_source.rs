@@ -47,6 +47,38 @@ impl AdmittedSourceReading {
     }
 }
 
+/// The admitted sources a batch's manifests rename, to re-derive with it.
+///
+/// A manifest edit can rename sources whose own bytes did not change: moving
+/// `[lib] path` makes one source a crate's root and leaves the old root a
+/// plain module. Every source under a manifest the batch carries is named
+/// under the tree's current manifests without parsing it and compared with
+/// the module the graph holds for it ([`kin_index::sources_renamed_by_manifests`]),
+/// and each one that differs is returned, so the batch derives it again
+/// rather than leaving a strict read of it to find the graph behind its own
+/// bytes. Sources already in `batch` are not returned.
+pub(crate) fn renamed_by_manifests(
+    graph: &kin_db::InMemoryGraph,
+    blobs: &BlobStore,
+    batch: &[FilePathId],
+) -> Result<Vec<FilePathId>> {
+    let changed: Vec<&str> = batch
+        .iter()
+        .map(|file| file.0.as_str())
+        .filter(|path| kin_parser::project_manifest::could_hold_naming_manifest(path))
+        .collect();
+    if changed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let project = kin_index::GraphProjectFiles::new(graph, blobs);
+    let renamed =
+        kin_index::sources_renamed_by_manifests(graph, &graph.resolved_tree(), &project, &changed)?;
+    Ok(renamed
+        .into_iter()
+        .filter(|file| !batch.contains(file))
+        .collect())
+}
+
 fn invalid(file: &FilePathId, reason: &str) -> ReconcileError {
     ReconcileError::InvalidTransaction(format!("admitted dependent source {file}: {reason}"))
 }
@@ -90,7 +122,7 @@ pub(crate) fn load_with_content<G: GraphStore>(
 pub(crate) fn inspect_with_content<G: GraphStore>(
     graph: &G,
     file: &FilePathId,
-    mut read: impl FnMut(kin_model::Hash256) -> Result<Vec<u8>>,
+    read: impl FnMut(kin_model::Hash256) -> Result<Vec<u8>>,
 ) -> Result<AdmittedSourceReading> {
     let path = RepoPath::from_utf8(file.0.clone()).map_err(|e| invalid(file, &e.to_string()))?;
     if graph.artifact_id_at_path(&path).is_none() {
@@ -104,7 +136,8 @@ pub(crate) fn inspect_with_content<G: GraphStore>(
     };
     let digest = kin_blobs::Hash256::from_hex(&hash.to_string())
         .map_err(|e| invalid(file, &e.to_string()))?;
-    let bytes = read(hash)?;
+    let read = std::cell::RefCell::new(read);
+    let bytes = (read.borrow_mut())(hash)?;
     if kin_blobs::digest(&bytes) != digest {
         return Err(invalid(file, "source blob digest mismatch"));
     }
@@ -116,9 +149,12 @@ pub(crate) fn inspect_with_content<G: GraphStore>(
     ) {
         return Ok(AdmittedSourceReading::NotComplete);
     }
-    let mut indexed = kin_index::IndexPipeline::new()
-        .index_file_content_with_tests(file, &bytes, digest)?
-        .indexed_file;
+    // Shared with every other read of these bytes in this process: a commit
+    // reads each admitted source this way, and all but one are unchanged. The
+    // graph's own tree holds the manifests the source is named under.
+    let project =
+        kin_index::GraphProjectFiles::with_reader(graph, |hash| (read.borrow_mut())(hash).ok());
+    let mut indexed = kin_index::shared_index::index_source(file, &bytes, digest, &project)?;
     if !matches!(indexed.parse_state, ParseState::Valid) {
         return Ok(AdmittedSourceReading::NotComplete);
     }

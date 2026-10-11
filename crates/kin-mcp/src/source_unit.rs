@@ -129,86 +129,97 @@ pub fn is_repository_base_conflict(text: &str) -> bool {
     })
 }
 
-/// What a unit holds, in its language's own terms.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnitRole {
-    /// Ordinary package source.
-    #[default]
-    Source,
-    /// Test code compiled only by the language's test runner (Go `_test.go`).
-    Test,
-}
+pub use kin_parser::unit_editor::UnitRole;
 
-/// A source unit named by language-native identity.
+/// A source unit named by language identity: its language, where it sits in
+/// its project (`package`), its own `name`, and its `role`. What the package
+/// and the name mean is the language's unit editor's to say (a Go package's
+/// import path and package clause, a Python package's dotted path and its
+/// module's name), and so is where the unit lives: callers never name a
+/// file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "language", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SourceUnit {
-    /// A Go package unit. `package` is the import path relative to the module
-    /// root (`.` for the root package, `internal/store`), `name` its package
-    /// clause, and `role` whether this is the package's source or test unit.
-    Go {
-        package: String,
-        name: String,
-        #[serde(default)]
-        role: UnitRole,
-    },
+#[serde(deny_unknown_fields)]
+pub struct SourceUnit {
+    #[serde(with = "unit_language")]
+    pub language: kin_model::LanguageId,
+    pub package: String,
+    pub name: String,
+    #[serde(default)]
+    pub role: UnitRole,
 }
 
-/// The file-name stem Kin projects a Go unit to, derived from its package name.
-///
-/// The Go toolchain reads meaning into file names: everything after the first
-/// underscore can make a file platform-specific (`_linux`, `_amd64`) or a test
-/// (`_test`), and a leading `_` or `.` hides it. A package name is kept exactly
-/// as given, so the stem, never the identity, absorbs that: a name with an
-/// underscore gains a neutral `_unit` element, which is neither a platform, an
-/// architecture nor `test`, and a leading underscore gains a `unit` prefix.
-/// The mapping is deterministic and internal; callers never name files.
-pub fn go_unit_file_stem(package_name: &str) -> String {
-    let mut stem = if package_name.starts_with('_') {
-        format!("unit{package_name}")
-    } else {
-        package_name.to_string()
-    };
-    if stem.contains('_') {
-        stem.push_str("_unit");
+/// A unit's language on the wire: the name Kin writes for it (`go`,
+/// `typescript`).
+mod unit_language {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        language: &kin_model::LanguageId,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(language.profile().wire_name)
     }
-    stem
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<kin_model::LanguageId, D::Error> {
+        let written = String::deserialize(deserializer)?;
+        kin_parser::ALL_LANGUAGE_IDS
+            .iter()
+            .copied()
+            .find(|language| language.profile().wire_name == written)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown unit language {written:?}; a unit is addressed in {}",
+                    super::unit_language_names()
+                ))
+            })
+    }
+}
+
+/// The wire names of the languages whose units Kin writes: `go, typescript`.
+pub fn unit_language_names() -> String {
+    kin_parser::unit_editor::unit_languages()
+        .into_iter()
+        .map(|language| language.profile().wire_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl SourceUnit {
-    pub fn language(&self) -> kin_model::LanguageId {
-        match self {
-            Self::Go { .. } => kin_model::LanguageId::Go,
+    /// A Go package unit: its import path relative to the module root, its
+    /// package clause and its role.
+    pub fn go(package: impl Into<String>, name: impl Into<String>, role: UnitRole) -> Self {
+        Self {
+            language: kin_model::LanguageId::Go,
+            package: package.into(),
+            name: name.into(),
+            role,
         }
+    }
+
+    pub fn language(&self) -> kin_model::LanguageId {
+        self.language
     }
 
     pub fn role(&self) -> UnitRole {
-        match self {
-            Self::Go { role, .. } => *role,
-        }
+        self.role
     }
 
-    /// The unit's package clause name.
+    /// The unit's own name: a Go package clause, a module's name.
     pub fn package_name(&self) -> &str {
-        match self {
-            Self::Go { name, .. } => name,
-        }
+        &self.name
     }
 
     /// Human-readable identity for refusals: never a path.
     pub fn describe(&self) -> String {
-        match self {
-            Self::Go {
-                package,
-                name,
-                role,
-            } => format!(
-                "Go package {package} (package {name}, {} unit)",
-                match role {
-                    UnitRole::Source => "source",
-                    UnitRole::Test => "test",
-                }
+        match kin_parser::unit_editor::unit_editor_for(self.language) {
+            Some(editor) => editor.describe_unit(&self.package, &self.name, self.role),
+            None => format!(
+                "{} unit {} {}",
+                self.language.profile().display_name,
+                self.package,
+                self.name
             ),
         }
     }
@@ -216,81 +227,18 @@ impl SourceUnit {
     /// Refuse anything that is not a language-native identity. A file path, a
     /// file name, an escape or a directory the toolchain ignores is refused.
     pub fn validate(&self) -> Result<(), String> {
-        match self {
-            Self::Go { package, name, .. } => {
-                if package != "." {
-                    if package.is_empty()
-                        || package.len() > 512
-                        || package.starts_with('/')
-                        || package.ends_with('/')
-                    {
-                        return Err(format!(
-                            "Go unit package {package:?} must be \".\" or an import path relative \
-                             to the module root, such as \"internal/store\""
-                        ));
-                    }
-                    for element in package.split('/') {
-                        if element.is_empty()
-                            || element == "."
-                            || element == ".."
-                            || element.starts_with('.')
-                            || element.starts_with('_')
-                            || element == "testdata"
-                            || element == "vendor"
-                            || !element
-                                .bytes()
-                                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-~".contains(&byte))
-                        {
-                            return Err(format!(
-                                "Go unit package {package:?} is not a package import path relative \
-                                 to the module root: element {element:?} is empty, relative, \
-                                 ignored by the Go toolchain, or not a plain name. Address the \
-                                 unit by package, never by file path"
-                            ));
-                        }
-                    }
-                    if package.ends_with(".go") {
-                        return Err(format!(
-                            "Go unit package {package:?} looks like a file; address the unit by \
-                             its package, such as \"internal/store\", never by file path"
-                        ));
-                    }
-                }
-                if !kin_parser::go_unit::is_go_identifier(name) || name == "_" {
-                    return Err(format!(
-                        "Go unit name {name:?} must be the package clause name, one Go identifier"
-                    ));
-                }
-                Ok(())
-            }
-        }
+        unit_editor(self)?.validate_unit(&self.package, &self.name, self.role)
     }
 
-    /// The projection path Kin derives for this unit: the package directory
-    /// under the module root, then `<name>.go` or `<name>_test.go`.
-    pub fn projection_path(&self, module_root: &str) -> Result<kin_model::RepoPath, String> {
-        self.validate()?;
-        let Self::Go {
-            package,
-            name,
-            role,
-        } = self;
-        let mut directory = module_root.trim_end_matches('/').to_string();
-        if package != "." {
-            if !directory.is_empty() {
-                directory.push('/');
-            }
-            directory.push_str(package);
-        }
-        let stem = go_unit_file_stem(name);
-        let file = match role {
-            UnitRole::Source => format!("{stem}.go"),
-            UnitRole::Test => format!("{stem}_test.go"),
-        };
-        let path = if directory.is_empty() {
-            file
+    /// The projection path Kin derives for this unit under its project's
+    /// root, as its language's unit editor places it.
+    pub fn projection_path(&self, project_root: &str) -> Result<kin_model::RepoPath, String> {
+        let relative = unit_editor(self)?.unit_path(&self.package, &self.name, self.role)?;
+        let root = project_root.trim_end_matches('/');
+        let path = if root.is_empty() {
+            relative
         } else {
-            format!("{directory}/{file}")
+            format!("{root}/{relative}")
         };
         let path = kin_model::RepoPath::from_utf8(path).map_err(|error| error.to_string())?;
         kin_core::validate_source_paths([&path]).map_err(|error| error.to_string())?;
@@ -304,38 +252,19 @@ impl SourceUnit {
 pub fn go_module_root<'a>(
     paths: impl IntoIterator<Item = &'a kin_model::RepoPath>,
 ) -> Result<String, String> {
-    let mut roots = paths
-        .into_iter()
-        .map(ToString::to_string)
-        .filter_map(|path| match path.rsplit_once('/') {
-            Some((directory, "go.mod")) => Some(directory.to_string()),
-            None if path == "go.mod" => Some(String::new()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    roots.sort();
-    roots.dedup();
-    match roots.len() {
-        0 => Ok(String::new()),
-        1 => Ok(roots.remove(0)),
-        count => Err(format!(
-            "this repository holds {count} Go modules; addressing a unit by a module-relative \
-             package needs exactly one go.mod, and multi-module repositories are not supported yet"
-        )),
-    }
+    kin_parser::unit_editor::project_root(kin_model::LanguageId::Go, paths)
 }
 
-/// The unit's projection path resolved against a tree's own `go.mod`.
+/// The unit's projection path resolved against its project's root in a tree.
 pub fn unit_projection_path(
     unit: &SourceUnit,
     tree: &kin_model::ResolvedTree,
 ) -> Result<kin_model::RepoPath, String> {
-    match unit {
-        SourceUnit::Go { .. } => {
-            let root = go_module_root(tree.artifacts().map(|artifact| &artifact.path))?;
-            unit.projection_path(&root)
-        }
-    }
+    let root = kin_parser::unit_editor::project_root(
+        unit.language(),
+        tree.artifacts().map(|artifact| &artifact.path),
+    )?;
+    unit.projection_path(&root)
 }
 
 /// A declaration kind, language-neutral in name. Each language admits the
@@ -369,19 +298,34 @@ impl DeclarationKind {
         "var",
     ];
 
-    /// The Go declaration this kind names, or a refusal naming the Go kinds.
-    pub fn go(self) -> Result<kin_parser::go_unit::GoDeclarationKind, String> {
-        use kin_parser::go_unit::GoDeclarationKind as Go;
-        Ok(match self {
-            Self::Function => Go::Function,
-            Self::Method => Go::Method,
-            Self::Struct | Self::Class => Go::Struct,
-            Self::Interface => Go::Interface,
-            Self::Type => Go::Type,
-            Self::Const => Go::Const,
-            Self::Var => Go::Var,
-        })
+    /// The declaration a unit editor creates for this kind.
+    pub fn unit(self) -> kin_parser::unit_editor::UnitDeclarationKind {
+        use kin_parser::unit_editor::UnitDeclarationKind as Unit;
+        match self {
+            Self::Function => Unit::Function,
+            Self::Method => Unit::Method,
+            Self::Struct | Self::Class => Unit::Struct,
+            Self::Interface => Unit::Interface,
+            Self::Type => Unit::Type,
+            Self::Const => Unit::Const,
+            Self::Var => Unit::Var,
+        }
     }
+}
+
+/// The editor of `unit`'s language, or the refusal that says the language
+/// writes no unit-addressed declaration.
+pub fn unit_editor(
+    unit: &SourceUnit,
+) -> Result<&'static dyn kin_parser::unit_editor::UnitEditor, String> {
+    let language = unit.language();
+    kin_parser::unit_editor::unit_editor_for(language).ok_or_else(|| {
+        format!(
+            "{} declarations are not created by unit; create one beside a current declaration \
+             with its source_base and a placement",
+            language.profile().display_name
+        )
+    })
 }
 
 /// One import: a bare path, or a path with an explicit package name.
@@ -401,13 +345,14 @@ pub struct NamedImport {
 }
 
 impl ImportSpec {
-    pub fn go(&self) -> kin_parser::go_unit::GoImport {
+    /// The import as a unit editor reads it.
+    pub fn unit(&self) -> kin_parser::unit_editor::UnitImport {
         match self {
-            Self::Path(path) => kin_parser::go_unit::GoImport {
+            Self::Path(path) => kin_parser::unit_editor::UnitImport {
                 path: path.clone(),
                 alias: None,
             },
-            Self::Named(named) => kin_parser::go_unit::GoImport {
+            Self::Named(named) => kin_parser::unit_editor::UnitImport {
                 path: named.path.clone(),
                 alias: named.alias.clone(),
             },
@@ -423,12 +368,9 @@ impl ImportSpec {
 }
 
 fn validate_imports(unit: &SourceUnit, imports: &[ImportSpec]) -> Result<(), String> {
-    match unit {
-        SourceUnit::Go { .. } => {
-            for import in imports {
-                import.go().validate()?;
-            }
-        }
+    let editor = unit_editor(unit)?;
+    for import in imports {
+        editor.validate_import(&import.unit())?;
     }
     let mut paths = imports.iter().map(ImportSpec::path).collect::<Vec<_>>();
     paths.sort_unstable();
@@ -503,13 +445,17 @@ pub fn repository_base_schema() -> serde_json::Value {
 }
 
 pub fn source_unit_schema() -> serde_json::Value {
+    let languages: Vec<&str> = kin_parser::unit_editor::unit_languages()
+        .into_iter()
+        .map(|language| language.profile().wire_name)
+        .collect();
     serde_json::json!({
         "type": "object",
-        "description": "A source unit named by language identity, never by path. Go: package is the import path relative to the module root (\".\" or \"internal/store\"), name is the package clause, role is source or test (the package's _test unit). Kin derives the file and owns the package clause.",
+        "description": "A source unit named by language identity. Go: package is the import path relative to the module root (\".\" or \"internal/store\"), name is the package clause, role is source or test (the package's _test unit); Kin owns the package clause. Python: package is the dotted package (\".\" or \"shop.models\"), name the module. TypeScript and JavaScript: package is the directory under the project root (\".\" or \"src/runs\"), name the module without extension. Rust: package \".\", name lib or main for the crate root, or role test for an integration test.",
         "properties": {
-            "language": {"const": "go"},
+            "language": {"enum": languages},
             "package": {"type": "string", "minLength": 1},
-            "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+            "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$"},
             "role": {"type": "string", "enum": ["source", "test"], "default": "source"}
         },
         "required": ["language", "package", "name"],
@@ -554,11 +500,7 @@ mod tests {
     use super::*;
 
     fn go(package: &str, name: &str, role: UnitRole) -> SourceUnit {
-        SourceUnit::Go {
-            package: package.into(),
-            name: name.into(),
-            role,
-        }
+        SourceUnit::go(package, name, role)
     }
 
     #[test]

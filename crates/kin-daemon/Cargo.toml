@@ -13,12 +13,13 @@ repository.workspace = true
 doctest = false
 
 [features]
-default = ["vector", "embeddings", "metal"]
+# The same product default as kin-cli: no embedding model. See kin-cli's manifest.
+default = ["vector", "external-embeddings"]
 vector = ["kin-db/vector", "kin-cli/vector"]
+external-embeddings = ["kin-db/external-embeddings", "kin-cli/external-embeddings"]
 embeddings = ["kin-db/embeddings", "kin-cli/embeddings"]
-# `metal` is a macOS GPU-acceleration *marker* feature (see kin-cli for the full rationale).
-# It intentionally does NOT pull `kin-db/metal`; the real macOS-only activation lives in the
-# `[target.'cfg(target_os = "macos")'.dependencies]` block below so Linux never compiles it.
+decision = ["kin-cli/decision"]
+# Embeddings on Apple's GPU; `embeddings` and nothing more off macOS.
 metal = ["embeddings", "kin-cli/metal"]
 # `object_store` is kin-db's own GCS client crate, pulled in here at the same
 # version so `GcsBackend::from_store` accepts a store this crate built. That is
@@ -33,8 +34,10 @@ kin-model = { workspace = true }
 kin-core = { workspace = true }
 kin-daemon-spawn = { workspace = true }
 kin-db = { workspace = true }
+# The resource plan only. The engine arrives through `kin-db/embeddings`.
 kin-infer = { workspace = true }
 kin-blobs = { workspace = true }
+kin-io = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
 kin-parser = { workspace = true }
@@ -52,6 +55,8 @@ kin-review = { workspace = true }
 kin-remote = { workspace = true, features = ["http"] }
 axum = { workspace = true }
 http-body = "1"
+futures-util = "0.3"
+rayon = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -91,18 +96,17 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
-# macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
-# Additive via feature unification; absent on Linux so the Linux build stays green.
-[target.'cfg(target_os = "macos")'.dependencies]
-kin-db = { workspace = true, features = ["metal", "accelerate"] }
-kin-infer = { workspace = true, features = ["metal"] }
-
 [dev-dependencies]
 kin-mcp = { workspace = true, features = ["test-support"] }
+# A shorter termination grace, so the language-server group tests prove the
+# escalation to SIGKILL without waiting out the production two seconds.
+kin-lsp = { workspace = true, features = ["test-support"] }
 async-trait = "0.1"
-futures-util = "0.3"
 kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }
+# A watcher backend that delivers nothing, so the loop's behaviour when the host
+# drops every filesystem event is graded deterministically.
+kin-index = { workspace = true, features = ["test-support"] }
 kin-migrate = { workspace = true }
 # The durable spine fake, so the composed rollout path can be driven against the
 # real FirestoreSpineBackend over a fake transport rather than a second
@@ -111,6 +115,7 @@ kin-spine = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+toml = { workspace = true }
 # `full` does not carry `test-util`, so paused time for a deadline test needs it
 # named here: a sibling's dev dependency unifies it only into that sibling's
 # own test build.

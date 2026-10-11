@@ -1,0 +1,281 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/admission.rs",
+    "src/call_site_escape.rs",
+    "src/call_site_escape/outside_imports.rs",
+    "src/engine/graph.rs",
+    "src/engine/index.rs",
+    "src/engine/mod.rs",
+    "src/error.rs",
+    "src/lib.rs",
+    "src/storage/format.rs",
+    "src/storage/history_replay.rs",
+    "src/storage/mod.rs",
+    "src/storage/repository.rs",
+    "src/store.rs",
+    "src/types.rs",
+]
+
+[[excluded]]
+reason = "tests: each file is compiled only inside a #[cfg(test)] module (mod tests, #[path] or include!)"
+files = [
+    "src/call_site_escape/tests.rs",
+    "src/session_publication_observer_test.rs",
+    "src/storage/binding_history_tests.rs",
+    "src/storage/call_site_ledgers_format_tests.rs",
+    "src/storage/context_validations_format_tests.rs",
+    "src/storage/derivation_ledger_tests.rs",
+    "src/storage/enrichment_marks_format_tests.rs",
+    "src/storage/repository/session_publication_tests.rs",
+    "src/storage/repository/test_git_snapshot_proof_integration.rs",
+    "src/storage/resolution_records_format_tests.rs",
+    "src/storage/snapshot_kvec_root_stamp_test.rs",
+]
+
+[[excluded]]
+reason = "test support: lib.rs compiles it only under cfg(test) or the test-support feature"
+files = [
+    "src/session_publication_test_support.rs",
+]
+
+[[excluded]]
+reason = "not compiled: engine/mod.rs declares no matching module, so nothing reaches this file"
+files = [
+    "src/engine/matching.rs",
+]
+
+[[excluded]]
+reason = "graph reads that write nothing: traversals (impact, neighborhoods, dead code) no derivation path calls, enrichment and source-derivation status facts that kin-daemon, kin-mcp and kin-review read, and a tree diff (compute_diff) with no caller"
+files = [
+    "src/engine/graph/enrichment_status.rs",
+    "src/engine/graph/source_derivation.rs",
+    "src/engine/incremental.rs",
+    "src/engine/traverse.rs",
+]
+
+[[excluded]]
+reason = "embeddings and vectors: model loading, inference, caching, producer provenance and the HNSW index, separate products; nothing here writes an entity or relation"
+files = [
+    "src/embed/cache_admin.rs",
+    "src/embed/external.rs",
+    "src/embed/inference.rs",
+    "src/embed/mod.rs",
+    "src/embed/model_identity.rs",
+    "src/embed/producer.rs",
+    "src/embed/rerank.rs",
+    "src/embed/serving.rs",
+    "src/vector/hnsw.rs",
+    "src/vector/mod.rs",
+]
+
+[[excluded]]
+reason = "text index, retrieval and ranking: the kin-search text index, unified retrieval candidates and the CLI read index only read and rank what is stored"
+files = [
+    "src/retrieval.rs",
+    "src/search/mod.rs",
+    "src/search/text.rs",
+    "src/storage/index.rs",
+]
+
+[[excluded]]
+reason = "storage IO and layout: backends, snapshot load and save, the disk-backed change map and its MessagePack body walk, delta journals and snapshot-to-snapshot deltas, memory maps, the SQLite backend and an unused tiered store; they hold and move stored bytes and derive nothing"
+files = [
+    "src/storage/backend.rs",
+    "src/storage/body_walk.rs",
+    "src/storage/change_map.rs",
+    "src/storage/delta.rs",
+    "src/storage/local_journal.rs",
+    "src/storage/mmap.rs",
+    "src/storage/snapshot.rs",
+    "src/storage/sql.rs",
+    "src/storage/tiered.rs",
+]
+
+[[excluded]]
+reason = "repository authority and durability: durable publication and authority frames, crash-safe session publication, integrity and root hashes, change-id validation, the owed-derivation ledger, binding-history qualification and native Git snapshot proofs; they accept, refuse, prove or persist a graph and never change an entity or relation"
+files = [
+    "src/storage/authority.rs",
+    "src/storage/authority_frame.rs",
+    "src/storage/backend/session_publication.rs",
+    "src/storage/binding_history.rs",
+    "src/storage/canonical_hash.rs",
+    "src/storage/change_validation.rs",
+    "src/storage/derivation_ledger.rs",
+    "src/storage/merkle.rs",
+    "src/storage/repository/git_snapshot_proof.rs",
+    "src/storage/repository/session_publication.rs",
+    "src/storage/session_publication.rs",
+]
+
+[[excluded]]
+reason = "remote and hosted storage: the GCS backend and its envelope compatibility record"
+files = [
+    "src/storage/gcs.rs",
+    "src/storage/gcs_compatibility.rs",
+]
+
+
+[[excluded_items]]
+file = "src/call_site_escape.rs"
+reason = "the escape census an answer computes from stored records to say whether a value may leave its module; the linker uses only ImportRoots, and nothing at ingest calls these"
+items = [
+    "fn census_one",
+    "fn could_read_focal",
+    "fn focal_escape_evidence",
+    "fn focal_escape_evidence_batch",
+    "fn focal_escape_evidence_batch_scoped",
+    "fn focal_escape_evidence_in",
+    "fn instance_receiver_class",
+    "fn mention_reading",
+    "fn non_callable_binding",
+    "fn read_domain",
+    "fn site_reaches",
+    "fn test_owned_occurrence",
+    "fn use_kind_wire",
+    "impl ClassTable / fn derived_from",
+    "impl ClassTable / fn inherits",
+    "impl ClassTable / fn may_hold_member_of",
+    "impl ClassTable / fn may_share_a_member",
+    "impl ClassTable / fn shares_no_instance",
+    "impl ClassTable / fn value_classes",
+    "impl ClassTable / fn with_bases",
+    "impl EscapeCensusGraph for StoreCensus<'_,G> / fn import_evidence_into",
+    "impl EscapeCensusGraph for StoreCensus<'_,G> / fn uses_into",
+    "impl FocalFacts<'_> / fn declared_here",
+    "impl FocalFacts<'_> / fn imported_by",
+    "impl FocalFacts<'_> / fn proven_aliases",
+    "impl ProvenOutside<'a> / fn import_binds_another",
+    "impl ProvenOutside<'a> / fn typed_class",
+    "trait EscapeCensusGraph / fn import_evidence_into",
+    "trait EscapeCensusGraph / fn imports_written_in",
+    "trait EscapeCensusGraph / fn typed_member_reads",
+    "trait EscapeCensusGraph / fn uses_into",
+]
+
+[[excluded_items]]
+file = "src/call_site_escape/outside_imports.rs"
+reason = "the escape census an answer computes from stored records to say whether a value may leave its module; the linker uses only ImportRoots, and nothing at ingest calls these"
+items = [
+    "fn outside_receiver",
+]
+
+[[excluded_items]]
+file = "src/engine/graph.rs"
+reason = "reads, searches and maintains what is stored (the text index, vectors and embeddings, recall, counts, impact and neighbourhood queries, entity history pages and warnings); answering calls them, deriving never does"
+items = [
+    "fn anchor_staleness",
+    "fn coverage_percent",
+    "fn recall_basis_rank",
+    "fn recall_staleness_rank",
+    "fn set_embedding_coverage_before_count_hook",
+    "fn set_save_vector_index_after_detach_hook",
+    "impl ChangeStore for InMemoryGraph / fn get_entity_history_page",
+    "impl EntityStore for InMemoryGraph / fn expand_neighborhood",
+    "impl EntityStore for InMemoryGraph / fn find_dead_code",
+    "impl EntityStore for InMemoryGraph / fn get_dependency_neighborhood",
+    "impl EntityStore for InMemoryGraph / fn get_downstream_impact",
+    "impl EntityStore for InMemoryGraph / fn text_search",
+    "impl InMemoryGraph / fn artifact_count",
+    "impl InMemoryGraph / fn create_downstream_warning",
+    "impl InMemoryGraph / fn downstream_warnings_for_entity",
+    "impl InMemoryGraph / fn embed_stage_timings_snapshot",
+    "impl InMemoryGraph / fn embedding_coverage_counts",
+    "impl InMemoryGraph / fn embedding_status",
+    "impl InMemoryGraph / fn entity_count",
+    "impl InMemoryGraph / fn flush_text_index",
+    "impl InMemoryGraph / fn graph_stats",
+    "impl InMemoryGraph / fn hard_collisions_for_entity",
+    "impl InMemoryGraph / fn install_vector_index",
+    "impl InMemoryGraph / fn invalidate_persisted_text_index",
+    "impl InMemoryGraph / fn load_vector_index",
+    "impl InMemoryGraph / fn load_vector_index_compatible",
+    "impl InMemoryGraph / fn load_vector_index_compatible_with_producers",
+    "impl InMemoryGraph / fn loaded_embedding_runtime",
+    "impl InMemoryGraph / fn locks_for_entity",
+    "impl InMemoryGraph / fn persist_embedded_batch",
+    "impl InMemoryGraph / fn persist_text_index_with_root_hash",
+    "impl InMemoryGraph / fn queue_for_embedding",
+    "impl InMemoryGraph / fn queue_keys_for_embedding",
+    "impl InMemoryGraph / fn recall_for_entity",
+    "impl InMemoryGraph / fn recall_for_entity_with",
+    "impl InMemoryGraph / fn reconcile_salvaged_vector_index",
+    "impl InMemoryGraph / fn relation_count",
+    "impl InMemoryGraph / fn reset_vector_sidecar_flush_throttle",
+    "impl InMemoryGraph / fn resolution_record_count",
+    "impl InMemoryGraph / fn save_vector_index",
+    "impl InMemoryGraph / fn save_vector_index_with_provenance",
+    "impl InMemoryGraph / fn save_vector_index_with_provenance_as",
+    "impl InMemoryGraph / fn search_loaded_vector_index_for_test",
+    "impl InMemoryGraph / fn semantic_search_batch_filtered",
+    "impl InMemoryGraph / fn semantic_workspace_matches",
+    "impl InMemoryGraph / fn share_embedder_from",
+    "impl InMemoryGraph / fn should_flush_vector_sidecar_now",
+    "impl InMemoryGraph / fn stamp_vector_index_descriptor",
+    "impl InMemoryGraph / fn stranded_relation_count",
+    "impl InMemoryGraph / fn text_doc_frequency",
+    "impl InMemoryGraph / fn text_document_count",
+    "impl InMemoryGraph / fn text_index_unavailable",
+    "impl InMemoryGraph / fn text_search",
+    "impl InMemoryGraph / fn vector_actual_producers",
+    "impl InMemoryGraph / fn vector_index_descriptor",
+    "impl InMemoryGraph / fn vector_index_stats",
+    "impl InMemoryGraph / fn vector_sidecar_flush_due",
+    "impl InMemoryGraph / fn with_text_index",
+    "impl InMemoryGraph / fn with_text_index_read_only",
+    "impl VerificationStore for InMemoryGraph / fn get_mock_hints_for_test",
+    "impl VerificationStore for InMemoryGraph / fn list_runs_for_test",
+]
+
+
+[dependencies]
+kin-model = { decides = ["graph"] }
+kin-infer = { reason = "embedding inference engine, used only by embed/, a separate product" }
+kin-vector = { reason = "vector index, used only by vector/, a separate product" }
+kin-search = { reason = "text index and its tokenizer, a separate product; engine/index.rs tokenizes names only for name-pattern lookups, which no derivation path issues (derivation queries by file and kind)" }
+kin-blobs = { reason = "durable fsync helper for storage writes (kin_blobs::durable::sync_all); no derived value" }
+serde = { reason = "serialization derive with a fixed data model; a release changes no derived value" }
+serde_json = { reason = "JSON, a fixed specification; value-escape records are read as values" }
+thiserror = { reason = "error type derive; no derived value" }
+parking_lot = { reason = "locks; no derived value" }
+hashbrown = { reason = "hash containers with a per-process seeded hasher; derived output is sorted, so it cannot rest on a release's iteration order" }
+rustc-hash = { reason = "FxHash containers used only by retrieval.rs, which is excluded" }
+uuid = { reason = "UUIDs per RFC 9562; name-based ids are fully specified" }
+chrono = { reason = "date and time types with fixed formats; a release changes no derived value" }
+hex = { reason = "hex encoding, a fixed specification" }
+libc = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+bincode = { reason = "encoding of the CLI read index (storage/index.rs), which is excluded" }
+rmp = { reason = "MessagePack, a fixed specification, for persisted snapshots" }
+rmp-serde = { reason = "MessagePack, a fixed specification, for persisted snapshots" }
+sha2 = { reason = "SHA-256, a fixed specification" }
+gix-ignore = { decides = ["graph"] }
+bstr = { reason = "byte-string views admission hands to gix-ignore; it wraps the bytes without changing them" }
+memmap2 = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+fs2 = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+object_store = { reason = "GCS backend for hosted storage (storage/gcs.rs), excluded" }
+tokio = { reason = "GCS backend for hosted storage (storage/gcs.rs), excluded" }
+bytes = { reason = "GCS backend for hosted storage (storage/gcs.rs), excluded" }
+rusqlite = { reason = "SQLite storage backend (storage/sql.rs), excluded" }
+ndarray = { reason = "embeddings product (embed/), excluded; no entity or relation" }
+safetensors = { reason = "embeddings product (embed/), excluded; no entity or relation" }
+tokenizers = { reason = "embeddings product (embed/), excluded; no entity or relation" }
+hf-hub = { reason = "embeddings product (embed/), excluded; no entity or relation" }
+directories = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+cap-std = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+cap-fs-ext = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+half = { reason = "declared but not used by this crate's source; no derived value" }
+rkyv = { reason = "optional archive feature not used by this crate's source; no derived value" }
+rayon = { reason = "parallel iteration; derived results are collected in order or sorted, so scheduling never reaches output" }
+sysinfo = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+tempfile = { reason = "OS and file IO for storage, locking and memory budgeting; no derived value" }
+tracing = { reason = "logging and spans; no derived value" }
+reqwest = { reason = "HTTP client for external embedding providers (embed/external.rs), excluded" }
+windows-sys = { reason = "Windows file IO for storage; no derived value" }

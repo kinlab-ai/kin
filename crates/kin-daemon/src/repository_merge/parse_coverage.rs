@@ -51,7 +51,9 @@ pub(super) fn compose_relations(
         },
         MergeSideValue::relation,
         |_| None,
-        |left, right| left == right,
+        // A span moved by a neighbour's edit is the same edge. Call shape,
+        // origin and the other evidence fields still conflict.
+        kin_core::workspace_semantics::relation_sides_agree,
         conflicts,
     )?;
     let mut deferred = BTreeMap::new();
@@ -137,6 +139,8 @@ pub(super) fn rederive(
         }
     }
     let pipeline = kin_index::IndexPipeline::new();
+    // The merged tree's own manifests name its units.
+    let manifests = crate::source_cas::tree_manifests(tree, &state.blobs, Some(&authority.manager));
     for (id, artifact) in deferred {
         let Some(source) = tree.get(artifact) else {
             continue;
@@ -161,10 +165,11 @@ pub(super) fn rederive(
         let body = super::read_publishable_source(&state.blobs, &authority.manager, hash)
             .with_context(|| format!("read merged source for parser coverage: {path}"))?;
         let indexed = pipeline
-            .index_any_content(
+            .index_any_content_in(
                 &kin_model::FilePathId::new(path),
                 body.body(),
                 kin_blobs::Hash256::from_bytes(*hash.as_bytes()),
+                &manifests,
             )
             .with_context(|| format!("derive merged parser coverage: {path}"))?;
         let kin_index::IndexedAny::EntitySource(indexed) = indexed else {

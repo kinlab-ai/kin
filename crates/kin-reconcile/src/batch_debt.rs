@@ -31,6 +31,7 @@ fn is_current_reobservation(
     observed: &kin_index::binding_debt::LocalBindingObligation,
     current: &kin_index::IndexedFile,
     blobs: &kin_blobs::BlobStore,
+    project: &dyn kin_parser::project_manifest::ProjectFiles,
 ) -> Result<bool> {
     if observed.source_digest != kin_model::Hash256::from_bytes(current.blob_hash.0)
         || original
@@ -51,7 +52,7 @@ fn is_current_reobservation(
         return Err(invalid("original duplicate source digest mismatch"));
     }
     let prior = kin_index::IndexPipeline::new()
-        .index_file_content_with_tests(&current.file_id, &bytes, digest)?
+        .index_file_content_in(&current.file_id, &bytes, digest, project)?
         .indexed_file;
     if !matches!(prior.parse_state, kin_model::ParseState::Valid)
         || !matches!(current.parse_state, kin_model::ParseState::Valid)
@@ -381,6 +382,7 @@ pub(crate) fn retain_removed_bindings(
             "withdrawn binding has no exact immutable predecessor",
         ));
     }
+    let project = kin_index::GraphProjectFiles::new(current, blobs);
     for (artifact, mut debt) in additions {
         let indexed = crate::admitted_source::load(current, blobs, &debt.source_file)?
             .ok_or_else(|| invalid("current source is incomplete"))?;
@@ -399,7 +401,13 @@ pub(crate) fn retain_removed_bindings(
                         .find(|new| new.retired_relation.id == obligation.retired_relation.id)
                     {
                         if added != &obligation
-                            && !is_current_reobservation(added, &obligation, &indexed, blobs)?
+                            && !is_current_reobservation(
+                                added,
+                                &obligation,
+                                &indexed,
+                                blobs,
+                                &project,
+                            )?
                         {
                             return Err(invalid("prior binding identity collision"));
                         }
@@ -465,6 +473,7 @@ mod tests {
         binding_debt::LocalBindingObligation, FileParseData, IndexPipeline, IndexedFile,
     };
     use kin_model::{ArtifactId, EntityKind, Hash256, RelationKind};
+    use kin_parser::project_manifest::NoProjectFiles;
 
     const OLD: &str = "from local import beta\n\ndef run(value):\n    return beta(value)\n";
     const CURRENT: &str = "from local import beta\n\ndef run(value):\n    return beta(value) + 1\n";
@@ -553,7 +562,8 @@ mod tests {
         ] {
             let (old, observed, current) = fixture(&blobs, body);
             assert_eq!(
-                is_current_reobservation(&old, &observed, &current, &blobs).unwrap(),
+                is_current_reobservation(&old, &observed, &current, &blobs, &NoProjectFiles)
+                    .unwrap(),
                 accepted,
                 "{body}"
             );
@@ -599,7 +609,8 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                !is_current_reobservation(&old, &observed, &current, &blobs).unwrap(),
+                !is_current_reobservation(&old, &observed, &current, &blobs, &NoProjectFiles)
+                    .unwrap(),
                 "{control}"
             );
         }
@@ -665,7 +676,8 @@ mod tests {
             // source/certificate validation, not the early equality guard.
             observed.retired_relation = old.retired_relation.clone();
             assert_eq!(
-                is_current_reobservation(&old, &observed, &current, &blobs).unwrap(),
+                is_current_reobservation(&old, &observed, &current, &blobs, &NoProjectFiles)
+                    .unwrap(),
                 accepted,
                 "{control}"
             );
@@ -682,10 +694,14 @@ mod tests {
                 *old.source_digest.as_bytes(),
             ))
             .unwrap();
-        assert!(is_current_reobservation(&old, &observed, &current, &blobs).is_err());
+        assert!(
+            is_current_reobservation(&old, &observed, &current, &blobs, &NoProjectFiles).is_err()
+        );
         let (mut old, observed, current) = fixture(&blobs, CURRENT);
         let other = blobs.write(b"def run(value):\n    return value\n").unwrap();
         old.source_digest = Hash256::from_bytes(other.0);
-        assert!(!is_current_reobservation(&old, &observed, &current, &blobs).unwrap());
+        assert!(
+            !is_current_reobservation(&old, &observed, &current, &blobs, &NoProjectFiles).unwrap()
+        );
     }
 }

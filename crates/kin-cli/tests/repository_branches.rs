@@ -10,7 +10,7 @@ use serde_json::Value;
 #[cfg(target_os = "macos")]
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -73,7 +73,56 @@ fn initialize_kin_repo(
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
-    kin_core::KinLayout::discover(repo).expect("discover exact layout")
+    runtime.layout_for(repo)
+}
+
+/// The base fixture: one commit on `main`.
+fn base_repository(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    initialize_git_repo(&repo);
+    repo
+}
+
+/// The base fixture with the polyglot `feature` branch beside `main`.
+#[cfg(unix)]
+fn feature_repository(root: &Path) -> PathBuf {
+    let repo = base_repository(root);
+    add_feature_branch(&repo);
+    repo
+}
+
+/// This test's own copy of `fixture`, converted by [`initialize_kin_repo`]
+/// once per test binary rather than once per test.
+///
+/// No test here is about the conversion. `kin init` stops the daemon it
+/// started, so a test's first command starts a daemon over the copy exactly as
+/// it would have over a store it had just converted itself. `name` must be the
+/// fixture's own name, because the template is keyed by it. Declare the result
+/// before the test's runtime, so the runtime stops its daemons before the copy
+/// is removed.
+fn prepare(name: &str, fixture: fn(&Path) -> PathBuf) -> common::PreparedRepository {
+    common::prepared_repository(&format!("{name}-init"), |root| {
+        let repo = fixture(root);
+        let runtime = common::IsolatedDaemonRuntime::new(&repo);
+        // The template is copied as one self-contained repository. Fresh
+        // conversions below still exercise the default central layout.
+        let init = runtime
+            .kin_command()
+            .args(["init", ".", "--json"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+            .env("KIN_STORE_LAYOUT", "in-tree")
+            .current_dir(&repo)
+            .output()
+            .expect("initialize copied fixture");
+        assert!(
+            init.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+        repo
+    })
 }
 
 /// Give a repository a Kin-native author, for fixtures that then hide `.git`.
@@ -332,6 +381,7 @@ fn add_exact_refs(layout: &kin_core::KinLayout) {
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     // As the daemon commits a ref write: through the local binding-history
     // verifier, which carries the store's checked lineage across a ref-only
@@ -376,16 +426,16 @@ fn exact_ref_create_transaction(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     }
 }
 
 #[test]
 fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
+    let prepared = prepare("base", base_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     add_exact_refs(&layout);
 
     let before = run_kin(&runtime, &repo, &["branch", "list", "--json"]);
@@ -450,11 +500,10 @@ fn branch_list_preserves_byte_refs_and_ignores_checkout_git_state() {
 
 #[test]
 fn branch_create_and_delete_commit_exact_ref_cas() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
+    let prepared = prepare("base", base_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     let create = run_kin(&runtime, &repo, &["branch", "create", "feature"]);
     assert!(
@@ -550,11 +599,10 @@ const SERVED_DAEMON_POLL: Duration = Duration::from_millis(50);
 
 #[test]
 fn a_daemon_that_served_a_branch_command_keeps_answering_its_recorded_endpoint() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
+    let prepared = prepare("base", base_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
 
     let command = runtime.kin_command();
     for key in [
@@ -605,11 +653,9 @@ fn a_daemon_that_served_a_branch_command_keeps_answering_its_recorded_endpoint()
 
 #[test]
 fn stale_branch_transaction_cannot_overwrite_new_repository_roots() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let prepared = prepare("base", base_repository);
+    let repo = prepared.repo().to_path_buf();
+    let layout = kin_core::KinLayout::discover(&repo).expect("copied in-tree store");
     let (repository_id, manager) = open_authority(&layout);
     let lease = manager.read_authority();
     let roots = lease.roots().clone();
@@ -662,11 +708,10 @@ fn stale_branch_transaction_cannot_overwrite_new_repository_roots() {
 
 #[test]
 fn branch_delete_rejects_default_and_checked_out_ref_without_mutation() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
+    let prepared = prepare("base", base_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (_, manager) = open_authority(&layout);
     let before = manager.read_authority().roots().clone();
 
@@ -682,11 +727,10 @@ fn branch_delete_rejects_default_and_checked_out_ref_without_mutation() {
 
 #[test]
 fn branch_mutations_accept_canonical_hex_for_non_utf8_refs() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
+    let prepared = prepare("base", base_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let raw = RefName::from_bytes([
         b'r', b'e', b'f', b's', b'/', b'h', b'e', b'a', b'd', b's', b'/', b'r', b'a', b'w', b'-',
         0xff,
@@ -803,12 +847,10 @@ fn branch_create_uses_detached_workspace_target_without_git_fallback() {
 fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_cas() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (repository_id, manager) = open_authority(&layout);
     let lease = manager.read_authority();
     let roots = lease.roots().clone();
@@ -845,7 +887,7 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
     // that the watcher may correctly admit while this checks a clean switch.
     fs::rename(
         repo.join(".git"),
-        root.path().join("git-authority-disabled"),
+        prepared.root().join("git-authority-disabled"),
     )
     .expect("hide Git outside the watched working copy");
 
@@ -949,15 +991,13 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
 #[cfg(unix)]
 #[test]
 fn branch_switch_admits_and_carries_an_unadmitted_edit_the_branches_agree_about() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     // Bound to `_` rather than dropped: the call converts the repository, and
     // this test no longer reads the layout because the authority assertions it
     // used to make moved to the refusal test named in the comment above.
-    let _layout = initialize_kin_repo(&runtime, &repo);
+    let _layout = runtime.layout_for(&repo);
     // Written straight to the working copy and never admitted, which is the
     // whole point: no `admit_uncommitted_workspace_edit` here, unlike the test
     // below that is otherwise the same scenario.
@@ -991,12 +1031,10 @@ fn branch_switch_admits_and_carries_an_unadmitted_edit_the_branches_agree_about(
 #[cfg(unix)]
 #[test]
 fn branch_switch_carries_an_admitted_edit_to_a_member_both_branches_hold_identically() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (repository_id, manager) = open_authority(&layout);
     admit_uncommitted_workspace_edit(
         &repository_id,
@@ -1050,12 +1088,10 @@ fn branch_switch_carries_an_admitted_edit_to_a_member_both_branches_hold_identic
 #[cfg(unix)]
 #[test]
 fn branch_switch_refuses_an_admitted_edit_to_a_member_the_branches_disagree_about() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (repository_id, manager) = open_authority(&layout);
     admit_uncommitted_workspace_edit(
         &repository_id,
@@ -1071,11 +1107,11 @@ fn branch_switch_refuses_an_admitted_edit_to_a_member_the_branches_disagree_abou
     let stderr = String::from_utf8_lossy(&switched.stderr);
     assert!(
         stderr.contains("compose.yaml"),
-        "the refusal must name the exact blocked path, got {stderr}"
+        "the refusal must name the blocked member, got {stderr}"
     );
     assert!(
         stderr.contains("holds this member differently"),
-        "the refusal must say which side the path would have cost, got {stderr}"
+        "the refusal must say which side the member would have cost, got {stderr}"
     );
     assert!(
         stderr.contains("Commit these") && stderr.contains("kin stash push"),
@@ -1101,12 +1137,10 @@ fn branch_switch_refuses_an_admitted_edit_to_a_member_the_branches_disagree_abou
 #[cfg(unix)]
 #[test]
 fn branch_switch_carries_an_admitted_addition_the_destination_does_not_track() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (repository_id, manager) = open_authority(&layout);
     let admitted = admit_uncommitted_workspace_addition(
         &repository_id,
@@ -1164,12 +1198,10 @@ fn branch_switch_carries_an_admitted_addition_the_destination_does_not_track() {
 #[cfg(unix)]
 #[test]
 fn branch_switch_refuses_an_admitted_addition_the_destination_tracks_differently() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (repository_id, manager) = open_authority(&layout);
     admit_uncommitted_workspace_addition(
         &repository_id,
@@ -1185,7 +1217,7 @@ fn branch_switch_refuses_an_admitted_addition_the_destination_tracks_differently
     let stderr = String::from_utf8_lossy(&switched.stderr);
     assert!(
         stderr.contains("Dockerfile"),
-        "the refusal must name the exact blocked path, got {stderr}"
+        "the refusal must name the blocked member, got {stderr}"
     );
     assert!(
         stderr.contains("would overwrite"),
@@ -1215,12 +1247,10 @@ fn branch_switch_refuses_an_admitted_addition_the_destination_tracks_differently
 #[cfg(unix)]
 #[test]
 fn branch_switch_round_trip_leaves_the_carried_workspace_byte_identical() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let (repository_id, manager) = open_authority(&layout);
     admit_uncommitted_workspace_addition(
         &repository_id,
@@ -1433,6 +1463,7 @@ fn publish_uncommitted_workspace_deltas(
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         })
         .expect("commit admitted workspace change");
 
@@ -1715,12 +1746,10 @@ fn lineage_reading(layout: &kin_core::KinLayout) -> (bool, u64, usize) {
 #[cfg(unix)]
 #[test]
 fn branch_create_delete_and_switch_leave_a_daemon_start_nothing_to_requalify() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
-    initialize_git_repo(&repo);
-    add_feature_branch(&repo);
+    let prepared = prepare("feature", feature_repository);
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    let layout = runtime.layout_for(&repo);
     let stop = |what: &str| {
         let stopped = run_kin(&runtime, &repo, &["daemon", "stop"]);
         assert!(

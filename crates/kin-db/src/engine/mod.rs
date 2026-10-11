@@ -12,7 +12,8 @@ pub use graph::{
     EmbeddingStatus, EnrichmentContextStatus, EnrichmentStatusError, EnrichmentStatusFacts,
     FileEnrichmentStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
     ProducedSemanticSearchBatch, ResolvedRetrievalItem, SourceDerivationFacts,
-    SourceDerivationLimit, SourceDerivationLimits, SourceDerivationUnavailable,
-    SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact, SourceReservedRelation,
+    SourceDerivationItem, SourceDerivationLimit, SourceDerivationLimits,
+    SourceDerivationUnavailable, SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact,
+    SourceReservedRelation,
 };
 pub use incremental::{compute_diff, IncrementalDiff};

@@ -72,6 +72,14 @@ fn known_entity_names(diff: &SemanticDiff, impact: &ImpactReport) -> BTreeMap<En
         .chain(impact.affected_dependents.iter())
         .chain(impact.affected_contract_consumers.iter())
         .chain(impact.affected_tests.iter())
+        .chain(impact.affected_overrides.iter())
+        .chain(
+            impact
+                .affected_override_callers
+                .iter()
+                .chain(&impact.override_caller_candidates)
+                .map(|row| &row.entity),
+        )
     {
         names
             .entry(entity.id)
@@ -211,8 +219,9 @@ fn change_findings(diff: &SemanticDiff, impact: &ImpactReport) -> Vec<ChangeFind
         let mut notes = Vec::new();
         match &change.kind {
             EntityChangeKind::Modified { old, new } => {
-                // Signature changed?
-                if old.signature != new.signature {
+                // Signature changed? Text that differs only by a comment or
+                // layout inside the declaration is the same signature.
+                if crate::contract::signature_changed(old, new) {
                     let entity = per_entity(impact, &change.entity_id);
                     // External consumers only: a signature change its own tests
                     // cover is not a break somebody else has to absorb.
@@ -238,6 +247,7 @@ fn change_findings(diff: &SemanticDiff, impact: &ImpactReport) -> Vec<ChangeFind
                     new.kind,
                     EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
                 ) && contract_consumers > 0
+                    && !crate::contract::ContractChange::of(old, new).consumers_unaffected()
                 {
                     contract_violations.push(format!(
                         "Contract `{}` ({:?}) modified with {} consumer(s)",

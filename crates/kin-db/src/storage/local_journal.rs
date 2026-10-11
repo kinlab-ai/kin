@@ -64,7 +64,7 @@ pub(crate) fn sync_parent_directory(path: &Path) -> Result<(), KinDbError> {
                 parent.display()
             ))
         })?;
-        directory.sync_all().map_err(|error| {
+        kin_blobs::durable::sync_all(&directory).map_err(|error| {
             KinDbError::StorageError(format!(
                 "failed to fsync journal directory {}: {error}",
                 parent.display()

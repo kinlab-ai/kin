@@ -5,11 +5,79 @@ fn mcp_lifecycle_fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
     install_test_registry_override();
     let dir = tempfile::tempdir().unwrap();
     let layout = kin_core::init(dir.path()).unwrap().layout;
+    mcp_lifecycle_open(dir, layout)
+}
+
+fn mcp_lifecycle_open(
+    dir: tempfile::TempDir,
+    layout: kin_core::KinLayout,
+) -> (tempfile::TempDir, Arc<DaemonState>) {
     let state = Arc::new(DaemonState::open(layout).unwrap());
     state
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
     (dir, state)
+}
+
+/// A seeded lifecycle store, built once per test binary and run and handed out
+/// as fresh copies.
+///
+/// Many tests, and the cases of fault matrices, ran the same seeding: an init
+/// and one or more conversion commits. A template keeps what that seeding left
+/// on disk, built by the first test process to ask for it (see
+/// [`crate::test_fixture_cache`]), and every caller gets its own copy at its
+/// own path, opened afresh with `DaemonState::open`, so opening still runs for
+/// real and no caller can see another's writes. A copy is the same store at a
+/// new path: an in-tree `.kin` serves its parent directory, and nothing in it
+/// names the working tree's path. Sealing refuses an external store, whose
+/// record does.
+///
+/// Every copy of one template is the same repository, so a test that needs two
+/// distinct repositories builds the second one from the seeding itself.
+struct SeededStore {
+    template: crate::test_fixture_cache::Template,
+}
+
+/// The template member that holds the seeded working tree and its `.kin`.
+const SEEDED_STORE_MEMBER: &str = "repository";
+
+impl SeededStore {
+    /// The template `name`, seeded by `seed` when no test process in this run
+    /// has seeded it yet. `seed` returns a store in its own temporary
+    /// directory; its state's last handle is dropped before the store is kept.
+    async fn cached<F, Fut>(name: &str, seed: F) -> Self
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = (tempfile::TempDir, Arc<DaemonState>)>,
+    {
+        let template = crate::test_fixture_cache::template_async(name, |staging| async move {
+            let (dir, state) = seed().await;
+            Self::seal(dir, state, &staging.join(SEEDED_STORE_MEMBER));
+        })
+        .await;
+        Self { template }
+    }
+
+    /// Move the store `state` serves in `dir` to `destination`. Takes the last
+    /// handle on `state` and drops it first, so nothing is still writing into
+    /// the store when it moves.
+    fn seal(dir: tempfile::TempDir, state: Arc<DaemonState>, destination: &std::path::Path) {
+        crate::test_fixture_cache::assert_in_tree_store(dir.path(), &state.layout);
+        let state = Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("a template's state must have no other handles"));
+        drop(state);
+        crate::test_fixture_cache::assert_names_no_path(dir.path(), dir.path());
+        std::fs::rename(dir.keep(), destination).unwrap();
+    }
+
+    /// A fresh copy of the seeded store, opened as the lifecycle fixture
+    /// opens one, through the canonical path `kin_core::init` would record.
+    fn open_copy(&self) -> (tempfile::TempDir, Arc<DaemonState>) {
+        install_test_registry_override();
+        let dir = self.template.copy_member_to_tempdir(SEEDED_STORE_MEMBER);
+        let layout = crate::test_fixture_cache::copied_layout(dir.path());
+        mcp_lifecycle_open(dir, layout)
+    }
 }
 
 fn mcp_lifecycle_operation(name: &str) -> serde_json::Value {
@@ -87,6 +155,18 @@ async fn mcp_staging_ack_refuses_failed_persistence_and_preserves_acknowledged_w
 #[tokio::test]
 async fn mcp_staging_ack_install_and_journal_failures_preserve_each_lifecycle_state() {
     use crate::state::McpTransactionWritePhase;
+    // The matrix tests lifecycle persistence, not repository initialization.
+    // Prepare one real, empty store, close every authority handle, and copy
+    // its regular files into an independent namespace for each fault case.
+    // Each copy still takes the production open and every retry/restart below.
+    #[cfg(unix)]
+    let (_baseline_dir, baseline_layout) = {
+        let (dir, state) = mcp_lifecycle_fixture();
+        assert!(state.mcp_transactions.lock().unwrap().is_empty());
+        let layout = state.layout.clone();
+        drop(state);
+        (dir, layout)
+    };
     for tool in [
         "kin_transaction_begin",
         "kin_transaction_stage",
@@ -104,6 +184,27 @@ async fn mcp_staging_ack_install_and_journal_failures_preserve_each_lifecycle_st
             McpTransactionWritePhase::JournalRemove,
             McpTransactionWritePhase::AcknowledgementDirectorySync,
         ] {
+            #[cfg(unix)]
+            let (_dir, state) = {
+                let dir = tempfile::tempdir().unwrap();
+                let destination_store = kin_core::layout::reserve_store_root(dir.path()).unwrap();
+                copy_test_directory(baseline_layout.root(), &destination_store);
+                // An external copy must serve this case's independent working
+                // tree, not retain the baseline's working-tree record.
+                kin_core::layout::stage_store_placement(
+                    &destination_store,
+                    &destination_store,
+                    dir.path(),
+                )
+                .unwrap();
+                let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+                let state = Arc::new(DaemonState::open(layout).unwrap());
+                state
+                    .is_initialized
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                (dir, state)
+            };
+            #[cfg(not(unix))]
             let (_dir, state) = mcp_lifecycle_fixture();
             let session_id = mcp_test_session(&state);
             let tx_id = mcp_lifecycle_begin(&state, &session_id).await;
@@ -243,22 +344,28 @@ async fn mcp_staging_ack_recovery_failures_retain_retryable_evidence() {
             .unwrap()
             .staged_operations
             .push(serde_json::from_value(mcp_lifecycle_operation("first")).unwrap());
-        let failure = crate::state::write_mcp_transaction_lifecycle(&state.layout, &next, |phase| {
-            if matches!(phase, McpTransactionWritePhase::DirectorySync)
-                || phase as u8 == failed_recovery_phase as u8
-            {
-                Err(std::io::Error::other(format!("injected {phase:?}")))
-            } else {
-                Ok(())
-            }
-        })
-        .unwrap_err();
-        assert!(failure.to_string().contains("transaction_recovery_required"));
-        assert!(state
-            .layout
-            .root()
-            .join("mcp_transactions.lifecycle.json")
-            .exists(), "{failed_recovery_phase:?}: recovery must remain discoverable");
+        let failure =
+            crate::state::write_mcp_transaction_lifecycle(&state.layout, &next, |phase| {
+                if matches!(phase, McpTransactionWritePhase::DirectorySync)
+                    || phase as u8 == failed_recovery_phase as u8
+                {
+                    Err(std::io::Error::other(format!("injected {phase:?}")))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(failure
+            .to_string()
+            .contains("transaction_recovery_required"));
+        assert!(
+            state
+                .layout
+                .root()
+                .join("mcp_transactions.lifecycle.json")
+                .exists(),
+            "{failed_recovery_phase:?}: recovery must remain discoverable"
+        );
         // The next API call must complete recovery and reload the restored
         // registry before applying a retry. This covers the live-recovery gap
         // after a successful journal unlink whose directory sync then fails.
@@ -268,13 +375,28 @@ async fn mcp_staging_ack_recovery_failures_retain_retryable_evidence() {
             serde_json::json!({ "transaction_id": tx_id, "operations": [mcp_lifecycle_operation("first")] }),
         )
         .await;
-        assert_ne!(retried.is_error, Some(true), "{}", mcp_result_text(&retried));
+        assert_ne!(
+            retried.is_error,
+            Some(true),
+            "{}",
+            mcp_result_text(&retried)
+        );
         assert_ne!(std::fs::read(&mirror).unwrap(), previous);
-        assert_eq!(state.mcp_transactions.lock().unwrap()[&tx_id].staged_operations.len(), 1);
+        assert_eq!(
+            state.mcp_transactions.lock().unwrap()[&tx_id]
+                .staged_operations
+                .len(),
+            1
+        );
         let layout = state.layout.clone();
         drop(state);
         let reopened = DaemonState::open(layout).unwrap();
-        assert_eq!(reopened.mcp_transactions.lock().unwrap()[&tx_id].staged_operations.len(), 1);
+        assert_eq!(
+            reopened.mcp_transactions.lock().unwrap()[&tx_id]
+                .staged_operations
+                .len(),
+            1
+        );
     }
 }
 
@@ -289,12 +411,15 @@ async fn mcp_staging_ack_first_begin_finalization_failure_restores_absence() {
         let session_id = mcp_test_session(&state);
         let mirror = crate::state::mcp_transactions_disk_path(&state.layout);
         assert!(!mirror.exists());
-        state.mcp_lifecycle_persist_fail_once.store(phase as u8, std::sync::atomic::Ordering::SeqCst);
+        state
+            .mcp_lifecycle_persist_fail_once
+            .store(phase as u8, std::sync::atomic::Ordering::SeqCst);
         let failed = mcp_call(
             router(Arc::clone(&state)),
             "kin_transaction_begin",
             serde_json::json!({ "session_id": session_id, "scope": "repository" }),
-        ).await;
+        )
+        .await;
         assert_eq!(failed.is_error, Some(true), "{}", mcp_result_text(&failed));
         assert!(!mirror.exists());
         assert!(state.mcp_transactions.lock().unwrap().is_empty());
@@ -313,7 +438,11 @@ async fn mcp_staging_ack_finalization_interruption_preserves_possible_outcomes()
     use crate::state::McpTransactionWritePhase;
     for (phase, pending, expected_operations) in [
         (McpTransactionWritePhase::JournalRemove, true, 0),
-        (McpTransactionWritePhase::AcknowledgementDirectorySync, false, 1),
+        (
+            McpTransactionWritePhase::AcknowledgementDirectorySync,
+            false,
+            1,
+        ),
     ] {
         let (_dir, state) = mcp_lifecycle_fixture();
         let session_id = mcp_test_session(&state);
@@ -333,11 +462,23 @@ async fn mcp_staging_ack_finalization_interruption_preserves_possible_outcomes()
             .unwrap();
         }));
         assert!(interrupted.is_err());
-        assert_eq!(state.layout.root().join("mcp_transactions.lifecycle.json").exists(), pending);
+        assert_eq!(
+            state
+                .layout
+                .root()
+                .join("mcp_transactions.lifecycle.json")
+                .exists(),
+            pending
+        );
         let layout = state.layout.clone();
         drop(state);
         let reopened = DaemonState::open(layout).unwrap();
-        assert_eq!(reopened.mcp_transactions.lock().unwrap()[&tx_id].staged_operations.len(), expected_operations);
+        assert_eq!(
+            reopened.mcp_transactions.lock().unwrap()[&tx_id]
+                .staged_operations
+                .len(),
+            expected_operations
+        );
         // Before journal unlink, recovery restores the previous state. Once
         // unlink is observable, a lost response may have applied the stage.
         // A process interruption cannot emulate whether that unlink survives
@@ -374,9 +515,26 @@ async fn mcp_staging_ack_malformed_recovery_record_cannot_erase_the_mirror() {
             serde_json::json!({ "transaction_id": tx_id }),
         )
         .await;
-        assert_eq!(refused.is_error, Some(true));
-        assert!(mcp_result_text(&refused).contains("transaction_recovery_required"));
+        assert_eq!(
+            refused.is_error,
+            Some(true),
+            "{}",
+            mcp_result_text(&refused)
+        );
+        assert!(
+            mcp_result_text(&refused).contains("transaction_recovery_required"),
+            "public refusal must retain its semantic recovery code: {}",
+            mcp_result_text(&refused)
+        );
+        assert!(!mcp_result_text(&refused).contains(&record.display().to_string()));
     }
+    // The public recovery code must survive without exposing physical
+    // coordinates. Also verify the exact failure at the private boundary.
+    let recovery_error = crate::state::recover_mcp_transaction_lifecycle(&reopened.layout)
+        .expect_err("the malformed journal must still require recovery");
+    assert!(recovery_error
+        .to_string()
+        .contains("transaction_recovery_required"));
     assert!(reopened.mcp_transactions.lock().unwrap().is_empty());
     assert_eq!(std::fs::read(&mirror).unwrap(), previous);
     assert_eq!(std::fs::read(&record).unwrap(), b"{}");
@@ -460,8 +618,23 @@ async fn mcp_staging_ack_corrupt_mirror_requires_recovery_without_erasing_eviden
         serde_json::json!({"transaction_id": tx_id}),
     )
     .await;
-    assert_eq!(refused.is_error, Some(true));
-    assert!(mcp_result_text(&refused).contains("transaction_recovery_required"));
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "{}",
+        mcp_result_text(&refused)
+    );
+    assert!(
+        mcp_result_text(&refused).contains("transaction_recovery_required"),
+        "public refusal must retain its semantic recovery code: {}",
+        mcp_result_text(&refused)
+    );
+    assert!(!mcp_result_text(&refused).contains(&mirror.display().to_string()));
+    let recovery_error = crate::state::load_persisted_mcp_transactions_checked(&reopened.layout)
+        .expect_err("the corrupt mirror must still require recovery");
+    assert!(recovery_error
+        .to_string()
+        .contains("transaction_recovery_required"));
     assert_eq!(std::fs::read(&mirror).unwrap(), corrupt);
     assert!(crate::state::write_persisted_mcp_transactions_checked(
         &reopened.layout,
@@ -504,12 +677,21 @@ async fn mcp_after_compound_cold_recovery_failure() -> (tempfile::TempDir, Arc<D
     let staged = mcp_call(
         router(Arc::clone(&state)),
         "kin_transaction_stage",
-        serde_json::json!({ "transaction_id": tx_id, "operations": [acknowledged] }),
+        serde_json::json!({
+            "transaction_id": tx_id,
+            "operations": [ticketed_source_operation(acknowledged.clone())]
+        }),
     )
     .await;
     assert_ne!(staged.is_error, Some(true), "{}", mcp_result_text(&staged));
     let mirror = crate::state::mcp_transactions_disk_path(&state.layout);
     let previous = std::fs::read(&mirror).unwrap();
+    assert_eq!(
+        serde_json::to_value(&state.mcp_transactions.lock().unwrap()[&tx_id].staged_operations[0])
+            .unwrap()["payload"],
+        acknowledged["payload"],
+        "public ticket staging must retain the complete private source-base witness"
+    );
     let body_of = |store: &HashMap<String, kin_mcp::McpTransaction>| {
         store
             .get(&tx_id)
@@ -573,6 +755,15 @@ async fn mcp_after_compound_cold_recovery_failure() -> (tempfile::TempDir, Arc<D
             .as_deref(),
         Some(acknowledged_body)
     );
+    assert_eq!(
+        serde_json::to_value(
+            &crate::state::load_persisted_mcp_transactions_checked(&layout).unwrap()[&tx_id]
+                .staged_operations[0]
+        )
+        .unwrap()["payload"],
+        acknowledged["payload"],
+        "compound recovery must retain the complete private source-base witness"
+    );
     (dir, reopened, tx_id)
 }
 
@@ -607,7 +798,9 @@ async fn mcp_staging_ack_compound_cold_recovery_failure_preserves_acknowledged_b
 async fn mcp_staging_ack_compound_cold_recovery_failure_can_commit_acknowledged_body() {
     let (_dir, reopened, tx_id) = mcp_after_compound_cold_recovery_failure().await;
     let layout = reopened.layout.clone();
-    let owner = crate::state::load_persisted_mcp_transactions_checked(&layout).unwrap()[&tx_id].session_id.clone();
+    let owner = crate::state::load_persisted_mcp_transactions_checked(&layout).unwrap()[&tx_id]
+        .session_id
+        .clone();
     reregister_transaction_owner(&reopened, &owner).await;
     let committed = mcp_call(
         router(Arc::clone(&reopened)),
@@ -645,9 +838,12 @@ async fn mcp_staging_ack_compound_cold_recovery_failure_can_commit_acknowledged_
             .body()
             .to_vec()
     }
+    // An update replaces the entity's code and nothing around it: the line
+    // break the body was sent with was never part of the entity, and the
+    // source had none after it.
     assert_eq!(
         published_body(&reopened),
-        MCP_RECOVERY_ACKNOWLEDGED_BODY.as_bytes()
+        MCP_RECOVERY_ACKNOWLEDGED_BODY.trim_end().as_bytes()
     );
     drop(reopened);
     let after_restart = Arc::new(DaemonState::open(layout).unwrap());
@@ -656,7 +852,7 @@ async fn mcp_staging_ack_compound_cold_recovery_failure_can_commit_acknowledged_
         .store(true, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         published_body(&after_restart),
-        MCP_RECOVERY_ACKNOWLEDGED_BODY.as_bytes()
+        MCP_RECOVERY_ACKNOWLEDGED_BODY.trim_end().as_bytes()
     );
     let replay = mcp_call(
         router(Arc::clone(&after_restart)),

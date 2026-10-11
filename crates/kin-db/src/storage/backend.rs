@@ -618,7 +618,7 @@ fn issue_source_body_barrier(
     #[cfg(not(target_vendor = "apple"))]
     let _ = barrier;
     record_source_device_flush();
-    file.sync_all()
+    kin_blobs::durable::sync_all(&file)
 }
 
 #[cfg(all(test, unix))]
@@ -639,7 +639,7 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
         )));
     }
     record_source_device_flush();
-    file.sync_all().map_err(|error| {
+    kin_blobs::durable::sync_all(&file).map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to fsync immutable source blob {}: {error}",
             display_path.display()
@@ -650,7 +650,7 @@ fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result
 #[cfg(windows)]
 fn sync_source_file_for_ack(file: &std::fs::File, display_path: &Path) -> Result<(), KinDbError> {
     record_source_device_flush();
-    file.sync_all().map_err(|error| {
+    kin_blobs::durable::sync_all(&file).map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to flush immutable source blob {}: {error}",
             display_path.display()
@@ -865,6 +865,20 @@ fn open_source_directory_at(
         })
 }
 
+/// Inspect the entry a storage-root path names, without following it, by
+/// asking its parent for that name.
+///
+/// `lstat` follows a final symlink when the path ends in `/` or `/.`, so
+/// `kindb/` reports whatever a link at `kindb` points to. Joining the parent
+/// and the final name inspects the entry itself however the root is spelled.
+/// `None` when the path has no parent or no final name, such as `/` or a path
+/// ending in `..`.
+fn storage_root_entry_metadata(path: &Path) -> Option<std::io::Result<std::fs::Metadata>> {
+    Some(std::fs::symlink_metadata(
+        path.parent()?.join(path.file_name()?),
+    ))
+}
+
 #[cfg(unix)]
 fn prepare_source_trust_root(
     base_path: &Path,
@@ -874,13 +888,17 @@ fn prepare_source_trust_root(
     // The storage root is an explicit repository-layout boundary. Source-body
     // IO may create descendants beneath it, but must never recreate the root:
     // exact eject revokes this backend by atomically moving the whole `.kin`
-    // namespace while already-open processes may still exist.
-    let metadata = std::fs::symlink_metadata(base_path).map_err(|error| {
-        KinDbError::StorageError(format!(
-            "immutable source blob trust root {} is unavailable; refusing to recreate a detached repository namespace: {error}",
-            base_path.display()
-        ))
-    })?;
+    // namespace while already-open processes may still exist. The root is
+    // inspected by name, so a trailing `/` or `/.` cannot make a link to a
+    // directory read as a real one.
+    let metadata = storage_root_entry_metadata(base_path)
+        .unwrap_or_else(|| std::fs::symlink_metadata(base_path))
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "immutable source blob trust root {} is unavailable; refusing to recreate a detached repository namespace: {error}",
+                base_path.display()
+            ))
+        })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(KinDbError::StorageError(format!(
             "immutable source blob trust root {} is not a real directory",
@@ -1134,8 +1152,7 @@ fn read_source_file_at(
             "failed to reserve {byte_len} bytes for pinned local source object: {error}"
         ))
     })?;
-    data.resize(capacity, 0);
-    file.read_exact(&mut data).map_err(|error| {
+    super::read_exact_into_reserved(&mut file, &mut data, capacity).map_err(|error| {
         KinDbError::StorageError(format!(
             "pinned local source object changed length while reading {byte_len} bytes: {error}"
         ))
@@ -1711,8 +1728,7 @@ fn read_windows_source_file_at(
             "failed to reserve {byte_len} bytes for pinned local Windows source object: {error}"
         ))
     })?;
-    data.resize(capacity, 0);
-    file.read_exact(&mut data).map_err(|error| {
+    super::read_exact_into_reserved(&mut file, &mut data, capacity).map_err(|error| {
         KinDbError::StorageError(format!(
             "pinned local Windows source object changed length while reading {byte_len} bytes: {error}"
         ))
@@ -3820,7 +3836,7 @@ fn sync_source_blob_device(namespace: &LocalRepositoryCapability) -> Result<(), 
         ))
     })?;
     record_source_device_flush();
-    repo_dir.sync_all().map_err(|error| {
+    kin_blobs::durable::sync_all(&repo_dir).map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to flush the device before publishing names below {}: {error}",
             namespace.display_path.display()
@@ -4208,9 +4224,17 @@ impl LocalRepositoryCapability {
             )));
         }
         if let Some(expected) = surfaces.get(name) {
-            let current = self.open_surface(name)?;
+            // Only the identity is compared and the pin is what is returned,
+            // so the entry gets only the no-follow inspection the bind starts
+            // with (on Unix a parent-relative lstat that opens nothing), not
+            // the bind's open, second inspection and emptiness listing.
+            let current = LocalFileBackend::pinned_directory_identity(
+                &self.directory,
+                name.as_ref(),
+                &expected.display_path,
+            )?;
             return match current {
-                Some(current) if current.identity == expected.identity => {
+                Some(current) if current == expected.identity => {
                     confirm_pending_local_directory_publication(
                         &self.directory,
                         &self.display_path,
@@ -4760,6 +4784,26 @@ impl LocalFileBackend {
                 display_path.display()
             ))),
         }
+    }
+
+    /// The identity a pinned directory entry has now, for revalidating a pin.
+    ///
+    /// Revalidation used to bind the entry afresh, opening it, proving its
+    /// before, opened and after identities agree and listing it for emptiness,
+    /// and then dropped everything but the identity, because the retained pin
+    /// is what it returns. The bind's first step is this same no-follow
+    /// inspection, and on a path that is not changing its other steps can only
+    /// reach the same identity. A path that changes underneath is a race
+    /// either way: the bind reports it as a change while opening, this reads
+    /// the old or the new entry, and the caller refuses the new one as a
+    /// replacement. A missing entry is `None` and anything that is not a real
+    /// directory is the same refusal the bind gave.
+    fn pinned_directory_identity(
+        parent: &cap_std::fs::Dir,
+        component: &std::ffi::OsStr,
+        display_path: &Path,
+    ) -> Result<Option<LocalStorageRootIdentity>, KinDbError> {
+        Self::local_directory_entry_identity(parent, component, display_path)
     }
 
     /// Open one existing descendant directory and prove that the entry seen
@@ -5441,6 +5485,9 @@ impl LocalFileBackend {
     fn storage_root_capability(
         &self,
     ) -> Result<Option<std::sync::Arc<LocalStorageRootCapability>>, KinDbError> {
+        if let Some(pinned) = self.pinned_storage_root_still_visible() {
+            return Ok(Some(pinned));
+        }
         let current = Self::open_storage_root_capability(&self.base_path)?;
         let mut expected = self.storage_root_capability.lock();
         match (expected.as_ref(), current) {
@@ -5462,6 +5509,40 @@ impl LocalFileBackend {
             }
             (None, None) => Ok(None),
         }
+    }
+
+    /// The pinned storage-root capability, when the root path still names
+    /// exactly the directory this backend pinned, decided from one `lstat`.
+    ///
+    /// Every repository operation confirms its storage root, a source body
+    /// read several times over, and the full reopen walks the root's canonical
+    /// path with one capability-relative open per component, reopens the root
+    /// through its parent and inspects it again: dozens of system calls each
+    /// time. Once a root is pinned, that reopen is used only for its identity,
+    /// which is compared with the pin and dropped. On Unix the visible path's
+    /// device and inode are that identity, and the reopen itself refuses a
+    /// root whose visible identity differs from the directory it walked to,
+    /// so a path that still names the pinned directory, as a real directory
+    /// rather than a link, gets the answer the reopen would give.
+    ///
+    /// The root is inspected by name in its parent, never as the path itself:
+    /// a path ending in `/` or `/.` makes `lstat` follow a final link, and
+    /// would accept a link to the pinned directory moved elsewhere, which the
+    /// reopen refuses.
+    ///
+    /// Anything else returns `None` and the caller takes the full reopen,
+    /// which reports the exact refusal: no pin yet, a missing, linked,
+    /// replaced or uninspectable root, a root path with no parent or final
+    /// name, or a platform whose visible metadata is not an identity.
+    fn pinned_storage_root_still_visible(
+        &self,
+    ) -> Option<std::sync::Arc<LocalStorageRootCapability>> {
+        let pinned = self.storage_root_capability.lock().clone()?;
+        let visible = storage_root_entry_metadata(&self.base_path)?.ok()?;
+        if visible.file_type().is_symlink() || !visible.is_dir() {
+            return None;
+        }
+        (Self::visible_directory_identity(&visible)? == pinned.identity).then_some(pinned)
     }
 
     /// Report whether this backend still reaches the exact repository
@@ -5629,7 +5710,11 @@ impl LocalFileBackend {
         let Some(expected) = expected else {
             return LocalStorageRootProbeFault::Unavailable(error);
         };
-        let visible = match std::fs::symlink_metadata(&self.base_path) {
+        // By name, so a trailing `/` or `/.` cannot make a link read as the
+        // directory it points to.
+        let visible = match storage_root_entry_metadata(&self.base_path)
+            .unwrap_or_else(|| std::fs::symlink_metadata(&self.base_path))
+        {
             Ok(visible) => visible,
             Err(observation_error) if observation_error.kind() == std::io::ErrorKind::NotFound => {
                 return LocalStorageRootProbeFault::IdentityLost(
@@ -5774,9 +5859,17 @@ impl LocalFileBackend {
             )));
         }
         if let Some(expected) = namespaces.get(repo_id) {
-            let current = Self::open_repository_from_root(&root, repo_id, &self.base_path)?;
+            // Only the identity is compared and the pin is what is returned,
+            // so the entry gets only the no-follow inspection the bind starts
+            // with (on Unix a parent-relative lstat that opens nothing), not
+            // the bind's open, second inspection and emptiness listing.
+            let current = Self::pinned_directory_identity(
+                root.directory(),
+                repo_id.as_ref(),
+                &expected.display_path,
+            )?;
             match current {
-                Some(current) if current.identity == expected.identity => {
+                Some(current) if current == expected.identity => {
                     confirm_pending_local_directory_publication(
                         root.directory(),
                         &self.base_path,
@@ -5891,14 +5984,18 @@ impl LocalFileBackend {
                 self.base_path.display()
             ))
         })?;
-        let current = Self::open_repository_from_root(&root, &namespace.repo_id, &self.base_path)?
-            .ok_or_else(|| {
-                KinDbError::StorageError(format!(
-                    "local repository namespace {} was detached while capability was held",
-                    namespace.display_path.display()
-                ))
-            })?;
-        if current.identity != namespace.identity {
+        let current = Self::pinned_directory_identity(
+            root.directory(),
+            namespace.repo_id.as_ref(),
+            &namespace.display_path,
+        )?
+        .ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "local repository namespace {} was detached while capability was held",
+                namespace.display_path.display()
+            ))
+        })?;
+        if current != namespace.identity {
             return Err(KinDbError::StorageError(format!(
                 "local repository namespace {} changed while capability was held",
                 namespace.display_path.display()
@@ -7383,6 +7480,17 @@ impl LocalFileBackend {
         let path = namespace.display(relative);
         if !namespace.exists(relative)? {
             return Ok(None);
+        }
+        if cleanup {
+            // The destination rename is the commit. A candidate still staged
+            // beside it is an unfinished write, and confirming would refuse
+            // the previous authority. Drop that candidate. A read-only freeze
+            // leaves it staged and still refuses.
+            mmap::discard_unpromoted_recovery_candidate_at(
+                &namespace.directory,
+                relative,
+                &namespace.display_path,
+            )?;
         }
         mmap::confirm_installed_write_at(
             &namespace.directory,
@@ -14413,6 +14521,418 @@ mod tests {
                 );
             }
             other => panic!("an uninspectable storage root must be unavailable, got {other:?}"),
+        }
+    }
+
+    /// The suffixes that spell one storage root three ways `lstat` treats
+    /// differently: a trailing `/` or `/.` makes it follow a final link.
+    #[cfg(unix)]
+    const STORAGE_ROOT_SPELLINGS: [&str; 3] = ["", "/", "/."];
+
+    #[cfg(unix)]
+    fn spelled_storage_root(root: &Path, suffix: &str) -> PathBuf {
+        let mut spelled = root.as_os_str().to_os_string();
+        spelled.push(suffix);
+        PathBuf::from(spelled)
+    }
+
+    /// The refusal a call must give, with the call named when it succeeds.
+    #[cfg(unix)]
+    fn refused<T: std::fmt::Debug>(result: Result<T, KinDbError>, call: &str) -> KinDbError {
+        match result {
+            Ok(value) => panic!("{call}: expected a refusal, got {value:?}"),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether a message is the storage root itself being refused: the reopen
+    /// found a link or non-directory at the root path, or could not open the
+    /// root through its parent without following a link.
+    #[cfg(unix)]
+    fn is_storage_root_refusal(message: &str) -> bool {
+        message.contains("local storage root") || message.contains("retained local")
+    }
+
+    /// Remove every permission from `path`, returning what restores it.
+    #[cfg(unix)]
+    fn deny_all_access(path: &Path) -> (PathBuf, std::fs::Permissions) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        (path.to_path_buf(), original)
+    }
+
+    /// A root swapped for a link to the pinned directory, moved elsewhere, is
+    /// refused by real operations however the root path is spelled.
+    ///
+    /// `kindb/` and `kindb/.` are why this exists. `lstat` on them follows the
+    /// link to the moved directory, whose identity is the pin, so a
+    /// revalidation that inspected the path itself accepted the link and
+    /// served the moved directory, where the full reopen through the parent
+    /// refuses it. The source trust root and the probe's classification of a
+    /// failed reopen inspect the root by name for the same reason.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_storage_root_refuses_a_link_to_its_moved_directory_however_spelled() {
+        for suffix in STORAGE_ROOT_SPELLINGS {
+            let spelling = format!("kindb{suffix}");
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("kindb");
+            std::fs::create_dir(&root).unwrap();
+            let backend = LocalFileBackend::new(spelled_storage_root(&root, suffix));
+            let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+            let generation = backend
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .unwrap();
+            assert!(
+                backend.load_snapshot("repo-a").unwrap().is_some(),
+                "{spelling}: the pinned root serves its repository before the swap"
+            );
+
+            let moved = dir.path().join("kindb-moved");
+            std::fs::rename(&root, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &root).unwrap();
+            let moved_before = test_directory_bytes(&moved);
+
+            let read = refused(
+                backend
+                    .load_snapshot("repo-a")
+                    .map(|loaded| loaded.is_some()),
+                &format!("{spelling} read"),
+            );
+            assert!(
+                is_storage_root_refusal(&read.to_string()),
+                "{spelling}: unexpected linked-root read error: {read}"
+            );
+            let write = refused(
+                backend
+                    .save_snapshot("repo-a", &snapshot, generation)
+                    .map(|_| ()),
+                &format!("{spelling} snapshot write"),
+            );
+            assert!(
+                is_storage_root_refusal(&write.to_string()),
+                "{spelling}: unexpected linked-root write error: {write}"
+            );
+            let overlay = refused(
+                backend.save_overlay("repo-a", "session-a", b"must not reach the moved root"),
+                &format!("{spelling} overlay write"),
+            );
+            assert!(
+                is_storage_root_refusal(&overlay.to_string()),
+                "{spelling}: unexpected linked-root overlay error: {overlay}"
+            );
+            let source = b"must not reach the moved root";
+            let source_error = refused(
+                backend.save_source_blob("repo-a", source_digest(source), source),
+                &format!("{spelling} source write"),
+            );
+            assert!(
+                source_error
+                    .to_string()
+                    .contains("immutable source blob trust root"),
+                "{spelling}: the source trust root must refuse the link itself: {source_error}"
+            );
+
+            assert_eq!(
+                test_directory_bytes(&moved),
+                moved_before,
+                "{spelling}: refused operations must not write through the link"
+            );
+            assert!(
+                std::fs::symlink_metadata(&root)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{spelling}: the link is left in place"
+            );
+
+            match backend.probe_pinned_repository_namespace("repo-a") {
+                LocalNamespaceProbe::IdentityLost(LocalNamespaceIdentityFault::StorageRoot(
+                    error,
+                )) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("changed to a non-directory or link"),
+                        "{spelling}: unexpected linked-root probe error: {error}"
+                    );
+                }
+                other => panic!(
+                    "{spelling}: a linked storage root must be an identity loss, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// A root replaced by a file is refused by real operations however the
+    /// root path is spelled, and the file is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_storage_root_refuses_a_file_in_its_place_however_spelled() {
+        for suffix in STORAGE_ROOT_SPELLINGS {
+            let spelling = format!("kindb{suffix}");
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("kindb");
+            std::fs::create_dir(&root).unwrap();
+            let backend = LocalFileBackend::new(spelled_storage_root(&root, suffix));
+            let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+            let generation = backend
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .unwrap();
+
+            std::fs::rename(&root, dir.path().join("kindb-moved")).unwrap();
+            std::fs::write(&root, b"not a storage root").unwrap();
+
+            let read = refused(
+                backend
+                    .load_snapshot("repo-a")
+                    .map(|loaded| loaded.is_some()),
+                &format!("{spelling} read"),
+            );
+            assert!(
+                read.to_string().contains("local storage root"),
+                "{spelling}: unexpected file-root read error: {read}"
+            );
+            let write = refused(
+                backend
+                    .save_snapshot("repo-a", &snapshot, generation)
+                    .map(|_| ()),
+                &format!("{spelling} snapshot write"),
+            );
+            assert!(
+                write.to_string().contains("local storage root"),
+                "{spelling}: unexpected file-root write error: {write}"
+            );
+            let source = b"must not replace the file";
+            let source_error = refused(
+                backend.save_source_blob("repo-a", source_digest(source), source),
+                &format!("{spelling} source write"),
+            );
+            assert!(
+                source_error
+                    .to_string()
+                    .contains("immutable source blob trust root"),
+                "{spelling}: unexpected file-root source error: {source_error}"
+            );
+            assert_eq!(
+                std::fs::read(&root).unwrap(),
+                b"not a storage root",
+                "{spelling}: refused operations leave the file alone"
+            );
+        }
+    }
+
+    /// A pinned namespace renamed away, replaced by a file, or made
+    /// uninspectable is refused by real operations that it served before,
+    /// and nothing is recreated in its place.
+    ///
+    /// A namespace that keeps its identity but loses its permissions is the
+    /// same directory, so revalidation keeps the pin, which on Unix is an
+    /// lstat that opens nothing. The first access inside it is then refused
+    /// by the filesystem, and nothing lands.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_namespace_refuses_a_renamed_file_or_uninspectable_replacement() {
+        #[derive(Clone, Copy, Debug)]
+        enum NamespaceLoss {
+            RenamedAway,
+            File,
+            /// The pinned directory itself, with every permission removed.
+            PermissionsRemoved,
+            /// A storage root this process may not search, so the namespace
+            /// entry cannot even be inspected.
+            Uninspectable,
+        }
+
+        for loss in [
+            NamespaceLoss::RenamedAway,
+            NamespaceLoss::File,
+            NamespaceLoss::PermissionsRemoved,
+            NamespaceLoss::Uninspectable,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("kindb");
+            std::fs::create_dir(&root).unwrap();
+            let backend = LocalFileBackend::new(&root);
+            let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+            let generation = backend
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .unwrap();
+            assert!(
+                backend.load_snapshot("repo-a").unwrap().is_some(),
+                "{loss:?}: the pinned namespace serves reads before it is lost"
+            );
+
+            let namespace = root.join("repo-a");
+            let restore = match loss {
+                NamespaceLoss::RenamedAway => {
+                    std::fs::rename(&namespace, dir.path().join("repo-a-moved")).unwrap();
+                    None
+                }
+                NamespaceLoss::File => {
+                    std::fs::rename(&namespace, dir.path().join("repo-a-moved")).unwrap();
+                    std::fs::write(&namespace, b"not a namespace").unwrap();
+                    None
+                }
+                NamespaceLoss::PermissionsRemoved => Some(deny_all_access(&namespace)),
+                NamespaceLoss::Uninspectable => Some(deny_all_access(&root)),
+            };
+            let read = backend
+                .load_snapshot("repo-a")
+                .map(|loaded| loaded.is_some());
+            let write = backend
+                .save_snapshot("repo-a", &snapshot, generation)
+                .map(|_| ());
+            let overlay = backend.save_overlay("repo-a", "session-a", b"must not land");
+            if let Some((path, permissions)) = restore {
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+
+            let expected = match loss {
+                NamespaceLoss::RenamedAway => "was detached after this backend opened",
+                NamespaceLoss::File => "is not a real directory",
+                NamespaceLoss::PermissionsRemoved => "Permission denied",
+                NamespaceLoss::Uninspectable => "failed to inspect local directory namespace",
+            };
+            for (operation, result) in [
+                ("read", read.map(|_| ())),
+                ("snapshot write", write),
+                ("overlay write", overlay),
+            ] {
+                let error = refused(result, &format!("{loss:?} {operation}"));
+                assert!(
+                    error.to_string().contains(expected),
+                    "{loss:?} {operation}: unexpected namespace refusal: {error}"
+                );
+            }
+            match loss {
+                NamespaceLoss::RenamedAway => assert!(
+                    !namespace.exists(),
+                    "{loss:?}: a refused write must not recreate the namespace"
+                ),
+                NamespaceLoss::File => assert_eq!(
+                    std::fs::read(&namespace).unwrap(),
+                    b"not a namespace",
+                    "{loss:?}: refused operations leave the file alone"
+                ),
+                NamespaceLoss::PermissionsRemoved | NamespaceLoss::Uninspectable => assert!(
+                    !backend.overlay_path("repo-a", "session-a").exists(),
+                    "{loss:?}: a refused overlay write must not land"
+                ),
+            }
+        }
+    }
+
+    /// A pinned surface renamed away, replaced by a link to its moved
+    /// directory, or replaced by a file is refused by `surface()` after an
+    /// earlier call bound it, and by a real read through the backend.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_surface_refuses_a_renamed_linked_or_file_replacement_after_binding() {
+        #[derive(Clone, Copy, Debug)]
+        enum SurfaceLoss {
+            RenamedAway,
+            Linked,
+            File,
+        }
+
+        for loss in [
+            SurfaceLoss::RenamedAway,
+            SurfaceLoss::Linked,
+            SurfaceLoss::File,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path().join("kindb");
+            std::fs::create_dir(&root).unwrap();
+            let backend = LocalFileBackend::new(&root);
+            let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+            backend
+                .save_snapshot("repo-a", &snapshot, GENERATION_INIT)
+                .unwrap();
+            let namespace = backend
+                .repository_capability("repo-a", false)
+                .unwrap()
+                .expect("the repository namespace is pinned");
+            let name = LocalFileBackend::snapshots_surface_name();
+            let bound = namespace
+                .surface(name, false)
+                .unwrap()
+                .expect("the snapshot surface binds");
+            let revalidated = namespace
+                .surface(name, false)
+                .unwrap()
+                .expect("an unchanged surface revalidates");
+            assert!(
+                std::sync::Arc::ptr_eq(&bound, &revalidated),
+                "{loss:?}: revalidating an unchanged surface returns its pin"
+            );
+
+            let visible = root.join("repo-a").join(name);
+            let moved = dir.path().join("snapshots-moved");
+            std::fs::rename(&visible, &moved).unwrap();
+            match loss {
+                SurfaceLoss::RenamedAway => {}
+                SurfaceLoss::Linked => std::os::unix::fs::symlink(&moved, &visible).unwrap(),
+                SurfaceLoss::File => std::fs::write(&visible, b"not a surface").unwrap(),
+            }
+            let moved_before = test_directory_bytes(&moved);
+            let expected = match loss {
+                SurfaceLoss::RenamedAway => "was detached after this backend opened",
+                SurfaceLoss::Linked | SurfaceLoss::File => "is not a real directory",
+            };
+
+            for (call, result) in [
+                (
+                    "surface",
+                    namespace
+                        .surface(name, false)
+                        .map(|surface| surface.is_some()),
+                ),
+                (
+                    "surface create",
+                    namespace
+                        .surface(name, true)
+                        .map(|surface| surface.is_some()),
+                ),
+                (
+                    "read",
+                    backend
+                        .load_snapshot("repo-a")
+                        .map(|loaded| loaded.is_some()),
+                ),
+            ] {
+                let error = refused(result, &format!("{loss:?} {call}"));
+                assert!(
+                    error.to_string().contains(expected),
+                    "{loss:?} {call}: unexpected surface refusal: {error}"
+                );
+            }
+
+            assert_eq!(
+                test_directory_bytes(&moved),
+                moved_before,
+                "{loss:?}: refused calls must not touch the moved surface"
+            );
+            match loss {
+                SurfaceLoss::RenamedAway => assert!(
+                    !visible.exists(),
+                    "{loss:?}: a refused create must not bind a new surface epoch"
+                ),
+                SurfaceLoss::Linked => assert!(
+                    std::fs::symlink_metadata(&visible)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{loss:?}: the link is left in place"
+                ),
+                SurfaceLoss::File => assert_eq!(
+                    std::fs::read(&visible).unwrap(),
+                    b"not a surface",
+                    "{loss:?}: refused calls leave the file alone"
+                ),
+            }
         }
     }
 

@@ -298,8 +298,9 @@ publication.
 *Flags:*
 - `--json`: report the exact committed repository/workspace authority result,
   including the semantic enrichment admission produced and, under
-  `cross_file_enrichment`, whether the cross-file sweep that follows admission
-  produced its edges or left them owed, and why. The
+  `cross_file_enrichment`, whether the language-server sweep that follows
+  admission produced its edges, left them owed, or found enrichment off for
+  this repository, and why. The
   [CLI reference](./cli-reference.md#kin-init) lists the reasons.
 
 ### How long admission takes, and what it prints
@@ -345,7 +346,7 @@ reports the same line afterwards. On ripgrep at `e89fff89`, 2,261 commits, it
 reads:
 
 ```
-  Store size: 405.4 MiB under .kin/, 66.5x the 6.1 MiB Git object store
+  Store size: 405.4 MiB in the store, 66.5x the 6.1 MiB Git object store
 ```
 
 Read that multiple as one measurement, not as a constant. The ratio moves by
@@ -626,8 +627,8 @@ is **nothing else to configure**. Open your agent in a Kin repository and ask it
 the semantic tools:
 
 ```
-Use Kin to explore this codebase: run semantic_locate to find the
-main entry point, then get_context_pack on that file.
+Use Kin to explore this codebase: run locate to find the
+main entry point, then context on it.
 ```
 
 For Claude Code the wizard writes this entry:
@@ -654,9 +655,9 @@ set `full` (or pass `--tool-profile full`) when you want every tool. (The wizard
 absolute path to the installed `kin` binary as the `command`, so the entry works in agent
 processes that do not inherit your `PATH`.)
 
-> Vector-backed MCP retrieval (`semantic_locate`) and the stateful session / transaction /
+> Vector-backed MCP retrieval (`locate` by description) and the stateful session / transaction /
 > work / review tools operate against the repo's running Kin daemon. Daemon auto-start is
-> on by default, so these tools have a live graph to query. `semantic_locate` returns an
+> on by default, so these tools have a live graph to query. `locate` by description returns an
 > explicit error in offline / no-daemon mode.
 
 ### What to ask for on a brand new project
@@ -664,10 +665,10 @@ processes that do not inherit your `PATH`.)
 Adjust the ask when the repository is one you just started. Kin ranks on cross-file
 structure, and a five-file project has the least of it. The tools that pay off from the
 first checkpoint are `kin commit`, `kin graph status` to watch the graph fill in,
-`trace_data_flow` for how the pieces wire together, and `get_entity_source` for reading
-code back. Description-shaped `semantic_locate` queries need more entities than a new
+`trace` for how the pieces wire together, and `source` for reading
+code back. Description-shaped `locate` queries need more entities than a new
 project has, so ask by exact name at that size and let ranked retrieval earn your trust as
-the graph grows. When the graph is small enough for this to bite, `semantic_locate` says so
+the graph grows. When the graph is small enough for this to bite, `locate` says so
 in its `degradations` array rather than leaving you to find out from a weak answer.
 
 For the full tool surface, see the [MCP Tools Reference](mcp-tools.md). To wire up a

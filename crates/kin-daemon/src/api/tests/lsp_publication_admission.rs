@@ -7,7 +7,16 @@
 
 const LSP_PUBLICATION_CALLER: &str = "def run(callback):\n    return callback()\n";
 
+/// A fresh copy of the parsed and committed LSP publication baseline, opened
+/// afresh. The baseline is seeded once per test binary and run.
 async fn lsp_publication_fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
+    SeededStore::cached("lsp-publication", lsp_publication_seeded)
+        .await
+        .open_copy()
+}
+
+/// Four parsed Python files admitted and committed into a lifecycle store.
+async fn lsp_publication_seeded() -> (tempfile::TempDir, Arc<DaemonState>) {
     let (repo, state) = mcp_lifecycle_fixture();
     for (file, body) in [
         ("target.py", "def work():\n    return 7\n"),
@@ -61,6 +70,124 @@ fn lsp_publication_durable(state: &DaemonState) -> kin_db::GraphSnapshot {
         .workspace_graph_snapshot(&context.workspace_id())
         .unwrap()
         .unwrap()
+}
+
+/// Complete controlled empty server answers over the actual admitted bodies.
+/// The production census builds every caller's ledger, and the sweep's normal
+/// completion path queues the full-input native marks for publication.
+fn stage_lsp_publication_completion(state: &DaemonState, files: &[&str]) {
+    use crate::call_site_ledger::{FilePass, PassEnding, build_ledgers};
+    use kin_model::EntityStore as _;
+    let durable = lsp_publication_durable(state);
+    let entities = state.graph.list_all_entities().unwrap();
+    let refs = entities
+        .iter()
+        .filter_map(|entity| {
+            crate::daemon::lsp_entity_ref(entity, &entity.file_origin.as_ref()?.0)
+        })
+        .collect();
+    let index = kin_lsp::EntityIndex::new(refs, state.layout.working_dir());
+    let context = kin_model::ProofContext {
+        language: kin_model::LanguageId::Python,
+        resolver: "lsp:fixture".to_owned(),
+        resolver_version: "1".to_owned(),
+        configuration_hash: kin_model::Hash256::from_bytes([1; 32]),
+        environment_hash: kin_model::Hash256::from_bytes([2; 32]),
+        environment_summary: String::new(),
+    };
+    let proof = kin_model::ResolutionRecord::ProofContext(context.clone());
+    let validation = kin_model::ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+        language: kin_model::LanguageId::Python,
+        state: kin_model::ContextValidationState::Validated { context },
+    });
+    let mut records = vec![proof.clone(), validation];
+    let epoch = crate::daemon::current_marker_epoch(state);
+    for file in files {
+        let path = kin_model::RepoPath::from_utf8(*file).unwrap();
+        let body = durable
+            .resolved_tree
+            .artifact_at_path(&path)
+            .unwrap()
+            .entry
+            .blob_identity()
+            .unwrap();
+        let bytes = state.blobs.read(&body).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let file_entities = entities
+            .iter()
+            .filter(|entity| entity.file_origin.as_ref().is_some_and(|path| path.0 == *file))
+            .collect::<Vec<_>>();
+        let uri = kin_lsp::protocol::path_to_uri(&state.layout.working_dir().join(file));
+        let ledgers = build_ledgers(&FilePass {
+            file,
+            text,
+            uri: &uri,
+            index: &index,
+            entities: &file_entities,
+            answers: &[],
+            names: &kin_lsp::call_sites::ExternalNames::new(),
+            unproven: &[],
+            recorded: &[],
+            static_proofs: &[],
+            outside_calls: &[],
+            produced_references: &Default::default(),
+            ending: PassEnding::Complete,
+            not_in_build: false,
+            context: proof.id(),
+            body,
+        })
+        .expect("the production parser reads the committed fixture body");
+        assert_eq!(ledgers.counts.unattributed, 0);
+        if *file == "caller.py" {
+            assert_eq!(ledgers.counts.expressions, 1, "callback() is a real call");
+        }
+        records.extend(ledgers.ledgers.into_values().map(kin_model::ResolutionRecord::CallSites));
+        assert!(crate::daemon::record_sweep_file_completed(state, file, body, epoch));
+    }
+    let deltas = records
+        .into_iter()
+        .filter_map(|new| match state.graph.get_resolution_record(&new.id()) {
+            Some(old) if old == new => None,
+            Some(old) => Some(kin_model::ResolutionRecordDelta::Modified { old, new }),
+            None => Some(kin_model::ResolutionRecordDelta::Added { new }),
+        })
+        .collect::<Vec<_>>();
+    state.graph.apply_resolution_record_deltas(&deltas).unwrap();
+}
+
+fn assert_lsp_publication_native_completion(state: &DaemonState, files: &[&str]) {
+    lsp_publication_durable_with_native_completion(state, files);
+}
+
+/// The durable workspace graph, read once, after asserting that each of
+/// `files` has a current native full-input proof in the same authority.
+///
+/// One reading serves both, so a caller that needs the durable graph and the
+/// completion check pays for one workspace materialization rather than two.
+fn lsp_publication_durable_with_native_completion(
+    state: &DaemonState,
+    files: &[&str],
+) -> kin_db::GraphSnapshot {
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .unwrap();
+    let authority = context.open().unwrap();
+    let lease = authority.read_authority();
+    let graph = lease.workspace_graph_snapshot(&context.workspace_id()).unwrap().unwrap();
+    {
+        let resumed = crate::state::resumable_enrichment_files(
+            lease.workspace_enrichment_marks(&context.workspace_id()),
+            &graph.resolved_tree,
+            &graph.entities,
+            graph.relations.values(),
+            graph.resolution_records.values(),
+            kin_core::lsp_scope::upgrade_recorded(&state.layout),
+        );
+        for file in files {
+            assert!(resumed.contains_key(*file), "{file} has no current native full-input proof");
+        }
+    }
+    graph
 }
 
 fn lsp_publication_same_semantics(left: &kin_db::GraphSnapshot, right: &kin_db::GraphSnapshot) {
@@ -289,9 +416,10 @@ async fn lsp_publication_fence_late_atomic_admit_answer_is_stale_without_warm_co
         cold.graph.binding_history_observation(),
         kin_model::BindingHistoryObservation::Checked { .. }
     ));
-    binding_disclosure_impact(
+    binding_disclosure_impact_with_coverage(
         &cold,
         caller.id,
+        false,
         false,
         "LSP stale answer after canonical cold startup",
     )

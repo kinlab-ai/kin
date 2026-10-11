@@ -278,7 +278,7 @@
       "imports": "present",
       "references": "present"
     },
-    "cross_file_classes": [
+    "cross_unit_classes": [
       "calls",
       "imports",
       "references"

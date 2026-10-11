@@ -33,8 +33,8 @@ class ParityError(RuntimeError):
 class ParityResult:
     install_sha256: str
     install_ps1_sha256: str
-    install_generation: str
-    install_ps1_generation: str
+    install_generation: str | None
+    install_ps1_generation: str | None
 
 
 @dataclass(frozen=True)
@@ -58,11 +58,15 @@ def verify_payloads(
     public_manifest: bytes,
     public_install_generation: str | None,
     public_install_ps1_generation: str | None,
+    surface: str = "gcs",
 ) -> ParityResult:
     if TAG_RE.fullmatch(tag) is None:
         raise ParityError(f"invalid stable release tag: {tag}")
     if SHA_RE.fullmatch(commit) is None:
         raise ParityError(f"invalid peeled release commit: {commit}")
+
+    if surface not in {"gcs", "pages"}:
+        raise ParityError(f"unsupported public installer surface: {surface}")
 
     install_sha = sha256(source_install)
     ps1_sha = sha256(source_install_ps1)
@@ -83,11 +87,14 @@ def verify_payloads(
         "install_generation": public_install_generation,
         "install_ps1_generation": public_install_ps1_generation,
     }
-    for key, value in public_generations.items():
-        if value is None or re.fullmatch(r"[0-9]+", value) is None:
-            raise ParityError(
-                f"public endpoint has missing or invalid x-goog-generation for {key}"
-            )
+    # Pages has no GCS object generations. Only an explicit caller selection
+    # changes that contract; absent headers never downgrade the GCS proof.
+    if surface == "gcs":
+        for key, value in public_generations.items():
+            if value is None or re.fullmatch(r"[0-9]+", value) is None:
+                raise ParityError(
+                    f"public endpoint has missing or invalid x-goog-generation for {key}"
+                )
 
     try:
         manifest: Any = json.loads(public_manifest)
@@ -103,8 +110,9 @@ def verify_payloads(
         "sha": commit,
         "install_sha256": install_sha,
         "install_ps1_sha256": ps1_sha,
-        **public_generations,
     }
+    if surface == "gcs":
+        expected.update(public_generations)
     for key, value in expected.items():
         if manifest.get(key) != value:
             raise ParityError(
@@ -113,8 +121,8 @@ def verify_payloads(
     return ParityResult(
         install_sha,
         ps1_sha,
-        public_install_generation,
-        public_install_ps1_generation,
+        public_install_generation if surface == "gcs" else None,
+        public_install_ps1_generation if surface == "gcs" else None,
     )
 
 
@@ -178,6 +186,10 @@ def main() -> int:
     parser.add_argument("--expected-sha", help="Optional expected peeled 40-hex commit")
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument(
+        "--surface", choices=("gcs", "pages"), default="gcs",
+        help="Reviewed installer delivery surface; GCS requires generation headers",
+    )
     args = parser.parse_args()
 
     try:
@@ -202,6 +214,7 @@ def main() -> int:
             public_manifest=fetch(f"{base}/current.json"),
             public_install_generation=public_install.generation,
             public_install_ps1_generation=public_install_ps1.generation,
+            surface=args.surface,
         )
     except (
         ParityError,
@@ -213,8 +226,10 @@ def main() -> int:
 
     print(
         f"installer parity verified: {args.tag}@{commit} "
-        f"install={result.install_sha256}#{result.install_generation} "
-        f"install.ps1={result.install_ps1_sha256}#{result.install_ps1_generation}"
+        f"surface={args.surface} "
+        f"install={result.install_sha256} "
+        f"install.ps1={result.install_ps1_sha256} "
+        f"generations={result.install_generation},{result.install_ps1_generation}"
     )
     return 0
 

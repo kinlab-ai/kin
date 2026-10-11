@@ -1,0 +1,239 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/adapter.rs",
+    "src/binding_callability.rs",
+    "src/call_owner.rs",
+    "src/declaration_census.rs",
+    "src/declaration_extent.rs",
+    "src/declaration_only.rs",
+    "src/error.rs",
+    "src/extract.rs",
+    "src/file_evidence.rs",
+    "src/import_origin.rs",
+    "src/import_witness.rs",
+    "src/import_witness/python_namespace.rs",
+    "src/languages/c_lang.rs",
+    "src/languages/cpp_declarations.rs",
+    "src/languages/cpp_escape.rs",
+    "src/languages/cpp_lang.rs",
+    "src/languages/cpp_nested.rs",
+    "src/languages/csharp_declarations.rs",
+    "src/languages/ecmascript_declarations.rs",
+    "src/languages/ecmascript_extent.rs",
+    "src/languages/go.rs",
+    "src/languages/go_declarations.rs",
+    "src/languages/go_escape.rs",
+    "src/languages/hcl.rs",
+    "src/languages/java.rs",
+    "src/languages/java_declarations.rs",
+    "src/languages/java_escape.rs",
+    "src/languages/javascript.rs",
+    "src/languages/javascript_dynamic.rs",
+    "src/languages/javascript_escape.rs",
+    "src/languages/javascript_imported_receiver.rs",
+    "src/languages/javascript_key_facts.rs",
+    "src/languages/javascript_nested.rs",
+    "src/languages/kotlin.rs",
+    "src/languages/kotlin_declarations.rs",
+    "src/languages/kotlin_escape.rs",
+    "src/languages/mod.rs",
+    "src/languages/php.rs",
+    "src/languages/php_declarations.rs",
+    "src/languages/php_escape.rs",
+    "src/languages/python.rs",
+    "src/languages/python_declarations.rs",
+    "src/languages/python_escape.rs",
+    "src/languages/python_fields.rs",
+    "src/languages/ruby_declarations.rs",
+    "src/languages/rust_crates.rs",
+    "src/languages/rust_declarations.rs",
+    "src/languages/rust_escape.rs",
+    "src/languages/rust_lang.rs",
+    "src/languages/rust_nested.rs",
+    "src/languages/shallow_backed.rs",
+    "src/languages/swift.rs",
+    "src/languages/swift_declarations.rs",
+    "src/languages/swift_escape.rs",
+    "src/languages/swift_nested.rs",
+    "src/languages/typescript.rs",
+    "src/lib.rs",
+    "src/literal_members.rs",
+    "src/module_contains.rs",
+    "src/nested.rs",
+    "src/project_manifest.rs",
+    "src/scope.rs",
+    "src/shallow.rs",
+    "src/value_escape.rs",
+    "src/value_origins/cpp.rs",
+    "src/value_origins/go.rs",
+    "src/value_origins/java.rs",
+    "src/value_origins/javascript.rs",
+    "src/value_origins/kotlin.rs",
+    "src/value_origins/mod.rs",
+    "src/value_origins/php.rs",
+    "src/value_origins/python.rs",
+    "src/value_origins/rust.rs",
+    "src/value_origins/swift.rs",
+]
+
+[[excluded]]
+reason = "tests: each module is declared under #[cfg(test)]"
+files = [
+    "src/language_conformance_test.rs",
+    "src/languages/cpp_escape/tests.rs",
+    "src/languages/php_escape/tests.rs",
+    "src/languages/swift_escape/tests.rs",
+    "src/value_origins/cpp/tests.rs",
+    "src/value_origins/swift/tests.rs",
+]
+
+[[excluded]]
+reason = "edit paths that plan, place and syntax-check declarations and units before a write; kin-mcp and kin-daemon call them for entity and unit edits, no ingestion or history replay does, and their written source is subsequently derived like any other"
+files = [
+    "src/code_placement.rs",
+    "src/declaration_lifecycle.rs",
+    "src/languages/ecmascript_edit.rs",
+    "src/languages/go_edit.rs",
+    "src/languages/go_unit.rs",
+    "src/languages/python_edit.rs",
+    "src/languages/python_layout.rs",
+    "src/languages/rust_edit.rs",
+    "src/member_placement.rs",
+    "src/syntax_reading.rs",
+    "src/unit_append.rs",
+    "src/unit_editor.rs",
+]
+
+[[excluded]]
+reason = "language facts that readers apply to what the graph already holds (kin-mcp site quoting, ask name lookup, kin-cli locate scoring); adapters return them through LanguageAdapter methods no kin-index, kin-git or kin-core code calls"
+files = [
+    "src/body_syntax.rs",
+    "src/name_syntax.rs",
+    "src/site_syntax.rs",
+]
+
+[[excluded]]
+reason = "read and edit guard: checks a stored module span against a fresh parse and refuses, never writes; callers are kin-mcp handlers, kin-cli graph and kin-daemon mcp_commit only"
+files = [
+    "src/source_span.rs",
+]
+
+[[excluded]]
+reason = "TODO/FIXME scan of held text for explicit work-item imports; CLI and daemon work commands call it, and its results never enter the derived source entity or relation graph"
+files = [
+    "src/todos.rs",
+]
+
+[[excluded]]
+reason = "opt-in CommonJS key-domain analysis that emits no relation or record; its only caller, kin_index::key_domain::analyze_imported_keys, is reached from kin-index/tests/key_domain.rs alone"
+files = [
+    "src/key_domain.rs",
+]
+
+
+[[excluded_items]]
+file = "src/adapter.rs"
+reason = "hooks only readers and edit planners call: how a language writes names, bodies and call sites, and how an edit is laid out; kin-mcp, kin-cli and the daemon read them to quote or place an entity, nothing at ingest calls them, and nothing they return is stored"
+items = [
+    "trait LanguageAdapter / fn declaration_lifecycle",
+    "trait LanguageAdapter / fn member_placement",
+    "trait LanguageAdapter / fn unit_editor",
+    "trait LanguageAdapter / fn layout_problems",
+    "trait LanguageAdapter / fn is_docstring",
+    "trait LanguageAdapter / fn body_syntax",
+    "trait LanguageAdapter / fn name_syntax",
+    "trait LanguageAdapter / fn site_syntax",
+]
+
+[[excluded_items]]
+file = "src/languages/go.rs"
+reason = "hooks only readers and edit planners call: how a language writes names, bodies and call sites, and how an edit is laid out; kin-mcp, kin-cli and the daemon read them to quote or place an entity, nothing at ingest calls them, and nothing they return is stored"
+items = [
+    "impl LanguageAdapter for GoAdapter / fn declaration_lifecycle",
+    "impl LanguageAdapter for GoAdapter / fn member_placement",
+    "impl LanguageAdapter for GoAdapter / fn unit_editor",
+    "impl LanguageAdapter for GoAdapter / fn name_syntax",
+]
+
+[[excluded_items]]
+file = "src/languages/javascript.rs"
+reason = "hooks only readers and edit planners call: how a language writes names, bodies and call sites, and how an edit is laid out; kin-mcp, kin-cli and the daemon read them to quote or place an entity, nothing at ingest calls them, and nothing they return is stored"
+items = [
+    "impl LanguageAdapter for JavaScriptAdapter / fn declaration_lifecycle",
+    "impl LanguageAdapter for JavaScriptAdapter / fn member_placement",
+    "impl LanguageAdapter for JavaScriptAdapter / fn unit_editor",
+    "impl LanguageAdapter for JavaScriptAdapter / fn body_syntax",
+    "impl LanguageAdapter for JavaScriptAdapter / fn name_syntax",
+    "impl LanguageAdapter for JavaScriptAdapter / fn site_syntax",
+]
+
+[[excluded_items]]
+file = "src/languages/python.rs"
+reason = "hooks only readers and edit planners call: how a language writes names, bodies and call sites, and how an edit is laid out; kin-mcp, kin-cli and the daemon read them to quote or place an entity, nothing at ingest calls them, and nothing they return is stored"
+items = [
+    "impl LanguageAdapter for PythonAdapter / fn declaration_lifecycle",
+    "impl LanguageAdapter for PythonAdapter / fn member_placement",
+    "impl LanguageAdapter for PythonAdapter / fn unit_editor",
+    "impl LanguageAdapter for PythonAdapter / fn layout_problems",
+    "impl LanguageAdapter for PythonAdapter / fn is_docstring",
+    "impl LanguageAdapter for PythonAdapter / fn body_syntax",
+    "impl LanguageAdapter for PythonAdapter / fn name_syntax",
+    "impl LanguageAdapter for PythonAdapter / fn site_syntax",
+]
+
+[[excluded_items]]
+file = "src/languages/rust_lang.rs"
+reason = "hooks only readers and edit planners call: how a language writes names, bodies and call sites, and how an edit is laid out; kin-mcp, kin-cli and the daemon read them to quote or place an entity, nothing at ingest calls them, and nothing they return is stored"
+items = [
+    "impl LanguageAdapter for RustAdapter / fn declaration_lifecycle",
+    "impl LanguageAdapter for RustAdapter / fn member_placement",
+    "impl LanguageAdapter for RustAdapter / fn unit_editor",
+    "impl LanguageAdapter for RustAdapter / fn name_syntax",
+]
+
+[[excluded_items]]
+file = "src/languages/typescript.rs"
+reason = "hooks only readers and edit planners call: how a language writes names, bodies and call sites, and how an edit is laid out; kin-mcp, kin-cli and the daemon read them to quote or place an entity, nothing at ingest calls them, and nothing they return is stored"
+items = [
+    "impl LanguageAdapter for TypeScriptAdapter / fn declaration_lifecycle",
+    "impl LanguageAdapter for TypeScriptAdapter / fn member_placement",
+    "impl LanguageAdapter for TypeScriptAdapter / fn unit_editor",
+    "impl LanguageAdapter for TypeScriptAdapter / fn body_syntax",
+    "impl LanguageAdapter for TypeScriptAdapter / fn name_syntax",
+    "impl LanguageAdapter for TypeScriptAdapter / fn site_syntax",
+]
+
+[dependencies]
+kin-io = { reason = "filesystem capability dependency retained for explicit IO boundaries; no parser extraction or held-text TODO scan calls it" }
+kin-model = { decides = ["graph"] }
+tree-sitter = { decides = ["graph"] }
+kin-grammar-typescript = { decides = ["graph"] }
+tree-sitter-javascript = { decides = ["graph"] }
+tree-sitter-python = { decides = ["graph"] }
+tree-sitter-go = { decides = ["graph"] }
+tree-sitter-java = { decides = ["graph"] }
+tree-sitter-rust = { decides = ["graph"] }
+tree-sitter-c = { decides = ["graph"] }
+tree-sitter-cpp = { decides = ["graph"] }
+tree-sitter-c-sharp = { decides = ["graph"] }
+tree-sitter-ruby = { decides = ["graph"] }
+tree-sitter-php = { decides = ["graph"] }
+tree-sitter-swift = { decides = ["graph"] }
+tree-sitter-kotlin-ng = { decides = ["graph"] }
+tree-sitter-hcl = { decides = ["graph"] }
+sha2 = { reason = "SHA-256 as FIPS 180-4 specifies it; a release changes no fingerprint or other derived value" }
+thiserror = { reason = "derives Error and Display from the format strings error.rs writes; a release changes no derived value" }
+tracing = { reason = "debug logging only; nothing it emits is stored" }
+tree-sitter-language = { decides = ["graph"] }
+serde = { reason = "serialization with a fixed, specified format; a release changes no derived value" }
+serde_json = { reason = "JSON as RFC 8259 specifies it, for metadata values; a release changes no derived value" }
+toml = { decides = ["graph"] }  # reads the Cargo manifests a Rust crate root takes its crate name from; a release that accepts another TOML version can change which manifests parse

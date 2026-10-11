@@ -70,7 +70,9 @@ RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.t
 # build below, or the cooked artifacts are keyed differently and the workspace
 # build recompiles them anyway.
 COPY --from=planner /recipe.json /recipe.json
-RUN cargo chef cook --locked --release --features kin-daemon/gcs,kin-daemon/firestore --recipe-path /recipe.json
+# Hosted images retain optional local inference for explicitly configured tenant
+# model work. This profile is separate from engine-free core archives.
+RUN cargo chef cook --locked --release --features kin-daemon/gcs,kin-daemon/firestore,kin-daemon/embeddings --recipe-path /recipe.json
 
 # Copy kin source (this repository)
 COPY . /build/kin
@@ -86,9 +88,9 @@ RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BU
       KIN_BUILD_GIT_SHA_OVERRIDE="$KIN_BUILD_GIT_SHA" \
       KIN_BUILD_DIRTY_OVERRIDE="$KIN_BUILD_DIRTY" \
       KIN_BUILD_BRANCH_OVERRIDE="$KIN_BUILD_BRANCH" \
-      cargo build --locked --release --features kin-daemon/gcs,kin-daemon/firestore --bin kin-daemon --bin kin; \
+      cargo build --locked --release --features kin-daemon/gcs,kin-daemon/firestore,kin-daemon/embeddings --bin kin-daemon --bin kin; \
     else \
-      cargo build --locked --release --features kin-daemon/gcs,kin-daemon/firestore --bin kin-daemon --bin kin; \
+      cargo build --locked --release --features kin-daemon/gcs,kin-daemon/firestore,kin-daemon/embeddings --bin kin-daemon --bin kin; \
     fi
 
 # Alternate image: Kin's MCP stdio server instead of the daemon. Select it
@@ -108,6 +110,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates l
 RUN groupadd -r kin \
     && useradd -r -g kin -d /home/kin -m kin \
     && chmod 0700 /home/kin
+LABEL ai.firelock.kin.build-profile="hosted-optional-inference"
 ENV HOME=/home/kin
 WORKDIR /app
 COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin
@@ -125,6 +128,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates c
 RUN groupadd -r kin \
     && useradd -r -g kin -d /home/kin -m kin \
     && chmod 0700 /home/kin
+LABEL ai.firelock.kin.build-profile="hosted-optional-inference"
 ENV HOME=/home/kin
 WORKDIR /app
 COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daemon

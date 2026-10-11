@@ -10,6 +10,7 @@ members = [
 
     # Kin libraries, developed here and published as independent packages.
     "crates/kin-blobs",
+    "crates/kin-io",
     "crates/kin-db",
     "crates/kin-infer",
     "crates/kin-lsp",
@@ -31,6 +32,7 @@ members = [
     "crates/kin-migrate",
     "crates/kin-runtime",
     "crates/kin-buildinfo",
+    "crates/kin-derivation-inputs",
     "crates/kin-notify",
     "crates/kin-notifier-macos",
     "crates/kin-agent",
@@ -146,6 +148,7 @@ serial_test = "4"
 kin-model = { path = "crates/kin-model", version = "=0.7.28", registry = "kin" }
 kin-blobs = { path = "crates/kin-blobs", version = "=0.1.5", registry = "kin" }
 kin-core = { path = "crates/kin-core" }
+kin-io = { path = "crates/kin-io" }
 kin-parser = { path = "crates/kin-parser" }
 kin-index = { path = "crates/kin-index" }
 kin-projection = { path = "crates/kin-projection" }
@@ -159,6 +162,7 @@ kin-review = { path = "crates/kin-review" }
 kin-migrate = { path = "crates/kin-migrate" }
 kin-runtime = { path = "crates/kin-runtime" }
 kin-buildinfo = { path = "crates/kin-buildinfo" }
+kin-derivation-inputs = { path = "crates/kin-derivation-inputs" }
 kin-notify = { path = "crates/kin-notify" }
 kin-agent = { path = "crates/kin-agent" }
 kin-cli = { path = "crates/kin-cli", default-features = false }
@@ -168,28 +172,20 @@ kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
 kin-lsp = { path = "crates/kin-lsp", version = "=0.7.19", registry = "kin" }
-# Named here for the first time. Until this import kin-infer arrived only through
-# kin-db's features and one direct pin in crates/kin-migrate, which asked for
-# `>=0.2.1`; a workspace member can say `{ workspace = true }` only for a name this
-# table carries, so that pin becomes the inherited one and its requirement tightens
-# to the version in crates/, like every other library here. `default-features =
-# false` carries kin-migrate's own intent forward: a no-op today, since kin-infer
-# declares `default = []`, and the guarantee still standing if it ever gains one.
+# `default-features = false` matters: kin-infer's default is its `engine` feature,
+# the inference engine and its dependencies. kin-cli and kin-daemon read only its
+# resource plan, and the engine arrives only through `kin-db/embeddings`, so a
+# build without embeddings compiles none of it.
 kin-infer = { path = "crates/kin-infer", version = "=0.2.44", registry = "kin", default-features = false }
-# Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
-# `[target.'cfg(...)']`-gated, so listing "metal" here asks for the macOS-only
-# kin-infer/metal backend on every target. Metal is re-enabled additively on macOS via a
-# `[target.'cfg(target_os = "macos")'.dependencies]` block in the binary/runtime crates
-# (kin-cli, kin-daemon). Feature unification makes that additive.
-#
-# This comment used to add "incl. Linux, where it cannot compile". That was stale and is
-# dropped. Every metal and accelerate site in kin-infer is gated
-# `all(feature = ..., target_os = "macos")`, including the `pub mod metal_backend;`
-# declaration, and the metal, objc2 and block crates are declared only under
-# `[target.'cfg(target_os = "macos")'.dependencies]`, so off macOS the feature turns on
-# nothing rather than failing to build. The rule above stands on its own reason, which is
-# that a workspace entry cannot be target-gated and so would state a macOS choice for
-# every target.
+# No "metal" here, and no embeddings either: each member asks for what it uses.
+# Metal is the `metal` feature of kin-cli and kin-daemon, which asks for
+# `kin-db/metal` on every target. That is safe because every metal and accelerate
+# site in kin-infer is gated `all(feature = ..., target_os = "macos")`, including the
+# `pub mod metal_backend;` declaration, and the metal, objc2 and block crates are
+# declared only under `[target.'cfg(target_os = "macos")'.dependencies]`, so off
+# macOS the feature turns on nothing rather than failing to build. It used to be an
+# unconditional macOS dependency block in kin-cli and kin-daemon, which put the whole
+# embedding stack into every macOS build, including one without default features.
 kin-db = { path = "crates/kin-db", version = "=0.7.114", registry = "kin", default-features = false }
 # Pinned to the exact version kin-db builds its name-token index with. A
 # per-token name query hits that index only when the token came out of the same
@@ -211,6 +207,26 @@ kin-vector = { path = "crates/kin-vector", version = "=0.2.1", registry = "kin" 
 # unchanged.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# A persistent local edit/test profile. Optimize dependencies once, while
+# keeping workspace code cheap to rebuild and retaining incremental state.
+[profile.iteration]
+inherits = "dev"
+opt-level = 0
+debug = 0
+incremental = true
+lto = "off"
+codegen-units = 256
+
+[profile.iteration.package."*"]
+opt-level = 3
+debug = 0
+
+# An explicit local full-suite profile retains dev assertions and overflow
+# checks while optimizing workspace code for warm test execution.
+[profile.suite]
+inherits = "iteration"
+opt-level = 2
 
 [profile.release]
 opt-level = 3

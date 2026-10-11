@@ -484,7 +484,7 @@ fn check_registry_authority() -> HealthCheck {
             detail,
         )
         .fixable()
-        .with_manual_fix("run `kin doctor --fix` to authorize a permission-only 0600 repair")
+        .with_manual_fix("run `kin doctor --fix` to authorize a permission-only repair")
     }
 }
 
@@ -2230,7 +2230,7 @@ pub const STRANDED_STAGE_RECLAIM_SCHEMA: &str = "kin.stranded-stage-reclaim.v1";
 fn check_commit_author() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
     let layout = kin_core::KinLayout::discover(&cwd)
-        .unwrap_or_else(|| kin_core::KinLayout::new(cwd.join(".kin")));
+        .unwrap_or_else(|| kin_core::KinLayout::for_working_dir(&cwd));
     commit_author_check_for(&layout)
 }
 
@@ -2255,7 +2255,7 @@ fn commit_author_check(
                     "commit_author",
                     "Author",
                     HealthStatus::Missing,
-                    "not configured; changes cannot be admitted or committed",
+                    "not configured; changes cannot be committed",
                 )
                 .with_manual_fix(kin_core::IDENTITY_REMEDIATION)
             } else {
@@ -3639,6 +3639,27 @@ fn check_setup_ledger() -> HealthCheck {
     };
 
     if verifications.is_empty() {
+        // Setup that ran into a Kin home its group can write could not record
+        // a ledger, and telling that person to run setup again is circular.
+        let unwritable = crate::commands::setup::kin_dir().ok().and_then(|kin_home| {
+            kin_core::registry::shared_write_directory_mode(&kin_home).map(|mode| (kin_home, mode))
+        });
+        if let Some((kin_home, mode)) = unwritable {
+            return HealthCheck::new(
+                "setup_ledger",
+                "Install ledger",
+                HealthStatus::Unsupported,
+                format!(
+                    "no install ledger: {} is group or world writable (mode {mode:04o}), so \
+                     `kin setup` could not record one",
+                    kin_home.display()
+                ),
+            )
+            .with_manual_fix(format!(
+                "run `kin doctor --fix` or `{}`, then `kin setup`",
+                kin_core::registry::remove_shared_write_command(&kin_home)
+            ));
+        }
         return HealthCheck::new(
             "setup_ledger",
             "Install ledger",
@@ -3977,6 +3998,41 @@ async fn check_background_work() -> HealthCheck {
 /// `kin languages` listed the language as fully extracted, so every readiness
 /// signal pointed away from the gap.
 async fn check_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let repository_enabled = kin_core::KinLayout::discover(&cwd).map_or(true, |layout| {
+        kin_core::enrichment_setting::repository_enabled(&layout)
+    });
+    with_repository_enrichment_off(
+        measured_reference_edge_coverage(graph_status).await,
+        repository_enabled,
+    )
+}
+
+/// The coverage row for a repository whose own setting switches language-server
+/// enrichment off.
+///
+/// The gaps it reports are the edges a sweep would add, and no sweep runs on
+/// such a repository, so the install-and-sweep fix the row otherwise carries is
+/// advice that changes nothing. It names the setting and the way to turn it on
+/// instead. A row with nothing to fix is left as it is.
+fn with_repository_enrichment_off(check: HealthCheck, repository_enabled: bool) -> HealthCheck {
+    if repository_enabled || check.manual_fix.is_none() {
+        return check;
+    }
+    let detail = format!(
+        "{}, so no language server adds reference and override edges across units; {}",
+        kin_core::enrichment_setting::OFF_FOR_REPOSITORY,
+        check.detail
+    );
+    HealthCheck { detail, ..check }.with_manual_fix(format!(
+        "`{}` turns enrichment on and links them",
+        kin_core::enrichment_setting::TURN_ON_COMMAND
+    ))
+}
+
+/// [`check_reference_edge_coverage`] before the repository's own enrichment
+/// setting is laid over it.
+async fn measured_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthCheck {
     // Probed first, because it needs no daemon. Every branch below that cannot
     // read the graph still reports this half, so a repository whose daemon is
     // down does not silently lose the language-server signal that used to have
@@ -3986,7 +4042,7 @@ async fn check_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthC
     // serves no language, and a row that reports it as served sends an operator
     // looking for a problem somewhere else entirely.
     let readiness = crate::commands::language_servers::probe_language_server_readiness(&cwd).await;
-    let missing_servers = missing_language_servers(&readiness);
+    let missing_servers = HostServerGaps::of(&readiness);
     // The run's one fetch. Every unreadable state is phrased by this row in its
     // own words rather than reported once by the fetch, because a row that reads
     // graph truth must never render the same whether the graph was healthy or
@@ -4097,7 +4153,7 @@ fn with_servers_only_this_shell_finds(
 /// reporting it once, and no unreadable state renders as a healthy graph.
 fn coverage_row_for_unread_graph<'a>(
     status: &'a GraphStatusForRun,
-    missing_servers: &[String],
+    missing_servers: &HostServerGaps,
 ) -> Result<&'a crate::commands::graph::GraphCommandResponse, HealthCheck> {
     const ID: &str = "reference_edge_coverage";
     const LABEL: &str = "Reference edge coverage";
@@ -4386,7 +4442,7 @@ fn coverage_unreadable(
     status: HealthStatus,
     detail: impl Into<String>,
     manual_fix: &str,
-    missing_servers: &[String],
+    missing_servers: &HostServerGaps,
 ) -> HealthCheck {
     const ID: &str = "reference_edge_coverage";
     const LABEL: &str = "Reference edge coverage";
@@ -4410,7 +4466,13 @@ fn coverage_unreadable(
             language_server_gap_detail(missing_servers)
         ),
     )
-    .with_manual_fix(language_server_fix())
+    .with_manual_fix(if missing_servers.missing.is_empty() {
+        "repair what the reason above names, then stop this daemon (`kin daemon stop`) so the \
+         next command starts one that tries the server again"
+            .to_string()
+    } else {
+        language_server_fix()
+    })
 }
 
 /// Turn the measurement into a verdict, split from its fetch so the rule is
@@ -4453,7 +4515,13 @@ pub(crate) fn reference_edge_coverage_health(
     // used to have a sibling that probed the host, and that sibling warned about
     // rust-analyzer on a Python-only repository, which is exactly the row a
     // reader learns to skip.
-    let missing_servers = coverage.languages_missing_a_language_server();
+    // A server that is not installed and one that is installed and cannot
+    // start need different repairs, so they are said apart: the first with
+    // the install that adds it, the second with the reason it gave, which
+    // is its repair. Counting the second as missing told an operator to
+    // install what they already had.
+    let missing_servers = coverage.languages_without_a_language_server();
+    let cannot_start = coverage.language_server_start_failures();
     let mut gaps = coverage.unsupportable_absence_reasons();
     if !missing_servers.is_empty() {
         gaps.push(format!(
@@ -4462,6 +4530,15 @@ pub(crate) fn reference_edge_coverage_health(
             missing_servers.join(", ")
         ));
     }
+    for failure in &cannot_start {
+        gaps.push(format!(
+            "{failure}. Import and call edges are still resolved from source"
+        ));
+    }
+    let summary = match coverage.partial_enrichment_notes() {
+        notes if notes.is_empty() => summary,
+        notes => format!("{summary}; {}", notes.join("; ")),
+    };
     if gaps.is_empty() {
         return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, summary);
     }
@@ -4486,7 +4563,13 @@ pub(crate) fn reference_edge_coverage_health(
     // The install line used to be set here and then overwritten by the
     // generic sentence below, so a first run's doctor said "install the
     // servers" and never named the command that does.
-    if missing_servers.is_empty() {
+    if missing_servers.is_empty() && !cannot_start.is_empty() {
+        check.with_manual_fix(
+            "repair what the reason above names, then stop this daemon (`kin daemon stop`) so \
+             the next command starts one that tries the server again, and treat any \"unused\" \
+             answer as unverified until cross-file edges resolve",
+        )
+    } else if missing_servers.is_empty() {
         check.with_manual_fix(
             "install the servers, then stop this daemon (`kin daemon stop`) because a daemon \
              discovers language servers once at startup and the next command starts one that \
@@ -4520,10 +4603,14 @@ fn semantic_query_readiness_without_a_daemon() -> HealthCheck {
     .with_manual_fix("run any `kin` command in the repo to auto-start the daemon")
 }
 
+/// `nothing_embeds` is why nothing will ever embed this repository with this
+/// build and model selection, or `None` when something can
+/// ([`kin_db::embed::embedding_unavailable_reason`]).
 #[cfg(feature = "vector")]
 fn semantic_query_health_from_runtime(
     daemon_url: &str,
     runtime: &crate::commands::resources::EmbedRuntimeState,
+    nothing_embeds: Option<&str>,
 ) -> HealthCheck {
     let indexed = runtime.embeddings_indexed;
     let total = runtime.embeddings_total;
@@ -4554,6 +4641,29 @@ fn semantic_query_health_from_runtime(
             HealthStatus::Healthy,
             detail,
         );
+    }
+
+    // The same holds when no embedding provider can run here: an unselected
+    // slot owes no model work, and a build without a local model cannot run the
+    // built-in one, so the queue never drains on its own. Pending would promise
+    // a fill the daemon is not doing, so say what is missing and what turns it
+    // on instead.
+    if let Some(reason) = nothing_embeds {
+        let fix = if cfg!(feature = "embeddings") {
+            "run `kin embed`, which selects the built-in embedding provider for this repository \
+             and embeds it; locate, search, refs and context answer from the graph without it"
+        } else {
+            "select an external embedding provider as docs/model-slots.md describes, or use a \
+             build with the `embeddings` feature; locate, search, refs and context answer from \
+             the graph without it"
+        };
+        return HealthCheck::new(
+            "semantic_query_readiness",
+            "Semantic query readiness",
+            HealthStatus::Unsupported,
+            format!("{detail}; search by meaning is off, so nothing will embed here: {reason}"),
+        )
+        .with_manual_fix(fix);
     }
 
     // A backlog is only work in progress if something is going to consume it.
@@ -4724,12 +4834,41 @@ fn semantic_query_readiness_sample_from_runtime(
     runtime: &crate::commands::resources::EmbedRuntimeState,
 ) -> SemanticQueryReadinessSample {
     SemanticQueryReadinessSample {
-        check: semantic_query_health_from_runtime(daemon_url, runtime),
+        check: semantic_query_health_from_runtime(
+            daemon_url,
+            runtime,
+            kin_db::embed::embedding_unavailable_reason().as_deref(),
+        ),
         embedding_coverage: Some(kin_core::memory_pressure::EmbeddingCoverage {
             pending: runtime.embeddings_pending,
             indexed: runtime.embeddings_indexed,
             total: runtime.embeddings_total,
         }),
+    }
+}
+
+/// What the host probe found wrong with this host's language servers, in the
+/// two kinds that need different repairs: not installed, and installed but
+/// unable to start, with why.
+#[derive(Debug, Clone, Default)]
+struct HostServerGaps {
+    /// `<language> (<binaries>)` for each language with no server installed.
+    missing: Vec<String>,
+    /// "<Label> enrichment unavailable: <reason>" for each language whose
+    /// server is installed and cannot start.
+    cannot_start: Vec<String>,
+}
+
+impl HostServerGaps {
+    fn of(readiness: &kin_core::reference_coverage::LanguageServerReadinessMap) -> Self {
+        Self {
+            missing: missing_language_servers(readiness),
+            cannot_start: language_server_start_failures(readiness),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.cannot_start.is_empty()
     }
 }
 
@@ -4755,13 +4894,12 @@ fn missing_language_servers(
         .into_iter()
         .filter_map(|(language, binaries)| match readiness.get(&language) {
             Some(LanguageServerReadiness::Usable) => None,
-            // A server that is installed and cannot start is NOT reported here.
+            // A server that is installed and cannot start is reported by
+            // [`language_server_start_failures`], with its reason, never here.
             // Telling an operator to install what they already have sends them
             // to the wrong repair, which is the whole reason the two states are
             // kept apart.
-            Some(LanguageServerReadiness::Unusable { reason }) => Some(format!(
-                "{language} (installed but it did not start: {reason})"
-            )),
+            Some(LanguageServerReadiness::Unusable { .. }) => None,
             // Switched-off enrichment says nothing about what is installed, so
             // it is not reported as a missing server either.
             Some(LanguageServerReadiness::Disabled) => None,
@@ -4772,17 +4910,46 @@ fn missing_language_servers(
         .collect()
 }
 
+/// One sentence per language whose server is installed and cannot start,
+/// built from its display label and its reason: "TypeScript enrichment
+/// unavailable: <reason>".
+fn language_server_start_failures(
+    readiness: &kin_core::reference_coverage::LanguageServerReadinessMap,
+) -> Vec<String> {
+    use kin_core::reference_coverage::{enrichment_unavailable_sentence, LanguageServerReadiness};
+    crate::commands::language_servers::language_server_binaries()
+        .into_iter()
+        .filter_map(|(language, _)| match readiness.get(&language) {
+            Some(LanguageServerReadiness::Unusable { reason }) => Some(
+                enrichment_unavailable_sentence(language.profile().display_name, reason.trim()),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The sentence that names what a missing server costs, and what still works.
 ///
 /// A row that reports only the loss reads as "the graph knows nothing across
 /// files", and import-bound calls are resolved from source with no language
 /// server involved at all.
-fn language_server_gap_detail(missing: &[String]) -> String {
+fn language_server_gap_detail(gaps: &HostServerGaps) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !gaps.missing.is_empty() {
+        parts.push(format!(
+            "cross-file reference and override edges unavailable: no language server found for \
+             {}",
+            gaps.missing.join(", ")
+        ));
+    }
+    // A server that is installed and cannot start leads with its own reason,
+    // never with "no language server found", which sends a reader to install
+    // what they already have.
+    parts.extend(gaps.cannot_start.iter().cloned());
     format!(
-        "cross-file reference and override edges unavailable: no language server found for {}; \
-         import and call edges are still resolved from source. Languages outside {} gain no \
+        "{}; import and call edges are still resolved from source. Languages outside {} gain no \
          reference edges in this build either",
-        missing.join(", "),
+        parts.join("; "),
         crate::commands::language_servers::language_server_binaries()
             .into_iter()
             .map(|(language, _)| language.to_string())
@@ -5375,13 +5542,17 @@ fn check_daemon_kill_record() -> HealthCheck {
     // `kin doctor` before starting one is exactly the reader who just watched a
     // command die. This row would have told them no daemon serving this store
     // has ever been killed.
-    daemon_kill_record_check_for(crate::daemon_death::recorded_for_store(layout.root()).as_ref())
+    daemon_kill_record_check_for(
+        crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
+        kin_core::enrichment_setting::state_for(&layout),
+    )
 }
 
 /// Core of [`check_daemon_kill_record`] with the record as its input, so both
 /// branches are testable on any host and without a killed daemon.
 fn daemon_kill_record_check_for(
     record: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    enrichment: kin_daemon_spawn::EnrichmentState,
 ) -> HealthCheck {
     const ID: &str = "daemon_kill_record";
     const LABEL: &str = "Daemon kills";
@@ -5394,7 +5565,7 @@ fn daemon_kill_record_check_for(
         );
     };
     HealthCheck::new(ID, LABEL, HealthStatus::Degraded, record.cause_sentence())
-        .with_manual_fix(record.remediation())
+        .with_manual_fix(record.remediation_in(enrichment))
 }
 
 /// Whether this store's language-server enrichment has been switched off.
@@ -5419,14 +5590,41 @@ fn check_suspended_sweep() -> HealthCheck {
             "not in a Kin repository, so there is no store whose sweeps could be suspended",
         );
     };
-    suspended_sweep_check_for(kin_daemon_spawn::SuspendedSweep::read(layout.root()).as_ref())
+    suspended_sweep_check_for(
+        kin_daemon_spawn::SuspendedSweep::read(layout.root()).as_ref(),
+        kin_core::enrichment_setting::repository_enabled(&layout),
+    )
 }
 
 /// Core of [`check_suspended_sweep`] with the reading as its input, so both
 /// branches are testable without a store that has lost three sweeps.
-fn suspended_sweep_check_for(suspended: Option<&kin_daemon_spawn::SuspendedSweep>) -> HealthCheck {
+///
+/// A repository whose own setting switches enrichment off runs no sweep to
+/// suspend, so the row says that and names the way to turn it on, rather than
+/// calling the sweeps healthy. Not applicable rather than degraded: it is the
+/// repository's own choice, not a fault in the install or the machine.
+fn suspended_sweep_check_for(
+    suspended: Option<&kin_daemon_spawn::SuspendedSweep>,
+    repository_enabled: bool,
+) -> HealthCheck {
     const ID: &str = "suspended_sweep";
     const LABEL: &str = "Enrichment sweeps";
+    if !repository_enabled {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            format!(
+                "{}, so no daemon runs a sweep and reference and override edges across units \
+                 are not added",
+                kin_core::enrichment_setting::OFF_FOR_REPOSITORY
+            ),
+        )
+        .with_manual_fix(format!(
+            "`{}` turns enrichment on",
+            kin_core::enrichment_setting::TURN_ON_COMMAND
+        ));
+    }
     let Some(suspended) = suspended else {
         return HealthCheck::new(
             ID,
@@ -7644,9 +7842,8 @@ mod tests {
     /// carry its own row; folding the two rows must not lose the probe.
     #[test]
     fn doctor_names_the_language_whose_missing_server_costs_cross_file_edges() {
-        let missing = missing_language_servers(
-            &kin_core::reference_coverage::LanguageServerReadinessMap::new(),
-        );
+        let missing =
+            HostServerGaps::of(&kin_core::reference_coverage::LanguageServerReadinessMap::new());
         let check = coverage_unreadable(
             HealthStatus::Unsupported,
             "no daemon running for this repository",
@@ -7867,7 +8064,7 @@ mod tests {
                     )
                 })
                 .collect();
-        let missing = missing_language_servers(&installed);
+        let missing = HostServerGaps::of(&installed);
         assert!(missing.is_empty(), "{missing:?}");
 
         let check = coverage_unreadable(
@@ -7902,25 +8099,36 @@ mod tests {
             },
         );
 
-        let missing = missing_language_servers(&readiness);
-        let javascript: Vec<&String> = missing
-            .iter()
-            .filter(|row| row.starts_with("javascript"))
-            .collect();
+        let gaps = HostServerGaps::of(&readiness);
+        assert!(
+            gaps.missing.is_empty(),
+            "a broken install is not a missing one: {gaps:?}"
+        );
         assert_eq!(
-            missing.len(),
-            1,
-            "only the broken language is reported: {missing:?}"
+            gaps.cannot_start,
+            vec![
+                "JavaScript enrichment unavailable: Could not find a valid TypeScript installation"
+                    .to_string()
+            ],
+            "the row carries the server's own reason, which names the repair"
+        );
+        let check = coverage_unreadable(
+            HealthStatus::Unsupported,
+            "no daemon running for this repository",
+            "start the daemon",
+            &gaps,
         );
         assert!(
-            javascript[0].contains("installed but it did not start"),
-            "the row must say the install is broken rather than absent: {}",
-            javascript[0]
+            check.detail.starts_with(
+                "JavaScript enrichment unavailable: Could not find a valid TypeScript installation"
+            ),
+            "the reason leads, never \"no language server found\": {}",
+            check.detail
         );
         assert!(
-            javascript[0].contains("Could not find a valid TypeScript installation"),
-            "the row must carry the server's own reason, which names the repair: {}",
-            javascript[0]
+            !check.detail.contains("no language server found"),
+            "{}",
+            check.detail
         );
     }
 
@@ -7929,9 +8137,8 @@ mod tests {
     /// would turn `kin doctor` red on every host that never installed one.
     #[test]
     fn a_missing_language_server_needs_attention_without_blocking_readiness() {
-        let missing = missing_language_servers(
-            &kin_core::reference_coverage::LanguageServerReadinessMap::new(),
-        );
+        let missing =
+            HostServerGaps::of(&kin_core::reference_coverage::LanguageServerReadinessMap::new());
         let check = coverage_unreadable(
             HealthStatus::Unsupported,
             "no daemon running for this repository",
@@ -8059,7 +8266,7 @@ mod tests {
     /// words naming what happened.
     #[test]
     fn an_unreadable_graph_reaches_the_row_rather_than_being_reported_once() {
-        let no_servers: Vec<String> = Vec::new();
+        let no_servers = HostServerGaps::default();
 
         let unreadable = [
             (
@@ -8323,6 +8530,7 @@ mod tests {
                 external_reference_edges: 0,
                 resolution: ReferenceResolution::PartiallyResolved,
                 reference_enrichment: ReferenceEnrichment::NoLanguageServer,
+                reference_enrichment_reason: None,
             }],
             totals: None,
         };
@@ -10511,6 +10719,7 @@ mod tests {
             external_reference_edges: 0,
             resolution: kin_core::reference_coverage::ReferenceResolution::PartiallyResolved,
             reference_enrichment: enrichment,
+            reference_enrichment_reason: None,
         }
     }
 
@@ -10829,6 +11038,7 @@ mod tests {
                     external_reference_edges: 0,
                     resolution: ReferenceResolution::PartiallyResolved,
                     reference_enrichment: ReferenceEnrichment::Available,
+                    reference_enrichment_reason: None,
                 }],
                 totals: None,
             }
@@ -10921,6 +11131,9 @@ mod tests {
 
     #[tokio::test]
     async fn report_is_non_empty_and_serializes_with_ids() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         // Health inspects the managed MCP client configs, which are addressed
         // from the home directory, so an unscoped run reads the developer's
         // live configuration and reports on whatever it happens to contain.
@@ -10970,6 +11183,9 @@ mod tests {
     #[test]
     #[serial]
     fn registry_authority_health_is_read_only_and_explicitly_fixable() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -11043,6 +11259,9 @@ mod tests {
     #[test]
     #[serial]
     fn shell_path_is_healthy_when_rc_declares_path_for_next_shell() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
@@ -11095,6 +11314,9 @@ mod tests {
     #[test]
     #[serial]
     fn shell_path_reads_the_file_a_non_interactive_zsh_actually_reads() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
@@ -11148,6 +11370,9 @@ mod tests {
     #[serial]
     #[cfg(not(target_os = "windows"))]
     fn shell_path_judges_the_named_shell_when_powershell_is_merely_installed() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let kin_home = tmp.path().join("kin-home");
@@ -11240,6 +11465,9 @@ mod tests {
     #[serial]
     #[cfg(unix)]
     fn a_detected_client_reaches_the_row_that_used_to_say_nothing_to_configure() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -11704,7 +11932,7 @@ mod tests {
             embedding_coverage_ever_complete: true,
             ..Default::default()
         };
-        let healthy = semantic_query_health_from_runtime("http://daemon", &topping_up);
+        let healthy = semantic_query_health_from_runtime("http://daemon", &topping_up, None);
         assert!(
             matches!(healthy.status, HealthStatus::Healthy),
             "the control: these counters alone are a healthy top-up: {:?}",
@@ -11718,7 +11946,7 @@ mod tests {
             }),
             ..topping_up.clone()
         };
-        let stale = semantic_query_health_from_runtime("http://daemon", &salvaged);
+        let stale = semantic_query_health_from_runtime("http://daemon", &salvaged, None);
         assert!(
             matches!(stale.status, HealthStatus::Stale),
             "coverage retired at open is not a backlog filling: {:?}, {}",
@@ -11761,7 +11989,7 @@ mod tests {
             embedding_coverage_ever_complete: true,
             ..Default::default()
         };
-        let filling = semantic_query_health_from_runtime("http://daemon", &topping_up);
+        let filling = semantic_query_health_from_runtime("http://daemon", &topping_up, None);
         assert!(
             matches!(filling.status, HealthStatus::Healthy),
             "a top-up on a store whose fill completed is not lost ground: {:?}",
@@ -11783,7 +12011,7 @@ mod tests {
             vector_index_discarded: Some("the persisted vector index was not loaded".to_string()),
             ..topping_up.clone()
         };
-        let stale = semantic_query_health_from_runtime("http://daemon", &discarded);
+        let stale = semantic_query_health_from_runtime("http://daemon", &discarded, None);
         assert!(matches!(stale.status, HealthStatus::Stale));
         assert!(stale.manual_fix.is_some());
         assert!(
@@ -11795,7 +12023,7 @@ mod tests {
             embed_worker_failed: true,
             ..topping_up
         };
-        let missing = semantic_query_health_from_runtime("http://daemon", &failed);
+        let missing = semantic_query_health_from_runtime("http://daemon", &failed, None);
         assert!(matches!(missing.status, HealthStatus::Missing));
         assert!(missing.detail.contains("embedding worker failed"));
         assert!(missing.manual_fix.is_some());
@@ -11822,6 +12050,7 @@ mod tests {
         let semantic = semantic_query_health_from_runtime(
             "http://daemon",
             &after_the_proof_wrote_its_own_output,
+            None,
         );
         assert!(
             matches!(semantic.status, HealthStatus::Healthy),
@@ -11843,7 +12072,7 @@ mod tests {
             ..after_the_proof_wrote_its_own_output
         };
         assert!(matches!(
-            semantic_query_health_from_runtime("http://daemon", &first_fill).status,
+            semantic_query_health_from_runtime("http://daemon", &first_fill, None).status,
             HealthStatus::Pending
         ));
     }
@@ -11853,6 +12082,47 @@ mod tests {
     /// vector-sidecar contract, the worker never starts and `/embed` refuses,
     /// so the queue is not draining and no amount of waiting changes that.
     /// Naming the host's limit is honest; reporting progress is not.
+    /// A build or model selection that cannot embed leaves the same queue a
+    /// first fill does, and nothing drains it: the default archive with no
+    /// external provider, or a local-model build before `kin embed` selected
+    /// the built-in one. Reporting that as a first pass still filling is the
+    /// pending that never resolves, so it is unsupported with the reason named,
+    /// and the identical runtime reports pending again once something can embed.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_backlog_no_provider_can_embed_is_unsupported_rather_than_pending() {
+        let unselected = crate::commands::resources::EmbedRuntimeState {
+            embeddings_indexed: 0,
+            embeddings_total: 6,
+            embeddings_pending: 6,
+            ..Default::default()
+        };
+        let reason = "this Kin build has no local embedding model, and no external embedding \
+                      provider is selected for this repository";
+
+        let semantic =
+            semantic_query_health_from_runtime("http://daemon", &unselected, Some(reason));
+        assert!(
+            matches!(semantic.status, HealthStatus::Unsupported),
+            "a queue no provider will consume is not a first pass filling: {:?}",
+            semantic.status
+        );
+        assert!(
+            semantic.detail.contains("search by meaning is off")
+                && semantic.detail.contains(reason)
+                && !semantic.detail.contains("still filling"),
+            "the reason has to be named where the check is read: {}",
+            semantic.detail
+        );
+        assert!(semantic.manual_fix.is_some());
+        assert!(assemble_health_report("test".to_string(), vec![semantic]).healthy());
+
+        assert!(matches!(
+            semantic_query_health_from_runtime("http://daemon", &unselected, None).status,
+            HealthStatus::Pending
+        ));
+    }
+
     #[cfg(feature = "vector")]
     #[test]
     fn a_backlog_nothing_will_drain_is_reported_unsupported_rather_than_pending() {
@@ -11864,7 +12134,7 @@ mod tests {
             ..Default::default()
         };
 
-        let semantic = semantic_query_health_from_runtime("http://daemon", &no_local_sidecar);
+        let semantic = semantic_query_health_from_runtime("http://daemon", &no_local_sidecar, None);
         assert!(
             matches!(semantic.status, HealthStatus::Unsupported),
             "a queue nothing will consume is not work in progress: {:?}",
@@ -11886,7 +12156,7 @@ mod tests {
             ..no_local_sidecar
         };
         assert!(matches!(
-            semantic_query_health_from_runtime("http://daemon", &local).status,
+            semantic_query_health_from_runtime("http://daemon", &local, None).status,
             HealthStatus::Pending
         ));
     }
@@ -11908,7 +12178,7 @@ mod tests {
             ..Default::default()
         };
 
-        let semantic = semantic_query_health_from_runtime("http://daemon", &discarded);
+        let semantic = semantic_query_health_from_runtime("http://daemon", &discarded, None);
 
         assert!(matches!(semantic.status, HealthStatus::Stale));
         assert!(
@@ -11937,7 +12207,7 @@ mod tests {
             embeddings_pending: 0,
             ..discarded
         };
-        let settled = semantic_query_health_from_runtime("http://daemon", &rebuilt);
+        let settled = semantic_query_health_from_runtime("http://daemon", &rebuilt, None);
         assert!(
             matches!(settled.status, HealthStatus::Healthy),
             "a paid-off discard must not hold the check yellow forever: {:?}",
@@ -11965,7 +12235,7 @@ mod tests {
             ..Default::default()
         };
 
-        let semantic = semantic_query_health_from_runtime("http://daemon", &mid_first_fill);
+        let semantic = semantic_query_health_from_runtime("http://daemon", &mid_first_fill, None);
         assert!(
             matches!(semantic.status, HealthStatus::Pending),
             "a first fill in progress is expected first-run work, not a failure: {:?}",
@@ -12013,7 +12283,7 @@ mod tests {
             ),
             ..mid_first_fill.clone()
         };
-        let after_discard = semantic_query_health_from_runtime("http://daemon", &discarded);
+        let after_discard = semantic_query_health_from_runtime("http://daemon", &discarded, None);
         assert!(
             matches!(after_discard.status, HealthStatus::Stale),
             "a discarded index is still the announced blocking state: {:?}",
@@ -12036,7 +12306,7 @@ mod tests {
             embedding_coverage_ever_complete: true,
             ..mid_first_fill.clone()
         };
-        let after_top_up = semantic_query_health_from_runtime("http://daemon", &topping_up);
+        let after_top_up = semantic_query_health_from_runtime("http://daemon", &topping_up, None);
         assert!(
             matches!(after_top_up.status, HealthStatus::Healthy),
             "a backlog on a store whose fill completed is not lost ground: {:?}",
@@ -12049,7 +12319,7 @@ mod tests {
             embed_worker_failed: true,
             ..mid_first_fill
         };
-        let after_wedge = semantic_query_health_from_runtime("http://daemon", &wedged);
+        let after_wedge = semantic_query_health_from_runtime("http://daemon", &wedged, None);
         assert!(
             matches!(after_wedge.status, HealthStatus::Missing),
             "a failed embedding worker is a failure at any point in a store's life: {:?}",
@@ -12392,6 +12662,9 @@ mod tests {
     #[test]
     #[serial]
     fn mcp_health_binds_to_the_exact_managed_launcher() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let kin_home = dir.path().join("kin-home");
         let managed = kin_home.join("bin/kin");
@@ -13780,7 +14053,8 @@ mod tests {
     /// a row saying so ambiguously.
     #[test]
     fn the_daemon_kill_row_reports_a_record_and_stays_quiet_without_one() {
-        let quiet = daemon_kill_record_check_for(None);
+        let quiet =
+            daemon_kill_record_check_for(None, kin_daemon_spawn::EnrichmentState::Available);
         assert!(matches!(quiet.status, HealthStatus::Healthy));
         assert!(quiet.manual_fix.is_none());
 
@@ -13796,7 +14070,10 @@ mod tests {
             limit_bytes: Some(12 * 1024 * 1024 * 1024),
             last_rss_bytes: None,
         };
-        let reported = daemon_kill_record_check_for(Some(&record));
+        let reported = daemon_kill_record_check_for(
+            Some(&record),
+            kin_daemon_spawn::EnrichmentState::Available,
+        );
         assert!(matches!(reported.status, HealthStatus::Degraded));
         assert!(
             reported
@@ -13817,6 +14094,20 @@ mod tests {
             !blocks_readiness(&reported),
             "a machine too small for this repository is not a broken install"
         );
+
+        // A repository switched off by its own setting already runs no sweep,
+        // so the fix offers no enrichment switch to turn off.
+        let off = daemon_kill_record_check_for(
+            Some(&record),
+            kin_daemon_spawn::EnrichmentState::OffForRepository,
+        );
+        assert!(
+            off.manual_fix.as_deref().is_some_and(
+                |fix| !fix.contains("KIN_DAEMON_DISABLE_LSP") && fix.contains("To recover:")
+            ),
+            "{:?}",
+            off.manual_fix
+        );
     }
 
     /// The sweep row exists because the page reads healthy while enrichment is
@@ -13825,7 +14116,7 @@ mod tests {
     /// must not grow a row that reads like a complaint.
     #[test]
     fn the_sweep_row_reports_a_suspension_and_stays_quiet_without_one() {
-        let quiet = suspended_sweep_check_for(None);
+        let quiet = suspended_sweep_check_for(None, true);
         assert!(matches!(quiet.status, HealthStatus::Healthy));
         assert!(quiet.manual_fix.is_none());
         assert!(
@@ -13835,7 +14126,7 @@ mod tests {
         );
 
         let suspended = kin_daemon_spawn::SuspendedSweep { interruptions: 3 };
-        let reported = suspended_sweep_check_for(Some(&suspended));
+        let reported = suspended_sweep_check_for(Some(&suspended), true);
         assert!(matches!(reported.status, HealthStatus::Degraded));
         assert!(
             reported.detail.contains('3') && reported.detail.contains("suspended"),
@@ -13853,6 +14144,53 @@ mod tests {
         assert!(
             !blocks_readiness(&reported),
             "a store whose sweeps keep dying is telling you about the machine, not the install"
+        );
+    }
+
+    /// A repository whose own setting switches enrichment off is told so on
+    /// the sweep row, with the way to turn it on, and the coverage row trades
+    /// its install-and-sweep fix for the same command, because no sweep runs.
+    #[test]
+    fn a_repository_switched_off_by_its_own_setting_is_named_with_the_way_back() {
+        let off = suspended_sweep_check_for(None, false);
+        assert!(matches!(off.status, HealthStatus::Unsupported));
+        assert!(
+            off.detail.contains("off for this repository"),
+            "{}",
+            off.detail
+        );
+        assert_eq!(
+            off.manual_fix.as_deref(),
+            Some("`kin daemon sweep --enable` turns enrichment on")
+        );
+        assert!(
+            !blocks_readiness(&off),
+            "an operator's choice blocks nothing"
+        );
+
+        let gap = HealthCheck::new(
+            "reference_edge_coverage",
+            "Reference edge coverage",
+            HealthStatus::Pending,
+            "python: 3 files and no cross-file reference edge between them",
+        )
+        .with_manual_fix("install the servers, then `kin daemon sweep`");
+        let named = with_repository_enrichment_off(gap.clone(), false);
+        assert!(
+            named
+                .detail
+                .starts_with("language-server enrichment is off for this repository"),
+            "{}",
+            named.detail
+        );
+        assert_eq!(
+            named.manual_fix.as_deref(),
+            Some("`kin daemon sweep --enable` turns enrichment on and links them")
+        );
+        assert_eq!(
+            with_repository_enrichment_off(gap.clone(), true).manual_fix,
+            gap.manual_fix,
+            "a repository that enriches keeps the row it had"
         );
     }
 

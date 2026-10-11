@@ -66,12 +66,23 @@ async fn assert_refs_source_verdict_parity(
             expected_reason.is_none(),
             "CLI: {cli_negative}; MCP: {mcp}"
         );
-        if let Some(reason) = expected_reason {
-            assert!(
-                negative["trust_reason"].as_str().unwrap().contains(reason),
-                "{negative}"
-            );
-        }
+    }
+    if let Some(reason) = expected_reason {
+        assert!(
+            cli_negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains(reason),
+            "{cli_negative}"
+        );
+        assert_eq!(mcp["_kin"]["verdict"]["state"], "inconclusive", "{mcp}");
+        assert!(
+            mcp["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .contains(reason),
+            "{mcp}"
+        );
     }
     assert_eq!(
         cli.lines.join("\n").contains("Kin cannot rule out"),
@@ -91,7 +102,11 @@ async fn refs_endpoint_qualifies_local_binding_like_mcp_through_enrichment() {
 
     std::fs::remove_file(repo.path().join("local.py")).unwrap();
     waiting_admit(&state, "refs remove local target").await;
-    assert_refs_source_verdict_parity(&state, Some("local_binding_outstanding")).await;
+    // The binding left outstanding is `caller.py`'s import of `work`, which
+    // sits outside `unused_probe` and spells none of its names. Both surfaces
+    // count it beside the answer under the same code, and neither lets the
+    // empty answer stand as an absence.
+    assert_refs_source_verdict_parity(&state, Some("local_binding_unrelated")).await;
 
     std::fs::write(repo.path().join("local.py"), WAITING_TARGET).unwrap();
     waiting_admit(&state, "refs restore local target").await;

@@ -125,13 +125,13 @@ impl StoreFootprint {
         };
         match (self.git_objects.as_ref(), self.ratio_to_git_objects()) {
             (Some(git), Some(ratio)) => format!(
-                "{} under .kin/, {} the {} Git object store",
+                "{} in the store, {} the {} Git object store",
                 store.render(),
                 render_ratio(ratio),
                 git.render()
             ),
             _ => format!(
-                "{} under .kin/ (no Git object store here to compare against)",
+                "{} in the store (no Git object store here to compare against)",
                 store.render()
             ),
         }

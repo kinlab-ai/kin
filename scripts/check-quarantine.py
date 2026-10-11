@@ -142,7 +142,8 @@ def parse_rows(text):
     bookkeeping lives, so a TOML-only read would report every row as having no
     ticket. tomllib still runs, in `load_config`, to prove the file is valid
     TOML. Scheduling-only overrides assign a declared test group without
-    retries; they do not belong to quarantine.
+    retries; they do not belong to quarantine. A platform selector narrows
+    where that scheduling rule applies and does not make it a retry rule.
     """
 
     config = tomllib.loads(text)
@@ -174,7 +175,7 @@ def parse_rows(text):
                     break
         if (
             not meta
-            and set(override) == {"filter", "test-group"}
+            and set(override) - {"platform"} == {"filter", "test-group"}
             and isinstance(override["test-group"], str)
             and override["test-group"] in groups
         ):
@@ -501,19 +502,37 @@ max-threads = 1
 filter = 'binary_id(=pkg::target) & test(=a_test_that_is_defined)'
 test-group = 'model-download'
 """
-        findings, warnings = grade(scheduling + clean)
-        if findings or warnings or len(parse_rows(scheduling + clean)) != 1:
-            raise AssertionError(
-                "control failed: a scheduling-only group was treated as quarantine"
-            )
-        for untracked in (
-            scheduling + "retries = 2\n",
-            scheduling.replace("test-group = 'model-download'", "test-group = 'unknown'"),
-        ):
-            findings, _ = grade(untracked)
-            if not any(finding.startswith("no-ticket:") for finding in findings):
+        platform_scheduling = scheduling.replace(
+            "[[profile.default.overrides]]",
+            "[[profile.default.overrides]]\nplatform = 'cfg(target_os = \"macos\")'",
+        ).replace("test(=a_test_that_is_defined)", "test(/^watcher::tests::/)")
+        for scheduled in (scheduling, platform_scheduling):
+            findings, warnings = grade(scheduled + clean)
+            if findings or warnings or len(parse_rows(scheduled + clean)) != 1:
                 raise AssertionError(
-                    "control failed: a retry or unknown group bypassed quarantine validation"
+                    "control failed: a scheduling-only group was treated as quarantine"
+                )
+            for untracked in (
+                scheduled + "retries = 2\n",
+                scheduled + "retries = 0\n",
+                scheduled + "slow-timeout = '20s'\n",
+                scheduled.replace("test-group = 'model-download'", "test-group = 'unknown'"),
+            ):
+                findings, _ = grade(untracked)
+                if not any(finding.startswith("no-ticket:") for finding in findings):
+                    raise AssertionError(
+                        "control failed: a retry, extra setting or unknown group "
+                        "bypassed quarantine validation"
+                    )
+            ticketed = scheduled.replace(
+                "[[profile.default.overrides]]",
+                f"{COMMENT_MARKER} ticket={dict(KEY.findall(clean))['ticket']}\n"
+                "[[profile.default.overrides]]",
+            )
+            findings, _ = grade(ticketed)
+            if not any(finding.startswith("no-retries:") for finding in findings):
+                raise AssertionError(
+                    "control failed: a ticketed row bypassed quarantine validation"
                 )
         for retries in ("2", '{ count = 2, backoff = "fixed", delay = "1s" }'):
             try:

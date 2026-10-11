@@ -239,6 +239,11 @@ impl PreparedRepositoryInit {
         &self.config
     }
 
+    /// The staged layout, for a record that must be published with the store.
+    pub(crate) fn layout(&self) -> &KinLayout {
+        &self.layout
+    }
+
     pub fn manifest(&self) -> &KinManifest {
         &self.manifest
     }
@@ -323,10 +328,17 @@ impl PreparedRepositoryInit {
     /// Running it here rather than after publication is the cheapest correct
     /// place: nothing is visible yet, so a failure aborts the conversion and
     /// cleans up staging instead of publishing a store that misreports itself.
-    pub fn reconcile_bootstrap_hydration_semantics(&self, declared: Option<u32>) -> Result<()> {
+    pub fn reconcile_bootstrap_hydration_semantics(
+        &self,
+        declared: Option<u32>,
+        declared_derivation: Option<&str>,
+    ) -> Result<()> {
+        let read = crate::hydration_semantics::read(&self.layout);
         if crate::hydration_semantics::transfer_preserves_creation_record(
-            crate::hydration_semantics::read(&self.layout).created_under(),
+            read.created_under(),
+            read.creation_derivation(),
             declared,
+            declared_derivation,
         ) {
             return Ok(());
         }
@@ -628,7 +640,7 @@ fn refuse_adoption_over_existing_replica(working_dir: &Path, adopted: &str) -> R
     let Ok(canonical_working_dir) = working_dir.canonicalize() else {
         return Ok(());
     };
-    let layout = KinLayout::new(canonical_working_dir.join(".kin"));
+    let layout = KinLayout::for_working_dir(&canonical_working_dir);
     let Ok(existing) = KinManifest::load(&layout.manifest_path()) else {
         return Ok(());
     };
@@ -655,7 +667,7 @@ fn init_with_config(
     let canonical_working_dir = working_dir
         .canonicalize()
         .map_err(|error| KinError::io(working_dir, error))?;
-    let kin_dir = canonical_working_dir.join(".kin");
+    let kin_dir = crate::layout::reserve_store_root(&canonical_working_dir)?;
     match std::fs::symlink_metadata(&kin_dir) {
         Ok(_) => {
             return Err(KinError::AlreadyInitialized(
@@ -666,13 +678,15 @@ fn init_with_config(
         Err(error) => return Err(KinError::io(&kin_dir, error)),
     }
 
-    let staging_parent = canonical_working_dir.parent().ok_or_else(|| {
-        KinError::Other(format!(
-            "repository root has no parent for atomic staging: {}",
-            canonical_working_dir.display()
-        ))
-    })?;
-    crate::init_staging::require_writable_init_directories(staging_parent, &canonical_working_dir)?;
+    let staging_parent = crate::layout::store_staging_parent(&canonical_working_dir, &kin_dir)
+        .ok_or_else(|| {
+            KinError::Other(format!(
+                "repository root has no parent for atomic staging: {}",
+                canonical_working_dir.display()
+            ))
+        })?;
+    let staging_parent = staging_parent.as_path();
+    crate::init_staging::require_writable_init_directories(staging_parent, &kin_dir)?;
     let staging_dir = staging_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let admission_case = detect_admission_case(&canonical_working_dir)?;
     let mut prepared =
@@ -687,6 +701,7 @@ fn init_with_config(
         None,
     )?;
     prepared.commit_repository_bootstrap(transaction)?;
+    crate::layout::stage_store_placement(&staging_dir, &kin_dir, &canonical_working_dir)?;
     let result = publish_repository_layout(prepared)?;
 
     info!(
@@ -1146,7 +1161,7 @@ fn reserve_repository_init_stage_owner(
     }
     if let Err(error) = (|| -> std::io::Result<()> {
         owner_file.write_all(&bytes)?;
-        owner_file.sync_all()
+        kin_blobs::durable::sync_all(&owner_file)
     })() {
         drop(owner_file);
         let _ = std::fs::remove_file(&owner_path);
@@ -1214,7 +1229,7 @@ fn publish_repository_init_stage_owner(
     (|| -> std::io::Result<()> {
         lease.owner_file.seek(SeekFrom::Start(0))?;
         lease.owner_file.write_all(&bytes)?;
-        lease.owner_file.sync_all()
+        kin_blobs::durable::sync_all(&lease.owner_file)
     })()
     .map_err(|error| KinError::io(&lease.owner_path, error))?;
     lease.record = record;
@@ -1698,6 +1713,7 @@ fn build_repository_bootstrap_transaction(
             "initialize unborn repository workspace".to_string()
         },
         external_objects: Vec::new(),
+        git_snapshot_proofs: Vec::new(),
         changes: initial_change.into_iter().collect(),
         aliases: Vec::new(),
         git_authority_delta: None,
@@ -1794,10 +1810,15 @@ where
                     "streamed Git bootstrap cannot use transfer admission".into(),
                 ))
             }
+            // A Git history the transition verifier cannot account for in
+            // full starts its lineage at this bootstrap instead, verified by
+            // re-deriving the committed graph, so the first daemon start has
+            // no re-qualification to run on a store this build just wrote.
             (None, Some(changes)) => authority.commit_git_bootstrap_with_binding_history(
                 transaction,
                 changes,
                 &kin_index::binding_history::LocalBindingHistoryVerifier,
+                &kin_index::binding_history::RederivationBindingHistoryVerifier::default(),
             ),
             (Some(case), None) => {
                 authority.commit_transferred_repository_transaction(transaction, Some(case))
@@ -2125,14 +2146,17 @@ fn canonical_staging_root(staging_kin_dir: &Path) -> Result<PathBuf> {
 }
 
 fn canonical_final_kin_dir(final_kin_dir: &Path) -> Result<PathBuf> {
-    if !final_kin_dir.is_absolute()
-        || final_kin_dir.file_name() != Some(std::ffi::OsStr::new(".kin"))
-    {
+    // A store kept outside its working tree may carry any name; the name is
+    // not what makes it a store, its canonical parent and its record are.
+    let Some(final_name) = final_kin_dir
+        .file_name()
+        .filter(|_| final_kin_dir.is_absolute())
+    else {
         return Err(KinError::Other(format!(
             "published repository path must be an absolute .kin directory: {}",
             final_kin_dir.display()
         )));
-    }
+    };
     let supplied_parent = final_kin_dir.parent().ok_or_else(|| {
         KinError::Other(format!(
             "published repository path has no parent: {}",
@@ -2142,7 +2166,7 @@ fn canonical_final_kin_dir(final_kin_dir: &Path) -> Result<PathBuf> {
     let parent = supplied_parent
         .canonicalize()
         .map_err(|error| KinError::io(supplied_parent, error))?;
-    let canonical = parent.join(".kin");
+    let canonical = parent.join(final_name);
     if canonical != final_kin_dir {
         return Err(KinError::Other(format!(
             "published repository path must use its canonical parent: {}",
@@ -2215,7 +2239,23 @@ fn open_to_flush(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
+/// Flush every file and directory under `path` to stable storage.
+///
+/// Every entry is durable once this returns, as it always was. What changed is
+/// how that is paid for on Apple platforms, where the full flush `sync_all`
+/// issues (`F_FULLFSYNC`) empties the whole drive cache: about 9 ms an entry
+/// on an Apple SSD, and a staged repository holds a file per source body and
+/// per Git object, so the two walks before publication spent 13 of a
+/// 4,399-file repository's admission seconds here. Each entry is handed to the
+/// drive with an ordinary `fsync` instead, and one full flush at the end makes
+/// all of them durable together. Elsewhere an entry's `fsync` is already the
+/// full flush, and each gets its own as before.
 fn sync_layout_recursively(path: &Path) -> Result<()> {
+    hand_layout_to_drive(path)?;
+    flush_drive_cache(path)
+}
+
+fn hand_layout_to_drive(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| KinError::io(path, error))?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -2226,7 +2266,7 @@ fn sync_layout_recursively(path: &Path) -> Result<()> {
     }
     if file_type.is_file() {
         let file = open_to_flush(path).map_err(|error| KinError::io(path, error))?;
-        return file.sync_all().map_err(|error| KinError::io(path, error));
+        return hand_to_drive(&file).map_err(|error| KinError::io(path, error));
     }
     if !file_type.is_dir() {
         return Err(KinError::Other(format!(
@@ -2240,17 +2280,60 @@ fn sync_layout_recursively(path: &Path) -> Result<()> {
         .map_err(|error| KinError::io(path, error))?;
     children.sort_by_key(std::fs::DirEntry::file_name);
     for child in children {
-        sync_layout_recursively(&child.path())?;
+        hand_layout_to_drive(&child.path())?;
     }
+    hand_directory_to_drive(path)
+}
+
+/// Move one open file's data and metadata to the drive. On Apple platforms an
+/// ordinary `fsync`, which leaves the drive's own cache for
+/// [`flush_drive_cache`]; elsewhere `fsync` is the full flush.
+#[cfg(target_vendor = "apple")]
+fn hand_to_drive(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fsync reads a descriptor `file` owns for the whole call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn hand_to_drive(file: &File) -> std::io::Result<()> {
+    kin_blobs::durable::sync_all(&file)
+}
+
+/// [`sync_parent_directory`] for a directory the walk reached, handing it to
+/// the drive as [`hand_to_drive`] hands a file.
+#[cfg(unix)]
+fn hand_directory_to_drive(path: &Path) -> Result<()> {
+    let directory = std::fs::File::open(path).map_err(|error| KinError::io(path, error))?;
+    hand_to_drive(&directory).map_err(|error| KinError::io(path, error))
+}
+
+#[cfg(not(unix))]
+fn hand_directory_to_drive(path: &Path) -> Result<()> {
     sync_parent_directory(path)
+}
+
+/// Empty the drive's cache, making everything [`hand_to_drive`] handed it
+/// durable. Only Apple platforms need it: elsewhere each entry's own `fsync`
+/// already reached stable storage.
+#[cfg(target_vendor = "apple")]
+fn flush_drive_cache(path: &Path) -> Result<()> {
+    sync_parent_directory(path)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn flush_drive_cache(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
     let directory = std::fs::File::open(path).map_err(|error| KinError::io(path, error))?;
-    directory
-        .sync_all()
-        .map_err(|error| KinError::io(path, error))
+    kin_blobs::durable::sync_all(&directory).map_err(|error| KinError::io(path, error))
 }
 
 fn sync_publication_parents(source_parent: &Path, destination_parent: &Path) -> Result<()> {
@@ -3174,10 +3257,23 @@ fn scan_repository_init_stages(
         StageScanScope::Destination(final_kin_dir) => Some(exact_path_identity(final_kin_dir)?),
         StageScanScope::Unbound => None,
     };
-    let mut entries = std::fs::read_dir(staging_parent)
-        .map_err(|error| KinError::io(staging_parent, error))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .map_err(|error| KinError::io(staging_parent, error))?;
+    // Every candidate below is named `.kin.init-...`, so only those entries are
+    // kept and sorted. The parent is often a directory Kin does not own, such
+    // as a temp directory or a folder of many checkouts, and can hold far more
+    // unrelated entries than stages.
+    let mut entries = Vec::new();
+    for entry in
+        std::fs::read_dir(staging_parent).map_err(|error| KinError::io(staging_parent, error))?
+    {
+        let entry = entry.map_err(|error| KinError::io(staging_parent, error))?;
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(INIT_STAGE_PREFIX.as_bytes())
+        {
+            entries.push(entry);
+        }
+    }
     entries.sort_by_key(std::fs::DirEntry::file_name);
     let mut outcome = StageScanOutcome::default();
     for entry in entries {
@@ -3951,13 +4047,19 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
 
-    /// An unborn init under a parent this user cannot write refuses by name
-    /// before it stages anything, the same as a Git admission does.
+    /// An unborn in-tree init under a parent this user cannot write refuses by
+    /// name before staging. Default central storage needs no write there.
     #[cfg(unix)]
     #[test]
     fn an_unborn_init_under_a_read_only_parent_is_refused_by_name() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        if crate::git_init::tests::run_in_isolated_store(
+            "init::tests::an_unborn_init_under_a_read_only_parent_is_refused_by_name",
+            &["central", "in-tree"],
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("app");
         let working = parent.join("project");
@@ -3975,12 +4077,22 @@ mod tests {
             return;
         }
 
-        let error = init(&working).unwrap_err().to_string();
-
-        let parent_shown = parent.canonicalize().unwrap().display().to_string();
-        assert!(error.contains("kin init cannot start"), "{error}");
-        assert!(error.contains(&format!("in {parent_shown}")), "{error}");
-        assert!(error.contains("Nothing was changed"), "{error}");
+        let initialized = init(&working);
+        if crate::layout::default_store_placement() == crate::layout::StorePlacement::Central {
+            let result = initialized.expect("central storage does not write the source parent");
+            assert_eq!(
+                result.layout.root(),
+                crate::layout::store_root_for(&working)
+            );
+            assert!(result.layout.root().is_dir());
+            assert_eq!(std::fs::read_dir(&working).unwrap().count(), 0);
+        } else {
+            let error = initialized.unwrap_err().to_string();
+            let parent_shown = parent.canonicalize().unwrap().display().to_string();
+            assert!(error.contains("kin init cannot start"), "{error}");
+            assert!(error.contains(&format!("in {parent_shown}")), "{error}");
+            assert!(error.contains("Nothing was changed"), "{error}");
+        }
         assert!(!working.join(".kin").exists());
         let staged: Vec<_> = std::fs::read_dir(&parent)
             .unwrap()
@@ -4281,10 +4393,9 @@ mod tests {
         let path = directory.path().join("staged.toml");
         std::fs::write(&path, b"mode = \"native\"\n").unwrap();
 
-        let refused = File::open(&path)
-            .expect("a read-only handle opens")
-            .sync_all()
-            .expect_err("a read-only handle must not be able to flush on Windows");
+        let refused =
+            kin_blobs::durable::sync_all(&File::open(&path).expect("a read-only handle opens"))
+                .expect_err("a read-only handle must not be able to flush on Windows");
         let access_denied = i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED)
             .expect("a documented WIN32_ERROR fits an i32");
         assert_eq!(
@@ -4293,9 +4404,7 @@ mod tests {
             "the refusal must be the documented access denial, not something else: {refused}"
         );
 
-        open_to_flush(&path)
-            .expect("a writable handle opens")
-            .sync_all()
+        kin_blobs::durable::sync_all(&open_to_flush(&path).expect("a writable handle opens"))
             .expect("the same file must flush through a writable handle");
     }
 

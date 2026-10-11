@@ -289,8 +289,10 @@ pub fn verify_external_import_predecessor(
     if kin_blobs::digest(&bytes) != digest {
         return Err(invalid("predecessor source blob digest mismatch"));
     }
+    // Named under the predecessor's own manifests, as it was derived.
+    let project = kin_index::TreeProjectFiles::from_blobs(&predecessor.tree, blobs);
     let indexed = kin_index::IndexPipeline::new()
-        .index_file_content_with_tests(file, &bytes, digest)?
+        .index_file_content_in(file, &bytes, digest, &project)?
         .indexed_file;
     verify_stored_source(relation, source, &indexed)
 }
@@ -403,6 +405,7 @@ pub(crate) fn prepare<G: GraphStore>(
     // Old blobs are CAS inputs, never workspace paths. Cache per immutable
     // version so multiple external calls in one file pay for one parse.
     let mut parsed = HashMap::new();
+    let project = kin_index::GraphProjectFiles::new(graph, blobs);
     for relation in old {
         if !kin_index::is_external_import_placeholder(relation) {
             return Err(invalid(format!(
@@ -428,7 +431,7 @@ pub(crate) fn prepare<G: GraphStore>(
         if !stable_entities.iter().any(|entity| entity.id == source.id) {
             continue;
         }
-        let proof = prove_stored(relation, source, indexed, blobs, &mut parsed)?;
+        let proof = prove_stored(relation, source, indexed, blobs, &project, &mut parsed)?;
         if retire_unprovable {
             if !matches!(proof, SourceProof::Proven) {
                 tracing::debug!(
@@ -455,6 +458,7 @@ fn prove_stored(
     source: &Entity,
     indexed: &IndexedFile,
     blobs: &BlobStore,
+    project: &dyn kin_parser::project_manifest::ProjectFiles,
     parsed: &mut HashMap<String, IndexedFile>,
 ) -> Result<SourceProof> {
     if !kin_index::is_external_import_placeholder(relation) {
@@ -478,7 +482,7 @@ fn prove_stored(
             return Err(invalid("old source blob digest mismatch"));
         }
         let previous = kin_index::IndexPipeline::new()
-            .index_file_content_with_tests(&indexed.file_id, &bytes, digest)?
+            .index_file_content_in(&indexed.file_id, &bytes, digest, project)?
             .indexed_file;
         entry.insert(previous);
     }
@@ -504,6 +508,7 @@ pub(crate) fn retire_rebound<G: GraphStore>(
 ) -> Result<Vec<Relation>> {
     let mut files = HashSet::new();
     let mut removed = Vec::new();
+    let project = kin_index::GraphProjectFiles::new(graph, blobs);
     for binding in rebound {
         let Some(id) = binding.src.as_entity() else {
             continue;
@@ -570,7 +575,7 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             return Err(invalid("waiting source blob digest mismatch"));
         }
         let indexed = kin_index::IndexPipeline::new()
-            .index_file_content_with_tests(&file, &bytes, digest)?
+            .index_file_content_in(&file, &bytes, digest, &project)?
             .indexed_file;
         if !matches!(indexed.parse_state, ParseState::Valid) {
             return Err(invalid("waiting source parse is incomplete"));
@@ -622,9 +627,19 @@ pub(crate) fn retire_rebound<G: GraphStore>(
             .iter()
             .filter(|relation| !claims_external_import(relation))
         {
+            // An external placeholder target is derived from the import
+            // coordinate the source names and is never admitted as an entity,
+            // so its absence from the graph says nothing about the cache. An
+            // `Overrides` edge to a base class's member from another package is
+            // the case that reached here: the placeholder predicate proves the
+            // target id from the module and symbol, which no cache supplies.
+            let placeholder = kin_index::is_external_import_placeholder(relation)
+                .then(|| relation.dst.as_entity())
+                .flatten();
             for id in [relation.src, relation.dst]
                 .iter()
                 .filter_map(|node| node.as_entity())
+                .filter(|id| Some(*id) != placeholder)
             {
                 if removed_entities.contains(&id) {
                     return Err(invalid(

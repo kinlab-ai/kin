@@ -72,9 +72,16 @@ pub enum SourceDerivationUnavailable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceEntityBinding {
+    /// Exact current owner, retained so a consumer can scope source-owned debt
+    /// without inferring roles from a source's path or name.
+    pub entity_id: kin_model::EntityId,
+    pub role: kin_model::EntityRole,
     pub file: FilePathId,
     /// Absent for missing, malformed or noncanonical source-digest metadata.
     pub digest: Option<Hash256>,
+    /// A declaration span on this source. No body or metadata is copied.
+    /// Conflicting origin/span identities cannot establish ownership.
+    pub declaration_bytes: Option<(usize, usize)>,
 }
 
 impl SourceEntityBinding {
@@ -83,8 +90,18 @@ impl SourceEntityBinding {
     pub fn from_entity(entity: &Entity) -> Option<Self> {
         let file = entity_file(entity)?;
         Some(Self {
+            entity_id: entity.id,
+            role: entity.role,
             file: file.clone(),
             digest: Self::source_digest(entity),
+            declaration_bytes: entity.span.as_ref().and_then(|span| {
+                (span.start_byte < span.end_byte
+                    && entity
+                        .file_origin
+                        .as_ref()
+                        .is_none_or(|origin| origin == &span.file))
+                .then_some((span.start_byte, span.end_byte))
+            }),
         })
     }
 
@@ -518,6 +535,180 @@ impl InMemoryGraph {
     }
 }
 
+/// One step of an inventory walk: the facts of one admitted artifact, the
+/// source evidence no admitted artifact owns, or an artifact whose own facts
+/// exceeded the limits and so were not checked.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceDerivationItem {
+    /// Facts for exactly one admitted artifact, or for the entities and
+    /// layouts whose file no admitted artifact holds, which a consumer reports
+    /// as held outside the inventory.
+    Facts(SourceDerivationFacts),
+    /// One artifact whose facts alone exceed a limit. Its path is named so a
+    /// consumer can list it instead of refusing the whole inventory.
+    Unchecked {
+        path: RepoPath,
+        limit: SourceDerivationLimit,
+    },
+}
+
+impl InMemoryGraph {
+    /// Walk the whole admitted inventory one artifact at a time, under one
+    /// entity-store read guard, handing each artifact's facts to `visit`.
+    ///
+    /// The single-copy inventory read above holds every artifact's facts at
+    /// once, so a large repository exceeds its byte limit and the whole
+    /// observation is refused, which on React refused every query. Here the
+    /// limits apply to one artifact's facts, the rest of the inventory is still
+    /// inspected when one artifact exceeds them, and that artifact is named.
+    /// The read guard is held for the whole walk, so the items describe one
+    /// graph state, exactly as a single-copy read does. Entities and layouts
+    /// whose file has no admitted artifact arrive last, in one item, so the
+    /// consumer still sees evidence held outside the inventory.
+    ///
+    /// Returns the graph's binding-history observation from the same guard,
+    /// which an empty inventory yields no item to carry.
+    pub fn for_each_source_derivation_artifact(
+        &self,
+        limits: SourceDerivationLimits,
+        reserved_relation: fn(ArtifactId) -> RelationId,
+        mut visit: impl FnMut(SourceDerivationItem),
+    ) -> kin_model::BindingHistoryObservation {
+        let lock_requested = Instant::now();
+        let ent = self.entities.read();
+        let _hold = LockHoldLog {
+            requested: lock_requested,
+            acquired: Instant::now(),
+        };
+        let binding_history = ent
+            .verified_binding_history
+            .as_ref()
+            .map_or(kin_model::BindingHistoryObservation::Unproven, |proof| {
+                proof.observation()
+            });
+        let mut entities_by_file: std::collections::HashMap<&str, Vec<&Entity>> =
+            std::collections::HashMap::new();
+        for entity in ent.entities.values() {
+            if let Some(file) = entity_file(entity) {
+                entities_by_file.entry(&file.0).or_default().push(entity);
+            }
+        }
+        let mut held: BTreeSet<&str> = BTreeSet::new();
+        for artifact in ent.resolved_tree.artifacts_by_path() {
+            let path = artifact.path.as_utf8();
+            if let Some(path) = path {
+                held.insert(path);
+            }
+            let facts = (|| -> Result<SourceDerivationFacts, SourceDerivationUnavailable> {
+                let mut budget = Budget { limits, bytes: 0 };
+                let mut facts = SourceDerivationFacts {
+                    binding_history: binding_history.clone(),
+                    ..Default::default()
+                };
+                budget.array::<ResolvedArtifact>(1)?;
+                budget.charge(artifact.path.as_bytes().len())?;
+                facts.artifacts.push(artifact.clone());
+                if let Some(path) = path {
+                    let file = FilePathId::new(path);
+                    let entities = entities_by_file.get(path).map(Vec::as_slice).unwrap_or(&[]);
+                    budget.count(
+                        entities.len(),
+                        limits.max_entities,
+                        SourceDerivationLimit::Entities,
+                    )?;
+                    for entity in entities {
+                        budget.array::<SourceEntityBinding>(1)?;
+                        budget.charge(path.len())?;
+                        if let Some(binding) = SourceEntityBinding::from_entity(entity) {
+                            facts.entities.push(binding);
+                        }
+                    }
+                    if let Some(layout) = ent.file_layouts.get(&file) {
+                        budget.array::<SourceLayoutFact>(1)?;
+                        budget.charge(path.len())?;
+                        facts.layouts.push(SourceLayoutFact {
+                            file: layout.file_id.clone(),
+                            full: matches!(layout.parse_completeness, ParseCompleteness::Full),
+                        });
+                    }
+                    if let Some(opaque) = ent.opaque_artifacts.get(&file) {
+                        budget.array::<SourceOpaqueFact>(1)?;
+                        budget.charge(path.len())?;
+                        facts.opaque.push(SourceOpaqueFact {
+                            file: opaque.file_id.clone(),
+                            hash: opaque.content_hash,
+                        });
+                    }
+                }
+                let id = reserved_relation(artifact.artifact_id);
+                let occupant = ent.relations.get(&id);
+                budget.array::<SourceReservedRelation>(1)?;
+                if let Some(relation) = occupant {
+                    budget.relation_payload(relation)?;
+                }
+                facts.reserved_relations.push(SourceReservedRelation {
+                    artifact: artifact.artifact_id,
+                    id,
+                    relation: occupant.cloned(),
+                });
+                let node = GraphNodeId::Artifact(artifact.artifact_id);
+                if let Some(outgoing) = ent.node_outgoing.get(&node) {
+                    budget.count(
+                        outgoing.len().saturating_add(1),
+                        limits.max_relations,
+                        SourceDerivationLimit::Relations,
+                    )?;
+                    for id in outgoing {
+                        let Some(relation) = ent.relations.get(id) else {
+                            continue;
+                        };
+                        if relation.src == node {
+                            budget.relation(relation)?;
+                            facts.relations.push(relation.clone());
+                        }
+                    }
+                }
+                Ok(facts)
+            })();
+            match facts {
+                Ok(facts) => visit(SourceDerivationItem::Facts(facts)),
+                Err(SourceDerivationUnavailable::LimitExceeded(limit)) => {
+                    visit(SourceDerivationItem::Unchecked {
+                        path: artifact.path.clone(),
+                        limit,
+                    })
+                }
+            }
+        }
+        let mut outside = SourceDerivationFacts {
+            binding_history: binding_history.clone(),
+            ..Default::default()
+        };
+        for (file, entities) in &entities_by_file {
+            if held.contains(file) {
+                continue;
+            }
+            for entity in entities {
+                if let Some(binding) = SourceEntityBinding::from_entity(entity) {
+                    outside.entities.push(binding);
+                }
+            }
+        }
+        for layout in ent.file_layouts.values() {
+            if !held.contains(layout.file_id.0.as_str()) {
+                outside.layouts.push(SourceLayoutFact {
+                    file: layout.file_id.clone(),
+                    full: matches!(layout.parse_completeness, ParseCompleteness::Full),
+                });
+            }
+        }
+        if !outside.entities.is_empty() || !outside.layouts.is_empty() {
+            visit(SourceDerivationItem::Facts(outside));
+        }
+        binding_history
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl InMemoryGraph {
     /// Hold the entity-store write lock without writing, so a dependent
@@ -862,6 +1053,7 @@ mod tests {
         let binary = artifact(raw_path, 3);
         let mut stale = entity("a.rs", 1);
         stale.doc_summary = Some("large unrelated body".repeat(10_000));
+        let stale_binding = SourceEntityBinding::from_entity(&stale).unwrap();
         let held = entity("removed.rs", 4);
         {
             let mut ent = graph.entities.write();
@@ -919,10 +1111,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(facts.artifacts, vec![current, binary]);
-        assert!(facts.entities.contains(&SourceEntityBinding {
-            file: FilePathId::new("a.rs"),
-            digest: Some(Hash256::from_bytes([1; 32]))
-        }));
+        assert!(facts.entities.contains(&stale_binding));
         assert!(facts
             .entities
             .iter()

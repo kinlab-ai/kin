@@ -75,6 +75,24 @@ pub struct ImportItem {
     pub byte_range: Range<usize>,
 }
 
+/// The extensions of source Kin parses into entities: the ones an adapter in
+/// `kin-parser`'s registry claims. The indexer's classifier routes them to the
+/// parser and holds this list to the registry by test; it lives here so a
+/// crate below the indexer, such as the Git import, reads the same list.
+pub const ENTITY_SOURCE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "pyi", "go", "java", "rs", "c", "h", "cpp",
+    "hpp", "cc", "cxx", "cs", "rb", "kt", "kts", "swift", "php", "tf", "tfvars",
+];
+
+/// Whether `path` names source Kin parses, by its last extension. Anything
+/// else is held without parsing: text, parts or bytes.
+pub fn is_entity_source_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty() && ENTITY_SOURCE_EXTENSIONS.contains(&extension)
+    })
+}
+
 /// Classification of all tracked files in Kin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TrackedFile {
@@ -133,6 +151,24 @@ pub struct ShallowTrackedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parsed source is told by its last extension, and a name that is only
+    /// an extension, or none, is held without parsing.
+    #[test]
+    fn parsed_source_is_told_by_its_last_extension() {
+        for parsed in ["src/app.py", "a/b/c.rs", "web/index.d.ts", "main.go"] {
+            assert!(is_entity_source_path(parsed), "{parsed}");
+        }
+        for unparsed in [
+            "README.md",
+            "static/logo.png",
+            ".py",
+            "Makefile",
+            "src.py/notes",
+        ] {
+            assert!(!is_entity_source_path(unparsed), "{unparsed}");
+        }
+    }
 
     #[test]
     fn artifact_kind_roundtrip() {

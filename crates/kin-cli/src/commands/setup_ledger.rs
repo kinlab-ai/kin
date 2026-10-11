@@ -59,6 +59,11 @@ pub enum ArtifactKind {
     DiscoveryReminder,
     /// The `~/.kin/config/setup.toml` daemon config file Kin owns entirely.
     DaemonConfig,
+    /// The prompt hook entry Kin added to an agent client's settings, such as
+    /// Claude Code's `UserPromptSubmit` hook in `~/.claude/settings.json`. The
+    /// owned slice is that one hook entry; every other hook and key is the
+    /// person's.
+    PromptHook,
 }
 
 impl ArtifactKind {
@@ -80,6 +85,7 @@ impl ArtifactKind {
             Self::VfsShim => "VFS shim",
             Self::DiscoveryReminder => "discovery reminder",
             Self::DaemonConfig => "daemon config",
+            Self::PromptHook => "prompt hook",
         }
     }
 }
@@ -142,6 +148,22 @@ impl LedgerEntry {
             target: target.into(),
             path,
             fingerprint: fingerprint_mcp_entry(kin_entry),
+            snippet: None,
+            kin_version: kin_version(),
+            written_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// Build an entry for the prompt hook entry Kin added to a client's
+    /// settings, fingerprinted as that one entry.
+    pub fn prompt_hook(target: impl Into<String>, path: PathBuf, hook: &serde_json::Value) -> Self {
+        let now = now_rfc3339();
+        Self {
+            kind: ArtifactKind::PromptHook,
+            target: target.into(),
+            path,
+            fingerprint: sha256_hex(hook.to_string().as_bytes()),
             snippet: None,
             kin_version: kin_version(),
             written_at: now.clone(),
@@ -317,6 +339,11 @@ pub struct EntryVerification {
 fn current_owned_fingerprint_from_bytes(entry: &LedgerEntry, content: &[u8]) -> Option<String> {
     match entry.kind {
         ArtifactKind::McpConfig => current_mcp_fingerprint_from_bytes(entry, content),
+        ArtifactKind::PromptHook => {
+            let root: serde_json::Value = serde_json::from_slice(content).ok()?;
+            let hook = super::setup_hooks::current_prompt_hook(&root)?;
+            Some(sha256_hex(hook.to_string().as_bytes()))
+        }
         ArtifactKind::ShellHook | ArtifactKind::VfsShim | ArtifactKind::DaemonConfig => {
             Some(sha256_hex(content))
         }
@@ -589,6 +616,20 @@ fn remove_owned_slice_locked(
         lock.write_guarded(&entry.path, &formatted, Some(&original))?;
         return Ok(format!(
             "removed mcpServers.kin from {}",
+            entry.path.display()
+        ));
+    }
+    if entry.kind == ArtifactKind::PromptHook {
+        let mut root: serde_json::Value = serde_json::from_slice(&original)
+            .with_context(|| format!("{} is not valid JSON", entry.path.display()))?;
+        super::setup_hooks::without_prompt_hook(&mut root);
+        // The settings file stays: Kin removes only its own hook entry.
+        let mut formatted =
+            serde_json::to_vec_pretty(&root).context("failed to serialize client settings")?;
+        formatted.push(b'\n');
+        lock.write_guarded(&entry.path, &formatted, Some(&original))?;
+        return Ok(format!(
+            "removed Kin's prompt hook from {}",
             entry.path.display()
         ));
     }

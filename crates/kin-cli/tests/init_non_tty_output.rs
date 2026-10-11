@@ -89,11 +89,11 @@ fn a_captured_init_writes_phase_summaries_and_no_progress_frames() {
         "the in-place bar belongs to a terminal: {stderr}"
     );
     assert!(
-        stderr.contains("derive semantic history"),
+        stderr.contains("build the code history"),
         "the per-phase summaries are what a captured run keeps: {stderr}"
     );
     assert!(
-        stderr.contains("build bootstrap transaction"),
+        stderr.contains("make the first save"),
         "every phase still reports: {stderr}"
     );
     assert!(
@@ -111,19 +111,82 @@ fn init_finishes_its_store_when_the_reader_closes_the_pipe() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("head-capped");
     seed_linkable_git_repo(&repo);
-    let status_file = root.path().join("init-status");
 
     let runtime = IsolatedDaemonRuntime::new(&repo);
+    init_into_a_reader_that_closes_after_one_line(&runtime, root.path(), &repo, None);
+}
+
+/// The same reader, with `kin init` started from inside a repository nested
+/// under another store.
+///
+/// Every command discovers the store serving its working directory before it
+/// does anything else. Discovery used to refuse the parent store from in here
+/// and say so on stderr through `eprintln!`, and the second copy of that
+/// refusal panicked on the closed pipe before the admission began: exit 101
+/// and no store. The test above met this only when its checkout sat below a
+/// stray `.kin` directory, which is how a Linux runner whose home held one
+/// failed it while a machine whose home is a Kin install passed. Discovery now
+/// stops at the nested repository's own root and says nothing about what is
+/// above it, and this builds the condition on purpose to hold both.
+#[test]
+fn init_finishes_its_store_when_a_refused_parent_store_meets_the_closed_pipe() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("head-capped");
+    seed_linkable_git_repo(&repo);
+    let parent = root.path().join("parent");
+    fs::create_dir_all(parent.join(".kin")).expect("create the parent store");
+    fs::write(parent.join(".kin/version"), "2").expect("mark the parent store");
+    let nested = parent.join("nested");
+    fs::create_dir_all(&nested).expect("create the nested repository");
+    run_git(&nested, &["init", "--initial-branch=main"]);
+
+    let runtime = IsolatedDaemonRuntime::new(&repo);
+    init_into_a_reader_that_closes_after_one_line(&runtime, root.path(), &repo, Some(&nested));
+
+    // The control: from in here the parent store is neither bound nor
+    // mentioned. A command that writes nothing about it cannot meet a closed
+    // pipe over it, and `kin store path` proves the nested repository has no
+    // store rather than the parent's.
+    let control = runtime
+        .kin_command()
+        .args(["store", "path"])
+        .current_dir(&nested)
+        .output()
+        .expect("run kin from inside the nested repository");
+    let stderr = String::from_utf8_lossy(&control.stderr);
+    let stdout = String::from_utf8_lossy(&control.stdout);
+    assert!(
+        !control.status.success(),
+        "the nested repository has no store of its own: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("parent store") && !stdout.contains(&*parent.to_string_lossy()),
+        "nothing above the nested repository's root is announced: stdout={stdout} stderr={stderr}"
+    );
+}
+
+/// Run `kin init <repo>` with both streams in one pipe whose reader takes one
+/// line and leaves, from `cwd` when given, and require that the admission
+/// still finished and reported itself.
+fn init_into_a_reader_that_closes_after_one_line(
+    runtime: &IsolatedDaemonRuntime,
+    root: &Path,
+    repo: &Path,
+    cwd: Option<&Path>,
+) {
+    let status_file = root.join("init-status");
     let script = format!(
         "{{ {kin} init {repo} 2>&1; echo $? > {status}; }} | head -1 > /dev/null",
         kin = shell_quote(env!("CARGO_BIN_EXE_kin")),
         repo = shell_quote(&repo.display().to_string()),
         status = shell_quote(&status_file.display().to_string()),
     );
-    let output = runtime
-        .process_command_for_test("sh")
-        .arg("-c")
-        .arg(&script)
+    let mut command = runtime.process_command_for_test("sh");
+    command.arg("-c").arg(&script);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
         .output()
         .expect("run kin init into a reader that closes early");
     assert!(
@@ -139,7 +202,7 @@ fn init_finishes_its_store_when_the_reader_closes_the_pipe() {
         "the exit status must report the admission, not the pipe"
     );
     assert_eq!(
-        fs::read_to_string(repo.join(".kin/version"))
+        fs::read_to_string(runtime.layout_for(repo).version_path())
             .expect("a completed admission leaves a store")
             .trim(),
         kin_core::layout::KIN_LAYOUT_VERSION.to_string(),
@@ -201,7 +264,7 @@ fn the_conversion_phase_leaves_no_daemon_behind_when_it_exits_early() {
     // to find it.
     #[cfg(unix)]
     {
-        let pid_file = repo.join(".kin").join("daemon.pid");
+        let pid_file = runtime.layout().root().join("daemon.pid");
         if let Ok(recorded) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = recorded.trim().parse::<i32>() {
                 let alive = unsafe { libc::kill(pid, 0) } == 0;

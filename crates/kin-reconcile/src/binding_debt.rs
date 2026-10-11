@@ -193,6 +193,7 @@ pub(crate) fn settle<G: GraphStore>(
         return Ok(vec![]);
     }
     let mut remaining = Vec::new();
+    let project = kin_index::GraphProjectFiles::new(graph, blobs);
     for obligation in debt.obligations {
         let digest =
             kin_blobs::Hash256::from_hex(&obligation.source_digest.to_string()).map_err(invalid)?;
@@ -201,13 +202,14 @@ pub(crate) fn settle<G: GraphStore>(
             return Err(invalid("prior source digest mismatch"));
         }
         let old = kin_index::IndexPipeline::new()
-            .index_file_content_with_tests(
+            .index_file_content_in(
                 obligation
                     .prior_source_file
                     .as_ref()
                     .unwrap_or(&current.file_id),
                 &bytes,
                 digest,
+                &project,
             )?
             .indexed_file;
         if !matches!(old.parse_state, kin_model::ParseState::Valid) {

@@ -5,6 +5,7 @@ pub mod corpus;
 pub mod entity_ranking;
 pub mod features;
 pub mod ltr;
+pub mod module_qualifier;
 pub mod relevance;
 pub mod signal_builder;
 pub mod tuner;

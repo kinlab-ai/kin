@@ -25,6 +25,7 @@
 //! worktree by [`crate::preflight::classify_other_worktrees`], and the ones
 //! that pass are disclosed as a note rather than refused.
 
+use kin_io::WorktreeRoot;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,9 +35,16 @@ use crate::error::{
 use crate::lossless::open_repo;
 use crate::preflight::{
     checkout_filter_facts, classify_other_worktrees, exact_directory_names, hook_executability,
-    hook_kind, open_repo_with_user_ignore_config, other_registered_worktrees, preflight_error,
-    reject_in_progress_operations, scan_remote_mapping, stable_path,
+    hook_kind, in_progress_operation, open_repo_with_user_ignore_config,
+    other_registered_worktrees, preflight_error, scan_remote_mapping, stable_path,
+    InProgressOperation,
 };
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 /// Paths of one class printed before the rest are counted rather than listed.
 const REPORTED_PATHS: usize = 10;
@@ -59,7 +67,7 @@ impl GitAdmissionReport {
 /// The source repository is only read. A clear result is not an admission
 /// proof: it establishes that the far more expensive exact proof is worth
 /// running, and that proof still decides.
-pub fn check_git_admission_blockers(repo_path: &Path) -> Result<()> {
+pub fn check_git_admission_blockers(repo_path: &WorktreeRoot) -> Result<()> {
     let report = collect_git_admission_blockers(repo_path)?;
     if report.is_clear() {
         return Ok(());
@@ -71,7 +79,8 @@ pub fn check_git_admission_blockers(repo_path: &Path) -> Result<()> {
 }
 
 /// The report behind [`check_git_admission_blockers`].
-pub fn collect_git_admission_blockers(repo_path: &Path) -> Result<GitAdmissionReport> {
+pub fn collect_git_admission_blockers(repo_path: &WorktreeRoot) -> Result<GitAdmissionReport> {
+    let repo_path = repo_path.path();
     let source = fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
     let repo = open_repo(&source)?;
     // A shallow source is deliberately not checked here. Capture refuses it a
@@ -87,15 +96,17 @@ pub fn collect_git_admission_blockers(repo_path: &Path) -> Result<GitAdmissionRe
     }
 
     let mut report = GitAdmissionReport::default();
-    match reject_in_progress_operations(&repo) {
-        Ok(()) => {}
-        Err(GitError::MigrationPreflight(reason)) => {
+    match in_progress_operation(&repo)? {
+        None => {}
+        Some(InProgressOperation::GarbageCollection(running)) => report.blockers.push(
+            GitAdmissionBlocker::new(running.sentence(), running.remedy()),
+        ),
+        Some(InProgressOperation::Operation(reason)) => {
             report.blockers.push(GitAdmissionBlocker::new(
                 reason,
                 "finish or abort the Git operation, then run kin init again",
             ))
         }
-        Err(error) => return Err(error),
     }
 
     let (tolerated, untolerable) =
@@ -514,7 +525,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_support::fixture_git;
+    use crate::test_support::{fixture_git, write_fixture_git_config, FixtureGitBatch};
 
     struct Fixture {
         temp: TempDir,
@@ -527,15 +538,27 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path().join("source");
             fs::create_dir(&repo).expect("source directory");
-            git(&repo, &["init", "--initial-branch=main"]);
-            git(&repo, &["config", "user.name", "Kin Test"]);
-            git(&repo, &["config", "user.email", "kin@example.invalid"]);
-            git(&repo, &["config", "commit.gpgSign", "false"]);
+            fs::write(repo.join("README.md"), b"seed\n").expect("readme");
             let fixture = Self { temp, repo };
+            // One launch for the seed commit, made under the identity the
+            // configuration names. The configuration is then written as the
+            // bytes its five `git config` commands leave, which
+            // `the_seed_configuration_is_the_bytes_git_writes` checks.
+            FixtureGitBatch::new()
+                .git(["init", "--initial-branch=main"])
+                .git(["add", "README.md"])
+                .git([
+                    "-c",
+                    "user.name=Kin Test",
+                    "-c",
+                    "user.email=kin@example.invalid",
+                    "commit",
+                    "-m",
+                    "seed",
+                    "--no-gpg-sign",
+                ])
+                .run_in(&fixture.repo);
             fixture.pin_ambient_configuration();
-            fs::write(fixture.repo.join("README.md"), b"seed\n").expect("readme");
-            git(&fixture.repo, &["add", "README.md"]);
-            git(&fixture.repo, &["commit", "-m", "seed", "--no-gpg-sign"]);
             fixture
         }
 
@@ -548,16 +571,14 @@ mod tests {
         /// one machine while proving nothing on another. Repository scope
         /// outranks the host, so pinning both here settles it.
         fn pin_ambient_configuration(&self) {
-            self.pin_hook_surface(&self.temp.path().join("empty-hooks"));
+            let hooks = self.temp.path().join("empty-hooks");
+            fs::create_dir_all(&hooks).expect("hook directory");
             let excludes = self.temp.path().join("global-ignore");
             fs::write(&excludes, b"").expect("empty global excludes");
-            git(
+            write_fixture_git_config(
                 &self.repo,
-                &[
-                    "config",
-                    "core.excludesFile",
-                    excludes.to_str().expect("utf8 test path"),
-                ],
+                &[("hooksPath", &hooks), ("excludesFile", &excludes)],
+                SEED_IDENTITY_CONFIG,
             );
         }
 
@@ -575,14 +596,53 @@ mod tests {
         }
 
         fn report(&self) -> GitAdmissionReport {
-            collect_git_admission_blockers(&self.repo).expect("collect admission blockers")
+            collect_git_admission_blockers(&worktree(&self.repo))
+                .expect("collect admission blockers")
         }
 
         fn refusal(&self) -> String {
-            check_git_admission_blockers(&self.repo)
+            check_git_admission_blockers(&worktree(&self.repo))
                 .expect_err("blocked admission")
                 .to_string()
         }
+    }
+
+    /// The identity sections the seed's `git config` commands write.
+    const SEED_IDENTITY_CONFIG: &str =
+        "[user]\n\tname = Kin Test\n\temail = kin@example.invalid\n[commit]\n\tgpgSign = false\n";
+
+    /// The seed configuration is the bytes Git writes for the commands it
+    /// replaces: identity, commit signing, the hook surface and the excludes
+    /// file, in that order.
+    #[test]
+    fn the_seed_configuration_is_the_bytes_git_writes() {
+        let fixture = Fixture::clean();
+        let written = fs::read_to_string(fixture.repo.join(".git/config")).expect("written config");
+        // A second repository on the same filesystem, so `git init` writes the
+        // same `[core]`, configured by the commands with the fixture's paths.
+        let commanded = fixture.temp.path().join("commanded");
+        fs::create_dir(&commanded).expect("commanded repository");
+        let hooks = fixture.temp.path().join("empty-hooks");
+        let excludes = fixture.temp.path().join("global-ignore");
+        FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.name", "Kin Test"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "commit.gpgSign", "false"])
+            .git([
+                "config",
+                "core.hooksPath",
+                hooks.to_str().expect("utf8 test path"),
+            ])
+            .git([
+                "config",
+                "core.excludesFile",
+                excludes.to_str().expect("utf8 test path"),
+            ])
+            .run_in(&commanded);
+        let by_commands =
+            fs::read_to_string(commanded.join(".git/config")).expect("commanded config");
+        assert_eq!(by_commands, written);
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -612,12 +672,63 @@ mod tests {
         fs::set_permissions(path, permissions).expect("chmod");
     }
 
+    /// `git gc` leaves `gc.pid` behind when it is killed, and a repository
+    /// copied from another machine carries the record of a collection that ran
+    /// there. Neither is running, and Git itself takes such a record over, so
+    /// neither may block a conversion. A collection that is running here is a
+    /// blocker, with a remedy that says to wait rather than to finish or abort.
+    #[test]
+    fn only_a_running_garbage_collection_blocks_admission() {
+        let fixture = Fixture::clean();
+        let record = fixture.repo.join(".git/gc.pid");
+        let host = crate::gc_lock::this_host();
+
+        let mut killed = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let gone = killed.id();
+        killed.wait().expect("reap true");
+        fs::write(&record, format!("{gone} {host}")).expect("write gc.pid");
+        let report = fixture.report();
+        assert!(
+            report.is_clear(),
+            "a collection whose process is gone blocked admission: {report:?}"
+        );
+
+        fs::write(
+            &record,
+            format!("{} another-host.invalid", std::process::id()),
+        )
+        .expect("write gc.pid");
+        let report = fixture.report();
+        assert!(
+            report.is_clear(),
+            "a record from another machine blocked admission: {report:?}"
+        );
+
+        // This test's own process stands in for a collection running here.
+        let running = std::process::id();
+        fs::write(&record, format!("{running} {host}")).expect("write gc.pid");
+        let report = fixture.report();
+        assert_eq!(report.blockers.len(), 1, "{report:?}");
+        let blocker = &report.blockers[0];
+        assert!(
+            blocker.subject.contains("garbage collection")
+                && blocker.subject.contains(&running.to_string()),
+            "{blocker:?}"
+        );
+        assert!(
+            blocker.remedy.starts_with("wait for it to finish"),
+            "{blocker:?}"
+        );
+    }
+
     #[test]
     fn a_repository_with_nothing_wrong_clears() {
         let fixture = Fixture::clean();
         let report = fixture.report();
         assert!(report.is_clear(), "unexpected blockers: {report:?}");
-        check_git_admission_blockers(&fixture.repo).expect("clean repository clears");
+        check_git_admission_blockers(&worktree(&fixture.repo)).expect("clean repository clears");
     }
 
     #[test]
@@ -882,7 +993,8 @@ mod tests {
             report.is_clear(),
             "uncommitted state is not an admission blocker: {report:?}"
         );
-        check_git_admission_blockers(&fixture.repo).expect("a worked-in repository clears");
+        check_git_admission_blockers(&worktree(&fixture.repo))
+            .expect("a worked-in repository clears");
     }
 
     #[test]
@@ -1266,7 +1378,8 @@ mod tests {
         // lossless snapshot, an import plan, or a blob store, because it is
         // never given one, which is what makes the check cheap enough to run
         // before any of them exist.
-        let refusal = check_git_admission_blockers(&fixture.repo).expect_err("blocked admission");
+        let refusal =
+            check_git_admission_blockers(&worktree(&fixture.repo)).expect_err("blocked admission");
         assert!(refusal.to_string().contains("pre-commit"), "{refusal}");
     }
 }

@@ -16,6 +16,8 @@ pub struct ReplicaBootstrapInput {
     /// value: a bootstrap whose provenance nobody declared leaves the published
     /// replica unstamped rather than stamped over history it cannot speak for.
     pub source_hydration_semantics: Option<u32>,
+    /// The sending store's recorded creation identity, if the pack declares it.
+    pub source_hydration_derivation: Option<String>,
 }
 
 /// Publish a complete replica without exposing a partially initialized target.
@@ -71,7 +73,10 @@ pub fn initialize(
             // and the history about to be committed into it was authored
             // somewhere else. This is the transfer receiver's rule, run at the
             // one boundary a bootstrap actually crosses.
-            prepared.reconcile_bootstrap_hydration_semantics(input.source_hydration_semantics)?;
+            prepared.reconcile_bootstrap_hydration_semantics(
+                input.source_hydration_semantics,
+                input.source_hydration_derivation.as_deref(),
+            )?;
             input.transaction
         }
         None => build_repository_bootstrap_transaction(
@@ -224,6 +229,9 @@ mod tests {
                 transaction: transaction(prepared, case),
                 bodies: vec![],
                 source_hydration_semantics: Some(crate::hydration_semantics::binary_version()),
+                source_hydration_derivation: Some(
+                    crate::hydration_semantics::binary_derivation().to_string(),
+                ),
             }))
         })
         .unwrap();
@@ -255,6 +263,7 @@ mod tests {
                     transaction: transaction(prepared, case),
                     bodies: vec![],
                     source_hydration_semantics: declared,
+                    source_hydration_derivation: None,
                 }))
             })
             .unwrap();
@@ -265,6 +274,35 @@ mod tests {
                 },
                 "a bootstrap declaring {declared:?} published a creation record anyway"
             );
+        }
+    }
+
+    #[test]
+    fn a_bootstrap_of_the_same_version_needs_the_same_creation_derivation() {
+        let different = format!("sha256:{}", "0".repeat(64));
+        for derivation in [None, Some(different), Some("malformed".to_string())] {
+            let parent = tempfile::tempdir().unwrap();
+            let identity = RepositoryId::new("hosted-repository".to_string()).unwrap();
+            let initialized = initialize(
+                &parent.path().join("replica"),
+                "trunk",
+                &identity,
+                |prepared, case| {
+                    Ok(Some(ReplicaBootstrapInput {
+                        transaction: transaction(prepared, case),
+                        bodies: vec![],
+                        source_hydration_semantics: Some(
+                            crate::hydration_semantics::binary_version(),
+                        ),
+                        source_hydration_derivation: derivation.clone(),
+                    }))
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                crate::hydration_semantics::read(&initialized.layout),
+                crate::hydration_semantics::HydrationSemanticsRead::Absent
+            ));
         }
     }
 
@@ -298,6 +336,7 @@ mod tests {
                 transaction,
                 bodies: vec![],
                 source_hydration_semantics: None,
+                source_hydration_derivation: None,
             }))
         })
         .unwrap_err();
@@ -320,6 +359,7 @@ mod tests {
             Ok(Some(ReplicaBootstrapInput {
                 transaction: transaction(prepared, case),
                 source_hydration_semantics: None,
+                source_hydration_derivation: None,
                 bodies: vec![(
                     Hash256::from_bytes(Sha256::digest(b"original").into()),
                     b"corrupt".to_vec(),
@@ -371,6 +411,7 @@ mod tests {
                 transaction,
                 bodies: vec![],
                 source_hydration_semantics: None,
+                source_hydration_derivation: None,
             }))
         })
         .unwrap_err();

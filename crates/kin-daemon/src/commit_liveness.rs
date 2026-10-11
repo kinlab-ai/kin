@@ -90,7 +90,7 @@ fn unix_now() -> u64 {
 
 /// Path of the marker for a repository working directory.
 pub fn transaction_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".kin").join(TRANSACTION_FILE_NAME)
+    kin_core::layout::store_root_for(repo_root).join(TRANSACTION_FILE_NAME)
 }
 
 /// Classify what `repo_root`'s marker says about the daemon running as `pid`.
@@ -100,7 +100,13 @@ pub fn transaction_path(repo_root: &Path) -> PathBuf {
 /// file, an unreadable file, a marker naming another pid — is merely the absence
 /// of proof. Callers use it to withhold a kill, never to authorize one.
 pub fn transaction_liveness(repo_root: &Path, pid: u32) -> TransactionLiveness {
-    let Some(open) = kin_daemon_spawn::read_open_transaction(&repo_root.join(".kin")) else {
+    transaction_liveness_in_store(&repo_root.join(".kin"), pid)
+}
+
+/// [`transaction_liveness`] for a daemon whose store directory is known, in
+/// or outside its working tree.
+pub fn transaction_liveness_in_store(store_root: &Path, pid: u32) -> TransactionLiveness {
+    let Some(open) = kin_daemon_spawn::read_open_transaction(store_root) else {
         return TransactionLiveness::None;
     };
     if open.pid != pid {

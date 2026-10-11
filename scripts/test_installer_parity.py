@@ -12,6 +12,7 @@ from unittest import mock
 
 from verify_installer_parity import (
     ParityError,
+    ParityResult,
     fetch_response,
     sha256,
     verify_payloads,
@@ -39,7 +40,7 @@ def manifest() -> bytes:
 
 
 class InstallerParityTests(unittest.TestCase):
-    def verify(self, **overrides: bytes | str | None) -> None:
+    def verify(self, **overrides: bytes | str | None) -> ParityResult:
         values = {
             "source_install": INSTALL,
             "source_install_ps1": INSTALL_PS1,
@@ -50,7 +51,7 @@ class InstallerParityTests(unittest.TestCase):
             "public_install_ps1_generation": "102",
         }
         values.update(overrides)
-        verify_payloads(tag=TAG, commit=COMMIT, **values)
+        return verify_payloads(tag=TAG, commit=COMMIT, **values)
 
     def test_exact_pair_and_manifest_pass(self) -> None:
         self.verify()
@@ -80,6 +81,63 @@ class InstallerParityTests(unittest.TestCase):
             ParityError, "missing or invalid x-goog-generation"
         ):
             self.verify(public_install_ps1_generation=None)
+
+    def verify_pages(self, **overrides: bytes | str | None) -> ParityResult:
+        pages = json.loads(manifest())
+        del pages["install_generation"]
+        del pages["install_ps1_generation"]
+        values = {
+            "surface": "pages",
+            "public_manifest": json.dumps(pages).encode(),
+            "public_install_generation": None,
+            "public_install_ps1_generation": None,
+        }
+        values.update(overrides)
+        return self.verify(**values)
+
+    def test_explicit_pages_accepts_exact_five_field_manifest_without_headers(self) -> None:
+        result = self.verify_pages()
+        self.assertEqual(result.install_sha256, sha256(INSTALL))
+        self.assertEqual(result.install_ps1_sha256, sha256(INSTALL_PS1))
+        self.assertIsNone(result.install_generation)
+        self.assertIsNone(result.install_ps1_generation)
+
+    def test_pages_accepts_legacy_manifest_generation_extras(self) -> None:
+        self.verify_pages(public_manifest=manifest())
+
+    def test_pages_still_requires_exact_served_bytes(self) -> None:
+        for field, body, message in (
+            ("public_install", INSTALL, "public install hash mismatch"),
+            ("public_install_ps1", INSTALL_PS1, "public install.ps1 hash mismatch"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ParityError, message):
+                self.verify_pages(**{field: body + b"# stale\n"})
+
+    def test_pages_still_binds_manifest_to_release_source(self) -> None:
+        for field, wrong_value in (
+            ("schema", 2),
+            ("tag", "v0.2.23"),
+            ("sha", "b" * 40),
+            ("install_sha256", "0" * 64),
+            ("install_ps1_sha256", "0" * 64),
+        ):
+            wrong = json.loads(manifest())
+            wrong[field] = wrong_value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ParityError, f"current.json {field}"
+            ):
+                self.verify_pages(public_manifest=json.dumps(wrong).encode())
+
+    def test_gcs_does_not_downgrade_when_both_headers_are_absent(self) -> None:
+        with self.assertRaisesRegex(ParityError, "missing or invalid x-goog-generation"):
+            self.verify(
+                public_install_generation=None,
+                public_install_ps1_generation=None,
+            )
+
+    def test_gcs_generation_headers_remain_numeric(self) -> None:
+        with self.assertRaisesRegex(ParityError, "missing or invalid x-goog-generation"):
+            self.verify(public_install_generation="pages")
 
     @mock.patch("verify_installer_parity.urllib.request.urlopen")
     def test_fetch_response_captures_generation_header(

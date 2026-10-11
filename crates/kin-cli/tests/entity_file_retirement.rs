@@ -29,7 +29,6 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use tempfile::tempdir;
 
 mod common;
 
@@ -104,7 +103,42 @@ fn initialize(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
     require_git(repo, &["add", "--all"]);
     require_git(repo, &["commit", "-m", "first commit"]);
 
-    require_kin(runtime, repo, &["init", ".", "--json"]);
+    // The prepared fixture copies the working tree and its store together.
+    // Only this template builder needs the supported in-tree placement.
+    let initialized = runtime
+        .kin_command()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .env("KIN_STORE_LAYOUT", "in-tree")
+        .args(["init", ".", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("initialize prepared fixture");
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+}
+
+/// This test's own copy of the repository [`initialize`] converts, built once
+/// per test binary rather than once per test.
+///
+/// No test here is about the conversion. `kin init` stops the daemon it
+/// started, so a test's first command starts a daemon over the copy exactly as
+/// it would have over a store it had just converted itself. Declare the result
+/// before the test's runtime, so the runtime stops its daemons before the copy
+/// is removed.
+fn initialized() -> common::PreparedRepository {
+    common::prepared_repository("initialized-in-tree-v2", |root| {
+        let repo = root.join("repo");
+        let runtime = common::IsolatedDaemonRuntime::new(&repo);
+        initialize(&runtime, &repo);
+        repo
+    })
 }
 
 /// Every file path `kin locate` attributes a ranked hit to.
@@ -139,10 +173,9 @@ fn located_paths(runtime: &common::IsolatedDaemonRuntime, repo: &Path, query: &s
 /// from the staged tree" and `kin locate` keeps returning `src/retired.rs`.
 #[test]
 fn deleting_a_committed_entity_owning_file_retires_it_from_every_query_surface() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
+    let prepared = initialized();
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    initialize(&runtime, &repo);
 
     fs::write(
         repo.join("src/retired.rs"),
@@ -177,10 +210,9 @@ fn deleting_a_committed_entity_owning_file_retires_it_from_every_query_surface()
 /// The plain-file arm, which already worked and must keep working.
 #[test]
 fn deleting_a_file_that_owns_no_entity_still_commits() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
+    let prepared = initialized();
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    initialize(&runtime, &repo);
 
     fs::remove_file(repo.join("notes.txt")).expect("delete the plain file");
     let retired = run_kin(&runtime, &repo, &["commit", "-m", "retire the plain file"]);
@@ -204,8 +236,11 @@ fn references_text(runtime: &common::IsolatedDaemonRuntime, repo: &Path, entity:
 
 /// Resolve the committed main ref from newly opened repository authority.
 /// The manager is never held across a CLI subprocess or a daemon restart.
-fn committed_graph(repo: &Path) -> kin_model::graph::ResolvedGraphState {
-    let layout = kin_core::KinLayout::discover(repo).unwrap();
+fn committed_graph(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+) -> kin_model::graph::ResolvedGraphState {
+    let layout = runtime.layout_for(repo);
     let manifest = kin_core::KinManifest::load(&layout.manifest_path()).unwrap();
     let manager = kin_db::RepositoryAuthorityManager::open(
         kin_model::RepositoryId::new(manifest.repo_id).unwrap(),
@@ -287,10 +322,9 @@ fn caller_binding_debt(
 /// the rename commit then fails with "absent from the staged tree".
 #[test]
 fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
+    let prepared = initialized();
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    initialize(&runtime, &repo);
 
     fs::write(
         repo.join("src/moved.py"),
@@ -317,7 +351,7 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
          destroys is not under test here: {references_before}"
     );
     require_kin(&runtime, &repo, &["daemon", "stop"]);
-    let graph_before = committed_graph(&repo);
+    let graph_before = committed_graph(&runtime, &repo);
     let target_before = entity_at(&graph_before, "src/moved.py", "moved_target");
     let caller_before = entity_at(&graph_before, "src/caller.py", "moved_caller");
     let artifact_before = graph_before
@@ -365,7 +399,7 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
         !references_after.contains("src/caller.py"),
         "an unchanged old-module import must not follow a moved target: {references_after}"
     );
-    let graph_after = committed_graph(&repo);
+    let graph_after = committed_graph(&runtime, &repo);
     assert_eq!(
         entity_at(&graph_after, "src/renamed.py", "moved_target").id,
         target_before.id
@@ -400,7 +434,7 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
 
     require_kin(&runtime, &repo, &["daemon", "stop"]);
     assert!(!references_text(&runtime, &repo, "moved_target").contains("src/caller.py"));
-    let reopened = committed_graph(&repo);
+    let reopened = committed_graph(&runtime, &repo);
     assert_eq!(caller_binding_debt(&reopened), Some(debt.clone()));
     assert_eq!(
         entity_at(&reopened, "src/renamed.py", "moved_target").id,
@@ -427,7 +461,10 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
         later_paths.iter().any(|path| path == "src/later.py"),
         "work committed after a rename never reached the graph: {later_paths:?}"
     );
-    assert_eq!(caller_binding_debt(&committed_graph(&repo)), Some(debt));
+    assert_eq!(
+        caller_binding_debt(&committed_graph(&runtime, &repo)),
+        Some(debt)
+    );
 
     fs::write(
         repo.join("src/caller.py"),
@@ -439,7 +476,7 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
         &repo,
         &["commit", "-m", "repair the caller's module import"],
     );
-    let repaired = committed_graph(&repo);
+    let repaired = committed_graph(&runtime, &repo);
     assert_eq!(
         entity_at(&repaired, "src/renamed.py", "moved_target").id,
         target_before.id
@@ -478,7 +515,7 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
     assert!(caller_binding_debt(&repaired).is_none());
     require_kin(&runtime, &repo, &["daemon", "stop"]);
     assert!(references_text(&runtime, &repo, "moved_target").contains("src/caller.py"));
-    let repaired_cold = committed_graph(&repo);
+    let repaired_cold = committed_graph(&runtime, &repo);
     assert_eq!(repaired_cold.entities, repaired.entities);
     assert_eq!(repaired_cold.relations, repaired.relations);
     assert!(caller_binding_debt(&repaired_cold).is_none());
@@ -492,10 +529,9 @@ fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it
 /// wrong.
 #[test]
 fn editing_a_committed_file_in_place_is_not_treated_as_a_relocation() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
+    let prepared = initialized();
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    initialize(&runtime, &repo);
 
     fs::write(
         repo.join("src/edited.py"),
@@ -537,10 +573,9 @@ fn editing_a_committed_file_in_place_is_not_treated_as_a_relocation() {
 /// rebind site authority to the admitted new path, not merely keep a scalar edge.
 #[test]
 fn moving_a_caller_preserves_certified_named_import_sites() {
-    let root = tempdir().expect("temp root");
-    let repo = root.path().join("repo");
+    let prepared = initialized();
+    let repo = prepared.repo().to_path_buf();
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    initialize(&runtime, &repo);
     fs::write(
         repo.join("src/target.py"),
         b"def stable_target():\n    return 1\n",
@@ -557,7 +592,7 @@ fn moving_a_caller_preserves_certified_named_import_sites() {
         &["commit", "-m", "record importing caller"],
     );
     require_kin(&runtime, &repo, &["daemon", "stop"]);
-    let before = committed_graph(&repo);
+    let before = committed_graph(&runtime, &repo);
     let target = entity_at(&before, "src/target.py", "stable_target");
     let caller = entity_at(&before, "src/caller.py", "moving_caller");
     let call = before
@@ -584,7 +619,7 @@ fn moving_a_caller_preserves_certified_named_import_sites() {
     fs::rename(repo.join("src/caller.py"), repo.join("src/relocated.py")).unwrap();
     require_kin(&runtime, &repo, &["commit", "-m", "move importing caller"]);
     require_kin(&runtime, &repo, &["daemon", "stop"]);
-    let after = committed_graph(&repo);
+    let after = committed_graph(&runtime, &repo);
     assert_eq!(
         entity_at(&after, "src/relocated.py", "moving_caller").id,
         caller.id

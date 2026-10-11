@@ -26,6 +26,7 @@ default = ["simd"]
 simd = []
 
 [dependencies]
+kin-blobs = { workspace = true }
 fs2 = "0.4"
 hashbrown = { version = "0.15", features = ["serde"] }
 memmap2 = "0.9"

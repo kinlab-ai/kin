@@ -22,6 +22,7 @@
 //! a conflicted or sparse index, an entry Git has been told not to compare, and
 //! a materialized nested repository.
 
+use kin_io::WorktreeRoot;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -40,10 +41,15 @@ use crate::error::{
     RegisteredGitWorktreeFact, RegisteredGitWorktreeKind, Result, UntolerableGitWorktree,
 };
 use crate::lossless::{
-    capture_lossless_git_repository, open_repo, reject_shallow_repository, GitObjectFormat,
-    LosslessGitRepository,
+    open_repo, reject_shallow_repository, CaptureScope, GitObjectFormat, LosslessGitRepository,
 };
 use crate::semantic_import::{ProvedPlanFacts, SemanticGitImportPlan};
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 /// Successful, point-in-time proof that one Git workspace can be admitted
 /// without flattening index or worktree state into repository authority.
@@ -457,11 +463,12 @@ struct ExpectedIndexEntry {
 /// A later history-enrichment/admission step must still attach and validate
 /// shared admission policy deltas before repository authority can be published.
 pub fn preflight_git_migration(
-    repo_path: &Path,
+    repo_path: &WorktreeRoot,
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
+    let repo_path = repo_path.path();
     preflight_git_migration_with_hook(repo_path, snapshot, plan, blob_store, None, None, || {})
 }
 
@@ -498,12 +505,13 @@ pub fn preflight_git_migration(
 /// `semantic_plan_fingerprint`, which is still derived fresh on every
 /// observation and compared through the whole-proof comparison below.
 pub fn reprove_git_migration(
-    repo_path: &Path,
+    repo_path: &WorktreeRoot,
     baseline: &GitMigrationPreflightProof,
     snapshot: &LosslessGitRepository,
     plan: &impl ProvedPlanFacts,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
+    let repo_path = repo_path.path();
     prove_from_plan_facts(
         repo_path,
         snapshot,
@@ -541,13 +549,14 @@ pub fn reprove_git_migration(
 ///
 /// It observes once for the reasons given at [`reprove_git_migration`].
 pub fn reprove_git_migration_after_publication(
-    repo_path: &Path,
+    repo_path: &WorktreeRoot,
     published_kin_dir: &Path,
     baseline: &GitMigrationPreflightProof,
     snapshot: &LosslessGitRepository,
     plan: &impl ProvedPlanFacts,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
+    let repo_path = repo_path.path();
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
     let published_kin_dir = canonical_published_kin_dir(&source_worktree, published_kin_dir)?;
@@ -556,7 +565,7 @@ pub fn reprove_git_migration_after_publication(
         snapshot,
         plan,
         blob_store,
-        Some(&published_kin_dir),
+        published_kin_dir.as_deref(),
         Some(ProofBaseline {
             proof: baseline,
             changed: "Git source proof changed across repository publication; published \
@@ -572,12 +581,13 @@ pub fn reprove_git_migration_after_publication(
 /// proof of this source to measure against. An admission always does, and uses
 /// [`reprove_git_migration_after_publication`].
 pub fn preflight_git_migration_after_publication(
-    repo_path: &Path,
+    repo_path: &WorktreeRoot,
     published_kin_dir: &Path,
     snapshot: &LosslessGitRepository,
     plan: &SemanticGitImportPlan,
     blob_store: &BlobStore,
 ) -> Result<GitMigrationPreflightProof> {
+    let repo_path = repo_path.path();
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
     let published_kin_dir = canonical_published_kin_dir(&source_worktree, published_kin_dir)?;
@@ -586,21 +596,25 @@ pub fn preflight_git_migration_after_publication(
         snapshot,
         plan,
         blob_store,
-        Some(&published_kin_dir),
+        published_kin_dir.as_deref(),
         None,
         || {},
     )
 }
 
-/// The exact `.kin` a post-publication proof is allowed to exclude.
+/// The exact `.kin` a post-publication proof is allowed to exclude, or `None`
+/// when the store was published outside the worktree and there is nothing to
+/// exclude.
 ///
 /// Only a real directory at the canonical worktree root qualifies. Resolving
-/// through a symlink, or accepting a path elsewhere, would let the exclusion
-/// hide a part of the worktree the proof is supposed to cover.
+/// through a symlink, or accepting a path elsewhere inside the worktree, would
+/// let the exclusion hide a part of the worktree the proof is supposed to
+/// cover. A store outside the worktree hides nothing, so the proof then covers
+/// every path, which is the stricter reading: publication wrote nothing here.
 fn canonical_published_kin_dir(
     source_worktree: &Path,
     published_kin_dir: &Path,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let expected_kin_dir = source_worktree.join(".kin");
     let metadata = fs::symlink_metadata(published_kin_dir)
         .map_err(|error| GitError::io(published_kin_dir, error))?;
@@ -612,13 +626,18 @@ fn canonical_published_kin_dir(
     }
     let published_kin_dir = fs::canonicalize(published_kin_dir)
         .map_err(|error| GitError::io(published_kin_dir, error))?;
+    if !published_kin_dir.starts_with(source_worktree)
+        && !source_worktree.starts_with(&published_kin_dir)
+    {
+        return Ok(None);
+    }
     if published_kin_dir != expected_kin_dir {
         return Err(preflight_error(format!(
             "post-publication proof may exclude only {}",
             expected_kin_dir.display()
         )));
     }
-    Ok(published_kin_dir)
+    Ok(Some(published_kin_dir))
 }
 
 /// An earlier proof of this same admission, and what to say when the source no
@@ -729,6 +748,8 @@ fn bind_plan_to_snapshot(
         || plan.proved_external_objects() != snapshot.objects.as_slice()
         || plan.proved_refs() != &snapshot.refs
         || plan.proved_head() != &snapshot.head
+        || plan.proved_history_boundary() != &snapshot.history_boundary
+        || plan.proved_scope() != snapshot.scope
     {
         return Err(preflight_error(
             "semantic import plan is not bound to the supplied lossless snapshot",
@@ -748,10 +769,14 @@ fn observe(
 ) -> Result<PreflightObservation> {
     let source_worktree =
         fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
-    let snapshot = capture_lossless_git_repository(
+    // Re-captured under the snapshot's own scope, so a checked-out-commit
+    // admission proves the commit, tree and refs it took and nothing it chose
+    // not to take.
+    let snapshot = crate::lossless::capture_lossless_git_repository_at(
         &source_worktree,
         expected_snapshot.repository_id.clone(),
         blob_store,
+        expected_snapshot.scope,
     )?;
     if snapshot != *expected_snapshot {
         return Err(preflight_error(
@@ -760,7 +785,9 @@ fn observe(
     }
 
     let repo = open_repo(&source_worktree)?;
-    reject_shallow_repository(&repo)?;
+    if snapshot.scope == CaptureScope::Reachable {
+        reject_shallow_repository(&repo)?;
+    }
     reject_in_progress_operations(&repo)?;
     let source_git_dir = stable_path(repo.git_dir());
     let workdir = repo.workdir().ok_or_else(|| {
@@ -1774,10 +1801,57 @@ fn prove_tracked_entry(
 }
 
 pub(crate) fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()> {
+    let mut found = in_progress_operation(repo)?;
+    if let Some(InProgressOperation::GarbageCollection(running)) = &found {
+        // `git commit` starts its automatic collection detached, so one can
+        // begin after `kin init` waited out the last one at its admission
+        // check, and be running when this proof reads the source again minutes
+        // later. It finishes on its own, and refusing here would throw away the
+        // whole conversion over Git's own housekeeping.
+        tracing::info!(
+            pid = running.pid,
+            "waiting for Git garbage collection to finish before proving the source"
+        );
+        let still = crate::gc_lock::wait_for_running_git_gc_in(
+            repo.common_dir(),
+            crate::gc_lock::GIT_GC_WAIT,
+            &mut |_| {},
+        )?;
+        if still.is_none() {
+            found = in_progress_operation(repo)?;
+        }
+    }
+    match found {
+        None => Ok(()),
+        Some(found) => Err(preflight_error(found.reason())),
+    }
+}
+
+/// Unfinished work a repository's Git directories record.
+pub(crate) enum InProgressOperation {
+    /// A rebase, merge, sequencer, lock or other operation someone has to
+    /// finish or abort, in the words the refusal uses.
+    Operation(String),
+    /// Git's garbage collection, which finishes on its own and is waited out
+    /// rather than finished by hand.
+    GarbageCollection(crate::gc_lock::RunningGitGc),
+}
+
+impl InProgressOperation {
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Operation(reason) => reason.clone(),
+            Self::GarbageCollection(running) => running.sentence(),
+        }
+    }
+}
+
+/// The first unfinished operation the source's Git directories record, if any.
+pub(crate) fn in_progress_operation(repo: &gix::Repository) -> Result<Option<InProgressOperation>> {
     if let Some(operation) = repo.state() {
-        return Err(preflight_error(format!(
+        return Ok(Some(InProgressOperation::Operation(format!(
             "Git operation {operation:?} is in progress"
-        )));
+        ))));
     }
     let mut roots = vec![repo.git_dir().to_path_buf()];
     if stable_path(repo.common_dir()) != stable_path(repo.git_dir()) {
@@ -1785,10 +1859,15 @@ pub(crate) fn reject_in_progress_operations(repo: &gix::Repository) -> Result<()
     }
     for root in &roots {
         if let Some(reason) = in_progress_operation_state(root)? {
-            return Err(preflight_error(reason));
+            return Ok(Some(InProgressOperation::Operation(reason)));
         }
     }
-    Ok(())
+    // Git keeps `gc.pid` in the common directory only, so one read covers the
+    // source and every worktree sharing its objects.
+    if let Some(running) = crate::gc_lock::running_git_gc_in(repo.common_dir())? {
+        return Ok(Some(InProgressOperation::GarbageCollection(running)));
+    }
+    Ok(None)
 }
 
 /// Administrative state under one Git directory that says work is unfinished.
@@ -1813,7 +1892,9 @@ fn in_progress_operation_state(root: &Path) -> Result<Option<String>> {
         "packed-refs.lock",
         "shallow.lock",
         "config.lock",
-        "gc.pid",
+        // `gc.pid` is not here: it outlives a collection that was killed, so
+        // its existence proves nothing. [`in_progress_operation`] asks
+        // [`crate::gc_lock`] whether the collection it names is running.
     ];
     for marker in MARKERS {
         let path = root.join(marker);
@@ -2263,6 +2344,17 @@ pub(crate) struct RemoteMappingScan {
 }
 
 /// Read the transport configuration, refusing at the first reason it carries.
+/// The remote and branch-tracking configuration an admission of the Git
+/// repository at `repo_path` records, read exactly as the preflight reads it.
+///
+/// For a store that was admitted from one checkout and is reused beside
+/// another: the history is the same, and the remotes are this checkout's own.
+pub fn git_remote_mapping_facts(repo_path: &WorktreeRoot) -> Result<GitRemoteMappingFacts> {
+    let repo_path = repo_path.path();
+    let source = fs::canonicalize(repo_path).map_err(|error| GitError::io(repo_path, error))?;
+    remote_mapping_facts(&open_repo(&source)?)
+}
+
 pub(crate) fn remote_mapping_facts(repo: &gix::Repository) -> Result<GitRemoteMappingFacts> {
     let scan = scan_remote_mapping(repo)?;
     match scan.refusals.into_iter().next() {
@@ -2842,6 +2934,15 @@ fn fingerprint_snapshot(snapshot: &LosslessGitRepository) -> Hash256 {
     }
     encode_refs(&mut hash, &snapshot.refs);
     encode_head(&mut hash, &snapshot.head);
+    // Only a scoped snapshot adds these bytes, so a complete snapshot's
+    // fingerprint is exactly what it always was.
+    if !snapshot.is_complete_history() {
+        hash.bytes(b"checked-out-commit-scope");
+        hash.u64(snapshot.history_boundary.len() as u64);
+        for oid in &snapshot.history_boundary {
+            hash.bytes(oid.as_bytes());
+        }
+    }
     hash.finish()
 }
 
@@ -2859,6 +2960,8 @@ fn fingerprint_plan(plan: &impl ProvedPlanFacts) -> Result<Hash256> {
             objects: plan.proved_external_objects().to_vec(),
             refs: plan.proved_refs().clone(),
             head: plan.proved_head().clone(),
+            history_boundary: plan.proved_history_boundary().clone(),
+            scope: plan.proved_scope(),
         })
         .as_bytes(),
     );
@@ -2995,7 +3098,8 @@ const KIN_STORE_DIR: &str = ".kin";
 ///
 /// `Err` means the question could not be put to Git at all, which is a
 /// different answer from "no rule covers it" and is left to the caller.
-pub fn kin_store_is_git_ignored(repo_root: &Path) -> Result<bool> {
+pub fn kin_store_is_git_ignored(repo_root: &WorktreeRoot) -> Result<bool> {
+    let repo_root = repo_root.path();
     let repo = open_repo_with_user_ignore_config(repo_root)?;
     let index_path = repo.index_path();
     let index = gix::index::File::at_or_default(
@@ -3973,7 +4077,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_support::{fixture_git, FixtureGitCommand};
+    use crate::test_support::{
+        fixture_git, write_fixture_git_config, FixtureGitBatch, FixtureGitCommand,
+    };
     use crate::{plan_semantic_git_import, GitError};
 
     struct Fixture {
@@ -3989,9 +4095,6 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path().join("source");
             fs::create_dir(&repo).expect("source directory");
-            git(&repo, &["init", "--initial-branch=main"]);
-            configure_identity(&repo);
-            git(&repo, &["config", "core.filemode", "true"]);
 
             fs::create_dir_all(repo.join("src")).expect("src");
             fs::write(repo.join("src/main.rs"), b"fn main() {}\n").expect("main.rs");
@@ -4023,22 +4126,35 @@ mod tests {
             ignore_permissions.set_mode(0o755);
             fs::set_permissions(repo.join(".gitignore"), ignore_permissions)
                 .expect("chmod gitignore");
-            git(&repo, &["add", "--all", "--force"]);
-            commit(&repo, "initial exact tree");
 
-            let gitlink_target = git_stdout(&repo, &["rev-parse", "HEAD"]);
+            // History first, committed under the identity the configuration
+            // names. The configuration itself is written afterwards as the
+            // bytes `git config` and `git remote` produce, which saves the
+            // seventeen fixture Git execs that issuing them one key at a time
+            // cost; see `write_clean_fixture_config`.
+            let mut seed = FixtureGitBatch::new();
+            seed.git(["init", "--initial-branch=main"])
+                .git(["config", "core.filemode", "true"])
+                .git(["add", "--all", "--force"])
+                .git([
+                    "-c",
+                    "user.name=Kin Test",
+                    "-c",
+                    "user.email=kin@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "-m",
+                    "initial exact tree",
+                    "--no-gpg-sign",
+                ])
+                .git_stdout(["rev-parse", "HEAD"]);
+            let gitlink_target = String::from_utf8(seed.run_in(&repo))
+                .expect("utf8 HEAD")
+                .trim()
+                .to_string();
+
             fs::create_dir_all(repo.join("vendor/dependency")).expect("gitlink directory");
-            git(
-                &repo,
-                &[
-                    "update-index",
-                    "--add",
-                    "--cacheinfo",
-                    &format!("160000,{gitlink_target},vendor/dependency"),
-                ],
-            );
-            commit(&repo, "add gitlink leaf");
-
             fs::create_dir_all(repo.join("ignored")).expect("ignored directory");
             fs::write(repo.join("ignored/cache.bin"), b"cache\n").expect("ignored cache");
             let info_exclude = repo.join(".git/info/exclude");
@@ -4048,79 +4164,19 @@ mod tests {
             fs::write(repo.join("local.tmp"), b"local\n").expect("local ignored");
             let global_excludes = temp.path().join("global-ignore");
             fs::write(&global_excludes, b"global.tmp\n").expect("global ignore");
-            git(
-                &repo,
-                &[
-                    "config",
-                    "core.excludesFile",
-                    global_excludes.to_str().expect("utf8 test path"),
-                ],
-            );
             fs::write(repo.join("global.tmp"), b"global\n").expect("global ignored");
+            write_clean_fixture_config(&repo, &global_excludes);
+            pin_default_hook_surface_directory(&repo);
 
-            git(
-                &repo,
-                &[
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://example.invalid/private/repo.git",
-                ],
-            );
-            git(
-                &repo,
-                &[
-                    "remote",
-                    "set-url",
-                    "--add",
-                    "origin",
-                    "https://mirror.example.invalid/private/repo.git",
-                ],
-            );
-            git(
-                &repo,
-                &[
-                    "remote",
-                    "set-url",
-                    "--push",
-                    "origin",
-                    "ssh://example.invalid/private/repo.git",
-                ],
-            );
-            git(
-                &repo,
-                &[
-                    "remote",
-                    "set-url",
-                    "--add",
-                    "--push",
-                    "origin",
-                    "ssh://mirror.example.invalid/private/repo.git",
-                ],
-            );
-            git(
-                &repo,
-                &[
-                    "config",
-                    "--add",
-                    "remote.origin.fetch",
-                    "+refs/tags/*:refs/tags/*",
-                ],
-            );
-            git(
-                &repo,
-                &[
-                    "config",
-                    "--add",
-                    "remote.origin.push",
-                    "refs/heads/main:refs/heads/main",
-                ],
-            );
-            git(&repo, &["config", "branch.main.remote", "origin"]);
-            git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
-            git(&repo, &["config", "branch.main.pushRemote", "origin"]);
-            git(&repo, &["config", "remote.pushDefault", "origin"]);
-            git(&repo, &["config", "push.default", "simple"]);
+            let mut gitlink = FixtureGitBatch::new();
+            gitlink.git([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{gitlink_target},vendor/dependency"),
+            ]);
+            commit_step(&mut gitlink, "add gitlink leaf");
+            gitlink.run_in(&repo);
 
             let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
             let (snapshot, plan) = snapshot_plan(&repo, &store);
@@ -4133,9 +4189,160 @@ mod tests {
             }
         }
 
-        fn preflight(&self) -> Result<GitMigrationPreflightProof> {
-            preflight_git_migration(&self.repo, &self.snapshot, &self.plan, &self.store)
+        /// `N` independent clean fixtures, for a case that needs several.
+        ///
+        /// Built once and copied, so a case that needs seven pays for one
+        /// build. Each copy is the repository a fresh `clean()` produces at its
+        /// own path: worktree bytes, modes, links and raw names, the index and
+        /// object database, the ignored local state, and configuration whose
+        /// paths name the copy. Its store, capture and plan are taken from the
+        /// copy itself. The copies are made before the case touches any of
+        /// them.
+        fn clean_set<const N: usize>() -> [Self; N] {
+            let first = Self::clean();
+            let copies = (1..N).map(|_| first.duplicate()).collect::<Vec<_>>();
+            let Ok(set) =
+                <[Self; N]>::try_from(std::iter::once(first).chain(copies).collect::<Vec<_>>())
+            else {
+                unreachable!("one fixture and N - 1 copies make N");
+            };
+            set
         }
+
+        fn duplicate(&self) -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path().join("source");
+            copy_tree(&self.repo, &repo);
+            fs::copy(
+                self.temp.path().join("global-ignore"),
+                temp.path().join("global-ignore"),
+            )
+            .expect("copy global ignore");
+            let from = self.temp.path().to_str().expect("utf8 test path");
+            let to = temp.path().to_str().expect("utf8 test path");
+            let config_path = repo.join(".git/config");
+            let config = fs::read_to_string(&config_path).expect("read copied config");
+            assert!(
+                config.contains(from),
+                "the clean fixture's configuration names its own paths: {config}"
+            );
+            fs::write(&config_path, config.replace(from, to)).expect("rebind copied config");
+            let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
+            let (snapshot, plan) = snapshot_plan(&repo, &store);
+            Self {
+                temp,
+                repo,
+                store,
+                snapshot,
+                plan,
+            }
+        }
+
+        fn preflight(&self) -> Result<GitMigrationPreflightProof> {
+            preflight_git_migration(
+                &worktree(&self.repo),
+                &self.snapshot,
+                &self.plan,
+                &self.store,
+            )
+        }
+    }
+
+    /// The configuration the fixtures write directly is the configuration Git
+    /// writes for the same commands, byte for byte.
+    ///
+    /// The clean fixture and `config_only_repository` skip seventeen and four
+    /// `git config` launches by writing those bytes themselves. This runs the
+    /// commands once and compares, so a Git that ever writes them differently
+    /// fails here rather than silently changing what every preflight case
+    /// observes.
+    #[test]
+    fn fixture_configuration_is_the_bytes_git_writes_for_the_same_commands() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("source");
+        fs::create_dir(&repo).expect("source directory");
+        let global_excludes = temp.path().join("global-ignore");
+        FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "core.filemode", "true"])
+            .run_in(&repo);
+        let initialized = fs::read(repo.join(".git/config")).expect("init config");
+
+        let mut identity = FixtureGitBatch::new();
+        configure_identity_steps(&mut identity, &repo);
+        identity.run_in(&repo);
+        let identity_bytes = fs::read(repo.join(".git/config")).expect("identity config");
+        fs::write(repo.join(".git/config"), &initialized).expect("reset config");
+        write_identity_config(&repo);
+        assert_eq!(
+            String::from_utf8(identity_bytes).expect("utf8 config"),
+            fs::read_to_string(repo.join(".git/config")).expect("written config")
+        );
+
+        fs::write(repo.join(".git/config"), &initialized).expect("reset config");
+        let mut commands = FixtureGitBatch::new();
+        configure_identity_steps(&mut commands, &repo);
+        commands
+            .git(["config", "core.filemode", "true"])
+            .git([
+                "config",
+                "core.excludesFile",
+                global_excludes.to_str().expect("utf8 test path"),
+            ])
+            .git([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/private/repo.git",
+            ])
+            .git([
+                "remote",
+                "set-url",
+                "--add",
+                "origin",
+                "https://mirror.example.invalid/private/repo.git",
+            ])
+            .git([
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "ssh://example.invalid/private/repo.git",
+            ])
+            .git([
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "ssh://mirror.example.invalid/private/repo.git",
+            ])
+            .git([
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/tags/*:refs/tags/*",
+            ])
+            .git([
+                "config",
+                "--add",
+                "remote.origin.push",
+                "refs/heads/main:refs/heads/main",
+            ])
+            .git(["config", "branch.main.remote", "origin"])
+            .git(["config", "branch.main.merge", "refs/heads/main"])
+            .git(["config", "branch.main.pushRemote", "origin"])
+            .git(["config", "remote.pushDefault", "origin"])
+            .git(["config", "push.default", "simple"]);
+        commands.run_in(&repo);
+        let commanded = fs::read(repo.join(".git/config")).expect("commanded config");
+        fs::write(repo.join(".git/config"), &initialized).expect("reset config");
+        write_clean_fixture_config(&repo, &global_excludes);
+        let written = fs::read(repo.join(".git/config")).expect("written config");
+        assert_eq!(
+            String::from_utf8(commanded).expect("utf8 config"),
+            String::from_utf8(written).expect("utf8 config")
+        );
     }
 
     #[test]
@@ -4283,8 +4490,8 @@ mod tests {
             .artifact_at_path(&RepoPath::from_bytes(raw_path.to_vec()).unwrap())
             .is_some());
 
-        let proof =
-            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("exact preflight");
+        let proof = preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
+            .expect("exact preflight");
         assert_eq!(proof.index.entry_count, 2);
         assert_eq!(proof.tracked_worktree.entry_count, 2);
         assert_eq!(proof.tracked_worktree.host_unrepresentable_count, 1);
@@ -4304,7 +4511,7 @@ mod tests {
         let baseline = fixture.preflight().expect("baseline proof");
 
         let agreed = reprove_git_migration(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &baseline,
             &fixture.snapshot,
             &fixture.plan,
@@ -4317,7 +4524,7 @@ mod tests {
         fs::create_dir(&published_kin).expect("published Kin directory");
         fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
         let after_publication = reprove_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &baseline,
             &fixture.snapshot,
@@ -4333,7 +4540,7 @@ mod tests {
         fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
             .expect("tracked source drift");
         let before_publication = reprove_git_migration(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &baseline,
             &fixture.snapshot,
             &fixture.plan,
@@ -4347,7 +4554,7 @@ mod tests {
             "{before_publication}"
         );
         let across_publication = reprove_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &baseline,
             &fixture.snapshot,
@@ -4377,7 +4584,7 @@ mod tests {
         fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
 
         let error = reprove_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &baseline,
             &fixture.snapshot,
@@ -4406,7 +4613,7 @@ mod tests {
         baseline.semantic_plan_fingerprint = digest(b"a plan this admission never proved");
 
         let error = reprove_git_migration(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &baseline,
             &fixture.snapshot,
             &fixture.plan,
@@ -4437,7 +4644,7 @@ mod tests {
             "",
         );
         let after = preflight_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
@@ -4448,7 +4655,7 @@ mod tests {
 
         fs::write(fixture.repo.join("outside-kin.txt"), b"untracked\n").expect("untracked sibling");
         let sibling = preflight_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
@@ -4481,7 +4688,7 @@ mod tests {
         fs::create_dir(&published_kin).expect("published Kin directory");
         fs::write(published_kin.join("version"), b"6\n").expect("published Kin metadata");
         let clean = preflight_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
@@ -4493,7 +4700,7 @@ mod tests {
         fs::write(fixture.repo.join("compose.yaml"), b"services: {}\n")
             .expect("tracked source drift");
         let drifted = preflight_git_migration_after_publication(
-            &fixture.repo,
+            &worktree(&fixture.repo),
             &published_kin,
             &fixture.snapshot,
             &fixture.plan,
@@ -4515,7 +4722,7 @@ mod tests {
 
     #[test]
     fn rejects_materialized_gitlink_state_instead_of_silently_skipping_it() {
-        let nested_marker = Fixture::clean();
+        let [nested_marker, nested_worktree] = Fixture::clean_set();
         fs::write(
             nested_marker.repo.join("vendor/dependency/.git"),
             b"gitdir: nested-admin\n",
@@ -4523,7 +4730,6 @@ mod tests {
         .expect("nested marker");
         assert_preflight_contains(&nested_marker, "materialized nested-repository state");
 
-        let nested_worktree = Fixture::clean();
         fs::write(
             nested_worktree.repo.join("vendor/dependency/dirty.txt"),
             b"unmapped nested worktree\n",
@@ -4539,7 +4745,7 @@ mod tests {
     /// workspace state rather than a reason the source cannot be read.
     #[test]
     fn reports_staged_and_intent_to_add_index_state() {
-        let staged = Fixture::clean();
+        let [staged, intent] = Fixture::clean_set();
         fs::write(staged.repo.join("compose.yaml"), b"services: {}\n").expect("edit");
         git(&staged.repo, &["add", "compose.yaml"]);
         let proof = staged.preflight().expect("staged work is observed");
@@ -4550,7 +4756,6 @@ mod tests {
             "not the committed one",
         );
 
-        let intent = Fixture::clean();
         fs::write(intent.repo.join("intent.txt"), b"intent\n").expect("intent");
         git(&intent.repo, &["add", "--intent-to-add", "intent.txt"]);
         let proof = intent.preflight().expect("an announced path is observed");
@@ -4578,21 +4783,19 @@ mod tests {
     /// line the in-progress-operation refusal already draws.
     #[test]
     fn rejects_conflicted_and_ambiguous_index_state() {
-        let assume = Fixture::clean();
+        let [assume, skipped, conflicted, sparse] = Fixture::clean_set();
         git(
             &assume.repo,
             &["update-index", "--assume-unchanged", "compose.yaml"],
         );
         assert_preflight_contains(&assume, "ambiguous flags");
 
-        let skipped = Fixture::clean();
         git(
             &skipped.repo,
             &["update-index", "--skip-worktree", "compose.yaml"],
         );
         assert_preflight_contains(&skipped, "ambiguous flags");
 
-        let conflicted = Fixture::clean();
         let stage_zero = git_stdout(&conflicted.repo, &["ls-files", "-s", "src/main.rs"]);
         let oid = stage_zero
             .split_whitespace()
@@ -4608,7 +4811,6 @@ mod tests {
         git_stdin(&conflicted.repo, &["update-index", "--index-info"], &input);
         assert_preflight_contains(&conflicted, "conflict stage");
 
-        let sparse = Fixture::clean();
         fs::write(sparse.repo.join(".git/info/sparse-checkout"), b"/src/\n")
             .expect("sparse marker");
         assert_preflight_contains(&sparse, "sparse checkout");
@@ -4621,7 +4823,8 @@ mod tests {
     /// question is whether init said so.
     #[test]
     fn reports_unstaged_untracked_mode_symlink_and_byte_mismatches() {
-        let unstaged = Fixture::clean();
+        let [unstaged, untracked, executable, symlink_target, symlink_kind, removed, unstaged_removal] =
+            Fixture::clean_set();
         fs::write(unstaged.repo.join("src/main.rs"), b"fn changed() {}\n").expect("edit");
         assert_discloses(
             &unstaged.preflight().expect("an edit is observed"),
@@ -4630,7 +4833,6 @@ mod tests {
             "bytes differ",
         );
 
-        let untracked = Fixture::clean();
         fs::write(untracked.repo.join("surprise.txt"), b"surprise\n").expect("untracked");
         assert_discloses(
             &untracked
@@ -4641,7 +4843,6 @@ mod tests {
             "",
         );
 
-        let executable = Fixture::clean();
         let mut permissions = fs::metadata(executable.repo.join("script.sh"))
             .expect("script metadata")
             .permissions();
@@ -4654,7 +4855,6 @@ mod tests {
             "executable mode differs",
         );
 
-        let symlink_target = Fixture::clean();
         fs::remove_file(symlink_target.repo.join("source-link")).expect("remove symlink");
         symlink(
             Path::new("compose.yaml"),
@@ -4670,7 +4870,6 @@ mod tests {
             "link target differs",
         );
 
-        let symlink_kind = Fixture::clean();
         fs::remove_file(symlink_kind.repo.join("source-link")).expect("remove symlink");
         fs::write(symlink_kind.repo.join("source-link"), b"src/main.rs").expect("regular file");
         assert_discloses(
@@ -4682,7 +4881,6 @@ mod tests {
             "no longer materializes it as a symbolic link",
         );
 
-        let removed = Fixture::clean();
         fs::remove_file(removed.repo.join("compose.yaml")).expect("remove tracked file");
         assert_discloses(
             &removed
@@ -4693,7 +4891,6 @@ mod tests {
             "",
         );
 
-        let unstaged_removal = Fixture::clean();
         git(&unstaged_removal.repo, &["rm", "--cached", "compose.yaml"]);
         assert_discloses(
             &unstaged_removal
@@ -4759,26 +4956,32 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
-        git(&repo, &["init", "--initial-branch=main"]);
-        configure_identity(&repo);
-        git(&repo, &["config", "core.autocrlf", "true"]);
         // The exact shape every Gradle and Maven wrapper project carries, so
         // the pattern this resolves is a glob rather than a literal name.
         fs::write(repo.join(".gitattributes"), b"*.bat text eol=crlf\n").expect("attributes");
         fs::write(repo.join("gradlew.bat"), b"line one\nline two\n").expect("text");
-        git(&repo, &["add", "--all"]);
-        commit(&repo, "crlf checkout");
+        let mut seed = FixtureGitBatch::new();
+        seed.git(["init", "--initial-branch=main"]);
+        configure_identity_steps(&mut seed, &repo);
+        seed.git(["config", "core.autocrlf", "true"])
+            .git(["add", "--all"]);
+        commit_step(&mut seed, "crlf checkout");
+        seed.run_in(&repo);
+        pin_default_hook_surface_directory(&repo);
         fs::remove_file(repo.join("gradlew.bat")).expect("remove text");
-        git(&repo, &["checkout", "--", "gradlew.bat"]);
+        let status = FixtureGitBatch::new()
+            .git(["checkout", "--", "gradlew.bat"])
+            .git_stdout(["status", "--porcelain"])
+            .run_in(&repo);
         assert!(fs::read(repo.join("gradlew.bat"))
             .expect("text bytes")
             .windows(2)
             .any(|pair| pair == b"\r\n"));
-        assert_eq!(git_stdout(&repo, &["status", "--porcelain"]), "");
+        assert_eq!(String::from_utf8(status).expect("utf8 status"), "");
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let proof = preflight_git_migration(&repo, &snapshot, &plan, &store)
+        let proof = preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
             .expect("a rewritten checkout is observed");
         let reported = only_detail(&proof.workspace_divergence.entries);
         assert!(reported.contains("text eol=crlf"), "{reported}");
@@ -4806,14 +5009,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
-        git(&repo, &["init", "--initial-branch=main"]);
-        configure_identity(&repo);
-        pin_default_hook_surface(&repo);
         fs::write(repo.join("README.md"), b"seed\n").expect("readme");
-        git(&repo, &["add", "--all"]);
-        commit(&repo, "seed");
-
-        let blob = git_stdout(&repo, &["rev-parse", "HEAD:README.md"]);
+        let mut seed = FixtureGitBatch::new();
+        seed.git(["init", "--initial-branch=main"]);
+        configure_identity_steps(&mut seed, &repo);
+        pin_default_hook_surface_step(&mut seed, &repo);
+        seed.git(["add", "--all"]);
+        commit_step(&mut seed, "seed");
+        seed.git_stdout(["rev-parse", "HEAD:README.md"]);
+        let blob = String::from_utf8(seed.run_in(&repo))
+            .expect("utf8 object id")
+            .trim()
+            .to_string();
+        pin_default_hook_surface_directory(&repo);
         // Written as raw tree bytes because `git mktree` canonicalises the mode
         // on the way in, which is exactly the normalisation this case needs to
         // be missing.
@@ -4859,7 +5067,7 @@ mod tests {
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let proof = preflight_git_migration(&repo, &snapshot, &plan, &store)
+        let proof = preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
             .expect("a non-canonical mode is admissible");
         assert_no_divergence(&proof);
     }
@@ -4875,19 +5083,22 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source");
-        git(&repo, &["init", "--initial-branch=main"]);
-        configure_identity(&repo);
-        git(&repo, &["config", "core.autocrlf", "false"]);
         fs::write(repo.join("text.txt"), b"line one\nline two\n").expect("text");
-        git(&repo, &["add", "--all"]);
-        commit(&repo, "committed text");
+        let mut seed = FixtureGitBatch::new();
+        seed.git(["init", "--initial-branch=main"]);
+        configure_identity_steps(&mut seed, &repo);
+        seed.git(["config", "core.autocrlf", "false"])
+            .git(["add", "--all"]);
+        commit_step(&mut seed, "committed text");
+        seed.run_in(&repo);
+        pin_default_hook_surface_directory(&repo);
         fs::write(repo.join("text.txt"), b"line one\nline three\n").expect("edit");
         assert_ne!(git_stdout(&repo, &["status", "--porcelain"]), "");
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let proof =
-            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("an edit is observed");
+        let proof = preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
+            .expect("an edit is observed");
         assert_discloses(
             &proof,
             "text.txt",
@@ -4902,7 +5113,7 @@ mod tests {
 
     #[test]
     fn rejects_operations_missing_index_missing_objects_and_shallow_state() {
-        let operation = Fixture::clean();
+        let [operation, missing_index, missing_object, shallow] = Fixture::clean_set();
         fs::write(
             operation.repo.join(".git/MERGE_HEAD"),
             b"0000000000000000000000000000000000000000\n",
@@ -4910,14 +5121,12 @@ mod tests {
         .expect("merge marker");
         assert_preflight_contains(&operation, "operation Merge");
 
-        let missing_index = Fixture::clean();
         fs::remove_file(missing_index.repo.join(".git/index")).expect("remove index");
         let error = missing_index
             .preflight()
             .expect_err("missing index must reject");
         assert!(error.to_string().contains("index"));
 
-        let missing_object = Fixture::clean();
         let object = missing_object
             .snapshot
             .objects
@@ -4943,7 +5152,6 @@ mod tests {
             GitError::MissingObject { .. } | GitError::Git(_) | GitError::CorruptObject { .. }
         ));
 
-        let shallow = Fixture::clean();
         let head = git_stdout(&shallow.repo, &["rev-parse", "HEAD"]);
         fs::write(shallow.repo.join(".git/shallow"), format!("{head}\n")).expect("shallow");
         assert!(matches!(
@@ -4974,7 +5182,7 @@ mod tests {
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
-        let message = preflight_git_migration(&repo, &snapshot, &plan, &store)
+        let message = preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
             .expect_err("unsupported key must reject")
             .to_string();
 
@@ -4984,7 +5192,7 @@ mod tests {
 
     #[test]
     fn returns_structured_hook_filter_and_worktree_blockers() {
-        let hook = Fixture::clean();
+        let [hook, filter, custom_hooks, worktrees] = Fixture::clean_set();
         let hook_path = hook.repo.join(".git/hooks/pre-commit");
         fs::write(&hook_path, b"#!/bin/sh\nexit 0\n").expect("hook");
         let mut permissions = fs::metadata(&hook_path)
@@ -5012,7 +5220,6 @@ mod tests {
             error => panic!("unexpected error: {error:?}"),
         }
 
-        let filter = Fixture::clean();
         git(
             &filter.repo,
             &["config", "filter.demo.clean", "external-clean"],
@@ -5037,7 +5244,6 @@ mod tests {
             error => panic!("unexpected error: {error:?}"),
         }
 
-        let custom_hooks = Fixture::clean();
         let custom_dir = custom_hooks.temp.path().join("custom-hooks");
         fs::create_dir_all(&custom_dir).expect("custom hooks directory");
         let redirected = custom_dir.join("pre-push");
@@ -5064,7 +5270,6 @@ mod tests {
             error => panic!("unexpected error: {error:?}"),
         }
 
-        let worktrees = Fixture::clean();
         let other = worktrees.temp.path().join("other-worktree");
         git(
             &worktrees.repo,
@@ -5081,8 +5286,13 @@ mod tests {
             &["commit", "--allow-empty", "-m", "anchored only here"],
         );
         let (snapshot, plan) = snapshot_plan(&worktrees.repo, &worktrees.store);
-        let error = preflight_git_migration(&worktrees.repo, &snapshot, &plan, &worktrees.store)
-            .expect_err("additional worktree blocker");
+        let error = preflight_git_migration(
+            &worktree(&worktrees.repo),
+            &snapshot,
+            &plan,
+            &worktrees.store,
+        )
+        .expect_err("additional worktree blocker");
         let rendered = error.to_string();
         match error {
             GitError::AdditionalWorktrees { count, worktrees } => {
@@ -5125,8 +5335,9 @@ mod tests {
         );
 
         let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
-        let proof = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
-            .expect("an idle sibling worktree is tolerated");
+        let proof =
+            preflight_git_migration(&worktree(&fixture.repo), &snapshot, &plan, &fixture.store)
+                .expect("an idle sibling worktree is tolerated");
         assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
         assert_eq!(
             stable_path(&proof.compatibility.other_registered_worktrees[0].path),
@@ -5155,8 +5366,9 @@ mod tests {
         );
 
         let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
-        let proof = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
-            .expect("a detached sibling at a published commit is tolerated");
+        let proof =
+            preflight_git_migration(&worktree(&fixture.repo), &snapshot, &plan, &fixture.store)
+                .expect("a detached sibling at a published commit is tolerated");
         assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
         assert_eq!(
             stable_path(&proof.compatibility.other_registered_worktrees[0].path),
@@ -5188,9 +5400,10 @@ mod tests {
         fs::create_dir(admin.join("rebase-merge")).expect("in-progress rebase state");
 
         let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
-        let rendered = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
-            .expect_err("a sibling mid-rebase is refused")
-            .to_string();
+        let rendered =
+            preflight_git_migration(&worktree(&fixture.repo), &snapshot, &plan, &fixture.store)
+                .expect_err("a sibling mid-rebase is refused")
+                .to_string();
         assert!(
             rendered.contains("rebasing-worktree") && rendered.contains("rebase-merge"),
             "the refusal names the worktree and its state: {rendered}"
@@ -5223,9 +5436,10 @@ mod tests {
         .expect("private ref");
 
         let (snapshot, plan) = snapshot_plan(&fixture.repo, &fixture.store);
-        let rendered = preflight_git_migration(&fixture.repo, &snapshot, &plan, &fixture.store)
-            .expect_err("a sibling holding private refs is refused")
-            .to_string();
+        let rendered =
+            preflight_git_migration(&worktree(&fixture.repo), &snapshot, &plan, &fixture.store)
+                .expect_err("a sibling holding private refs is refused")
+                .to_string();
         assert!(
             rendered.contains("bisecting-worktree") && rendered.contains("bisect"),
             "the refusal names the worktree and the ref: {rendered}"
@@ -5255,7 +5469,7 @@ mod tests {
         );
 
         let (snapshot, plan) = snapshot_plan(&other, &fixture.store);
-        let proof = preflight_git_migration(&other, &snapshot, &plan, &fixture.store)
+        let proof = preflight_git_migration(&worktree(&other), &snapshot, &plan, &fixture.store)
             .expect("an idle main sibling with loose shared branches is tolerated");
         assert_eq!(proof.compatibility.other_registered_worktrees.len(), 1);
         assert_eq!(
@@ -5290,7 +5504,7 @@ mod tests {
         .expect("main per-worktree ref");
 
         let (snapshot, plan) = snapshot_plan(&other, &fixture.store);
-        let rendered = preflight_git_migration(&other, &snapshot, &plan, &fixture.store)
+        let rendered = preflight_git_migration(&worktree(&other), &snapshot, &plan, &fixture.store)
             .expect_err("a main sibling mid-bisect is refused")
             .to_string();
         assert!(
@@ -5304,52 +5518,59 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let seed = temp.path().join("seed");
         fs::create_dir(&seed).expect("seed");
-        git(&seed, &["init", "--initial-branch=main"]);
-        configure_identity(&seed);
         fs::write(seed.join("README.md"), b"seed\n").expect("seed file");
-        git(&seed, &["add", "README.md"]);
-        commit(&seed, "seed");
-
         let bare = temp.path().join("common.git");
-        git_at(
-            temp.path(),
-            &["init", "--bare", bare.to_str().expect("bare path")],
-        );
-        git_dir(
-            &bare,
-            &[
+        let linked = temp.path().join("linked");
+        let bare_dir = bare.to_str().expect("bare path");
+        // One launch from the seed checkout: the bare repository's commands
+        // name it with `--git-dir`, as separate launches from anywhere would.
+        let mut batch = FixtureGitBatch::new();
+        batch.git(["init", "--initial-branch=main"]);
+        configure_identity_steps(&mut batch, &seed);
+        batch.git(["add", "README.md"]);
+        commit_step(&mut batch, "seed");
+        batch
+            .git(["init", "--bare", bare_dir])
+            .git([
+                "--git-dir",
+                bare_dir,
                 "fetch",
                 seed.to_str().expect("seed path"),
                 "main:refs/heads/main",
-            ],
-        );
-        git_dir(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        // The linked worktree resolves hooks through this common directory, so
-        // the pin that keeps a developer host out of the answer belongs here.
-        git_dir(
-            &bare,
-            &[
+            ])
+            .git([
+                "--git-dir",
+                bare_dir,
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/main",
+            ])
+            // The linked worktree resolves hooks through this common
+            // directory, so the pin that keeps a developer host out of the
+            // answer belongs here.
+            .git([
+                "--git-dir",
+                bare_dir,
                 "config",
                 "core.hooksPath",
                 bare.join("hooks").to_str().expect("bare hooks path"),
-            ],
-        );
-        let linked = temp.path().join("linked");
-        git_dir(
-            &bare,
-            &[
+            ])
+            .git([
+                "--git-dir",
+                bare_dir,
                 "worktree",
                 "add",
                 linked.to_str().expect("linked path"),
                 "main",
-            ],
-        );
+            ]);
+        batch.run_in(&seed);
+        pin_default_hook_surface_directory(&seed);
         assert!(linked.join(".git").is_file());
 
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&linked, &store);
-        let proof =
-            preflight_git_migration(&linked, &snapshot, &plan, &store).expect("linked preflight");
+        let proof = preflight_git_migration(&worktree(&linked), &snapshot, &plan, &store)
+            .expect("linked preflight");
         assert!(proof.compatibility.other_registered_worktrees.is_empty());
         assert_eq!(proof.tracked_worktree.entry_count, 1);
     }
@@ -5427,16 +5648,15 @@ mod tests {
 
         for (case_index, (key, value, secret)) in cases.into_iter().enumerate() {
             let (temp, repo) = config_only_repository();
-            git(
-                &repo,
-                &[
+            FixtureGitBatch::new()
+                .git([
                     "remote",
                     "add",
                     "origin",
                     "https://example.invalid/repo.git",
-                ],
-            );
-            git(&repo, &["config", "--replace-all", key, value]);
+                ])
+                .git(["config", "--replace-all", key, value])
+                .run_in(&repo);
             let error = match remote_mapping_facts(&open_repo(&repo).expect("open config fixture"))
             {
                 Ok(_) => panic!("unsafe transport config case {case_index} must reject"),
@@ -5638,8 +5858,8 @@ mod tests {
         let store = BlobStore::new(temp.path().join("cas")).expect("blob store");
         let (snapshot, plan) = snapshot_plan(&repo, &store);
 
-        let proof =
-            preflight_git_migration(&repo, &snapshot, &plan, &store).expect("unborn preflight");
+        let proof = preflight_git_migration(&worktree(&repo), &snapshot, &plan, &store)
+            .expect("unborn preflight");
         assert!(!proof.index.present);
         assert_eq!(proof.index.entry_count, 0);
         assert!(proof.base_target.is_none());
@@ -5664,14 +5884,19 @@ mod tests {
         assert!(born_plan.workspace_seed.base_tree_hash.is_some());
         assert!(born_plan.workspace_seed.base_tree.is_empty());
         fs::remove_file(born_repo.join(".git/index")).expect("remove born empty index");
-        let error = preflight_git_migration(&born_repo, &born_snapshot, &born_plan, &born_store)
-            .expect_err("born empty repository without an index must reject");
+        let error = preflight_git_migration(
+            &worktree(&born_repo),
+            &born_snapshot,
+            &born_plan,
+            &born_store,
+        )
+        .expect_err("born empty repository without an index must reject");
         assert!(error.to_string().contains("index"));
     }
 
     #[test]
     fn fails_when_source_or_local_ignore_inputs_change_during_preflight() {
-        let source_change = Fixture::clean();
+        let [source_change, ignore_change] = Fixture::clean_set();
         let repo = source_change.repo.clone();
         let error = preflight_git_migration_with_hook(
             &source_change.repo,
@@ -5689,7 +5914,6 @@ mod tests {
             .to_string()
             .contains("changed during migration preflight"));
 
-        let ignore_change = Fixture::clean();
         let info_exclude = ignore_change.repo.join(".git/info/exclude");
         let error = preflight_git_migration_with_hook(
             &ignore_change.repo,
@@ -5724,7 +5948,7 @@ mod tests {
     fn the_store_reads_as_ignored_through_a_rule_git_resolves_outside_the_repository() {
         let (temp, repo) = config_only_repository();
         assert!(
-            !kin_store_is_git_ignored(&repo).expect("resolve ignore rules"),
+            !kin_store_is_git_ignored(&worktree(&repo)).expect("resolve ignore rules"),
             "the fixture must start with nothing hiding the store, or this test proves nothing"
         );
 
@@ -5740,7 +5964,7 @@ mod tests {
         );
 
         assert!(
-            kin_store_is_git_ignored(&repo).expect("resolve ignore rules"),
+            kin_store_is_git_ignored(&worktree(&repo)).expect("resolve ignore rules"),
             "a rule Git resolves outside the repository still hides the store"
         );
         assert!(
@@ -5755,13 +5979,40 @@ mod tests {
         );
     }
 
+    /// Copy a directory tree exactly: file bytes and permissions, symbolic
+    /// links as links, and every name as the bytes it was created with.
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir(to).expect("copy directory");
+        for entry in fs::read_dir(from).expect("read directory") {
+            let entry = entry.expect("directory entry");
+            let source = entry.path();
+            let target = to.join(entry.file_name());
+            let kind = entry.file_type().expect("entry type");
+            if kind.is_symlink() {
+                symlink(fs::read_link(&source).expect("link target"), &target).expect("copy link");
+            } else if kind.is_dir() {
+                copy_tree(&source, &target);
+            } else {
+                fs::copy(&source, &target).expect("copy file");
+            }
+        }
+        fs::set_permissions(
+            to,
+            fs::metadata(from)
+                .expect("directory metadata")
+                .permissions(),
+        )
+        .expect("copy directory permissions");
+    }
+
     fn snapshot_plan(
         repo: &Path,
         store: &BlobStore,
     ) -> (LosslessGitRepository, SemanticGitImportPlan) {
         let repository_id = RepositoryId::new("preflight-test").expect("repository id");
         let snapshot =
-            capture_lossless_git_repository(repo, repository_id, store).expect("capture");
+            crate::lossless::capture_lossless_git_repository(&worktree(repo), repository_id, store)
+                .expect("capture");
         let plan = plan_semantic_git_import(&snapshot, store).expect("plan");
         (snapshot, plan)
     }
@@ -5770,9 +6021,68 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("source");
         fs::create_dir(&repo).expect("source directory");
-        git(&repo, &["init", "--initial-branch=main"]);
-        configure_identity(&repo);
+        FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .run_in(&repo);
+        write_identity_config(&repo);
+        pin_default_hook_surface_directory(&repo);
         (temp, repo)
+    }
+
+    /// The sections `configure_identity_steps` adds after `[core]`, as Git
+    /// writes them.
+    const IDENTITY_CONFIG: &str =
+        "[user]\n\tname = Kin Test\n\temail = kin@example.invalid\n[commit]\n\tgpgSign = false\n";
+
+    /// The remote, branch and push sections the clean fixture's `git remote`
+    /// and `git config` commands create, in the order they create them.
+    const CLEAN_FIXTURE_REMOTE_CONFIG: &str = "[remote \"origin\"]\n\
+        \turl = https://example.invalid/private/repo.git\n\
+        \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+        \turl = https://mirror.example.invalid/private/repo.git\n\
+        \tpushurl = ssh://example.invalid/private/repo.git\n\
+        \tpushurl = ssh://mirror.example.invalid/private/repo.git\n\
+        \tfetch = +refs/tags/*:refs/tags/*\n\
+        \tpush = refs/heads/main:refs/heads/main\n\
+        [branch \"main\"]\n\
+        \tremote = origin\n\
+        \tmerge = refs/heads/main\n\
+        \tpushRemote = origin\n\
+        [remote]\n\
+        \tpushDefault = origin\n\
+        [push]\n\
+        \tdefault = simple\n";
+
+    /// Write the clean fixture's configuration as the bytes Git itself writes.
+    ///
+    /// The fixture used to set it with seventeen `git config` and `git remote`
+    /// commands, each a fixture Git exec, and that was most of what building
+    /// the fixture cost. Git appends a key it adds to an existing section at
+    /// that section's end and starts every new section at the end of the
+    /// file, so the commands in their order (identity, hooks path, file mode,
+    /// excludes file, then the remote, branch and push keys) leave exactly
+    /// `[core]` with `hooksPath` and `excludesFile` appended, then the
+    /// identity sections, then the remote sections below.
+    fn write_clean_fixture_config(repo: &Path, global_excludes: &Path) {
+        let mut sections = String::from(IDENTITY_CONFIG);
+        sections.push_str(CLEAN_FIXTURE_REMOTE_CONFIG);
+        write_fixture_git_config(
+            repo,
+            &[
+                ("hooksPath", &repo.join(".git/hooks")),
+                ("excludesFile", global_excludes),
+            ],
+            &sections,
+        );
+    }
+
+    /// The bytes `configure_identity_steps` has Git write after `git init`.
+    fn write_identity_config(repo: &Path) {
+        write_fixture_git_config(
+            repo,
+            &[("hooksPath", &repo.join(".git/hooks"))],
+            IDENTITY_CONFIG,
+        );
     }
 
     fn assert_preflight_contains(fixture: &Fixture, expected: &str) {
@@ -5823,11 +6133,16 @@ mod tests {
         );
     }
 
-    fn configure_identity(repo: &Path) {
-        git(repo, &["config", "user.name", "Kin Test"]);
-        git(repo, &["config", "user.email", "kin@example.invalid"]);
-        git(repo, &["config", "commit.gpgSign", "false"]);
-        pin_default_hook_surface(repo);
+    /// Queue the identity a fixture commits under, then pin its hook surface.
+    ///
+    /// Run inside an already-initialized repository, followed by
+    /// [`pin_default_hook_surface_directory`] once the batch has run.
+    fn configure_identity_steps(batch: &mut FixtureGitBatch, repo: &Path) {
+        batch
+            .git(["config", "user.name", "Kin Test"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "commit.gpgSign", "false"]);
+        pin_default_hook_surface_step(batch, repo);
     }
 
     /// Bind a fixture's hook surface to its own `.git/hooks`.
@@ -5836,52 +6151,40 @@ mod tests {
     /// not the isolated Git child a fixture launches, so a developer host that
     /// sets `core.hooksPath` globally redirects a fixture too. Repository scope
     /// outranks the host, so pinning it here settles what every case reads.
-    fn pin_default_hook_surface(repo: &Path) {
+    fn pin_default_hook_surface_step(batch: &mut FixtureGitBatch, repo: &Path) {
         let hooks = repo.join(".git/hooks");
-        fs::create_dir_all(&hooks).expect("default hook directory");
-        git(
-            repo,
-            &[
-                "config",
-                "core.hooksPath",
-                hooks.to_str().expect("utf8 test path"),
-            ],
-        );
+        batch.git([
+            "config",
+            "core.hooksPath",
+            hooks.to_str().expect("utf8 test path"),
+        ]);
+    }
+
+    /// The pinned hook directory exists whether or not `git init` copied a
+    /// template into it.
+    fn pin_default_hook_surface_directory(repo: &Path) {
+        fs::create_dir_all(repo.join(".git/hooks")).expect("default hook directory");
     }
 
     fn commit(repo: &Path, message: &str) {
-        git(
-            repo,
-            &[
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "-m",
-                message,
-                "--no-gpg-sign",
-            ],
-        );
+        let mut batch = FixtureGitBatch::new();
+        commit_step(&mut batch, message);
+        batch.run_in(repo);
+    }
+
+    fn commit_step(batch: &mut FixtureGitBatch, message: &str) {
+        batch.git([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            message,
+            "--no-gpg-sign",
+        ]);
     }
 
     fn git(repo: &Path, args: &[&str]) -> Output {
         let output = git_command(repo).args(args).output().expect("run git");
-        assert_git_success(args, &output);
-        output
-    }
-
-    fn git_at(directory: &Path, args: &[&str]) -> Output {
-        let output = git_command(directory).args(args).output().expect("run git");
-        assert_git_success(args, &output);
-        output
-    }
-
-    fn git_dir(git_dir: &Path, args: &[&str]) -> Output {
-        let output = clean_git_command()
-            .arg("--git-dir")
-            .arg(git_dir)
-            .args(args)
-            .output()
-            .expect("run git-dir command");
         assert_git_success(args, &output);
         output
     }

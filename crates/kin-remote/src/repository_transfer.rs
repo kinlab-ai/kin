@@ -22,10 +22,11 @@ use kin_model::{
     compute_resolved_tree_hash, validate_semantic_change_id, AdmissionCase, AuthorId, ChangeOrigin,
     ChangeStore, CollaborationDelta, DefaultRefExpectation, DefaultRefMutation,
     ExternalChangeAlias, ExternalObjectId, ExternalObjectKind, ExternalObjectRecord,
-    GitExternalAuthority, GitExternalAuthorityDelta, Hash256, ModelError, OperationId,
-    RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy, RepositoryCommitOutcome,
-    RepositoryCommitReceipt, RepositoryId, RepositoryTransaction, RootBundle, SemanticChange,
-    SemanticChangeId, TreeEntry, WorkspaceId, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    GitExternalAuthority, GitExternalAuthorityDelta, GitSnapshotProof, Hash256, ModelError,
+    OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
+    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
+    RootBundle, SemanticChange, SemanticChangeId, TreeEntry, WorkspaceId,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 
 use crate::collaboration_transfer::{
@@ -139,9 +140,63 @@ pub const FEATURE_RAW_REPOSITORY_PATHS: &str = "raw-repository-paths-v1";
 ///
 /// Advertised, never required: a peer without it gets exactly the transfer it
 /// always got, and the sender says which records it did not carry. So it is
-/// deliberately absent from [`REQUIRED_FEATURES`], whose list a pack must
-/// repeat exactly.
+/// deliberately absent from [`REQUIRED_FEATURES`], the base requirements every
+/// pack repeats in canonical order.
 pub const FEATURE_COLLABORATION: &str = "collaboration-v1";
+/// Understand exact Git snapshot provenance without inventing imported history.
+/// Required only by packs that carry proofs; ordinary packs retain their bytes.
+pub const FEATURE_GIT_SNAPSHOT_PROOFS: &str = "git-snapshot-proofs-v1";
+/// Optional creation-derivation declaration. Emitted only to a capable peer.
+pub const FEATURE_SOURCE_DERIVATION: &str = "source-derivation-v1";
+
+/// Provenance read from the sending store's pinned creation record.
+/// A legacy caller can declare its version alone, which remains unknown at a
+/// receiver that compares full derivation identities.
+#[derive(Debug, Clone, Default)]
+pub struct SourceHydrationProvenance {
+    pub semantics: Option<u32>,
+    pub derivation: Option<String>,
+}
+
+impl From<Option<u32>> for SourceHydrationProvenance {
+    fn from(semantics: Option<u32>) -> Self {
+        Self {
+            semantics,
+            derivation: None,
+        }
+    }
+}
+
+impl From<&SourceHydrationProvenance> for SourceHydrationProvenance {
+    fn from(source: &SourceHydrationProvenance) -> Self {
+        source.clone()
+    }
+}
+
+fn valid_source_derivation(identity: &str) -> bool {
+    identity.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+impl SourceHydrationProvenance {
+    fn negotiated_derivation(&self, supported: &[String]) -> Option<String> {
+        if self.semantics.is_none()
+            || !supported
+                .iter()
+                .any(|feature| feature == FEATURE_SOURCE_DERIVATION)
+        {
+            return None;
+        }
+        self.derivation
+            .as_ref()
+            .filter(|identity| valid_source_derivation(identity))
+            .cloned()
+    }
+}
 
 pub const MAX_TRANSFER_CHANGES: usize = 512;
 pub const MAX_TRANSFER_TREES: usize = MAX_TRANSFER_CHANGES;
@@ -463,7 +518,7 @@ pub fn replica_bootstrap_expectation(
         roots,
         default_ref: None,
         git_authority_hash: None,
-        supported_features: required_features(),
+        supported_features: pack_required_features(true, true),
         limits: RepositoryTransferLimits::default(),
     };
     validate_expectation(&expectation)?;
@@ -487,6 +542,8 @@ pub struct ReplicaBootstrap {
     /// so the one place that validated the pack is the one place that reports
     /// what it said.
     pub source_hydration_semantics: Option<u32>,
+    /// Full creation identity declared by the validated source pack.
+    pub source_hydration_derivation: Option<String>,
 }
 
 /// Compose a validated transfer and its first workspace as one transaction.
@@ -617,6 +674,7 @@ pub fn prepare_replica_bootstrap(
         transaction,
         bodies: decoded.into_iter().collect(),
         source_hydration_semantics: pack.source_hydration_semantics,
+        source_hydration_derivation: pack.source_hydration_derivation.clone(),
     })
 }
 
@@ -764,8 +822,8 @@ pub struct RepositoryTransferPack {
     /// The replay-semantics version the SENDING store records at its own
     /// creation, declared beside the history this pack carries.
     ///
-    /// A receiver compares it against its own creation record and keeps that
-    /// record only when the two agree; see
+    /// A receiver compares this and `source_hydration_derivation` against its
+    /// own creation record and keeps that record only when both agree; see
     /// `kin_core::hydration_semantics::transfer_preserves_creation_record`,
     /// which is where the comparison lives. The claim is exactly what the
     /// sender's own record claims and no more: it says which version was in
@@ -784,6 +842,10 @@ pub struct RepositoryTransferPack {
     /// declared one is caught as a transfer-identity mismatch.
     #[serde(default)]
     pub source_hydration_semantics: Option<u32>,
+    /// Full creation identity declared only to a peer advertising its feature.
+    /// Omitted when unknown or unsupported, preserving legacy pack bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hydration_derivation: Option<String>,
     /// Review records this pack carries.
     ///
     /// Present only on a pack that moves no history, sent after the ref phase to
@@ -792,6 +854,10 @@ pub struct RepositoryTransferPack {
     /// its bytes and its transfer identity exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration: Option<CollaborationDelta>,
+    /// Exact snapshot provenance for native root changes carried in this pack.
+    /// Omitted when empty to preserve ordinary schema-5 packs and identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_snapshot_proofs: Vec<GitSnapshotProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -957,6 +1023,8 @@ pub fn repository_ref_advertisement<B: StorageBackend + ?Sized + 'static>(
 fn advertised_features() -> Vec<String> {
     let mut features = required_features();
     features.push(FEATURE_COLLABORATION.to_string());
+    features.push(FEATURE_GIT_SNAPSHOT_PROOFS.to_string());
+    features.push(FEATURE_SOURCE_DERIVATION.to_string());
     features
 }
 
@@ -1011,8 +1079,11 @@ enum Assembled {
     OverNegotiatedBound(String),
 }
 
-/// `source_hydration_semantics` is the creation-time replay version the SENDING
-/// store records, or `None` when it records none this caller can read. It is
+/// `source_hydration_semantics` is the SENDING store's creation provenance.
+/// A legacy `Option<u32>` caller declares only its version. Full provenance
+/// must come from the pinned creation record, never this binary's identity or
+/// a later upgrade. The optional identity is emitted only to a capable peer.
+/// It is
 /// declared rather than derived here on purpose: the record is a file beside the
 /// store, and the authority this function holds is a storage backend that may
 /// not be a local one at all, so only the caller that pinned the store can speak
@@ -1021,8 +1092,9 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: impl Into<SourceHydrationProvenance>,
 ) -> Result<RepositoryTransferPack> {
+    let source_hydration_semantics = source_hydration_semantics.into();
     let expectation = locally_bounded_expectation(expectation)?;
     let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     let ordered = collect_fast_forward_closure(
@@ -1042,7 +1114,7 @@ pub fn build_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
         &expectation,
         source_ref,
         &plan,
-        source_hydration_semantics,
+        &source_hydration_semantics,
     )? {
         Assembled::Pack(pack) => Ok(*pack),
         Assembled::OverNegotiatedBound(reason) => Err(invalid(reason)),
@@ -1064,8 +1136,9 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: impl Into<SourceHydrationProvenance>,
 ) -> Result<RepositoryTransferSegment> {
+    let source_hydration_semantics = source_hydration_semantics.into();
     let expectation = locally_bounded_expectation(expectation)?;
     let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     let closure = collect_fast_forward_closure(
@@ -1085,7 +1158,7 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
                 &context,
                 &expectation,
                 source_ref,
-                source_hydration_semantics,
+                &source_hydration_semantics,
                 records,
             )?;
             return Ok(RepositoryTransferSegment {
@@ -1115,7 +1188,7 @@ pub fn build_repository_transfer_segment<B: StorageBackend + ?Sized + 'static>(
             &expectation,
             source_ref,
             &plan,
-            source_hydration_semantics,
+            &source_hydration_semantics,
         )? {
             Assembled::Pack(pack) => {
                 return Ok(RepositoryTransferSegment {
@@ -1169,16 +1242,17 @@ pub fn build_collaboration_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     source_ref: &RefName,
     expectation: &RepositoryTransferExpectation,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: impl Into<SourceHydrationProvenance>,
     collaboration: CollaborationDelta,
 ) -> Result<RepositoryTransferPack> {
+    let source_hydration_semantics = source_hydration_semantics.into();
     let expectation = locally_bounded_expectation(expectation)?;
     let context = TransferSourceContext::read(authority, source_ref, &expectation)?;
     collaboration_pack(
         &context,
         &expectation,
         source_ref,
-        source_hydration_semantics,
+        &source_hydration_semantics,
         Some(collaboration),
     )
 }
@@ -1216,7 +1290,7 @@ fn collaboration_pack(
     context: &TransferSourceContext,
     expectation: &RepositoryTransferExpectation,
     source_ref: &RefName,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: &SourceHydrationProvenance,
     collaboration: Option<CollaborationDelta>,
 ) -> Result<RepositoryTransferPack> {
     let head = context.source_head;
@@ -1233,6 +1307,8 @@ fn collaboration_pack(
     let tree = TransferChangeStore::new(context.all_changes.values().cloned())
         .resolve_tree_at(&head)
         .map_err(model)?;
+    let source_hydration_derivation =
+        source_hydration_semantics.negotiated_derivation(&expectation.supported_features);
     let mut pack = RepositoryTransferPack {
         schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
         protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
@@ -1251,14 +1327,16 @@ fn collaboration_pack(
         source_git_authority_hash: context.source_git_authority_hash,
         expected_destination_git_authority_hash: expectation.git_authority_hash,
         git_authority_bootstrap: None,
-        required_features: required_features(),
+        required_features: pack_required_features(false, source_hydration_derivation.is_some()),
         changes: Vec::new(),
         trees: Vec::new(),
         external_objects: Vec::new(),
         aliases: Vec::new(),
         bodies: Vec::new(),
-        source_hydration_semantics,
+        source_hydration_semantics: source_hydration_semantics.semantics,
+        source_hydration_derivation,
         collaboration,
+        git_snapshot_proofs: Vec::new(),
     };
     pack.transfer_id = compute_transfer_id(&pack)?;
     validate_pack(&pack, &expectation.limits)?;
@@ -1348,6 +1426,7 @@ struct TransferSourceContext {
     bootstrap_authority: Option<GitExternalAuthority>,
     aliases: Vec<ExternalChangeAlias>,
     external_objects: Vec<ExternalObjectRecord>,
+    git_snapshot_proofs: Vec<GitSnapshotProof>,
 }
 
 /// Whether the destination this expectation describes has admitted anything at
@@ -1406,6 +1485,32 @@ impl TransferSourceContext {
             ));
         };
 
+        let git_snapshot_proofs = lease.authority_metadata().git_snapshot_proofs.clone();
+        if !git_snapshot_proofs.is_empty()
+            && !expectation
+                .supported_features
+                .iter()
+                .any(|feature| feature == FEATURE_GIT_SNAPSHOT_PROOFS)
+        {
+            // Refuse before the first segment: a later segment cannot repair a
+            // peer that does not understand provenance needed by this history.
+            let closure = collect_fast_forward_closure(
+                &lease.snapshot().changes,
+                source_head,
+                expectation.destination_head,
+            )?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            if git_snapshot_proofs
+                .iter()
+                .any(|proof| closure.contains(&proof.snapshot_change_id))
+            {
+                return Err(invalid(format!(
+                    "destination does not advertise required feature {FEATURE_GIT_SNAPSHOT_PROOFS}"
+                )));
+            }
+        }
+
         Ok(Self {
             all_changes: lease.snapshot().changes.clone(),
             source_head,
@@ -1413,6 +1518,7 @@ impl TransferSourceContext {
             bootstrap_authority,
             aliases: lease.authority_metadata().aliases.clone(),
             external_objects: lease.authority_metadata().external_objects.clone(),
+            git_snapshot_proofs,
         })
     }
 }
@@ -1517,7 +1623,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
     expectation: &RepositoryTransferExpectation,
     source_ref: &RefName,
     plan: &SegmentPlan,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: &SourceHydrationProvenance,
 ) -> Result<Assembled> {
     // An empty closure means the two replicas already resolve the ref to the
     // same change. The pack then publishes that head and carries nothing,
@@ -1579,6 +1685,17 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         changes.push(change);
     }
 
+    let git_snapshot_proofs = context
+        .git_snapshot_proofs
+        .iter()
+        .filter(|proof| included.contains(&proof.snapshot_change_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let snapshot_objects = git_snapshot_proofs
+        .iter()
+        .flat_map(|proof| proof.objects.iter().copied())
+        .collect::<BTreeSet<_>>();
+
     // Same reasoning as the external objects below: an installed authority
     // projects every commit in its closure, and kin-db requires each projection
     // to have an alias, so a bootstrap carries all of them rather than only the
@@ -1595,8 +1712,8 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
             .cloned()
             .collect::<Vec<_>>()
     };
-    // An ordinary pack carries only the objects its own Git-origin changes name,
-    // because the destination already holds the baseline. A bootstrap carries
+    // An ordinary pack carries the objects its own Git-origin changes name
+    // and the full closure of each included snapshot proof. A bootstrap carries
     // the WHOLE closure, because the authority it installs describes every one
     // of them and kin-db refuses an authority whose closure names an object the
     // repository's external-object set does not hold.
@@ -1606,7 +1723,10 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         context
             .external_objects
             .iter()
-            .filter(|record| required_git_oids.contains(&record.object.oid))
+            .filter(|record| {
+                required_git_oids.contains(&record.object.oid)
+                    || snapshot_objects.contains(&record.object)
+            })
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -1634,7 +1754,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
     }
 
     let mut total_bytes = 0_u64;
-    let mut bodies = Vec::with_capacity(required_body_hashes.len());
+    let mut raw_bodies = Vec::with_capacity(required_body_hashes.len());
     for hash in required_body_hashes {
         let bytes = authority
             .load_source_blob(hash)
@@ -1657,9 +1777,20 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
                 expectation.limits.max_decoded_body_bytes
             )));
         }
-        bodies.push(RepositoryTransferBody::from_bytes(hash, &bytes)?);
+        raw_bodies.push((hash, bytes));
     }
 
+    // Encode only a closure that fits. An oversized closure would discard every
+    // base64 body built before the crossing, and decoded buffers stay bounded
+    // by the negotiated limit above. Consume each buffer as it is encoded so
+    // the complete decoded and encoded closures are never retained together.
+    let bodies = raw_bodies
+        .into_iter()
+        .map(|(hash, bytes)| RepositoryTransferBody::from_bytes(hash, &bytes))
+        .collect::<Result<Vec<_>>>()?;
+
+    let source_hydration_derivation =
+        source_hydration_semantics.negotiated_derivation(&expectation.supported_features);
     let mut pack = RepositoryTransferPack {
         schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
         protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
@@ -1678,14 +1809,19 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         source_git_authority_hash: context.source_git_authority_hash,
         expected_destination_git_authority_hash: expectation.git_authority_hash,
         git_authority_bootstrap: context.bootstrap_authority.clone(),
-        required_features: required_features(),
+        required_features: pack_required_features(
+            !git_snapshot_proofs.is_empty(),
+            source_hydration_derivation.is_some(),
+        ),
         changes,
         trees,
         external_objects,
         aliases,
         bodies,
-        source_hydration_semantics,
+        source_hydration_semantics: source_hydration_semantics.semantics,
+        source_hydration_derivation,
         collaboration: None,
+        git_snapshot_proofs,
     };
     pack.transfer_id = compute_transfer_id(&pack)?;
     // The sender checks its own work against the ceilings it ASSEMBLED under,
@@ -1780,9 +1916,12 @@ pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'stati
 /// shared policy has no rule sources, so a caller that claims no case can never
 /// admit anything under a case nobody chose.
 ///
-/// `before_authority_commit` runs exactly once, after every validation and
-/// after the immutable CAS prewrites, immediately before the authority
-/// transaction. That position is the whole point of the hook. Earlier would
+/// `before_authority_commit` runs once after transport validation and immutable
+/// CAS prewrites, immediately before the authority transaction. The storage
+/// commit can still refuse admission or lose a compare-and-swap race. Such a
+/// late refusal leaves conservative local invalidation in place; restoring a
+/// stamp after an ambiguous commit failure would risk a false all-clear.
+/// Earlier would
 /// degrade local state over a pack this receiver then refuses; later reopens the
 /// crash window where transported history is durable and the receiver still
 /// describes itself by a record that no longer speaks for its contents. Its
@@ -1974,8 +2113,9 @@ where
         authority.save_source_blob(hash, &bytes).map_err(storage)?;
     }
     // The receiver's admission-provenance policy, at the last point before this
-    // history becomes visible and after everything that could still refuse the
-    // pack. A failure here returns without starting the commit, so the receiver
+    // history becomes visible and after transport checks. Storage admission or
+    // compare-and-swap can still refuse; that keeps the conservative local
+    // invalidation. A hook failure returns before commit, so the receiver
     // is never left describing history it now holds by a record that predates
     // it.
     before_authority_commit().map_err(storage)?;
@@ -2029,7 +2169,27 @@ pub fn validate_pack(
     }
     pack.expected_destination_roots.validate().map_err(model)?;
     validate_git_authority_shape(pack)?;
-    validate_required_features(&pack.required_features)?;
+    validate_required_features(
+        &pack.required_features,
+        !pack.git_snapshot_proofs.is_empty(),
+        pack.source_hydration_derivation.is_some(),
+    )?;
+    if pack
+        .source_hydration_derivation
+        .as_ref()
+        .is_some_and(|identity| {
+            pack.source_hydration_semantics.is_none() || !valid_source_derivation(identity)
+        })
+    {
+        return Err(invalid(
+            "source derivation must be a canonical sha256 identity beside a creation version",
+        ));
+    }
+    enforce_count(
+        "Git snapshot proofs",
+        pack.git_snapshot_proofs.len(),
+        limits.max_changes,
+    )?;
     enforce_count("changes", pack.changes.len(), MAX_TRANSFER_CHANGES as u32)?;
     enforce_count("trees", pack.trees.len(), MAX_TRANSFER_TREES as u32)?;
     enforce_count("bodies", pack.bodies.len(), MAX_TRANSFER_BODIES as u32)?;
@@ -2201,6 +2361,39 @@ pub fn validate_pack(
         // each external body from the pack OR from CAS, and runs the full
         // `validate_raw` against whichever bytes it got. Nothing is trusted
         // that was not verified; what changed is where the bytes may come from.
+    }
+    let mut previous_proof = None;
+    for proof in &pack.git_snapshot_proofs {
+        proof
+            .validate_for_repository(&pack.repository_id)
+            .map_err(model)?;
+        if previous_proof.is_some_and(|previous| previous >= proof.snapshot_change_id) {
+            return Err(invalid(
+                "Git snapshot proofs are duplicated or out of canonical order",
+            ));
+        }
+        previous_proof = Some(proof.snapshot_change_id);
+        let change = pack
+            .changes
+            .iter()
+            .find(|change| change.id == proof.snapshot_change_id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "Git snapshot proof names absent change {}",
+                    proof.snapshot_change_id
+                ))
+            })?;
+        if !matches!(change.origin, ChangeOrigin::Native) || !change.parents.is_empty() {
+            return Err(invalid("Git snapshot proof requires a native root change"));
+        }
+        for object in &proof.objects {
+            if !external_ids.contains(object) {
+                return Err(invalid(format!(
+                    "Git snapshot proof lacks external object {}",
+                    object.oid
+                )));
+            }
+        }
     }
     let mut alias_oids = BTreeSet::new();
     for alias in &pack.aliases {
@@ -2381,10 +2574,28 @@ pub(crate) fn require_negotiated_features(supported: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn validate_required_features(required: &[String]) -> Result<()> {
-    let expected = required_features();
+fn pack_required_features(carries_snapshot_proofs: bool, carries_derivation: bool) -> Vec<String> {
+    let mut features = required_features();
+    if carries_snapshot_proofs {
+        features.push(FEATURE_GIT_SNAPSHOT_PROOFS.to_string());
+    }
+    if carries_derivation {
+        features.push(FEATURE_SOURCE_DERIVATION.to_string());
+    }
+    features
+}
+
+fn validate_required_features(
+    required: &[String],
+    carries_snapshot_proofs: bool,
+    carries_derivation: bool,
+) -> Result<()> {
+    let expected = pack_required_features(carries_snapshot_proofs, carries_derivation);
     if required != expected {
-        let known = REQUIRED_FEATURES.into_iter().collect::<BTreeSet<_>>();
+        let known = REQUIRED_FEATURES
+            .into_iter()
+            .chain([FEATURE_GIT_SNAPSHOT_PROOFS, FEATURE_SOURCE_DERIVATION])
+            .collect::<BTreeSet<_>>();
         if let Some(unknown) = required
             .iter()
             .map(String::as_str)
@@ -2629,6 +2840,7 @@ pub(crate) fn pack_moves_history(pack: &RepositoryTransferPack) -> bool {
         || !pack.external_objects.is_empty()
         || !pack.aliases.is_empty()
         || pack.git_authority_bootstrap.is_some()
+        || !pack.git_snapshot_proofs.is_empty()
         || pack.transfer_target_head != pack.source_head
         || pack.expected_destination_head != Some(pack.source_head)
 }
@@ -2693,6 +2905,7 @@ fn transfer_transaction(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: pack.collaboration.clone(),
+        git_snapshot_proofs: pack.git_snapshot_proofs.clone(),
     };
     transaction.validate().map_err(model)?;
     Ok(transaction)
@@ -2740,10 +2953,18 @@ struct RepositoryTransferIdentity<'a> {
     aliases: &'a [ExternalChangeAlias],
     bodies: Vec<RepositoryTransferBodyIdentity>,
     source_hydration_semantics: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_hydration_derivation: Option<String>,
     /// Skipped when absent, so every pack that carries no review records keeps
     /// the identity it always had.
     #[serde(skip_serializing_if = "Option::is_none")]
     collaboration: Option<Hash256>,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    git_snapshot_proofs: &'a [GitSnapshotProof],
+}
+
+fn slice_is_empty<T>(values: &&[T]) -> bool {
+    values.is_empty()
 }
 
 #[derive(Serialize)]
@@ -2789,6 +3010,8 @@ fn compute_transfer_id(pack: &RepositoryTransferPack) -> Result<Hash256> {
             })
             .collect(),
         source_hydration_semantics: pack.source_hydration_semantics,
+        source_hydration_derivation: pack.source_hydration_derivation.clone(),
+        git_snapshot_proofs: &pack.git_snapshot_proofs,
         collaboration: pack
             .collaboration
             .as_ref()
@@ -2996,7 +3219,9 @@ mod tests {
             visibility: Visibility::Private,
             role: EntityRole::Source,
             doc_summary: None,
-            metadata: EntityMetadata { extra },
+            metadata: EntityMetadata {
+                extra: extra.into(),
+            },
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
@@ -3101,6 +3326,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -3245,6 +3471,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -3514,6 +3741,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(source_lease);
         source
@@ -3704,7 +3932,9 @@ mod tests {
             // A Git-admitted bootstrap fixture speaks for no local store, so it
             // declares nothing, which is the same thing a hosted sender does.
             source_hydration_semantics: None,
+            source_hydration_derivation: None,
             collaboration: None,
+            git_snapshot_proofs: Vec::new(),
         };
         pack.transfer_id = compute_transfer_id(&pack).unwrap();
         pack
@@ -4763,6 +4993,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         fixture
@@ -4825,6 +5056,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         authority
@@ -4881,6 +5113,126 @@ mod tests {
         duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
         let error = validate_pack(&duplicate, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("duplicate source body"));
+    }
+
+    #[test]
+    fn source_derivation_is_negotiated_bound_and_absent_for_old_peers() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        let identity = format!("sha256:{}", "a".repeat(64));
+        let source = SourceHydrationProvenance {
+            semantics: Some(47),
+            derivation: Some(identity.clone()),
+        };
+        let pack =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &expectation, &source)
+                .unwrap();
+        assert_eq!(
+            pack.source_hydration_derivation.as_deref(),
+            Some(identity.as_str())
+        );
+        assert!(pack
+            .required_features
+            .iter()
+            .any(|f| f == FEATURE_SOURCE_DERIVATION));
+        validate_pack(&pack, &expectation.limits).unwrap();
+
+        let mut changed = pack.clone();
+        changed.source_hydration_derivation = Some(format!("sha256:{}", "b".repeat(64)));
+        assert!(validate_pack(&changed, &expectation.limits)
+            .unwrap_err()
+            .to_string()
+            .contains("transfer identity"));
+        let mut stripped = pack.clone();
+        stripped.source_hydration_derivation = None;
+        stripped
+            .required_features
+            .retain(|f| f != FEATURE_SOURCE_DERIVATION);
+        assert!(validate_pack(&stripped, &expectation.limits)
+            .unwrap_err()
+            .to_string()
+            .contains("transfer identity"));
+        let mut unnegotiated = pack.clone();
+        unnegotiated
+            .required_features
+            .retain(|f| f != FEATURE_SOURCE_DERIVATION);
+        unnegotiated.transfer_id = compute_transfer_id(&unnegotiated).unwrap();
+        assert!(validate_pack(&unnegotiated, &expectation.limits).is_err());
+        let mut malformed = pack.clone();
+        malformed.source_hydration_derivation = Some("sha256:short".to_string());
+        malformed.transfer_id = compute_transfer_id(&malformed).unwrap();
+        assert!(validate_pack(&malformed, &expectation.limits)
+            .unwrap_err()
+            .to_string()
+            .contains("canonical sha256"));
+
+        expectation
+            .supported_features
+            .retain(|f| f != FEATURE_SOURCE_DERIVATION);
+        let mut old =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &expectation, &source)
+                .unwrap();
+        let legacy =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &expectation, Some(47))
+                .unwrap();
+        assert!(old.source_hydration_derivation.is_none());
+        assert!(!old
+            .required_features
+            .iter()
+            .any(|f| f == FEATURE_SOURCE_DERIVATION));
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("source_hydration_derivation")
+            .is_none());
+        // Normalize only the fresh operation id: the old serializer shape and
+        // transfer identity must match exactly when the optional field is absent.
+        old.operation_id = legacy.operation_id;
+        old.transfer_id = compute_transfer_id(&old).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&old).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        let decoded: RepositoryTransferPack =
+            serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(decoded.source_hydration_derivation.is_none());
+        validate_pack(&decoded, &expectation.limits).unwrap();
+    }
+
+    #[test]
+    fn unknown_or_malformed_source_records_do_not_invent_a_derivation() {
+        let fixture = fixture();
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        for source in [
+            SourceHydrationProvenance::from(Some(47)),
+            SourceHydrationProvenance {
+                semantics: Some(47),
+                derivation: Some("broken".to_string()),
+            },
+            SourceHydrationProvenance {
+                semantics: None,
+                derivation: Some(format!("sha256:{}", "a".repeat(64))),
+            },
+        ] {
+            let pack = build_repository_transfer_pack(
+                &fixture.source,
+                &fixture.main,
+                &expectation,
+                source,
+            )
+            .unwrap();
+            assert!(pack.source_hydration_derivation.is_none());
+            assert!(!pack
+                .required_features
+                .iter()
+                .any(|f| f == FEATURE_SOURCE_DERIVATION));
+            validate_pack(&pack, &expectation.limits).unwrap();
+        }
     }
 
     /// The declaration is bound by the transfer identity, so no peer or proxy
@@ -4958,7 +5310,7 @@ mod tests {
             .collect::<Vec<_>>();
         let first = entries.iter().cloned().collect::<HashMap<_, _>>();
         let first_bytes = serde_json::to_vec(&EntityMetadata {
-            extra: first.clone(),
+            extra: first.clone().into(),
         })
         .unwrap();
         let second = (0..256)
@@ -4973,7 +5325,7 @@ mod tests {
             })
             .find(|candidate| {
                 serde_json::to_vec(&EntityMetadata {
-                    extra: candidate.clone(),
+                    extra: candidate.clone().into(),
                 })
                 .unwrap()
                     != first_bytes
@@ -5165,6 +5517,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         fixture
@@ -5355,6 +5708,61 @@ mod tests {
             assert_eq!(calls.get(), 0, "the policy ran for a refused pack");
         }
 
+        #[test]
+        fn a_late_compare_and_swap_refusal_keeps_the_precommit_side_effect() {
+            let fixture = fixture();
+            let marker_dir = TempDir::new().unwrap();
+            let marker = marker_dir.path().join("creation-stamp");
+            std::fs::write(&marker, b"current before incoming history").unwrap();
+            let calls = Cell::new(0u32);
+            let mut competing = fixture.pack.clone();
+            competing.operation_id = OperationId::new();
+            competing.transfer_id = compute_transfer_id(&competing).unwrap();
+            let error = apply_repository_transfer_pack_with_pre_commit(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+                AuthorId::new("late-refusal"),
+                &fixture.pack,
+                &RepositoryTransferLimits::default(),
+                None,
+                || {
+                    calls.set(calls.get() + 1);
+                    std::fs::remove_file(&marker)?;
+                    // Advance the real authority after transport validation,
+                    // so only the later storage compare-and-swap can refuse.
+                    apply_repository_transfer_pack(
+                        &fixture.destination,
+                        &fixture.repository_id,
+                        &fixture.main,
+                        AuthorId::new("competing-writer"),
+                        &competing,
+                        &RepositoryTransferLimits::default(),
+                    )
+                    .expect("the competing publication");
+                    Ok(())
+                },
+            )
+            .expect_err("a stale authority lease must fail after the hook");
+            assert!(
+                matches!(error, RepositoryTransferError::Conflict(_)),
+                "{error:?}"
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(
+                !marker.exists(),
+                "late refusal must not restore uncertain provenance"
+            );
+            let lease = fixture.destination.read_authority();
+            let receipts = &lease.authority_metadata().receipts;
+            assert!(receipts
+                .iter()
+                .any(|receipt| receipt.operation_id == competing.operation_id));
+            assert!(!receipts
+                .iter()
+                .any(|receipt| receipt.operation_id == fixture.pack.operation_id));
+        }
+
         /// A replay moves nothing, so it must not re-run the policy. The
         /// original commit already ran it, and a second run would mutate local
         /// state for a transfer that changed no history.
@@ -5400,6 +5808,468 @@ mod tests {
             );
             assert_eq!(calls.get(), 1, "the replay re-ran the policy");
         }
+    }
+    struct SnapshotFixture {
+        _source_dir: TempDir,
+        destination_dir: TempDir,
+        source: TestManager,
+        destination: TestManager,
+        repository_id: RepositoryId,
+        main: RefName,
+        proof: GitSnapshotProof,
+        pack: RepositoryTransferPack,
+    }
+
+    fn snapshot_fixture() -> SnapshotFixture {
+        let repository_id = RepositoryId::new("snapshot-transfer-test").unwrap();
+        let main = RefName::branch(b"main").unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = manager(&source_dir, &repository_id);
+        let destination = manager(&destination_dir, &repository_id);
+        let mut raw = GitBodies::default();
+        let ignore = git_record(
+            ExternalObjectKind::Blob,
+            b"generated.txt\n".to_vec(),
+            &mut raw,
+        );
+        let artifact = git_record(
+            ExternalObjectKind::Blob,
+            b"tracked despite ignore\n".to_vec(),
+            &mut raw,
+        );
+        let tree = git_record(
+            ExternalObjectKind::Tree,
+            git_tree_body(&[
+                (b".gitignore", b"100644", ignore.object.oid),
+                (b"generated.txt", b"100644", artifact.object.oid),
+            ]),
+            &mut raw,
+        );
+        let commit = git_record(
+            ExternalObjectKind::Commit,
+            git_commit_body(tree.object.oid, &[], b"source snapshot\n"),
+            &mut raw,
+        );
+        let mut records = vec![ignore.clone(), artifact.clone(), tree, commit.clone()];
+        records.sort_by_key(|record| record.object);
+        for (hash, body) in &raw.0 {
+            source.save_source_blob(*hash, body).unwrap();
+        }
+        let mut change = native_change(
+            Vec::new(),
+            "native snapshot from exact Git tree",
+            vec![
+                TreeDelta::Added {
+                    artifact_id: ArtifactId(Uuid::from_u128(81)),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(".gitignore").unwrap(),
+                        TreeEntry::blob(ignore.body_hash, false),
+                    ),
+                },
+                TreeDelta::Added {
+                    artifact_id: ArtifactId(Uuid::from_u128(82)),
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8("generated.txt").unwrap(),
+                        TreeEntry::blob(artifact.body_hash, false),
+                    ),
+                },
+            ],
+        );
+        let store = TransferChangeStore::new([change.clone()]);
+        let resolved = store.resolve_tree_at(&change.id).unwrap();
+        let (_, policy_delta) =
+            kin_model::SharedAdmissionPolicy::derive_from_tree(None, &resolved, |hash| {
+                Ok(raw.0.get(&hash).unwrap().len() as u64)
+            })
+            .unwrap();
+        change.admission_policy_delta = policy_delta;
+        change.id = compute_semantic_change_id(&change).unwrap();
+        let proof = GitSnapshotProof {
+            repository_id: repository_id.clone(),
+            snapshot_change_id: change.id,
+            source_commit: commit.object.oid,
+            objects: records.iter().map(|record| record.object).collect(),
+        };
+        let lease = source.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("snapshot-test"),
+            reason: "seed exact snapshot provenance".to_string(),
+            external_objects: records,
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: main.clone(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::change(change.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+            collaboration_delta: None,
+            git_snapshot_proofs: vec![proof.clone()],
+        };
+        drop(lease);
+        source
+            .commit_transferred_repository_transaction(transaction, Some(AdmissionCase::Sensitive))
+            .unwrap();
+        let expectation = replica_bootstrap_expectation(
+            repository_id.clone(),
+            main.clone(),
+            destination.read_authority().roots().clone(),
+        )
+        .unwrap();
+        let pack = build_repository_transfer_pack(&source, &main, &expectation, None).unwrap();
+        SnapshotFixture {
+            _source_dir: source_dir,
+            destination_dir,
+            source,
+            destination,
+            repository_id,
+            main,
+            proof,
+            pack,
+        }
+    }
+
+    fn receive_snapshot(
+        fixture: &SnapshotFixture,
+        pack: &RepositoryTransferPack,
+    ) -> Result<RepositoryTransferReceipt> {
+        apply_repository_transfer_pack_with_pre_commit(
+            &fixture.destination,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("snapshot-receiver"),
+            pack,
+            &RepositoryTransferLimits::default(),
+            Some(AdmissionCase::Sensitive),
+            || Ok(()),
+        )
+    }
+
+    #[test]
+    fn git_snapshot_proof_transfers_and_survives_receiver_reopen() {
+        let fixture = snapshot_fixture();
+        assert_eq!(
+            fixture.pack.git_snapshot_proofs,
+            vec![fixture.proof.clone()]
+        );
+        assert!(fixture
+            .pack
+            .required_features
+            .iter()
+            .any(|feature| feature == FEATURE_GIT_SNAPSHOT_PROOFS));
+        assert!(fixture.pack.git_authority_bootstrap.is_none());
+        assert!(fixture.pack.aliases.is_empty());
+        assert_eq!(
+            fixture.pack.external_objects.len(),
+            fixture.proof.objects.len()
+        );
+        let encoded = serde_json::to_vec(&fixture.pack).unwrap();
+        let decoded = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            receive_snapshot(&fixture, &decoded).unwrap().outcome,
+            RepositoryTransferApplyOutcome::Committed
+        );
+        let reopened = manager(&fixture.destination_dir, &fixture.repository_id);
+        let lease = reopened.read_authority();
+        assert_eq!(
+            lease.authority_metadata().git_snapshot_proofs,
+            vec![fixture.proof]
+        );
+        assert!(lease.authority_metadata().git_external_authority.is_none());
+        assert!(matches!(
+            lease.snapshot().changes[&fixture.pack.source_head].origin,
+            ChangeOrigin::Native
+        ));
+    }
+
+    #[test]
+    fn merge_transfer_repeats_a_held_snapshot_root_without_readmitting_its_ignored_artifacts() {
+        let fixture = snapshot_fixture();
+        receive_snapshot(&fixture, &fixture.pack).unwrap();
+        let root = fixture.proof.snapshot_change_id;
+        let left = native_change(vec![root], "left descendant of the snapshot", Vec::new());
+        let right = native_change(vec![root], "right descendant of the snapshot", Vec::new());
+        let merged = native_change(
+            vec![left.id, right.id],
+            "merge snapshot descendants",
+            Vec::new(),
+        );
+
+        let advance_source = |changes: Vec<SemanticChange>, before, after| {
+            let lease = fixture.source.read_authority();
+            let transaction = RepositoryTransaction {
+                schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: OperationId::new(),
+                repository_id: fixture.repository_id.clone(),
+                expected_generation: lease.roots().generation,
+                expected_roots: lease.roots().clone(),
+                actor: AuthorId::new("snapshot-merge-test"),
+                reason: "advance descendants of an admitted snapshot".to_string(),
+                external_objects: Vec::new(),
+                git_authority_delta: None,
+                changes,
+                aliases: Vec::new(),
+                ref_mutations: vec![RefMutation {
+                    name: fixture.main.clone(),
+                    expected: RefExpectation::MustEqual {
+                        target: RefTarget::change(before),
+                    },
+                    new_target: Some(RefTarget::change(after)),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                }],
+                default_ref_mutation: None,
+                workspace_mutation: None,
+                local_overlay_delta: None,
+                merge_transaction_delta: None,
+                sealed_observation: None,
+                collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
+            };
+            drop(lease);
+            fixture
+                .source
+                .commit_repository_transaction(transaction)
+                .unwrap();
+        };
+        let build_next = || {
+            let status = repository_transfer_status(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+            )
+            .unwrap();
+            let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &expectation, None)
+                .unwrap()
+        };
+
+        advance_source(vec![left.clone()], root, left.id);
+        let left_pack = build_next();
+        assert_eq!(left_pack.changes.len(), 1);
+        assert!(left_pack.git_snapshot_proofs.is_empty());
+        receive_snapshot(&fixture, &left_pack).unwrap();
+
+        advance_source(vec![right.clone(), merged.clone()], left.id, merged.id);
+        let merge_pack = build_next();
+        // The normal closure stops at left, but follows right back to root.
+        // Repeating that identical held root is required by this pack's parent
+        // closure and must not turn its already-admitted paths into new input.
+        assert_eq!(
+            merge_pack
+                .changes
+                .iter()
+                .map(|change| change.id)
+                .collect::<Vec<_>>(),
+            vec![root, right.id, merged.id]
+        );
+        assert_eq!(merge_pack.git_snapshot_proofs, vec![fixture.proof.clone()]);
+        assert_eq!(merge_pack.expected_destination_head, Some(left.id));
+        let receipt = receive_snapshot(&fixture, &merge_pack).unwrap();
+        assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+        assert_eq!(receipt.destination_head, merged.id);
+
+        let expected_roots = fixture.destination.read_authority().roots().clone();
+        let reopened = manager(&fixture.destination_dir, &fixture.repository_id);
+        let lease = reopened.read_authority();
+        assert_eq!(lease.roots(), &expected_roots);
+        assert_eq!(lease.snapshot().changes.len(), 4);
+        assert_eq!(
+            lease.authority_metadata().git_snapshot_proofs,
+            vec![fixture.proof]
+        );
+        let tree = TransferChangeStore::new(lease.snapshot().changes.values().cloned())
+            .resolve_tree_at(&merged.id)
+            .unwrap();
+        let ignored = tree
+            .artifact_at_path(&RepoPath::from_utf8("generated.txt").unwrap())
+            .unwrap();
+        assert_eq!(ignored.artifact_id, ArtifactId(Uuid::from_u128(82)));
+        assert_eq!(
+            ignored.entry,
+            TreeEntry::blob(digest(b"tracked despite ignore\n"), false)
+        );
+    }
+
+    #[test]
+    fn git_snapshot_proof_is_required_before_sender_builds_any_segment() {
+        let fixture = snapshot_fixture();
+        let mut expectation = replica_bootstrap_expectation(
+            fixture.repository_id.clone(),
+            fixture.main.clone(),
+            fixture.destination.read_authority().roots().clone(),
+        )
+        .unwrap();
+        expectation
+            .supported_features
+            .retain(|feature| feature != FEATURE_GIT_SNAPSHOT_PROOFS);
+        let error =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation, None)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains(FEATURE_GIT_SNAPSHOT_PROOFS),
+            "{error}"
+        );
+        let error = verify_transfer_source_readiness(&fixture.source, &fixture.main, &expectation)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(FEATURE_GIT_SNAPSHOT_PROOFS),
+            "{error}"
+        );
+        assert_eq!(fixture.destination.read_authority().roots().generation, 0);
+    }
+
+    #[test]
+    fn git_snapshot_proof_stripping_cannot_admit_ignored_tree() {
+        let fixture = snapshot_fixture();
+        let roots = fixture.destination.read_authority().roots().clone();
+        let mut stripped = fixture.pack.clone();
+        stripped.git_snapshot_proofs.clear();
+        assert!(validate_pack(&stripped, &RepositoryTransferLimits::default()).is_err());
+        stripped.required_features = required_features();
+        stripped.transfer_id = compute_transfer_id(&stripped).unwrap();
+        // A rewritten transfer manifest still cannot turn arbitrary raw Git
+        // records into provenance. Storage must require the bound proof.
+        let error = receive_snapshot(&fixture, &stripped).unwrap_err();
+        assert!(error.to_string().contains("admission"), "{error}");
+        assert_eq!(fixture.destination.read_authority().roots(), &roots);
+        assert!(fixture
+            .destination
+            .read_authority()
+            .snapshot()
+            .changes
+            .is_empty());
+    }
+
+    #[test]
+    fn git_snapshot_proof_pack_refuses_missing_records_and_wrong_bindings() {
+        let fixture = snapshot_fixture();
+        let mut missing = fixture.pack.clone();
+        missing.external_objects.pop();
+        missing.transfer_id = compute_transfer_id(&missing).unwrap();
+        assert!(
+            validate_pack(&missing, &RepositoryTransferLimits::default())
+                .unwrap_err()
+                .to_string()
+                .contains("lacks external object")
+        );
+        let mut wrong = fixture.pack.clone();
+        wrong.git_snapshot_proofs[0].repository_id =
+            RepositoryId::new("another-repository").unwrap();
+        wrong.transfer_id = compute_transfer_id(&wrong).unwrap();
+        assert!(validate_pack(&wrong, &RepositoryTransferLimits::default()).is_err());
+        let mut changed = fixture.pack.clone();
+        changed.git_snapshot_proofs[0].source_commit = GitObjectId::sha1([0x61; 20]);
+        assert_ne!(
+            compute_transfer_id(&changed).unwrap(),
+            fixture.pack.transfer_id
+        );
+        changed.transfer_id = compute_transfer_id(&changed).unwrap();
+        assert!(validate_pack(&changed, &RepositoryTransferLimits::default()).is_err());
+    }
+
+    #[test]
+    fn git_snapshot_proof_receiver_recomputes_tree_instead_of_trusting_wire_claim() {
+        let fixture = snapshot_fixture();
+        let mut altered = fixture.pack.clone();
+        let new = match &mut altered.changes[0].tree_deltas[1] {
+            TreeDelta::Added { new, .. } => new,
+            _ => unreachable!(),
+        };
+        new.entry = TreeEntry::blob(new.entry.blob_identity().unwrap(), true);
+        altered.changes[0].id = compute_semantic_change_id(&altered.changes[0]).unwrap();
+        let id = altered.changes[0].id;
+        altered.source_head = id;
+        altered.transfer_target_head = id;
+        altered.git_snapshot_proofs[0].snapshot_change_id = id;
+        let store = TransferChangeStore::new(altered.changes.clone());
+        let hash = compute_resolved_tree_hash(&store.resolve_tree_at(&id).unwrap()).unwrap();
+        altered.source_tree_hash = hash;
+        altered.trees[0] = RepositoryTransferTreeIdentity {
+            change_id: id,
+            tree_hash: hash,
+        };
+        altered.transfer_id = compute_transfer_id(&altered).unwrap();
+        validate_pack(&altered, &RepositoryTransferLimits::default()).unwrap();
+        receive_snapshot(&fixture, &altered)
+            .expect_err("matching wire identities cannot substitute a different exact tree");
+        assert_eq!(fixture.destination.read_authority().roots().generation, 0);
+    }
+
+    #[test]
+    fn git_snapshot_proof_cannot_omit_raw_bodies_unless_receiver_already_holds_them() {
+        let fixture = snapshot_fixture();
+        let commit_record = fixture
+            .pack
+            .external_objects
+            .iter()
+            .find(|record| record.object.kind == ExternalObjectKind::Commit)
+            .unwrap();
+        let raw_body = fixture
+            .pack
+            .bodies
+            .iter()
+            .find(|body| body.hash == commit_record.body_hash)
+            .unwrap();
+        let mut omitted = fixture.pack.clone();
+        omitted
+            .bodies
+            .retain(|body| body.hash != commit_record.body_hash);
+        omitted.transfer_id = compute_transfer_id(&omitted).unwrap();
+        receive_snapshot(&fixture, &omitted)
+            .expect_err("receiver has no commit body to authenticate proof");
+        assert_eq!(fixture.destination.read_authority().roots().generation, 0);
+        fixture
+            .destination
+            .save_source_blob(raw_body.hash, &raw_body.decode().unwrap())
+            .unwrap();
+        receive_snapshot(&fixture, &omitted)
+            .expect("an independently verified existing CAS body satisfies the same proof");
+    }
+
+    #[test]
+    fn no_snapshot_proof_keeps_legacy_wire_shape_and_identity() {
+        let fixture = fixture();
+        assert!(fixture.pack.git_snapshot_proofs.is_empty());
+        assert_eq!(fixture.pack.required_features, required_features());
+        let status =
+            repository_transfer_status(&fixture.destination, &fixture.repository_id, &fixture.main)
+                .unwrap();
+        let mut expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        expectation.supported_features = required_features();
+        let mut legacy_peer_pack =
+            build_repository_transfer_pack(&fixture.source, &fixture.main, &expectation, None)
+                .unwrap();
+        // Operation identity is fresh per assembly; every other byte must be
+        // independent of an optional capability this ordinary transfer does not use.
+        legacy_peer_pack.operation_id = fixture.pack.operation_id;
+        legacy_peer_pack.transfer_id = compute_transfer_id(&legacy_peer_pack).unwrap();
+        let wire = serde_json::to_vec(&fixture.pack).unwrap();
+        assert_eq!(serde_json::to_vec(&legacy_peer_pack).unwrap(), wire);
+        let mut json: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert!(json.get("git_snapshot_proofs").is_none());
+        json["git_snapshot_proofs"] = serde_json::json!([]);
+        let decoded: RepositoryTransferPack = serde_json::from_value(json).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), wire);
+        assert_eq!(
+            compute_transfer_id(&decoded).unwrap(),
+            fixture.pack.transfer_id
+        );
+        validate_pack(&decoded, &RepositoryTransferLimits::default()).unwrap();
     }
 }
 

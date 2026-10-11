@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-derivation-inputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build-time identities over the classified sources that decide what Kin derives and stores"
+repository.workspace = true
+# A build dependency of crates that build only inside this workspace. It reads
+# its neighbours by relative path, which a packaged build does not have.
+publish = false
+
+[dependencies]
+sha2 = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -18,8 +18,6 @@ use kin_model::{ArtifactId, Entity, EntityId, EntityKind, Hash256, ResolvedTree,
 mod syntax;
 mod targets;
 
-pub const RUST_PROJECT_AUTHORITY_VERSION: u32 = 1;
-
 /// A complete inventory can establish static membership or explicitly leave it
 /// unproven. This never converts a CAS/read/processing-bound failure into a
 /// successful negative observation.
@@ -152,8 +150,33 @@ fn is_project_input(path: &[u8]) -> bool {
     path.ends_with(b".rs") || path.rsplit(|byte| *byte == b'/').next() == Some(b"Cargo.toml")
 }
 
+/// Whether a change at `path` of `tree` can change what a Rust project reads.
+///
+/// A Cargo manifest held as a link reads its target's body, and the target
+/// can be named anything, so where `tree` holds such a link, a path that could
+/// hold a manifest's text is an input too
+/// ([`kin_parser::project_manifest::could_hold_naming_manifest`]). Which
+/// target a link names is in its body, which this census does not read, so
+/// every such path counts.
+pub fn is_project_input_of(tree: &ResolvedTree, path: &[u8]) -> bool {
+    is_project_input(path)
+        || std::str::from_utf8(path).is_ok_and(|path| {
+            kin_parser::project_manifest::could_hold_naming_manifest(path)
+                && holds_linked_manifest(tree)
+        })
+}
+
+fn holds_linked_manifest(tree: &ResolvedTree) -> bool {
+    tree.artifacts_by_path().any(|artifact| {
+        matches!(artifact.entry, TreeEntry::Symlink { .. })
+            && artifact.path.as_bytes().rsplit(|byte| *byte == b'/').next() == Some(b"Cargo.toml")
+    })
+}
+
 /// Nominate all current regular Rust sources when an exact admitted Cargo or
-/// Rust source artifact changes. This deliberately includes empty/use-only
+/// Rust source artifact changes, or, in a tree that holds a Cargo manifest as
+/// a link, any artifact that could hold a manifest's text ([`is_project_input_of`]).
+/// This deliberately includes empty/use-only
 /// sources, custom roots and disconnected callers, without entity-name tests.
 /// `None` means no supported input changed; it never certifies derived freshness.
 /// No CAS or filesystem read occurs here. Limits precede inventory cloning and
@@ -167,9 +190,17 @@ pub fn affected_source_batch(
     for tree in [previous, current] {
         check_inventory(tree, limits).map_err(RustProjectInvalidationError::Limit)?;
     }
+    let linked = holds_linked_manifest(previous) || holds_linked_manifest(current);
     let relevant = |tree: &ResolvedTree| {
         tree.artifacts_by_path()
-            .filter(|artifact| is_project_input(artifact.path.as_bytes()))
+            .filter(|artifact| {
+                is_project_input(artifact.path.as_bytes())
+                    || linked
+                        && artifact
+                            .path
+                            .as_utf8()
+                            .is_some_and(kin_parser::project_manifest::could_hold_naming_manifest)
+            })
             .map(|artifact| {
                 (
                     artifact.path.clone(),

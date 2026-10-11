@@ -95,9 +95,9 @@ fn daemon_base_url() -> Option<String> {
 // only interface is MCP cannot restart its own server, so that state was
 // terminal by construction, and no part of the response said what had happened.
 //
-// Resolution is now a question this process re-asks, through the same probe
-// `kin doctor` reports from, and it is bounded twice so a directory that never
-// becomes a Kin repository cannot turn every call into a stall:
+// Resolution is now a question this process re-asks through a typed registrar
+// probe, including validated standalone endpoints and readiness observations.
+// It is bounded twice so an unresolved route cannot turn every call into a stall:
 //
 //   1. At most one probe per cooldown window. The window starts at
 //      RERESOLVE_MIN_BACKOFF and doubles to RERESOLVE_MAX_BACKOFF, so a session
@@ -154,10 +154,23 @@ pub(crate) enum DelegateGap {
     /// Nothing at or above this server's working directory is a Kin
     /// repository.
     NoRepository { working_dir: std::path::PathBuf },
-    /// A repository is here and no daemon is serving it.
+    /// A repository is here, but no ready route was found by the probe.
     DaemonNotRunning {
         repo: std::path::PathBuf,
         retry_in: Duration,
+    },
+    /// An endpoint was observed without repository readiness being established.
+    DaemonNotReady {
+        repo: std::path::PathBuf,
+        retry_in: Duration,
+        detail: String,
+        warming: bool,
+    },
+    /// The bounded probe did not establish a route or daemon absence.
+    ProbeUnresolved {
+        repo: std::path::PathBuf,
+        retry_in: Duration,
+        detail: String,
     },
     /// This server started before the repository existed, so it bound no
     /// delegate then and has never held one since; the repository exists now.
@@ -179,6 +192,22 @@ impl DelegateGap {
                 repo: repo.clone(),
                 retry_in,
             },
+            Self::DaemonNotReady {
+                repo,
+                detail,
+                warming,
+                ..
+            } => Self::DaemonNotReady {
+                repo: repo.clone(),
+                retry_in,
+                detail: detail.clone(),
+                warming: *warming,
+            },
+            Self::ProbeUnresolved { repo, detail, .. } => Self::ProbeUnresolved {
+                repo: repo.clone(),
+                retry_in,
+                detail: detail.clone(),
+            },
             Self::StartupPredatesRepository { repo, .. } => Self::StartupPredatesRepository {
                 repo: repo.clone(),
                 retry_in,
@@ -186,74 +215,176 @@ impl DelegateGap {
         }
     }
 
-    /// What a caller is told, and what it can do about it. `init_served` says
-    /// whether this connection serves `kin_init`.
-    fn message(&self, tool: &str, init_served: bool) -> String {
-        self.message_spelled(tool, crate::first_contact::Spelling::here(), init_served)
+    /// What a caller is told, and what it can do about it.
+    ///
+    /// The message reaches an agent, so it names no path and carries a probe's
+    /// detail only when that detail is itself semantic. The semantic surface
+    /// withholds any message holding a storage word or a coordinate, and a
+    /// refusal that named the repository's path reached the agent as a
+    /// withheld note instead of the refusal and its remedy. The path and the
+    /// probe's detail go to the operator log at warn level instead.
+    fn message(&self, tool: &str) -> String {
+        self.log_for_operator(tool);
+        self.message_spelled(tool, crate::first_contact::Spelling::here())
+    }
+
+    /// The operator half of [`DelegateGap::message`]: the path the gap was
+    /// observed at, and the probe's own detail, at warn level.
+    fn log_for_operator(&self, tool: &str) {
+        match self {
+            Self::NoRepository { working_dir } => tracing::warn!(
+                tool,
+                working_dir = %working_dir.display(),
+                "kin-mcp is not inside a Kin repository; refused the tool call"
+            ),
+            Self::DaemonNotRunning { repo, .. } => tracing::warn!(
+                tool,
+                repo = %repo.display(),
+                "no ready daemon route was found for the repository; refused the tool call"
+            ),
+            Self::DaemonNotReady {
+                repo,
+                detail,
+                warming,
+                ..
+            } => tracing::warn!(
+                tool,
+                repo = %repo.display(),
+                detail = detail.as_str(),
+                warming,
+                "the repository's daemon endpoint has not established readiness; refused the \
+                 tool call"
+            ),
+            Self::ProbeUnresolved { repo, detail, .. } => tracing::warn!(
+                tool,
+                repo = %repo.display(),
+                detail = detail.as_str(),
+                "the bounded daemon route probe was unresolved; refused the tool call"
+            ),
+            Self::StartupPredatesRepository { repo, .. } => tracing::warn!(
+                tool,
+                repo = %repo.display(),
+                "kin-mcp started before its repository existed and no ready daemon route was \
+                 found; refused the tool call"
+            ),
+        }
     }
 
     /// [`DelegateGap::message`] with the reader's command spelling given.
     ///
-    /// Every remedy names a step that works for the reader: `kin_init` where
-    /// this connection serves it, which only a profile that writes does, and a
-    /// `kin` command spelled so it runs where the reader is, as the `npx` form
-    /// of this release when no `kin` is on the server's PATH. A registry
-    /// install runs Kin through `npx`, and "run `kin init .`" named a command
-    /// that user did not have.
-    fn message_spelled(
-        &self,
-        tool: &str,
-        spelling: crate::first_contact::Spelling,
-        init_served: bool,
-    ) -> String {
+    /// Every remedy names a step that works for the reader: a `kin` command
+    /// spelled so it runs where the reader is, as the `npx` form of this
+    /// release when no `kin` is on the server's PATH. A registry install runs
+    /// Kin through `npx`, and "run `kin init .`" named a command that user did
+    /// not have.
+    fn message_spelled(&self, tool: &str, spelling: crate::first_contact::Spelling) -> String {
         use crate::first_contact::kin_command;
         match self {
-            Self::NoRepository { working_dir } => format!(
-                "kin-mcp cannot answer '{tool}': {} is not a Kin repository, and neither is any \
-                 directory above it, so there is no graph to answer from. To set it up, {}. This \
-                 server re-resolves its repository and daemon on every tool call, so the first \
-                 call after that finishes is answered; you do not need to restart the MCP \
-                 server, and a caller could not.",
-                working_dir.display(),
-                if init_served {
-                    format!(
-                        "call kin_init, which sets up the client's workspace folder, or run {} in \
-                         that folder",
-                        kin_command("init .", spelling)
-                    )
-                } else {
-                    format!("run {} in that folder", kin_command("init .", spelling))
-                }
+            Self::NoRepository { .. } => format!(
+                "kin-mcp cannot answer '{tool}': this server is not running inside a Kin \
+                 repository, so there is no graph to answer from. To set one up, {}. This server \
+                 re-resolves its repository and daemon on every tool call, so the first call \
+                 after that finishes is answered; you do not need to restart the MCP server, and \
+                 a caller could not.",
+                format!(
+                    "run {} at the root of the project the client works in",
+                    kin_command("init .", spelling)
+                )
             ),
-            Self::DaemonNotRunning { repo, retry_in } => format!(
-                "kin-mcp cannot answer '{tool}': {} is a Kin repository, but no daemon is serving \
-                 it right now. That is the same probe `kin doctor` reports its daemon-reachability \
-                 verdict from, and it starts nothing. Run {} in that repository to start a \
-                 daemon. This server re-resolves its delegate on the next tool call (at most {}s \
-                 from now), so retry once a daemon is up; restarting the MCP server is not \
-                 required.",
-                repo.display(),
-                kin_command("status", spelling),
+            Self::DaemonNotRunning { repo, retry_in } if store_written_by_older_build(repo) => {
+                format!(
+                    "kin-mcp cannot answer '{tool}': this repository's Kin store was written by \
+                     an older version of Kin, and no ready daemon route could be found for it. \
+                     Run {} in the repository: it re-derives the store for this version, keeps \
+                     every commit, branch and review, and lets a daemon serve it. This server \
+                     re-resolves its delegate on the next tool call (at most {}s from now), so \
+                     retry once it finishes; restarting the MCP server is not required.",
+                    kin_command("upgrade", spelling),
+                    retry_in.as_secs()
+                )
+            }
+            Self::DaemonNotRunning { retry_in, .. } => format!(
+                "kin-mcp cannot answer '{tool}': this is a Kin repository, but no ready daemon \
+                 route could be found for it. This does not establish daemon absence. It starts \
+                 nothing. Run {} in the repository with KIN_NO_DAEMON unset to allow Kin to \
+                 start a daemon. This server re-resolves its delegate on the next tool call (at \
+                 most {}s from now), so retry once a daemon is ready; restarting the MCP server \
+                 is not required.",
+                kin_command("graph status", spelling),
                 retry_in.as_secs()
             ),
-            Self::StartupPredatesRepository { repo, retry_in } => format!(
-                "kin-mcp cannot answer '{tool}': this server started before {} was a Kin \
-                 repository, so it bound no daemon at startup, and no daemon is serving that \
-                 repository yet. The binding is not one-shot: this server re-resolves it on the \
-                 next tool call (at most {}s from now), so retry once a daemon is up; {}. Do \
-                 not restart the MCP server; a caller cannot, and it is not what is wrong.",
-                repo.display(),
+            Self::DaemonNotReady {
+                retry_in,
+                detail,
+                warming,
+                ..
+            } => format!(
+                "kin-mcp cannot answer '{tool}': the repository's daemon endpoint has not \
+                 established readiness for this repository (warming={warming}){}. This does not \
+                 establish daemon absence. The probe starts nothing; retry after readiness, when \
+                 this server re-resolves its delegate (at most {}s from now). Do not restart or \
+                 reinitialize the repository to resolve a readiness wait.",
+                semantic_detail(detail),
+                retry_in.as_secs()
+            ),
+            Self::ProbeUnresolved {
+                retry_in, detail, ..
+            } => format!(
+                "kin-mcp cannot answer '{tool}': the bounded daemon route probe for this \
+                 repository was unresolved{}. This does not establish daemon absence. Capture {} \
+                 output and retry; this server re-resolves its delegate (at most {}s from now). \
+                 The probe starts nothing. If a daemon needs starting, run {} with KIN_NO_DAEMON \
+                 unset in the repository.",
+                semantic_detail(detail),
+                kin_command("doctor", spelling),
                 retry_in.as_secs(),
-                if init_served {
-                    format!(
-                        "calling kin_init on that folder starts one, and so does {} there",
-                        kin_command("status", spelling)
-                    )
-                } else {
-                    format!("{} there starts one", kin_command("status", spelling))
-                }
+                kin_command("graph status", spelling)
+            ),
+            Self::StartupPredatesRepository { retry_in, .. } => format!(
+                "kin-mcp cannot answer '{tool}': this server started before its repository was a \
+                 Kin repository, so it bound no daemon at startup, and no ready daemon route \
+                 could be found for it now. This does not establish daemon absence. The binding \
+                 is not one-shot: this server re-resolves it on the next tool call (at most {}s \
+                 from now). Run {} in the repository with KIN_NO_DAEMON unset to allow Kin to \
+                 start a daemon, then retry. Do not restart the MCP server; a caller cannot, and \
+                 it is not what is wrong.",
+                retry_in.as_secs(),
+                kin_command("graph status", spelling)
             ),
         }
+    }
+}
+
+/// A route probe's detail as the refusal carries it: `": <detail>"` when the
+/// detail is semantic, and otherwise a note that it went to the operator log.
+/// A probe's detail can quote an endpoint or a transport error, either of
+/// which would withhold the whole refusal from the agent it is meant for.
+fn semantic_detail(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        String::new()
+    } else if crate::semantic_surface::is_semantic(detail) {
+        format!(": {detail}")
+    } else {
+        "; the probe's detail names operator coordinates, so it went to the kin-mcp log".into()
+    }
+}
+
+/// Whether the store at `root` holds state an older Kin build derived, so
+/// `kin upgrade` is the step that lets a daemon serve it.
+///
+/// Only a store with a readable record behind this build's. A store with no
+/// record, or one a newer build wrote, needs a different step, and each of those
+/// already names its own.
+pub(crate) fn store_written_by_older_build(root: &std::path::Path) -> bool {
+    use kin_core::hydration_semantics::HydrationStanding;
+    let Some(layout) = kin_core::KinLayout::discover(root) else {
+        return false;
+    };
+    match kin_core::hydration_semantics::standing(&layout) {
+        HydrationStanding::Behind { .. } | HydrationStanding::OtherDerivation { .. } => true,
+        HydrationStanding::Rederived { under, derives, .. } => under < derives,
+        _ => false,
     }
 }
 
@@ -280,17 +411,17 @@ pub(crate) trait DelegateProbe: Sync {
     fn repository(&self) -> Option<std::path::PathBuf>;
 
     /// The endpoint of a daemon **already** serving `kin_root`. Starts nothing.
-    async fn running_route(&self, kin_root: &Path) -> Option<String>;
+    async fn running_route(
+        &self,
+        kin_root: &Path,
+        budget: Duration,
+    ) -> kin_daemon_spawn::RunningDaemonRouteReading;
 }
 
-/// Production probe: the same two steps, in the same order, that `kin doctor`
-/// answers its daemon-reachability check with.
-///
-/// Doctor discovers the repository from the working directory with
-/// `KinLayout::discover` and then asks for the route of a daemon already
-/// serving it. Doing anything else here is what let the two surfaces disagree:
-/// MCP was reading a URL resolved once at startup, so it reported the daemon
-/// unavailable while doctor, resolving at call time, reported it healthy.
+/// Production probe discovers the repository and asks the CLI's typed,
+/// bounded registrar seam for an already-serving route. The registrar also
+/// validates recorded standalone endpoints that a supervisor route lookup
+/// alone cannot see, and preserves readiness or unresolved observations.
 pub(crate) struct RealDelegateProbe;
 
 impl DelegateProbe for RealDelegateProbe {
@@ -302,8 +433,12 @@ impl DelegateProbe for RealDelegateProbe {
         kin_core::KinLayout::discover(&self.working_dir()).map(|layout| layout.root().to_path_buf())
     }
 
-    async fn running_route(&self, kin_root: &Path) -> Option<String> {
-        kin_daemon_spawn::running_daemon_route(kin_root).await
+    async fn running_route(
+        &self,
+        kin_root: &Path,
+        budget: Duration,
+    ) -> kin_daemon_spawn::RunningDaemonRouteReading {
+        kin_daemon_spawn::running_daemon_route_reading(kin_root, budget).await
     }
 }
 
@@ -330,7 +465,7 @@ struct ReresolveGate {
 }
 
 impl ReresolveGate {
-    /// Widen the cooldown after a route probe that found no daemon and report
+    /// Widen the cooldown after a route probe found no ready delegate and report
     /// the window installed.
     fn back_off(&mut self, now: tokio::time::Instant) -> Duration {
         let backoff = match self.backoff {
@@ -443,40 +578,57 @@ async fn resolve_delegate_within(
 
     // A probe that never answers must not become a stall every caller pays,
     // so it is abandoned for this round rather than awaited.
-    let route = tokio::time::timeout(probe_budget, probe.running_route(&kin_root))
-        .await
-        .ok()
-        .flatten();
+    // Leave the typed probe time to return its last readiness observation;
+    // cancellation of the outer guard is reported as uncertainty, never absence.
+    let route = tokio::time::timeout(
+        probe_budget,
+        probe.running_route(&kin_root, probe_budget.saturating_sub(probe_budget / 10)),
+    )
+    .await
+    .unwrap_or_else(
+        |_| kin_daemon_spawn::RunningDaemonRouteReading::Unresolved {
+            detail: "the route probe exceeded its bounded deadline".to_string(),
+        },
+    );
 
-    match route {
-        Some(url) => {
-            gate.reset_for(Some(kin_root));
-            DelegateResolution::Resolved(url)
-        }
-        None => {
-            let retry_in = gate.back_off(now);
-            let repo = kin_root
-                .parent()
-                .unwrap_or(kin_root.as_path())
-                .to_path_buf();
-            let gap = classify_daemon_absent(
-                repo,
-                retry_in,
-                history.ever_resolved,
-                history.startup_repository_present,
-            );
-            gate.last_gap = Some(gap.clone());
-            DelegateResolution::Gap(gap)
-        }
+    use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+    if let Reading::Serving(url) = route {
+        gate.reset_for(Some(kin_root));
+        return DelegateResolution::Resolved(url);
     }
+    let retry_in = gate.back_off(tokio::time::Instant::now());
+    let repo =
+        kin_core::layout::working_dir_of_store(&kin_root).unwrap_or_else(|| kin_root.to_path_buf());
+    let gap = match route {
+        Reading::Absent => classify_daemon_absent(
+            repo,
+            retry_in,
+            history.ever_resolved,
+            history.startup_repository_present,
+        ),
+        Reading::NotReady { detail, warming } => DelegateGap::DaemonNotReady {
+            repo,
+            retry_in,
+            detail,
+            warming,
+        },
+        Reading::Unresolved { detail } => DelegateGap::ProbeUnresolved {
+            repo,
+            retry_in,
+            detail,
+        },
+        Reading::Serving(_) => unreachable!("serving routes returned above"),
+    };
+    gate.last_gap = Some(gap.clone());
+    DelegateResolution::Gap(gap)
 }
 
-/// Which of the two repository-present gaps this is.
+/// Classify a no-ready-route observation by repository startup history.
 ///
 /// Only a server that has never held a delegate *and* whose launcher reported
 /// no repository at startup is the startup-ordering case. An unknown startup
 /// report (nobody called [`note_startup_repository`]) reads as the ordinary
-/// daemon-absent case, because claiming the stronger diagnosis without the
+/// no-ready-route case, because claiming the stronger diagnosis without the
 /// evidence for it would be a guess wearing a fact's clothes.
 fn classify_daemon_absent(
     repo: std::path::PathBuf,
@@ -552,11 +704,13 @@ fn mcp_spawn_idle_timeout(user_env_is_set: bool) -> Option<&'static str> {
 fn mcp_spawn_plan(
     daemon_bin: std::path::PathBuf,
     working_dir: std::path::PathBuf,
+    store_root: Option<std::path::PathBuf>,
     supervisor_url: Option<String>,
 ) -> kin_daemon_spawn::DaemonSpawnPlan {
     kin_daemon_spawn::DaemonSpawnPlan {
         daemon_bin,
         working_dir,
+        store_root,
         idle_timeout_secs: mcp_spawn_idle_timeout(
             std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some(),
         )
@@ -865,6 +1019,14 @@ pub(crate) fn hydration_semantics_standing(
     ))
 }
 
+/// How much of its Git history this store admitted.
+///
+/// Read fresh on every call for the reason the others are: a background
+/// derivation attaches the complete history while a session stays open.
+pub(crate) fn history_standing() -> Option<kin_core::history_state::HistoryStanding> {
+    Some(kin_core::history_state::standing_at(&discover_kin_dir()?))
+}
+
 /// What this store's last enrichment sweep could not publish.
 ///
 /// Read fresh on every call for the reason the others are: the record is
@@ -884,8 +1046,21 @@ pub(crate) fn enrichment_shortfall() -> Option<kin_daemon_spawn::RefusedEnrichme
 /// of the request that just failed, and the wording keeps those apart.
 fn recorded_kill_detail(record: Option<&kin_daemon_spawn::DaemonKillRecord>) -> String {
     match record {
-        Some(record) => format!(" {}", record.summary()),
+        Some(record) => format!(" {}", record.summary_in(store_enrichment_state())),
         None => String::new(),
+    }
+}
+
+/// How language-server enrichment stands for this server's store, so a kill
+/// remedy never offers to switch off a sweep the repository's own setting
+/// already switched off. Read from the store on every call, for the reason the
+/// kill record is: the setting changes under a running server.
+fn store_enrichment_state() -> kin_daemon_spawn::EnrichmentState {
+    match discover_kin_dir() {
+        Some(kin_dir) => kin_core::enrichment_setting::state_for_store(&kin_dir),
+        None => {
+            kin_core::enrichment_setting::state_given(kin_daemon_spawn::enrichment_disabled(), true)
+        }
     }
 }
 
@@ -900,12 +1075,18 @@ fn recorded_kill_detail(record: Option<&kin_daemon_spawn::DaemonKillRecord>) -> 
 /// that advice, because every action in it is one the caller can take.
 fn daemon_gone_advice(record: Option<&kin_daemon_spawn::DaemonKillRecord>) -> String {
     match record {
-        Some(record) => record.summary(),
+        Some(record) => record.summary_in(store_enrichment_state()),
         None => "Restart `kin mcp start` to recover.".to_string(),
     }
 }
 
 /// The message for a daemon that stopped answering and could not be replaced.
+///
+/// It reaches an agent, so it states the condition and the refusal and leaves
+/// out the endpoint and the raw transport error, which are operator
+/// coordinates the semantic surface withholds. Carried in the message they
+/// withheld the whole refusal with them, `KIN_NO_DAEMON` and its remedy
+/// included, so they go to the operator log instead.
 pub(crate) fn revival_failed_message(
     operation: &str,
     daemon_url: &str,
@@ -913,22 +1094,37 @@ pub(crate) fn revival_failed_message(
     revive_err: &str,
     record: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> String {
+    tracing::warn!(
+        operation,
+        daemon_url,
+        transport_error = first_err,
+        revival_error = revive_err,
+        "repo daemon is not responding and revival failed"
+    );
     format!(
-        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon at {daemon_url} is not \
-         responding ({first_err}); revival failed: {revive_err}. {}",
+        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: the repository daemon is not \
+         responding; revival failed: {revive_err}. {}",
         daemon_gone_advice(record)
     )
 }
 
 /// The message for a replacement daemon that started and still could not answer.
+///
+/// The replacement's endpoint goes to the operator log, for the reason
+/// [`revival_failed_message`] gives.
 pub(crate) fn revived_retry_failed_message(
     operation: &str,
     new_url: &str,
     detail: &str,
     record: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> String {
+    tracing::warn!(
+        operation,
+        daemon_url = new_url,
+        "a replacement repo daemon started and the retry still failed"
+    );
     format!(
-        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: daemon was revived at {new_url} but the \
+        "{DAEMON_EXITED_RESTART_REQUIRED}: {operation}: a replacement daemon started but the \
          retry still failed: {detail}. Check `kin daemon status`.{}",
         recorded_kill_detail(record)
     )
@@ -1002,11 +1198,19 @@ fn resolve_daemon_auth_token(env_token: Option<String>, kin_dir: Option<&Path>) 
             return Some(env_token);
         }
     }
-    let token_path = kin_dir?.join("daemon.token");
-    let contents = std::fs::read_to_string(token_path).ok()?;
-    let token = contents.trim().to_string();
+    // The token is a record in this repository's own store, so the capability
+    // that reads it reaches the store and nothing else.
+    let store = kin_io::StoreDir::open(kin_dir?, &kin_io::Grant::ambient()).ok()?;
+    let bytes = store
+        .read_record("daemon.token", MAX_DAEMON_TOKEN_BYTES)
+        .ok()??;
+    let token = String::from_utf8(bytes).ok()?.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
+
+/// A loopback bearer token is a short random string; a record longer than this
+/// is not one, and reads as no token.
+const MAX_DAEMON_TOKEN_BYTES: u64 = 4096;
 
 /// This server's repository `.kin` directory, found by the rule every other Kin
 /// surface uses.
@@ -1431,17 +1635,15 @@ fn find_mcp_daemon_binary_from(
     executable: Option<&std::path::Path>,
     search_path: Option<&std::ffi::OsStr>,
 ) -> Option<std::path::PathBuf> {
+    // Every place the daemon binary may be, in order of precedence. Finding a
+    // program to start is a process boundary, so the existence checks belong to
+    // the spawner that will start it.
+    let mut candidates = Vec::new();
     if let Some(explicit) = explicit {
-        let path = std::path::PathBuf::from(explicit);
-        if path.exists() {
-            return Some(path);
-        }
+        candidates.push(std::path::PathBuf::from(explicit));
     }
     if let Some(exe) = executable {
-        let sibling = exe.with_file_name(MCP_DAEMON_BINARY_FILE_NAME);
-        if sibling.exists() {
-            return Some(sibling);
-        }
+        candidates.push(exe.with_file_name(MCP_DAEMON_BINARY_FILE_NAME));
         // Dev/test layout: .../target/<profile>/deps/ → .../target/<profile>/
         if exe
             .parent()
@@ -1449,22 +1651,17 @@ fn find_mcp_daemon_binary_from(
             .is_some_and(|name| name == "deps")
         {
             if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
-                let target_sibling = target_dir.join(MCP_DAEMON_BINARY_FILE_NAME);
-                if target_sibling.exists() {
-                    return Some(target_sibling);
-                }
+                candidates.push(target_dir.join(MCP_DAEMON_BINARY_FILE_NAME));
             }
         }
     }
     // Walk PATH manually (avoids `which` crate dep).
-    let path_var = search_path?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(MCP_DAEMON_BINARY_FILE_NAME);
-        if candidate.exists() {
-            return Some(candidate);
-        }
+    if let Some(path_var) = search_path {
+        candidates.extend(
+            std::env::split_paths(&path_var).map(|dir| dir.join(MCP_DAEMON_BINARY_FILE_NAME)),
+        );
     }
-    None
+    kin_io::Spawner::new(&kin_io::Grant::ambient()).locate_program(candidates)
 }
 
 fn configured_managed_install_root() -> Option<std::path::PathBuf> {
@@ -1538,10 +1735,8 @@ async fn revive_mcp_daemon() -> Result<String, String> {
 
     let kin_dir =
         discover_kin_dir().ok_or_else(|| "MCP revival: cannot find .kin directory".to_string())?;
-    let working_dir = kin_dir
-        .parent()
-        .ok_or_else(|| "MCP revival: invalid .kin layout (no parent directory)".to_string())?
-        .to_path_buf();
+    let working_dir = kin_core::layout::working_dir_of_store(&kin_dir)
+        .ok_or_else(|| "MCP revival: invalid .kin layout (no parent directory)".to_string())?;
     let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
         "MCP revival: kin-daemon binary not found (not in PATH or next to kin binary)".to_string()
     })?;
@@ -1557,7 +1752,8 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     kin_daemon_spawn::clear_orphaned_port_record(&kin_dir);
 
     let supervisor_url = kin_daemon_spawn::supervisor_url_for_spawn().await;
-    let plan = mcp_spawn_plan(daemon_bin, working_dir.clone(), supervisor_url);
+    let store_root = kin_core::layout::read_working_tree_record(&kin_dir).map(|_| kin_dir.clone());
+    let plan = mcp_spawn_plan(daemon_bin, working_dir.clone(), store_root, supervisor_url);
 
     tracing::info!(
         binary = %plan.daemon_bin.display(),
@@ -2178,21 +2374,38 @@ where
     // demonstrably running, a replacement would only lose the race for the
     // repository lock this one already holds, and the caller would be told a
     // live daemon had exited.
+    // The endpoint and the transport errors are operator coordinates, logged
+    // here and kept out of every message below, for the reason
+    // `revival_failed_message` gives.
     let first_err = format!("{first_err}; retry: {retry_err}");
     if reviver.is_provably_alive(daemon_url).await {
+        tracing::warn!(
+            operation,
+            daemon_url,
+            transport_error = first_err.as_str(),
+            "repo daemon is alive but did not answer; left running"
+        );
         return Err(format!(
-            "{operation}: daemon at {daemon_url} is alive but did not answer this request \
-             ({first_err}); it was left running rather than restarted. Retry, or inspect it \
-             with `kin daemon status`."
+            "{operation}: the repository daemon is alive but did not answer this request; it \
+             was left running rather than restarted. Retry, or inspect it with `kin daemon \
+             status`."
         ));
     }
     match reviver.revive().await {
-        Err(revive_err) if is_still_starting_error(&revive_err) => Err(format!(
-            "{operation}: daemon at {daemon_url} is not responding ({first_err}); a replacement \
-             was started and is still loading this repository's graph ({revive_err}). It was \
-             left running. Retry this tool in a moment; do not restart `kin mcp start`, which \
-             discards the startup already in progress."
-        )),
+        Err(revive_err) if is_still_starting_error(&revive_err) => {
+            tracing::warn!(
+                operation,
+                daemon_url,
+                transport_error = first_err.as_str(),
+                "repo daemon is not responding; its replacement is still loading"
+            );
+            Err(format!(
+                "{operation}: the repository daemon is not responding; a replacement was started \
+                 and is still loading this repository's graph ({revive_err}). It was left \
+                 running. Retry this tool in a moment; do not restart `kin mcp start`, which \
+                 discards the startup already in progress."
+            ))
+        }
         Err(revive_err) => Err(revival_failed_message(
             operation,
             daemon_url,
@@ -2251,9 +2464,15 @@ where
             Err(_) => {}
         }
     }
+    tracing::warn!(
+        operation,
+        daemon_url,
+        transport_error = first_err.as_str(),
+        "repo daemon did not answer within its patience; left running"
+    );
     Err(format!(
-        "{operation}: daemon at {daemon_url} did not answer within {}s ({first_err}); it was \
-         left running rather than restarted for being slow. Wait for it, raise \
+        "{operation}: the repository daemon did not answer within {}s; it was left running \
+         rather than restarted for being slow. Wait for it, raise \
          KIN_MCP_DAEMON_PATIENCE_SECS, or stop it with `kin daemon stop`.",
         patience.as_secs()
     ))
@@ -2441,9 +2660,7 @@ pub async fn forward_tool_call(
     match name {
         "register_session" => {
             let assistant_name = required_string(arguments, "assistant_name")?;
-            let cwd = std::env::current_dir()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|_| ".".to_string());
+            let cwd = required_string(arguments, "cwd")?;
             forward_session_start(&assistant_name, &assistant_name, "mcp", None, &cwd, None)
                 .await?
                 .map(text_result_from_value)
@@ -2565,6 +2782,19 @@ fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> R
     if crate::handlers::sessions::names_external_relation_endpoint(operations_val) {
         return Ok(());
     }
+    if crate::source_ticket::contains(operations_val) {
+        for operation in operations_val
+            .as_array()
+            .expect("contains requires an array")
+        {
+            if crate::source_ticket::check_forward_operation(operation)? {
+                continue;
+            }
+            let parsed = crate::session::parse_staged_operations(&serde_json::json!([operation]))?;
+            crate::session::validate_staged_operations(&parsed)?;
+        }
+        return Ok(());
+    }
     let operations = crate::session::parse_staged_operations(operations_val)?;
     crate::session::validate_staged_operations(&operations)
 }
@@ -2586,8 +2816,436 @@ async fn forward_graph_status(
 }
 
 fn validate_graph_status_result(result: ToolCallResult) -> Result<ToolCallResult, String> {
-    parse_graph_status_report(&result)?;
+    if !validate_semantic_graph_status_result(&result)? {
+        parse_graph_status_report(&result)?;
+    }
     Ok(result)
+}
+
+/// The public status keeps semantic observations but deliberately omits the
+/// producer's physical inventory. Validate that contract without manufacturing
+/// missing inventory or recomputing a verdict from the reduced evidence.
+pub(crate) fn validate_semantic_graph_status_result(
+    result: &ToolCallResult,
+) -> Result<bool, String> {
+    if result.is_error == Some(true) {
+        return Ok(false);
+    }
+    let [ContentBlock::Text { text }] = result.content.as_slice() else {
+        return Err("daemon kin_graph_status expected exactly one text block".into());
+    };
+    let payload: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("daemon kin_graph_status contract validation failed: {error}"))?;
+    let Some(marker) = payload.pointer("/_kin/semantic_surface") else {
+        return Ok(false);
+    };
+    if marker.as_u64() != Some(crate::semantic_surface::VERSION) {
+        return Err("daemon kin_graph_status has an unsupported semantic surface version".into());
+    }
+    validate_semantic_graph_status_payload(&payload).map_err(|error| {
+        format!("daemon semantic kin_graph_status contract validation failed: {error}")
+    })?;
+    Ok(true)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticGraphStatusReport {
+    schema: String,
+    view: crate::handlers::entities::GraphStatusView,
+    scope: crate::handlers::entities::GraphStatusScope,
+    authority: crate::handlers::entities::GraphStatusAuthority,
+    sampling: crate::handlers::entities::GraphStatusSampling,
+    authority_epoch: u64,
+    entity_count: u64,
+    durable_entity_count: Option<u64>,
+    relation_count: u64,
+    durable_relation_count: Option<u64>,
+    embedding_source: crate::handlers::entities::GraphStatusEmbeddingSource,
+    embeddings_indexed: u64,
+    embeddings_pending: u64,
+    embeddings_total: u64,
+    embedding_index_keys: Option<u64>,
+    embedding_keys_not_in_graph: Option<u64>,
+    search_vectors_used: Option<bool>,
+    completion_attested: bool,
+    stale: Option<crate::handlers::entities::GraphStatusStaleness>,
+    #[serde(rename = "_kin")]
+    envelope: serde_json::Value,
+    binding_coverage: Option<serde_json::Value>,
+    repository_base: Option<crate::source_unit::RepositoryBase>,
+    call_sites: Option<serde_json::Value>,
+    enrichment: Option<serde_json::Value>,
+    open_transactions: Option<serde_json::Value>,
+    status_page: Option<serde_json::Value>,
+}
+
+fn validate_semantic_graph_status_payload(payload: &serde_json::Value) -> Result<(), String> {
+    use crate::handlers::entities::{GraphStatusSampling, GraphStatusScope};
+    use serde_json::Value;
+
+    let report: SemanticGraphStatusReport =
+        serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
+    // These typed fields have closed wire vocabularies. Reading them here also
+    // makes clear that the public schema retains the producer's entire fence.
+    let _ = (
+        &report.view,
+        &report.authority,
+        report.authority_epoch,
+        &report.embedding_source,
+        report.search_vectors_used,
+    );
+    if report.schema != crate::handlers::entities::GRAPH_STATUS_SCHEMA || report.completion_attested
+    {
+        return Err("invalid semantic status schema or completion attestation".into());
+    }
+    let indexed = report.embeddings_indexed;
+    let pending = report.embeddings_pending;
+    let total = report.embeddings_total;
+    if indexed > total || pending < total - indexed {
+        return Err("inconsistent selected embedding coverage".into());
+    }
+    match (
+        report.embedding_index_keys,
+        report.embedding_keys_not_in_graph,
+    ) {
+        (Some(keys), Some(stale)) if keys.checked_sub(indexed) == Some(stale) => {}
+        (None, None) => {}
+        _ => return Err("inconsistent selected embedding index population".into()),
+    }
+    if matches!(
+        report.sampling,
+        GraphStatusSampling::LastSettledSelectedGraph
+    ) != report.stale.is_some()
+    {
+        return Err("sampling disagrees with the selected stale disclosure".into());
+    }
+    let envelope = report.envelope.as_object().ok_or("_kin is not an object")?;
+    if envelope.get("envelope_version").and_then(Value::as_u64)
+        != Some(u64::from(crate::envelope::ENVELOPE_VERSION))
+        || envelope.get("runtime").and_then(Value::as_str) != Some("repo-daemon")
+        || envelope.contains_key("graph_as_of")
+    {
+        return Err("invalid selected status envelope identity".into());
+    }
+    let graph_state = report.envelope["graph_state"]
+        .as_object()
+        .ok_or("selected graph state is missing")?;
+    if graph_state.len() != 1
+        || graph_state.get("entity_count").and_then(Value::as_u64) != Some(report.entity_count)
+    {
+        return Err("_kin graph_state differs from the selected observation".into());
+    }
+    let coverage: crate::envelope::SemanticCoverage =
+        serde_json::from_value(report.envelope["semantic_coverage"].clone())
+            .map_err(|error| format!("invalid semantic coverage: {error}"))?;
+    if (
+        coverage.indexed,
+        coverage.pending,
+        coverage.total,
+        coverage.complete,
+    ) != (indexed, pending, total, pending == 0 && indexed == total)
+    {
+        return Err("_kin semantic_coverage differs from selected counters".into());
+    }
+    let degraded = report.envelope["degraded"]
+        .as_object()
+        .ok_or("selected status degraded observation is missing")?;
+    if [
+        "daemon_unreachable",
+        "no_repository",
+        "embed_worker_failed",
+        "mass_deletion_blocked",
+        "offline_fallback",
+        "workspace_mismatch",
+    ]
+    .iter()
+    .any(|key| degraded.contains_key(*key))
+    {
+        return Err("selected status carries unscoped daemon health".into());
+    }
+    if let Some(value) = envelope.get("durability") {
+        let durability: crate::envelope::Durability =
+            serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+        if durability.live_entities != Some(report.entity_count)
+            || durability.live_relations != Some(report.relation_count)
+            || durability.durable_entities != report.durable_entity_count
+            || durability.durable_relations != report.durable_relation_count
+        {
+            return Err("_kin durability differs from selected counters".into());
+        }
+    }
+    let freshness = envelope
+        .get("freshness")
+        .map(|value| serde_json::from_value::<crate::envelope::GraphFreshness>(value.clone()))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    match (&report.stale, freshness) {
+        (
+            Some(stale),
+            Some(crate::envelope::GraphFreshness::Stale {
+                basis,
+                reason,
+                settled_age_ms,
+                observed_authority_epoch,
+                live_attempts,
+            }),
+        ) if !stale.note.trim().is_empty()
+            && basis == "selected_graph_sample"
+            && reason == stale.reason.as_str()
+            && settled_age_ms == stale.settled_age_ms
+            && observed_authority_epoch == stale.observed_authority_epoch
+            && live_attempts == stale.live_attempts => {}
+        (None, Some(crate::envelope::GraphFreshness::Stale { .. })) | (Some(_), _) => {
+            return Err("_kin freshness differs from the selected stale observation".into());
+        }
+        (None, _) => {}
+    }
+    if let Some(verdict) = envelope.get("verdict") {
+        validate_semantic_status_verdict(verdict)?;
+    } else if report.entity_count == 0
+        || report.stale.is_some()
+        || report
+            .call_sites
+            .as_ref()
+            .is_some_and(|value| value["settled"].is_boolean())
+        || report
+            .enrichment
+            .as_ref()
+            .is_some_and(|value| value["status"] == "bounded")
+        || report
+            .binding_coverage
+            .as_ref()
+            .is_some_and(|value| value["scope"] != "selected_historical")
+        || ["completeness", "watcher_loss", "behind"]
+            .iter()
+            .any(|key| envelope.contains_key(*key))
+    {
+        // A populated count-only reading and a historical source observation
+        // can have no speaking verdict inputs. Reduced live source evidence
+        // cannot establish that silence, so its producer's verdict is required.
+        return Err("selected status omits a verdict for its evidence".into());
+    }
+    if report.binding_coverage.as_ref() != envelope.get("binding_coverage") {
+        return Err("_kin binding coverage differs from the selected source scope".into());
+    }
+    if let Some(binding) = &report.binding_coverage {
+        validate_semantic_status_binding(binding, report.scope)?;
+    }
+    if let Some(base) = &report.repository_base {
+        if report.scope != GraphStatusScope::Head {
+            return Err("temporal status carries a live repository base".into());
+        }
+        base.validate()?;
+    }
+    if report
+        .call_sites
+        .as_ref()
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err("selected call-site observation is not an object".into());
+    }
+    if let Some(enrichment) = &report.enrichment {
+        validate_semantic_status_enrichment(
+            enrichment,
+            report.scope,
+            report.stale.is_none(),
+            report.status_page.is_some(),
+        )?;
+    }
+    // Transactions keep their complete semantic rows. The private validator is
+    // reusable for this collection alone, but not for removed enrichment rows.
+    crate::status_pages::validate_collections(None, report.open_transactions.as_ref(), None)?;
+    let transaction_page = report
+        .open_transactions
+        .as_ref()
+        .and_then(|value| value.get("page"))
+        .map(|page| validate_semantic_status_page(page, false))
+        .transpose()?;
+    if let (Some(transactions), Some((_, returned, _))) =
+        (&report.open_transactions, transaction_page)
+    {
+        if transactions["items"]
+            .as_array()
+            .map(|items| items.len() as u64)
+            != Some(returned)
+        {
+            return Err("transaction page differs from its semantic rows".into());
+        }
+    }
+    if let Some(page) = &report.status_page {
+        let (_, returned, _) = validate_semantic_status_page(page, true)?;
+        if !semantic_status_digest(&page["snapshot_id"]) {
+            return Err("invalid status page identity".into());
+        }
+        let enrichment_returned = report
+            .enrichment
+            .as_ref()
+            .and_then(|value| value.get("page"))
+            .map(|page| validate_semantic_status_page(page, false))
+            .transpose()?
+            .map_or(0, |(_, count, _)| count);
+        let transaction_returned = transaction_page.map_or(0, |(_, count, _)| count);
+        if enrichment_returned.checked_add(transaction_returned) != Some(returned) {
+            return Err("status page differs from its collection observations".into());
+        }
+    }
+    let mut projected = payload.clone();
+    crate::semantic_surface::project("kin_graph_status", &mut projected);
+    if projected != *payload {
+        return Err("semantic status contains unprojected private evidence".into());
+    }
+    Ok(())
+}
+
+fn validate_semantic_status_verdict(verdict: &serde_json::Value) -> Result<(), String> {
+    let state = verdict["state"]
+        .as_str()
+        .ok_or("status verdict state is missing")?;
+    let absence = verdict["absence_claim"]
+        .as_str()
+        .ok_or("status absence claim is missing")?;
+    let inputs = verdict["inputs"]
+        .as_object()
+        .ok_or("status verdict inputs are missing")?;
+    let limited = verdict
+        .get("limiting_factor")
+        .ok_or("status verdict limitation is missing")?;
+    if !matches!(state, "certified" | "certified_except" | "inconclusive")
+        || !matches!(
+            absence,
+            "not_applicable" | "authoritative" | "not_authoritative"
+        )
+        || verdict["safe_to_conclude_absent"].as_bool() != Some(absence == "authoritative")
+        || (absence == "authoritative" && state != "certified")
+        || !(limited.is_null() || limited.as_str().is_some_and(|text| !text.trim().is_empty()))
+        || (state == "inconclusive" && limited.is_null())
+        || inputs.values().any(|value| {
+            !matches!(
+                value.as_str(),
+                Some("certified" | "inconclusive" | "not_applicable")
+            )
+        })
+        || (state == "certified"
+            && inputs
+                .values()
+                .any(|value| value.as_str() == Some("inconclusive")))
+        || !inputs
+            .values()
+            .any(|value| value.as_str() != Some("not_applicable"))
+    {
+        return Err("invalid or contradictory daemon status verdict".into());
+    }
+    Ok(())
+}
+
+fn validate_semantic_status_binding(
+    binding: &serde_json::Value,
+    graph_scope: crate::handlers::entities::GraphStatusScope,
+) -> Result<(), String> {
+    use crate::source_derivation::SourceObservationScope;
+    let object = binding
+        .as_object()
+        .ok_or("binding coverage is not an object")?;
+    let scope: SourceObservationScope =
+        serde_json::from_value(binding["scope"].clone()).map_err(|error| error.to_string())?;
+    if (graph_scope == crate::handlers::entities::GraphStatusScope::TemporalSession
+        && scope == SourceObservationScope::LiveHead)
+        || binding["checked_scope"].as_str().is_none_or(str::is_empty)
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "scope" | "checked_scope" | "binding_scope" | "local_binding_requirement"
+            )
+        })
+    {
+        return Err("binding coverage disagrees with selected source scope".into());
+    }
+    serde_json::from_value::<crate::source_derivation::LocalBindingRequirement>(
+        binding["local_binding_requirement"].clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(value) = binding.get("binding_scope") {
+        serde_json::from_value::<crate::source_derivation::BindingScope>(value.clone())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn semantic_status_digest(value: &serde_json::Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|text| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn validate_semantic_status_enrichment(
+    value: &serde_json::Value,
+    scope: crate::handlers::entities::GraphStatusScope,
+    current: bool,
+    mixed_page: bool,
+) -> Result<(), String> {
+    let expected = match scope {
+        crate::handlers::entities::GraphStatusScope::Head => "workspace_head",
+        crate::handlers::entities::GraphStatusScope::TemporalSession => "committed_graph",
+    };
+    if value["schema"] != "kin.enrichment-status.v1"
+        || value["proof_scope"] != "recorded_call_site_census"
+        || value["all_relationships_attested"] != false
+        || value["current"].as_bool() != Some(current)
+        || value["truth_epoch"].as_u64().is_none()
+        || !semantic_status_digest(&value["snapshot_id"])
+        || value["scope"]["kind"] != expected
+        || (expected == "committed_graph"
+            && value["scope"]["change"].as_str().is_none_or(str::is_empty))
+    {
+        return Err("invalid selected semantic enrichment identity or scope".into());
+    }
+    if let Some(unavailable) = value.get("unavailable") {
+        let limit = match unavailable["limit_kind"].as_str() {
+            Some("bytes" | "path_bytes") => 8 * 1024 * 1024,
+            Some("records") => 1_000_000,
+            _ => return Err("invalid enrichment metadata limit kind".into()),
+        };
+        if unavailable["limit"].as_u64() != Some(limit)
+            || unavailable["reason"].as_str().is_none_or(str::is_empty)
+            || value["status"] != "bounded"
+            || value["limitation"].as_str().is_none_or(str::is_empty)
+            || value.get("page").is_some()
+        {
+            return Err("unavailable enrichment cannot certify metadata coverage".into());
+        }
+    } else if let Some(page) = value.get("page") {
+        validate_semantic_status_page(page, !mixed_page)?;
+    }
+    Ok(())
+}
+
+fn validate_semantic_status_page(
+    page: &serde_json::Value,
+    continuation: bool,
+) -> Result<(u64, u64, u64), String> {
+    let start = page["start"]
+        .as_u64()
+        .ok_or("invalid semantic page start")?;
+    let returned = page["returned"]
+        .as_u64()
+        .ok_or("invalid semantic page returned count")?;
+    let total = page["total"]
+        .as_u64()
+        .ok_or("invalid semantic page total")?;
+    let end = start
+        .checked_add(returned)
+        .filter(|end| *end <= total)
+        .ok_or("invalid semantic page range")?;
+    let valid_cursor = match (continuation, end < total, page.get("next_cursor")) {
+        (true, true, Some(serde_json::Value::String(cursor))) => !cursor.is_empty(),
+        (true, false, None | Some(serde_json::Value::Null)) | (false, _, None) => true,
+        _ => false,
+    };
+    if page["complete"].as_bool() != Some(start == 0 && end == total) || !valid_cursor {
+        return Err("semantic page continuation disagrees with its range".into());
+    }
+    Ok((start, returned, total))
 }
 
 pub(crate) fn parse_graph_status_report(
@@ -2612,43 +3270,50 @@ pub(crate) fn parse_graph_status_report(
 ///
 /// Asks the resolver rather than inspecting the filesystem itself, so the
 /// message describes the state the forwarding attempt actually found, and
-/// names which of the three gaps it is. Within one tool call this costs no
+/// names the observed gap. Within one tool call this costs no
 /// second probe: the forwarding attempt already ran one, and the resolver's
 /// cooldown replays that verdict.
 pub async fn daemon_unavailable_tool_result(
     name: &str,
-    init_served: bool,
 ) -> (ToolCallResult, crate::envelope::Envelope) {
     match resolve_delegate().await {
         DelegateResolution::Gap(gap) => (
-            ToolCallResult::error(gap.message(name, init_served)),
+            ToolCallResult::error(gap.message(name)),
             envelope_for_gap(&gap),
         ),
         // A delegate resolved between the forwarding attempt and this message,
         // or the attempt failed for a reason that is not endpoint resolution
         // (no HTTP client could be built at all). Neither is something the
-        // caller can act on, and neither is any of the three gaps, so it is
+        // caller can act on, and neither is any of the observed gaps, so it is
         // reported as itself rather than dressed as one of them.
-        DelegateResolution::Resolved(url) => (
-            ToolCallResult::error(format!(
-                "kin-mcp could not issue '{name}' to the repo daemon at {url}, though the \
-                 delegate resolves there now. Retry the call; if it keeps failing, capture `kin \
-                 doctor` output, which probes that same endpoint."
-            )),
-            crate::envelope::Envelope::daemon_unreachable(),
-        ),
+        DelegateResolution::Resolved(url) => {
+            tracing::warn!(
+                tool = name,
+                daemon_url = url.as_str(),
+                "could not issue a tool call to a delegate that resolves now"
+            );
+            (
+                ToolCallResult::error(format!(
+                    "kin-mcp could not issue '{name}' to the repository daemon, though its \
+                     delegate resolves now. Retry the call; if it keeps failing, capture `kin \
+                     doctor` output for repository and daemon diagnostics."
+                )),
+                crate::envelope::Envelope::daemon_unreachable(),
+            )
+        }
     }
 }
 
 /// The envelope a gap goes out under. A working directory that is no repository
-/// has no daemon to be unreachable, so it carries its own flag; the two gaps with
-/// a repository and no daemon keep `daemon_unreachable`.
+/// has no daemon to be unreachable, so it carries its own flag; repository
+/// route and readiness gaps keep `daemon_unreachable`.
 fn envelope_for_gap(gap: &DelegateGap) -> crate::envelope::Envelope {
     match gap {
         DelegateGap::NoRepository { .. } => crate::envelope::Envelope::no_repository(),
-        DelegateGap::DaemonNotRunning { .. } | DelegateGap::StartupPredatesRepository { .. } => {
-            crate::envelope::Envelope::daemon_unreachable()
-        }
+        DelegateGap::DaemonNotRunning { .. }
+        | DelegateGap::StartupPredatesRepository { .. }
+        | DelegateGap::DaemonNotReady { .. }
+        | DelegateGap::ProbeUnresolved { .. } => crate::envelope::Envelope::daemon_unreachable(),
     }
 }
 
@@ -2915,6 +3580,62 @@ pub async fn forward_check_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store an older Kin build wrote names `kin upgrade` when no ready route
+    /// serves it, because a daemon cannot serve it until it is re-derived. The
+    /// same repository with a current record names `kin graph status`.
+    #[test]
+    fn a_missing_daemon_on_a_store_an_older_build_wrote_names_kin_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().to_path_buf();
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::discover(&repo).unwrap();
+        let gap = DelegateGap::DaemonNotRunning {
+            repo: repo.clone(),
+            retry_in: Duration::from_secs(0),
+        };
+        let spelling = crate::first_contact::Spelling::Kin;
+        let write = |version: u32| {
+            let stamp: kin_core::hydration_semantics::HydrationSemanticsStamp =
+                serde_json::from_value(serde_json::json!({
+                    "schema": kin_core::hydration_semantics::HYDRATION_SEMANTICS_SCHEMA,
+                    "created_under": version,
+                    "at": "2026-09-28T00:00:00Z",
+                    "derivation": kin_core::hydration_semantics::binary_derivation(),
+                }))
+                .unwrap();
+            kin_core::hydration_semantics::write(&layout, &stamp).unwrap();
+        };
+
+        write(kin_core::hydration_semantics::binary_version());
+        let current = gap.message_spelled("find_references", spelling);
+        assert!(current.contains("`kin graph status`"), "{current}");
+        assert!(!current.contains("kin upgrade"), "{current}");
+
+        // The same version derived by a build that recorded no derivation
+        // identity is not this build's, so it too names the upgrade.
+        let legacy: kin_core::hydration_semantics::HydrationSemanticsStamp =
+            serde_json::from_value(serde_json::json!({
+                "schema": kin_core::hydration_semantics::HYDRATION_SEMANTICS_SCHEMA,
+                "created_under": kin_core::hydration_semantics::binary_version(),
+                "at": "2026-09-28T00:00:00Z",
+            }))
+            .unwrap();
+        kin_core::hydration_semantics::write(&layout, &legacy).unwrap();
+        let other_build = gap.message_spelled("find_references", spelling);
+        assert!(
+            other_build.contains("Run `kin upgrade` in the repository"),
+            "{other_build}"
+        );
+
+        write(kin_core::hydration_semantics::binary_version() - 1);
+        let behind = gap.message_spelled("find_references", spelling);
+        assert!(
+            behind.contains("Run `kin upgrade` in the repository"),
+            "{behind}"
+        );
+        assert!(!behind.contains("`kin status`"), "{behind}");
+    }
 
     /// A revival waits only on a daemon that owes tracked files and can still
     /// take them. One whose admissions are failing, one that owes nothing, and
@@ -3918,6 +4639,303 @@ mod tests {
         assert_eq!(actual, &expected);
     }
 
+    fn semantic_graph_status_result(
+        scope: crate::handlers::entities::GraphStatusScope,
+        stale: bool,
+    ) -> ToolCallResult {
+        use crate::handlers::entities::GraphStatusScope;
+        use serde_json::json;
+        let raw = valid_graph_status_result();
+        let ContentBlock::Text { text } = &raw.content[0];
+        let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        payload["scope"] = json!(scope);
+        payload["durable_entity_count"] = json!(40);
+        payload["durable_relation_count"] = json!(17);
+        payload["embedding_index_keys"] = json!(9);
+        payload["embedding_keys_not_in_graph"] = json!(2);
+        payload["source_derivation"] = json!(match scope {
+            GraphStatusScope::Head =>
+                crate::source_derivation::SourceDerivationObservation::unavailable(
+                    "selected source observation unavailable",
+                ),
+            GraphStatusScope::TemporalSession =>
+                crate::source_derivation::SourceDerivationObservation::historical(),
+        });
+        payload["enrichment"] = json!({
+            "schema":"kin.enrichment-status.v1",
+            "proof_scope":"recorded_call_site_census",
+            "all_relationships_attested":false,
+            "current":!stale,
+            "truth_epoch":42,
+            "snapshot_id":"a".repeat(64),
+            "scope":match scope {
+                GraphStatusScope::Head => json!({"kind":"workspace_head"}),
+                GraphStatusScope::TemporalSession => json!({"kind":"committed_graph","change":"b".repeat(64)}),
+            },
+            "files":[{"projection_path":"src/fixture.py","entity_count":42}],
+            "page":{"start":0,"returned":1,"total":1,"complete":true},
+        });
+        payload["open_transactions"] = json!({
+            "observed_at":"2026-01-01T00:00:01Z",
+            "scope":"live_staged_session_work",
+            "snapshot_id":"c".repeat(64),
+            "items":[{
+                "transaction_id":"transaction-one","session_id":"session-one",
+                "scope":"workspace_head","state":"active","staged_count":1,
+                "staged_digest":"d".repeat(64),
+                "created_at":"2026-01-01T00:00:00Z","age_seconds":1,
+            }],
+            "page":{"start":0,"returned":1,"total":1,"complete":true},
+        });
+        payload["status_page"] = json!({
+            "snapshot_id":"e".repeat(64),"start":0,"returned":2,"total":2,
+            "complete":true,"next_cursor":null,
+        });
+        let mut base = crate::envelope::Envelope::daemon().with_selected_graph_observation(
+            crate::envelope::DurabilityCounts {
+                live_entities: 42,
+                durable_entities: Some(40),
+                live_relations: Some(17),
+                durable_relations: Some(17),
+            },
+            7,
+            3,
+            10,
+        );
+        if stale {
+            payload["sampling"] = json!("last_settled_selected_graph");
+            payload["stale"] = json!({
+                "reason":"selected_graph_changing", "settled_age_ms":12,
+                "observed_authority_epoch":43,"live_attempts":3,
+                "note":"Selected graph changed during the bounded observation.",
+            });
+            base = base.with_selected_graph_staleness("selected_graph_changing", 12, Some(43), 3);
+        }
+        let result = crate::envelope::finalize(
+            ToolCallResult::text(payload.to_string()),
+            base,
+            "kin_graph_status",
+        );
+        parse_graph_status_report(&result).expect("producer report validates before projection");
+        let mut transport = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut transport, "kin_graph_status");
+        serde_json::from_value(transport).unwrap()
+    }
+
+    #[test]
+    fn semantic_graph_status_accepts_projected_selected_observations_unchanged() {
+        use crate::handlers::entities::GraphStatusScope;
+        for scope in [GraphStatusScope::Head, GraphStatusScope::TemporalSession] {
+            for stale in [false, true] {
+                let result = semantic_graph_status_result(scope, stale);
+                assert!(validate_semantic_graph_status_result(&result).unwrap());
+                let ContentBlock::Text { text } = &result.content[0];
+                let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert!(payload["enrichment"].get("files").is_none());
+                assert!(payload.get("source_derivation").is_none());
+                assert!(payload.get("binding_coverage").is_some());
+                assert!(parse_graph_status_report(&result).is_err());
+                let expected = serde_json::to_value(&result).unwrap();
+                assert_eq!(
+                    serde_json::to_value(validate_graph_status_result(result).unwrap()).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_graph_status_refuses_malformed_observations_and_copied_counters() {
+        use crate::handlers::entities::GraphStatusScope;
+        use serde_json::json;
+        let result = semantic_graph_status_result(GraphStatusScope::Head, false);
+        let ContentBlock::Text { text } = &result.content[0];
+        let original: serde_json::Value = serde_json::from_str(text).unwrap();
+        for (pointer, replacement) in [
+            ("/_kin/semantic_surface", json!(2)),
+            ("/_kin/semantic_surface", json!(false)),
+            ("/_kin/semantic_surface", json!("1")),
+            ("/_kin/semantic_surface", json!(null)),
+            ("/entity_count", json!(-1)),
+            ("/entity_count", json!("42")),
+            ("/completion_attested", json!(true)),
+            ("/embeddings_indexed", json!(11)),
+            ("/embeddings_pending", json!(2)),
+            ("/embedding_keys_not_in_graph", json!(1)),
+            ("/_kin/envelope_version", json!(999)),
+            ("/_kin/runtime", json!("offline-in-process")),
+            ("/_kin/graph_state/entity_count", json!(43)),
+            ("/_kin/semantic_coverage/pending", json!(4)),
+            ("/_kin/semantic_coverage/complete", json!(true)),
+            ("/_kin/durability/live_relations", json!(18)),
+            ("/_kin/verdict", json!({})),
+            ("/_kin/verdict/safe_to_conclude_absent", json!(true)),
+            ("/sampling", json!("last_settled_selected_graph")),
+            ("/scope", json!("temporal_session")),
+            ("/enrichment/current", json!(false)),
+            ("/enrichment/proof_scope", json!("all_relationships")),
+            ("/enrichment/truth_epoch", json!(null)),
+            ("/enrichment/snapshot_id", json!("")),
+            ("/enrichment/page/returned", json!(2)),
+            ("/enrichment/page/complete", json!(false)),
+            ("/enrichment/scope/kind", json!("committed_graph")),
+            ("/open_transactions/page/returned", json!(0)),
+            ("/status_page/returned", json!(1)),
+            ("/status_page/next_cursor", json!(false)),
+            ("/_kin/binding_coverage/scope", json!("live_head")),
+        ] {
+            let mut payload = original.clone();
+            *payload.pointer_mut(pointer).expect(pointer) = replacement;
+            let changed = ToolCallResult::text(payload.to_string());
+            assert!(
+                validate_semantic_graph_status_result(&changed).is_err(),
+                "accepted {pointer}: {payload}"
+            );
+            assert!(
+                validate_graph_status_result(changed).is_err(),
+                "fallback accepted {pointer}"
+            );
+        }
+        for field in [
+            "entity_count",
+            "relation_count",
+            "embeddings_total",
+            "authority_epoch",
+            "_kin",
+        ] {
+            let mut payload = original.clone();
+            payload.as_object_mut().unwrap().remove(field);
+            assert!(
+                validate_graph_status_result(ToolCallResult::text(payload.to_string())).is_err(),
+                "accepted missing {field}"
+            );
+        }
+        for (pointer, key, replacement) in [
+            ("", "unexpected", json!(true)),
+            ("", "source_path", json!("src/fixture.py")),
+            ("/enrichment", "files", json!([])),
+            ("/_kin", "graph_as_of", json!({"generation":900})),
+            ("/_kin/graph_state", "loaded", json!(true)),
+            ("/_kin/degraded", "embed_worker_failed", json!(false)),
+            ("/enrichment/page", "next_cursor", json!("unneeded")),
+            ("/enrichment/page", "next_cursor", json!(false)),
+        ] {
+            let mut payload = original.clone();
+            payload
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), replacement);
+            assert!(
+                validate_graph_status_result(ToolCallResult::text(payload.to_string())).is_err(),
+                "accepted added {pointer}/{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_graph_status_refuses_stale_and_historical_scope_relabeling() {
+        use crate::handlers::entities::GraphStatusScope;
+        use serde_json::json;
+        let result = semantic_graph_status_result(GraphStatusScope::TemporalSession, true);
+        let ContentBlock::Text { text } = &result.content[0];
+        let original: serde_json::Value = serde_json::from_str(text).unwrap();
+        for (pointer, replacement) in [
+            ("/sampling", json!("point_in_time_selected_graph")),
+            ("/stale/note", json!("")),
+            ("/_kin/freshness/observed_authority_epoch", json!(44)),
+            ("/enrichment/scope/change", json!("")),
+        ] {
+            let mut payload = original.clone();
+            *payload.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                validate_semantic_graph_status_result(&ToolCallResult::text(payload.to_string()))
+                    .is_err(),
+                "accepted {pointer}"
+            );
+        }
+        let mut payload = original;
+        payload["binding_coverage"]["scope"] = json!("live_head");
+        payload["_kin"]["binding_coverage"]["scope"] = json!("live_head");
+        assert!(
+            validate_semantic_graph_status_result(&ToolCallResult::text(payload.to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_graph_status_keeps_errors_and_private_reports_on_the_private_path() {
+        assert!(
+            !validate_semantic_graph_status_result(&ToolCallResult::error("unavailable")).unwrap()
+        );
+        assert!(!validate_semantic_graph_status_result(&valid_graph_status_result()).unwrap());
+    }
+
+    #[test]
+    fn semantic_graph_status_preserves_count_only_silence_without_fabricating_a_verdict() {
+        use serde_json::json;
+        let result = crate::envelope::finalize(
+            valid_graph_status_result(),
+            crate::envelope::Envelope::daemon().with_selected_graph_observation(
+                crate::envelope::DurabilityCounts {
+                    live_entities: 42,
+                    durable_entities: None,
+                    live_relations: Some(17),
+                    durable_relations: None,
+                },
+                7,
+                3,
+                10,
+            ),
+            "kin_graph_status",
+        );
+        parse_graph_status_report(&result).unwrap();
+        let mut transport = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut transport, "kin_graph_status");
+        let result: ToolCallResult = serde_json::from_value(transport).unwrap();
+        let ContentBlock::Text { text } = &result.content[0];
+        let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(payload["_kin"].get("verdict").is_none());
+        assert!(validate_semantic_graph_status_result(&result).unwrap());
+        payload["entity_count"] = json!(0);
+        payload["_kin"]["graph_state"]["entity_count"] = json!(0);
+        payload["_kin"]["durability"]["live_entities"] = json!(0);
+        assert!(
+            validate_semantic_graph_status_result(&ToolCallResult::text(payload.to_string()))
+                .is_err()
+        );
+
+        let result =
+            semantic_graph_status_result(crate::handlers::entities::GraphStatusScope::Head, false);
+        let ContentBlock::Text { text } = &result.content[0];
+        let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        payload["_kin"].as_object_mut().unwrap().remove("verdict");
+        assert!(
+            validate_semantic_graph_status_result(&ToolCallResult::text(payload.to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_graph_status_keeps_a_partial_metadata_page_without_inventing_removed_rows() {
+        use crate::handlers::entities::GraphStatusScope;
+        use serde_json::json;
+        let result = semantic_graph_status_result(GraphStatusScope::Head, false);
+        let ContentBlock::Text { text } = &result.content[0];
+        let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        payload["enrichment"]["page"]["total"] = json!(2);
+        payload["enrichment"]["page"]["complete"] = json!(false);
+        payload["status_page"]["total"] = json!(3);
+        payload["status_page"]["complete"] = json!(false);
+        payload["status_page"]["next_cursor"] = json!("opaque-continuation");
+        assert!(payload["enrichment"].get("files").is_none());
+        assert!(
+            validate_semantic_graph_status_result(&ToolCallResult::text(payload.to_string()))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn graph_status_rejects_a_durable_status_body() {
         let result = ToolCallResult::text(
@@ -4259,6 +5277,7 @@ mod tests {
             std::path::PathBuf::from("/usr/bin/kin-daemon"),
             std::path::PathBuf::from("/repo"),
             None,
+            None,
         );
         let cmd = plan.command();
         let args: Vec<String> = cmd
@@ -4289,6 +5308,7 @@ mod tests {
             std::path::PathBuf::from("/usr/bin/kin-daemon"),
             std::path::PathBuf::from("/repo"),
             None,
+            None,
         );
         let carried = plan.command().get_envs().any(|(key, value)| {
             key == "KIN_DAEMON_AUTO_EMBED"
@@ -4306,6 +5326,7 @@ mod tests {
         let plan = mcp_spawn_plan(
             std::path::PathBuf::from("/usr/bin/kin-daemon"),
             std::path::PathBuf::from("/repo"),
+            None,
             None,
         );
         assert!(
@@ -4334,6 +5355,7 @@ mod tests {
         let plan = mcp_spawn_plan(
             std::path::PathBuf::from("/usr/bin/kin-daemon"),
             std::path::PathBuf::from("/repo"),
+            None,
             Some("http://127.0.0.1:9100".to_string()),
         );
         let cmd = plan.command();
@@ -5008,6 +6030,30 @@ mod tests {
     }
 
     #[test]
+    fn delegate_stage_accepts_ticket_shape_and_keeps_mixed_operation_checks() {
+        let entity = "600c6388-0170-48cc-bde5-2bc591e4e8aa";
+        let ticket = format!("sb1.{entity}.3.{}", "d".repeat(32));
+        let operation = serde_json::json!({"verb":"update","target":entity,
+            "body":"def updated(): pass", "description":"replace entity",
+            "payload":{"EntitySourceBase":{"ticket":ticket}}});
+        let mut args = HashMap::from([("operations".into(), serde_json::json!([operation]))]);
+        let before = args.clone();
+        assert!(validate_stage_arguments(&args).is_ok());
+        assert_eq!(args, before, "forward the original ticket bytes");
+        args.get_mut("operations")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(stage_op("modify", Some(stage_relation()))).unwrap());
+        assert!(validate_stage_arguments(&args)
+            .unwrap_err()
+            .contains("not committable for relation payloads"));
+        args = before;
+        args.get_mut("operations").unwrap()[0]["body"] = serde_json::Value::Null;
+        assert!(validate_stage_arguments(&args).is_err());
+    }
+
+    #[test]
     fn delegate_stage_missing_operations_defers_to_daemon() {
         // No `operations` key => stage validation is a no-op so the daemon's
         // authoritative missing-parameter message stays the one the agent sees.
@@ -5187,6 +6233,7 @@ mod tests {
         working_dir: std::path::PathBuf,
         repository: std::sync::Mutex<Option<std::path::PathBuf>>,
         route: std::sync::Mutex<Option<String>>,
+        reading: std::sync::Mutex<Option<kin_daemon_spawn::RunningDaemonRouteReading>>,
         route_probes: std::sync::atomic::AtomicUsize,
         repository_probes: std::sync::atomic::AtomicUsize,
         /// How long `running_route` takes to answer, for the probe-budget case.
@@ -5199,6 +6246,7 @@ mod tests {
                 working_dir: std::path::PathBuf::from("/work/express"),
                 repository: std::sync::Mutex::new(None),
                 route: std::sync::Mutex::new(None),
+                reading: std::sync::Mutex::new(None),
                 route_probes: std::sync::atomic::AtomicUsize::new(0),
                 repository_probes: std::sync::atomic::AtomicUsize::new(0),
                 route_delay: Duration::ZERO,
@@ -5242,13 +6290,112 @@ mod tests {
             self.repository.lock().unwrap().clone()
         }
 
-        async fn running_route(&self, _kin_root: &Path) -> Option<String> {
+        async fn running_route(
+            &self,
+            _kin_root: &Path,
+            _budget: Duration,
+        ) -> kin_daemon_spawn::RunningDaemonRouteReading {
             self.route_probes
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if !self.route_delay.is_zero() {
                 tokio::time::sleep(self.route_delay).await;
             }
-            self.route.lock().unwrap().clone()
+            if let Some(reading) = self.reading.lock().unwrap().clone() {
+                return reading;
+            }
+            match self.route.lock().unwrap().clone() {
+                Some(url) => kin_daemon_spawn::RunningDaemonRouteReading::Serving(url),
+                None => kin_daemon_spawn::RunningDaemonRouteReading::Absent,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typed_route_readings_preserve_warming_uncertainty_and_serving() {
+        use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+        let probe = ScriptedProbe::repository_without_daemon();
+        for (reading, expected) in [
+            (
+                Reading::NotReady {
+                    detail: "opening synthetic authority".to_string(),
+                    warming: true,
+                },
+                "warming",
+            ),
+            (
+                Reading::NotReady {
+                    detail: "readiness unanswered".to_string(),
+                    warming: false,
+                },
+                "not-ready",
+            ),
+            (
+                Reading::Unresolved {
+                    detail: "probe unavailable".to_string(),
+                },
+                "unresolved",
+            ),
+            (
+                Reading::Serving("http://127.0.0.1:51000".to_string()),
+                "serving",
+            ),
+        ] {
+            *probe.reading.lock().unwrap() = Some(reading);
+            let result = resolve_delegate_within(
+                &probe,
+                &fresh_gate(),
+                RERESOLVE_PROBE_BUDGET,
+                DelegateHistory::default(),
+            )
+            .await;
+            match (expected, result) {
+                (
+                    "warming",
+                    DelegateResolution::Gap(DelegateGap::DaemonNotReady { warming: true, .. }),
+                ) => {}
+                (
+                    "not-ready",
+                    DelegateResolution::Gap(DelegateGap::DaemonNotReady { warming: false, .. }),
+                ) => {}
+                ("unresolved", DelegateResolution::Gap(DelegateGap::ProbeUnresolved { .. })) => {}
+                ("serving", DelegateResolution::Resolved(url)) => {
+                    assert_eq!(url, "http://127.0.0.1:51000")
+                }
+                (_, result) => panic!("{expected} was collapsed into {result:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn readiness_and_unresolved_messages_do_not_claim_absence_or_reinitialization() {
+        use crate::first_contact::Spelling;
+        let repo = std::path::PathBuf::from("/work/synthetic");
+        let gaps = [
+            DelegateGap::DaemonNotReady {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(1),
+                detail: "opening authority".to_string(),
+                warming: true,
+            },
+            DelegateGap::ProbeUnresolved {
+                repo,
+                retry_in: Duration::from_secs(1),
+                detail: "deadline".to_string(),
+            },
+        ];
+        for gap in gaps {
+            let text = gap.message_spelled("semantic_locate", Spelling::Kin);
+            assert!(text.contains("does not establish daemon absence"), "{text}");
+            assert!(
+                !text.contains("kin_init")
+                    && !text.contains("`kin status`")
+                    && !text.contains("kin init ."),
+                "{text}"
+            );
+            assert_eq!(
+                envelope_for_gap(&gap).degraded.daemon_unreachable,
+                Some(true)
+            );
         }
     }
 
@@ -5401,8 +6548,11 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(outcome, DelegateResolution::Gap(_)),
-            "an abandoned probe resolves nothing: {outcome:?}"
+            matches!(
+                outcome,
+                DelegateResolution::Gap(DelegateGap::ProbeUnresolved { .. })
+            ),
+            "an abandoned probe is unresolved, not evidence of absence: {outcome:?}"
         );
         assert!(
             began.elapsed() < Duration::from_secs(4),
@@ -5512,10 +6662,16 @@ mod tests {
     #[tokio::test]
     async fn the_production_probe_reports_no_route_rather_than_starting_a_daemon() {
         let route = RealDelegateProbe
-            .running_route(Path::new("/nonexistent/repository/.kin"))
+            .running_route(
+                Path::new("/nonexistent/repository/.kin"),
+                RERESOLVE_PROBE_BUDGET,
+            )
             .await;
         assert!(
-            route.is_none(),
+            matches!(
+                route,
+                kin_daemon_spawn::RunningDaemonRouteReading::Unresolved { .. }
+            ),
             "with no route seam installed the probe must answer that it has none: {route:?}"
         );
     }
@@ -5523,7 +6679,7 @@ mod tests {
     // ── The three situations one string used to cover ─────────────────────
 
     fn gap_text(gap: &DelegateGap) -> String {
-        gap.message("semantic_locate", false)
+        gap.message("semantic_locate")
     }
 
     /// A reader with no `kin` on PATH, which is every registry install, is
@@ -5548,41 +6704,37 @@ mod tests {
             },
         ];
         let npx = format!("`npx -y @kinlab/kin@{} ", env!("CARGO_PKG_VERSION"));
-        for init_served in [true, false] {
-            for gap in &gaps {
-                let text = gap.message_spelled("semantic_locate", Spelling::Npx, init_served);
-                assert!(text.contains(&npx), "{text}");
-                assert!(
-                    !text.contains("`kin init") && !text.contains("`kin status"),
-                    "{text}"
-                );
-                assert_eq!(
-                    text.contains("kin_init"),
-                    init_served && !matches!(gap, DelegateGap::DaemonNotRunning { .. }),
-                    "{text}"
-                );
-            }
+        for gap in &gaps {
+            let text = gap.message_spelled("semantic_locate", Spelling::Npx);
+            assert!(text.contains(&npx), "{text}");
+            assert!(
+                !text.contains("`kin init") && !text.contains("`kin status"),
+                "{text}"
+            );
+            assert!(!text.contains("kin_init"), "{text}");
         }
-        let no_repository = gaps[0].message_spelled("semantic_locate", Spelling::Npx, true);
-        assert!(no_repository.contains("call kin_init"), "{no_repository}");
+        let no_repository = gaps[0].message_spelled("semantic_locate", Spelling::Npx);
         assert!(no_repository.contains("init .`"), "{no_repository}");
-        let read_only = gaps[0].message_spelled("semantic_locate", Spelling::Npx, false);
         assert!(
-            read_only.contains("run `npx -y @kinlab/kin@"),
-            "{read_only}"
+            no_repository.contains("run `npx -y @kinlab/kin@"),
+            "{no_repository}"
         );
-        let spelled_kin = gaps[0].message_spelled("semantic_locate", Spelling::Kin, false);
+        let spelled_kin = gaps[0].message_spelled("semantic_locate", Spelling::Kin);
         assert!(spelled_kin.contains("`kin init .`"), "{spelled_kin}");
     }
 
     #[test]
-    fn the_no_repository_message_names_the_path_and_a_caller_action() {
+    fn the_no_repository_message_names_what_is_wrong_and_a_caller_action() {
         let text = gap_text(&DelegateGap::NoRepository {
             working_dir: std::path::PathBuf::from("/work/express"),
         });
         assert!(
-            text.contains("/work/express") && text.contains("is not a Kin repository"),
-            "the message must name the path and what is wrong with it: {text}"
+            text.contains("not running inside a Kin repository"),
+            "the message must say what is wrong: {text}"
+        );
+        assert!(
+            !text.contains("/work/express"),
+            "the path is an operator coordinate, logged rather than sent: {text}"
         );
         assert!(
             text.contains("kin init ."),
@@ -5592,6 +6744,152 @@ mod tests {
             text.contains("do not need to restart"),
             "an agent cannot restart its own MCP server, so the message must not ask it to: {text}"
         );
+    }
+
+    /// Every gap's refusal reaches an agent whole. Each one used to name the
+    /// repository's path, and the semantic surface withholds any message that
+    /// carries a coordinate, so the agent read a withheld note in place of the
+    /// refusal, `KIN_NO_DAEMON` and the remedy included. A probe's detail is
+    /// carried only when it is semantic itself; one that quotes an endpoint or
+    /// a transport error is left to the operator log.
+    #[test]
+    fn every_gap_refusal_reaches_an_agent_whole_without_its_path() {
+        use crate::first_contact::Spelling;
+        let repo = std::path::PathBuf::from("/srv/repos/express");
+        let endpoint_error = "error sending request for url (http://127.0.0.1:51000/health)";
+        let gaps = [
+            DelegateGap::NoRepository {
+                working_dir: repo.clone(),
+            },
+            DelegateGap::DaemonNotRunning {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(4),
+            },
+            DelegateGap::DaemonNotReady {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(4),
+                detail: "opening authority".into(),
+                warming: true,
+            },
+            DelegateGap::DaemonNotReady {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(4),
+                detail: endpoint_error.into(),
+                warming: false,
+            },
+            DelegateGap::ProbeUnresolved {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(4),
+                detail: "the route probe exceeded its bounded deadline".into(),
+            },
+            DelegateGap::ProbeUnresolved {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(4),
+                detail: endpoint_error.into(),
+            },
+            DelegateGap::StartupPredatesRepository {
+                repo: repo.clone(),
+                retry_in: Duration::from_secs(4),
+            },
+        ];
+        for spelling in [Spelling::Kin, Spelling::Npx] {
+            for gap in &gaps {
+                let text = gap.message_spelled("find_references", spelling);
+                assert_eq!(
+                    crate::semantic_surface::diagnostic(&text),
+                    text,
+                    "the semantic surface withholds this refusal: {gap:?}"
+                );
+                assert!(
+                    text.starts_with("kin-mcp cannot answer 'find_references': "),
+                    "{text}"
+                );
+                assert!(!text.contains("/srv/repos"), "{text}");
+                assert!(!text.contains("127.0.0.1"), "{text}");
+                match gap {
+                    DelegateGap::DaemonNotReady { detail, .. }
+                    | DelegateGap::ProbeUnresolved { detail, .. } => {
+                        assert_eq!(
+                            text.contains(detail.as_str()),
+                            detail != endpoint_error,
+                            "a semantic detail is carried and an endpoint is not: {text}"
+                        );
+                        if detail == endpoint_error {
+                            assert!(text.contains("kin-mcp log"), "{text}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// What the agent no longer reads, the operator still can: the path the
+    /// gap was observed at and the probe's own detail go to the log at warn
+    /// level whenever a gap is turned into a refusal.
+    #[test]
+    fn a_gap_logs_its_path_and_detail_for_the_operator() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = CapturedEvents(std::sync::Arc::clone(&events));
+        let endpoint_error = "error sending request for url (http://127.0.0.1:51000/health)";
+        let text = tracing::subscriber::with_default(capture, || {
+            DelegateGap::ProbeUnresolved {
+                repo: std::path::PathBuf::from("/srv/repos/express"),
+                retry_in: Duration::from_secs(4),
+                detail: endpoint_error.into(),
+            }
+            .message("find_references")
+        });
+        assert!(!text.contains("/srv/repos"), "{text}");
+        let events = events.lock().unwrap();
+        let warned: Vec<&String> = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, fields)| fields)
+            .collect();
+        assert!(
+            warned
+                .iter()
+                .any(|fields| fields.contains("/srv/repos/express")
+                    && fields.contains(endpoint_error)
+                    && fields.contains("find_references")),
+            "the operator log must carry the path and the detail: {events:?}"
+        );
+    }
+
+    /// A subscriber that records each event's level and fields, so a test can
+    /// read what reached the operator log without a logging dependency.
+    struct CapturedEvents(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), fields.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     /// A working directory that is no repository goes out as that, not as a
@@ -5658,13 +6956,13 @@ mod tests {
             retry_in: Duration::from_secs(4),
         });
         assert!(
-            text.contains("/work/express") && text.contains("no daemon is serving it"),
+            text.contains("this is a Kin repository") && text.contains("no ready daemon"),
             "the message must separate a present repository from an absent daemon: {text}"
         );
+        assert!(!text.contains("/work/express"), "{text}");
         assert!(
-            text.contains("kin doctor"),
-            "the message must name the probe it shares with doctor, which is why the two cannot \
-             disagree: {text}"
+            text.contains("kin graph status") && text.contains("KIN_NO_DAEMON unset"),
+            "the recovery command must actually allow daemon startup: {text}"
         );
         assert!(
             text.contains("at most 4s"),
@@ -5683,9 +6981,10 @@ mod tests {
             retry_in: Duration::from_secs(8),
         });
         assert!(
-            text.contains("started before /work/express was a Kin repository"),
+            text.contains("started before its repository was a Kin repository"),
             "the message must name the ordering that caused this: {text}"
         );
+        assert!(!text.contains("/work/express"), "{text}");
         assert!(
             text.contains("not one-shot") && text.contains("at most 8s"),
             "the message must say the binding is retried and when: {text}"
@@ -5760,7 +7059,7 @@ mod tests {
         let retry_in = match gap {
             DelegateGap::DaemonNotRunning { retry_in, .. }
             | DelegateGap::StartupPredatesRepository { retry_in, .. } => retry_in,
-            DelegateGap::NoRepository { .. } => panic!("the fixture has a repository"),
+            _ => panic!("the fixture explicitly establishes daemon absence"),
         };
         assert!(
             retry_in <= RERESOLVE_MIN_BACKOFF / 2 && !retry_in.is_zero(),
@@ -6295,8 +7594,10 @@ mod tests {
     }
 
     /// The positive control for every message below. A store that has never
-    /// lost a daemon must read exactly as it read before any of this existed,
-    /// so the expected strings here are the literal pre-change text.
+    /// lost a daemon must read exactly as the base text reads, so the expected
+    /// strings here are that literal text. It names no endpoint and no raw
+    /// transport error: those are operator coordinates, logged instead, because
+    /// the semantic surface withholds any message that carries one.
     #[test]
     fn a_store_with_no_kill_record_reads_exactly_as_it_did() {
         assert_eq!(
@@ -6307,10 +7608,9 @@ mod tests {
                 "MCP revival: daemon exited during startup with status signal: 9 (SIGKILL)",
                 None,
             ),
-            "repo daemon exited; restart required: tool find_references: daemon at \
-             http://127.0.0.1:32881 is not responding (error sending request); revival failed: \
-             MCP revival: daemon exited during startup with status signal: 9 (SIGKILL). Restart \
-             `kin mcp start` to recover."
+            "repo daemon exited; restart required: tool find_references: the repository daemon \
+             is not responding; revival failed: MCP revival: daemon exited during startup with \
+             status signal: 9 (SIGKILL). Restart `kin mcp start` to recover."
         );
         assert_eq!(
             revived_retry_failed_message(
@@ -6319,9 +7619,8 @@ mod tests {
                 "timed out",
                 None,
             ),
-            "repo daemon exited; restart required: tool find_references: daemon was revived at \
-             http://127.0.0.1:34507 but the retry still failed: timed out. Check `kin daemon \
-             status`."
+            "repo daemon exited; restart required: tool find_references: a replacement daemon \
+             started but the retry still failed: timed out. Check `kin daemon status`."
         );
         assert_eq!(
             transport_dropped_message(

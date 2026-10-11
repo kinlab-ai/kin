@@ -25,10 +25,11 @@ take their types from here instead of redefining them.
 
 ## What is Kin?
 
-Kin is a graph-native code repository for people and AI agents: your code as a graph of
-entities, relations, and intents, not a pile of files and diffs. AI agents and humans
-navigate it semantically, with provenance, review, and governance built in. It coexists
-with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with them:
+your code as a graph of entities, relations, and intents, not a pile of files and diffs.
+AI agents and humans navigate it semantically, with provenance, review, and governance
+built in. It coexists with Git and projects graph truth back to a normal filesystem, so
+any tool works unchanged.
 
 Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 

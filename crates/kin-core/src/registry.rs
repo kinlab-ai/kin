@@ -190,6 +190,10 @@ pub struct RegisteredRepo {
     /// correct zero, and this can.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies_recorded_by: Option<String>,
+    /// Last successful refresh of held manifests; source heuristics retain
+    /// their admission-time provenance in `last_commit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies_manifest_recorded_at: Option<String>,
 }
 
 /// The Kin version a registration written now records against its entry.
@@ -307,8 +311,8 @@ impl KinRegistry {
 
     /// Register or update a repo entry.
     ///
-    /// Automatically detects cross-repo dependencies from manifest files
-    /// (`Cargo.toml`, `package.json`, `go.mod`) located at `path`.
+    /// This location-only form leaves dependencies unrecorded. Admission uses
+    /// `upsert_with_held_content` to supply graph-held dependency content.
     ///
     /// If `remote_repo_ids` is provided, dependency detection also matches
     /// against repos known to the remote spine (KinLab). This enables
@@ -325,6 +329,19 @@ impl KinRegistry {
         entities: usize,
         remote_repo_ids: &[String],
     ) {
+        self.upsert_with_held_content(id, path, entities, remote_repo_ids, None);
+    }
+
+    /// Register held dependency content supplied by admission. Without a view,
+    /// registration is explicitly unrecorded, never filled from the working tree.
+    pub fn upsert_with_held_content(
+        &mut self,
+        id: String,
+        path: PathBuf,
+        entities: usize,
+        remote_repo_ids: &[String],
+        content: Option<&crate::dependencies::HeldContent>,
+    ) {
         let now = chrono::Utc::now().to_rfc3339();
         // Combine local + remote repo IDs for dependency detection.
         let mut all_ids: Vec<String> = self.repos.iter().map(|r| r.id.clone()).collect();
@@ -333,13 +350,34 @@ impl KinRegistry {
                 all_ids.push(remote_id.clone());
             }
         }
-        let deps = crate::dependencies::detect_dependencies_with_registry(&path, &all_ids);
-        if let Some(existing) = self.repos.iter_mut().find(|r| r.id == id) {
+        let deps = content
+            .map(|held| crate::dependencies::detect_dependencies_with_registry(held, &all_ids))
+            .unwrap_or_default();
+        let recorded_by = content.map(|_| dependency_recording_build());
+        let manifest_recorded_at = content.map(|_| now.clone());
+        // A row is a location of a repository, and one repository can have
+        // more than one: a store copied or adopted into another checkout
+        // keeps its repository identity. So the row to update is the one at
+        // this location, or else a row of this repository whose location no
+        // longer holds it, which is a store that moved. A row at a location
+        // that still holds this repository is another live location, and it
+        // is kept rather than overwritten.
+        let index = self
+            .repos
+            .iter()
+            .position(|row| row.id == id && same_location(&row.path, &path))
+            .or_else(|| {
+                self.repos
+                    .iter()
+                    .position(|row| row.id == id && !location_holds(&row.path, &id))
+            });
+        if let Some(existing) = index.map(|index| &mut self.repos[index]) {
             existing.path = path;
             existing.entities = entities;
             existing.last_commit = now;
             existing.dependencies = deps;
-            existing.dependencies_recorded_by = Some(dependency_recording_build());
+            existing.dependencies_recorded_by = recorded_by;
+            existing.dependencies_manifest_recorded_at = manifest_recorded_at;
         } else {
             self.repos.push(RegisteredRepo {
                 id,
@@ -347,9 +385,18 @@ impl KinRegistry {
                 entities,
                 last_commit: now,
                 dependencies: deps,
-                dependencies_recorded_by: Some(dependency_recording_build()),
+                dependencies_recorded_by: recorded_by,
+                dependencies_manifest_recorded_at: manifest_recorded_at,
             });
         }
+    }
+
+    /// Every row naming `id`, in registration order.
+    ///
+    /// More than one row names a repository with more than one location; the
+    /// first is the one a reader that needs a single location selects.
+    pub fn locations_of<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a RegisteredRepo> {
+        self.repos.iter().filter(move |row| row.id == id)
     }
 
     /// Resolve the remote spine URL from config, if any.
@@ -404,16 +451,38 @@ impl KinRegistry {
         crate::dependencies::dependency_graph(&self.repos)
     }
 
-    /// Remove entries whose paths no longer contain a `.kin/` directory.
+    /// Remove entries whose working trees no longer have a store, in the tree
+    /// or kept outside it.
     pub fn clean(&mut self) -> usize {
         let before = self.repos.len();
-        self.repos.retain(|r| r.path.join(".kin").exists());
+        self.repos
+            .retain(|r| crate::layout::store_exists_for(&r.path));
         before - self.repos.len()
     }
 
     /// Get all registered repo paths.
     pub fn repo_paths(&self) -> Vec<&Path> {
         self.repos.iter().map(|r| r.path.as_path()).collect()
+    }
+}
+
+/// Whether two registry paths name one location.
+fn same_location(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// Whether the store at `path` still publishes the repository identity `id`.
+///
+/// A location with no readable manifest holds no repository, so its row is
+/// the one a moved store's registration updates.
+fn location_holds(path: &Path, id: &str) -> bool {
+    match published_repository_identity(path) {
+        Some(published) => published == id,
+        None => false,
     }
 }
 
@@ -524,17 +593,30 @@ impl RegistryAuthorityReport {
     }
 }
 
-/// Explicitly repair mode bits on structurally safe registry-authority files.
+/// One permission-only change made by [`repair_registry_authority_permissions_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryPermissionRepair {
+    pub path: PathBuf,
+    /// The permission bits the path holds after the repair: 0600 for an
+    /// authority file, or the registry directory's own mode without its group
+    /// and world write bits.
+    pub mode: u32,
+}
+
+/// Explicitly repair mode bits on structurally safe registry authority.
 ///
+/// The registry directory loses group and world write access when it is a
+/// real, current-user-owned directory, and authority files are set to 0600.
 /// This never reads or replaces contents and refuses symlinks, non-regular
 /// files, wrong ownership, hard links, unsafe parents, and path collisions.
-pub fn repair_registry_authority_permissions() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+pub fn repair_registry_authority_permissions(
+) -> Result<Vec<RegistryPermissionRepair>, Box<dyn std::error::Error>> {
     repair_registry_authority_permissions_at(&registry_path())
 }
 
 pub fn repair_registry_authority_permissions_at(
     path: &Path,
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+) -> Result<Vec<RegistryPermissionRepair>, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
         repair_registry_authority_permissions_at_unix(path)
@@ -659,7 +741,7 @@ impl RegistryAnchor {
                 "registry path collides with its reserved .lock or .tmp authority path",
             ));
         }
-        validate_parent(&parent)?;
+        validate_parent(&parent, &normalized_parent(path))?;
 
         Ok(Self {
             parent,
@@ -790,7 +872,7 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<File> {
 
     let canonical_ancestor = ancestor.canonicalize()?;
     let mut current = File::open(&canonical_ancestor)?;
-    validate_parent(&current).map_err(|err| {
+    validate_parent(&current, &canonical_ancestor).map_err(|err| {
         std::io::Error::new(
             err.kind(),
             format!(
@@ -800,7 +882,9 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<File> {
         )
     })?;
 
+    let mut current_path = canonical_ancestor;
     for name in missing.into_iter().rev() {
+        current_path.push(&name);
         let name_c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -839,7 +923,7 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<File> {
         }
 
         let next = open_directory_after_create_race(&current, &name_c)?;
-        validate_parent(&next)?;
+        validate_parent(&next, &current_path)?;
         if created && stat_file(&next)?.st_mode & 0o7777 != 0o700 {
             return Err(registry_security_error(
                 "new registry directory did not reach mode 0700",
@@ -924,6 +1008,28 @@ fn inspect_registry_authority_at_unix(path: &Path) -> RegistryAuthorityReport {
             return absent_authority_report(path);
         }
         Err(err) => {
+            // A directory the user owns whose only fault is group or world
+            // write is permission drift, which `--fix` may repair with consent.
+            // A umask of 0002, the default wherever USERGROUPS_ENAB is set,
+            // leaves exactly this behind. Anything else stays unsafe.
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                let parent_path = normalized_parent(path);
+                if let Some((_, mode)) = open_shared_write_parent(&parent_path) {
+                    return RegistryAuthorityReport {
+                        checks: vec![authority_check(
+                            "registry directory",
+                            parent_path.clone(),
+                            RegistryAuthorityState::RepairablePermissions,
+                            format!(
+                                "mode {mode:04o}; group or world writable, so the registry inside it \
+                                 cannot be trusted. Contents were not read. Run `kin doctor --fix` \
+                                 or `{}` to authorize repair",
+                                remove_shared_write_command(&parent_path)
+                            ),
+                        )],
+                    };
+                }
+            }
             return RegistryAuthorityReport {
                 checks: vec![authority_check(
                     "registry authority",
@@ -1012,11 +1118,17 @@ fn inspect_named_authority(
 #[cfg(unix)]
 fn repair_registry_authority_permissions_at_unix(
     path: &Path,
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+) -> Result<Vec<RegistryPermissionRepair>, Box<dyn std::error::Error>> {
+    let mut repaired = Vec::new();
+    // The directory comes first: until it loses group and world write it
+    // cannot anchor the process lock, so no file below it can be judged.
+    if let Some(repair) = repair_shared_write_parent(&normalized_parent(path))? {
+        repaired.push(repair);
+    }
     let _process_guard = lock_registry_process(path)?;
     let anchor = match RegistryAnchor::open(path) {
         Ok(anchor) => anchor,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(repaired),
         Err(err) => return Err(Box::new(err)),
     };
     let report = inspect_registry_authority_at_unix(path);
@@ -1052,15 +1164,119 @@ fn repair_registry_authority_permissions_at_unix(
         opened.push((name.to_os_string(), label, candidate_path, file, identity));
     }
 
-    let mut repaired = Vec::new();
     for (name, label, candidate_path, file, identity) in opened {
         if stat_file(&file)?.st_mode & 0o7777 != 0o600 {
             set_private_mode(&file)?;
             verify_named_identity(&anchor, &name, identity, label)?;
-            repaired.push(candidate_path);
+            repaired.push(RegistryPermissionRepair {
+                path: candidate_path,
+                mode: 0o600,
+            });
         }
     }
     Ok(repaired)
+}
+
+/// Open the registry directory when it is a real directory the current user
+/// owns and its one fault is group or world write, returning its mode bits.
+///
+/// Anything else, including a symlink at the final component, a foreign
+/// owner or a missing directory, returns `None` and is left to the anchor's
+/// own refusal.
+#[cfg(unix)]
+fn open_shared_write_parent(parent_path: &Path) -> Option<(File, u32)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent_c = std::ffi::CString::new(parent_path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `parent_c` is NUL-terminated and remains alive for the call.
+    let fd = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was returned by `open` and ownership transfers to `File`.
+    let parent = unsafe { File::from_raw_fd(fd) };
+    let stat = stat_file(&parent).ok()?;
+    let mode = stat.st_mode & 0o7777;
+    // SAFETY: `geteuid` has no preconditions.
+    let owned = stat.st_uid == unsafe { libc::geteuid() };
+    if (stat.st_mode & libc::S_IFMT) == libc::S_IFDIR && owned && mode & 0o022 != 0 {
+        Some((parent, u32::from(mode)))
+    } else {
+        None
+    }
+}
+
+/// Remove group and world write from the registry directory, with consent.
+///
+/// The change is made through the opened descriptor, so a directory swapped
+/// in after the check is never the one changed. It only ever removes bits,
+/// and every file below the directory is still judged by the ordinary rules
+/// once it can anchor the lock.
+#[cfg(unix)]
+fn repair_shared_write_parent(
+    parent_path: &Path,
+) -> std::io::Result<Option<RegistryPermissionRepair>> {
+    use std::os::fd::AsRawFd;
+
+    let Some((parent, mode)) = open_shared_write_parent(parent_path) else {
+        return Ok(None);
+    };
+    let repaired = mode & !0o022;
+    // SAFETY: the descriptor is valid and the mode has no invalid bits.
+    if unsafe { libc::fchmod(parent.as_raw_fd(), repaired as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if stat_file(&parent)?.st_mode & 0o022 != 0 {
+        return Err(registry_security_error(format!(
+            "registry directory {} kept group or world write after repair",
+            parent_path.display()
+        )));
+    }
+    Ok(Some(RegistryPermissionRepair {
+        path: parent_path.to_path_buf(),
+        mode: repaired,
+    }))
+}
+
+/// The mode bits of `path` when it is a real directory the current user owns
+/// and its one fault is group or world write, the state a 0002 umask leaves.
+/// `None` for anything else, and always off Unix.
+pub fn shared_write_directory_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        open_shared_write_parent(path).map(|(_, mode)| mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The command that removes group and world write from `path`, quoted so a
+/// person can paste it into a terminal.
+pub fn remove_shared_write_command(path: &Path) -> String {
+    format!("chmod go-w {}", shell_word(path))
+}
+
+/// `path` as one shell word, quoted only when it needs to be.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+,:@%=".contains(&byte));
+    if plain {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 #[cfg(unix)]
@@ -1096,6 +1312,14 @@ fn initialize_registry_authority_at_unix(
 
 #[cfg(unix)]
 fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>> {
+    load_private_toml_unix(path)
+}
+
+#[cfg(unix)]
+fn load_private_toml_unix<S>(path: &Path) -> Result<S, Box<dyn std::error::Error>>
+where
+    S: serde::de::DeserializeOwned + Default,
+{
     let _process_guard = lock_registry_process(path)?;
     // Reject the complete authority snapshot before a missing lock can be
     // created. Descriptor-anchored checks below then revalidate under lock.
@@ -1103,7 +1327,7 @@ fn load_from_unix(path: &Path) -> Result<KinRegistry, Box<dyn std::error::Error>
     let anchor = match RegistryAnchor::open(path) {
         Ok(anchor) => anchor,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(KinRegistry::default());
+            return Ok(S::default());
         }
         Err(err) => return Err(Box::new(err)),
     };
@@ -1131,6 +1355,17 @@ fn update_at_unix<T>(
     path: &Path,
     mutate: impl FnOnce(&mut KinRegistry) -> T,
 ) -> Result<T, Box<dyn std::error::Error>> {
+    update_private_toml_unix(path, mutate)
+}
+
+#[cfg(unix)]
+fn update_private_toml_unix<S, T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut S) -> T,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    S: Serialize + serde::de::DeserializeOwned + Default,
+{
     let _process_guard = lock_registry_process(path)?;
     require_registry_authority_secure_at(path)?;
     let anchor = prepare_anchor(path)?;
@@ -1165,10 +1400,13 @@ fn update_at_unix<T>(
 }
 
 #[cfg(unix)]
-fn read_registry_at(anchor: &RegistryAnchor) -> Result<KinRegistry, Box<dyn std::error::Error>> {
+fn read_registry_at<S>(anchor: &RegistryAnchor) -> Result<S, Box<dyn std::error::Error>>
+where
+    S: serde::de::DeserializeOwned + Default,
+{
     let Some(mut file) = open_existing_regular_at(anchor, &anchor.registry_name, "registry file")?
     else {
-        return Ok(KinRegistry::default());
+        return Ok(S::default());
     };
     let identity = validate_regular_file(&file, "registry file")?;
     let mut content = String::new();
@@ -1311,23 +1549,28 @@ fn name_cstring(name: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
 }
 
 #[cfg(unix)]
-fn validate_parent(parent: &File) -> std::io::Result<()> {
+fn validate_parent(parent: &File, parent_path: &Path) -> std::io::Result<()> {
     let stat = stat_file(parent)?;
     if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-        return Err(registry_security_error(
-            "registry parent must be a directory",
-        ));
+        return Err(registry_security_error(format!(
+            "registry parent {} must be a directory",
+            parent_path.display()
+        )));
     }
     // SAFETY: `geteuid` has no preconditions.
     if stat.st_uid != unsafe { libc::geteuid() } {
-        return Err(registry_security_error(
-            "registry parent must be owned by the current user",
-        ));
+        return Err(registry_security_error(format!(
+            "registry parent {} must be owned by the current user",
+            parent_path.display()
+        )));
     }
     if stat.st_mode & 0o022 != 0 {
         return Err(registry_security_error(format!(
-            "registry parent must not be group/world writable (found mode {:04o})",
-            stat.st_mode & 0o7777
+            "registry parent {} must not be group/world writable (found mode {:04o}). \
+             Remove that access with `{}`, then retry",
+            parent_path.display(),
+            stat.st_mode & 0o7777,
+            remove_shared_write_command(parent_path)
         )));
     }
     Ok(())
@@ -1506,7 +1749,7 @@ fn write_registry_atomically_at(
             "registry transaction temp file",
         )?;
         file.write_all(contents)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
 
         #[cfg(test)]
         if std::env::var_os("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC").is_some() {
@@ -1536,7 +1779,7 @@ fn write_registry_atomically_at(
             return Err(Box::new(std::io::Error::last_os_error()));
         }
         verify_named_identity(anchor, &anchor.registry_name, identity, "registry file")?;
-        anchor.parent.sync_all()?;
+        kin_blobs::durable::sync_all(&anchor.parent)?;
         Ok(())
     })();
 
@@ -1629,9 +1872,70 @@ fn write_registry_atomically(
 /// directory name, because a row that names the path badly is better than no row
 /// at all; the daemon does not, because it has already opened the manifest by
 /// the time it needs this.
+/// Read a private TOML file kept beside the registry, under the registry's own
+/// ownership, mode and lock checks. An absent file reads as the default.
+///
+/// For store-level state that must hold the registry's guarantees without
+/// being a registry row, such as [`crate::prepared_store`]'s catalog.
+pub fn load_private_toml<S>(path: &Path) -> Result<S, Box<dyn std::error::Error>>
+where
+    S: serde::de::DeserializeOwned + Default,
+{
+    #[cfg(unix)]
+    {
+        load_private_toml_unix(path)
+    }
+    #[cfg(not(unix))]
+    {
+        if !path.exists() {
+            return Ok(S::default());
+        }
+        let lock_path = path.with_extension("lock");
+        let lock_file = open_private_lock_file(&lock_path)?;
+        lock_file.lock_shared()?;
+        Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+    }
+}
+
+/// Update a private TOML file kept beside the registry under one exclusive
+/// read-modify-write lock, published atomically with the registry's
+/// discipline.
+pub fn update_private_toml<S, T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut S) -> T,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    S: Serialize + serde::de::DeserializeOwned + Default,
+{
+    #[cfg(unix)]
+    {
+        update_private_toml_unix(path, mutate)
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_path = path.with_extension("lock");
+        let lock_file = open_private_lock_file(&lock_path)?;
+        lock_file.lock_exclusive()?;
+        let mut value: S = if path.exists() {
+            toml::from_str(&std::fs::read_to_string(path)?)?
+        } else {
+            S::default()
+        };
+        let result = mutate(&mut value);
+        write_registry_atomically(path, toml::to_string_pretty(&value)?.as_bytes())?;
+        Ok(result)
+    }
+}
+
 pub fn published_repository_identity(repo_root: &Path) -> Option<String> {
-    let manifest =
-        crate::manifest::KinManifest::load(&repo_root.join(".kin/manifest.json")).ok()?;
+    let store = crate::layout::locate_store(repo_root)?;
+    let manifest = crate::manifest::KinManifest::load(&store.manifest_path()).ok()?;
     Some(manifest.repo_id).filter(|repo_id| !repo_id.trim().is_empty())
 }
 
@@ -1712,6 +2016,32 @@ pub fn managed_kin_home() -> PathBuf {
         || directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
         || directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
     )
+}
+
+/// Create a directory Kin keeps its own state in, and every missing ancestor,
+/// at mode 0755 on Unix.
+///
+/// `create_dir_all` asks for 0777 and leaves the rest to the process umask.
+/// Under the 0002 umask that distributions with `USERGROUPS_ENAB` give every
+/// login, that makes `~/.kin` group writable, and the registry then refuses
+/// the directory it lives in. Asking for 0755 means no umask can add group or
+/// world write, while a stricter umask still narrows it. A directory that
+/// already exists keeps its mode: tightening one is a repair, and repairs
+/// wait for consent (`kin doctor --fix`).
+pub fn create_kin_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 /// The policy behind [`managed_kin_home`], with the platform, the environment,
@@ -2088,6 +2418,7 @@ mod tests {
                             last_commit: "now".to_string(),
                             dependencies: Vec::new(),
                             dependencies_recorded_by: None,
+                            dependencies_manifest_recorded_at: None,
                         });
                     })
                     .unwrap();
@@ -2132,6 +2463,7 @@ mod tests {
                         last_commit: "2026-07-13T00:00:00Z".to_string(),
                         dependencies: Vec::new(),
                         dependencies_recorded_by: None,
+                        dependencies_manifest_recorded_at: None,
                     });
                 })
                 .map_err(|err| err.to_string())
@@ -2283,6 +2615,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn kin_directories_ignore_a_permissive_umask() {
+        run_registry_security_subprocess("permissive-umask-kin-dirs");
+    }
+
+    /// The state an install under umask 0002 left behind before Kin created
+    /// its directories with an explicit mode. The refusal has to name the
+    /// directory and its remedy, nothing may change it implicitly, and the
+    /// consented repair has to clear it.
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_registry_directory_is_named_and_repaired_only_with_consent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let kin_home = root.path().join("home with space").join(".kin");
+        std::fs::create_dir_all(&kin_home).unwrap();
+        std::fs::set_permissions(&kin_home, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let registry = kin_home.join("registry.toml");
+
+        let error = initialize_registry_authority_at(&registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("group/world writable"), "{error}");
+        assert!(error.contains("found mode 0775"), "{error}");
+        assert!(
+            error.contains(&kin_home.display().to_string()),
+            "the refusal must name the directory: {error}"
+        );
+        assert!(
+            error.contains(&format!("chmod go-w '{}'", kin_home.display())),
+            "the refusal must carry a remedy that can be pasted: {error}"
+        );
+        let error = KinRegistry::load_from(&registry).unwrap_err().to_string();
+        assert!(
+            error.contains(&kin_home.display().to_string()),
+            "every refusal names the directory: {error}"
+        );
+        assert_eq!(mode(&kin_home), 0o775, "a refusal never repairs");
+        assert!(!registry.exists());
+        assert!(!registry.with_extension("lock").exists());
+
+        let report = inspect_registry_authority_at(&registry);
+        assert_eq!(report.checks.len(), 1, "{report:?}");
+        assert_eq!(report.checks[0].path, kin_home);
+        assert_eq!(
+            report.checks[0].state,
+            RegistryAuthorityState::RepairablePermissions
+        );
+        assert!(report.checks[0].detail.contains("kin doctor --fix"));
+        assert!(!report.has_unsafe_object());
+        assert!(require_registry_authority_secure_at(&registry).is_err());
+
+        let repaired = repair_registry_authority_permissions_at(&registry).unwrap();
+        assert_eq!(
+            repaired,
+            vec![RegistryPermissionRepair {
+                path: kin_home.clone(),
+                mode: 0o755,
+            }]
+        );
+        assert_eq!(mode(&kin_home), 0o755);
+        initialize_registry_authority_at(&registry).unwrap();
+        assert_eq!(mode(&registry), 0o600);
+        assert!(inspect_registry_authority_at(&registry).is_secure());
+    }
+
+    /// The consented repair changes only a real directory: a symlink in the
+    /// final position is refused, and its target keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn registry_directory_repair_never_follows_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let registry = link.join("registry.toml");
+
+        assert!(inspect_registry_authority_at(&registry).has_unsafe_object());
+        assert!(repair_registry_authority_permissions_at(&registry).is_err());
+        assert_eq!(mode(&real), 0o775);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reserved_registry_path_collisions_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         for filename in [
@@ -2340,6 +2760,7 @@ mod tests {
                                 last_commit: "2026-07-13T00:00:00Z".to_string(),
                                 dependencies: Vec::new(),
                                 dependencies_recorded_by: None,
+                                dependencies_manifest_recorded_at: None,
                             });
                         })
                         .unwrap();
@@ -2361,6 +2782,7 @@ mod tests {
                                 last_commit: "2026-07-13T00:00:00Z".to_string(),
                                 dependencies: Vec::new(),
                                 dependencies_recorded_by: None,
+                                dependencies_manifest_recorded_at: None,
                             });
                         })
                         .unwrap();
@@ -2482,6 +2904,51 @@ mod tests {
                 assert!(started.elapsed() < std::time::Duration::from_secs(1));
                 assert!(error.to_string().contains("regular file"), "{error}");
             }
+            "permissive-umask-kin-dirs" => {
+                let existing = work.join("existing");
+                std::fs::create_dir(&existing).unwrap();
+                std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o775))
+                    .unwrap();
+                let mut created = Vec::new();
+                for (umask, home) in [(0o002, "usergroups-home"), (0o000, "open-home")] {
+                    let kin_home = work.join(home).join(".kin");
+                    // SAFETY: this isolated subprocess runs one thread, and the
+                    // umask is restored before any assertion can panic.
+                    let previous = unsafe { libc::umask(umask) };
+                    let results = [
+                        create_kin_dir_all(&kin_home.join("bin")),
+                        create_kin_dir_all(&kin_home.join("lib")),
+                        create_kin_dir_all(&existing),
+                    ];
+                    // SAFETY: as above.
+                    unsafe { libc::umask(previous) };
+                    for result in results {
+                        result.unwrap();
+                    }
+                    created.push(kin_home);
+                }
+                for kin_home in &created {
+                    for directory in [
+                        kin_home.parent().unwrap().to_path_buf(),
+                        kin_home.clone(),
+                        kin_home.join("bin"),
+                        kin_home.join("lib"),
+                    ] {
+                        assert_eq!(
+                            mode(&directory),
+                            0o755,
+                            "{} under a permissive umask",
+                            directory.display()
+                        );
+                    }
+                    initialize_registry_authority_at(&kin_home.join("registry.toml")).unwrap();
+                }
+                assert_eq!(
+                    mode(&existing),
+                    0o775,
+                    "an existing directory is never tightened without consent"
+                );
+            }
             "writable-parent" => {
                 std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
                 let error = KinRegistry::default().save_to(&registry_path).unwrap_err();
@@ -2513,6 +2980,7 @@ mod tests {
                     last_commit: "2026-07-13T00:00:00Z".to_string(),
                     dependencies: Vec::new(),
                     dependencies_recorded_by: None,
+                    dependencies_manifest_recorded_at: None,
                 });
                 assert!(changed.save_to(&registry_path).is_err());
                 fail_after_temp_sync.apply::<_, &str>("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC", None);
@@ -2594,6 +3062,73 @@ mod tests {
         assert_eq!(reg.repos.len(), 1);
         assert_eq!(reg.repos[0].path, PathBuf::from("/b"));
         assert_eq!(reg.repos[0].entities, 20);
+    }
+
+    /// A repository with two live locations, a store reused beside another
+    /// checkout being the usual cause, keeps a row for each; a location that
+    /// no longer holds the repository is a store that moved, and its row
+    /// follows it.
+    #[test]
+    fn upsert_keeps_every_live_location_of_one_repository() {
+        fn copy_fixture_tree(source: &std::path::Path, destination: &std::path::Path) {
+            let metadata = std::fs::symlink_metadata(source).unwrap();
+            if metadata.is_dir() {
+                std::fs::create_dir(destination).unwrap();
+                for entry in std::fs::read_dir(source).unwrap() {
+                    let entry = entry.unwrap();
+                    copy_fixture_tree(&entry.path(), &destination.join(entry.file_name()));
+                }
+                std::fs::set_permissions(destination, metadata.permissions()).unwrap();
+            } else {
+                assert!(metadata.is_file(), "fixture contains a non-regular entry");
+                std::fs::copy(source, destination).unwrap();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        std::fs::create_dir_all(&first).unwrap();
+        let init = crate::init(&first).unwrap();
+        let id = init.repository_id.as_str().to_string();
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        copy_fixture_tree(init.layout.root(), &second.join(".kin"));
+        // A reused in-tree copy takes its working root from the new parent.
+        let copied_binding = second.join(".kin").join(crate::layout::WORKING_TREE_RECORD);
+        if copied_binding.exists() {
+            std::fs::remove_file(copied_binding).unwrap();
+        }
+        assert_eq!(
+            published_repository_identity(&first).as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            published_repository_identity(&second).as_deref(),
+            Some(id.as_str())
+        );
+
+        let mut reg = KinRegistry::default();
+        reg.upsert(id.clone(), first.clone(), 1);
+        reg.upsert(id.clone(), second.clone(), 2);
+        reg.upsert(id.clone(), second.clone(), 3);
+        assert_eq!(
+            reg.locations_of(&id)
+                .map(|row| (row.path.clone(), row.entities))
+                .collect::<Vec<_>>(),
+            vec![(first.clone(), 1), (second.clone(), 3)]
+        );
+
+        // The first location is gone, so registering a third location of the
+        // repository is that store having moved.
+        std::fs::remove_dir_all(init.layout.root()).unwrap();
+        let third = dir.path().join("third");
+        reg.upsert(id.clone(), third.clone(), 4);
+        assert_eq!(
+            reg.locations_of(&id)
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            vec![third, second]
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ description = "Graph build and update pipeline for Kin"
 repository.workspace = true
 
 [dependencies]
+kin-io = { workspace = true }
 kin-model = { workspace = true }
 kin-parser = { workspace = true }
 kin-blobs = { workspace = true }
@@ -29,6 +30,11 @@ tokio = { workspace = true }
 toml = { workspace = true }
 rustix = { workspace = true }
 tempfile = { workspace = true }
+
+[features]
+# A watcher backend that delivers nothing, for dependents that grade how they
+# behave when the host drops every filesystem event.
+test-support = []
 
 [dev-dependencies]
 kin-spine = { workspace = true }

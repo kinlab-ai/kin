@@ -440,7 +440,7 @@ fn go_receiver_removal_keeps_held_parser_identity_and_foreign_evidence() {
     let mut parsed = held.remove(0);
     assert_eq!(
         parsed.id,
-        kin_model::RelationId::from_content(&owner.to_string(), &method.to_string(), "Contains"),
+        kin_index::linker::stable_relation_id(&owner, &method, &RelationKind::Contains),
         "fixture holds the actual pipeline identity"
     );
 
@@ -471,9 +471,9 @@ fn go_receiver_removal_keeps_held_parser_identity_and_foreign_evidence() {
                 && relation.dst.as_entity() == Some(method)
         })
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         parsed.id, alternate.id,
-        "the real pipeline and linker identities differ"
+        "a same-file edge keeps one id in the pipeline and the linker"
     );
 
     parsed.created_in = Some(kin_model::SemanticChangeId(Hash256::from_bytes([7; 32])));

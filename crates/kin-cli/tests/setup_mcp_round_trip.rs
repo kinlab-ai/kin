@@ -23,6 +23,24 @@ mod common;
 /// above both and far below a run that is not going to finish.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(240);
 
+fn kin_command(home: &Path) -> common::Command<'static> {
+    let mut command = common::Command::new(env!("CARGO_BIN_EXE_kin"));
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
+        .env("KIN_VFS_DISABLE", "1")
+        .env("KIN_NO_DAEMON", "1")
+        .env_remove("KIN_STORE")
+        .env_remove("KIN_STORE_LAYOUT")
+        .env_remove("KIN_DIR")
+        .env_remove("KIN_DAEMON_URL")
+        .env_remove("KIN_MCP_REPO");
+    command
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     home: PathBuf,
@@ -46,13 +64,9 @@ impl Fixture {
 
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo dir");
-        let init = common::Command::new(env!("CARGO_BIN_EXE_kin"))
+        let init = kin_command(&home)
             .arg("init")
             .arg(&repo)
-            .env("HOME", &home)
-            .env("USERPROFILE", &home)
-            .env("KIN_VFS_DISABLE", "1")
-            .env("KIN_NO_DAEMON", "1")
             .output_within(SETUP_TIMEOUT)
             .expect("kin init");
         assert!(
@@ -60,6 +74,8 @@ impl Fixture {
             "kin init failed: {}",
             String::from_utf8_lossy(&init.stderr)
         );
+        let layout = common::repository_layout(kin_command(&home), &repo);
+        assert!(layout.is_external(), "init uses the private central store");
 
         let plain = root.path().join("not-a-repo");
         std::fs::create_dir_all(&plain).expect("create plain dir");
@@ -79,20 +95,17 @@ impl Fixture {
     /// repo daemon, so the tool call is answered by the transport under test
     /// rather than by whatever daemon happens to be running on the machine.
     fn setup(&self, dir: &Path, extra: &[&str]) -> String {
-        let output = common::Command::new(env!("CARGO_BIN_EXE_kin"))
-            .args(["setup", "--no-interactive", "--intent", "agent"])
+        let output = kin_command(&self.home)
+            .args([
+                "setup",
+                "--no-interactive",
+                "--verbose",
+                "--intent",
+                "agent",
+            ])
             .args(extra)
             .current_dir(dir)
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env("KIN_HOME", self.home.join(".kin"))
-            .env("KIN_VFS_DISABLE", "1")
-            .env("KIN_NO_DAEMON", "1")
             .env("KIN_MCP_SCAN_ROOT", dir)
-            .env("KIN_REGISTRY_PATH", self.home.join("registry.toml"))
-            .env_remove("KIN_DIR")
-            .env_remove("KIN_DAEMON_URL")
-            .env_remove("KIN_MCP_REPO")
             .output_within(SETUP_TIMEOUT)
             .expect("kin setup");
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -141,7 +154,7 @@ fn setup_reports_what_the_configured_client_s_own_server_answered() {
         "the recorded entry did not complete a round trip: {line}\n\n{stdout}"
     );
     assert!(
-        line.contains("kin_graph_status"),
+        line.contains("status reports"),
         "the round trip must name the tool it called: {line}"
     );
     assert!(
@@ -183,7 +196,7 @@ fn setup_refuses_to_claim_a_client_whose_recorded_launcher_cannot_run() {
         "a launcher that cannot run must be reported as a failure: {line}\n\n{stdout}"
     );
     assert!(
-        !line.contains("declined to answer") && !line.contains("kin_graph_status answered"),
+        !line.contains("declined to answer") && !line.contains("status answered"),
         "nothing may be claimed for a client whose entry never answered: {line}"
     );
     assert!(

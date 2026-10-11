@@ -58,14 +58,32 @@ use kin_model::{
 use kin_parser::{ExtractedRelation, FileImport};
 use tracing::{debug, info, warn};
 
-/// Upper bound on files retained for backward binding.
-///
-/// Imported files retain relations and import declarations after resolution,
-/// so a removed or recreated destination can rebind an unchanged source.
-/// Non-importing files retain unresolved relations. Entities and source bytes
-/// are not cached here. The checked route refuses capacity overflow before
-/// publication rather than silently losing dependent files.
-const MAX_PENDING_FILES: usize = 20_000;
+/// Conservative retained-byte budget for dependency nominations and exact
+/// import witnesses. File count is not a resource bound: small fragments can
+/// cover large trees, while a single generated source can carry many records.
+/// Charge compact payloads and reverse-index entries, never source bodies or
+/// entities. A checked pass fails before publication if it cannot retain its
+/// evidence; an unchecked pass reports the same failure instead of dropping it.
+fn dependency_cache_budget_for(total_ram: u64) -> usize {
+    // Reserve at most one thirty-second of RAM for this cache. Checked forks
+    // may temporarily duplicate it; graph state and source parsing have their
+    // own footprints. The budget follows host capability instead of assuming
+    // every repository runs on the same small machine.
+    if total_ram == 0 {
+        256 * 1024 * 1024
+    } else {
+        usize::try_from(total_ram / 32)
+            .unwrap_or(usize::MAX)
+            .max(64 * 1024 * 1024)
+    }
+}
+
+fn dependency_cache_budget_bytes() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| dependency_cache_budget_for(kin_db::SystemMemInfo::detect().total_ram))
+}
+/// Bound repeated identity refresh work separately from retained cache size.
+const MAX_IMPORT_INPUT_INSPECTIONS: usize = 20_000;
 
 /// Whether an edit can change how the files that depend on it bind.
 ///
@@ -100,6 +118,8 @@ struct PendingFile {
     /// it. A graph reseed may preserve it only with matching admitted bytes and
     /// declaration identities; absence is never permission to reuse a fragment.
     source_blob_hash: Option<String>,
+    /// Conservative charge for this fragment and its reverse-index entries.
+    retained_bytes: usize,
     /// Destination names that nominate this source for verified rederivation.
     waiting_on: BTreeSet<String>,
     /// Resolver candidate paths nominate imports even when the exported symbol
@@ -354,6 +374,7 @@ impl PriorCallSites {
         source: &Entity,
         target: &Entity,
         blobs: &kin_blobs::BlobStore,
+        project: &dyn kin_parser::project_manifest::ProjectFiles,
     ) -> bool {
         let Some(span) = source.span.as_ref() else {
             return false;
@@ -376,7 +397,7 @@ impl PriorCallSites {
                     return None;
                 }
                 kin_index::IndexPipeline::new()
-                    .index_file_content_with_tests(&span.file, &bytes, digest)
+                    .index_file_content_in(&span.file, &bytes, digest, project)
                     .ok()
                     .map(|result| result.indexed_file)
             });
@@ -549,7 +570,10 @@ pub struct LiveCrossFileLinker {
     // The entire private batch, including its second pass after withholding
     // empties, delegates Rust authority to the one final coherent census.
     defer_rust_project: bool,
-    capacity_reported: bool,
+    dependency_cache_bytes: usize,
+    witness_cache_bytes: HashMap<String, usize>,
+    #[cfg(test)]
+    dependency_cache_budget: Option<usize>,
     /// Files the most recent pass resolved. The cost bound made observable:
     /// this is the number a test can assert stays independent of repository
     /// size, and the number a trace can read when a write looks slow.
@@ -591,7 +615,10 @@ impl LiveCrossFileLinker {
             dependencies_restored: self.dependencies_restored,
             withheld: self.withheld.clone(),
             defer_rust_project: self.defer_rust_project,
-            capacity_reported: self.capacity_reported,
+            dependency_cache_bytes: self.dependency_cache_bytes,
+            witness_cache_bytes: self.witness_cache_bytes.clone(),
+            #[cfg(test)]
+            dependency_cache_budget: self.dependency_cache_budget,
             last_files_resolved: self.last_files_resolved,
         })
     }
@@ -675,17 +702,20 @@ impl LiveCrossFileLinker {
         for source in sources {
             let path = &source.file_id.0;
             let artifact = adopted[path];
-            if staged.needs_dependency_entry(
+            let fragment = staged.dependency_fragment_with(
+                path,
+                ParseCompleteness::Full,
                 &source.extracted_relations,
                 &source.imports,
                 &source.entities,
-            ) && !staged.pending.contains_key(path)
-                && staged.pending.len() >= MAX_PENDING_FILES
-            {
-                return Err(crate::error::ReconcileError::InvalidTransaction(
-                    "admitted dependency cache capacity exceeded".into(),
-                ));
-            }
+                true,
+            );
+            let witness = kin_index::linker::bind_import_witness(
+                path,
+                &source.entities,
+                &source.extracted_relations,
+            );
+            staged.check_cache_capacity(path, fragment.as_ref(), witness.as_ref())?;
             staged.install_observed_file(path, artifact, &source.entities);
             let parse = FileParseData {
                 file_path: path.clone(),
@@ -699,13 +729,14 @@ impl LiveCrossFileLinker {
             staged
                 .linker
                 .record_class_bases(std::slice::from_ref(&parse));
+            staged.replace_witness_charge(path, witness.as_ref());
             staged.record_pending(
                 path,
                 ParseCompleteness::Full,
                 &source.extracted_relations,
                 &source.imports,
                 &source.entities,
-            );
+            )?;
         }
         Ok((
             staged,
@@ -847,6 +878,8 @@ impl LiveCrossFileLinker {
         }
         // A checked seed reclaims authority from the complete staged snapshot.
         // Never retain destinations that only existed in a rejected proposal.
+        self.dependency_cache_bytes -= self.witness_cache_bytes.values().sum::<usize>();
+        self.witness_cache_bytes.clear();
         self.linker = IncrementalLinker::new();
         self.artifact_id_by_file.clear();
         self.file_by_artifact_id.clear();
@@ -882,12 +915,16 @@ impl LiveCrossFileLinker {
     }
 
     /// Coverage comes only from this entire fresh parse, never pending fragments.
-    pub(crate) fn coverage_for(
+    /// The graph answers for the value-origin facts of files outside the parse,
+    /// so a receiver proof whose chain crosses into one is recorded exactly as
+    /// a cold link records it.
+    pub(crate) fn coverage_for<G: GraphStore>(
         &self,
+        graph: &G,
         indexed: &kin_index::IndexedFile,
         artifact_id: ArtifactId,
     ) -> Relation {
-        let mut relation = kin_index::build_incremental_parse_coverage_relation(
+        let mut relation = kin_index::build_incremental_parse_coverage_relation_with_graph(
             &FileParseData {
                 file_path: indexed.file_id.0.clone(),
                 entities: indexed.entities.clone(),
@@ -897,6 +934,7 @@ impl LiveCrossFileLinker {
             artifact_id,
             &ParseCompleteness::from_parse_state(&indexed.parse_state),
             &self.linker,
+            graph,
         );
         kin_index::bind_parse_coverage_source(
             &mut relation,
@@ -1068,6 +1106,7 @@ impl LiveCrossFileLinker {
         mut paths: Vec<String>,
     ) -> crate::error::Result<(Vec<String>, Vec<String>)> {
         paths.sort();
+        paths.dedup();
         let mut present = Vec::new();
         let mut absent = Vec::new();
         for path in paths {
@@ -1132,6 +1171,7 @@ impl LiveCrossFileLinker {
             self.file_by_artifact_id.remove(&artifact_id);
         }
         self.linker.remove_file(file_path);
+        self.replace_witness_charge(file_path, None);
     }
 
     /// Resolve cross-file relations for a file that just changed, and re-bind
@@ -1170,7 +1210,7 @@ impl LiveCrossFileLinker {
         blobs: &kin_blobs::BlobStore,
         editing: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.restore_dependencies_inner(graph, blobs, editing, None, None)
+        self.restore_dependencies_inner(graph, blobs, editing, None, None, false)
             .map(|_| ())
     }
 
@@ -1180,14 +1220,17 @@ impl LiveCrossFileLinker {
     ///
     /// With `stale` supplied, a source whose graph declarations were not
     /// derived from its bytes is named there instead of failing the census,
-    /// every such source is named, and nothing is installed into this fork
-    /// when any was found. The caller then discards the fork.
+    /// and every such source is named. Unless `install_rest` is set, nothing is
+    /// installed into this fork when any was found, and the caller discards
+    /// the fork. With it set, the named sources supply nothing and every other
+    /// source is installed as usual.
     pub(crate) fn restore_canonical_sources<G: GraphStore>(
         &mut self,
         graph: &G,
         blobs: &kin_blobs::BlobStore,
         paths: Vec<String>,
         stale: Option<&mut Vec<crate::reconciler::StaleCanonicalSource>>,
+        install_rest: bool,
     ) -> crate::error::Result<Vec<crate::admitted_source::AdmittedSource>> {
         if !self.withheld.is_empty() {
             return Err(crate::error::ReconcileError::InvalidTransaction(
@@ -1195,7 +1238,7 @@ impl LiveCrossFileLinker {
             ));
         }
         self.seed_from_graph_checked(graph)?;
-        self.restore_dependencies_inner(graph, blobs, None, Some(paths), stale)
+        self.restore_dependencies_inner(graph, blobs, None, Some(paths), stale, install_rest)
     }
 
     fn restore_dependencies_inner<G: GraphStore>(
@@ -1205,6 +1248,7 @@ impl LiveCrossFileLinker {
         editing: Option<&str>,
         source_paths: Option<Vec<String>>,
         mut stale: Option<&mut Vec<crate::reconciler::StaleCanonicalSource>>,
+        install_rest: bool,
     ) -> crate::error::Result<Vec<crate::admitted_source::AdmittedSource>> {
         let retain_sources = source_paths.is_some();
         if (self.dependencies_restored && !retain_sources) || !self.seeded {
@@ -1221,14 +1265,12 @@ impl LiveCrossFileLinker {
         let mut sources = Vec::new();
         let mut observations = Vec::new();
         let mut witnesses = Vec::new();
-        let mut witness_count = 0;
-        for path in paths {
-            let file = kin_model::FilePathId::new(path);
-            let reading = crate::admitted_source::inspect_with_content(graph, &file, |hash| {
-                blobs
-                    .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
-                    .map_err(Into::into)
-            })?;
+        let mut cache_bytes = self.dependency_cache_bytes;
+        for path in &absent {
+            cache_bytes = self.replacement_cache_bytes(cache_bytes, path, None, None);
+        }
+        for (file, reading) in inspect_admitted_sources(graph, blobs, paths) {
+            let reading = reading?;
             let reading = match (reading, stale.as_deref_mut()) {
                 (crate::admitted_source::AdmittedSourceReading::Stale(reason), Some(stale)) => {
                     stale.push(crate::reconciler::StaleCanonicalSource { file, reason });
@@ -1238,46 +1280,37 @@ impl LiveCrossFileLinker {
             };
             if let Some(source) = reading.into_complete(&file)? {
                 let indexed = &source.indexed;
-                witnesses.push((
-                    indexed.file_id.0.clone(),
-                    kin_index::linker::bind_import_witness(
-                        &indexed.file_id.0,
-                        &indexed.entities,
-                        &indexed.extracted_relations,
-                    ),
-                ));
-                witness_count += usize::from(
-                    witnesses
-                        .last()
-                        .is_some_and(|(_, witness)| witness.is_some()),
+                let file_path = &indexed.file_id.0;
+                let witness = kin_index::linker::bind_import_witness(
+                    file_path,
+                    &indexed.entities,
+                    &indexed.extracted_relations,
                 );
-                if witness_count > MAX_PENDING_FILES {
-                    return Err(crate::error::ReconcileError::InvalidTransaction(
-                        "admitted import evidence cache capacity exceeded".into(),
-                    ));
-                }
-                if let Some(fragment) = self.dependency_fragment(
-                    &indexed.file_id.0,
+                let fragment = self.dependency_fragment(
+                    file_path,
                     ParseCompleteness::Full,
                     &indexed.extracted_relations,
                     &indexed.imports,
                     &indexed.entities,
-                ) {
-                    observations.push((indexed.file_id.0.clone(), fragment));
-                    if observations.len() > MAX_PENDING_FILES {
-                        return Err(crate::error::ReconcileError::InvalidTransaction(
-                            "admitted dependency cache capacity exceeded".into(),
-                        ));
-                    }
-                }
+                );
+                cache_bytes = self.replacement_cache_bytes(
+                    cache_bytes,
+                    file_path,
+                    fragment.as_ref(),
+                    witness.as_ref(),
+                );
+                self.check_cache_bytes(cache_bytes)?;
+                witnesses.push((file_path.clone(), witness));
+                observations.push((file_path.clone(), fragment));
                 if retain_sources {
                     sources.push(source);
                 }
             }
         }
         // A census that named a stale source installs nothing: the caller
-        // re-derives those sources and restores again from the result.
-        if stale.is_some_and(|stale| !stale.is_empty()) {
+        // re-derives those sources and restores again from the result. A
+        // census that withholds them installs every other source.
+        if !install_rest && stale.is_some_and(|stale| !stale.is_empty()) {
             return Ok(Vec::new());
         }
         // Install only after every read succeeds. Ordinary restoration retains
@@ -1307,10 +1340,14 @@ impl LiveCrossFileLinker {
             self.linker.record_class_bases(std::slice::from_ref(&parse));
         }
         for (file, witness) in witnesses {
+            self.replace_witness_charge(&file, witness.as_ref());
             self.linker.replace_import_witness(&file, witness);
         }
         for (file, fragment) in observations {
-            self.install_pending(&file, fragment);
+            match fragment {
+                Some(fragment) => self.install_pending(&file, fragment),
+                None => self.clear_pending(&file),
+            }
         }
         self.dependencies_restored = true;
         Ok(sources)
@@ -1329,14 +1366,6 @@ impl LiveCrossFileLinker {
         dependents: Dependents,
     ) -> crate::error::Result<CrossFilePass> {
         self.restore_dependencies(graph, blobs, Some(file_path))?;
-        if self.needs_dependency_entry(extracted, imports, entities)
-            && !self.pending.contains_key(file_path)
-            && self.pending.len() >= MAX_PENDING_FILES
-        {
-            return Err(crate::error::ReconcileError::InvalidTransaction(
-                "admitted dependency cache capacity exceeded".into(),
-            ));
-        }
         let mut sources = Vec::new();
         let nominated = match dependents {
             Dependents::Rebind => self.files_waiting_on_names_of(file_path, entities),
@@ -1413,7 +1442,7 @@ impl LiveCrossFileLinker {
             examined = examined.checked_add(paths.len()).ok_or_else(|| {
                 crate::error::ReconcileError::Graph("named-import input inspection overflow".into())
             })?;
-            if examined > MAX_PENDING_FILES {
+            if examined > MAX_IMPORT_INPUT_INSPECTIONS {
                 return Err(crate::error::ReconcileError::Graph(
                     "named-import input inspection budget exceeded".into(),
                 ));
@@ -1523,6 +1552,25 @@ impl LiveCrossFileLinker {
                 ..CrossFilePass::default()
             };
         };
+
+        let fragment = self.dependency_fragment_with(
+            file_path,
+            completeness.clone(),
+            extracted,
+            imports,
+            entities,
+            true,
+        );
+        let witness = kin_index::linker::bind_import_witness(file_path, entities, extracted);
+        if let Err(error) =
+            self.check_cache_capacity(file_path, fragment.as_ref(), witness.as_ref())
+        {
+            return CrossFilePass {
+                failure: Some(error.to_string()),
+                referenced,
+                ..CrossFilePass::default()
+            };
+        }
 
         let own = FileParseData {
             file_path: file_path.to_string(),
@@ -1763,7 +1811,35 @@ impl LiveCrossFileLinker {
             .collect();
         source_artifacts.sort_by_key(|id| format!("{id:?}"));
 
-        self.record_pending(file_path, completeness, extracted, imports, entities);
+        let witness = kin_index::linker::bind_import_witness(file_path, entities, extracted);
+        let fragment = self.dependency_fragment(
+            file_path,
+            completeness.clone(),
+            extracted,
+            imports,
+            entities,
+        );
+        if let Err(error) =
+            self.check_cache_capacity(file_path, fragment.as_ref(), witness.as_ref())
+        {
+            return CrossFilePass {
+                failure: Some(error.to_string()),
+                referenced,
+                files_resolved,
+                ..CrossFilePass::default()
+            };
+        }
+        self.replace_witness_charge(file_path, witness.as_ref());
+        if let Err(error) =
+            self.record_pending(file_path, completeness, extracted, imports, entities)
+        {
+            return CrossFilePass {
+                failure: Some(error.to_string()),
+                referenced,
+                files_resolved,
+                ..CrossFilePass::default()
+            };
+        }
         for dependent in &dependents {
             // A proposed local binding may still fail validation or application.
             // Keep its waiting fragment while graph truth retains an external
@@ -1850,7 +1926,7 @@ impl LiveCrossFileLinker {
         }
         // Follow source-declared importer paths transitively: an intermediate
         // re-export may change without changing any of its symbol names. The
-        // pending map is bounded by MAX_PENDING_FILES; each file is visited once.
+        // compact pending index visits each dependent file once.
         // Names nominate only the first wave, never guessed transitive bindings.
         let mut queue = std::collections::VecDeque::from([file_path.to_string()]);
         queue.extend(dependents.iter().cloned());
@@ -1873,6 +1949,7 @@ impl LiveCrossFileLinker {
             .collect()
     }
 
+    #[cfg(test)]
     fn needs_dependency_entry(
         &self,
         extracted: &[ExtractedRelation],
@@ -1882,8 +1959,7 @@ impl LiveCrossFileLinker {
         !imports.is_empty()
             || !go_receiver_owner_names(extracted, entities).is_empty()
             || extracted.iter().any(|relation| {
-                !kin_parser::is_call_extraction_incomplete_marker(relation)
-                    && !kin_parser::import_witness::claims_import_witness(relation)
+                !kin_parser::is_reserved_parser_record(relation)
                     && !self.linker_knows_name(&relation.dst_name)
             })
     }
@@ -1897,22 +1973,79 @@ impl LiveCrossFileLinker {
         extracted: &[ExtractedRelation],
         imports: &[FileImport],
         entities: &[Entity],
-    ) {
+    ) -> crate::error::Result<()> {
         let Some(fragment) =
             self.dependency_fragment(file_path, completeness, extracted, imports, entities)
         else {
             self.clear_pending(file_path);
-            return;
+            return Ok(());
         };
-        if !self.pending.contains_key(file_path) && self.pending.len() >= MAX_PENDING_FILES {
-            if !self.capacity_reported {
-                self.capacity_reported = true;
-                warn!(cap = MAX_PENDING_FILES, file = %file_path,
-                    "cross-file waiting index is full; legacy unchecked caller cannot retain another dependency");
-            }
-            return;
-        }
+        let bytes = self
+            .dependency_cache_bytes
+            .saturating_sub(
+                self.pending
+                    .get(file_path)
+                    .map_or(0, |old| old.retained_bytes),
+            )
+            .saturating_add(fragment.retained_bytes);
+        self.check_cache_bytes(bytes)?;
         self.install_pending(file_path, fragment);
+        Ok(())
+    }
+
+    fn check_cache_bytes(&self, bytes: usize) -> crate::error::Result<()> {
+        let budget = dependency_cache_budget_bytes();
+        #[cfg(test)]
+        let budget = self.dependency_cache_budget.unwrap_or(budget);
+        if bytes > budget {
+            return Err(crate::error::ReconcileError::InvalidTransaction(format!(
+                "admitted dependency evidence cache needs {bytes} charged bytes, budget {budget}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn replacement_cache_bytes(
+        &self,
+        bytes: usize,
+        file: &str,
+        fragment: Option<&PendingFile>,
+        witness: Option<&kin_index::linker::BoundImportWitness>,
+    ) -> usize {
+        bytes
+            .saturating_sub(self.pending.get(file).map_or(0, |old| old.retained_bytes))
+            .saturating_sub(self.witness_cache_bytes.get(file).copied().unwrap_or(0))
+            .saturating_add(fragment.map_or(0, |new| new.retained_bytes))
+            .saturating_add(witness.map_or(0, |new| new.retained_size_hint()))
+    }
+
+    fn check_cache_capacity(
+        &self,
+        file: &str,
+        fragment: Option<&PendingFile>,
+        witness: Option<&kin_index::linker::BoundImportWitness>,
+    ) -> crate::error::Result<()> {
+        self.check_cache_bytes(self.replacement_cache_bytes(
+            self.dependency_cache_bytes,
+            file,
+            fragment,
+            witness,
+        ))
+    }
+
+    fn replace_witness_charge(
+        &mut self,
+        file: &str,
+        witness: Option<&kin_index::linker::BoundImportWitness>,
+    ) {
+        if let Some(old) = self.witness_cache_bytes.remove(file) {
+            self.dependency_cache_bytes -= old;
+        }
+        if let Some(witness) = witness {
+            let bytes = witness.retained_size_hint();
+            self.witness_cache_bytes.insert(file.to_owned(), bytes);
+            self.dependency_cache_bytes += bytes;
+        }
     }
 
     fn dependency_fragment(
@@ -1923,13 +2056,25 @@ impl LiveCrossFileLinker {
         imports: &[FileImport],
         entities: &[Entity],
     ) -> Option<PendingFile> {
+        self.dependency_fragment_with(file_path, completeness, extracted, imports, entities, false)
+    }
+
+    fn dependency_fragment_with(
+        &self,
+        file_path: &str,
+        completeness: ParseCompleteness,
+        extracted: &[ExtractedRelation],
+        imports: &[FileImport],
+        entities: &[Entity],
+        retain_resolved: bool,
+    ) -> Option<PendingFile> {
         let go_receiver_owners = go_receiver_owner_names(extracted, entities);
         let relations: Vec<ExtractedRelation> = extracted
             .iter()
-            .filter(|relation| !kin_parser::is_call_extraction_incomplete_marker(relation))
-            .filter(|relation| !kin_parser::import_witness::claims_import_witness(relation))
+            .filter(|relation| !kin_parser::is_reserved_parser_record(relation))
             .filter(|relation| {
-                !imports.is_empty()
+                retain_resolved
+                    || !imports.is_empty()
                     || go_receiver_owners.contains(&relation.src_name)
                     || !self.linker_knows_name(&relation.dst_name)
             })
@@ -1938,7 +2083,7 @@ impl LiveCrossFileLinker {
         if relations.is_empty() && imports.is_empty() {
             return None;
         }
-        let waiting_on = relations
+        let waiting_on: BTreeSet<String> = relations
             .iter()
             .map(|relation| relation.dst_name.clone())
             .chain(go_receiver_owners.iter().cloned())
@@ -1956,7 +2101,7 @@ impl LiveCrossFileLinker {
                     }),
             )
             .collect();
-        let waiting_on_paths = imports
+        let waiting_on_paths: BTreeSet<String> = imports
             .iter()
             .flat_map(|import| {
                 kin_index::workspace_package_import_candidate_paths(file_path, &import.module_path)
@@ -1967,7 +2112,30 @@ impl LiveCrossFileLinker {
                     ))
             })
             .collect();
+        // Four serialized bytes per payload byte cover owned strings, spare
+        // vector capacity and record allocations. Charge reverse-index entries
+        // separately, including a full path copy and a tree-node allowance.
+        let payload = serde_json::to_vec(&(&relations, imports, &completeness))
+            .map_or(usize::MAX, |bytes| bytes.len());
+        let reverse =
+            waiting_on
+                .iter()
+                .chain(waiting_on_paths.iter())
+                .fold(0usize, |bytes, key| {
+                    bytes.saturating_add(
+                        (128usize
+                            .saturating_add(key.len())
+                            .saturating_add(file_path.len()))
+                        .saturating_mul(2),
+                    )
+                });
+        let retained_bytes = payload
+            .saturating_mul(4)
+            .saturating_add(reverse)
+            .saturating_add(file_path.len().saturating_mul(4))
+            .saturating_add(512);
         Some(PendingFile {
+            retained_bytes,
             parse: FileParseData {
                 file_path: file_path.to_string(),
                 entities: Vec::new(),
@@ -2003,6 +2171,7 @@ impl LiveCrossFileLinker {
                     .insert(file_path.to_string());
             }
         }
+        self.dependency_cache_bytes += fragment.retained_bytes;
         self.pending.insert(file_path.to_string(), fragment);
     }
 
@@ -2025,49 +2194,21 @@ impl LiveCrossFileLinker {
             self.clear_pending(file_path);
             return;
         }
-        let waiting: BTreeSet<String> = still_waiting
-            .iter()
-            .map(|relation| relation.dst_name.clone())
-            .collect();
         let imports = pending.parse.imports.clone();
         let completeness = pending.completeness.clone();
         let source_blob_hash = pending.source_blob_hash.clone();
-        self.clear_pending(file_path);
-        for name in &waiting {
-            self.waiting_on
-                .entry(name.clone())
-                .or_default()
-                .insert(file_path.to_string());
-            let bare = bare_entity_name(name);
-            if bare != name {
-                self.waiting_on
-                    .entry(bare.to_string())
-                    .or_default()
-                    .insert(file_path.to_string());
-            }
-        }
-        self.pending.insert(
-            file_path.to_string(),
-            PendingFile {
-                parse: FileParseData {
-                    file_path: file_path.to_string(),
-                    entities: Vec::new(),
-                    relations: still_waiting,
-                    imports,
-                },
-                completeness,
-                source_blob_hash,
-                waiting_on: waiting,
-                waiting_on_paths: BTreeSet::new(),
-                go_receiver_owners: BTreeSet::new(),
-            },
-        );
+        let mut fragment = self
+            .dependency_fragment(file_path, completeness, &still_waiting, &imports, &[])
+            .expect("unresolved records require a dependency fragment");
+        fragment.source_blob_hash = source_blob_hash;
+        self.install_pending(file_path, fragment);
     }
 
     fn clear_pending(&mut self, file_path: &str) {
         let Some(previous) = self.pending.remove(file_path) else {
             return;
         };
+        self.dependency_cache_bytes -= previous.retained_bytes;
         for name in previous.waiting_on {
             let bare = bare_entity_name(&name).to_string();
             for key in [name, bare] {
@@ -2102,6 +2243,58 @@ impl LiveCrossFileLinker {
 fn admitted_artifact_id<G: GraphStore>(graph: &G, path: &str) -> Option<ArtifactId> {
     let repo_path = RepoPath::from_utf8(path.to_string()).ok()?;
     graph.artifact_id_at_path(&repo_path)
+}
+
+/// How many admitted sources one step of [`inspect_admitted_sources`] reads
+/// and parses together. It bounds how many parses a dependency restore that
+/// keeps none of them holds at once, and it is large enough that one slow file
+/// rarely leaves the other threads idle.
+const INSPECTION_CHUNK: usize = 512;
+
+/// Read and parse each admitted source against the graph, in `paths` order.
+///
+/// Each reading is independent of every other: it reads the graph and the
+/// exact bytes the tree names, and nothing in one depends on another, which is
+/// what a sequential walk relied on too. So each chunk is inspected in
+/// parallel, and the readings are handed back in
+/// path order for the caller to consume exactly as a sequential walk would,
+/// including stopping at the first error in that order. A chunk is inspected
+/// only when the caller asks for its first reading, so a caller that stops at
+/// an error leaves the chunks after it unread.
+///
+/// Measured on a React-sized store (4,561 sources): the sequential census held
+/// a starting daemon for about twenty seconds after the graph was open, every
+/// start, before it served.
+fn inspect_admitted_sources<'a, G: GraphStore>(
+    graph: &'a G,
+    blobs: &'a kin_blobs::BlobStore,
+    paths: Vec<String>,
+) -> impl Iterator<
+    Item = (
+        kin_model::FilePathId,
+        crate::error::Result<crate::admitted_source::AdmittedSourceReading>,
+    ),
+> + 'a {
+    use rayon::prelude::*;
+    let mut chunks = Vec::new();
+    let mut paths = paths.into_iter().peekable();
+    while paths.peek().is_some() {
+        chunks.push(paths.by_ref().take(INSPECTION_CHUNK).collect::<Vec<_>>());
+    }
+    chunks.into_iter().flat_map(move |chunk| {
+        chunk
+            .into_par_iter()
+            .map(|path| {
+                let file = kin_model::FilePathId::new(path);
+                let reading = crate::admitted_source::inspect_with_content(graph, &file, |hash| {
+                    blobs
+                        .read(&kin_blobs::Hash256::from_bytes(*hash.as_bytes()))
+                        .map_err(Into::into)
+                });
+                (file, reading)
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -2360,13 +2553,15 @@ mod source_evidence_tests {
                 },
             )
             .unwrap();
-        linker.record_pending(
-            &source_path,
-            ParseCompleteness::Full,
-            &source.extracted_relations,
-            &source.imports,
-            &source.entities,
-        );
+        linker
+            .record_pending(
+                &source_path,
+                ParseCompleteness::Full,
+                &source.extracted_relations,
+                &source.imports,
+                &source.entities,
+            )
+            .unwrap();
         assert_eq!(linker.pending_file_count(), 1);
         assert!(linker.knows_file("old.py"));
         assert!(linker
@@ -2665,10 +2860,14 @@ mod source_evidence_tests {
         );
     }
 
+    /// Syntax that runs inside the caller's walk without being one of its
+    /// named calls withdraws the caller's absence. A nested definition the
+    /// parser could not admit is walked as the caller's own body: here the
+    /// second `nested`, whose name the first already holds.
     #[test]
     fn nested_execution_scopes_and_decorators_withdraw_caller_absence() {
         for source in [
-            "def caller():\n    def nested():\n        return target()\n    return 1\n",
+            "def caller():\n    def nested():\n        return 1\n    def nested():\n        return target()\n    return 1\n",
             "def caller():\n    return lambda: target()\n",
             "def caller(arg=target()):\n    return 1\n",
             "@decorator\ndef caller():\n    return 1\n",
@@ -2682,6 +2881,40 @@ mod source_evidence_tests {
                     "unmentioned"
                 ),
                 "{source}"
+            );
+        }
+    }
+
+    /// A nested definition the parser admits is an entity of its own, and the
+    /// calls written in its body are its calls. They neither withdraw nor feed
+    /// the enclosing caller's absence, and the nested entity keeps every name
+    /// it calls.
+    #[test]
+    fn an_admitted_nested_definition_owns_its_calls_and_leaves_the_caller_certified() {
+        for (source, nested) in [
+            (
+                "def caller():\n    def nested():\n        return target()\n    return 1\n",
+                "caller.<locals>.nested",
+            ),
+            (
+                "def caller():\n    class Local:\n        def run(self):\n            return target()\n    return Local\n",
+                "caller.<locals>.Local.run",
+            ),
+        ] {
+            let file = parsed(source);
+            let observed = evidence(&file, ParseCompleteness::Full);
+            let caller = identity(&file, "caller");
+            assert!(
+                observed.can_retire_from(caller, RelationKind::Calls, "unmentioned"),
+                "{source}"
+            );
+            assert!(
+                observed.can_retire_from(caller, RelationKind::Calls, "target"),
+                "the call is the nested entity's, not the caller's: {source}"
+            );
+            assert!(
+                !observed.can_retire_from(identity(&file, nested), RelationKind::Calls, "target"),
+                "the nested entity still calls target: {source}"
             );
         }
     }
@@ -2745,11 +2978,19 @@ mod source_evidence_tests {
         ] {
             let mut file = parsed(body);
             let hash = blobs.write(body.as_bytes()).unwrap();
-            let call = file
+            // A prior edge can remain after the current parser correctly
+            // records a local alias as a gap. Its lexical site still exists,
+            // and must never authorize retiring that edge as a direct call.
+            let site = file
                 .extracted_relations
                 .iter()
-                .find(|r| r.kind == RelationKind::Calls)
-                .unwrap();
+                .find(|r| {
+                    r.site.is_some()
+                        && (r.kind == RelationKind::Calls
+                            || kin_parser::is_scoped_call_extraction_incomplete_marker(r))
+                })
+                .and_then(|r| r.site.clone())
+                .expect("the call or its scoped gap retains its lexical site");
             let source = file
                 .entities
                 .iter_mut()
@@ -2772,18 +3013,19 @@ mod source_evidence_tests {
                 created_in: None,
                 import_source: Some("absent".into()),
                 evidence: vec![RelationEvidence {
-                    source_span: Some(
-                        call.site
-                            .as_ref()
-                            .unwrap()
-                            .to_source_span(&source.span.as_ref().unwrap().file),
-                    ),
+                    source_span: Some(site.to_source_span(&source.span.as_ref().unwrap().file)),
                     ..Default::default()
                 }],
             };
             let mut prior = PriorCallSites::default();
             assert_eq!(
-                prior.supports_retirement(&relation, source, &target, &blobs),
+                prior.supports_retirement(
+                    &relation,
+                    source,
+                    &target,
+                    &blobs,
+                    &kin_parser::project_manifest::NoProjectFiles
+                ),
                 allowed,
                 "{body}"
             );
@@ -2793,11 +3035,29 @@ mod source_evidence_tests {
                     .as_mut()
                     .unwrap()
                     .start_byte += 1;
-                assert!(!prior.supports_retirement(&relation, source, &target, &blobs));
+                assert!(!prior.supports_retirement(
+                    &relation,
+                    source,
+                    &target,
+                    &blobs,
+                    &kin_parser::project_manifest::NoProjectFiles
+                ));
                 relation.evidence.clear();
-                assert!(!prior.supports_retirement(&relation, source, &target, &blobs));
+                assert!(!prior.supports_retirement(
+                    &relation,
+                    source,
+                    &target,
+                    &blobs,
+                    &kin_parser::project_manifest::NoProjectFiles
+                ));
                 source.metadata.extra.remove("blob_hash");
-                assert!(!prior.supports_retirement(&relation, source, &target, &blobs));
+                assert!(!prior.supports_retirement(
+                    &relation,
+                    source,
+                    &target,
+                    &blobs,
+                    &kin_parser::project_manifest::NoProjectFiles
+                ));
             }
         }
     }

@@ -18,39 +18,41 @@ pub struct HookTemplate {
 
 /// Generate recommended Claude Code hook templates.
 ///
-/// Returns hooks that remind the agent to use Kin CLI commands
-/// for semantic operations instead of raw file manipulation.
+/// The `UserPromptSubmit` hook is Kin's answer before the model's first turn:
+/// `kin ask --hook claude` reads the prompt, answers it when it names code and
+/// asks something Kin routes, and adds nothing otherwise. `kin setup` offers
+/// that one hook and records it; the others are reminders a person can add.
 pub fn generate_claude_hooks() -> Vec<HookTemplate> {
     vec![
         HookTemplate {
             event: "SessionStart".into(),
             matcher: None,
-            command: "echo '📋 This repo uses Kin. For exact symbol tasks, start with `kin trace <ExactName> --compact`. Use `kin overview --compact` only for broad architecture. Keep `kin search --show-body` exact and small (`--limit 5`). Use `kin commit` instead of `git commit`.'".into(),
-            description: "Orients the agent to the Kin-first workflow at session start, with an emphasis on `kin trace` for exact tasks.".into(),
+            command: "echo 'This repository is held in Kin. Ask code questions in plain words with the Kin ask tool or `kin ask \"<question>\"`; for a single step use `kin locate`, `kin refs`, `kin trace`, `kin impact`, `kin context` or `kin source`. Record changes with `kin commit` rather than `git commit`.'".into(),
+            description: "Orients the agent at session start: ask first, then the verbs for single steps.".into(),
         },
         HookTemplate {
             event: "UserPromptSubmit".into(),
             matcher: None,
-            command: "echo 'Kin reminder: start exact code questions with `kin trace <ExactName> --compact`. Use `kin overview --compact` for broad orientation. Only use `kin search --show-body --limit 5` for exact follow-up symbols.'".into(),
-            description: "Reinforces the winning Kin workflow every time the user submits a prompt.".into(),
+            command: "kin ask --hook claude".into(),
+            description: "Kin answers a code question before the model's first turn, and adds nothing for any other prompt. `kin setup` offers this hook; `kin setup --prompt-hook` adds it without asking.".into(),
         },
         HookTemplate {
             event: "SubagentStart".into(),
             matcher: None,
-            command: "echo 'Kin subagent reminder: do not start with broad exploration. If the task names a symbol, start with `kin trace <ExactName> --compact`. Keep `kin search --show-body` exact and small (`--limit 5`).'".into(),
-            description: "Keeps Claude subagents from immediately falling back to broad exploration patterns.".into(),
+            command: "echo 'Kin: before exploring broadly, ask the code question with the Kin ask tool or `kin ask \"<question>\"`; for a single step use `kin locate`, `kin refs` or `kin trace`.'".into(),
+            description: "Keeps subagents from starting with broad exploration.".into(),
         },
         HookTemplate {
             event: "PreToolUse".into(),
             matcher: Some("Edit|Write".into()),
-            command: "echo '⚠ This repo uses Kin: change code through Kin by entity, not by editing files. Read the entity with get_entity_source for its source_base, then kin_mutate it by id; check impact with `kin review`.'".into(),
-            description: "Redirects a file edit to Kin's entity edit through kin_mutate.".into(),
+            command: "echo 'This repository is held in Kin: change code through Kin by entity rather than by editing text in place. Read the entity with source for its source base, then mutate it by id, and check what the change affects with `kin impact`.'".into(),
+            description: "Redirects a text edit to Kin's entity edit through mutate.".into(),
         },
         HookTemplate {
             event: "PostToolUse".into(),
             matcher: Some("Bash".into()),
-            command: r#"if echo "$TOOL_INPUT" | grep -q 'git commit'; then echo '⚠ Use `kin commit` instead of `git commit` to preserve semantic history.'; fi"#.into(),
-            description: "Reminds the agent to use `kin commit` instead of `git commit` for semantic tracking.".into(),
+            command: r#"if echo "$TOOL_INPUT" | grep -q 'git commit'; then echo 'Use `kin commit` instead of `git commit` to keep semantic history.'; fi"#.into(),
+            description: "Reminds the agent to record changes with `kin commit`.".into(),
         },
     ]
 }
@@ -92,11 +94,14 @@ pub fn render_hooks_json(hooks: &[HookTemplate]) -> String {
 /// Render a human-readable setup guide for the hook templates.
 pub fn render_hooks_instructions(hooks: &[HookTemplate]) -> String {
     let mut out = String::new();
-    out.push_str("# Kin — Claude Code Hook Setup Guide\n\n");
-    out.push_str("Add these hooks to your `.claude/settings.json` to get Kin-aware reminders.\n\n");
+    out.push_str("# Kin hooks for Claude Code\n\n");
+    out.push_str(
+        "Add these hooks to your `.claude/settings.json`. `kin setup` offers the prompt hook \
+         and records it, so `kin setup uninstall` removes it.\n\n",
+    );
 
     for (i, hook) in hooks.iter().enumerate() {
-        out.push_str(&format!("## Hook {} — {} ", i + 1, hook.event));
+        out.push_str(&format!("## Hook {}: {} ", i + 1, hook.event));
         if let Some(ref m) = hook.matcher {
             out.push_str(&format!("(matcher: {})", m));
         }
@@ -107,17 +112,17 @@ pub fn render_hooks_instructions(hooks: &[HookTemplate]) -> String {
     out.push_str("## Quick Start\n\n");
     out.push_str("1. Copy the JSON output from `kin assistant hooks claude-code`.\n");
     out.push_str("2. Merge the `hooks` object into your `.claude/settings.json`.\n");
-    out.push_str("3. Key Kin CLI commands the hooks reference:\n");
+    out.push_str("3. The Kin CLI commands the hooks name:\n");
     out.push_str(
-        "   - `kin trace <ExactName> --compact` — one-shot focal trace for exact symbol tasks\n",
+        "   - `kin ask \"<question>\"`: a code question in plain words, answered in one reply\n",
     );
-    out.push_str(
-        "   - `kin overview --compact` — high-level orientation without broad file exploration\n",
-    );
-    out.push_str("   - `kin search <query> --show-body --limit 5` — exact follow-up search with bounded output\n");
-    out.push_str("   - `kin context <entity>` — focused context for an entity\n");
-    out.push_str("   - `kin commit` — record a semantic change\n");
-    out.push_str("   - `kin review` — review semantic impact before editing\n");
+    out.push_str("   - `kin locate`: find an entity by name or by what it does\n");
+    out.push_str("   - `kin refs`: callers, importers and references of one entity\n");
+    out.push_str("   - `kin trace`: everything that can end up calling one entity\n");
+    out.push_str("   - `kin impact`: what a change to an entity affects\n");
+    out.push_str("   - `kin context`: the code around an entity\n");
+    out.push_str("   - `kin commit`: record a semantic change\n");
+    out.push_str("   - `kin review`: review semantic impact before a change lands\n");
 
     out
 }
@@ -154,26 +159,62 @@ mod tests {
     fn test_hooks_mention_kin_commands() {
         let hooks = generate_claude_hooks();
         let instructions = render_hooks_instructions(&hooks);
-        assert!(instructions.contains("kin trace"), "must mention kin trace");
+        for command in [
+            "kin ask",
+            "kin locate",
+            "kin refs",
+            "kin trace",
+            "kin impact",
+            "kin context",
+            "kin commit",
+            "kin review",
+        ] {
+            assert!(instructions.contains(command), "must mention {command}");
+        }
+    }
+
+    #[test]
+    fn every_echo_is_one_single_quoted_word_a_shell_runs_whole() {
+        for hook in generate_claude_hooks() {
+            if let Some(quoted) = hook.command.strip_prefix("echo '") {
+                let body = quoted.strip_suffix('\'').expect("the echo ends its quote");
+                assert!(!body.contains('\''), "{}", hook.command);
+            }
+        }
+    }
+
+    #[test]
+    fn the_prompt_hook_is_kins_answer_before_the_first_turn() {
+        let hooks = generate_claude_hooks();
+        let prompt = hooks
+            .iter()
+            .find(|hook| hook.event == "UserPromptSubmit")
+            .expect("a prompt hook");
+        assert_eq!(prompt.command, "kin ask --hook claude");
+    }
+
+    #[test]
+    fn the_templates_name_no_retired_command_and_carry_no_emoji_or_dash() {
+        let hooks = generate_claude_hooks();
+        let all: String = hooks
+            .iter()
+            .map(|hook| format!("{} {}", hook.command, hook.description))
+            .chain([render_hooks_instructions(&hooks)])
+            .collect();
+        for retired in [
+            "--compact",
+            "kin overview",
+            "kin search",
+            "get_entity_source",
+            "kin_mutate",
+        ] {
+            assert!(!all.contains(retired), "names {retired}");
+        }
+        assert!(!all.contains('\u{2014}'), "an em dash");
         assert!(
-            instructions.contains("kin overview"),
-            "must mention kin overview"
+            all.chars().all(|character| (character as u32) < 0x2600),
+            "an emoji"
         );
-        assert!(
-            instructions.contains("kin search"),
-            "must mention kin search"
-        );
-        assert!(
-            instructions.contains("kin context"),
-            "must mention kin context"
-        );
-        assert!(
-            instructions.contains("kin commit"),
-            "must mention kin commit"
-        );
-        assert!(
-            instructions.contains("kin review"),
-            "must mention kin review"
-        );
+        assert!(!all.to_lowercase().contains("editing files"));
     }
 }

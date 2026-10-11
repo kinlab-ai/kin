@@ -110,8 +110,12 @@ pub fn query_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<E
 /// Read off the entity alone, so it answers the same way for a store built
 /// today and one built from the same tree six commits ago, and nothing here
 /// consults the filesystem.
+///
+/// The rule lives in `kin_ranking::entity_ranking::carries_body`, where name
+/// resolution folds a declaration into its definition by it, so the resolver
+/// and the rankers here cannot read one entity two ways.
 pub fn carries_body(entity: &Entity) -> bool {
-    !entity.signature.trim_end().ends_with(';')
+    kin_ranking::entity_ranking::carries_body(entity)
 }
 
 /// The order two entities sharing a name are chosen in when nothing the caller
@@ -207,6 +211,14 @@ pub fn name_resolution_certainly_misses(
     // the index knows keeps the caller on the resolving path.
     if let Some((_, leaf)) = trimmed.rsplit_once("::") {
         if leaf != trimmed && !name_index_rules_out(graph, leaf)? {
+            return Ok(false);
+        }
+    }
+    // A module-qualified name (`flask.app._make_timedelta`) resolves through
+    // the name it qualifies, so a name the index knows after any qualifier
+    // keeps the caller on the resolving path too.
+    for (_, tail) in kin_ranking::module_qualifier::qualifier_splits(trimmed) {
+        if !name_index_rules_out(graph, &tail)? {
             return Ok(false);
         }
     }

@@ -274,7 +274,7 @@ async fn run(
         return kin_mcp::ToolCallResult::error(json!({"schema":"kin.entity.draft.apply_pending.v1",
             "code":"draft_apply_unresolved","draft_id":id,"attempt":attempt,"receipt_saved":false,
             "mutation_result":result,
-            "remedy":"Retry Apply to resolve this original attempt. For a stale source base, create a fresh draft from a current source read and preserve this draft's text/history. Save may preserve newer text while this attempt remains bound."}).to_string());
+            "remedy":"Retry Apply to resolve this original attempt. For a stale source base, create a fresh draft from a current source read and preserve this draft's text and history. Save may preserve newer text while this attempt remains bound."}).to_string());
     }
     let receipt = (|| -> Result<(Value, Option<Value>)> {
         let [kin_mcp::ContentBlock::Text { text }] = result.content.as_slice() else {

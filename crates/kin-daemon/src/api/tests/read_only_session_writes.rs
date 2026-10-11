@@ -114,7 +114,9 @@ fn assert_read_only_refusal(result: &kin_mcp::ToolCallResult, door: &str) {
     assert!(text.starts_with("read_only_session: "), "{text}");
     assert!(text.contains(&format!("{door} writes")), "{text}");
     assert!(text.contains("can_write=false"), "{text}");
-    assert!(text.contains("kin_session_start"), "{text}");
+    // The fix is the connection's own session, never a session tool.
+    assert!(text.contains("without session_id"), "{text}");
+    assert!(!text.contains("kin_session_start"), "{text}");
 }
 
 fn assert_cli_read_only_refusal(
@@ -173,7 +175,7 @@ async fn a_read_only_session_is_refused_at_every_write_door() {
 
     let roots = source_base_roots(&state);
     let retained = retained_transaction_value(&state, &tx);
-    let created = source_base_operation(&source);
+    let created = ticketed_source_operation(source_base_operation(&source));
 
     let begin = mcp_call_as(
         router(Arc::clone(&state)),
@@ -195,7 +197,7 @@ async fn a_read_only_session_is_refused_at_every_write_door() {
 
     for arguments in [
         serde_json::json!({ "transaction_id": tx }),
-        serde_json::json!({ "transaction_id": tx, "operations": [source_base_operation(&source)] }),
+        serde_json::json!({ "transaction_id": tx, "operations": [created.clone()] }),
     ] {
         let commit = mcp_call_as(
             router(Arc::clone(&state)),
@@ -417,12 +419,13 @@ async fn a_default_install_and_a_stale_shell_session_still_write() {
         .to_string();
     // Each entity write carries the base of the version it replaces, read
     // fresh because every commit above and below moves the workspace.
+    let roots = source_base_roots(&state);
     let current = source_base_read_named(&state, "commit_0").await;
-    let write = source_base_replacement(
+    let write = ticketed_source_operation(source_base_replacement(
         &current,
         "pub fn commit_0() -> u32 { 200 }",
         "an entity write",
-    );
+    ));
     let stage = mcp_call_as(
         router(Arc::clone(&state)),
         "kin_transaction_stage",
@@ -439,12 +442,14 @@ async fn a_default_install_and_a_stale_shell_session_still_write() {
     )
     .await;
     assert_ne!(commit.is_error, Some(true), "{}", mcp_result_text(&commit));
+    assert_eq!(source_base_roots(&state).generation, roots.generation + 1);
     let current = source_base_read_named(&state, "commit_0").await;
-    let write = source_base_replacement(
+    assert_eq!(current["body"], "pub fn commit_0() -> u32 { 200 }");
+    let write = ticketed_source_operation(source_base_replacement(
         &current,
         "pub fn commit_0() -> u32 { 300 }",
         "entity update with default capabilities",
-    );
+    ));
     let keyed = mutate_http(
         &state,
         "kin_mutate",
@@ -454,9 +459,20 @@ async fn a_default_install_and_a_stale_shell_session_still_write() {
     )
     .await;
     assert_ne!(keyed.is_error, Some(true), "{}", mcp_result_text(&keyed));
-    assert_eq!(tool_result_payload(&commit)["modified_files"], serde_json::json!(["commit_0.rs"]));
-    assert_eq!(tool_result_payload(&keyed)["modified_files"], serde_json::json!(["commit_0.rs"]));
-    assert!(std::fs::read_to_string(repo.path().join("commit_0.rs")).unwrap().contains("{ 300 }"));
+    for result in [&commit, &keyed] {
+        let receipt = tool_result_payload(result);
+        assert_eq!(receipt["ops_applied"], 1, "{receipt}");
+        assert_eq!(receipt["already_applied"], false, "{receipt}");
+        assert!(receipt.get("modified_files").is_none(), "{receipt}");
+    }
+    assert_eq!(source_base_roots(&state).generation, roots.generation + 2);
+    assert_eq!(
+        source_base_read_named(&state, "commit_0").await["body"],
+        "pub fn commit_0() -> u32 { 300 }"
+    );
+    assert!(std::fs::read_to_string(repo.path().join("commit_0.rs"))
+        .unwrap()
+        .contains("{ 300 }"));
 
     // Push and pull pass the session check and reach the transfer itself,
     // which fails here only because nothing answers at the remote.

@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kin_model::LanguageId;
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, Command};
 use tokio::sync::{Mutex, Notify};
@@ -17,13 +16,15 @@ use crate::adapters::{LoadCheck, Readiness, ServerLaunch};
 use crate::client::{JsonRpcClient, ServerRequestAnswers, ServerWatch};
 use crate::error::{LspError, Result};
 use crate::protocol::{self, InitializeParams, InitializeResult, WorkspaceFolder};
-use crate::registry::{
-    BinaryFinder, ProviderGap, ProviderGapReason, ProviderProbe, ProviderRegistry,
-    SystemBinaryFinder,
-};
 use crate::server_process::ServerProcess;
+use crate::start_failure::{
+    rpc_error_message, spawn_failure, start_failure_reason, HandshakeFailure,
+};
+pub use crate::start_failure::{stderr_tail_for_reason, START_FAILURE_STDERR};
 use crate::typescript_call_hierarchy::TypeScriptGrammars;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::server_process::set_termination_grace_for_tests;
 pub use crate::server_process::TERMINATION_GRACE;
 
 /// How much of a server's stderr is retained. Bounded because a chatty server
@@ -55,6 +56,23 @@ pub struct LspServer {
     /// resolution named them, so no configuration of this server answers for
     /// them.
     not_in_any_build: Arc<std::collections::HashSet<std::path::PathBuf>>,
+    /// How many questions a pass keeps in flight to this server. One unless
+    /// the caller raises the ceiling (see [`Self::in_flight`]).
+    in_flight: crate::concurrency::InFlightWindow,
+    /// Keep a scripted test peer's program on disk for its whole lifetime.
+    #[cfg(any(test, feature = "test-support"))]
+    _scripted_directory: Option<tempfile::TempDir>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scripted_peer_identity(script: &str, interpreter_identity: &str) -> String {
+    format!(
+        "scripted-peer:{}",
+        kin_model::proof_context_digest(
+            "kin.test-scripted-resolver.v1",
+            &[script.as_bytes(), interpreter_identity.as_bytes()],
+        )
+    )
 }
 
 /// How long a settling launch waits for a server's first status report before
@@ -67,6 +85,37 @@ const FIRST_STATUS_WAIT: Duration = Duration::from_secs(15);
 /// can fetch dependencies, so this is generous; a server still loading when it
 /// runs out is used as it is.
 pub const LOAD_BUDGET: Duration = Duration::from_secs(180);
+
+/// How often [`LspServer::wait_until_indexed`] asks a server that reports no
+/// work for a workspace-wide answer.
+const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long, after the last piece of work a server reported ends, no new work
+/// must begin before it counts as indexed.
+const WORK_SETTLE: Duration = Duration::from_millis(300);
+
+/// How long, after a server that reported no work answers the workspace-wide
+/// probe, work may still begin and be waited on.
+const WORK_GRACE: Duration = Duration::from_secs(1);
+
+/// How [`LspServer::wait_until_indexed`] learned a server was ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Indexed {
+    /// It loads its project per document, so there was nothing to wait for.
+    PerDocument,
+    /// Its `experimental/serverStatus` reported `quiescent`.
+    Quiescent,
+    /// Every piece of work it reported through `$/progress` ended. `work` is
+    /// how many it reported.
+    ProgressEnded { work: u64 },
+    /// It reported no work, and answered a workspace-wide probe.
+    Probe,
+    /// It declares neither definitions nor references, and got a fixed pause.
+    FixedPause,
+    /// The budget ran out before it said it was ready, or it stopped
+    /// answering.
+    OutOfTime,
+}
 
 /// What a server reported about loading its project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +204,7 @@ impl ServerDeparture {
 }
 
 /// The last `max` bytes of `text`, moved forward to a character boundary.
-fn last_bytes(text: &str, max: usize) -> &str {
+pub(crate) fn last_bytes(text: &str, max: usize) -> &str {
     if text.len() <= max {
         return text;
     }
@@ -228,23 +277,39 @@ fn drain_stderr(stderr: ChildStderr) -> StderrTail {
     StderrTail { buffer, drained }
 }
 
-/// Attach the server's own last words to a failure, when it left any.
+/// How long [`LspServer::launch`] waits for a server to answer `initialize`.
 ///
-/// A server that answers over JSON-RPC explains itself through the error it
-/// returns. One that dies before it can frame a reply explains itself only on
-/// stderr, and that is the case this exists for.
-async fn with_stderr(reason: LspError, tail: &StderrTail) -> LspError {
-    // Wait, briefly, for the stream to reach EOF. A server that has already
-    // exited hits EOF at once; a server still running never does, which is what
-    // the bound is for.
+/// Ten seconds, the client's default request limit, which was always the
+/// limit that fired first: a 30 s bound around the request never ran out, so
+/// a start that names 10 s states what has been in force.
+pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a server wrote to stderr so far, after waiting briefly for the stream
+/// to reach EOF.
+///
+/// The write that fails and the read that captures the server's words happen
+/// on different tasks, so at the instant a failure surfaces the words may be
+/// there and not collected yet. A server that has already exited hits EOF at
+/// once; a server still running never does, which is what the bound is for.
+async fn settled_stderr(tail: &StderrTail) -> String {
     let _ = tokio::time::timeout(STDERR_SETTLE, tail.drained.notified()).await;
     let captured = tail.buffer.lock().await;
-    if captured.is_empty() {
-        return reason;
-    }
-    LspError::ServerFailedWithStderr {
-        reason: reason.to_string(),
-        stderr: String::from_utf8_lossy(&captured).trim().to_string(),
+    String::from_utf8_lossy(&captured).trim().to_string()
+}
+
+/// How the server's process ended, as the clause a reason carries ("it
+/// exited with code 3"), waiting up to [`STDERR_SETTLE`] for it: a closed
+/// pipe and a reaped exit are separate events.
+async fn settled_exit(process: &mut ServerProcess) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + STDERR_SETTLE;
+    loop {
+        if let Some(status) = process.exit_status() {
+            return Some(describe_exit(status));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -283,6 +348,103 @@ impl LspServer {
         .await
     }
 
+    /// Start a controlled Python peer whose context binds its script and
+    /// interpreter bytes. Answer fixtures are mutable server data, so changing
+    /// an answer keeps the context current while changing the program does not.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn start_scripted_for_tests(
+        script: &str,
+        responses: &serde_json::Value,
+        workspace_root: &Path,
+    ) -> Result<Self> {
+        let python = which::which("python3")
+            .map_err(|error| LspError::ServerNotFound(format!("python3: {error}")))?;
+        Self::start_scripted_with_python_for_tests(&python, script, responses, workspace_root).await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn start_scripted_with_python_for_tests(
+        selected_python: &Path,
+        script: &str,
+        responses: &serde_json::Value,
+        workspace_root: &Path,
+    ) -> Result<Self> {
+        // A version-manager shim selects Python but does not identify its
+        // bytes. Ask that interpreter where it runs, then identify and launch
+        // the resolved binary directly for this controlled fixture.
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(selected_python)
+                .args(["-c", "import json, sys; print(json.dumps(sys.executable))"])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            LspError::ServerStartFailed("scripted peer interpreter probe timed out".into())
+        })??;
+        if !output.status.success() {
+            return Err(LspError::ServerStartFailed(format!(
+                "scripted peer interpreter probe exited with {}",
+                output.status
+            )));
+        }
+        let executable: String = serde_json::from_slice(&output.stdout).map_err(|error| {
+            LspError::ServerStartFailed(format!(
+                "scripted peer interpreter probe returned no executable: {error}"
+            ))
+        })?;
+        let executable = Path::new(&executable);
+        if !executable.is_absolute() {
+            return Err(LspError::ServerStartFailed(
+                "scripted peer interpreter probe returned a non-absolute executable".into(),
+            ));
+        }
+        let python = executable.canonicalize()?;
+        let interpreter_identity = crate::proof_context::resolver_content_identity(&python)
+            .ok_or_else(|| {
+                LspError::ServerStartFailed(format!(
+                    "scripted peer interpreter {} has no content identity",
+                    python.display()
+                ))
+            })?;
+        let identity = scripted_peer_identity(script, &interpreter_identity);
+        let directory = tempfile::Builder::new()
+            .prefix("kin-scripted-lsp-")
+            .tempdir()?;
+        let program = directory.path().join("scripted-peer.py");
+        std::fs::write(&program, script)?;
+        let program = program.canonicalize()?;
+        let command = python.to_str().ok_or_else(|| {
+            LspError::ServerStartFailed("scripted peer interpreter path is not UTF-8".into())
+        })?;
+        let program = program.to_str().ok_or_else(|| {
+            LspError::ServerStartFailed("scripted peer program path is not UTF-8".into())
+        })?;
+        let responses = responses.to_string();
+        let mut server = Self::start(
+            command,
+            &["-u", program, &responses],
+            workspace_root,
+            None,
+            None,
+        )
+        .await?;
+        // The fixture controls the exact program rather than guessing its
+        // identity from an interpreter process. Random temporary paths do not
+        // name its program, and Kin's producer identity remains in the basis.
+        server.proof_basis = crate::proof_context::ProofBasis::of_resolver(
+            &ServerLaunch::default(),
+            workspace_root,
+            "scripted-peer",
+            Some(&identity),
+            Some("scripted-peer"),
+            None,
+        );
+        server._scripted_directory = Some(directory);
+        Ok(server)
+    }
+
     /// Start an LSP server with one adapter's whole configuration and perform
     /// the initialize handshake.
     ///
@@ -295,6 +457,8 @@ impl LspServer {
     /// Python interpreter pyright is told to use. The client answers the
     /// server's requests from the launch's settings and the one workspace
     /// folder. `typescript_grammars` are as for [`Self::start`].
+    ///
+    /// The server is given [`INITIALIZE_TIMEOUT`] to answer `initialize`.
     pub async fn launch(
         command: &str,
         args: &[&str],
@@ -302,13 +466,42 @@ impl LspServer {
         launch: &ServerLaunch,
         typescript_grammars: Option<TypeScriptGrammars>,
     ) -> Result<Self> {
+        Self::launch_within(
+            command,
+            args,
+            workspace_root,
+            launch,
+            typescript_grammars,
+            INITIALIZE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// [`Self::launch`], giving the server `handshake_limit` to answer
+    /// `initialize`.
+    ///
+    /// The limit is enforced here rather than around the call, so a server
+    /// that runs it out is still held when its failure is described: the
+    /// reason names the limit and carries the end of its stderr, which an
+    /// outer timeout that drops the start can no longer read. A failure of
+    /// any kind is a [`LspError::HandshakeFailed`] whose sentence is the whole
+    /// reason, or a [`LspError::ServerNotFound`] naming where the program was
+    /// looked for.
+    pub async fn launch_within(
+        command: &str,
+        args: &[&str],
+        workspace_root: &Path,
+        launch: &ServerLaunch,
+        typescript_grammars: Option<TypeScriptGrammars>,
+        handshake_limit: Duration,
+    ) -> Result<Self> {
         info!(command, ?args, configuration = %launch.label, "starting LSP server");
 
         let mut invocation = Command::new(command);
         invocation.args(args);
         invocation.envs(launch.env.iter().map(|(name, value)| (name, value)));
         let mut process = ServerProcess::spawn(invocation)
-            .map_err(|e| LspError::ServerStartFailed(format!("{}: {}", command, e)))?;
+            .map_err(|error| spawn_failure(command, launch, &error))?;
 
         let (stdin, stdout, stderr) = process.take_stdio();
         let stdin = stdin
@@ -335,21 +528,42 @@ impl LspServer {
         let init_params = InitializeParams::for_launch(workspace_root, launch);
 
         let handshake = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            client.request("initialize", &init_params),
+            handshake_limit,
+            client.request_within("initialize", &init_params, handshake_limit),
         )
         .await;
 
         let result = match handshake {
-            Err(_) => return Err(with_stderr(LspError::Timeout, &stderr_tail).await),
-            Ok(Err(error)) => {
-                return Err(with_stderr(
-                    LspError::InitializeFailed(error.to_string()),
+            Ok(Ok(result)) => result,
+            Err(_) | Ok(Err(LspError::Timeout)) => {
+                return Err(Self::describe_start_failure(
+                    command,
+                    launch,
+                    HandshakeFailure::TimedOut(handshake_limit),
+                    &mut process,
                     &stderr_tail,
+                    &client,
                 )
                 .await)
             }
-            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                let failure = match error {
+                    LspError::JsonRpc(error) => {
+                        HandshakeFailure::Refused(rpc_error_message(&error))
+                    }
+                    LspError::ServerDied | LspError::Io(_) => HandshakeFailure::Ended,
+                    other => HandshakeFailure::Other(other.to_string()),
+                };
+                return Err(Self::describe_start_failure(
+                    command,
+                    launch,
+                    failure,
+                    &mut process,
+                    &stderr_tail,
+                    &client,
+                )
+                .await);
+            }
         };
 
         let init_result: InitializeResult = serde_json::from_value(result)
@@ -416,7 +630,40 @@ impl LspServer {
             proof_basis,
             external_symbols,
             not_in_any_build,
+            in_flight: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            _scripted_directory: None,
         })
+    }
+
+    /// The [`LspError::HandshakeFailed`] for a server that started and did not
+    /// complete the handshake, read while its process, stderr and
+    /// notifications are still held. See [`start_failure_reason`].
+    async fn describe_start_failure(
+        command: &str,
+        launch: &ServerLaunch,
+        failure: HandshakeFailure,
+        process: &mut ServerProcess,
+        stderr_tail: &StderrTail,
+        client: &JsonRpcClient,
+    ) -> LspError {
+        let stderr = settled_stderr(stderr_tail).await;
+        // A server that ran out its time is still running, and waiting for it
+        // to exit would only spend the bound.
+        let exit = match failure {
+            HandshakeFailure::TimedOut(_) => process.exit_status().map(describe_exit),
+            _ => settled_exit(process).await,
+        };
+        let reason = start_failure_reason(
+            command,
+            &failure,
+            exit.as_deref(),
+            client.backend_exit(),
+            &stderr,
+            launch.toolchain_gap.as_deref(),
+        );
+        warn!(command, %reason, "the language server did not start");
+        LspError::HandshakeFailed(reason)
     }
 
     /// The proof context of this server's answers about `language`.
@@ -564,6 +811,126 @@ impl LspServer {
         self.readiness
     }
 
+    /// How many questions a pass keeps in flight to this server: a window
+    /// that starts at its ceiling, halves when the server falls behind and
+    /// widens back as it keeps up. The ceiling is one, one question at a
+    /// time, until the caller sets another with
+    /// [`crate::concurrency::InFlightWindow::set_ceiling`].
+    pub fn in_flight(&self) -> &crate::concurrency::InFlightWindow {
+        &self.in_flight
+    }
+
+    /// Wait, at most `budget`, until this server has finished indexing its
+    /// workspace, by the server's own word where it gives one, and say how
+    /// that was learned.
+    ///
+    /// - A server that loads its project per document has nothing to index
+    ///   before a document is open, and is ready at once.
+    /// - rust-analyzer says so in `experimental/serverStatus`: ready once it
+    ///   reports `quiescent`.
+    /// - A server that reports its indexing through `$/progress` is ready
+    ///   once every piece of work it began has ended and no new work begins
+    ///   for a moment. gopls loading packages and clangd indexing in the
+    ///   background report this way.
+    /// - Any other server is asked `workspace/symbol` with an empty query
+    ///   until it answers, as every server once was. An answer is taken as
+    ///   ready unless work begins within a second of it. pyright and
+    ///   Apple's clangd report no work at startup, so they are ready here,
+    ///   a second after they answer.
+    ///
+    /// A workspace-wide answer alone was the only signal the sweep had, and
+    /// a server that answers one while it is still indexing had its first
+    /// questions queued behind the index, each allowed two seconds.
+    pub async fn wait_until_indexed(&self, budget: Duration) -> Indexed {
+        if self.readiness == Readiness::PerDocument {
+            return Indexed::PerDocument;
+        }
+        if !self.has_references() && !self.has_definition() {
+            tokio::time::sleep(budget.min(Duration::from_secs(5))).await;
+            return Indexed::FixedPause;
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut status = self.client.server_status();
+        let quiescent = |status: &Option<serde_json::Value>| {
+            status
+                .as_ref()
+                .and_then(|status| status.get("quiescent"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        if status.borrow().is_some() {
+            let reported = tokio::time::timeout_at(deadline, status.wait_for(quiescent))
+                .await
+                .map(|seen| seen.is_ok());
+            return match reported {
+                Ok(true) => Indexed::Quiescent,
+                _ => Indexed::OutOfTime,
+            };
+        }
+        let mut progress = self.client.progress();
+        loop {
+            if progress.borrow().busy() {
+                let ended =
+                    tokio::time::timeout_at(deadline, progress.wait_for(|work| !work.busy()))
+                        .await
+                        .map(|seen| seen.is_ok());
+                if ended != Ok(true) {
+                    return Indexed::OutOfTime;
+                }
+                // Servers end one piece of work and begin the next: gopls
+                // sets up its workspace, then loads packages.
+                let begun = progress.borrow().begun;
+                let more = tokio::time::timeout(
+                    WORK_SETTLE
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    progress.wait_for(|work| work.begun > begun),
+                )
+                .await
+                .map(|seen| seen.is_ok());
+                if more != Ok(true) {
+                    return Indexed::ProgressEnded {
+                        work: progress.borrow().ended,
+                    };
+                }
+                continue;
+            }
+            if progress.borrow().ended > 0 {
+                return Indexed::ProgressEnded {
+                    work: progress.borrow().ended,
+                };
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let probe = tokio::time::timeout(
+                remaining,
+                self.client
+                    .request("workspace/symbol", serde_json::json!({ "query": "" })),
+            )
+            .await;
+            if progress.borrow().busy() {
+                continue;
+            }
+            if matches!(probe, Ok(Ok(_))) {
+                // Work a server begins right after it answers is still work
+                // the sweep's first questions would queue behind.
+                let grace =
+                    WORK_GRACE.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                let began = tokio::time::timeout(grace, progress.wait_for(|work| work.begun > 0))
+                    .await
+                    .map(|seen| seen.is_ok());
+                if began == Ok(true) {
+                    continue;
+                }
+                return Indexed::Probe;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Indexed::OutOfTime;
+            }
+            let pause =
+                PROBE_INTERVAL.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let _ = tokio::time::timeout(pause, progress.changed()).await;
+        }
+    }
+
     /// Wait, at most `budget`, until the server answers a request about the
     /// document at `uri`, which the caller has just opened, and return how
     /// long that took.
@@ -639,6 +1006,11 @@ impl LspServer {
             if let Some(report) = self.client.backend_exit() {
                 break Some(format!("it reported that its backend exited: {report}"));
             }
+            // A server whose own state failed runs on too, and failing every
+            // question the same way is how it ended.
+            if let Some(reason) = self.client.wedged() {
+                break Some(format!("its own state failed: {reason}"));
+            }
             if tokio::time::Instant::now() >= deadline {
                 break None;
             }
@@ -691,6 +1063,8 @@ impl LspServer {
             ),
             external_symbols: Arc::default(),
             not_in_any_build: Arc::default(),
+            in_flight: Default::default(),
+            _scripted_directory: None,
         }
     }
 
@@ -752,6 +1126,8 @@ impl LspServer {
             ),
             external_symbols: Arc::default(),
             not_in_any_build: Arc::default(),
+            in_flight: Default::default(),
+            _scripted_directory: None,
         }
     }
 
@@ -847,98 +1223,121 @@ impl LspServer {
     }
 }
 
-/// How long a readiness probe waits for a server to complete the handshake.
-///
-/// Deliberately far below the 30 s ceiling [`LspServer::start`] allows an
-/// enrichment run. A probe answers an operator or a startup path, and a
-/// surface that blocks for half a minute to render one status row has traded
-/// one bad answer for a worse experience.
-pub const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The startup probe lives in [`crate::readiness_probe`] and keeps its names
+/// here, where its callers already look for them.
+pub use crate::readiness_probe::{
+    probe_adapter, probe_readiness, probe_readiness_with, AdapterProbe, READINESS_PROBE_TIMEOUT,
+    READINESS_REPEAT_TIMEOUT,
+};
 
-/// Ask whether a language is actually served on this host, and answer with one
-/// of three states rather than two.
-///
-/// `Ok` is usable: the server resolved, completed the initialize handshake, and
-/// reported the capabilities in the returned [`ProviderProbe`]. `Err` is a
-/// [`ProviderGap`] whose reason separates the two ways a language can fail to
-/// be served: no binary at all, versus a binary that is present and refuses to
-/// initialize. Those need different repairs, which is why the caller is given
-/// the distinction instead of a boolean.
-///
-/// This exists because a binary on `PATH` is not a working language server.
-/// Resolution alone answered the weaker question, and a host whose server was
-/// installed but unusable was reported as served by every surface that asked.
-///
-/// It spawns a process, so it belongs to lifecycle paths that may spawn
-/// (daemon start, install verification, a diagnostic command) and never to a
-/// query path.
-pub async fn probe_readiness(
-    registry: &ProviderRegistry,
-    language: LanguageId,
-    workspace_root: &Path,
-    initialization_options: Option<serde_json::Value>,
-) -> std::result::Result<ProviderProbe, ProviderGap> {
-    probe_readiness_with(
-        registry,
-        language,
-        workspace_root,
-        initialization_options,
-        &SystemBinaryFinder,
-    )
-    .await
-}
+#[cfg(test)]
+mod scripted_identity_tests {
+    use super::*;
+    use kin_model::LanguageId;
 
-/// [`probe_readiness`] with an injected [`BinaryFinder`], so the three states
-/// can be exercised against fixture servers instead of whatever the host
-/// happens to have installed.
-pub async fn probe_readiness_with(
-    registry: &ProviderRegistry,
-    language: LanguageId,
-    workspace_root: &Path,
-    initialization_options: Option<serde_json::Value>,
-    finder: &dyn BinaryFinder,
-) -> std::result::Result<ProviderProbe, ProviderGap> {
-    let resolved = registry.resolve_with(language, finder)?;
-    let command = resolved.command.display().to_string();
-    let args: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scripted_peer_resolves_a_wrapper_and_executes_the_identified_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
 
-    let started = tokio::time::timeout(
-        READINESS_PROBE_TIMEOUT,
-        // A probe only checks readiness and never enriches, so it proves no
-        // TypeScript binding initializer and needs no grammar.
-        LspServer::start(
-            &command,
-            &args,
-            workspace_root,
-            initialization_options,
-            None,
-        ),
-    )
-    .await;
-
-    let unusable = |message: String| ProviderGap {
-        language,
-        reason: ProviderGapReason::ServerUnusable { message },
-        tried: vec![resolved.id.clone()],
-    };
-
-    match started {
-        Err(_) => Err(unusable(format!(
-            "did not complete the initialize handshake within {}s",
-            READINESS_PROBE_TIMEOUT.as_secs()
-        ))),
-        Ok(Err(error)) => Err(unusable(error.to_string())),
-        Ok(Ok(server)) => {
-            let probed_capabilities = server.probed_capabilities();
-            // Dropped rather than shut down politely: a drop ends the server's
-            // whole process group at once, and a probe has no session worth
-            // closing.
-            drop(server);
-            Ok(ProviderProbe {
-                resolved,
-                probed_capabilities,
-            })
+        let root = tempfile::tempdir().unwrap();
+        let python = which::which("python3").unwrap();
+        let wrapper = root.path().join("python-wrapper");
+        let quoted_python = python.to_str().unwrap().replace('\'', "'\\''");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\n[ \"$1\" = -c ] || exit 93\nexec '{quoted_python}' \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(crate::proof_context::resolver_content_identity(&wrapper).is_none());
+        let script = include_str!("enrichment_test_peer.py")
+            .replace("os.environ[\"KIN_LSP_TEST_RESPONSES\"]", "sys.argv[1]");
+        let responses = serde_json::json!({
+            "initialize": {"result": {"capabilities": {}}},
+            "test/answer": {"result": "native peer answered"}
+        });
+        let mut contexts = Vec::new();
+        for selected in [&wrapper, &python] {
+            let server = LspServer::start_scripted_with_python_for_tests(
+                selected,
+                &script,
+                &responses,
+                root.path(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                server
+                    .client
+                    .request("test/answer", serde_json::json!({}))
+                    .await
+                    .unwrap(),
+                serde_json::json!("native peer answered")
+            );
+            contexts.push(server.proof_context(LanguageId::Python));
+            server.shutdown().await.unwrap();
         }
+        assert_eq!(contexts[0], contexts[1], "the wrapper is not the resolver");
+    }
+
+    #[tokio::test]
+    async fn a_scripted_peer_context_binds_program_bytes_and_keeps_answer_changes_current() {
+        let root = tempfile::tempdir().unwrap();
+        let script = include_str!("enrichment_test_peer.py")
+            .replace("os.environ[\"KIN_LSP_TEST_RESPONSES\"]", "sys.argv[1]");
+        let changed_script = script.replace("seen = []", "seen = [\"new peer\"]");
+        let responses = serde_json::json!({"initialize": {"result": {"capabilities": {}}}});
+        let mut changed_responses = responses.clone();
+        changed_responses["textDocument/definition"] = serde_json::json!({"result": []});
+        let mut contexts = Vec::new();
+        let mut definition_answers = Vec::new();
+        for (program, answers) in [
+            (script.as_str(), &responses),
+            (script.as_str(), &changed_responses),
+            (changed_script.as_str(), &responses),
+        ] {
+            let server = LspServer::start_scripted_for_tests(program, answers, root.path())
+                .await
+                .unwrap();
+            let directory = server
+                ._scripted_directory
+                .as_ref()
+                .unwrap()
+                .path()
+                .to_owned();
+            let program_path = directory.join("scripted-peer.py");
+            assert_eq!(std::fs::read_to_string(&program_path).unwrap(), program);
+            assert!(!program_path.starts_with(root.path()));
+            contexts.push(server.proof_context(LanguageId::Python));
+            definition_answers.push(
+                server
+                    .client
+                    .request("textDocument/definition", serde_json::json!({}))
+                    .await
+                    .unwrap(),
+            );
+            server.shutdown().await.unwrap();
+            assert!(
+                !directory.exists(),
+                "shutdown releases the owned peer program"
+            );
+        }
+        assert_eq!(definition_answers[0], serde_json::Value::Null);
+        assert_eq!(definition_answers[1], serde_json::json!([]));
+        assert_eq!(contexts[0], contexts[1], "answers are mutable server data");
+        assert_ne!(
+            contexts[0], contexts[2],
+            "another program is another context"
+        );
+    }
+
+    #[test]
+    fn a_scripted_peer_identity_also_binds_its_interpreter_bytes() {
+        assert_ne!(
+            scripted_peer_identity("program", "sha256:one"),
+            scripted_peer_identity("program", "sha256:two"),
+        );
     }
 }
 
@@ -1173,7 +1572,11 @@ exec(open(sys.argv[2]).read())
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
-    use crate::registry::LspCapability;
+    use crate::registry::{
+        BinaryFinder, LspCapability, ProviderGap, ProviderGapReason, ProviderProbe,
+        ProviderRegistry,
+    };
+    use kin_model::LanguageId;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1303,6 +1706,9 @@ exit 127
         fn probe_version(&self, _path: &Path) -> Option<String> {
             Some("fixture".to_string())
         }
+        fn searched(&self) -> String {
+            "/fixture/bin, /usr/bin".to_string()
+        }
     }
 
     async fn probe(finder: &FixtureFinder) -> std::result::Result<ProviderProbe, ProviderGap> {
@@ -1382,8 +1788,20 @@ exit 127
             .expect_err("no binary means no server");
         assert_eq!(
             gap.reason,
-            ProviderGapReason::NoBinaryOnPath,
+            ProviderGapReason::NoBinaryOnPath {
+                binaries: vec![
+                    "typescript-language-server".to_string(),
+                    "vtsls".to_string()
+                ],
+                searched: "/fixture/bin, /usr/bin".to_string(),
+            },
             "an absent binary and an unusable server need different repairs"
+        );
+        let reason = gap.reason.to_string();
+        assert!(
+            reason.contains("`typescript-language-server`")
+                && reason.contains("looked in /fixture/bin, /usr/bin"),
+            "a missing server names what was looked for and where: {reason}"
         );
     }
 
@@ -1415,8 +1833,7 @@ exit 127
             drained.notify_one();
         });
 
-        let attached = with_stderr(LspError::ServerDied, &tail).await;
-        let rendered = attached.to_string();
+        let rendered = settled_stderr(&tail).await;
         assert!(
             rendered.contains("fatal: the reason it died"),
             "the server's words arrived after the failure and were read as silence: {rendered}"
@@ -1437,23 +1854,244 @@ exit 127
         );
     }
 
+    /// Start a fixture through the production launch, with `launch` and a
+    /// handshake limit of the test's own, and return why it did not start.
+    async fn start_failure(program: PathBuf, launch: ServerLaunch, limit: Duration) -> String {
+        let program = program.display().to_string();
+        match LspServer::launch_within(
+            "/bin/sh",
+            &[program.as_str()],
+            Path::new("/tmp"),
+            &launch,
+            None,
+            limit,
+        )
+        .await
+        {
+            Ok(_) => panic!("the fixture was expected not to start"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The field report's bare "would not start": a server that writes why to
+    /// stderr and exits before it answers initialize. The reason names the
+    /// exit status and the stderr line, where it used to be "server
+    /// initialization failed: server shutdown unexpectedly".
+    #[tokio::test]
+    async fn a_server_that_exits_during_initialize_names_its_status_and_stderr() {
+        let reason = start_failure(
+            fixture(
+                r#"#!/bin/sh
+echo 'Error: Cannot find module typescript/lib/tsserver.js' >&2
+exit 3
+"#,
+            ),
+            ServerLaunch::default(),
+            INITIALIZE_TIMEOUT,
+        )
+        .await;
+        assert!(
+            reason.contains("did not answer initialize: it exited with code 3"),
+            "the exit status is the first thing a reader needs: {reason}"
+        );
+        assert!(
+            reason.contains("Cannot find module typescript/lib/tsserver.js"),
+            "the server's own words are the rest: {reason}"
+        );
+        assert!(!reason.contains("shutdown unexpectedly"), "{reason}");
+    }
+
+    /// A server that never answers is reported as a timeout with the limit
+    /// it ran out, and with what it had written to stderr by then. The limit
+    /// is enforced inside the launch, so the stderr is still there to read.
+    #[tokio::test]
+    async fn a_server_that_never_answers_initialize_names_the_limit_and_its_stderr() {
+        let reason = start_failure(
+            fixture(
+                r#"#!/bin/sh
+echo 'loading 4000 files' >&2
+read -r _ 2>/dev/null
+sleep 30
+"#,
+            ),
+            ServerLaunch::default(),
+            Duration::from_millis(400),
+        )
+        .await;
+        assert!(
+            reason.contains("did not answer initialize within 400ms"),
+            "a timeout names its duration: {reason}"
+        );
+        assert!(reason.contains("loading 4000 files"), "{reason}");
+    }
+
+    /// A program that is not installed names where it was looked for.
+    #[tokio::test]
+    async fn a_missing_executable_names_the_directories_it_was_looked_for_in() {
+        let launch = ServerLaunch {
+            env: vec![(
+                "PATH".to_string(),
+                "/kin-test-nowhere/bin:/kin-test-elsewhere".to_string(),
+            )],
+            ..ServerLaunch::default()
+        };
+        let error = LspServer::launch_within(
+            "kin-no-such-language-server",
+            &[],
+            Path::new("/tmp"),
+            &launch,
+            None,
+            INITIALIZE_TIMEOUT,
+        )
+        .await
+        .err()
+        .expect("no such program starts");
+        let reason = error.to_string();
+        assert!(
+            reason.contains("no `kin-no-such-language-server` on PATH")
+                && reason.contains("/kin-test-nowhere/bin, /kin-test-elsewhere"),
+            "{reason}"
+        );
+    }
+
+    /// An initialize error response is reported by its `message`, never as
+    /// raw JSON-RPC, and the adapter's own finding about what is missing is
+    /// carried beside it.
+    #[tokio::test]
+    async fn an_initialize_error_response_is_reported_by_its_message() {
+        let launch = ServerLaunch {
+            toolchain_gap: Some(
+                "No TypeScript was found outside the repository: looked beside \
+                 typescript-language-server and for tsserver or tsc on PATH"
+                    .to_string(),
+            ),
+            ..ServerLaunch::default()
+        };
+        let reason = start_failure(unusable_server(), launch, INITIALIZE_TIMEOUT).await;
+        assert!(
+            reason.contains("refused initialize: Could not find a valid TypeScript installation"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("\"code\""),
+            "raw JSON-RPC leaked: {reason}"
+        );
+        assert!(
+            reason.ends_with("for tsserver or tsc on PATH"),
+            "the adapter's finding names where Kin looked: {reason}"
+        );
+    }
+
+    /// An adapter whose server is the fixture script, run by the shell the
+    /// finder resolves, with a launch that carries a toolchain finding.
+    struct FixtureAdapter(PathBuf);
+
+    impl crate::adapters::LspAdapter for FixtureAdapter {
+        fn language_id(&self) -> LanguageId {
+            LanguageId::TypeScript
+        }
+        fn server_command(&self) -> &str {
+            "fixture-language-server"
+        }
+        fn server_args(&self) -> Vec<String> {
+            vec![self.0.display().to_string()]
+        }
+        fn file_extensions(&self) -> &[&str] {
+            &["ts"]
+        }
+        fn launch(&self, _workspace_root: &Path) -> ServerLaunch {
+            ServerLaunch {
+                toolchain_gap: Some("the adapter found no toolchain".to_string()),
+                ..ServerLaunch::default()
+            }
+        }
+    }
+
+    /// The probe `kin doctor` runs starts the adapter's server with the
+    /// adapter's launch, as the daemon does, and keeps its three answers
+    /// apart: not installed (naming where it looked) and unusable (with the
+    /// whole reason, the launch's finding included).
+    #[tokio::test]
+    async fn an_adapter_probe_starts_the_adapters_launch_and_names_each_gap() {
+        let adapter = FixtureAdapter(unusable_server());
+        let adapter = &adapter;
+        let probe = |finder: FixtureFinder| async move {
+            crate::readiness_probe::probe_adapter(
+                adapter,
+                Path::new("/tmp"),
+                Duration::from_secs(10),
+                &finder,
+            )
+            .await
+        };
+        match probe(FixtureFinder(Some(PathBuf::from("/bin/sh")))).await {
+            crate::readiness_probe::AdapterProbe::Unusable { reason } => {
+                assert!(
+                    reason.contains("Could not find a valid TypeScript installation")
+                        && reason.ends_with("the adapter found no toolchain"),
+                    "{reason}"
+                );
+            }
+            other => panic!("a refused handshake is unusable, not {other:?}"),
+        }
+        assert_eq!(
+            probe(FixtureFinder(None)).await,
+            crate::readiness_probe::AdapterProbe::NotInstalled {
+                reason: "no `fixture-language-server` on PATH (looked in /fixture/bin, /usr/bin)"
+                    .to_string()
+            }
+        );
+    }
+
     /// A server that finishes the handshake and then exits on its own, having
     /// said why on stderr, the way a Go server that cannot start another
-    /// thread does partway through loading packages.
+    /// thread does partway through loading packages once a document is open.
     ///
-    /// It stays up long enough for the `initialized` notification to be
-    /// written, so the handshake is not what fails.
+    /// It reads every message it is sent whole before it acts: the
+    /// `initialize` request, the `initialized` notification, and then one more
+    /// message, which is when it dies. So the handshake is not what fails,
+    /// the test has seen it connected before it goes, and no write of the
+    /// client's can meet a closed pipe. It used to sleep two seconds after the
+    /// handshake instead, which every test using it waited out.
+    ///
+    /// `read` takes a header line and the blank line after it, and `dd`
+    /// takes exactly the body's bytes, one at a time, so nothing of the next
+    /// message is consumed with it.
     fn server_that_exits_after_the_handshake() -> PathBuf {
         fixture(
             r#"#!/bin/sh
-read -r _ 2>/dev/null
+read_message() {
+  IFS= read -r header || exit 0
+  length=${header#Content-Length: }
+  length=${length%?}
+  IFS= read -r _
+  dd bs=1 count="$length" of=/dev/null 2>/dev/null
+}
+read_message
 BODY='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"definitionProvider":true}}}'
 printf 'Content-Length: %d\r\n\r\n%s' "${#BODY}" "$BODY"
-sleep 2
+read_message
+read_message
 echo 'fatal error: runtime: failed to create new OS thread' >&2
 exit 2
 "#,
         )
+    }
+
+    /// Hand `server` a document, which is what makes
+    /// [`server_that_exits_after_the_handshake`] load packages and die.
+    async fn open_a_document(server: &LspServer) {
+        server
+            .client
+            .notify(
+                "textDocument/didOpen",
+                serde_json::json!({"textDocument": {
+                    "uri": "file:///w/main.go", "languageId": "go", "version": 1,
+                    "text": "package main\n",
+                }}),
+            )
+            .await
+            .expect("the server reads the whole document before it dies");
     }
 
     async fn start(program: PathBuf) -> LspServer {
@@ -1478,6 +2116,7 @@ exit 2
             !server.is_disconnected(),
             "a server that has just answered the handshake is connected"
         );
+        open_a_document(&server).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !server.is_disconnected() {
             assert!(
@@ -1539,6 +2178,7 @@ exit 2
     async fn a_departure_leaves_the_dead_leader_unreaped_until_the_stop() {
         let mut server = start(server_that_exits_after_the_handshake()).await;
         let leader = server.process.leader_pid();
+        open_a_document(&server).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !server.is_disconnected() {
             assert!(
@@ -1603,5 +2243,186 @@ exit 2
             quiet.describe(16),
             "its process had not exited, and it wrote nothing to stderr"
         );
+    }
+}
+
+#[cfg(test)]
+mod indexed_tests {
+    use super::*;
+
+    /// A peer that, before it reads anything, runs the script in the
+    /// `KIN_LSP_TEST_RESPONSES` it was handed under `startup`: notifications
+    /// written at their delay in seconds. It answers `workspace/symbol` at
+    /// once, whatever work it has reported, counts
+    /// the probes, and answers `test/probes` with that count.
+    const INDEXING_PEER: &str = r#"
+import json, os, sys, threading
+script = json.loads(os.environ["KIN_LSP_TEST_RESPONSES"])
+lock = threading.Lock()
+probes = [0]
+def write(message):
+    payload = json.dumps({"jsonrpc": "2.0", **message}).encode()
+    with lock:
+        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(payload) + payload)
+        sys.stdout.buffer.flush()
+for delay, notice in script.get("startup", []):
+    timer = threading.Timer(delay, write, [notice])
+    timer.daemon = True
+    timer.start()
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b"\n", b"\r\n"):
+            break
+        name, value = line.decode().split(":", 1)
+        headers[name.lower()] = value.strip()
+    message = json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+    if "id" not in message:
+        continue
+    if message["method"] == "workspace/symbol":
+        probes[0] += 1
+        write({"id": message["id"], "result": []})
+    elif message["method"] == "test/probes":
+        write({"id": message["id"], "result": probes[0]})
+    else:
+        write({"id": message["id"], "result": None})
+"#;
+
+    fn progress(token: &str, kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "method": "$/progress",
+            "params": {"token": token, "value": {"kind": kind, "title": "Indexing"}},
+        })
+    }
+
+    async fn probes(server: &LspServer) -> u64 {
+        server
+            .client
+            .request("test/probes", serde_json::Value::Null)
+            .await
+            .unwrap()
+            .as_u64()
+            .unwrap()
+    }
+
+    /// A server that answers the workspace-wide probe at once while it
+    /// reports indexing work is waited on until that work ends. The probe
+    /// alone called it ready the moment it answered.
+    #[tokio::test]
+    async fn a_server_reporting_indexing_is_ready_when_its_work_ends() {
+        let server = LspServer::scripted_for_tests(
+            INDEXING_PEER,
+            serde_json::json!({"startup": [
+                [0.0, progress("load", "begin")],
+                [0.4, progress("load", "end")],
+                [0.5, progress("index", "begin")],
+                [1.2, progress("index", "end")],
+            ]}),
+        );
+        let started = tokio::time::Instant::now();
+        let indexed = server.wait_until_indexed(Duration::from_secs(10)).await;
+        let waited = started.elapsed();
+        server.shutdown().await.unwrap();
+        assert_eq!(indexed, Indexed::ProgressEnded { work: 2 });
+        assert!(waited >= Duration::from_millis(1200), "waited {waited:?}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+    }
+
+    /// Work that begins just after the probe answered is still waited on.
+    #[tokio::test]
+    async fn work_that_begins_after_the_probe_answered_is_waited_on() {
+        let server = LspServer::scripted_for_tests(
+            INDEXING_PEER,
+            serde_json::json!({"startup": [
+                [0.3, progress("late", "begin")],
+                [1.0, progress("late", "end")],
+            ]}),
+        );
+        let started = tokio::time::Instant::now();
+        let indexed = server.wait_until_indexed(Duration::from_secs(10)).await;
+        let waited = started.elapsed();
+        server.shutdown().await.unwrap();
+        assert_eq!(indexed, Indexed::ProgressEnded { work: 1 });
+        assert!(waited >= Duration::from_millis(1000), "waited {waited:?}");
+    }
+
+    /// A server that reports no work falls back to the probe, and is ready
+    /// once it answers.
+    #[tokio::test]
+    async fn a_server_that_reports_nothing_is_ready_when_the_probe_answers() {
+        let server =
+            LspServer::scripted_for_tests(INDEXING_PEER, serde_json::json!({"startup": []}));
+        let started = tokio::time::Instant::now();
+        let indexed = server.wait_until_indexed(Duration::from_secs(10)).await;
+        let waited = started.elapsed();
+        let asked = probes(&server).await;
+        server.shutdown().await.unwrap();
+        assert_eq!(indexed, Indexed::Probe);
+        assert_eq!(asked, 1);
+        assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+    }
+
+    /// rust-analyzer's own status decides, and no probe is sent.
+    #[tokio::test]
+    async fn a_server_status_decides_without_a_probe() {
+        let status = |quiescent: bool| {
+            serde_json::json!({
+                "method": "experimental/serverStatus",
+                "params": {"health": "ok", "quiescent": quiescent},
+            })
+        };
+        let server = LspServer::scripted_for_tests(
+            INDEXING_PEER,
+            serde_json::json!({"startup": [[0.0, status(false)], [0.8, status(true)]]}),
+        );
+        let mut reported = server.client.server_status();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), reported.wait_for(Option::is_some)).await;
+        drop(reported);
+        let started = tokio::time::Instant::now();
+        let indexed = server.wait_until_indexed(Duration::from_secs(10)).await;
+        let waited = started.elapsed();
+        let asked = probes(&server).await;
+        server.shutdown().await.unwrap();
+        assert_eq!(indexed, Indexed::Quiescent);
+        assert_eq!(asked, 0);
+        assert!(waited >= Duration::from_millis(500), "waited {waited:?}");
+    }
+
+    /// Work that never ends runs the budget out and says so.
+    #[tokio::test]
+    async fn work_that_never_ends_runs_out_the_budget() {
+        let server = LspServer::scripted_for_tests(
+            INDEXING_PEER,
+            serde_json::json!({"startup": [[0.0, progress("stuck", "begin")]]}),
+        );
+        let indexed = server.wait_until_indexed(Duration::from_millis(900)).await;
+        server.shutdown().await.unwrap();
+        assert_eq!(indexed, Indexed::OutOfTime);
+    }
+
+    /// A launch whose server indexes its workspace claims work done progress;
+    /// one that loads per document does not.
+    #[test]
+    fn only_a_workspace_indexing_launch_claims_work_done_progress() {
+        let root = Path::new("/w");
+        let indexing = protocol::InitializeParams::for_launch(root, &ServerLaunch::default());
+        assert_eq!(
+            serde_json::to_value(&indexing).unwrap()["capabilities"]["window"],
+            serde_json::json!({"workDoneProgress": true})
+        );
+        let per_document = protocol::InitializeParams::for_launch(
+            root,
+            &ServerLaunch {
+                readiness: Readiness::PerDocument,
+                ..Default::default()
+            },
+        );
+        assert!(serde_json::to_value(&per_document).unwrap()["capabilities"]
+            .get("window")
+            .is_none());
     }
 }

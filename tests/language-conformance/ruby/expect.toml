@@ -1,0 +1,195 @@
+# Language conformance fixture: Ruby. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "ruby"
+
+[sources]
+module = "lib/shop/ledger.rb"
+helper = "lib/shop/helper.rb"
+test = "test/ledger_test.rb"
+forms = "lib/shop/forms.rb"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "pass"
+expect = [
+  "Module Shop",
+  "Module Shop.Ledger",
+  "Method Shop.Ledger.clamp",
+  "Method Shop.Ledger.total",
+  "Class Shop.Account",
+  "Method Shop.Account.initialize",
+  "Method Shop.Account.deposit",
+  "Method Shop.Account.validate",
+  "lib/shop/helper.rb: Method Shop.Helper.scale",
+]
+
+[module_name]
+status = "refused"
+reason = "The adapter mints no module entity."
+name = "ledger"
+
+[module_contains]
+status = "refused"
+reason = "The adapter mints no module entity."
+top_level = ["Shop.Ledger", "Shop.Account"]
+
+[declaration_extent]
+status = "pass"
+starts = { "Shop.Ledger.total" = "# Sum the values" }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "fail"
+gaps = ["accounted", "admitted"]
+enclosing = "Shop.Ledger.total"
+name = "double"
+
+[call_same_file]
+status = "pass"
+from = "Shop.Ledger.total"
+to = "Shop.Ledger.clamp"
+
+[call_receiver]
+status = "pass"
+from = "Shop.Account.deposit"
+to = "Shop.Account.validate"
+
+[imports]
+status = "pass"
+module_path = "helper"
+
+[tests_detected]
+status = "pass"
+name = "test_total"
+runner = "minitest"
+
+[refuse_unparseable]
+status = "pass"
+find = "def self.clamp(value)"
+replace = "def self.clamp(value"
+line = 5
+
+[placement_three_forms]
+status = "pass"
+entity = "Shop.Account.validate"
+
+[create_remove_spacing]
+status = "pass"
+anchor = "Shop.Ledger.clamp"
+code = '''
+def self.clamp_twice(value)
+      clamp(clamp(value))
+    end'''
+entity = "Shop.Ledger.clamp_twice"
+documented = "Shop.Ledger.total"
+doc = "# Sum the values"
+
+[form_generator]
+status = "pass"
+expect = ["Method Shop.Forms.each_value"]
+
+[form_async]
+status = "n/a"
+reason = "Ruby has no async functions."
+
+[form_bound_lambda]
+status = "pass"
+expect = ["Constant Shop.Forms.SQUARE"]
+
+[form_default_export]
+status = "n/a"
+reason = "Ruby has no default export."
+
+[form_overload]
+status = "n/a"
+reason = "Ruby has no overloads."
+
+[form_nested_type]
+status = "pass"
+expect = ["Class Shop.Forms.Inner", "Method Shop.Forms.Inner.ping"]
+
+[form_decorated]
+status = "n/a"
+reason = "Ruby has no decorators or annotations."
+
+[form_field]
+status = "fail"
+gaps = [
+  "Field|Method Shop.Forms.count",
+  "Field|Method Shop.Forms.label",
+  "Shop.Forms.count",
+  "Shop.Forms.label",
+]
+expect = ["Field|Method Shop.Forms.count", "Field|Method Shop.Forms.label"]
+
+[body_edit_keeps_entities]
+status = "pass"
+entity = "Shop.Ledger.total"
+find = "      double = ->(x) { x * 2 }\n"
+replace = "      double = ->(x) { x * 2 }\n      stats = Struct.new(:count).new\n      stats.count = values.size\n"
+
+[route_source]
+status = "pass"
+entity = "Shop.Ledger.total"
+starts = "# Sum the values"
+
+[route_locate]
+status = "pass"
+query = "total"
+entity = "Shop.Ledger.total"
+
+[route_refs]
+status = "pass"
+entity = "Shop.Ledger.clamp"
+caller = "Shop.Ledger.total"
+
+[route_impact]
+status = "pass"
+in = "helper"
+entity = "Shop.Helper.scale"
+affected = "Shop.Ledger.total"
+
+[route_context]
+status = "pass"
+entity = "Shop.Account"
+mentions = ["Shop.Account.deposit", "Shop.Account.validate"]
+
+[route_update]
+status = "pass"
+entity = "Shop.Ledger.clamp"
+find = "0"
+replace = "1"
+
+[route_patch]
+status = "pass"
+entity = "Shop.Account.validate"
+old_text = "positive?"
+new_text = "nonzero?"
+
+[route_body_edit]
+status = "pass"
+entity = "Shop.Ledger.total"
+find = "      double = ->(x) { x * 2 }\n"
+replace = "      double = ->(x) { x * 2 }\n      stats = Struct.new(:count).new\n      stats.count = values.size\n"
+
+[route_create_sibling]
+status = "refused"
+reason = "Nothing was written: entity lifecycle requires a top-level leaf function, or in TypeScript, JavaScript, Python, Go or Rust a method or a class."
+anchor = "Shop.Ledger.clamp"
+code = "def self.clamp_twice(value)\n      clamp(clamp(value))\n    end"
+entity = "Shop.Ledger.clamp_twice"
+
+[route_remove]
+status = "refused"
+reason = "Nothing was written: entity lifecycle requires a top-level leaf function, or in TypeScript, JavaScript, Python, Go or Rust a method or a class."
+entity = "Shop.Ledger.clamp"
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

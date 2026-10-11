@@ -29,7 +29,13 @@ async fn entity_draft_http(
 }
 
 fn entity_draft_create_args(source: &serde_json::Value, body: &str) -> serde_json::Value {
-    serde_json::json!({"draft_id":Uuid::new_v4(),"original_source_base":source["source_base"],
+    let base = &source["source_base"];
+    let ticket = if kin_mcp::source_ticket::is_ticket(base) {
+        base.clone()
+    } else {
+        kin_mcp::source_ticket::compact(base).expect("private source witness mints a ticket")
+    };
+    serde_json::json!({"draft_id":Uuid::new_v4(),"original_source_base":ticket,
         "original_body":source["body"],"body":body})
 }
 
@@ -66,6 +72,11 @@ async fn durable_entity_draft_invalid_empty_utf8_survives_restart_session_loss_a
     let id = args["draft_id"].as_str().unwrap();
     let before = source_base_roots(&state);
     let first_bytes = std::fs::read(entity_draft_file(&state, id, 1)).unwrap();
+    let persisted: serde_json::Value = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(
+        persisted["draft"]["original_source_base"],
+        source["source_base"]
+    );
     let saved = entity_draft_ok(
         &entity_draft_http(
             &state,
@@ -78,7 +89,7 @@ async fn durable_entity_draft_invalid_empty_utf8_survives_restart_session_loss_a
     assert_eq!(saved["draft"]["revision"], 2);
     assert_eq!(
         saved["draft"]["original_source_base"],
-        source["source_base"]
+        args["original_source_base"]
     );
     assert_eq!(saved["draft"]["original_body"], source["body"]);
     assert_eq!(
@@ -212,11 +223,30 @@ async fn durable_entity_draft_requires_bearer_and_refuses_unknown_or_foreign_sou
             "draft_invalid_request"
         );
     }
+    let store = crate::entity_drafts::DraftStore::from_state(
+        &state,
+        kin_mcp::entity_drafts::DraftOwner::LocalBearerV1,
+    )
+    .unwrap();
     for field in ["repository_id", "workspace_id"] {
+        let mut foreign_base = source["source_base"].clone();
+        foreign_base["context"][field] = serde_json::json!(Uuid::new_v4());
         let mut foreign = args.clone();
-        foreign["original_source_base"]["context"][field] = serde_json::json!(Uuid::new_v4());
-        let result = entity_draft_http(&state, "kin_draft_create", foreign).await;
+        foreign["original_source_base"] = kin_mcp::source_ticket::compact(&foreign_base).unwrap();
+        let result = entity_draft_http(&state, "kin_draft_create", foreign.clone()).await;
         assert_eq!(result.is_error, Some(true));
+        assert!(mcp_result_text(&result).contains("source_base_changed:"));
+
+        // Exercise private identity validation independently of the public
+        // ticket guard, which must never admit complete source coordinates.
+        foreign["original_source_base"] = foreign_base;
+        let request: kin_mcp::entity_drafts::DraftCreate = serde_json::from_value(foreign).unwrap();
+        let refused = store.create(request).unwrap_err();
+        assert_eq!(refused.code, "draft_invalid_request");
+        assert_eq!(
+            refused.message,
+            "draft original body, source identity and revision are inconsistent"
+        );
     }
     assert_eq!(
         entity_draft_ok(&entity_draft_http(&state, "kin_draft_list", serde_json::json!({})).await)
@@ -827,4 +857,43 @@ async fn durable_entity_draft_admission_refusal_keeps_reads_and_quota_retry_avai
         std::fs::read(entity_draft_file(&state, id, 1)).unwrap(),
         original
     );
+}
+
+#[tokio::test]
+async fn public_source_ticket_draft_create_replays_after_source_changes() {
+    let (_dir, state, witness) = source_base_fixture().await;
+    let public = entity_draft_http(
+        &state,
+        "get_entity_source",
+        serde_json::json!({"entity_id":witness["id"]}),
+    )
+    .await;
+    let source = entity_draft_ok(&public);
+    assert!(kin_mcp::source_ticket::is_ticket(&source["source_base"]));
+    let body = "pub fn value() -> &'static str { \"src/literal.rs\" }";
+    let args = entity_draft_create_args(&source, body);
+    let saved = entity_draft_ok(&entity_draft_http(&state, "kin_draft_create", args.clone()).await);
+    assert_eq!(saved["draft"]["body"], body);
+    assert_eq!(
+        saved["draft"]["original_source_base"],
+        source["source_base"]
+    );
+    source_base_commit_fresh(
+        &state,
+        &source["id"],
+        "pub fn value() -> u8 { 3 }",
+        "later work",
+    )
+    .await;
+    let roots = source_base_roots(&state);
+    let reopened = entity_draft_reopen(&state);
+    let replay =
+        entity_draft_ok(&entity_draft_http(&reopened, "kin_draft_create", args.clone()).await);
+    assert_eq!(replay["already_saved"], true);
+    assert_eq!(replay["draft"], saved["draft"]);
+    let mut changed = args;
+    changed["body"] = serde_json::json!("different text");
+    let refused = entity_draft_http(&reopened, "kin_draft_create", changed).await;
+    assert_eq!(refused.is_error, Some(true));
+    assert_eq!(source_base_roots(&reopened), roots);
 }

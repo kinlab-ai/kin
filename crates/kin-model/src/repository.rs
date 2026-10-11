@@ -257,23 +257,32 @@ fn for_each_enrichment_owner<'e>(
     entity_file: &impl Fn(&crate::EntityId) -> Option<&'e str>,
     mut owner: impl FnMut(&str),
 ) {
+    for evidence in &relation.evidence {
+        for_each_enrichment_evidence_owner(relation, evidence, entity_file, &mut owner);
+    }
+}
+
+/// The query owner of one evidence record, shared by ownership grouping and
+/// exact proof projection. No callback means its owner cannot be established.
+pub(crate) fn for_each_enrichment_evidence_owner<'e>(
+    relation: &crate::Relation,
+    evidence: &crate::RelationEvidence,
+    entity_file: &impl Fn(&crate::EntityId) -> Option<&'e str>,
+    mut owner: impl FnMut(&str),
+) {
     if relation.origin == crate::RelationOrigin::Lsp {
-        for evidence in &relation.evidence {
-            if answers_a_references_query(relation, evidence) {
-                if let crate::GraphNodeId::Entity(destination) = &relation.dst {
-                    if let Some(file) = entity_file(destination) {
-                        owner(file);
-                    }
+        if answers_a_references_query(relation, evidence) {
+            if let crate::GraphNodeId::Entity(destination) = &relation.dst {
+                if let Some(file) = entity_file(destination) {
+                    owner(file);
                 }
-            } else if let Some(span) = &evidence.source_span {
-                owner(&span.file.0);
             }
+        } else if let Some(span) = &evidence.source_span {
+            owner(&span.file.0);
         }
     } else if relation.kind == crate::RelationKind::Calls {
-        for evidence in &relation.evidence {
-            if let Some(span) = &evidence.source_span {
-                owner(&span.file.0);
-            }
+        if let Some(span) = &evidence.source_span {
+            owner(&span.file.0);
         }
     }
 }
@@ -660,19 +669,61 @@ impl Default for WorkspaceSemanticDelta {
 /// Storage must derive it by diffing the requested successor workspace against
 /// its new immutable base; an incremental mutation cannot be persisted here by
 /// accident.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
-pub struct WorkspaceSemanticOverlay(WorkspaceSemanticDelta);
+pub struct WorkspaceSemanticOverlay(
+    WorkspaceSemanticDelta,
+    #[serde(skip)]
+    #[schemars(skip)]
+    OverlayIdentityMemo,
+);
+
+/// An overlay's identity hash, computed at most once per overlay value.
+///
+/// The identity is a pure function of the overlay's content, and that content
+/// cannot change after construction: the delta is private, every method reads
+/// it or consumes the overlay to build a new one, and a deserialized overlay
+/// starts with an empty memo. So once computed it can be kept beside the
+/// content it describes. A clone carries it, since it carries identical
+/// content.
+///
+/// Worth keeping because a workspace validates its overlay on every
+/// construction, re-marking, binding and storage check, and each validation
+/// used to serialize the whole overlay canonically again. After a language
+/// server sweep that overlay holds every accepted relation, and one
+/// publication serialized tens of megabytes of it several times over.
+///
+/// Never part of equality, serialization, the schema or `Debug` output.
+#[derive(Clone, Default)]
+struct OverlayIdentityMemo(std::sync::OnceLock<Hash256>);
+
+impl PartialEq for OverlayIdentityMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for WorkspaceSemanticOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WorkspaceSemanticOverlay")
+            .field(&self.0)
+            .finish()
+    }
+}
 
 impl WorkspaceSemanticOverlay {
     pub fn new(
         entity_deltas: Vec<EntityDelta>,
         relation_deltas: Vec<RelationDelta>,
     ) -> Result<Self> {
-        Ok(Self(WorkspaceSemanticDelta::new(
+        Ok(Self::from_delta(WorkspaceSemanticDelta::new(
             entity_deltas,
             relation_deltas,
         )?))
+    }
+
+    fn from_delta(delta: WorkspaceSemanticDelta) -> Self {
+        Self(delta, OverlayIdentityMemo::default())
     }
 
     pub fn new_with_external_references(
@@ -680,11 +731,13 @@ impl WorkspaceSemanticOverlay {
         relation_deltas: Vec<RelationDelta>,
         external_reference_deltas: Vec<ExternalReferenceDelta>,
     ) -> Result<Self> {
-        Ok(Self(WorkspaceSemanticDelta::new_with_external_references(
-            entity_deltas,
-            relation_deltas,
-            external_reference_deltas,
-        )?))
+        Ok(Self::from_delta(
+            WorkspaceSemanticDelta::new_with_external_references(
+                entity_deltas,
+                relation_deltas,
+                external_reference_deltas,
+            )?,
+        ))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -705,6 +758,14 @@ impl WorkspaceSemanticOverlay {
     }
 
     pub fn identity_hash(&self) -> Result<Hash256> {
+        if let Some(hash) = self.1 .0.get() {
+            return Ok(*hash);
+        }
+        let hash = self.compute_identity_hash()?;
+        Ok(*self.1 .0.get_or_init(|| hash))
+    }
+
+    fn compute_identity_hash(&self) -> Result<Hash256> {
         self.validate()?;
         let encoded = canonical_json_bytes(self)?;
         let mut hasher = Sha256::new();
@@ -744,7 +805,7 @@ impl WorkspaceSemanticOverlay {
     /// This overlay, also carrying `deltas` of resolution records relative to
     /// the same base.
     pub fn with_resolution_records(self, deltas: Vec<ResolutionRecordDelta>) -> Result<Self> {
-        Ok(Self(self.0.with_resolution_records(deltas)?))
+        Ok(Self::from_delta(self.0.with_resolution_records(deltas)?))
     }
 
     pub fn transaction_delta(&self) -> TransactionDelta {
@@ -2010,10 +2071,17 @@ pub struct RepositoryTransaction {
     /// shipped binary builds, in both directions, to buy a compatibility this
     /// field does not need.
     ///
-    /// Deliberately last. Positional serialization emits explicit absent merge
-    /// and sealed slots when this field is present without them.
+    /// Positional serialization emits explicit absent merge and sealed slots
+    /// when this field, or a later proof field, is present without them.
     #[serde(default)]
     pub collaboration_delta: Option<CollaborationDelta>,
+    /// Exact raw Git evidence for newly admitted native snapshot roots.
+    ///
+    /// Last and omitted when empty, so existing transactions retain their
+    /// bytes and identity. Storage independently verifies each proof before
+    /// using it; this field grants no authority by its presence alone.
+    #[serde(default)]
+    pub git_snapshot_proofs: Vec<crate::GitSnapshotProof>,
 }
 
 #[derive(Serialize)]
@@ -2039,6 +2107,8 @@ struct RepositoryTransactionHumanReadable<'a> {
     sealed_observation: &'a Option<SealedObservationBinding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     collaboration_delta: &'a Option<CollaborationDelta>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    git_snapshot_proofs: &'a Vec<crate::GitSnapshotProof>,
 }
 
 impl Serialize for RepositoryTransaction {
@@ -2066,6 +2136,7 @@ impl Serialize for RepositoryTransaction {
                 merge_transaction_delta: &self.merge_transaction_delta,
                 sealed_observation: &self.sealed_observation,
                 collaboration_delta: &self.collaboration_delta,
+                git_snapshot_proofs: &self.git_snapshot_proofs,
             }
             .serialize(serializer);
         }
@@ -2077,13 +2148,15 @@ impl Serialize for RepositoryTransaction {
         // so a present later value never slides into an absent earlier one's
         // position. The chain is what keeps the rule stated once as the tail
         // grows: read it upward from the last field.
-        let has_collaboration_slot = self.collaboration_delta.is_some();
+        let has_proof_slot = !self.git_snapshot_proofs.is_empty();
+        let has_collaboration_slot = self.collaboration_delta.is_some() || has_proof_slot;
         let has_sealed_slot = self.sealed_observation.is_some() || has_collaboration_slot;
         let has_merge_slot = self.merge_transaction_delta.is_some() || has_sealed_slot;
         let field_count = LEGACY_FIELD_COUNT
             + usize::from(has_merge_slot)
             + usize::from(has_sealed_slot)
-            + usize::from(has_collaboration_slot);
+            + usize::from(has_collaboration_slot)
+            + usize::from(has_proof_slot);
         let mut sequence = serializer.serialize_seq(Some(field_count))?;
         sequence.serialize_element(&self.schema_version)?;
         sequence.serialize_element(&self.operation_id)?;
@@ -2108,6 +2181,9 @@ impl Serialize for RepositoryTransaction {
         }
         if has_collaboration_slot {
             sequence.serialize_element(&self.collaboration_delta)?;
+        }
+        if has_proof_slot {
+            sequence.serialize_element(&self.git_snapshot_proofs)?;
         }
         sequence.end()
     }
@@ -2250,7 +2326,8 @@ impl CanonicalTransaction<'_> {
         let field_count = HUMAN_READABLE_FIELD_COUNT
             + usize::from(source.merge_transaction_delta.is_some())
             + usize::from(source.sealed_observation.is_some())
-            + usize::from(source.collaboration_delta.is_some());
+            + usize::from(source.collaboration_delta.is_some())
+            + usize::from(!source.git_snapshot_proofs.is_empty());
 
         append_canonical_object_header(out, field_count)?;
 
@@ -2277,6 +2354,10 @@ impl CanonicalTransaction<'_> {
         append_canonical_seq(out, &self.external_objects)?;
         append_canonical_key(out, "git_authority_delta")?;
         append_canonical_value(out, &source.git_authority_delta)?;
+        if !source.git_snapshot_proofs.is_empty() {
+            append_canonical_key(out, "git_snapshot_proofs")?;
+            append_canonical_value(out, &source.git_snapshot_proofs)?;
+        }
         append_canonical_key(out, "local_overlay_delta")?;
         append_canonical_value(out, &source.local_overlay_delta)?;
         if source.merge_transaction_delta.is_some() {
@@ -2325,7 +2406,8 @@ impl Serialize for CanonicalTransaction<'_> {
             let field_count = HUMAN_READABLE_FIELD_COUNT
                 + usize::from(source.merge_transaction_delta.is_some())
                 + usize::from(source.sealed_observation.is_some())
-                + usize::from(source.collaboration_delta.is_some());
+                + usize::from(source.collaboration_delta.is_some())
+                + usize::from(!source.git_snapshot_proofs.is_empty());
             let mut state =
                 serializer.serialize_struct("RepositoryTransactionHumanReadable", field_count)?;
             state.serialize_field("schema_version", &source.schema_version)?;
@@ -2353,6 +2435,9 @@ impl Serialize for CanonicalTransaction<'_> {
             if source.collaboration_delta.is_some() {
                 state.serialize_field("collaboration_delta", &source.collaboration_delta)?;
             }
+            if !source.git_snapshot_proofs.is_empty() {
+                state.serialize_field("git_snapshot_proofs", &source.git_snapshot_proofs)?;
+            }
             return state.end();
         }
 
@@ -2362,13 +2447,15 @@ impl Serialize for CanonicalTransaction<'_> {
         // RepositoryTransaction`, whose element count varies with which
         // optional tail fields are present.
         const LEGACY_FIELD_COUNT: usize = 15;
-        let has_collaboration_slot = source.collaboration_delta.is_some();
+        let has_proof_slot = !source.git_snapshot_proofs.is_empty();
+        let has_collaboration_slot = source.collaboration_delta.is_some() || has_proof_slot;
         let has_sealed_slot = source.sealed_observation.is_some() || has_collaboration_slot;
         let has_merge_slot = source.merge_transaction_delta.is_some() || has_sealed_slot;
         let field_count = LEGACY_FIELD_COUNT
             + usize::from(has_merge_slot)
             + usize::from(has_sealed_slot)
-            + usize::from(has_collaboration_slot);
+            + usize::from(has_collaboration_slot)
+            + usize::from(has_proof_slot);
         let mut sequence = serializer.serialize_seq(Some(field_count))?;
         sequence.serialize_element(&source.schema_version)?;
         sequence.serialize_element(&source.operation_id)?;
@@ -2393,6 +2480,9 @@ impl Serialize for CanonicalTransaction<'_> {
         }
         if has_collaboration_slot {
             sequence.serialize_element(&source.collaboration_delta)?;
+        }
+        if has_proof_slot {
+            sequence.serialize_element(&source.git_snapshot_proofs)?;
         }
         sequence.end()
     }
@@ -2631,6 +2721,7 @@ impl RepositoryTransaction {
             && self.local_overlay_delta.is_none()
             && self.merge_transaction_delta.is_none()
             && self.collaboration_delta.is_none()
+            && self.git_snapshot_proofs.is_empty()
         {
             return Err(ModelError::InvalidOperation(
                 "repository transaction must contain at least one mutation".to_string(),
@@ -2669,6 +2760,19 @@ impl RepositoryTransaction {
                 })?;
         }
 
+        if self
+            .git_snapshot_proofs
+            .windows(2)
+            .any(|pair| pair[0].snapshot_change_id >= pair[1].snapshot_change_id)
+        {
+            return Err(ModelError::InvalidOperation(
+                "Git snapshot proofs must be unique and in canonical change order".into(),
+            ));
+        }
+        for proof in &self.git_snapshot_proofs {
+            proof.validate_for_repository(&self.repository_id)?;
+        }
+
         let mut aliases = BTreeMap::new();
         for alias in &self.aliases {
             if alias.repository_id != self.repository_id {
@@ -2703,6 +2807,17 @@ impl RepositoryTransaction {
             let change = change?;
             let change = change.borrow();
             validate_semantic_change_id(change)?;
+            if self
+                .git_snapshot_proofs
+                .iter()
+                .any(|proof| proof.snapshot_change_id == change.id)
+                && (!matches!(change.origin, crate::ChangeOrigin::Native)
+                    || !change.parents.is_empty())
+            {
+                return Err(ModelError::InvalidOperation(
+                    "Git snapshot proof must name a native root change".into(),
+                ));
+            }
             if !ids.insert(change.id) {
                 return Err(ModelError::InvalidOperation(format!(
                     "repository transaction contains duplicate change {}",
@@ -3115,6 +3230,8 @@ mod tests {
         RepoPath, SemanticFingerprint, SharedAdmissionPolicy, TreeEntry, Visibility,
     };
     use uuid::Uuid;
+
+    include!("enrichment_proof_owner_tests.rs");
 
     #[derive(Default)]
     struct TestBodies(BTreeMap<Hash256, Vec<u8>>);
@@ -3562,7 +3679,160 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         }
+    }
+
+    fn snapshot_proof(transaction: &RepositoryTransaction) -> crate::GitSnapshotProof {
+        crate::git_snapshot_proof::tests::sample(
+            transaction.repository_id.clone(),
+            SemanticChangeId::from_hash(Hash256::from_bytes([0x72; 32])),
+        )
+    }
+
+    #[test]
+    fn snapshot_proof_tail_preserves_all_adjacent_slots_and_named_omissions() {
+        let base = workspace_transaction();
+        let workspace_id = base.workspace_mutation.as_ref().unwrap().workspace_id;
+        for mask in 0..16 {
+            let mut transaction = base.clone();
+            if mask & 1 != 0 {
+                transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                    crate::merge::tests::sample_record(base.repository_id.clone(), workspace_id),
+                ));
+            }
+            if mask & 2 != 0 {
+                transaction.sealed_observation = Some(sealed_observation());
+            }
+            if mask & 4 != 0 {
+                transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
+            }
+            if mask & 8 != 0 {
+                transaction.git_snapshot_proofs.push(snapshot_proof(&base));
+            }
+            let expected_arity = if mask & 8 != 0 {
+                19
+            } else if mask & 4 != 0 {
+                18
+            } else if mask & 2 != 0 {
+                17
+            } else if mask & 1 != 0 {
+                16
+            } else {
+                15
+            };
+            let encoded = rmp_serde::to_vec(&transaction).unwrap();
+            assert_eq!(
+                messagepack_array_len(&encoded),
+                expected_arity,
+                "tail mask {mask}"
+            );
+            assert_eq!(
+                rmp_serde::from_slice::<RepositoryTransaction>(&encoded).unwrap(),
+                transaction
+            );
+            let named = serde_json::to_value(&transaction).unwrap();
+            assert_eq!(named.get("git_snapshot_proofs").is_some(), mask & 8 != 0);
+            assert_eq!(
+                serde_json::from_value::<RepositoryTransaction>(named).unwrap(),
+                transaction
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_proof_fields_participate_in_transaction_identity() {
+        let mut transaction = workspace_transaction();
+        let absent = transaction.transaction_hash().unwrap();
+        transaction
+            .git_snapshot_proofs
+            .push(snapshot_proof(&transaction));
+        let present = transaction.transaction_hash().unwrap();
+        assert_ne!(absent, present);
+        for field in ["repository", "change", "commit", "objects"] {
+            let mut changed = transaction.clone();
+            let proof = &mut changed.git_snapshot_proofs[0];
+            match field {
+                "repository" => proof.repository_id = RepositoryId::new("another").unwrap(),
+                "change" => {
+                    proof.snapshot_change_id =
+                        SemanticChangeId::from_hash(Hash256::from_bytes([0x73; 32]))
+                }
+                "commit" => {
+                    proof.source_commit = GitObjectId::sha1([9; 20]);
+                    proof.objects[0] = crate::ExternalObjectId::new(
+                        ExternalObjectKind::Commit,
+                        proof.source_commit,
+                    );
+                }
+                "objects" => {
+                    proof.objects.push(crate::ExternalObjectId::new(
+                        ExternalObjectKind::Blob,
+                        GitObjectId::sha1([9; 20]),
+                    ));
+                    proof.objects.sort();
+                }
+                _ => unreachable!(),
+            }
+            // A wrong repository binding is intentionally not a valid
+            // transaction, but it still must not collide on canonical bytes.
+            assert_ne!(
+                transaction.canonical_hash().unwrap(),
+                changed.canonical_hash().unwrap(),
+                "unbound {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_proof_transaction_shape_refuses_wrong_repository_order_and_nonroot() {
+        let mut transaction = workspace_transaction();
+        transaction
+            .git_snapshot_proofs
+            .push(snapshot_proof(&transaction));
+        transaction.validate().unwrap();
+        let mut wrong_repository = transaction.clone();
+        wrong_repository.git_snapshot_proofs[0].repository_id =
+            RepositoryId::new("another").unwrap();
+        assert!(wrong_repository.validate().is_err());
+        let mut duplicate = transaction.clone();
+        duplicate
+            .git_snapshot_proofs
+            .push(duplicate.git_snapshot_proofs[0].clone());
+        assert!(duplicate.validate().is_err());
+        let mut reversed = transaction.clone();
+        let mut second = reversed.git_snapshot_proofs[0].clone();
+        second.snapshot_change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
+        reversed.git_snapshot_proofs.push(second);
+        assert!(reversed.validate().is_err());
+
+        let mut git_root = transaction.clone();
+        let change = native_change(0x41, 2014, 2013, 2012, 2011);
+        assert!(matches!(
+            change.origin,
+            crate::ChangeOrigin::GitCommit { .. }
+        ));
+        git_root.git_snapshot_proofs[0].snapshot_change_id = change.id;
+        git_root.changes = vec![change];
+        assert!(git_root
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("native root"));
+
+        let mut child = native_change(0x40, 2004, 2003, 2002, 2001);
+        child.origin = crate::ChangeOrigin::Native;
+        child
+            .parents
+            .push(SemanticChangeId::from_hash(Hash256::from_bytes([0x74; 32])));
+        child.id = crate::compute_semantic_change_id(&child).unwrap();
+        transaction.git_snapshot_proofs[0].snapshot_change_id = child.id;
+        transaction.changes = vec![child];
+        assert!(transaction
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("native root"));
     }
 
     /// Peak live bytes allocated by `body` on this thread, from the crate's
@@ -5873,6 +6143,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         }
     }
 
@@ -6162,23 +6433,13 @@ mod tests {
     #[test]
     fn the_canonical_view_matches_across_every_optional_tail_combination() {
         let base = canonicalizable_transaction();
-        // Eight, not four. `HAND_KEPT_MIRRORS` registers this test as
-        // `RepositoryTransactionHumanReadable`'s entire disposition, on the
-        // grounds that it diffs that mirror's field SET, so a tail axis missing
-        // here is coverage the registration claims and does not have. A review
-        // found exactly that: deleting `collaboration_delta` from the
-        // human-readable branch of `Serialize for CanonicalTransaction` left
-        // the suite green.
-        for (label, merge, sealed, collaboration) in [
-            ("neither", false, false, false),
-            ("merge only", true, false, false),
-            ("sealed only", false, true, false),
-            ("merge and sealed", true, true, false),
-            ("collaboration only", false, false, true),
-            ("merge and collaboration", true, false, true),
-            ("sealed and collaboration", false, true, true),
-            ("all three", true, true, true),
-        ] {
+        // Every adjacent tail combination reaches both mirrors and the direct
+        // preimage writer, including an isolated proof after three nil slots.
+        for mask in 0..16 {
+            let label = format!("tail mask {mask}");
+            let merge = mask & 1 != 0;
+            let sealed = mask & 2 != 0;
+            let collaboration = mask & 4 != 0;
             let mut transaction = base.clone();
             if merge {
                 let workspace_id = transaction
@@ -6198,6 +6459,11 @@ mod tests {
             }
             if collaboration {
                 transaction.collaboration_delta = Some(crate::collaboration::tests::sample_delta());
+            }
+            if mask & 8 != 0 {
+                transaction
+                    .git_snapshot_proofs
+                    .push(snapshot_proof(&transaction));
             }
             assert_eq!(
                 rmp_serde::to_vec(&CanonicalTransaction::new(&transaction)).unwrap(),
@@ -8167,6 +8433,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         assert!(transaction.validate().is_err());
     }
@@ -8585,6 +8852,49 @@ mod tests {
     /// file's, wherever the site it found lies; every other query is the file
     /// its site is in.
     #[test]
+    fn enrichment_proof_keeps_the_own_pass_of_a_shared_relation() {
+        let mut caller = semantic_entity(1, "caller");
+        caller.file_origin = Some(crate::FilePathId::new("src/a.rs"));
+        let mut callee = semantic_entity(2, "callee");
+        callee.file_origin = Some(crate::FilePathId::new("src/b.rs"));
+        let mut own = lsp_relation(100, "src/a.rs");
+        own.kind = crate::RelationKind::References;
+        own.evidence[0].parser_rule = Some("lsp_definition".into());
+        let digest = |relation: &crate::Relation| {
+            crate::enrichment_proof_inputs_by_file(
+                ["src/a.rs", "src/b.rs"],
+                [&caller, &callee],
+                [relation],
+                [],
+            )
+            .unwrap()
+        };
+        let initial = digest(&own);
+        assert_eq!(
+            initial,
+            digest(&own.clone()),
+            "an identical observation moves no proof"
+        );
+        let mut shared = own.clone();
+        let mut peer = own.evidence[0].clone();
+        peer.parser_rule = Some(crate::LSP_REFERENCES_RULE.into());
+        shared.evidence.push(peer);
+        let later = digest(&shared);
+        println!(
+            "same_relation_checkpoint_dependencies: {}",
+            serde_json::json!({
+                "relation_id":own.id,"own_evidence":own.evidence,"successor_evidence":shared.evidence,
+                "first":initial,"second":later,"caller_payloads_changed":false,"ledger_records_changed":false,
+            })
+        );
+        assert_ne!(
+            initial["src/b.rs"], later["src/b.rs"],
+            "the file that asked the later reference query binds its new proof"
+        );
+        assert_eq!(initial["src/a.rs"], later["src/a.rs"], "a peer references proof merged under the same relation identity is outside the earlier file's completed passes");
+    }
+
+    #[test]
     fn an_enrichment_mark_vouches_for_its_own_passes_and_not_a_later_files_references() {
         // Entity 1 and 3 are declared in `src/a.rs`, entity 2 in `src/b.rs`.
         let entity_file = |id: &EntityId| match id.0.as_u128() {
@@ -8742,6 +9052,43 @@ mod tests {
                 marks: Vec::new(),
             })
             .unwrap();
-        assert!(WorkspaceSemanticOverlay(marked).validate().is_err());
+        assert!(WorkspaceSemanticOverlay::from_delta(marked)
+            .validate()
+            .is_err());
+    }
+
+    /// The overlay remembers its identity hash. A remembered hash must be the
+    /// one a fresh computation gives, survive neither serialization nor a
+    /// schema, and never make two overlays with the same content unequal.
+    #[test]
+    fn a_remembered_overlay_identity_is_the_computed_one_and_nothing_else() {
+        let overlay = WorkspaceSemanticOverlay::new(Vec::new(), Vec::new()).unwrap();
+        let computed = overlay.compute_identity_hash().unwrap();
+        assert_eq!(overlay.identity_hash().unwrap(), computed);
+        assert_eq!(
+            overlay.1 .0.get(),
+            Some(&computed),
+            "the first call remembers"
+        );
+        assert_eq!(overlay.identity_hash().unwrap(), computed);
+        assert_eq!(overlay.clone().identity_hash().unwrap(), computed);
+
+        let encoded = serde_json::to_value(&overlay).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::to_value(&overlay.0).unwrap(),
+            "the overlay still serializes as its delta alone"
+        );
+        let decoded: WorkspaceSemanticOverlay = serde_json::from_value(encoded).unwrap();
+        assert!(
+            decoded.1 .0.get().is_none(),
+            "a decoded overlay starts unremembered"
+        );
+        assert_eq!(decoded, overlay, "equality ignores what is remembered");
+        assert_eq!(decoded.identity_hash().unwrap(), computed);
+        assert_eq!(
+            format!("{overlay:?}"),
+            format!("WorkspaceSemanticOverlay({:?})", overlay.0)
+        );
     }
 }

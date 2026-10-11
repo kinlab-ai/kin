@@ -6,7 +6,7 @@ import copy
 import json
 import unittest
 
-from trace_pages import drain_references, drain_trace
+from trace_pages import drain_impact, drain_references, drain_trace
 
 
 def wire(page):
@@ -27,7 +27,8 @@ def sample():
     base = {
         'chain': [], 'next_cursor': None,
         '_kin': {'page': {'version': 1, 'complete': False, 'total_steps': 1},
-                 'verdict': {'state': 'inconclusive', 'safe_to_conclude_absent': False}},
+                 'verdict': {'state': 'inconclusive', 'safe_to_conclude_absent': False},
+                 'completeness': {'status': 'partial', 'limits': ['trace_page_partial']}},
         'negative': {'safe_to_conclude_absent': False},
     }
     pages = []
@@ -64,11 +65,87 @@ def drain(pages):
 
 
 class TracePagesTest(unittest.TestCase):
+    def impact_pages(self):
+        base = {
+            'affected_callers': [], 'next_cursor': 'second',
+            '_kin': {'page': {'version': 1, 'kind': 'impact', 'complete': False,
+                              'total_rows': 3, 'returned_rows': 1},
+                     'verdict': {'state': 'inconclusive', 'safe_to_conclude_absent': False},
+                     'completeness': {'status': 'partial', 'limits': ['impact_page_partial']}},
+            'negative': {'safe_to_conclude_absent': False},
+        }
+        first = copy.deepcopy(base)
+        first['affected_callers'] = [{'id': 'caller', 'body': 'λ'}]
+        second = copy.deepcopy(base)
+        second['next_cursor'] = None
+        second['_kin']['page']['returned_rows'] = 2
+        second['affected_overrides'] = [{'id': 'override'}]
+        second['affected_tests'] = [{'id': 'test'}]
+        second['readings'] = [
+            {'key': 'changed_ids', 'value': ['changed']},
+            {'key': '_kin', 'value': {'verdict': {'state': 'inconclusive',
+                                                 'limiting_factor': 'reference_completion'}}},
+            {'key': 'negative', 'value': {'safe_to_conclude_absent': False,
+                                          'reason': 'unmeasured references'}},
+        ]
+        return [first, second]
+
+    def drain_impact_pages(self, pages):
+        by_cursor = {None: pages[0], 'second': pages[1]}
+        return drain_impact(lambda cursor: wire(by_cursor[cursor]), 2000)
+
+    def test_impact_pages_preserve_all_buckets_and_readings(self):
+        answer = self.drain_impact_pages(self.impact_pages())
+        self.assertEqual(answer['affected_callers'], [{'id': 'caller', 'body': 'λ'}])
+        self.assertEqual(answer['affected_overrides'], [{'id': 'override'}])
+        self.assertEqual(answer['affected_tests'], [{'id': 'test'}])
+        self.assertEqual(answer['changed_ids'], ['changed'])
+        self.assertEqual(answer['_kin']['verdict']['limiting_factor'], 'reference_completion')
+        self.assertEqual(len(answer.page_wires), 2)
+        self.assertEqual(tuple(len(wire.encode('utf-8')) for wire in answer.page_wires),
+                         answer.page_bytes)
+
+    def test_impact_pages_reassemble_unicode_record_fragments(self):
+        pages, expected = sample()
+        for page in pages:
+            page.pop('chain')
+            page['affected_callers'] = []
+            page['_kin']['page'] = {'version': 1, 'kind': 'impact', 'complete': False,
+                                    'total_rows': 1, 'returned_rows': 0}
+            page['_kin']['completeness']['limits'] = ['impact_page_partial']
+            page['record_fragment']['collection'] = 'affected_tests'
+        by_cursor = {None: pages[0], pages[0]['next_cursor']: pages[1],
+                     pages[1]['next_cursor']: pages[2]}
+        answer = drain_impact(lambda cursor: wire(by_cursor[cursor]), 2000)
+        self.assertEqual(answer['affected_tests'], [expected['focal_entity']])
+
+    def test_impact_pages_reject_lost_rows_changed_totals_and_wrong_kind(self):
+        pages = self.impact_pages()
+        pages[-1]['affected_tests'] = []
+        pages[-1]['_kin']['page']['returned_rows'] = 1
+        with self.assertRaisesRegex(ValueError, 'lost bucket rows'):
+            self.drain_impact_pages(pages)
+        pages = self.impact_pages()
+        pages[-1]['_kin']['page']['total_rows'] = 2
+        with self.assertRaisesRegex(ValueError, 'row total changed'):
+            self.drain_impact_pages(pages)
+        pages = self.impact_pages()
+        pages[0]['_kin']['page']['kind'] = 'references'
+        with self.assertRaisesRegex(ValueError, 'another page kind'):
+            self.drain_impact_pages(pages)
+
+    def test_impact_pages_require_impact_partial_limit(self):
+        pages = self.impact_pages()
+        pages[0]['_kin']['completeness']['limits'] = ['reference_page_partial']
+        with self.assertRaisesRegex(ValueError, 'does not say it is partial'):
+            self.drain_impact_pages(pages)
+
     def test_reference_pages_preserve_nested_candidates_and_safety_readings(self):
         pages, expected = sample()
         for page in pages:
             page.pop('chain')
             page['references'] = []
+            page['_kin']['completeness']['limits'] = ['reference_page_partial']
             page['_kin']['page'] = {'version': 1, 'kind': 'references',
                                     'complete': False, 'total_references': 2}
         pages[0]['references'] = [{'entity_id': 'caller-a'}]
@@ -140,6 +217,20 @@ class TracePagesTest(unittest.TestCase):
         pages, _ = sample()
         pages[-1]['negative']['safe_to_conclude_absent'] = True
         with self.assertRaisesRegex(ValueError, 'certifies absence'):
+            drain(pages)
+
+    def test_partial_page_keeps_the_answers_state_but_must_say_it_is_partial(self):
+        pages, expected = sample()
+        for page in pages:
+            page['_kin']['verdict']['state'] = 'certified'
+        self.assertEqual(drain(pages), expected)
+        pages, _ = sample()
+        pages[1]['_kin']['verdict']['safe_to_conclude_absent'] = True
+        with self.assertRaisesRegex(ValueError, 'unqualified verdict'):
+            drain(pages)
+        pages, _ = sample()
+        pages[1]['_kin']['completeness']['limits'] = []
+        with self.assertRaisesRegex(ValueError, 'does not say it is partial'):
             drain(pages)
 
     def test_wire_overrun_is_not_hidden_by_reassembly(self):

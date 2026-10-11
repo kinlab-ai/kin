@@ -207,13 +207,13 @@ fn inventory(root: &Path) -> Result<BTreeMap<String, Entry>> {
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut output = OpenOptions::new().write(true).create_new(true).open(path)?;
     output.write_all(bytes)?;
-    output.sync_all()?;
+    kin_blobs::durable::sync_all(&output)?;
     Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
-    File::open(path)?.sync_all()?;
+    kin_blobs::durable::sync_all(&File::open(path)?)?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
@@ -272,7 +272,7 @@ fn copy_checked(source: &Path, target: &Path, files: &BTreeMap<String, Entry>) -
         let mut input = open_regular(&from)?;
         let mut output = OpenOptions::new().write(true).create_new(true).open(&to)?;
         std::io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
+        kin_blobs::durable::sync_all(&output)?;
         if &digest_file(&to)? != expected {
             bail!("recovery input changed: {name}");
         }
@@ -294,6 +294,81 @@ fn copy_checked(source: &Path, target: &Path, files: &BTreeMap<String, Entry>) -
     for directory in directories.into_iter().rev() {
         sync_directory(&directory)?;
     }
+    Ok(())
+}
+
+/// [`copy_checked`] with its durability batched: every file is written and
+/// checked first, then each is flushed and the directories synced once.
+///
+/// The published copy is exactly as durable, and on a host where a full sync
+/// flushes the whole device cache it costs one device flush instead of one per
+/// file. A store carries hundreds of files, and a device flush each was most of
+/// what copying one cost.
+fn copy_checked_batched(
+    source: &Path,
+    target: &Path,
+    files: &BTreeMap<String, Entry>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(target)?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir(target)?;
+    for name in files.keys() {
+        let relative = safe_relative(name)?;
+        let to = target.join(relative);
+        fs::create_dir_all(to.parent().context("payload parent missing")?)?;
+        let mut input = open_regular(&source.join(relative))?;
+        let mut output = OpenOptions::new().write(true).create_new(true).open(&to)?;
+        std::io::copy(&mut input, &mut output)?;
+    }
+    for (name, expected) in files {
+        let to = target.join(safe_relative(name)?);
+        if &digest_file(&to)? != expected {
+            bail!("recovery input changed: {name}");
+        }
+        flush_to_device(&File::open(&to)?)?;
+    }
+    let mut directories = vec![target.to_path_buf()];
+    for name in files.keys() {
+        let mut parent = target
+            .join(safe_relative(name)?)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        while parent != target {
+            directories.push(parent.clone());
+            parent.pop();
+        }
+    }
+    directories.sort();
+    directories.dedup();
+    for directory in directories.into_iter().rev() {
+        flush_to_device(&File::open(&directory)?)?;
+    }
+    // One full sync last: on Apple platforms it flushes the device cache for
+    // every file and directory flushed above.
+    sync_directory(target)?;
+    Ok(())
+}
+
+/// Hand one file's data to the device. On Apple platforms a full sync also
+/// flushes the device's own cache, which the caller's final directory sync
+/// does once for everything written before it, so each file needs only an
+/// ordinary `fsync` here.
+fn flush_to_device(file: &File) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` and valid for this call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    kin_blobs::durable::sync_all(&file)?;
     Ok(())
 }
 
@@ -345,7 +420,7 @@ pub(super) fn publish(source: &Path, target: &Path, mut manifest: Manifest) -> R
     ensure_directory_identity(&staging_handle, staging.path())?;
     publish_absent(staging.path(), target, &parent_handle, &parent_handle)
         .context("publish completed backup")?;
-    parent_handle.sync_all().context("backup was published, but parent durability is unconfirmed; preserve and inspect the destination")?;
+    kin_blobs::durable::sync_all(&parent_handle).context("backup was published, but parent durability is unconfirmed; preserve and inspect the destination")?;
     Ok(())
 }
 
@@ -428,7 +503,7 @@ fn verify_staged_authority(
     Ok(frozen)
 }
 
-const RUNTIME_FILES: &[&str] = &[
+pub(super) const RUNTIME_FILES: &[&str] = &[
     "daemon.pid",
     "daemon.port",
     "daemon.owner",
@@ -462,6 +537,170 @@ fn refuse_path_bound_recovery(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a reused store leaves `name`, a path relative to the donor's
+/// `.kin`, behind.
+///
+/// Everything that is the repository travels: authority, bodies, the graph
+/// section, the search and vector indexes, the enrichment records and the
+/// configuration. What stays is the donor's own running and record-keeping:
+/// its daemon's runtime files, logs, kill records and footprint, the sweep
+/// interruptions it counted, the agent coordination and MCP transaction
+/// records of its sessions, a daemon release it had pending, its benchmark
+/// state, its recovery backups, its run logs and its projection state. A
+/// fresh admission of the checkout has none of those, and a reused store
+/// starts the same way.
+fn reuse_leaves_behind(name: &str) -> bool {
+    let (top, nested) = match name.split_once('/') {
+        Some((top, _)) => (top, true),
+        None => (name, false),
+    };
+    RUNTIME_FILES
+        .iter()
+        .any(|runtime| name.eq_ignore_ascii_case(runtime))
+        || (!nested
+            && (top.starts_with("daemon")
+                || matches!(
+                    top,
+                    "lsp-sweep-interruptions"
+                        | "coordination_events.jsonl"
+                        | "mcp_transactions.json"
+                        | "pending-release.json"
+                        | "pending-release.lock"
+                )
+                // The tree a store kept outside its working tree serves is
+                // the donor's. The copy is given its own before it publishes.
+                || top == kin_core::layout::WORKING_TREE_RECORD))
+        || (nested && matches!(top, "logs" | "runs" | "bench" | "backups" | "projections"))
+}
+
+/// What copying a prepared store cost.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReuseCopy {
+    pub files: usize,
+    pub bytes: u64,
+    /// The workspace graph the copy was verified to hold, before `finish`.
+    pub entities: usize,
+    pub relations: usize,
+    /// Copying and hashing every file.
+    pub copy: std::time::Duration,
+    /// Proving the staged copy is the donor's authority, roots included.
+    pub verify: std::time::Duration,
+    /// The caller's finishing step on the staged copy.
+    pub finish: std::time::Duration,
+}
+
+/// Copy the prepared store at `source` into the absent `destination`, a
+/// `.kin` beside the checkout that reuses it, checked the way a carrier is.
+///
+/// The caller holds the donor's authority frozen for the whole call. Every
+/// file is copied and hashed, the donor is inventoried again to refuse a store
+/// that changed while it was read, and the staged copy is reopened and must
+/// carry exactly the repository, workspace and roots the caller froze. Only
+/// then does `finish` run on the staged copy, where a re-derivation or a
+/// configuration rewrite happens before anything is visible, and the copy is
+/// published with the same no-replace rename a restore uses. A failure at any
+/// point leaves `destination` absent and the donor untouched.
+pub(super) fn reuse_copy(
+    source: &Path,
+    destination: &Path,
+    roots: &kin_model::RootBundle,
+    repository_id: &str,
+    workspace_id: &str,
+    finish: impl FnOnce(&Path) -> Result<()>,
+) -> Result<ReuseCopy> {
+    ensure_platform()?;
+    refuse_path_bound_recovery(source)?;
+    let absolute_destination = std::path::absolute(destination)?;
+    let destination = absolute_destination.as_path();
+    if fs::symlink_metadata(destination).is_ok() {
+        bail!(
+            "reuse destination already exists: {}",
+            destination.display()
+        );
+    }
+    let parent = destination
+        .parent()
+        .context("reuse destination needs a parent")?
+        .canonicalize()?;
+    let source_root = source.canonicalize()?;
+    if parent.starts_with(&source_root) {
+        bail!("a reused store must be outside the prepared store it copies");
+    }
+    let parent_handle = open_sync_directory(&parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".kin-reuse-incomplete-")
+        .tempdir_in(&parent)?;
+    ensure_directory_identity(&parent_handle, &parent)?;
+    let staging_handle = open_directory(staging.path())?.into_std_file();
+    let carried = |files: BTreeMap<String, Entry>| -> BTreeMap<String, Entry> {
+        files
+            .into_iter()
+            .filter(|(name, _)| !reuse_leaves_behind(name))
+            .collect()
+    };
+    let started = std::time::Instant::now();
+    let files = carried(inventory(source)?);
+    // Staged under the name it is published as, so the configuration and
+    // layout rules that bind a store to its `.kin` directory hold for the
+    // staged copy exactly as they will for the published one.
+    let payload = staging.path().join(".kin");
+    copy_checked_batched(source, &payload, &files)?;
+    refuse_path_bound_recovery(&payload)?;
+    if carried(inventory(source)?) != files {
+        bail!("the prepared store changed while it was copied; nothing was reused");
+    }
+    let copy = started.elapsed();
+    let started = std::time::Instant::now();
+    let manifest = Manifest {
+        schema: SCHEMA.into(),
+        source_root,
+        repository_id: repository_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        layout_version: kin_core::KinLayout::new(payload.clone()).read_version()?,
+        roots: roots.clone(),
+        files: files.clone(),
+    };
+    let (entities, relations) = {
+        let frozen = verify_staged_authority(&payload, &manifest)
+            .context("validate the copied store's authority before reusing it")?;
+        let workspace = kin_core::LocalRepositoryAuthorityBinding::from_layout(
+            &kin_core::KinLayout::new(payload.clone()),
+        )?
+        .workspace_id();
+        frozen
+            .authority()
+            .workspace_graph_snapshot(&workspace)?
+            .map_or((0, 0), |graph| {
+                (graph.entities.len(), graph.relations.len())
+            })
+    };
+    let verify = started.elapsed();
+    for directory in kin_core::KinLayout::new(payload.clone()).all_dirs() {
+        fs::create_dir_all(directory)?;
+    }
+    let started = std::time::Instant::now();
+    finish(&payload)?;
+    let finish_elapsed = started.elapsed();
+    refuse_path_bound_recovery(&payload)?;
+    sync_directory(&payload)?;
+    ensure_directory_identity(&parent_handle, &parent)?;
+    ensure_directory_identity(&staging_handle, staging.path())?;
+    publish_absent(&payload, destination, &staging_handle, &parent_handle)
+        .context("publish the reused store")?;
+    kin_blobs::durable::sync_all(&parent_handle).context(
+        "the reused store was published, but parent durability is unconfirmed; inspect it",
+    )?;
+    Ok(ReuseCopy {
+        files: files.len(),
+        bytes: files.values().map(|entry| entry.size).sum(),
+        entities,
+        relations,
+        copy,
+        verify,
+        finish: finish_elapsed,
+    })
+}
+
 pub(super) fn restore(
     carrier: &Path,
     destination: &Path,
@@ -476,9 +715,13 @@ pub(super) fn restore(
         .files
         .iter()
         .filter(|(name, _)| {
+            // A restore publishes an in-tree `.kin`, whose working tree is its
+            // parent, so the record a store kept outside its tree carried
+            // would name the wrong tree.
             !RUNTIME_FILES
                 .iter()
                 .any(|runtime| name.eq_ignore_ascii_case(runtime))
+                && name.as_str() != kin_core::layout::WORKING_TREE_RECORD
         })
         .map(|(name, entry)| (name.clone(), entry.clone()))
         .collect();
@@ -532,7 +775,7 @@ pub(super) fn restore(
     refuse_path_bound_recovery(&payload)?;
     publish_absent(&payload, destination, &staging_handle, &parent_handle)
         .context("publish restored repository")?;
-    parent_handle.sync_all().context("restore was published, but parent durability is unconfirmed; preserve and inspect the destination")?;
+    kin_blobs::durable::sync_all(&parent_handle).context("restore was published, but parent durability is unconfirmed; preserve and inspect the destination")?;
     Ok(())
 }
 
@@ -550,6 +793,45 @@ mod tests {
         tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
     }
 
+    /// A reused store carries the repository and leaves the donor's own
+    /// running and record-keeping behind.
+    #[test]
+    fn a_reused_store_leaves_the_donors_runtime_and_records_behind() {
+        for carried in [
+            "manifest.json",
+            "config.toml",
+            "version",
+            "kindb/graph.kvec",
+            "kindb/hydration-semantics",
+            "kindb/last-admission",
+            "lsp-enriched-files.json",
+            "lsp-accepted-evidence.jsonl",
+            "lsp-owed-files.json",
+            "reconciliation/authority.key",
+            "stashes/.keep",
+            "docs/index.json",
+        ] {
+            assert!(!reuse_leaves_behind(carried), "{carried} must travel");
+        }
+        for left in [
+            "daemon.pid",
+            "daemon.log",
+            "daemon.kills.json",
+            "daemon-footprint",
+            "daemon-starting-owner.json",
+            "lsp-sweep-interruptions",
+            "coordination_events.jsonl",
+            "mcp_transactions.json",
+            "logs/daemon.1.log",
+            "runs/r1/out.txt",
+            "bench/prepared-manifest.json",
+            "backups/a/manifest.json",
+            "projections/p/state.json",
+        ] {
+            assert!(reuse_leaves_behind(left), "{left} must stay behind");
+        }
+    }
+
     #[test]
     fn publication_parent_handle_can_sync_and_retains_directory_identity() {
         let temp = scratch();
@@ -557,10 +839,10 @@ mod tests {
         let moved = temp.path().join("moved");
         fs::create_dir(&parent).unwrap();
         let handle = open_sync_directory(&parent).unwrap();
-        handle.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&handle).unwrap();
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
-        handle.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&handle).unwrap();
         ensure_directory_identity(&handle, &moved).unwrap();
         assert!(ensure_directory_identity(&handle, &parent).is_err());
     }
@@ -650,7 +932,14 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(inventory(&destination).unwrap(), expected);
+        let mut restored = expected.clone();
+        // The new in-tree store derives its tree from its parent. Carrying
+        // the donor's external-tree record would bind it to the old checkout.
+        restored.remove(kin_core::layout::WORKING_TREE_RECORD);
+        assert_eq!(inventory(&destination).unwrap(), restored);
+        assert!(!destination
+            .join(kin_core::layout::WORKING_TREE_RECORD)
+            .exists());
         assert_eq!(validate(&backup).unwrap().files, expected);
     }
 
@@ -896,10 +1185,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            inventory(&source).unwrap(),
-            inventory(&destination).unwrap()
-        );
+        assert_eq!(inventory(&source).unwrap(), before);
+        let mut restored = before;
+        restored.remove(kin_core::layout::WORKING_TREE_RECORD);
+        assert_eq!(inventory(&destination).unwrap(), restored);
+        assert!(!destination
+            .join(kin_core::layout::WORKING_TREE_RECORD)
+            .exists());
         assert!(
             super::super::backup::restore_carrier(backup.clone(), destination.clone())
                 .await
@@ -1229,6 +1521,7 @@ mod tests {
                 audit_events: vec![audit],
                 ..Default::default()
             }),
+            git_snapshot_proofs: Vec::new(),
         };
         manager.commit_repository_transaction(transaction).unwrap();
         manifest.roots = manager.read_authority().roots().clone();

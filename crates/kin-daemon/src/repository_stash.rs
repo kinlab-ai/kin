@@ -507,6 +507,7 @@ fn push(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     seal.validate()
         .context("validate the exact stash seal transaction")?;
@@ -674,6 +675,7 @@ fn return_to_base(
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
     transaction
         .validate()
@@ -684,14 +686,17 @@ fn return_to_base(
         &authority.manager,
     )
     .context("validate the exact workspace projection before returning it to its base")?;
-    if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::projection_conflict(format!(
-            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; the \
-             workspace state is already sealed as {}",
-            drift.len(),
-            plan.stash_ref
-        ))
-        .into());
+    if !drift.is_clean() {
+        return Err(
+            kin_core::KinError::projection_conflict(crate::entity_words::drift_refusal(
+                &drift.drifted_paths,
+                &format!(
+                    "the workspace state is already sealed as {}",
+                    plan.stash_ref
+                ),
+            ))
+            .into(),
+        );
     }
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
@@ -881,6 +886,7 @@ fn pop(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction
         .validate()
@@ -892,13 +898,14 @@ fn pop(
         &authority.manager,
     )
     .context("validate the exact workspace projection before restoring a stash")?;
-    if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::projection_conflict(format!(
-            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
-             reconcile them into graph authority before restoring a stash",
-            drift.len()
-        ))
-        .into());
+    if !drift.is_clean() {
+        return Err(
+            kin_core::KinError::projection_conflict(crate::entity_words::drift_refusal(
+                &drift.drifted_paths,
+                "take them in with `kin admit` before restoring a stash",
+            ))
+            .into(),
+        );
     }
     let previous_tree = workspace.tree.clone();
     // A stash sealed before the store's last `kin upgrade` restores state an

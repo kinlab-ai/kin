@@ -6,12 +6,19 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(any(feature = "embeddings", feature = "vector"))]
+#[cfg(any(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 use std::sync::Arc;
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
 use crate::embed::CodeEmbedder;
 #[cfg(feature = "vector")]
+#[cfg_attr(
+    not(any(feature = "embeddings", feature = "external-embeddings")),
+    allow(unused_imports)
+)]
 use crate::embed::EmbeddingProducer;
 use crate::embed::EmbeddingProducerSet;
 use crate::error::KinDbError;
@@ -43,12 +50,15 @@ pub use enrichment_status::{
 
 mod source_derivation;
 pub use source_derivation::{
-    SourceDerivationFacts, SourceDerivationLimit, SourceDerivationLimits,
+    SourceDerivationFacts, SourceDerivationItem, SourceDerivationLimit, SourceDerivationLimits,
     SourceDerivationUnavailable, SourceEntityBinding, SourceLayoutFact, SourceOpaqueFact,
     SourceReservedRelation,
 };
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn default_embedding_batch_size() -> usize {
     std::env::var("KIN_EMBED_BATCH_SIZE")
         .ok()
@@ -68,11 +78,17 @@ fn default_embedding_batch_size() -> usize {
 /// Bounded look-ahead between the drain+prep producer and the forward (GPU)
 /// stage: at most this many prepared batches may sit in flight, capping host
 /// scratch memory while still letting prep run ahead of inference.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 const EMBED_PIPELINE_PREP_CAPACITY: usize = 2;
 
 /// Bounded look-ahead between the forward stage and the persist consumer.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 const EMBED_PIPELINE_RESULT_CAPACITY: usize = 2;
 
 /// Whether the staged embed pipeline should overlap prep/forward/persist instead
@@ -83,7 +99,10 @@ const EMBED_PIPELINE_RESULT_CAPACITY: usize = 2;
 /// `KIN_EMBED_PIPELINED` value overrides in either direction (`1`/`true`/`on`
 /// forces pipelined, `0`/`false`/`off` forces serial); absent that, the pipeline
 /// turns on only under the throughput resource profile.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn embed_pipeline_enabled() -> bool {
     if let Ok(raw) = std::env::var("KIN_EMBED_PIPELINED") {
         let value = raw.trim();
@@ -117,7 +136,10 @@ fn embed_pipeline_enabled() -> bool {
 /// The first error from any stage is captured and returned; channel disconnection
 /// then tears the remaining stages down without deadlock — when a consumer drops
 /// its receiver, the upstream `send` fails rather than blocking.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn drive_embed_pipeline<P, F, G, H>(
     prep_capacity: usize,
     result_capacity: usize,
@@ -254,7 +276,10 @@ where
 
 const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
 const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 const MAX_EMBED_CONTEXT_VALUES_PER_LABEL: usize = 3;
 const VERIFICATION_RELATION_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x6a5a6d56593e4f4fb6f6f2e1de3d4f99);
@@ -2017,12 +2042,20 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     }
 
     /// Whether the deterministic frontier must be rebuilt before it is popped.
+    #[cfg_attr(
+        not(any(feature = "embeddings", feature = "external-embeddings")),
+        allow(dead_code)
+    )]
     fn frontier_needs_rebuild(&self) -> bool {
         self.frontier_dirty || (self.frontier.is_empty() && !self.items.is_empty())
     }
 
     /// Replace the cached frontier with a deterministic ordering containing
     /// every currently queued key exactly once.
+    #[cfg_attr(
+        not(any(feature = "embeddings", feature = "external-embeddings")),
+        allow(dead_code)
+    )]
     fn install_frontier<I>(&mut self, ordered: I)
     where
         I: IntoIterator<Item = K>,
@@ -2039,6 +2072,10 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     /// Pop up to `batch_size` items from a valid frontier. Membership remains
     /// authoritative in `items`, so stale deque entries can never escape even
     /// if a future caller violates the rebuild precondition.
+    #[cfg_attr(
+        not(any(feature = "embeddings", feature = "external-embeddings")),
+        allow(dead_code)
+    )]
     fn pop_frontier_batch(&mut self, batch_size: usize) -> Vec<(K, EmbedRecency)> {
         debug_assert!(!self.frontier_dirty);
         let mut batch = Vec::with_capacity(batch_size.min(self.items.len()));
@@ -2066,6 +2103,10 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
 // rest of the live source) before historical revisions, tests, and generated
 // code. The buckets are derived only from facts the graph already records
 // (visibility / role / kind) — no new analysis pass.
+#[cfg_attr(
+    not(any(feature = "embeddings", feature = "external-embeddings")),
+    allow(dead_code)
+)]
 #[cfg(feature = "vector")]
 mod embed_tier {
     /// Public API contract surface (endpoints, interfaces, traits, schemas).
@@ -2099,6 +2140,10 @@ mod embed_tier {
 
 /// Classify a HEAD entity into an [`embed_tier`] bucket from its visibility,
 /// role, and kind. Public API surface ranks first; non-source roles last.
+#[cfg_attr(
+    not(any(feature = "embeddings", feature = "external-embeddings")),
+    allow(dead_code)
+)]
 #[cfg(feature = "vector")]
 fn entity_embed_tier(entity: &Entity) -> u8 {
     // Role dominates: non-source code always ranks after live source code.
@@ -2134,6 +2179,10 @@ fn entity_embed_tier(entity: &Entity) -> u8 {
 /// Map an entity's incoming-relation degree (dependent/caller count, the cheap
 /// centrality proxy the graph already maintains) to an ascending sort rank, so
 /// that *higher* in-degree sorts *earlier*.
+#[cfg_attr(
+    not(any(feature = "embeddings", feature = "external-embeddings")),
+    allow(dead_code)
+)]
 #[cfg(feature = "vector")]
 fn embed_centrality_rank(in_degree: usize) -> u32 {
     u32::MAX - (in_degree.min(u32::MAX as usize) as u32)
@@ -2150,6 +2199,10 @@ fn embed_centrality_rank(in_degree: usize) -> u32 {
 /// state (and `key` is unique per queued item), the resulting order is a
 /// deterministic total order — identical across processes regardless of how the
 /// items were inserted.
+#[cfg_attr(
+    not(any(feature = "embeddings", feature = "external-embeddings")),
+    allow(dead_code)
+)]
 #[cfg(feature = "vector")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct EmbedSortKey {
@@ -2171,7 +2224,10 @@ struct EmbedSortKey {
 /// dropped key would be absent from the index with nothing left to notice, and
 /// the next pass's coverage read would render that shortfall as ordinary
 /// pending work of unknown origin. The caller requeues it instead.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn apply_carried_vectors(
     vi: &VectorIndex,
     carried: &[(RetrievalKey, RetrievalKey)],
@@ -2199,6 +2255,10 @@ fn apply_carried_vectors(
 /// `incoming`) plus `Vec::len`, and a constant-time `entity_embed_tier` match.
 /// No graph traversal happens here, so building keys for an init backfill of
 /// 20K–50K entities is O(n) and the surrounding drain sort is O(n log n).
+#[cfg_attr(
+    not(any(feature = "embeddings", feature = "external-embeddings")),
+    allow(dead_code)
+)]
 #[cfg(feature = "vector")]
 fn embed_sort_key_for(ent: &EntityData, key: RetrievalKey, recency: EmbedRecency) -> EmbedSortKey {
     let (tier, centrality_rank) = match key {
@@ -2288,6 +2348,9 @@ impl Drop for TruthWriteGuard<'_> {
     }
 }
 
+/// Source of [`InMemoryGraph::instance_id`].
+static NEXT_GRAPH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A cached exact answer for [`InMemoryGraph::embedding_status`]'s `indexed`
 /// and `total`.
 ///
@@ -2364,7 +2427,10 @@ struct VectorSidecarFlushThrottle {
 /// Prep for batch N+1, inference for batch N, and persist for batch N-1 can then
 /// overlap instead of serializing behind a single lock held across the whole
 /// pipeline. [`InMemoryGraph::process_embedding_queue`] composes the three stages.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 pub struct PreparedEmbedBatch {
     /// Keys whose text was successfully formatted (the work to embed).
     keys: Vec<RetrievalKey>,
@@ -2381,13 +2447,19 @@ pub struct PreparedEmbedBatch {
 
 /// Retrieval vectors paired with the conservative union of runtimes that
 /// actually returned them.
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 pub struct ProducedRetrievalBatch {
     items: Vec<(RetrievalKey, Vec<f32>)>,
     producers: EmbeddingProducerSet,
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 impl ProducedRetrievalBatch {
     fn empty() -> Self {
         Self {
@@ -2424,7 +2496,10 @@ pub struct ProducedSemanticSearchBatch {
     pub query_producers: EmbeddingProducerSet,
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 impl PreparedEmbedBatch {
     /// Number of entities prepared for embedding.
     pub fn len(&self) -> usize {
@@ -2478,7 +2553,7 @@ pub struct InMemoryGraph {
     /// 20K+ individual Tantivy upserts during bulk relation insertion.
     text_full_rebuild_required: AtomicBool,
     /// Code embedding model, lazily initialized on first embed call.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     embedder: parking_lot::Mutex<Option<Arc<CodeEmbedder>>>,
     /// HNSW vector index for semantic similarity search, lazily initialized.
     #[cfg(feature = "vector")]
@@ -2487,6 +2562,9 @@ pub struct InMemoryGraph {
     /// write to [`EntityData`]. Reading it is how a cached derivation of entity
     /// truth knows whether truth has moved.
     truth_epoch: AtomicU64,
+    /// Process-unique identity of this graph instance. See
+    /// [`InMemoryGraph::instance_id`].
+    instance_id: u64,
     /// Cached `(indexed, total)` embedding coverage, keyed on the truth epoch
     /// and the vector index's key-set token.
     ///
@@ -2546,6 +2624,22 @@ pub struct InMemoryGraph {
     fail_next_transaction_derived_cleanup: AtomicBool,
     #[cfg(test)]
     fail_next_text_rebuild: AtomicBool,
+}
+
+/// Local refresh state, so one scope cannot defer another writer's index work.
+/// Drop also refreshes writes accepted before an error or an early return.
+struct RelationTextRefreshBatch<'a> {
+    graph: &'a InMemoryGraph,
+    affected: HashSet<EntityId>,
+}
+
+impl Drop for RelationTextRefreshBatch<'_> {
+    fn drop(&mut self) {
+        if !self.affected.is_empty() {
+            let affected = sorted_unique_entity_ids(std::mem::take(&mut self.affected));
+            self.graph.refresh_text_index_for_entities(&affected);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2732,11 +2826,12 @@ impl InMemoryGraph {
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
             truth_epoch: AtomicU64::new(0),
+            instance_id: NEXT_GRAPH_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             #[cfg(feature = "vector")]
             embedding_coverage: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
@@ -3268,11 +3363,12 @@ impl InMemoryGraph {
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
             truth_epoch: AtomicU64::new(0),
+            instance_id: NEXT_GRAPH_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             #[cfg(feature = "vector")]
             embedding_coverage: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
@@ -3501,11 +3597,12 @@ impl InMemoryGraph {
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
-            #[cfg(feature = "embeddings")]
+            #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
             embedder: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
             truth_epoch: AtomicU64::new(0),
+            instance_id: NEXT_GRAPH_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             #[cfg(feature = "vector")]
             embedding_coverage: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
@@ -3945,6 +4042,116 @@ impl InMemoryGraph {
         );
     }
 
+    /// Apply relation writes in order with their ordinary admission and vector
+    /// results, refreshing relation-derived text once when the scope ends.
+    ///
+    /// Only use this while constructing the graph, before any reader or index
+    /// publication can run. This scope does not exclude concurrent readers or
+    /// index flushes. Each call writes graph truth independently, including a
+    /// call whose later vector invalidation fails. Identical re-offers retain
+    /// the ordinary no-write fast path. Startup accepted-evidence replay uses
+    /// this before the daemon serves readers.
+    pub fn with_relation_text_refresh_batch_before_readers<R>(
+        &self,
+        write: impl FnOnce(&mut dyn FnMut(&Relation) -> Result<(), KinDbError>) -> R,
+    ) -> R {
+        self.with_relation_text_refresh_batch(write)
+    }
+
+    /// Apply relation writes in order with their ordinary admission and vector
+    /// results, refreshing relation-derived text once for every entity the
+    /// scope touched when it ends.
+    ///
+    /// For a live writer that holds its own writer exclusion across the whole
+    /// batch and ends this scope before releasing it. A reader can see a
+    /// written edge before its endpoints' text documents mention it, exactly
+    /// as it can between one `upsert_relation`'s truth write and its refresh;
+    /// here that window closes when the scope ends rather than after each
+    /// edge. Each call writes graph truth independently, and an identical
+    /// re-offer keeps the ordinary no-write fast path.
+    ///
+    /// Refreshing once is what keeps a hub entity linear. A refresh re-collects
+    /// every neighbor name an entity has, so refreshing a caller or target
+    /// after each of its N new edges cost on the order of N squared.
+    pub fn with_relation_text_refresh_batch<R>(
+        &self,
+        write: impl FnOnce(&mut dyn FnMut(&Relation) -> Result<(), KinDbError>) -> R,
+    ) -> R {
+        let mut refresh = RelationTextRefreshBatch {
+            graph: self,
+            affected: HashSet::new(),
+        };
+        let mut upsert = |relation: &Relation| {
+            self.upsert_relation_with_text_refresh(relation, |affected| {
+                refresh.affected.extend(affected.iter().copied());
+            })
+        };
+        write(&mut upsert)
+    }
+
+    fn upsert_relation_with_text_refresh(
+        &self,
+        relation: &Relation,
+        refresh_text: impl FnOnce(&[EntityId]),
+    ) -> Result<(), KinDbError> {
+        // An identical edge is not a write. Taking the truth lock first would
+        // drop the binding witness and then discover there was nothing to
+        // change, which is how a re-offered language-server edge made a
+        // committed tree answer `local_binding_unproven` without moving a count.
+        //
+        // Not a write is still not a pass. The endpoint gate is what makes this
+        // edge writable at all, and an endpoint unadmitted since the edge was
+        // stored makes the re-offer the same refusal a first offer would get.
+        // Returning `Ok` on the identity alone would report the held edge as
+        // accepted over a graph that may no longer carry either end of it, so
+        // the gate runs on both early returns. It reads, so the read guard is
+        // enough and the witness survives.
+        {
+            let ent = self.entities.read();
+            if ent
+                .relations
+                .get(&relation.id)
+                .is_some_and(|held| held == relation)
+            {
+                self.require_admitted_relation_endpoints(&ent, relation)?;
+                return Ok(());
+            }
+        }
+        let mut ent = self.entities_write();
+        if ent
+            .relations
+            .get(&relation.id)
+            .is_some_and(|held| held == relation)
+        {
+            self.require_admitted_relation_endpoints(&ent, relation)?;
+            return Ok(());
+        }
+        self.require_admitted_relation_endpoints(&ent, relation)?;
+        let mut affected = HashSet::new();
+        let mut merkle_seeds = Vec::new();
+
+        // Remove old edge entries if updating
+        if let Some(old) = ent.relations.remove(&relation.id) {
+            affected.extend(entity_ids_for_relation(&old));
+            merkle_seeds.extend(entity_ids_for_relation(&old));
+            remove_relation_indexes(&mut ent, &old);
+            self.record_relation_delta_remove(&ent, &old);
+        }
+
+        // Insert new edge entries
+        insert_relation_indexes(&mut ent, relation);
+        ent.relations.insert(relation.id, relation.clone());
+        self.record_relation_delta_upsert(&ent, relation.clone());
+        affected.extend(entity_ids_for_relation(relation));
+        merkle_seeds.extend(entity_ids_for_relation(relation));
+        let affected: Vec<EntityId> = affected.into_iter().collect();
+        self.refresh_merkle_for_entities(&ent, merkle_seeds);
+        drop(ent);
+        refresh_text(&affected);
+        self.invalidate_entities_for_embedding(&affected)?;
+        Ok(())
+    }
+
     fn refresh_text_index_for_entities(&self, entity_ids: &[EntityId]) {
         let Some(ref ti) = self.text_index else {
             return;
@@ -4050,10 +4257,21 @@ impl InMemoryGraph {
 
     #[cfg(feature = "vector")]
     fn remove_retrievable_vector(&self, key: &RetrievalKey) -> Result<(), KinDbError> {
-        if let Some(ref vi) = *self.vector_index.lock() {
+        // The handle is cloned out so the slot lock is not held across the
+        // removal. The removal can wait on the index's own mutation guard, and
+        // every query and embed batch reads the slot first; holding it here
+        // stalled all of them behind one relation write.
+        if let Some(vi) = self.loaded_vector_index() {
             vi.remove_retrievable(key)?;
         }
         Ok(())
+    }
+
+    /// The loaded vector index handle, with the slot lock released before the
+    /// caller uses it.
+    #[cfg(feature = "vector")]
+    fn loaded_vector_index(&self) -> Option<Arc<VectorIndex>> {
+        self.vector_index.lock().clone()
     }
 
     #[cfg(not(feature = "vector"))]
@@ -4823,6 +5041,16 @@ impl InMemoryGraph {
         self.truth_epoch.load(Ordering::Acquire)
     }
 
+    /// A process-unique identity for this graph instance, never reused.
+    ///
+    /// A cache of something derived from a graph keys on this together with
+    /// [`Self::truth_epoch`]. The epoch alone cannot tell two graphs apart, and
+    /// an address cannot either once one graph is dropped and another is built
+    /// in its place with the same writes.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Number of entities in the graph.
     pub fn entity_count(&self) -> usize {
         self.entities.read().entities.len()
@@ -5515,7 +5743,10 @@ impl InMemoryGraph {
     ///
     /// Downloads the model from HuggingFace on first call (~270 MB).
     /// Subsequent calls return the cached instance.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn get_embedder(&self) -> Result<Arc<CodeEmbedder>, KinDbError> {
         let mut guard = self.embedder.lock();
         if let Some(ref e) = *guard {
@@ -5530,7 +5761,10 @@ impl InMemoryGraph {
 
     /// Local content identities must agree before old document vectors can
     /// receive either a new query or an incremental batch from a loaded model.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn validate_loaded_embedding_identity(
         &self,
         embedder: &CodeEmbedder,
@@ -5562,7 +5796,7 @@ impl InMemoryGraph {
 
     /// Snapshotting an owner that already loaded its model uses that captured
     /// identity, never a fresh interpretation of mutable environment or paths.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     #[cfg_attr(not(feature = "vector"), allow(dead_code))] // used by vector sidecar checks
     pub(crate) fn loaded_embedding_runtime(&self) -> Option<crate::embed::EmbeddingRuntimeConfig> {
         self.embedder
@@ -5577,13 +5811,19 @@ impl InMemoryGraph {
     /// every later one reads it from the local cache. A caller about to take a
     /// lock for an embedding batch calls this first, so the fetch never runs
     /// under that lock: the batch then finds the embedder already built.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn prepare_embedder(&self) -> Result<(), KinDbError> {
         self.get_embedder().map(|_| ())
     }
 
     /// A build without embeddings has no embedder to prepare.
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn prepare_embedder(&self) -> Result<(), KinDbError> {
         Ok(())
     }
@@ -5602,7 +5842,10 @@ impl InMemoryGraph {
     /// drop-the-guard-then-reset pattern allowed exactly that race, churning the
     /// embedding queue and pinning CPU; keeping the reset atomic is the kin-db
     /// side of the embed-worker dimension-loop contract.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn get_vector_index(&self) -> Result<Arc<VectorIndex>, KinDbError> {
         let embedder = self.get_embedder()?;
         let mut guard = self.vector_index.lock();
@@ -5673,7 +5916,10 @@ impl InMemoryGraph {
     /// built or refreshed in-process.
     ///
     /// Returns the number of entities embedded.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn embed_entities(&self, entity_ids: &[EntityId]) -> Result<usize, KinDbError> {
         let _span =
             tracing::info_span!("kindb.embed_entities", entity_ids = entity_ids.len()).entered();
@@ -5728,7 +5974,10 @@ impl InMemoryGraph {
     /// indexing or rebuilding the vector index from scratch.
     ///
     /// Returns the number of entities embedded.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
         let _span = tracing::info_span!("kindb.build_embeddings").entered();
         let mut all_ids: Vec<EntityId> = {
@@ -5744,13 +5993,19 @@ impl InMemoryGraph {
         self.embed_entities(&all_ids)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
         Ok(0)
     }
 
     /// Embed arbitrary retrieval documents and upsert them into the vector index.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn embed_retrievable_texts(
         &self,
         docs: &[(RetrievalKey, String)],
@@ -5786,7 +6041,10 @@ impl InMemoryGraph {
         Ok(count)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn embed_retrievable_texts(
         &self,
         _docs: &[(RetrievalKey, String)],
@@ -5876,13 +6134,37 @@ impl InMemoryGraph {
 
     /// Serialize one detached producer-bound vector candidate, let the caller
     /// promote matching metadata from its exact receipt, then atomically expose
-    /// the complete index. The vector mutation/provenance frontier stays held
-    /// across the callback and both promotions.
+    /// the complete index. The vector mutation/provenance frontier is held only
+    /// while the save copies the vectors and their producers, so what is
+    /// written is one instant of both; the rebuild, the write, the callback
+    /// and both promotions run with writers free, and saves stay serialized
+    /// against each other.
     #[cfg(feature = "vector")]
     pub(crate) fn save_vector_index_with_provenance<F>(
         &self,
         path: &std::path::Path,
         descriptor: Option<crate::vector::IndexDescriptor>,
+        before_index_promote: F,
+    ) -> Result<Option<crate::vector::VectorIndexPersistenceInfo>, KinDbError>
+    where
+        F: FnOnce(&crate::vector::VectorIndexPersistenceInfo) -> Result<(), KinDbError>,
+    {
+        self.save_vector_index_with_provenance_as(
+            path,
+            descriptor,
+            crate::vector::PersistTopology::Canonical,
+            before_index_promote,
+        )
+    }
+
+    /// [`Self::save_vector_index_with_provenance`] writing the HNSW topology
+    /// `topology` asks for.
+    #[cfg(feature = "vector")]
+    pub(crate) fn save_vector_index_with_provenance_as<F>(
+        &self,
+        path: &std::path::Path,
+        descriptor: Option<crate::vector::IndexDescriptor>,
+        topology: crate::vector::PersistTopology,
         before_index_promote: F,
     ) -> Result<Option<crate::vector::VectorIndexPersistenceInfo>, KinDbError>
     where
@@ -5928,7 +6210,7 @@ impl InMemoryGraph {
         run_save_vector_index_after_detach_hook(self);
         if let Some(index) = index {
             return index
-                .save_with_provenance(path, descriptor, before_index_promote)
+                .save_with_provenance_as(path, descriptor, topology, before_index_promote)
                 .map(Some);
         }
 
@@ -5964,7 +6246,7 @@ impl InMemoryGraph {
     /// embedding its text, a session graph sharing it) still has it, because
     /// dropping this reference then would free nothing and the next use would
     /// load a second copy beside the first.
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub fn release_embedder(&self) -> bool {
         let mut guard = self.embedder.lock();
         match guard.as_ref() {
@@ -5977,12 +6259,12 @@ impl InMemoryGraph {
     }
 
     /// Without the embedder feature there is never a model to release.
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
     pub fn release_embedder(&self) -> bool {
         false
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub fn share_embedder_from(&self, source: &InMemoryGraph) {
         let source_embedder = source.embedder.lock().clone();
         if let Some(e) = source_embedder {
@@ -6032,7 +6314,10 @@ impl InMemoryGraph {
     /// Returns up to `limit` `(RetrievalKey, distance)` pairs sorted by similarity.
     /// Returns an empty vec when embeddings are not yet built or features
     /// are disabled.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn semantic_search(
         &self,
         query: &str,
@@ -6045,7 +6330,10 @@ impl InMemoryGraph {
     /// enforce a hosted numerical-compatibility policy must inspect
     /// `query_producers`; the persisted index's lineage alone does not attest
     /// which runtime produced this query.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn semantic_search_with_producers(
         &self,
         query: &str,
@@ -6086,7 +6374,10 @@ impl InMemoryGraph {
     }
 
     /// Semantic similarity search (stub when features are disabled).
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn semantic_search(
         &self,
         _query: &str,
@@ -6095,7 +6386,10 @@ impl InMemoryGraph {
         Ok(Vec::new())
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn semantic_search_with_producers(
         &self,
         _query: &str,
@@ -6114,7 +6408,10 @@ impl InMemoryGraph {
     /// index for each resulting vector.
     ///
     /// Returns one `Vec<(RetrievalKey, distance)>` per query, in input order.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn semantic_search_batch(
         &self,
         queries: &[&str],
@@ -6126,7 +6423,10 @@ impl InMemoryGraph {
     }
 
     /// Batched semantic search with exact query-vector producer evidence.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn semantic_search_batch_with_producers(
         &self,
         queries: &[&str],
@@ -6174,7 +6474,10 @@ impl InMemoryGraph {
     }
 
     /// Batched semantic similarity search with a predicate filter.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn semantic_search_batch_filtered<P>(
         &self,
         queries: &[&str],
@@ -6191,7 +6494,10 @@ impl InMemoryGraph {
 
     /// Filtered batched semantic search with exact query-vector producer
     /// evidence for hosted ranking policy.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn semantic_search_batch_filtered_with_producers<P>(
         &self,
         queries: &[&str],
@@ -6241,7 +6547,10 @@ impl InMemoryGraph {
     }
 
     /// Batched semantic similarity search (stub when features are disabled).
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn semantic_search_batch(
         &self,
         queries: &[&str],
@@ -6250,7 +6559,10 @@ impl InMemoryGraph {
         Ok(vec![Vec::new(); queries.len()])
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn semantic_search_batch_with_producers(
         &self,
         queries: &[&str],
@@ -6260,6 +6572,24 @@ impl InMemoryGraph {
             matches: vec![Vec::new(); queries.len()],
             query_producers: EmbeddingProducerSet::new(),
         })
+    }
+
+    /// Without embeddings no query is embedded, so no filter has a vector hit
+    /// to keep: every query answers empty, as the unfiltered form above does.
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
+    pub fn semantic_search_batch_filtered_with_producers<P>(
+        &self,
+        queries: &[&str],
+        limit: usize,
+        _predicate: P,
+    ) -> Result<ProducedSemanticSearchBatch, KinDbError>
+    where
+        P: Fn(&RetrievalKey) -> bool,
+    {
+        self.semantic_search_batch_with_producers(queries, limit)
     }
 
     // -----------------------------------------------------------------------
@@ -6669,6 +6999,10 @@ impl InMemoryGraph {
     /// work drain identical batches in the identical order. That determinism is
     /// what removes the per-process batch-composition variance behind the embed
     /// determinism bug.
+    #[cfg_attr(
+        not(any(feature = "embeddings", feature = "external-embeddings")),
+        allow(dead_code)
+    )]
     #[cfg(feature = "vector")]
     fn drain_embedding_batch(&self, batch_size: usize) -> Vec<(RetrievalKey, EmbedRecency)> {
         let _drain_timer = self
@@ -6704,6 +7038,10 @@ impl InMemoryGraph {
     /// Mirrors [`InMemoryGraph::drain_embedding_batch`] for artifacts. This
     /// replaces the previous raw `HashSet::iter()` drain, whose per-process
     /// iteration order made artifact batch composition nondeterministic.
+    #[cfg_attr(
+        not(any(feature = "embeddings", feature = "external-embeddings")),
+        allow(dead_code)
+    )]
     #[cfg(feature = "vector")]
     fn drain_artifact_embedding_batch(&self, batch_size: usize) -> Vec<(ArtifactId, EmbedRecency)> {
         let batch_size = batch_size.max(1);
@@ -6734,7 +7072,10 @@ impl InMemoryGraph {
     /// changed entities and artifacts, and callers process only that pending
     /// work. Entity batches drain first; artifact batches follow through the
     /// same staged pipeline.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_all_pending_embeddings(&self, batch_size: usize) -> Result<usize, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.process_all_pending_embeddings",
@@ -6788,7 +7129,10 @@ impl InMemoryGraph {
     /// proof path. Output is byte-equivalent to the serial path (same drained
     /// batch sequence, same in-batch key order) modulo the pre-existing Metal
     /// float jitter, so the citable embed order is preserved.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_all_pending_embeddings_pipelined(
         &self,
         batch_size: usize,
@@ -6871,7 +7215,10 @@ impl InMemoryGraph {
         Ok(total)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn process_all_pending_embeddings(&self, _batch_size: usize) -> Result<usize, KinDbError> {
         Ok(0)
     }
@@ -6886,7 +7233,10 @@ impl InMemoryGraph {
     }
 
     /// Drain the current pending artifact embedding queue in batches.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_all_pending_artifact_embeddings(
         &self,
         batch_size: usize,
@@ -6926,7 +7276,10 @@ impl InMemoryGraph {
         Ok(total)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn process_all_pending_artifact_embeddings(
         &self,
         _batch_size: usize,
@@ -6940,13 +7293,19 @@ impl InMemoryGraph {
     /// the artifact queue), generates embeddings via the CodeEmbedder, and
     /// inserts them into the HNSW VectorIndex.
     /// Returns the number of items successfully embedded.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
         self.process_embedding_queue_observed(batch_size, &())
     }
 
     /// Process a batch with per-call compute progress and safe cancellation.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_embedding_queue_observed(
         &self,
         batch_size: usize,
@@ -6988,7 +7347,10 @@ impl InMemoryGraph {
     /// pipeline finishes a run with artifact vectors present instead of leaving
     /// that sub-space to a second hand-rolled drain loop. Entity work always
     /// drains first; artifacts never displace it within a batch.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn prepare_pending_embedding_batch(&self, batch_size: usize) -> PreparedEmbedBatch {
         use crate::embed::format_graph_entity_text;
         use crate::embed::format_graph_entity_text_with_context;
@@ -7133,7 +7495,10 @@ impl InMemoryGraph {
     /// so byte equality would refuse every real carry. Sameness of the object,
     /// tested through liveness, head position and the fingerprint triple, is the
     /// criterion instead.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn carry_source_for_head_revision(
         &self,
         ent: &EntityData,
@@ -7163,7 +7528,10 @@ impl InMemoryGraph {
     /// no graph lock — only the brief embedder/index Arc clones — so it can run
     /// concurrently with another batch's prep or persist. On failure the batch is
     /// requeued (preserving recency) so no work is lost.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn embed_prepared_batch(
         &self,
         prepared: &PreparedEmbedBatch,
@@ -7171,7 +7539,10 @@ impl InMemoryGraph {
         self.embed_prepared_batch_observed(prepared, &())
     }
 
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn embed_prepared_batch_observed(
         &self,
         prepared: &PreparedEmbedBatch,
@@ -7226,7 +7597,10 @@ impl InMemoryGraph {
     /// reconcile orphans when the queue drains. Touches only the vector index, so
     /// it can run concurrently with another batch's prep or inference. On failure
     /// the embedded keys are requeued.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn persist_embedded_batch(
         &self,
         embedded: Vec<(RetrievalKey, Vec<f32>)>,
@@ -7239,7 +7613,10 @@ impl InMemoryGraph {
         )
     }
 
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn persist_produced_embedding_batch(
         &self,
         embedded: ProducedRetrievalBatch,
@@ -7256,7 +7633,10 @@ impl InMemoryGraph {
     /// passes `false` because its drain thread empties the queue while batches are
     /// still in flight — firing the gate on every persist — and instead prunes
     /// once after the whole run drains.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn persist_embedded_batch_inner(
         &self,
         embedded: ProducedRetrievalBatch,
@@ -7343,7 +7723,10 @@ impl InMemoryGraph {
 
     /// Requeue embedding keys, restoring each key's recency so an error-requeue
     /// never silently demotes changed-this-sync work to backfill.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     fn requeue_embedding_keys<I: IntoIterator<Item = RetrievalKey>>(
         &self,
         keys: I,
@@ -7357,20 +7740,29 @@ impl InMemoryGraph {
     }
 
     /// Process embedding queue (stub when features are disabled).
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn process_embedding_queue(&self, _batch_size: usize) -> Result<usize, KinDbError> {
         Ok(0)
     }
 
     /// Process up to `batch_size` artifacts from the embedding queue.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_artifact_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
         self.process_artifact_embedding_queue_observed(batch_size, &())
     }
 
     /// Artifact counterpart of the observed entity queue, with the same
     /// cancellation and publication boundary.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[cfg(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    ))]
     pub fn process_artifact_embedding_queue_observed(
         &self,
         batch_size: usize,
@@ -7509,7 +7901,10 @@ impl InMemoryGraph {
         Ok(count)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn process_artifact_embedding_queue(
         &self,
         _batch_size: usize,
@@ -7517,7 +7912,10 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn process_embedding_queue_observed(
         &self,
         _batch_size: usize,
@@ -7527,7 +7925,10 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     pub fn process_artifact_embedding_queue_observed(
         &self,
         _batch_size: usize,
@@ -8136,7 +8537,7 @@ impl InMemoryGraph {
             }
             drop(queue);
 
-            if let Some(ref vi) = *self.vector_index.lock() {
+            if let Some(vi) = self.loaded_vector_index() {
                 for id in ids {
                     let _ = vi.remove(id);
                 }
@@ -8693,7 +9094,10 @@ fn collect_artifact_ids(ent: &EntityData) -> Vec<ArtifactId> {
     ids
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn artifact_embedding_doc(
     ent: &EntityData,
     artifact_id: &ArtifactId,
@@ -8786,7 +9190,10 @@ fn collect_relation_text_fields<'a>(
     }
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn collect_embedding_context_lines(ent: &EntityData, entity_id: &EntityId) -> Vec<String> {
     let mut candidates: Vec<(&'static str, String, f32)> = Vec::new();
 
@@ -8825,7 +9232,10 @@ fn collect_embedding_context_lines(ent: &EntityData, entity_id: &EntityId) -> Ve
     lines
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn collect_relation_embedding_context<'a>(
     ent: &EntityData,
     relation_ids: impl Iterator<Item = &'a RelationId>,
@@ -8875,7 +9285,10 @@ fn collect_relation_embedding_context<'a>(
     }
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn push_embedding_context_value(
     candidates: &mut Vec<(&'static str, String, f32)>,
     label: &'static str,
@@ -8889,7 +9302,10 @@ fn push_embedding_context_value(
     candidates.push((label, value.to_string(), score));
 }
 
-#[cfg(all(feature = "embeddings", feature = "vector"))]
+#[cfg(all(
+    any(feature = "embeddings", feature = "external-embeddings"),
+    feature = "vector"
+))]
 fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str {
     match (kind, outgoing) {
         (RelationKind::Calls, true) => "calls",
@@ -9345,62 +9761,9 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
-        // An identical edge is not a write. Taking the truth lock first would
-        // drop the binding witness and then discover there was nothing to
-        // change, which is how a re-offered language-server edge made a
-        // committed tree answer `local_binding_unproven` without moving a count.
-        //
-        // Not a write is still not a pass. The endpoint gate is what makes this
-        // edge writable at all, and an endpoint unadmitted since the edge was
-        // stored makes the re-offer the same refusal a first offer would get.
-        // Returning `Ok` on the identity alone would report the held edge as
-        // accepted over a graph that may no longer carry either end of it, so
-        // the gate runs on both early returns. It reads, so the read guard is
-        // enough and the witness survives.
-        {
-            let ent = self.entities.read();
-            if ent
-                .relations
-                .get(&relation.id)
-                .is_some_and(|held| held == relation)
-            {
-                self.require_admitted_relation_endpoints(&ent, relation)?;
-                return Ok(());
-            }
-        }
-        let mut ent = self.entities_write();
-        if ent
-            .relations
-            .get(&relation.id)
-            .is_some_and(|held| held == relation)
-        {
-            self.require_admitted_relation_endpoints(&ent, relation)?;
-            return Ok(());
-        }
-        self.require_admitted_relation_endpoints(&ent, relation)?;
-        let mut affected = HashSet::new();
-        let mut merkle_seeds = Vec::new();
-
-        // Remove old edge entries if updating
-        if let Some(old) = ent.relations.remove(&relation.id) {
-            affected.extend(entity_ids_for_relation(&old));
-            merkle_seeds.extend(entity_ids_for_relation(&old));
-            remove_relation_indexes(&mut ent, &old);
-            self.record_relation_delta_remove(&ent, &old);
-        }
-
-        // Insert new edge entries
-        insert_relation_indexes(&mut ent, relation);
-        ent.relations.insert(relation.id, relation.clone());
-        self.record_relation_delta_upsert(&ent, relation.clone());
-        affected.extend(entity_ids_for_relation(relation));
-        merkle_seeds.extend(entity_ids_for_relation(relation));
-        let affected: Vec<EntityId> = affected.into_iter().collect();
-        self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        drop(ent);
-        self.refresh_text_index_for_entities(&affected);
-        self.invalidate_entities_for_embedding(&affected)?;
-        Ok(())
+        self.upsert_relation_with_text_refresh(relation, |affected| {
+            self.refresh_text_index_for_entities(affected);
+        })
     }
 
     fn remove_entity(&self, id: &EntityId) -> Result<(), KinDbError> {
@@ -9459,7 +9822,7 @@ impl EntityStore for InMemoryGraph {
             self.embedding_queue
                 .lock()
                 .remove(&RetrievalKey::Entity(*id));
-            if let Some(ref vi) = *self.vector_index.lock() {
+            if let Some(vi) = self.loaded_vector_index() {
                 let _ = vi.remove(id);
             }
             // Removal can leave revision-key vectors behind that the incremental
@@ -9541,7 +9904,7 @@ impl EntityStore for InMemoryGraph {
             for id in ids {
                 eq.remove(&RetrievalKey::Entity(*id));
             }
-            if let Some(ref vi) = *self.vector_index.lock() {
+            if let Some(vi) = self.loaded_vector_index() {
                 vi.remove_batch(ids)?;
             }
             self.mark_vector_full_reconcile();
@@ -10829,8 +11192,11 @@ impl ChangeStore for InMemoryGraph {
         Ok(())
     }
 
+    /// Served from the records this graph's history already verified, so a
+    /// history read that replays the line from its head does not read, hash
+    /// and decode every change on it again per request.
     fn get_change(&self, id: &SemanticChangeId) -> Result<Option<SemanticChange>, KinDbError> {
-        self.changes.read().changes.read_change(id)
+        self.changes.read().changes.read_change_for_serving(id)
     }
 
     fn get_changes_since(
@@ -12733,7 +13099,14 @@ mod tests {
         // See `crate::embed::EMBED_MODEL_DOWNLOAD_LOCK`: shares the HF Hub
         // cache download with
         // `embed::tests::default_dimensions_match_default_model`.
+        // The parent holds it while its child downloads.
         let _download_guard = crate::embed::EMBED_MODEL_DOWNLOAD_LOCK.lock();
+        if !crate::embed::in_built_in_embeddings_child(
+            "engine::graph::tests::test_vector_index_dimension_mismatch_auto_recovery",
+            false,
+        ) {
+            return;
+        }
         let graph = InMemoryGraph::new();
         // Setup a vector index with a mismatching dimension (e.g. 100)
         let mismatched_vi = Arc::new(VectorIndex::new(100).unwrap());
@@ -13750,8 +14123,6 @@ mod tests {
     #[cfg(feature = "vector")]
     #[test]
     fn a_surviving_revision_key_does_not_resolve_a_retired_entity() {
-        #[cfg(feature = "embeddings")]
-        let _download_guard = crate::embed::EMBED_MODEL_DOWNLOAD_LOCK.lock();
         let graph = InMemoryGraph::new();
         let file = FilePathId::new("src/retired.rs");
         let entry = TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false);
@@ -13794,14 +14165,12 @@ mod tests {
 
         // Put both keys in the vector index, which is the state a real store
         // reaches after embedding: the live key and its revision history.
-        // The index rejects a wrong-width vector, and its error names the
-        // expected width, so this constant is checked by construction rather
-        // than guessed: a change to the default dimension fails here loudly.
-        let vector = vec![0.5_f32; 768];
+        // Supply a small dimension-matched fixture index. Retirement is an
+        // authority/key-liveness property and does not initialize a model.
+        let vector = vec![0.5_f32; 4];
+        graph.install_vector_index(VectorIndex::new(vector.len()).unwrap());
         {
-            let vi = graph
-                .get_vector_index()
-                .expect("vector index must be available under the vector feature");
+            let vi = graph.vector_index.lock().as_ref().cloned().unwrap();
             vi.upsert_retrievable(RetrievalKey::Entity(retired.id), &vector)
                 .unwrap();
             vi.upsert_retrievable(RetrievalKey::EntityRevision(revision_id), &vector)
@@ -13825,8 +14194,11 @@ mod tests {
             .expect("retiring the entity must succeed");
 
         let vi = graph
-            .get_vector_index()
-            .expect("vector index must survive the transaction");
+            .vector_index
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("the supplied vector index must survive the transaction");
 
         // (a) CONTROL: eviction happened. Without this the rest proves nothing.
         assert!(
@@ -14778,6 +15150,87 @@ mod tests {
         assert!(!graph.has_pending_delta());
     }
 
+    /// A relation write invalidates its endpoints' embeddings, which removes
+    /// their vectors, and it must not wait for a save of the vector index.
+    ///
+    /// Measured on a React store: every relation write the language-server
+    /// sweep made waited behind the save each embed batch ends with, whose
+    /// canonical HNSW rebuild ran tens of seconds on one core, so the sweep
+    /// advanced about one file per embed batch while the embedding backlog
+    /// drained. The save is paused here after its copy, where it used to still
+    /// hold the index's mutation guard.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_relation_write_does_not_wait_for_a_vector_index_save() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.kvec");
+        let graph = Arc::new(InMemoryGraph::new());
+        let caller = test_entity("sweep_caller", "src/caller.rs");
+        let callee = test_entity("sweep_callee", "src/callee.rs");
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        let index = VectorIndex::new(2).unwrap();
+        index
+            .upsert_retrievable_with_producers(
+                RetrievalKey::from(caller.id),
+                &[1.0, 0.0],
+                &crate::embed::EmbeddingProducerSet::singleton(
+                    crate::embed::EmbeddingProducer::Cpu,
+                ),
+            )
+            .unwrap();
+        graph.install_vector_index(index);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let saver = {
+            let graph = Arc::clone(&graph);
+            std::thread::spawn(move || {
+                graph.save_vector_index_with_provenance(&path, None, |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the test releases the save");
+                    Ok(())
+                })
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the save reaches its promote step");
+
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer = {
+            let graph = Arc::clone(&graph);
+            let relation = test_relation(caller.id, callee.id, RelationKind::Calls);
+            std::thread::spawn(move || {
+                written_tx.send(graph.upsert_relation(&relation)).unwrap();
+            })
+        };
+        let written = written_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).unwrap();
+        saver.join().unwrap().unwrap();
+        writer.join().unwrap();
+
+        written
+            .expect("the relation write must not wait for the save to finish")
+            .unwrap();
+        assert!(
+            !graph
+                .loaded_vector_index()
+                .unwrap()
+                .contains_retrievable(&RetrievalKey::from(caller.id)),
+            "the caller's stale vector was removed while the save was paused"
+        );
+        assert!(
+            graph.pending_embeddings() >= 1,
+            "the caller is owed a fresh vector"
+        );
+    }
+
     fn test_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
         Relation {
             id: RelationId::new(),
@@ -15162,23 +15615,54 @@ mod tests {
     /// root read.
     #[test]
     fn single_relation_upserts_defer_to_one_batch_merkle() {
-        let graph = InMemoryGraph::new();
         let n: usize = 12_000;
         let entities: Vec<Entity> = (0..n as u128)
             .map(|i| test_entity_with_id(i + 1, &format!("entity_{i}")))
             .collect();
-        graph.batch_upsert_entities(&entities).unwrap();
 
         // Chain every entity so the whole graph is one weakly-connected
-        // component — this is what makes a per-mutation refresh touch the entire
-        // graph in the buggy path.
+        // component, which is what makes a per-mutation refresh touch the
+        // entire graph in the buggy path.
         let chain: Vec<Relation> = entities
             .windows(2)
             .map(|window| test_relation(window[0].id, window[1].id, RelationKind::Calls))
             .collect();
-        graph.upsert_relations_batch(&chain).unwrap();
 
-        // Reset per-graph counter after the setup batches so we only count
+        // Load the graph from a snapshot, the way test materialization finds
+        // it after a store opens, rather than building it with batch upserts.
+        // Built that way, the setup records its pending delta one relation at
+        // a time and every single upsert below then scans that whole delta,
+        // which costs seconds and says nothing about Merkle deferral. The load
+        // rebuilds the adjacency from the relations, and the check below
+        // proves the burst still runs over one connected component.
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot
+            .entities
+            .extend(entities.iter().map(|entity| (entity.id, entity.clone())));
+        snapshot
+            .relations
+            .extend(chain.iter().map(|relation| (relation.id, relation.clone())));
+        let graph = InMemoryGraph::from_snapshot(snapshot).unwrap();
+        {
+            let ent = graph.entities.read();
+            assert!(
+                chain
+                    .iter()
+                    .all(|relation| ent.relations.contains_key(&relation.id))
+                    && entities.windows(2).all(|window| {
+                        ent.outgoing
+                            .get(&window[0].id)
+                            .is_some_and(|out| !out.is_empty())
+                            && ent
+                                .incoming
+                                .get(&window[1].id)
+                                .is_some_and(|inc| !inc.is_empty())
+                    }),
+                "the loaded graph must carry the whole chain, or the burst below is not over one component"
+            );
+        }
+
+        // Reset per-graph counter after the setup load so we only count
         // flushes triggered by the single-relation upsert loop below.
         // Using an instance counter (rather than the old process-wide global)
         // eliminates interference from other tests running concurrently.
@@ -21969,22 +22453,21 @@ mod tests {
         );
     }
 
-    // This test exercises the stub path compiled when neither embeddings nor
-    // vector features are active. With the default features ("vector" +
-    // "embeddings" both on) the full implementation is compiled instead; that
-    // path requires a real embedder and would fail here. Gate the test so it
-    // only runs under the feature combination it was written for.
-    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    // The stub exists only when neither built-in nor external embeddings can
+    // run. A default None slot in an embedding-capable build explicitly refuses
+    // an embed request rather than pretending it processed the queued entities.
+    #[cfg(not(all(
+        any(feature = "embeddings", feature = "external-embeddings"),
+        feature = "vector"
+    )))]
     #[test]
     fn process_embedding_queue_without_embeddings_is_noop() {
-        // With just "vector" feature (no "embeddings"), process should return 0
+        // No compiled embedding route: the stub returns zero.
         let graph = InMemoryGraph::new();
         let e = test_entity("foo", "src/main.rs");
         graph.upsert_entity(&e).unwrap();
 
-        // This should be Ok(0) regardless of feature flags
-        let result = graph.process_embedding_queue(64);
-        assert!(result.is_ok());
+        assert_eq!(graph.process_embedding_queue(64).unwrap(), 0);
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector"))]

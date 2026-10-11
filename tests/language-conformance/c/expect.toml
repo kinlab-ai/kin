@@ -1,0 +1,185 @@
+# Language conformance fixture: C. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "c"
+
+[sources]
+module = "ledger.c"
+helper = "helper.c"
+header = "helper.h"
+test = "test_ledger.c"
+forms = "forms.c"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "pass"
+expect = [
+  "Function clamp",
+  "Function twice",
+  "Function total",
+  "Class account",
+  "Field account.balance",
+  "Function account_validate",
+  "Function account_deposit",
+  "helper.c: Function scale",
+]
+
+[module_name]
+status = "refused"
+reason = "The adapter mints no module entity."
+name = "ledger"
+
+[module_contains]
+status = "refused"
+reason = "The adapter mints no module entity."
+top_level = ["clamp", "twice", "total", "account", "account_validate", "account_deposit"]
+
+[declaration_extent]
+status = "pass"
+starts = { total = "/** Sum the values" }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "n/a"
+reason = "C has no nested function definitions; GNU C's are an extension."
+
+[call_same_file]
+status = "pass"
+from = "total"
+to = "clamp"
+
+[call_receiver]
+status = "n/a"
+reason = "C has no methods and no receivers."
+
+[imports]
+status = "pass"
+module_path = "helper.h"
+
+[tests_detected]
+status = "pass"
+name = "test_total"
+runner = "c"
+
+[refuse_unparseable]
+status = "pass"
+find = "static int clamp(int value) {"
+replace = "static int clamp(int value {"
+line = 3
+
+[placement_three_forms]
+status = "pass"
+entity = "account_validate"
+
+[create_remove_spacing]
+status = "pass"
+anchor = "clamp"
+code = '''
+static int clamp_twice(int value) {
+    return clamp(clamp(value));
+}'''
+entity = "clamp_twice"
+documented = "total"
+doc = "/** Sum the values"
+
+[form_generator]
+status = "n/a"
+reason = "C has no generator functions."
+
+[form_async]
+status = "n/a"
+reason = "C has no async functions."
+
+[form_bound_lambda]
+status = "n/a"
+reason = "C has no anonymous functions to bind."
+
+[form_default_export]
+status = "n/a"
+reason = "C has no default export."
+
+[form_overload]
+status = "n/a"
+reason = "C has no overloads."
+
+[form_nested_type]
+status = "n/a"
+reason = "A struct declared inside a struct in C has file scope, so C has no nested type."
+
+[form_decorated]
+status = "pass"
+expect = ["Function spare"]
+
+[form_field]
+status = "pass"
+expect = ["Field point.x", "Field point.y"]
+
+[body_edit_keeps_entities]
+status = "pass"
+entity = "total"
+find = "    int result = 0;\n"
+replace = "    int result = 0;\n    struct account stats = {0};\n    stats.balance = count;\n"
+
+[route_source]
+status = "pass"
+entity = "total"
+starts = "/** Sum the values"
+
+[route_locate]
+status = "pass"
+query = "total"
+entity = "total"
+
+[route_refs]
+status = "pass"
+entity = "clamp"
+caller = "total"
+
+[route_impact]
+status = "pass"
+in = "helper"
+entity = "scale"
+affected = "total"
+
+[route_context]
+status = "n/a"
+reason = "C has no types with methods."
+
+[route_update]
+status = "pass"
+entity = "clamp"
+find = "0"
+replace = "1"
+
+[route_patch]
+status = "pass"
+entity = "account_validate"
+old_text = "> 0"
+new_text = ">= 0"
+
+[route_body_edit]
+status = "pass"
+entity = "total"
+find = "    int result = 0;\n"
+replace = "    int result = 0;\n    struct account stats = {0};\n    stats.balance = count;\n"
+
+[route_create_sibling]
+status = "refused"
+reason = "Nothing was written: entity lifecycle currently supports top-level leaf functions in TypeScript, JavaScript, Python, Go and Rust."
+anchor = "clamp"
+code = "static int clamp_twice(int value) {\n    return clamp(clamp(value));\n}"
+entity = "clamp_twice"
+
+[route_remove]
+status = "refused"
+reason = "Nothing was written: entity lifecycle currently supports top-level leaf functions in TypeScript, JavaScript, Python, Go and Rust."
+entity = "clamp"
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

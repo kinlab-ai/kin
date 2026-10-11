@@ -10,7 +10,7 @@ use std::pin::Pin;
 /// `kin mcp start` — Start the MCP stdio server.
 ///
 /// Starts a transport-only MCP server. Graph-backed tools are executed by the
-/// repo daemon resolved through the supervisor route; MCP never loads or serves
+/// repo daemon resolved through a validated route; MCP never loads or serves
 /// a local graph snapshot in product mode.
 ///
 /// Never hard-exits on a missing repository or an unreachable daemon: an agent
@@ -88,6 +88,9 @@ pub async fn start(
     );
     eprintln!("{}", resolved_profile.startup_notice());
     let mut config = served_config(resolved_profile.profile);
+    // This process serves one client for the life of the connection, so its
+    // plain replies can name long opaque values by short session handles.
+    config.serve_session_handles();
     // Paths the server compares, the client's folder against the repository
     // that answers, go through the same symlink resolution the binder uses.
     config.canonicalize = canonical_path;
@@ -139,23 +142,19 @@ pub async fn start(
     crate::daemon_client::install_spawn_registrar();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let init_served = config.serves_init();
     let bind_task = tokio::spawn(run_startup_binding(
         global,
         repo_override,
         cwd,
         std::sync::Arc::clone(&startup),
-        init_served,
     ));
 
-    // `kin_session_exec` runs toolchain commands in session workspaces through
-    // this launcher, the way `kin_init` sets folders up through it.
-    kin_mcp::session_exec::install_executor(crate::commands::agent_exec::executor());
-
-    let served =
-        kin_mcp::run_stdio_daemon(config, repo_binder, Some(startup), Some(repo_initializer()))
-            .await
-            .map_err(|e| anyhow::anyhow!("MCP server error: {}", e));
+    // The agent surface neither runs programs nor sets folders up, so the
+    // server is handed no launcher for either: a person runs `kin exec` and
+    // `kin init`.
+    let served = kin_mcp::run_stdio_daemon(config, repo_binder, Some(startup))
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server error: {}", e));
 
     // The client closed stdin, so this server is done. A daemon spawn already
     // in flight is detached and survives on its own by design, so the next
@@ -173,7 +172,6 @@ async fn run_startup_binding(
     repo_override: Option<PathBuf>,
     cwd: PathBuf,
     startup: std::sync::Arc<kin_mcp::StartupDaemonBinding>,
-    init_served: bool,
 ) {
     // Name the repository being bound before the slow work starts, so the
     // still-starting report can say how far that daemon's startup has come.
@@ -227,26 +225,15 @@ async fn run_startup_binding(
             return;
         }
         Err(reason) => {
-            if !global {
-                let init = kin_mcp::first_contact::kin_command(
-                    "init .",
+            eprintln!(
+                "{}",
+                startup_unbound_notice(
+                    discovered.as_ref().map(|layout| layout.working_dir()),
+                    &reason,
+                    global,
                     kin_mcp::first_contact::Spelling::here(),
-                );
-                // `kin_init` is a write, served only on a profile that writes.
-                let set_up = if init_served {
-                    format!("ask your agent to call kin_init, or run {init} in it")
-                } else {
-                    format!("run {init} in it")
-                };
-                eprintln!(
-                    "Kin MCP: no repository bound at startup ({reason}). If the MCP client \
-                     advertises workspace roots, Kin binds to the open repository after \
-                     initialization. To set a folder up, {set_up}; or relaunch inside a Kin \
-                     repository, or pass --repo <path> (or set KIN_MCP_REPO=<path>)."
-                );
-            } else {
-                eprintln!("Kin MCP: the launch directory bound no repository ({reason}).");
-            }
+                )
+            );
             reason
         }
     };
@@ -279,6 +266,34 @@ async fn run_startup_binding(
     startup.resolve_unbound(unbound_reason);
 }
 
+/// Startup discovery and route resolution are separate observations. A known
+/// repository with a route gap must never be handed missing-repository advice.
+fn startup_unbound_notice(
+    repository: Option<&Path>,
+    reason: &str,
+    global: bool,
+    spelling: kin_mcp::first_contact::Spelling,
+) -> String {
+    if let Some(repository) = repository {
+        return format!(
+            "Kin MCP: repository {} was found, but no ready daemon route bound at startup \
+             ({reason}). This server re-resolves its delegate on tool calls; retry once \
+             readiness is established.",
+            repository.display()
+        );
+    }
+    if global {
+        return format!("Kin MCP: the launch directory bound no repository ({reason}).");
+    }
+    let init = kin_mcp::first_contact::kin_command("init .", spelling);
+    format!(
+        "Kin MCP: no repository bound at startup ({reason}). If the MCP client advertises \
+         workspace roots, Kin binds to the open repository after initialization. To set a \
+         folder up, run {init} in it; or relaunch inside a Kin repository, or pass --repo \
+         <path> (or set KIN_MCP_REPO=<path>)."
+    )
+}
+
 // ── Tool profile ────────────────────────────────────────────────────────
 
 /// Which tool surface this server exposes.
@@ -307,6 +322,10 @@ pub(crate) enum McpToolProfile {
     /// returns full schemas; `kin_tool_call` invokes hidden read-only operations
     /// through their normal checks. Mutations still require a direct tool.
     AgentSearch,
+    /// The front door alone: `ask`, a question in plain words that Kin
+    /// routes, runs and answers in one reply. The surface the sealed
+    /// comparison measured; it writes nothing and is not the default.
+    AgentAsk,
     /// One routed tool, `kin`, for a client that loads every tool it is handed
     /// and re-sends them all with every request: Codex CLI, Cursor, Gemini CLI,
     /// Windsurf, Antigravity and LM Studio. Its commands reach the belt's tools
@@ -332,6 +351,7 @@ const TOOL_PROFILE_TOKENS: &[(&str, McpToolProfile)] = &[
     ("agent-default", McpToolProfile::AgentDefault),
     ("agent-query", McpToolProfile::AgentQuery),
     ("agent-search", McpToolProfile::AgentSearch),
+    ("agent-ask", McpToolProfile::AgentAsk),
     ("agent-routed", McpToolProfile::AgentRouted),
     ("agent-routed-query", McpToolProfile::AgentRoutedQuery),
     ("full", McpToolProfile::Full),
@@ -346,6 +366,7 @@ impl McpToolProfile {
             Self::AgentDefault => Some(kin_mcp::agent_default_tool_names()),
             Self::AgentQuery => Some(kin_mcp::agent_query_tool_names()),
             Self::AgentSearch => Some(kin_mcp::agent_search_tool_names()),
+            Self::AgentAsk => Some(kin_mcp::agent_ask_tool_names()),
             Self::AgentRouted | Self::AgentRoutedQuery => Some(kin_mcp::agent_routed_tool_names()),
             Self::Benchmark => Some(kin_mcp::benchmark_tool_names()),
             Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
@@ -354,7 +375,7 @@ impl McpToolProfile {
     }
 
     /// Whether this profile IS the curated agent belt: short descriptions,
-    /// trimmed input schemas, and the compact `semantic_locate` shape.
+    /// trimmed input schemas, and the compact shape `locate` ranks descriptions in.
     ///
     /// `agent-default`, `agent-query`, which is that belt with its write half
     /// removed, `agent-search`, which is the measured always-on slice of it, and
@@ -370,6 +391,7 @@ impl McpToolProfile {
             Self::AgentDefault
                 | Self::AgentQuery
                 | Self::AgentSearch
+                | Self::AgentAsk
                 | Self::AgentRouted
                 | Self::AgentRoutedQuery
         )
@@ -714,7 +736,12 @@ async fn bind_first_kin_repo(
     pinned_by_operator: bool,
     mode: DaemonBindMode,
 ) -> kin_mcp::WorkspaceBinding {
-    bind_first_kin_repo_against(roots, bound_repo_working_dir(), pinned_by_operator, mode).await
+    let pinned_repo = if pinned_by_operator {
+        pinned_repo_working_dir()
+    } else {
+        None
+    };
+    bind_first_kin_repo_against(roots, bound_repo_working_dir(), pinned_repo, mode).await
 }
 
 /// Core of [`bind_first_kin_repo`] with the currently bound repository as an
@@ -724,14 +751,14 @@ async fn bind_first_kin_repo(
 async fn bind_first_kin_repo_against(
     roots: Vec<PathBuf>,
     bound_repo: Option<PathBuf>,
-    pinned_by_operator: bool,
+    pinned_repo: Option<PathBuf>,
     mode: DaemonBindMode,
 ) -> kin_mcp::WorkspaceBinding {
     // `KinLayout::discover` is filesystem-rooted: it walks up from each root and
     // finds a `.kin/` or nothing, regardless of which daemon this process is
     // pinned to. A root that resolves to no layout is a root this server cannot
     // see, which is the distinction the two failure verdicts below rest on.
-    let candidates: Vec<PathBuf> = roots
+    let mut candidates: Vec<PathBuf> = roots
         .iter()
         .filter_map(|root| kin_core::KinLayout::discover(root))
         .map(|layout| canonical_path(layout.working_dir()))
@@ -767,16 +794,27 @@ async fn bind_first_kin_repo_against(
         };
     }
 
-    if pinned_by_operator {
-        // An explicit --repo/KIN_MCP_REPO names a repository the client is not
-        // looking at. Following the client would overrule a deliberate operator
-        // choice; serving the pinned repository anyway would answer about a
-        // codebase the client left. Report neither, and let the server refuse.
-        eprintln!(
-            "Kin MCP: the repository pinned by --repo/KIN_MCP_REPO is not among the client's \
-             workspace roots; refusing tool calls until the workspace and the pin agree."
-        );
-        return kin_mcp::WorkspaceBinding::OtherRepository(candidates);
+    if let Some(pin) = pinned_repo.as_ref() {
+        // Compare the roots with the pinned repository itself, not with a bound
+        // daemon: on a cold start the client's `roots/list` answer arrives before
+        // any daemon is bound, and a pin that only counted once bound refused
+        // every call from a client whose workspace was exactly the pinned folder.
+        if !candidates.iter().any(|candidate| candidate == pin) {
+            // An explicit --repo/KIN_MCP_REPO names a repository the client is
+            // not looking at. Following the client would overrule a deliberate
+            // operator choice; serving the pinned repository anyway would answer
+            // about a codebase the client left. Report neither, and let the
+            // server refuse.
+            eprintln!(
+                "Kin MCP: the repository pinned by --repo/KIN_MCP_REPO is not among the client's \
+                 workspace roots; refusing tool calls until the workspace and the pin agree."
+            );
+            return kin_mcp::WorkspaceBinding::OtherRepository(candidates);
+        }
+        // The workspace names the pinned repository. Bind that one, wherever it
+        // sits among the roots; before the first tool call a pin with no running
+        // daemon is reported unbound below, and that call starts it.
+        candidates.retain(|candidate| candidate == pin);
     }
 
     if bound_repo.is_some() {
@@ -842,6 +880,14 @@ fn bound_repo_working_dir() -> Option<PathBuf> {
     kin_core::KinLayout::discover(&cwd).map(|layout| canonical_path(layout.working_dir()))
 }
 
+/// The repository an operator pinned with --repo/KIN_MCP_REPO. The startup path
+/// moves the process into it before anything binds, so it is the repository
+/// containing the working directory, known with or without a daemon.
+fn pinned_repo_working_dir() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    kin_core::KinLayout::discover(&cwd).map(|layout| canonical_path(layout.working_dir()))
+}
+
 fn current_daemon_url() -> Option<String> {
     std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -865,15 +911,6 @@ pub(crate) fn command_spelling() -> kin_mcp::first_contact::Spelling {
     } else {
         kin_mcp::first_contact::Spelling::Npx
     }
-}
-
-/// What `kin_init` runs: the checks an agent-driven setup needs, then `kin
-/// init` itself. See [`crate::commands::init::initialize_for_mcp`].
-fn repo_initializer() -> kin_mcp::RepoInitializer {
-    std::sync::Arc::new(|dir: PathBuf| {
-        Box::pin(crate::commands::init::initialize_for_mcp(dir))
-            as Pin<Box<dyn Future<Output = kin_mcp::InitOutcome> + Send>>
-    })
 }
 
 fn session_authority_notice() -> &'static str {
@@ -905,8 +942,14 @@ pub(crate) fn served_config(profile: McpToolProfile) -> kin_mcp::McpServerConfig
         );
     }
     config.agent_belt = profile.is_agent_belt();
+    config.plain_replies =
+        profile.is_agent_belt() && !kin_mcp::plain_reply::machine_replies_requested();
     config.routed = profile.routed_surface();
     config.number_entity_lines = profile.numbers_entity_lines();
+    config.compact_trace_evidence = matches!(
+        profile,
+        McpToolProfile::AgentQuery | McpToolProfile::AgentSearch | McpToolProfile::AgentRoutedQuery
+    );
     config.citable = profile.is_citable();
     config
 }
@@ -959,18 +1002,27 @@ async fn resolve_daemon_for_repo_dir(
     let layout = crate::commands::require_repository_layout_at(dir)
         .map_err(|refusal| BindRefusal::Reason(format!("{refusal:#}")))?;
     if mode == DaemonBindMode::AttachOnly {
-        // Deliberately the resolver `kin doctor` reads from, not a second
-        // opinion: it answers for a daemon that is already serving and starts
-        // nothing. `None` here is not a failure, it is "a repository is here and
-        // nobody is serving it yet", which is the state a session that has asked
-        // for nothing is supposed to be left in.
-        return match crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await {
-            Some(url) => {
-                std::env::set_var("KIN_DAEMON_URL", &url);
-                Ok(url)
-            }
-            None => Err(BindRefusal::SpawnNotAdmitted),
-        };
+        // Use the same typed observer as per-call delegation, including the
+        // recorded standalone endpoint. Only readiness plus repository identity
+        // authorizes a route; this path starts nothing.
+        crate::daemon_client::install_spawn_registrar();
+        let budget = std::time::Duration::from_secs(3);
+        let reading = tokio::time::timeout(
+            budget,
+            kin_daemon_spawn::running_daemon_route_reading(
+                layout.root(),
+                budget.saturating_sub(budget / 10),
+            ),
+        )
+        .await
+        .unwrap_or_else(
+            |_| kin_daemon_spawn::RunningDaemonRouteReading::Unresolved {
+                detail: "the startup route probe exceeded its bounded deadline".to_string(),
+            },
+        );
+        let url = attach_only_route(reading)?;
+        std::env::set_var("KIN_DAEMON_URL", &url);
+        return Ok(url);
     }
     let url = crate::daemon_client::resolve_daemon_url_for_mcp(&layout)
         .await
@@ -982,6 +1034,18 @@ async fn resolve_daemon_for_repo_dir(
         })?;
     std::env::set_var("KIN_DAEMON_URL", &url);
     Ok(url)
+}
+
+fn attach_only_route(
+    reading: kin_daemon_spawn::RunningDaemonRouteReading,
+) -> std::result::Result<String, BindRefusal> {
+    use kin_daemon_spawn::RunningDaemonRouteReading as Reading;
+    match reading {
+        Reading::Serving(url) => Ok(url),
+        Reading::Absent => Err(BindRefusal::SpawnNotAdmitted),
+        Reading::NotReady { detail, warming } => Err(BindRefusal::NotReady { detail, warming }),
+        Reading::Unresolved { detail } => Err(BindRefusal::Unresolved { detail }),
+    }
 }
 
 /// Whether a bind may START a repo daemon or may only attach to one that is
@@ -1008,17 +1072,19 @@ impl DaemonBindMode {
 
 /// Why a bind produced no daemon URL.
 ///
-/// The two are kept apart because they mean opposite things to a caller. A
-/// reason is final for this bind's inputs and is what the operator is told. A
-/// spawn that was not admitted is a state, not a failure: the repository is
-/// there, nothing is serving it, and the same bind will succeed the moment
-/// somebody asks Kin a question.
+/// A discovered repository may lack a validated route, have a not-ready
+/// endpoint, or have an unresolved probe. None establishes process absence.
+/// Only the no-ready-route state may wait for an admitted start; readiness and
+/// uncertainty are reported now and re-resolved by later tool calls.
 #[derive(Debug)]
 pub(crate) enum BindRefusal {
-    /// No daemon, and none can be had here. Carries the sentence to report.
+    /// A repository discovery or resolution refusal, carrying its reason.
     Reason(String),
-    /// A Kin repository is here with no daemon serving it, and no caller has
-    /// asked for a graph answer yet.
+    /// The observed endpoint has not established repository readiness.
+    NotReady { detail: String, warming: bool },
+    /// The bounded probe did not establish a ready route or daemon absence.
+    Unresolved { detail: String },
+    /// No ready route was found, and no caller has admitted a start yet.
     SpawnNotAdmitted,
 }
 
@@ -1027,8 +1093,18 @@ impl BindRefusal {
     pub(crate) fn reason(self) -> String {
         match self {
             Self::Reason(reason) => reason,
+            Self::NotReady { detail, warming } => format!(
+                "the observed daemon endpoint has not established readiness for this repository \
+                 (warming={warming}): {detail}; this does not establish daemon absence; retry \
+                 once readiness is established"
+            ),
+            Self::Unresolved { detail } => format!(
+                "the bounded daemon route probe is unresolved: {detail}; this does not establish \
+                 daemon absence; retry the tool call"
+            ),
             Self::SpawnNotAdmitted => {
-                "no daemon is serving this repository yet and no tool call has asked for one"
+                "no ready daemon route could be validated for this repository and no tool call \
+                 has admitted a start; this does not establish daemon absence"
                     .to_string()
             }
         }
@@ -1049,10 +1125,10 @@ async fn bind_daemon_when_asked(
 ) -> std::result::Result<String, String> {
     match bind_daemon_for_repo_dir(dir, DaemonBindMode::AttachOnly).await {
         Ok(url) => return Ok(url),
-        // Not a repository, or a repository whose daemon this process cannot
-        // reach for a reason of its own. Neither improves by waiting.
-        Err(BindRefusal::Reason(reason)) => return Err(reason),
+        // Preserve readiness/uncertainty and discovery refusals. This startup
+        // observer does not turn either into permission to start a daemon.
         Err(BindRefusal::SpawnNotAdmitted) => {}
+        Err(refusal) => return Err(refusal.reason()),
     }
     if crate::daemon_client::daemon_spawns_are_disabled() {
         // The probe contract. No tool call will ever start a daemon here, so
@@ -1060,8 +1136,9 @@ async fn bind_daemon_when_asked(
         // every call answered "the daemon is still starting" about a daemon
         // nothing will start. Settle now and let each call fail loud instead.
         return Err(
-            "KIN_NO_DAEMON is set (or --no-spawn was passed) and no daemon is already \
-             serving this repository, so this server binds none"
+            "KIN_NO_DAEMON is set (or --no-spawn was passed), daemon starts are disabled, \
+             and no ready daemon route could be validated for this repository; this does not \
+             establish daemon absence, so this server binds no delegate at startup"
                 .to_string(),
         );
     }
@@ -1092,6 +1169,7 @@ mod tests {
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies: Vec::new(),
             dependencies_recorded_by: None,
+            dependencies_manifest_recorded_at: None,
         }
     }
 
@@ -1150,8 +1228,8 @@ mod tests {
             .allowed_tool_names()
             .expect("the default profile must filter the surface");
         assert!(
-            served.contains(&"impact_analysis"),
-            "impact_analysis must be in the profile an unconfigured agent gets: {served:?}"
+            served.contains(&"impact"),
+            "impact must be in the profile an unconfigured agent gets: {served:?}"
         );
         // The tool has to exist to be servable; a profile naming a tool the
         // crate does not define would filter it away silently.
@@ -1182,6 +1260,7 @@ mod tests {
             ("agent-default", McpToolProfile::AgentDefault),
             ("agent-query", McpToolProfile::AgentQuery),
             ("agent-search", McpToolProfile::AgentSearch),
+            ("agent-ask", McpToolProfile::AgentAsk),
             ("agent-routed", McpToolProfile::AgentRouted),
             ("agent-routed-query", McpToolProfile::AgentRoutedQuery),
             ("benchmark", McpToolProfile::Benchmark),
@@ -1376,6 +1455,10 @@ mod tests {
     /// send a user's agent to a tool the server does not list, or keep quiet
     /// about one it does, so the copies are read out of the wrapper's source and
     /// held to the registry here.
+    ///
+    /// No profile serves `kin_init`. Setting a folder up is a command a person
+    /// runs, not semantic agent work, so the agent surface refuses it on every
+    /// profile, the writing ones included, and the wrapper's copy is empty.
     #[test]
     fn the_npm_wrapper_agrees_on_which_profiles_serve_kin_init() {
         let wrapper = include_str!("../../../../packages/kin-mcp/src/index.js");
@@ -1383,17 +1466,29 @@ mod tests {
             .iter()
             .map(|(token, _)| *token)
             .collect();
-        let serving_init: std::collections::BTreeSet<&str> = TOOL_PROFILE_TOKENS
+        // The registry retires `kin_init` on every surface, so no profile's
+        // connection serves it, whatever the profile carries.
+        assert!(
+            kin_mcp::tools::retired_file_operation("kin_init").is_some(),
+            "the registry must retire kin_init on every surface"
+        );
+        let serving_init: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        // The refusal is not vacuous: the profiles that used to serve it still
+        // carry Kin's writes, and serve no `kin_init` all the same.
+        let writing: std::collections::BTreeSet<&str> = TOOL_PROFILE_TOKENS
             .iter()
-            .filter(|(_, profile)| config_for(*profile).serves_init())
+            .filter(|(_, profile)| profile.writes())
             .map(|(token, _)| *token)
             .collect();
-        // The rule is not vacuous: a profile that writes serves it and a
-        // read-only one does not.
-        assert!(serving_init.contains("agent-default"), "{serving_init:?}");
+        for token in ["agent-default", "agent-routed", "full"] {
+            assert!(
+                writing.contains(token),
+                "{token} lost its writes: {writing:?}"
+            );
+        }
         assert!(
-            !serving_init.contains("agent-routed-query"),
-            "{serving_init:?}"
+            serving_init.is_empty(),
+            "no profile may serve kin_init, a writing one included: {serving_init:?}"
         );
 
         assert_eq!(
@@ -1417,7 +1512,8 @@ mod tests {
     }
 
     /// The single-quoted strings inside `const <name> = new Set([ ... ]);` in the
-    /// wrapper's source.
+    /// wrapper's source. An empty set is read only from empty brackets, so a
+    /// set the reader could not parse never passes for an empty one.
     fn wrapper_string_set<'a>(source: &'a str, name: &str) -> std::collections::BTreeSet<&'a str> {
         let opening = format!("const {name} = new Set([");
         let start = source
@@ -1430,7 +1526,11 @@ mod tests {
             .unwrap_or_else(|| panic!("the wrapper's {name} is never closed"));
         let values: std::collections::BTreeSet<&str> =
             body[..end].split('\'').skip(1).step_by(2).collect();
-        assert!(!values.is_empty(), "the wrapper's {name} names nothing");
+        assert!(
+            !values.is_empty() || body[..end].trim().is_empty(),
+            "the wrapper's {name} holds something other than single-quoted names: {}",
+            &body[..end]
+        );
         values
     }
 
@@ -1680,7 +1780,7 @@ mod tests {
             bind_first_kin_repo_against(
                 vec![repo.path().to_path_buf()],
                 Some(repo_dir.clone()),
-                false,
+                None,
                 DaemonBindMode::SpawnIfNeeded,
             )
             .await,
@@ -1712,7 +1812,7 @@ mod tests {
         let bound = bind_first_kin_repo_against(
             vec![switched_to.path().to_path_buf()],
             Some(std::fs::canonicalize(previous.path()).unwrap()),
-            false,
+            None,
             DaemonBindMode::SpawnIfNeeded,
         )
         .await;
@@ -1744,7 +1844,7 @@ mod tests {
             bind_first_kin_repo_against(
                 vec![other.path().to_path_buf(), bound.path().to_path_buf()],
                 Some(bound_dir.clone()),
-                false,
+                None,
                 DaemonBindMode::SpawnIfNeeded,
             )
             .await,
@@ -1770,7 +1870,7 @@ mod tests {
         let bound = bind_first_kin_repo_against(
             vec![other.path().to_path_buf()],
             Some(std::fs::canonicalize(pinned.path()).unwrap()),
-            true,
+            Some(std::fs::canonicalize(pinned.path()).unwrap()),
             DaemonBindMode::SpawnIfNeeded,
         )
         .await;
@@ -1798,7 +1898,7 @@ mod tests {
             bind_first_kin_repo_against(
                 vec![pinned.path().to_path_buf()],
                 Some(pinned_dir.clone()),
-                true,
+                Some(pinned_dir.clone()),
                 DaemonBindMode::SpawnIfNeeded,
             )
             .await,
@@ -1807,6 +1907,58 @@ mod tests {
 
         assert_eq!(bound.root, pinned_dir);
         assert_eq!(bound.daemon_url, "http://127.0.0.1:4242");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_cold_pin_named_by_the_roots_is_not_refused() {
+        // Cold start: the client's roots arrive before any daemon is bound, so
+        // there is no bound repository to compare. A pin the roots name must
+        // stay the candidate the first tool call binds, not be refused as
+        // another repository, and the other folders open beside it are dropped.
+        let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let other = kin_repo_fixture();
+        let pinned = kin_repo_fixture();
+        let pinned_dir = std::fs::canonicalize(pinned.path()).unwrap();
+
+        let result = bind_first_kin_repo_against(
+            vec![other.path().to_path_buf(), pinned.path().to_path_buf()],
+            None,
+            Some(pinned_dir.clone()),
+            DaemonBindMode::SpawnIfNeeded,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            kin_mcp::WorkspaceBinding::OtherRepository(vec![pinned_dir]),
+            "with no daemon to start, the pinned repository alone stays owed to the first call"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_cold_pin_the_roots_do_not_name_is_refused() {
+        let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let other = kin_repo_fixture();
+        let pinned = kin_repo_fixture();
+        let other_dir = std::fs::canonicalize(other.path()).unwrap();
+
+        let result = bind_first_kin_repo_against(
+            vec![other.path().to_path_buf()],
+            None,
+            Some(std::fs::canonicalize(pinned.path()).unwrap()),
+            DaemonBindMode::SpawnIfNeeded,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            kin_mcp::WorkspaceBinding::OtherRepository(vec![other_dir]),
+            "a pin the workspace does not name is refused, and the report names what the client opened"
+        );
     }
 
     #[tokio::test]
@@ -1820,7 +1972,7 @@ mod tests {
             bind_first_kin_repo_against(
                 vec![plain.path().to_path_buf()],
                 None,
-                false,
+                None,
                 DaemonBindMode::SpawnIfNeeded,
             )
             .await,
@@ -1855,7 +2007,7 @@ mod tests {
             bind_first_kin_repo_against(
                 vec![host_only],
                 Some(served_dir.clone()),
-                false,
+                None,
                 DaemonBindMode::SpawnIfNeeded,
             )
             .await,
@@ -1871,7 +2023,7 @@ mod tests {
         let moved = bind_first_kin_repo_against(
             vec![other.path().to_path_buf()],
             Some(served_dir),
-            false,
+            None,
             DaemonBindMode::SpawnIfNeeded,
         )
         .await;
@@ -1894,6 +2046,294 @@ mod tests {
             .await
             .expect("an explicit KIN_DAEMON_URL must be trusted without repo discovery");
         assert_eq!(url, "http://127.0.0.1:4242");
+    }
+
+    async fn serve_startup_route_fixture(
+        repo: &std::path::Path,
+        warming: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let root = std::fs::canonicalize(repo).unwrap();
+        let health_root = root.clone();
+        let app = axum::Router::new()
+            .route(
+                "/readiness",
+                axum::routing::get(move || async move {
+                    (
+                        if warming {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            axum::http::StatusCode::OK
+                        },
+                        axum::Json(serde_json::json!({"ready": !warming, "warming": warming})),
+                    )
+                }),
+            )
+            .route(
+                "/health",
+                axum::routing::get(move || {
+                    let root = health_root.clone();
+                    async move {
+                        axum::Json(serde_json::json!({
+                            "status": "ok", "version": "test", "uptime_seconds": 0,
+                            "graph_entity_count": 0, "graph_loaded": true,
+                            "reconciliation_status": "idle", "repo_root": root,
+                            "pid": std::process::id(),
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let kin_root = root.join(".kin");
+        std::fs::write(
+            crate::daemon_client::repo_daemon_pid_path(&kin_root),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::daemon_client::repo_daemon_port_path(&kin_root),
+            port.to_string(),
+        )
+        .unwrap();
+        let identity = crate::daemon_client::current_process_identity().unwrap();
+        std::fs::write(
+            crate::daemon_client::repo_daemon_owner_path(&kin_root),
+            serde_json::json!({
+                "schema": crate::daemon_client::ENDPOINT_OWNER_SCHEMA, "identity": identity,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_attach_only_resolves_a_ready_standalone_daemon_without_spawn() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let _url = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let repo = kin_repo_fixture();
+        let _registry = EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            repo.path().join("isolated-supervisor/registry.toml"),
+        );
+        let (expected, server) = serve_startup_route_fixture(repo.path(), false).await;
+        let before: Vec<_> = ["daemon.pid", "daemon.port", "daemon.owner"]
+            .into_iter()
+            .map(|name| std::fs::read(repo.path().join(".kin").join(name)).unwrap())
+            .collect();
+        let result =
+            super::resolve_daemon_for_repo_dir(repo.path(), DaemonBindMode::AttachOnly).await;
+        server.abort();
+        assert_eq!(
+            result.expect(
+                "an already-ready standalone daemon must attach even when spawning is disabled"
+            ),
+            expected
+        );
+        let after: Vec<_> = ["daemon.pid", "daemon.port", "daemon.owner"]
+            .into_iter()
+            .map(|name| std::fs::read(repo.path().join(".kin").join(name)).unwrap())
+            .collect();
+        assert_eq!(
+            after, before,
+            "attach-only must leave endpoint publication unchanged"
+        );
+        assert!(!repo.path().join(".kin/daemon.lock").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_attach_only_preserves_warming_and_starts_nothing() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let _url = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let repo = kin_repo_fixture();
+        let _registry = EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            repo.path().join("isolated-supervisor/registry.toml"),
+        );
+        let (_, server) = serve_startup_route_fixture(repo.path(), true).await;
+        let before: Vec<_> = ["daemon.pid", "daemon.port", "daemon.owner"]
+            .into_iter()
+            .map(|name| std::fs::read(repo.path().join(".kin").join(name)).unwrap())
+            .collect();
+        let began = std::time::Instant::now();
+        let result =
+            super::resolve_daemon_for_repo_dir(repo.path(), DaemonBindMode::AttachOnly).await;
+        server.abort();
+        assert!(
+            matches!(result, Err(BindRefusal::NotReady { warming: true, .. })),
+            "{result:?}"
+        );
+        assert!(began.elapsed() < std::time::Duration::from_secs(4));
+        assert!(std::env::var_os("KIN_DAEMON_URL").is_none());
+        let after: Vec<_> = ["daemon.pid", "daemon.port", "daemon.owner"]
+            .into_iter()
+            .map(|name| std::fs::read(repo.path().join(".kin").join(name)).unwrap())
+            .collect();
+        assert_eq!(after, before);
+        assert!(!repo.path().join(".kin/daemon.lock").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_attach_only_keeps_incomplete_records_unresolved() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let _url = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let repo = kin_repo_fixture();
+        let _registry = EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            repo.path().join("isolated-supervisor/registry.toml"),
+        );
+        let pid = repo.path().join(".kin/daemon.pid");
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        let before = std::fs::read(&pid).unwrap();
+        let result =
+            super::resolve_daemon_for_repo_dir(repo.path(), DaemonBindMode::AttachOnly).await;
+        let refusal = result.expect_err("a PID without a port is not a serving route");
+        assert!(
+            matches!(refusal, BindRefusal::Unresolved { .. }),
+            "{refusal:?}"
+        );
+        assert!(refusal
+            .reason()
+            .contains("does not establish daemon absence"));
+        assert_eq!(std::fs::read(&pid).unwrap(), before);
+        assert!(std::env::var_os("KIN_DAEMON_URL").is_none());
+        assert!(!repo.path().join(".kin/daemon.lock").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_attach_only_refuses_a_route_for_another_repository() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let _url = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let other = kin_repo_fixture();
+        let expected = kin_repo_fixture();
+        let _registry = EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            expected.path().join("isolated-supervisor/registry.toml"),
+        );
+        let (_, server) = serve_startup_route_fixture(other.path(), false).await;
+        for name in ["daemon.pid", "daemon.port", "daemon.owner"] {
+            std::fs::copy(
+                other.path().join(".kin").join(name),
+                expected.path().join(".kin").join(name),
+            )
+            .unwrap();
+        }
+        let result =
+            super::resolve_daemon_for_repo_dir(expected.path(), DaemonBindMode::AttachOnly).await;
+        server.abort();
+        assert!(
+            matches!(result, Err(BindRefusal::Unresolved { .. })),
+            "{result:?}"
+        );
+        assert!(std::env::var_os("KIN_DAEMON_URL").is_none());
+        assert!(!expected.path().join(".kin/daemon.lock").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_disabled_spawn_reports_no_validated_route_without_admission() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
+        let _url = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let repo = kin_repo_fixture();
+        let _registry = EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            repo.path().join("isolated-supervisor/registry.toml"),
+        );
+        let startup = kin_mcp::StartupDaemonBinding::new();
+        let reason = super::bind_daemon_when_asked(repo.path(), &startup)
+            .await
+            .expect_err("starts are disabled");
+        assert!(
+            reason.contains("daemon starts are disabled")
+                && reason.contains("no ready daemon route"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("no daemon is")
+                && reason.contains("does not establish daemon absence"),
+            "{reason}"
+        );
+        assert!(!startup.daemon_spawn_admitted());
+        assert!(std::env::var_os("KIN_DAEMON_URL").is_none());
+        assert!(!repo.path().join(".kin/daemon.pid").exists());
+        assert!(!repo.path().join(".kin/daemon.lock").exists());
+    }
+
+    #[test]
+    fn startup_known_repository_notice_does_not_recommend_init_or_relaunch() {
+        use kin_mcp::first_contact::Spelling;
+        let repo = std::path::Path::new("/synthetic/pinned-repository");
+        for global in [true, false] {
+            let text = super::startup_unbound_notice(
+                Some(repo),
+                "warming observation",
+                global,
+                Spelling::Kin,
+            );
+            assert!(
+                text.contains("repository /synthetic/pinned-repository was found"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("no repository")
+                    && !text.contains("init tool")
+                    && !text.contains("kin init")
+                    && !text.contains("relaunch"),
+                "{text}"
+            );
+        }
+        // No agent surface sets a folder up, so the notice names only the
+        // command a person runs.
+        let missing =
+            super::startup_unbound_notice(None, "not a Kin repository", false, Spelling::Kin);
+        assert!(
+            !missing.contains("init tool") && missing.contains("run `kin init .` in it"),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn startup_explicit_url_compatibility_remains_separate() {
+        let _url = EnvVarGuard::set("KIN_DAEMON_URL", "http://127.0.0.1:9");
+        let _no_spawn = EnvVarGuard::set("KIN_NO_DAEMON", "1");
+        let no_repo = tempfile::tempdir().unwrap();
+        for mode in [DaemonBindMode::AttachOnly, DaemonBindMode::SpawnIfNeeded] {
+            let url = super::resolve_daemon_for_repo_dir(no_repo.path(), mode)
+                .await
+                .unwrap();
+            assert_eq!(url, "http://127.0.0.1:9");
+        }
+        assert!(!no_repo.path().join(".kin").exists());
+    }
+
+    #[test]
+    fn startup_unadmitted_reason_does_not_claim_daemon_absence() {
+        let reason = BindRefusal::SpawnNotAdmitted.reason();
+        assert!(reason.contains("no ready daemon route"), "{reason}");
+        assert!(!reason.contains("no daemon is serving"), "{reason}");
     }
 
     /// FIR-3099, at the seam that decides it. Whether a bind may start a daemon
@@ -1920,8 +2360,15 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_unadmitted_spawn_refuses_without_claiming_the_repository_is_broken() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
         let repo = kin_repo_fixture();
+        let _registry = EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            repo.path().join("isolated-supervisor/registry.toml"),
+        );
         let refusal = bind_daemon_for_repo_dir(repo.path(), DaemonBindMode::AttachOnly)
             .await
             .expect_err("no daemon is running for a fresh fixture, and none may be started");
@@ -1936,5 +2383,44 @@ mod tests {
                 .unwrap_or(true),
             "an attach-only bind that found no daemon must not pin a daemon URL"
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_trace_profile_tests {
+    use super::*;
+    use kin_core::test_env::EnvVarGuard;
+    use serial_test::serial;
+
+    #[test]
+    fn only_explicit_query_profiles_opt_in_to_trace_evidence_aliases() {
+        for (token, profile) in TOOL_PROFILE_TOKENS {
+            let config = served_config(*profile);
+            assert_eq!(
+                config.compact_trace_evidence,
+                matches!(
+                    profile,
+                    McpToolProfile::AgentQuery
+                        | McpToolProfile::AgentSearch
+                        | McpToolProfile::AgentRoutedQuery
+                ),
+                "{token}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn machine_reply_environment_disables_plain_and_compact_presentation() {
+        let _environment = EnvVarGuard::set(kin_mcp::plain_reply::MACHINE_REPLIES_ENV, "1");
+        for profile in [
+            McpToolProfile::AgentQuery,
+            McpToolProfile::AgentSearch,
+            McpToolProfile::AgentRoutedQuery,
+        ] {
+            let config = served_config(profile);
+            assert!(config.compact_trace_evidence);
+            assert!(!config.plain_replies);
+        }
     }
 }

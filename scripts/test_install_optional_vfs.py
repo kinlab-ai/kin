@@ -38,6 +38,22 @@ def target_name() -> str:
     return f"{os_name}-{arch}"
 
 
+# The release kin's registry check, reduced to the rule these tests depend on:
+# `registry authority` refuses a Kin home that its group or others can write,
+# as the real binary does. Every registry call is recorded beside the home.
+REGISTRY_CHECKING_KIN = """#!/bin/sh
+if [ "$1" = registry ]; then
+  printf '%s\\n' "$*" >> "$KIN_HOME/../registry-calls.log"
+  if [ -n "$(find "$KIN_HOME" -prune \\( -perm -020 -o -perm -002 \\) -print)" ]; then
+    echo "Error: registry authority initialization refused: registry parent $KIN_HOME must not be group/world writable" >&2
+    exit 1
+  fi
+  exit 0
+fi
+printf 'kin 9.9.9\\n'
+"""
+
+
 def executable(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -63,6 +79,9 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         shell: str = "/bin/sh",
         archive_vfs: bool = True,
         seed_stale_projection: bool = False,
+        umask: int | None = None,
+        group_writable_kin_home: bool = False,
+        extra_env: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -71,10 +90,7 @@ class OptionalVfsInstallerTests(unittest.TestCase):
         archive_root = root / f"kin-{target}"
         archive_root.mkdir()
 
-        executable(
-            archive_root / "kin",
-            "#!/bin/sh\nprintf 'kin 9.9.9\\n'\n",
-        )
+        executable(archive_root / "kin", REGISTRY_CHECKING_KIN)
         executable(archive_root / "kin-daemon", "#!/bin/sh\nexit 0\n")
         shim_name = (
             "libkin_vfs_shim.dylib"
@@ -148,6 +164,9 @@ class OptionalVfsInstallerTests(unittest.TestCase):
             (kin_home / "bin" / ".kinlab-kin-version").write_text(
                 "8.8.8\n", encoding="utf-8"
             )
+        if group_writable_kin_home:
+            (kin_home / "bin").mkdir(parents=True, exist_ok=True)
+            kin_home.chmod(0o775)
         if existing_notifier:
             old_contents = kin_home / "lib" / "KinNotifier.app" / "Contents"
             (old_contents / "MacOS").mkdir(parents=True)
@@ -167,6 +186,7 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 "SHELL": shell,
             }
         )
+        env.update(extra_env or {})
         fake_bin = root / "fake-bin"
         if pretend_macos or tar_stub is not None:
             fake_bin.mkdir(exist_ok=True)
@@ -247,6 +267,7 @@ class OptionalVfsInstallerTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
+                preexec_fn=None if umask is None else (lambda: os.umask(umask)),
             )
         return result, kin_home
 
@@ -363,6 +384,75 @@ class OptionalVfsInstallerTests(unittest.TestCase):
             str(kin_home / "bin"),
             (home / ".zshenv").read_text(encoding="utf-8"),
             "the zsh arm still has to do its own job",
+        )
+
+    def test_a_usergroups_umask_still_installs_with_private_directories(self) -> None:
+        """Ubuntu's default umask, 0002, made ~/.kin group writable.
+
+        The registry check then refused the directory and the site's first
+        command failed on every distribution that sets USERGROUPS_ENAB. The
+        installer now takes group and world write out of its own umask.
+        """
+
+        result, kin_home = self.run_installer(vfs_exit=0, umask=0o002)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for directory in (kin_home, kin_home / "bin", kin_home / "lib"):
+            self.assertEqual(
+                stat.S_IMODE(directory.stat().st_mode),
+                0o755,
+                f"{directory} under umask 0002",
+            )
+        self.assertEqual(
+            (kin_home.parent / "registry-calls.log").read_text(encoding="utf-8"),
+            "registry authority --initialize\n",
+        )
+
+    def test_a_stricter_umask_is_kept(self) -> None:
+        result, kin_home = self.run_installer(vfs_exit=0, umask=0o077)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(kin_home.stat().st_mode), 0o700)
+
+    def test_a_group_writable_kin_home_is_named_with_its_exact_repair(self) -> None:
+        """A home an earlier install left at 0775 is never repaired silently.
+
+        The refusal names the directory and the command that repairs it, and
+        nothing installed is replaced.
+        """
+
+        result, kin_home = self.run_installer(
+            vfs_exit=0,
+            umask=0o002,
+            seed_current_install=True,
+            group_writable_kin_home=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"chmod go-w '{kin_home}'", result.stderr)
+        self.assertIn("drwxrwxr-x", result.stderr)
+        self.assertIn("KIN_REGISTRY_REPAIR=1", result.stderr)
+        self.assertNotIn("For permission-only drift", result.stderr)
+        self.assertEqual(stat.S_IMODE(kin_home.stat().st_mode), 0o775)
+        self.assertIn(
+            "old-kin", (kin_home / "bin" / "kin").read_text(encoding="utf-8")
+        )
+
+    def test_registry_repair_consent_covers_a_group_writable_kin_home(self) -> None:
+        result, kin_home = self.run_installer(
+            vfs_exit=0,
+            umask=0o002,
+            seed_current_install=True,
+            group_writable_kin_home=True,
+            extra_env={"KIN_REGISTRY_REPAIR": "1"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(kin_home.stat().st_mode), 0o755)
+        self.assertIn(f"Removed group and world write from {kin_home}", result.stdout)
+        self.assertEqual(
+            (kin_home.parent / "registry-calls.log").read_text(encoding="utf-8"),
+            "registry authority --fix --initialize\n",
         )
 
     def test_reports_projection_only_when_vfs_is_executable(self) -> None:
