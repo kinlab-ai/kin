@@ -181,15 +181,18 @@ impl TraceMeter {
         self.should_stop()
     }
 
-    /// Cancellation is checked first. A walk nobody is waiting for should stop
-    /// for that reason rather than be reported as having run out of time.
-    fn should_stop(&self) -> Option<TraceStop> {
-        if self
-            .budget
+    /// Whether whoever asked has stopped waiting.
+    fn cancelled(&self) -> bool {
+        self.budget
             .cancel
             .as_ref()
             .is_some_and(TraceCancel::is_cancelled)
-        {
+    }
+
+    /// Cancellation is checked first. A walk nobody is waiting for should stop
+    /// for that reason rather than be reported as having run out of time.
+    fn should_stop(&self) -> Option<TraceStop> {
+        if self.cancelled() {
             return Some(TraceStop::Cancelled);
         }
         (self.started.elapsed() >= self.budget.time_budget).then_some(TraceStop::TimeBudget)
@@ -349,6 +352,18 @@ pub struct TraceDataFlowRequest {
     /// define stays a leaf either way.
     #[serde(default)]
     pub include_type_edges: Option<bool>,
+    /// A semantic scope the walk is held to while it runs: a module path
+    /// prefix, and whether it restricts the paths or only the rows. See
+    /// `kin_mcp::trace_scope`. Omitted when none is named, so a request from a
+    /// CLI that predates it reads as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<kin_mcp::trace_scope::ScopeRequest>,
+    /// Whether the walk reads code whose stored role is Test (default true).
+    /// `false` leaves tests out of a callers walk: a test is never a step, a
+    /// reach member or a place that could add a caller, and the reach block
+    /// counts what it left out. See `kin_mcp::trace_reach::Scans`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_tests: Option<bool>,
 }
 
 impl TraceDataFlowRequest {
@@ -388,6 +403,16 @@ pub struct TraceEntityRecord {
     /// reads, so a caller can see why a test callee lost a slot to a source one.
     pub entity_role: String,
     pub entity_file: Option<String>,
+    /// The dotted module the entity is declared in, read from the graph's
+    /// module records once the chain is whole, so a reader can tell which unit
+    /// a step sits in without a coordinate. Null for a symbol outside the
+    /// repository and wherever the records name no module.
+    ///
+    /// Defaulted on read, because the CLI parses this payload from whatever
+    /// daemon is already running, and one started before the field existed
+    /// answers without it.
+    #[serde(default)]
+    pub entity_module: Option<String>,
     /// True when the graph holds no file for this symbol: an import another
     /// repository defines, a builtin, or an alias split off its definition. Such
     /// a record carries identity and nothing else, and the nulls beside it are
@@ -462,6 +487,20 @@ pub struct TraceStep {
     /// Some retained occurrence sites could not be proven for this hop.
     #[serde(default)]
     pub reference_lines_partial_reason: Option<String>,
+    /// The line of code at each of `reference_lines`, as `{line, expr}`, cut
+    /// from the body that holds the site (see
+    /// `kin_mcp::site_expression::quote_lines`), so a reader sees what links
+    /// this step to its parent without reading either body. Null when no body
+    /// was read; a site past the quoting budget keeps its line alone.
+    #[serde(default)]
+    pub reference_sites: Option<Vec<serde_json::Value>>,
+    /// The code on the first of `reference_lines`, as written, read from the
+    /// entity that holds the site: this step for an inward step, its parent
+    /// for a callee. The call that proves the step, so a reader does not read
+    /// a body to see it. Null when no line is recorded or its text cannot be
+    /// read; serialized either way, so every step carries the same keys.
+    #[serde(default)]
+    pub code: Option<String>,
     /// This step's identity, location, and (when served) body.
     #[serde(flatten)]
     pub entity: TraceEntityRecord,
@@ -526,15 +565,15 @@ pub struct TraceFanoutClip {
     pub entity_name: String,
     pub dropped_callees: usize,
     pub dropped_callers: usize,
-    /// How many of the dropped neighbors lived outside this node's own file.
-    /// Zero, and omitted, when every neighbor this node dropped lived in it.
+    /// How many of the dropped neighbors lived outside this node's own source
+    /// unit. Zero, and omitted, when every neighbor this node dropped lived in it.
     ///
     /// The class of hop, not just the count. A node that dropped eleven
-    /// same-file callees lost breadth; a node that dropped the only hops that
+    /// same-unit callees lost breadth; a node that dropped the only hops that
     /// leave its module lost the kind of edge a data-flow question is about,
     /// and a single `dropped` number cannot tell those apart.
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub dropped_crossing_file: usize,
+    pub dropped_crossing_unit: usize,
     /// Whether the chain this reply carries goes on beneath this node, so it
     /// reads as a path that continues while a sibling branch was discarded. A
     /// response budget that cuts every step beneath the node sets it false,
@@ -565,11 +604,22 @@ pub struct TraceDataFlowResponse {
     pub focal_id: String,
     pub focal_name: String,
     pub focal_kind: String,
-    pub focal_file: Option<String>,
     /// The focal in the same shape every step uses, so a consumer can read the
     /// whole response through one record type. Carries the focal's span and
-    /// signature even when no body was served.
+    /// signature even when no body was served, and the module it is declared
+    /// in as its `entity_module`.
     pub focal_entity: TraceEntityRecord,
+    /// How the focal was resolved: whether it was addressed by entity id or by
+    /// name, how many entities the name reached by the rule that resolved it,
+    /// and the ones it did not answer for. The block every surface that
+    /// resolves a focal publishes (`kin_mcp`'s `focal_resolution_for`), so the
+    /// verdict reads a walk's resolution the way it reads a reference list's.
+    ///
+    /// Defaulted on read, because the CLI parses this payload from whatever
+    /// daemon is already running, and one started before the block existed
+    /// answers without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_resolution: Option<serde_json::Value>,
     /// Direction that was traversed.
     pub direction: String,
     /// Depth that was traversed.
@@ -630,17 +680,17 @@ pub struct TraceDataFlowResponse {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spine_clipped_steps: usize,
     /// How many neighbors the spine clips dropped that lived outside their
-    /// node's own file: the count of module-crossing hops this chain was never
-    /// offered. Zero, and omitted, when the clipped nodes the chain goes on
-    /// beneath dropped only neighbors in their own files, and also when it goes
+    /// node's own source unit: the count of module-crossing hops this chain was
+    /// never offered. Zero, and omitted, when the clipped nodes the chain goes on
+    /// beneath dropped only neighbors in their own units, and also when it goes
     /// on beneath none, which an omitted `spine_clipped_steps` says. After the
     /// response budget cuts the chain, it counts only the clipped nodes the
     /// chain still goes on beneath, each as its clip record measured it,
     /// including a node whose record the cut withheld. When a node's record
     /// never reached the pass that restated it, the reply also carries
-    /// `spine_dropped_crossing_file_is_floor: true`, and the count is a floor.
+    /// `spine_dropped_crossing_unit_is_floor: true`, and the count is a floor.
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub spine_dropped_crossing_file: usize,
+    pub spine_dropped_crossing_unit: usize,
     /// Step bodies the response budget dropped, and steps it dropped after that.
     /// Both zero — and omitted — for a response that fit as built.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -767,6 +817,47 @@ pub struct TraceDataFlowResponse {
     /// so a trace unaffected by these ceilings is unchanged by them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradations: Vec<RetrievalDegradation>,
+    /// Entities that reached a node on the callers side only by naming it as
+    /// a type, withheld because a type use is not a call and the walk would
+    /// stop at it anyway. `include_type_edges` walks them. Zero, and omitted,
+    /// when there were none or they were walked.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub type_uses_withheld: usize,
+    /// The named-scope reading of every method whose callers this walk read,
+    /// taken the way `find_references` takes it for its focal, which the
+    /// verdict reads in place of the bare method gate. Present on a walk that
+    /// read callers of a method focal; see `kin_mcp::trace_named_scope`.
+    ///
+    /// Defaulted on read, because the CLI parses this payload from whatever
+    /// daemon is already running, and one started before the block existed
+    /// answers without it.
+    #[serde(
+        rename = "call_sites",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub call_sites: Option<serde_json::Value>,
+    /// The closed answer to the reach question a walk that reads callers
+    /// answers: every entity that can end up calling the focal under a
+    /// declared policy, each with a witness hop, the entities that refer to
+    /// them without calling them, the places the reading could not settle,
+    /// and the bounds that stopped it. See `kin_mcp::trace_reach`.
+    ///
+    /// Defaulted on read, because the CLI parses this payload from whatever
+    /// daemon is already running, and one started before the block existed
+    /// answers without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<serde_json::Value>,
+    /// The scope a scoped walk was held to, as resolved, with what it met
+    /// outside, its frontier and the scoped answer's state. See
+    /// `kin_mcp::trace_scope`. Absent on an unscoped walk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<serde_json::Value>,
+    /// Where an unscoped walk's steps sit, counted by package, and the
+    /// package a `scope` would keep. See `kin_mcp::trace_scope::module_census`.
+    /// Absent on a scoped walk, and when every step sits in one package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<serde_json::Value>,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -785,10 +876,30 @@ pub async fn run_seeded(
     include_type_edges: Option<bool>,
     target: Option<String>,
     cursor: Option<String>,
+    scope: Option<String>,
+    scope_mode: Option<String>,
 ) -> Result<()> {
     let direction = match direction {
         Some(value) => Some(TraceDirection::parse(&value)?),
         None => None,
+    };
+    let scope = match (scope, scope_mode) {
+        (Some(module), mode) => Some(
+            kin_mcp::trace_scope::ScopeRequest::new(
+                &module,
+                match mode {
+                    Some(mode) => {
+                        kin_mcp::trace_scope::ScopeMode::parse(&mode).map_err(anyhow::Error::msg)?
+                    }
+                    None => kin_mcp::trace_scope::ScopeMode::default(),
+                },
+            )
+            .map_err(anyhow::Error::msg)?,
+        ),
+        (None, Some(_)) => {
+            anyhow::bail!("--scope-mode needs --scope, the module path the walk is confined to")
+        }
+        (None, None) => None,
     };
     let request = TraceDataFlowRequest {
         cursor,
@@ -799,7 +910,9 @@ pub async fn run_seeded(
         include_body,
         max_response_chars,
         include_type_edges,
+        scope,
         target,
+        include_tests: None,
     };
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
@@ -947,20 +1060,50 @@ fn build_trace_data_flow_response_inner(
         }
     }
 
-    // A member name several owners share names none of them, so the walk is
-    // refused with every candidate rather than run from one of them.
-    let shared = shared_member_candidates(graph, trimmed)?;
-    if shared.len() > 1 {
-        return Err(anyhow::Error::new(SharedMemberFocal {
-            lines: bounded_trace_candidate_lines(trimmed, &shared, request.budget_chars()),
-            query: trimmed.to_string(),
-            candidates: shared,
-        }));
-    }
+    // A name that reaches several distinct entities names none of them, so the
+    // walk is refused with every candidate rather than run from a ranked one:
+    // several owners' members, same-named definitions in several modules
+    // (`advanceTimers` in the scheduler and in its mock), or a qualified name
+    // whose leaf several entities carry.
     let focal_entity = match resolve_trace_focal(graph, trimmed)? {
-        Some(entity) => entity,
-        None => return Err(focal_not_found_error(trimmed)),
+        TraceFocal::One(entity) => entity,
+        TraceFocal::Ambiguous(reason, candidates) => {
+            let names = kin_mcp::handlers::entities::candidate_names(graph, &candidates);
+            return Err(anyhow::Error::new(AmbiguousFocal {
+                lines: bounded_trace_candidate_lines(
+                    trimmed,
+                    reason,
+                    &candidates,
+                    &names,
+                    request.budget_chars(),
+                ),
+                query: trimmed.to_string(),
+                reason,
+                names,
+                candidates,
+            }));
+        }
+        TraceFocal::Missing => return Err(focal_not_found_error(trimmed)),
     };
+    let focal_resolution = kin_mcp::handlers::entities::focal_resolution_for(
+        graph,
+        &focal_entity,
+        if uuid::Uuid::parse_str(trimmed).is_ok() {
+            None
+        } else {
+            Some(trimmed)
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("read the focal's resolution: {error}"))?;
+    // A scope that names no module path is refused, so a typo never reads as
+    // a walk that found nothing in scope.
+    let scope = request
+        .scope
+        .as_ref()
+        .map(|scope| kin_mcp::trace_scope::TraceScope::resolve(graph, scope))
+        .transpose()
+        .map_err(|refusal| anyhow::anyhow!("trace_data_flow: {refusal}"))?;
+    let include_tests = request.include_tests.unwrap_or(true);
 
     let mut meter = TraceMeter::new(budget);
     let mut degradations: Vec<RetrievalDegradation> = Vec::new();
@@ -1042,16 +1185,13 @@ fn build_trace_data_flow_response_inner(
         .map(str::trim)
         .filter(|target| !target.is_empty())
     {
-        let shared = shared_member_candidates(graph, target)?;
-        if shared.len() > 1 {
-            // Ranking toward one owner's member would be a silent pick of the
+        let resolved_target = resolve_trace_focal(graph, target)?;
+        if let TraceFocal::Ambiguous(reason, shared) = &resolved_target {
+            // Ranking toward one of several would be a silent pick of the
             // question itself; the walk ranks by relevance and says why, in the
             // words the in-process walker uses.
-            let entry = kin_mcp::handlers::entities::target_ambiguous_degradation(
-                target,
-                kin_ranking::entity_ranking::CandidateReason::SharedMemberName,
-                &shared,
-            );
+            let entry =
+                kin_mcp::handlers::entities::target_ambiguous_degradation(target, *reason, shared);
             target_ambiguity = Some(kin_mcp::handlers::entities::trace_target_listing(&entry));
             let field = |key: &str| entry[key].as_str().unwrap_or_default().to_string();
             record_degradation(
@@ -1064,10 +1204,10 @@ fn build_trace_data_flow_response_inner(
                 },
             );
         }
-        let resolved = if shared.len() > 1 {
-            None
-        } else {
-            resolve_trace_focal(graph, target)?
+        let target_is_ambiguous = matches!(resolved_target, TraceFocal::Ambiguous(..));
+        let resolved = match resolved_target {
+            TraceFocal::One(entity) => Some(entity),
+            TraceFocal::Ambiguous(..) | TraceFocal::Missing => None,
         };
         match resolved {
             Some(entity) => {
@@ -1116,7 +1256,7 @@ fn build_trace_data_flow_response_inner(
                 }
                 target_name = Some(entity.name.clone());
             }
-            None if shared.len() > 1 => {}
+            None if target_is_ambiguous => {}
             None => {
                 // Worded by the producer the in-process walk uses too.
                 let (detail, remediation) = kin_mcp::remediation::trace_target_not_resolved(target);
@@ -1155,6 +1295,9 @@ fn build_trace_data_flow_response_inner(
         name_index.insert(focal_entity.name.clone(), 0);
     }
     let mut external_identities_merged = 0usize;
+    // Entities that reach a node only by naming it as a type, withheld from a
+    // callers walk unless `include_type_edges` asks for them.
+    let mut type_users: HashSet<EntityId> = HashSet::new();
     let mut clipped_steps: Vec<TraceFanoutClip> = Vec::new();
     let mut truncated = false;
     let mut stop = TraceStop::Exhausted;
@@ -1272,6 +1415,18 @@ fn build_trace_data_flow_response_inner(
                     continue;
                 }
 
+                // A type use reached inward names this node as a type and does
+                // not call it, so it is no caller, and the walk would stop at
+                // it anyway. On a method it is the enclosing class, whose span
+                // holds the member's own call sites a second time. It is
+                // counted rather than listed, and `include_type_edges` walks
+                // it. The edge still counts above: the graph held a neighbor
+                // here, so the node is not a leaf. Mirrors the MCP arm.
+                if role == "caller" && rel.kind == RelationKind::UsesType && !include_type_edges {
+                    type_users.insert(next_id);
+                    continue;
+                }
+
                 let candidate_at = match candidate_index.get(&(next_id, role)) {
                     // The same neighbor reached twice, by two edges of different
                     // kinds or confidences. One step, described by the stronger
@@ -1319,6 +1474,24 @@ fn build_trace_data_flow_response_inner(
                         else {
                             continue;
                         };
+                        // Held to the scope while the walk runs, so a path
+                        // that leaves it is never followed back in.
+                        if scope
+                            .as_ref()
+                            .is_some_and(|scope| !scope.admits_step(&entity, node.step))
+                        {
+                            continue;
+                        }
+                        // A walk that leaves tests out never steps into one
+                        // on its way inward: a test that calls, names or
+                        // imports a step is no step. What the focal calls is
+                        // followed wherever it leads.
+                        if !include_tests
+                            && role != "callee"
+                            && entity.role == kin_model::EntityRole::Test
+                        {
+                            continue;
+                        }
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         // The candidate's own role decides which sense of
@@ -1404,6 +1577,13 @@ fn build_trace_data_flow_response_inner(
             } else {
                 Vec::new()
             };
+            // A symbol outside the repository belongs to no module.
+            if scope
+                .as_ref()
+                .is_some_and(|scope| !scope.admits_external(external_callees.len()))
+            {
+                external_callees.clear();
+            }
 
             // This node's relations were read to the end, so what the graph
             // held for it is now a fact rather than a guess.
@@ -1460,7 +1640,7 @@ fn build_trace_data_flow_response_inner(
                     entity_name,
                     dropped_callees,
                     dropped_callers,
-                    dropped_crossing_file: crossing_callees + crossing_callers,
+                    dropped_crossing_unit: crossing_callees + crossing_callers,
                     continued_below: false,
                     limit_per_step,
                 });
@@ -1555,7 +1735,11 @@ fn build_trace_data_flow_response_inner(
                 path_resolutions.insert(step_index, resolution);
                 chain.push(TraceStep {
                     step: step_index,
-                    role: candidate.role.to_string(),
+                    role: kin_mcp::trace_named_scope::step_role(
+                        candidate.role,
+                        candidate.relation_kind,
+                    )
+                    .to_string(),
                     relation_kind: format!("{:?}", candidate.relation_kind),
                     resolution: resolution.as_str().to_string(),
                     parent_step: node.step,
@@ -1565,6 +1749,8 @@ fn build_trace_data_flow_response_inner(
                     reference_lines_partial_reason: candidate
                         .reference_sites_withheld
                         .then(|| "unconfirmed_sites_withheld".into()),
+                    reference_sites: None,
+                    code: None,
                     entity: entity_record(
                         &candidate.entity,
                         source.as_ref(),
@@ -1629,6 +1815,76 @@ fn build_trace_data_flow_response_inner(
         record_trace_stop(&mut degradations, stop, &meter, chain.len());
     }
 
+    // Each step shows the call that proves it, not only its line.
+    with_held_source(
+        repository_authority,
+        graph,
+        projection.as_ref(),
+        source_scope,
+        |held, scope| {
+            quote_step_code(
+                graph,
+                &focal_entity,
+                &mut chain,
+                &kin_mcp::handlers::external_symbols::CalleeText::with_read_limit_at(
+                    held,
+                    kin_mcp::handlers::common::TRACE_STEP_CODE_READS_MAX,
+                    scope,
+                ),
+            )
+        },
+    );
+    // The walk read callers of a method, so it takes the named-scope reading
+    // `find_references` takes, for the focal and every expanded method in the
+    // chain, and the verdict reads it (see `kin_mcp::trace_named_scope`). A
+    // walk its own work ceiling already stopped does not spend more: it is
+    // truncated whatever the reading would say, and keeps the bare gate.
+    // Whether the walk finished decides it, never how long the walk took: a
+    // clock read here took the reading on an idle machine and skipped it on
+    // a busy one, for the same chain.
+    let mut scans = kin_mcp::trace_reach::Scans::reading_tests(include_tests);
+    let call_sites = (matches!(direction, TraceDirection::Callers | TraceDirection::Both)
+        && kin_core::reference_coverage::kind_under_resolves_incoming_calls(focal_entity.kind)
+        && stop == TraceStop::Exhausted
+        && !meter.cancelled())
+    .then(|| {
+        read_walked_methods(
+            repository_authority,
+            graph,
+            &focal_entity,
+            &chain,
+            &expansion,
+            projection.as_ref(),
+            source_scope,
+            &mut scans,
+        )
+    })
+    .transpose()?;
+    // A walk that reads callers also answers the reach question as a closed
+    // set, on the same budget and sharing the scans the reading above took.
+    let reach = matches!(direction, TraceDirection::Callers | TraceDirection::Both).then(|| {
+        with_held_source(
+            repository_authority,
+            graph,
+            projection.as_ref(),
+            source_scope,
+            |held, source| {
+                kin_mcp::trace_reach::read_in_scope(
+                    graph,
+                    held,
+                    source,
+                    &focal_entity,
+                    kin_mcp::trace_reach::Limits::default(),
+                    &mut meter,
+                    &mut scans,
+                    scope.as_ref(),
+                )
+            },
+        )
+    });
+    let type_uses_withheld = type_users.difference(&visited).count();
+    quote_step_sites(graph, &focal_entity, &mut chain, &parent_text);
+
     let mut response = TraceDataFlowResponse {
         source_change_id: match source_scope {
             EntitySourceScope::WorkspaceHead => None,
@@ -1638,8 +1894,8 @@ fn build_trace_data_flow_response_inner(
         focal_id: focal_entity.id.to_string(),
         focal_name: focal_entity.name.clone(),
         focal_kind: format!("{:?}", focal_entity.kind),
-        focal_file: focal_entity.file_origin.as_ref().map(|p| p.0.clone()),
         focal_entity: focal_entity_record,
+        focal_resolution: Some(focal_resolution),
         direction: direction.as_str().to_string(),
         depth,
         limit_per_step,
@@ -1652,7 +1908,7 @@ fn build_trace_data_flow_response_inner(
         target_ambiguity,
         clipped_steps,
         spine_clipped_steps: 0,
-        spine_dropped_crossing_file: 0,
+        spine_dropped_crossing_unit: 0,
         bodies_omitted: 0,
         steps_omitted: 0,
         fanout_narrowed: 0,
@@ -1669,7 +1925,17 @@ fn build_trace_data_flow_response_inner(
         max_response_chars: request.budget_chars(),
         chars_before_budget: None,
         degradations,
+        type_uses_withheld,
+        call_sites,
+        // A paged reply carries the block whole. A bounded one takes it after
+        // the chain is cut, so the chain is cut exactly as it was before the
+        // block existed, and the block fits the room left.
+        reach: if bound_response { None } else { reach.clone() },
+        scope: None,
+        modules: None,
     };
+    // Before the budget, so the size it measures is the size the reply ships.
+    name_trace_modules(graph, &focal_entity, &mut response);
     // Before the budget, because it reads facts the walk recorded per node and
     // the budget only ever removes steps. Counting them is what happens after.
     classify_walk_terminals(
@@ -1680,14 +1946,218 @@ fn build_trace_data_flow_response_inner(
         &step_language,
         &mut response,
     );
+    // Read once the terminals are classified, from the whole chain and the
+    // whole reach block, before any response bound cuts either.
+    if let Some(scope) = &scope {
+        let focal_dropped: u64 = response
+            .clipped_steps
+            .iter()
+            .filter(|clip| clip.step == 0)
+            .map(|clip| (clip.dropped_callees + clip.dropped_callers) as u64)
+            .sum();
+        let steps: Vec<kin_mcp::trace_scope::ChainStep<'_>> = response
+            .chain
+            .iter()
+            .map(|step| kin_mcp::trace_scope::ChainStep {
+                step: step.step,
+                id: &step.entity.entity_id,
+                name: &step.entity.entity_name,
+                depth: step.depth,
+                terminal: step.terminal.as_deref(),
+                fanout_dropped: step.fanout_dropped as u64,
+            })
+            .collect();
+        let block = scope.block(
+            &focal_entity,
+            response.focal_terminal.as_deref(),
+            focal_dropped,
+            &steps,
+            depth,
+            direction.as_str(),
+            reach.as_ref(),
+        );
+        response.scope = Some(block);
+    } else {
+        // Read before any bound cuts the chain, so the counts are the walk's.
+        let steps: Vec<&str> = response
+            .chain
+            .iter()
+            .map(|step| step.entity.entity_id.as_str())
+            .collect();
+        response.modules = kin_mcp::trace_scope::module_census(graph, &steps);
+    }
     if bound_response {
         enforce_response_budget(&mut response)?;
+        if let Some(mut reach) = reach {
+            let room = response
+                .max_response_chars
+                .saturating_sub(measure_response(&response))
+                .saturating_sub(kin_mcp::handlers::common::TRACE_DISCLOSURE_RESERVE_CHARS);
+            if kin_mcp::trace_reach::fit(&mut reach, room) {
+                response.reach = Some(reach);
+            }
+        }
+        if let Some(block) = response.scope.as_mut() {
+            kin_mcp::trace_scope::reconcile_block(block, response.reach.as_ref());
+        }
     } else {
         record_unproven_steps(&mut response);
         record_terminal_steps(&mut response);
         record_spine_clipping(&mut response);
     }
     Ok(response)
+}
+
+/// Fill each step's `code`: the line of its first reference line, read from
+/// the entity that holds the site.
+fn quote_step_code<T: kin_mcp::handlers::external_symbols::SiteText + ?Sized>(
+    graph: &kin_db::InMemoryGraph,
+    focal: &Entity,
+    chain: &mut [TraceStep],
+    text: &T,
+) {
+    let quoter = kin_mcp::trace_reach::LineQuoter::new(text);
+    let ids: Vec<String> = chain
+        .iter()
+        .map(|step| step.entity.entity_id.clone())
+        .collect();
+    let mut holders: HashMap<String, Option<Entity>> = HashMap::new();
+    for step in chain.iter_mut() {
+        let Some(&line) = step.reference_lines.iter().min() else {
+            continue;
+        };
+        let holder_id = if kin_mcp::trace_reach::step_holds_its_site(&step.role) {
+            step.entity.entity_id.clone()
+        } else if step.parent_step == 0 {
+            focal.id.to_string()
+        } else {
+            match ids.get(step.parent_step - 1) {
+                Some(id) => id.clone(),
+                None => continue,
+            }
+        };
+        let holder = holders.entry(holder_id.clone()).or_insert_with(|| {
+            uuid::Uuid::parse_str(&holder_id)
+                .ok()
+                .and_then(|uuid| graph.get_entity(&EntityId(uuid)).ok().flatten())
+        });
+        step.code = holder.as_ref().and_then(|holder| quoter.line(holder, line));
+    }
+}
+
+/// Run `read` with the source authority this walk holds for its bodies, the
+/// way [`read_walked_methods`] reads through it.
+fn with_held_source<T>(
+    repository_authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    projection: Option<&BodyProjection<'_>>,
+    source_scope: EntitySourceScope,
+    read: impl FnOnce(&HeldSourceAuthority<'_, kin_db::InMemoryGraph>, EntitySourceScope) -> T,
+) -> T {
+    match projection {
+        Some(BodyProjection::Committed { held, scope }) => read(held, *scope),
+        Some(BodyProjection::Workspace { authority, .. }) => {
+            let source = repository_authority.source_authority_from(authority);
+            read(
+                &HeldSourceAuthority::new(graph, Some(&source)),
+                source_scope,
+            )
+        }
+        None => read(&HeldSourceAuthority::new(graph, None), source_scope),
+    }
+}
+
+/// The walk's budget as the reach reading spends it: the one count of
+/// examined relations, and the caller's cancellation.
+///
+/// Not the walk's clock. That clock starts with the walk, so a reading that
+/// shared it was cut wherever a busy machine had left it, and the same graph
+/// answered a nine-member reach complete at one moment and partial at the
+/// next. The reading is bounded by what it counts, and keeps one clock of its
+/// own far above what those counts need
+/// ([`kin_mcp::trace_reach::Limits::safety_time`]).
+impl kin_mcp::trace_reach::ReachMeter for TraceMeter {
+    fn charge_edge(&mut self) -> Option<&'static str> {
+        self.edges_scanned = self.edges_scanned.saturating_add(1);
+        kin_mcp::trace_reach::ReachMeter::stop(self)
+    }
+
+    fn stop(&self) -> Option<&'static str> {
+        if self.cancelled() {
+            return Some(TraceStop::Cancelled.bound_name());
+        }
+        (self.edges_scanned >= self.budget.max_edges_scanned)
+            .then(|| TraceStop::EdgeBudget.bound_name())
+    }
+}
+
+impl TraceStop {
+    /// The bound's name, as a reach block names what stopped it.
+    fn bound_name(self) -> &'static str {
+        match self {
+            Self::Exhausted => "exhausted",
+            Self::TimeBudget => "time_budget",
+            Self::EdgeBudget => "edge_budget",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The named-scope reading of the focal and every expanded method in `chain`,
+/// through the open the walk already holds for its bodies, as the walk's
+/// `call_sites` block.
+fn read_walked_methods(
+    repository_authority: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    focal: &Entity,
+    chain: &[TraceStep],
+    expansion: &HashMap<usize, TraceExpansion>,
+    projection: Option<&BodyProjection<'_>>,
+    source_scope: EntitySourceScope,
+    scans: &mut kin_mcp::trace_reach::Scans,
+) -> Result<serde_json::Value> {
+    let mut expanded: Vec<usize> = expansion.keys().copied().collect();
+    expanded.sort_unstable();
+    let mut methods: Vec<(usize, Entity)> = Vec::new();
+    for step in expanded {
+        if step == 0 {
+            methods.push((0, focal.clone()));
+            continue;
+        }
+        let Some(record) = chain.get(step - 1) else {
+            continue;
+        };
+        if !kin_core::reference_coverage::kind_name_under_resolves_incoming_calls(
+            &record.entity.entity_kind,
+        ) {
+            continue;
+        }
+        let Ok(id) = uuid::Uuid::parse_str(&record.entity.entity_id) else {
+            continue;
+        };
+        if let Some(entity) = graph
+            .get_entity(&EntityId(id))
+            .context("load a traced method for its call sites")?
+        {
+            methods.push((step, entity));
+        }
+    }
+    let methods: Vec<kin_mcp::trace_named_scope::TraceMethod<'_>> = methods
+        .iter()
+        .map(|(step, entity)| kin_mcp::trace_named_scope::TraceMethod {
+            step: *step,
+            entity,
+        })
+        .collect();
+    Ok(with_held_source(
+        repository_authority,
+        graph,
+        projection,
+        source_scope,
+        |held, scope| {
+            kin_mcp::trace_named_scope::read_methods_with(graph, held, scope, &methods, scans)
+        },
+    ))
 }
 
 /// Mark the clips the chain continued beneath, and count them once at the top.
@@ -1704,18 +2174,18 @@ fn record_spine_clipping(response: &mut TraceDataFlowResponse) {
     for clip in &mut response.clipped_steps {
         clip.continued_below = parents.contains(&clip.step);
         if clip.continued_below {
-            spine_crossing += clip.dropped_crossing_file;
+            spine_crossing += clip.dropped_crossing_unit;
             nodes.push(kin_mcp::remediation::SpineNode {
                 entity_id: clip.entity_id.clone(),
                 entity_name: clip.entity_name.clone(),
                 dropped: clip.dropped_callees + clip.dropped_callers,
-                dropped_crossing_file: Some(clip.dropped_crossing_file),
+                dropped_crossing_unit: Some(clip.dropped_crossing_unit),
                 limit_per_step: clip.limit_per_step,
             });
         }
     }
     response.spine_clipped_steps = nodes.len();
-    response.spine_dropped_crossing_file = spine_crossing;
+    response.spine_dropped_crossing_unit = spine_crossing;
     // One producer for both walks and for the response-budget pass that
     // restates this disclosure after it cuts the chain further, so the three
     // word one fact one way.
@@ -2203,6 +2673,95 @@ fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
     });
 }
 
+/// Quote the line of code at each site of every repository step, cut from the
+/// body that holds it through the walk's one open authority: a callee's sites
+/// from its parent's body, every other step's from its own. The offline arm in
+/// kin-mcp quotes the same way.
+fn quote_step_sites(
+    graph: &kin_db::InMemoryGraph,
+    focal: &Entity,
+    chain: &mut [TraceStep],
+    text: &ParentBodyText<'_>,
+) {
+    use kin_mcp::site_expression::{quote_lines, spelled_name, trace_sites_in_parent};
+    let ids: Vec<Option<EntityId>> = chain
+        .iter()
+        .map(|step| {
+            uuid::Uuid::parse_str(&step.entity.entity_id)
+                .ok()
+                .map(EntityId)
+        })
+        .collect();
+    let mut entities: HashMap<EntityId, Option<Entity>> =
+        HashMap::from([(focal.id, Some(focal.clone()))]);
+    let mut spent = 0usize;
+    for index in 0..chain.len() {
+        if chain[index].reference_lines.is_empty() || chain[index].outside.symbol.is_some() {
+            continue;
+        }
+        let parent = chain[index].parent_step;
+        let parent_id = if parent == 0 {
+            Some(focal.id)
+        } else {
+            ids.get(parent - 1).copied().flatten()
+        };
+        let (holder_id, named_id) = if trace_sites_in_parent(&chain[index].role) {
+            (parent_id, ids[index])
+        } else {
+            (ids[index], parent_id)
+        };
+        let (Some(holder_id), Some(named_id)) = (holder_id, named_id) else {
+            continue;
+        };
+        for id in [holder_id, named_id] {
+            entities
+                .entry(id)
+                .or_insert_with(|| graph.get_entity(&id).ok().flatten());
+        }
+        let (Some(holder), Some(named)) = (
+            entities.get(&holder_id).cloned().flatten(),
+            entities.get(&named_id).cloned().flatten(),
+        ) else {
+            continue;
+        };
+        let lines: Vec<u64> = chain[index]
+            .reference_lines
+            .iter()
+            .map(|line| u64::from(*line))
+            .collect();
+        chain[index].reference_sites =
+            quote_lines(text, &holder, spelled_name(&named.name), &lines, &mut spent);
+    }
+}
+
+/// The text a site inside a whole file's module surface is quoted from: an
+/// import or a call at the top level of a file. The surface has no source of
+/// its own to serve, since Kin never returns whole files, so this is read only
+/// to cut a site's own line, through the walk's open workspace authority, and
+/// the text is never put on a step.
+fn module_site_text(
+    projection: Option<&BodyProjection<'_>>,
+    entity: &Entity,
+) -> Option<(usize, String)> {
+    if !kin_model::is_file_module_surface(entity)
+        || !matches!(kin_model::entity_derivation(entity), Ok(None))
+    {
+        return None;
+    }
+    let Some(BodyProjection::Workspace {
+        authority,
+        workspace,
+    }) = projection
+    else {
+        return None;
+    };
+    let (bytes, _) = crate::commands::graph::read_entity_file_bytes_with_digest_from(
+        authority, workspace, entity,
+    )
+    .ok()?;
+    Some((0, String::from_utf8(bytes).ok()?))
+}
+
 /// The text at an external call's sites, cut from the parent's own body as
 /// the walk's one authority serves it, each parent read once.
 struct ParentBodyText<'a> {
@@ -2221,6 +2780,7 @@ impl kin_mcp::handlers::external_symbols::SiteText for ParentBodyText<'_> {
         let body = bodies.entry(caller.id).or_insert_with(|| {
             source_record_or_none(self.projection, caller)
                 .map(|record| (record.start_byte, record.body))
+                .or_else(|| module_site_text(self.projection, caller))
                 .ok_or("caller_source_unavailable")
         });
         match &*body {
@@ -2264,12 +2824,15 @@ fn external_step(
             ReferenceLinesAbsent::SitesInEntity.as_str().to_string(),
         ),
         reference_lines_partial_reason: None,
+        reference_sites: None,
+        code: None,
         entity: TraceEntityRecord {
             entity_id: text_of("entity_id").unwrap_or_default(),
             entity_name: text_of("entity_name").unwrap_or_default(),
             entity_kind: external::EXTERNAL_SYMBOL_KIND.to_string(),
             entity_role: "external".to_string(),
             entity_file: None,
+            entity_module: None,
             external: true,
             start_line: None,
             end_line: None,
@@ -2294,6 +2857,31 @@ fn external_step(
             sites: field("sites").and_then(|value| value.as_array().cloned()),
         },
     }
+}
+
+/// Name the module the focal and every step's entity are declared in.
+///
+/// Read from the graph's module records, once per source unit, and never from
+/// a path, so a reader can tell which unit each hop sits in through a reply
+/// that carries no coordinates. A step outside the repository, or one whose
+/// entity the records name no module for, keeps its null. Mirrors
+/// `name_trace_modules` in the generic-store walker.
+fn name_trace_modules(
+    graph: &kin_db::InMemoryGraph,
+    focal: &Entity,
+    response: &mut TraceDataFlowResponse,
+) {
+    let mut modules = kin_mcp::semantic_owners::DeclaringModules::new(graph);
+    for step in &mut response.chain {
+        if step.entity.external {
+            continue;
+        }
+        let entity = uuid::Uuid::parse_str(&step.entity.entity_id)
+            .ok()
+            .and_then(|id| graph.get_entity(&EntityId(id)).ok().flatten());
+        step.entity.entity_module = entity.and_then(|entity| modules.of(&entity));
+    }
+    response.focal_entity.entity_module = modules.of(focal);
 }
 
 /// The one record shape every entity in a trace is reported in.
@@ -2321,6 +2909,8 @@ fn entity_record(
         entity_kind: format!("{:?}", entity.kind),
         entity_role: format!("{:?}", entity.role).to_lowercase(),
         entity_file: entity.file_origin.as_ref().map(|path| path.0.clone()),
+        // Named by `name_trace_modules` once the chain is whole.
+        entity_module: None,
         external: kin_ranking::entity_ranking::trace_entity_is_external(entity),
         start_line,
         end_line,
@@ -2723,41 +3313,52 @@ pub fn target_not_resolved(response: &TraceDataFlowResponse) -> bool {
     })
 }
 
-/// A trace focal that is a member name several owners share: the walk has no
-/// one entity to start from, so it answers with the candidates instead.
+/// A trace focal that names several distinct entities: several owners'
+/// members, same-named definitions in several modules, or a qualified name
+/// several entities answer to. The walk has no one entity to start from, so it
+/// answers with the candidates instead.
 ///
 /// Typed so the daemon's MCP route can answer with the structured reply every
 /// single-answer tool gives for such a name, while the text route prints
-/// [`SharedMemberFocal::lines`].
+/// [`AmbiguousFocal::lines`].
 #[derive(Debug)]
-pub struct SharedMemberFocal {
+pub struct AmbiguousFocal {
     pub query: String,
+    /// Why the name named several: the same whole name, a shared member name,
+    /// or a qualifier that names several modules.
+    pub reason: kin_ranking::entity_ranking::CandidateReason,
     pub candidates: Vec<Entity>,
+    /// The spelling that names each candidate alone, keyed by entity id, for a
+    /// caller to pass back as the focal.
+    pub names: kin_mcp::handlers::entities::CandidateNames,
     pub lines: Vec<String>,
 }
 
 fn bounded_trace_candidate_lines(
     query: &str,
+    reason: kin_ranking::entity_ranking::CandidateReason,
     candidates: &[Entity],
+    names: &kin_mcp::handlers::entities::CandidateNames,
     max_bytes: usize,
 ) -> Vec<String> {
-    use kin_mcp::handlers::entities::{
-        name_candidates_situation, CandidateReason, NAME_CANDIDATES_LISTED_MAX,
-    };
+    use kin_mcp::handlers::entities::{name_candidates_situation, NAME_CANDIDATES_LISTED_MAX};
+    let mut candidates = candidates.to_vec();
+    kin_ranking::entity_ranking::sort_name_candidates(&mut candidates);
     let total = candidates.len();
     for listed in (0..=total.min(NAME_CANDIDATES_LISTED_MAX)).rev() {
-        let mut lines = crate::entity_identity::name_candidate_lines(
+        let mut lines = kin_mcp::handlers::entities::name_candidates_lines_named(
             query,
-            CandidateReason::SharedMemberName,
+            reason,
             &candidates[..listed],
+            names,
         );
         lines[0] = format!(
             "{}, so no candidate was selected:",
-            name_candidates_situation(query, CandidateReason::SharedMemberName, total)
+            name_candidates_situation(query, reason, total)
         );
         if listed < total {
             lines.push(format!(
-                "{} candidates omitted; name the focal by its owner-qualified name or entity id",
+                "{} candidates omitted; name the focal by its qualified name or entity id",
                 total - listed
             ));
         }
@@ -2766,53 +3367,66 @@ fn bounded_trace_candidate_lines(
             return lines;
         }
     }
-    vec![format!("The focal has {total} candidates; all {total} are omitted because its ambiguity metadata exceeds the UTF-8 byte budget. Name the focal by its owner-qualified name or entity id.")]
+    vec![format!("The focal has {total} candidates; all {total} are omitted because its ambiguity metadata exceeds the UTF-8 byte budget. Name the focal by its qualified name or entity id.")]
 }
 
-impl std::fmt::Display for SharedMemberFocal {
+impl std::fmt::Display for AmbiguousFocal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.lines.join("\n"))
     }
 }
 
-impl std::error::Error for SharedMemberFocal {}
+impl std::error::Error for AmbiguousFocal {}
 
-/// The owners' members a bare `query` names when several of them share it and
-/// nothing is named it exactly, by the rule every surface shares; empty for
-/// any other query. An id names one entity and reaches none here.
-fn shared_member_candidates(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Vec<Entity>> {
-    if uuid::Uuid::parse_str(query.trim()).is_ok() {
-        return Ok(Vec::new());
-    }
-    Ok(
-        match kin_ranking::entity_ranking::reach_by_name(graph, query.trim())? {
-            kin_ranking::entity_ranking::NameReach::Members(members) if members.len() > 1 => {
-                members
-            }
-            _ => Vec::new(),
-        },
-    )
+/// What a trace focal or target resolves to.
+enum TraceFocal {
+    One(Entity),
+    /// Several distinct entities, none chosen, with why.
+    Ambiguous(kin_ranking::entity_ranking::CandidateReason, Vec<Entity>),
+    Missing,
 }
 
-/// Resolve a trace focal by UUID, exact name, or the entity-ranking fallback.
+/// Resolve a trace focal by UUID, by the name rule every surface shares, or by
+/// the qualified-leaf retry `kin_core::query_trace_matches` makes.
 ///
 /// Mirrors `resolve_source_entity` in graph.rs so trace_data_flow and
-/// `graph source` agree on which entity a name maps to.
-fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<Option<Entity>> {
+/// `graph source` agree on which entity a name maps to. A name that reaches
+/// several distinct entities, once the twins of one declaration are folded, is
+/// [`TraceFocal::Ambiguous`] and never ranked down to one, and that holds for
+/// the leaf retry too: `Router::route` retried against `route` may reach one
+/// `route` or several.
+fn resolve_trace_focal(graph: &kin_db::InMemoryGraph, query: &str) -> Result<TraceFocal> {
+    use kin_ranking::entity_ranking::{CandidateReason, NameResolution};
     let trimmed = query.trim();
     if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
-        return Ok(graph.get_entity(&EntityId(uuid))?);
+        return Ok(match graph.get_entity(&EntityId(uuid))? {
+            Some(entity) => TraceFocal::One(entity),
+            None => TraceFocal::Missing,
+        });
     }
-    // The name rule every surface shares. The caller refuses a shared member
-    // name before it gets here, so a shared name resolves to nothing rather
-    // than to one of its owners.
     match kin_ranking::entity_ranking::resolve_name(graph, trimmed)? {
-        kin_ranking::entity_ranking::NameResolution::One(entity) => return Ok(Some(entity)),
-        kin_ranking::entity_ranking::NameResolution::SharedMemberName(_) => return Ok(None),
-        kin_ranking::entity_ranking::NameResolution::Missing => {}
+        NameResolution::One(entity) => return Ok(TraceFocal::One(entity)),
+        NameResolution::SharedMemberName(candidates) => {
+            return Ok(TraceFocal::Ambiguous(
+                CandidateReason::SharedMemberName,
+                candidates,
+            ))
+        }
+        NameResolution::SameName(candidates) => {
+            return Ok(TraceFocal::Ambiguous(
+                kin_ranking::entity_ranking::same_name_reason(trimmed, &candidates),
+                candidates,
+            ))
+        }
+        NameResolution::Missing => {}
     }
     let matches = kin_core::query_trace_matches(graph, trimmed)?;
-    Ok(matches.into_iter().next())
+    let mut distinct = kin_ranking::entity_ranking::fold_same_name_twins(graph, matches)?.distinct;
+    Ok(match distinct.len() {
+        0 => TraceFocal::Missing,
+        1 => TraceFocal::One(distinct.remove(0)),
+        _ => TraceFocal::Ambiguous(CandidateReason::SameLeafName, distinct),
+    })
 }
 
 /// The open authority a walk reads every step's body through.
@@ -2977,7 +3591,9 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            scope: None,
             target: None,
+            include_tests: None,
         }
     }
 
@@ -3003,7 +3619,7 @@ mod tests {
         }
     }
 
-    fn both_trace_payloads(
+    pub(super) fn both_trace_payloads(
         graph: &InMemoryGraph,
         focal: &EntityId,
         direction: TraceDirection,
@@ -3036,6 +3652,74 @@ mod tests {
             serde_json::to_value(cli).unwrap(),
             serde_json::from_str(text).unwrap(),
         ]
+    }
+
+    /// Both walkers name a step by the edge that reached it, withhold a type
+    /// use from a callers walk the same way, and publish the same named-scope
+    /// reading of a method focal, so a daemon reply and an in-process one read
+    /// alike. The graph holds no call-site ledgers, so the reading accounts
+    /// for no method and the gate stays, naming the focal on both arms.
+    #[test]
+    fn both_trace_walkers_label_steps_and_read_method_callers_alike() {
+        let graph = InMemoryGraph::new();
+        let mut focal = make_entity("App._find_error_handler", "src/app.py");
+        focal.kind = EntityKind::Method;
+        let mut handler = make_entity("Flask.handle_exception", "src/app.py");
+        handler.kind = EntityKind::Method;
+        let mut hook = make_entity("Flask.register", "src/app.py");
+        hook.kind = EntityKind::Method;
+        let mut class = make_entity("Flask", "src/app.py");
+        class.kind = EntityKind::Class;
+        for entity in [&focal, &handler, &hook, &class] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for (src, dst, kind) in [
+            (handler.id, focal.id, RelationKind::Calls),
+            (hook.id, handler.id, RelationKind::References),
+            (class.id, focal.id, RelationKind::UsesType),
+        ] {
+            graph
+                .upsert_relation(&make_relation(src, dst, kind))
+                .unwrap();
+        }
+        let payloads = both_trace_payloads(&graph, &focal.id, TraceDirection::Callers, 3);
+        for payload in &payloads {
+            let mut roles: Vec<(String, String)> = payload["chain"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|step| {
+                    (
+                        step["entity_name"].as_str().unwrap().to_string(),
+                        step["role"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            roles.sort();
+            assert_eq!(
+                roles,
+                vec![
+                    ("Flask.handle_exception".to_string(), "caller".to_string()),
+                    ("Flask.register".to_string(), "referrer".to_string()),
+                ],
+                "{payload:#}"
+            );
+            assert_eq!(payload["type_uses_withheld"], 1, "{payload:#}");
+            let block = &payload[kin_mcp::call_sites::CALL_SITES_KEY];
+            assert_eq!(block["methods"]["walked"], 3, "{block:#}");
+            assert_eq!(block["methods"]["accounted"], 0, "{block:#}");
+            assert!(
+                block["clauses"][0].as_str().is_some_and(|clause| clause
+                    .starts_with("method_call_resolution_incomplete: ")
+                    && clause.contains("App._find_error_handler")),
+                "{block:#}"
+            );
+        }
+        assert_eq!(
+            payloads[0][kin_mcp::call_sites::CALL_SITES_KEY],
+            payloads[1][kin_mcp::call_sites::CALL_SITES_KEY],
+            "one reading, whichever arm served it"
+        );
     }
 
     #[test]
@@ -3187,7 +3871,9 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap_err();
@@ -3213,7 +3899,9 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap_err();
@@ -3265,7 +3953,9 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -3325,7 +4015,9 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -3374,7 +4066,9 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -3436,7 +4130,9 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            scope: None,
             target: None,
+            include_tests: None,
         }
     }
 
@@ -3511,6 +4207,83 @@ mod tests {
         // Still a well-formed answer about the right entity rather than an
         // error: the caller learns what was asked and why it stopped.
         assert_eq!(response.focal_id, focal_id.to_string());
+    }
+
+    /// The reach of a small graph is the same block whether or not the
+    /// walk's clock has run out. The clock still cuts the display chain, and
+    /// says so; the closed set of callers is bounded by what it counts, so
+    /// the same store gives the same answer on a busy machine as on an idle
+    /// one.
+    #[test]
+    fn the_reach_does_not_depend_on_the_walks_clock() {
+        let graph = InMemoryGraph::new();
+        seed_cross_file_witness(&graph, "rs");
+        let outer = make_entity("outer", "src/outer.rs");
+        let middle = make_entity("middle", "src/middle.rs");
+        let inner = make_entity("inner", "src/inner.rs");
+        for entity in [&outer, &middle, &inner] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        for (from, to) in [(outer.id, middle.id), (middle.id, inner.id)] {
+            graph
+                .upsert_relation(&make_relation(from, to, RelationKind::Calls))
+                .unwrap();
+        }
+        let (_t, binding) = empty_binding();
+        let request = TraceDataFlowRequest {
+            direction: Some(TraceDirection::Callers),
+            depth: Some(8),
+            ..hub_request(inner.id)
+        };
+        let asked = |budget: TraceBudget| {
+            build_trace_data_flow_response_within(
+                &RequestRepositoryAuthority::pinned(binding.clone()),
+                &graph,
+                &request,
+                budget,
+            )
+            .unwrap()
+        };
+        let on_time = asked(TraceBudget::default());
+        let late = asked(TraceBudget {
+            time_budget: Duration::ZERO,
+            ..TraceBudget::default()
+        });
+        // The chain is cut by the clock, and the reply says which bound cut it.
+        assert_eq!(on_time.total_steps, 2);
+        assert_eq!(late.total_steps, 0);
+        assert!(late
+            .degradations
+            .iter()
+            .any(|stop| stop.reason == "time_budget_exceeded"));
+        // The closure is not.
+        let reach = on_time
+            .reach
+            .as_ref()
+            .expect("a callers walk reads a reach");
+        assert_eq!(reach["members_total"], 2, "{reach:#}");
+        assert_eq!(reach["bounds"], serde_json::json!([]), "{reach:#}");
+        assert_eq!(late.reach.as_ref(), Some(reach));
+
+        // The meter the reading spends never reads the clock: a spent time
+        // budget stops nothing, a spent count of relations does.
+        let mut meter = TraceMeter::new(TraceBudget {
+            time_budget: Duration::ZERO,
+            max_edges_scanned: 2,
+            cancel: None,
+        });
+        assert_eq!(meter.should_stop(), Some(TraceStop::TimeBudget));
+        let reading: &mut dyn kin_mcp::trace_reach::ReachMeter = &mut meter;
+        assert_eq!(reading.stop(), None);
+        assert_eq!(reading.charge_edge(), None);
+        assert_eq!(reading.charge_edge(), Some("edge_budget"));
+        let cancel = TraceCancel::new();
+        cancel.cancel();
+        let abandoned = TraceMeter::new(TraceBudget::cancellable(cancel));
+        assert_eq!(
+            kin_mcp::trace_reach::ReachMeter::stop(&abandoned),
+            Some("cancelled")
+        );
     }
 
     #[test]
@@ -3626,7 +4399,9 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            scope: None,
             target: None,
+            include_tests: None,
         };
 
         let uncancelled = build_trace_data_flow_response_within(
@@ -4040,7 +4815,7 @@ mod tests {
             "exactly one slot goes to a hop that leaves the file, no more: {kept:?}"
         );
         assert_eq!(
-            response.clipped_steps[0].dropped_crossing_file, 2,
+            response.clipped_steps[0].dropped_crossing_unit, 2,
             "three callees live in another file, one now takes the reserved slot, \
              so two module-crossing hops are still dropped"
         );
@@ -4199,7 +4974,7 @@ mod tests {
             "the focal was clipped and the chain continues beneath it"
         );
         assert_eq!(
-            response.spine_dropped_crossing_file, 2,
+            response.spine_dropped_crossing_unit, 2,
             "two of the hops it never followed left the module"
         );
         assert!(
@@ -4260,7 +5035,7 @@ mod tests {
             disclosure.detail.starts_with(
                 "the walk continued beneath 1 node(s) whose fan-out limit_per_step 4 had already \
                  cut, dropping 11 neighbor(s) that were never followed, 2 of which lived outside \
-                 the file of the node that offered them; the widest was 'Session.send'"
+                 the module of the node that offered them; the widest was 'Session.send'"
             ),
             "{}",
             disclosure.detail
@@ -4288,7 +5063,7 @@ mod tests {
         );
         assert!(response.clipped_steps.is_empty());
         assert_eq!(response.spine_clipped_steps, 0);
-        assert_eq!(response.spine_dropped_crossing_file, 0);
+        assert_eq!(response.spine_dropped_crossing_unit, 0);
         assert!(
             !response
                 .degradations
@@ -4298,7 +5073,7 @@ mod tests {
             response.degradations
         );
         let json = serde_json::to_value(&response).unwrap();
-        for absent in ["spine_clipped_steps", "spine_dropped_crossing_file"] {
+        for absent in ["spine_clipped_steps", "spine_dropped_crossing_unit"] {
             assert!(
                 json.get(absent).is_none(),
                 "an unaffected walk must not carry {absent} at all"
@@ -4731,6 +5506,8 @@ mod tests {
                 parent_step: index.saturating_sub(1),
                 depth: 1,
                 reference_lines_partial_reason: None,
+                reference_sites: None,
+                code: None,
                 reference_lines: Vec::new(),
                 reference_lines_absent_reason: Some(
                     ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string(),
@@ -4748,8 +5525,8 @@ mod tests {
             focal_id: entity.id.to_string(),
             focal_name: entity.name.clone(),
             focal_kind: "Function".to_string(),
-            focal_file: Some("src/focal.rs".to_string()),
             focal_entity: entity_record(&entity, None, None),
+            focal_resolution: None,
             direction: "calls".to_string(),
             depth: 1,
             limit_per_step: 25,
@@ -4762,7 +5539,7 @@ mod tests {
             target_ambiguity: None,
             clipped_steps: Vec::new(),
             spine_clipped_steps: 0,
-            spine_dropped_crossing_file: 0,
+            spine_dropped_crossing_unit: 0,
             bodies_omitted: 0,
             steps_omitted: 0,
             fanout_narrowed: 0,
@@ -4779,6 +5556,11 @@ mod tests {
             max_response_chars: DEFAULT_MAX_RESPONSE_CHARS,
             chars_before_budget: None,
             degradations: Vec::new(),
+            type_uses_withheld: 0,
+            call_sites: None,
+            reach: None,
+            scope: None,
+            modules: None,
         }
     }
 
@@ -4830,7 +5612,7 @@ mod tests {
             entity_name: "step_199".to_string(),
             dropped_callees: 4,
             dropped_callers: 0,
-            dropped_crossing_file: 0,
+            dropped_crossing_unit: 0,
             continued_below: false,
             limit_per_step: 25,
         });
@@ -4896,6 +5678,8 @@ mod tests {
                 parent_step: parent,
                 depth,
                 reference_lines_partial_reason: None,
+                reference_sites: None,
+                code: None,
                 reference_lines: Vec::new(),
                 reference_lines_absent_reason: Some(
                     ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string(),
@@ -5158,7 +5942,7 @@ mod tests {
                 entity_name: format!("step_{step}"),
                 dropped_callees: 3,
                 dropped_callers: 0,
-                dropped_crossing_file: 0,
+                dropped_crossing_unit: 0,
                 continued_below: false,
                 limit_per_step: 12,
             });
@@ -5292,7 +6076,7 @@ mod tests {
             entity_name: name,
             dropped_callees: 9,
             dropped_callers: 0,
-            dropped_crossing_file: 2,
+            dropped_crossing_unit: 2,
             continued_below: false,
             limit_per_step: 25,
         });
@@ -5339,7 +6123,7 @@ mod tests {
             "a dropped terminal must not remain in the count"
         );
         assert_eq!(response.spine_clipped_steps, 1);
-        assert_eq!(response.spine_dropped_crossing_file, 2);
+        assert_eq!(response.spine_dropped_crossing_unit, 2);
         assert!(response.clipped_steps[0].continued_below);
         assert!(response.truncated);
         let present: BTreeSet<_> = response.chain.iter().map(|step| step.step).collect();
@@ -5432,7 +6216,7 @@ mod tests {
             &request,
         )
         .unwrap_err();
-        let shared = error.downcast_ref::<SharedMemberFocal>().unwrap();
+        let shared = error.downcast_ref::<AmbiguousFocal>().unwrap();
         assert_eq!(shared.candidates.len(), 200);
         assert!(shared.to_string().len() <= 8_000);
         assert!(shared.to_string().contains("candidates omitted"));
@@ -5528,7 +6312,7 @@ mod tests {
             entity_name: name.clone(),
             dropped_callees: 1,
             dropped_callers: 0,
-            dropped_crossing_file: 1,
+            dropped_crossing_unit: 1,
             continued_below: false,
             limit_per_step: 25,
         });
@@ -5887,7 +6671,9 @@ mod tests {
                     include_body: None,
                     max_response_chars: None,
                     include_type_edges: None,
+                    scope: None,
                     target: None,
+                    include_tests: None,
                 },
             ) {
                 Ok(response) => panic!("{focal} was walked: {:?}", step_names(&response)),
@@ -5970,6 +6756,7 @@ mod tests {
             "entity_kind",
             "entity_role",
             "entity_file",
+            "entity_module",
             "external",
             "start_line",
             "end_line",
@@ -5998,6 +6785,7 @@ mod tests {
             .find(|step| step["external"] == serde_json::Value::Bool(true))
             .unwrap();
         assert!(external["entity_file"].is_null());
+        assert!(external["entity_module"].is_null());
         assert!(external["start_line"].is_null());
         assert!(external["end_line"].is_null());
         assert!(external["entity_name"].is_string());
@@ -6617,7 +7405,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6652,7 +7442,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6730,7 +7522,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6787,7 +7581,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6835,7 +7631,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6877,7 +7675,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6927,7 +7727,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6979,7 +7781,9 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                scope: None,
                 target: None,
+                include_tests: None,
             },
         )
         .unwrap();
@@ -6994,5 +7798,451 @@ mod boundary_and_ranking_tests {
             step.entity.crossing.is_none(),
             "a step the repository owns crosses nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    //! The reach block the daemon's walk carries for a callers question.
+
+    use super::tests::{empty_binding, make_entity};
+    use super::*;
+    use kin_model::{RelationId, RelationOrigin};
+
+    fn calls(graph: &kin_db::InMemoryGraph, from: &Entity, to: &Entity) {
+        graph
+            .upsert_relation(&kin_model::Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(from.id),
+                dst: GraphNodeId::Entity(to.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn request(focal: &Entity, direction: TraceDirection) -> TraceDataFlowRequest {
+        TraceDataFlowRequest {
+            cursor: None,
+            focal: focal.id.to_string(),
+            depth: Some(1),
+            direction: Some(direction),
+            limit_per_step: None,
+            include_body: Some(false),
+            max_response_chars: None,
+            include_type_edges: None,
+            scope: None,
+            target: None,
+            include_tests: None,
+        }
+    }
+
+    /// A walk of depth one still answers the reach question to the end, on
+    /// the paged builder the daemon serves and on the bounded one, and the
+    /// block survives the round trip a CLI makes through a daemon's reply. A
+    /// callees walk carries none.
+    #[test]
+    fn a_callers_walk_carries_its_closed_reach_past_its_depth() {
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal", "src/lib.rs");
+        let near = make_entity("near", "src/lib.rs");
+        let middle = make_entity("middle", "src/a.rs");
+        let far = make_entity("far", "src/b.rs");
+        for entity in [&focal, &near, &middle, &far] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        calls(&graph, &near, &focal);
+        calls(&graph, &middle, &near);
+        calls(&graph, &far, &middle);
+
+        let (_temp, binding) = empty_binding();
+        let authority = RequestRepositoryAuthority::pinned(binding);
+        for bounded in [false, true] {
+            let response = if bounded {
+                build_trace_data_flow_response_within(
+                    &authority,
+                    &graph,
+                    &request(&focal, TraceDirection::Callers),
+                    TraceBudget::default(),
+                )
+            } else {
+                build_trace_data_flow_response_unpaged_within(
+                    &authority,
+                    &graph,
+                    &request(&focal, TraceDirection::Callers),
+                    TraceBudget::default(),
+                )
+            }
+            .unwrap();
+            assert_eq!(response.chain.len(), 1, "the chain stops at its depth");
+            let reach = response
+                .reach
+                .clone()
+                .expect("a callers walk carries reach");
+            let members: Vec<(&str, u64)> = reach["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["name"].as_str().unwrap(),
+                        row["distance"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                members,
+                vec![("near", 1), ("middle", 2), ("far", 3)],
+                "bounded: {bounded}: {reach:#}"
+            );
+            assert_eq!(reach["members"][2]["via"], middle.id.to_string());
+            assert_eq!(reach["bounds"], serde_json::json!([]), "{reach:#}");
+
+            let json = render_response_json(&response).unwrap();
+            let parsed: TraceDataFlowResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.reach, response.reach);
+        }
+
+        let callees = build_trace_data_flow_response_unpaged_within(
+            &authority,
+            &graph,
+            &request(&far, TraceDirection::Calls),
+            TraceBudget::default(),
+        )
+        .unwrap();
+        assert!(callees.reach.is_none());
+    }
+
+    /// The daemon's walker holds a scope the way the in-process one does: a
+    /// caller in scope that reaches the focal only through another package is
+    /// not followed, the block survives a daemon's reply, and an unscoped
+    /// reply carries no `scope` key at all.
+    /// An unscoped walk counts its steps by package from the graph's module
+    /// records, and names the largest package, which `scope` then resolves.
+    #[test]
+    fn an_unscoped_walk_counts_its_steps_by_package() {
+        let graph = kin_db::InMemoryGraph::new();
+        let module = |name: &str, file: &str| {
+            let mut module = make_entity(name, file);
+            module.kind = kin_model::EntityKind::Module;
+            if let Some(span) = module.span.as_mut() {
+                span.end_byte = 10_000;
+            }
+            module
+        };
+        let target = make_entity("target", "src/pkg/core.rs");
+        let direct = make_entity("direct", "src/pkg/core.rs");
+        let leaves = make_entity("leaves", "src/pkg/core.rs");
+        let bridge = make_entity("bridge", "src/other/bridge.rs");
+        let second = make_entity("second", "src/pkg/core.rs");
+        for entity in [
+            &module("pkg", "src/pkg/mod.rs"),
+            &module("core", "src/pkg/core.rs"),
+            &module("other", "src/other/mod.rs"),
+            &module("bridge_mod", "src/other/bridge.rs"),
+            &target,
+            &direct,
+            &leaves,
+            &bridge,
+            &second,
+        ] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        calls(&graph, &direct, &target);
+        calls(&graph, &second, &target);
+        calls(&graph, &bridge, &target);
+        calls(&graph, &leaves, &bridge);
+        let (_temp, binding) = empty_binding();
+        let authority = RequestRepositoryAuthority::pinned(binding);
+        let unscoped = request(&target, TraceDirection::Callers);
+        let response = build_trace_data_flow_response_within(
+            &authority,
+            &graph,
+            &unscoped,
+            TraceBudget::default(),
+        )
+        .unwrap();
+        let census = response
+            .modules
+            .clone()
+            .expect("an unscoped walk counts its packages");
+        assert_eq!(census["steps"], response.chain.len());
+        assert_eq!(census["largest"], "pkg", "{census:#}");
+        assert_eq!(census["outside_largest"], 1, "{census:#}");
+        assert_eq!(
+            census["packages"][0],
+            serde_json::json!({"module": "pkg", "steps": response.chain.len() - 1})
+        );
+        assert_eq!(
+            census["packages"][1],
+            serde_json::json!({"module": "other", "steps": 1})
+        );
+        // The named package is a scope the walk accepts.
+        let mut scoped = unscoped.clone();
+        scoped.scope = Some(
+            kin_mcp::trace_scope::ScopeRequest::new("pkg", kin_mcp::trace_scope::ScopeMode::Paths)
+                .unwrap(),
+        );
+        let narrowed = build_trace_data_flow_response_within(
+            &authority,
+            &graph,
+            &scoped,
+            TraceBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            narrowed.modules.is_none(),
+            "a scoped walk has nothing to narrow"
+        );
+        assert!(narrowed.scope.is_some());
+    }
+
+    /// The focal and every step name the module they are declared in, from the
+    /// graph's module records, on both walks a daemon serves and through a
+    /// JSON round trip, so a reply with no coordinates still says which unit
+    /// each hop sits in. A step in another unit names another module.
+    #[test]
+    fn every_traced_entity_names_its_declaring_module() {
+        let graph = kin_db::InMemoryGraph::new();
+        let module = |name: &str, file: &str| {
+            let mut module = make_entity(name, file);
+            module.kind = kin_model::EntityKind::Module;
+            if let Some(span) = module.span.as_mut() {
+                span.end_byte = 10_000;
+            }
+            module
+        };
+        let target = make_entity("target", "src/pkg/core.rs");
+        let direct = make_entity("direct", "src/pkg/core.rs");
+        let bridge = make_entity("bridge", "src/other/bridge.rs");
+        let core = module("core", "src/pkg/core.rs");
+        let bridge_mod = module("bridge_mod", "src/other/bridge.rs");
+        for entity in [&core, &bridge_mod, &target, &direct, &bridge] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        calls(&graph, &direct, &target);
+        calls(&graph, &bridge, &target);
+        let core_name = kin_mcp::semantic_owners::module_label(&graph, &core);
+        let bridge_name = kin_mcp::semantic_owners::module_label(&graph, &bridge_mod);
+        assert!(core_name.is_some() && bridge_name.is_some());
+        assert_ne!(core_name, bridge_name);
+
+        let (_temp, binding) = empty_binding();
+        let authority = RequestRepositoryAuthority::pinned(binding);
+        let callers = request(&target, TraceDirection::Callers);
+        for bounded in [false, true] {
+            let response = if bounded {
+                build_trace_data_flow_response_within(
+                    &authority,
+                    &graph,
+                    &callers,
+                    TraceBudget::default(),
+                )
+            } else {
+                build_trace_data_flow_response_unpaged_within(
+                    &authority,
+                    &graph,
+                    &callers,
+                    TraceBudget::default(),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                response.focal_entity.entity_module, core_name,
+                "bounded: {bounded}"
+            );
+            let module_of = |name: &str| {
+                response
+                    .chain
+                    .iter()
+                    .find(|step| step.entity.entity_name == name)
+                    .unwrap_or_else(|| panic!("{name} is a step: {:?}", response.chain))
+                    .entity
+                    .entity_module
+                    .clone()
+            };
+            assert_eq!(module_of("direct"), core_name, "bounded: {bounded}");
+            assert_eq!(module_of("bridge"), bridge_name, "bounded: {bounded}");
+
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                json["focal_entity"]["entity_module"],
+                serde_json::json!(core_name)
+            );
+            let parsed: TraceDataFlowResponse = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.focal_entity.entity_module, core_name);
+            let modules = |chain: &[TraceStep]| -> Vec<Option<String>> {
+                chain
+                    .iter()
+                    .map(|step| step.entity.entity_module.clone())
+                    .collect()
+            };
+            assert_eq!(modules(&parsed.chain), modules(&response.chain));
+        }
+        // The generic-store walker names them alike, through its public reply.
+        for payload in
+            super::tests::both_trace_payloads(&graph, &target.id, TraceDirection::Callers, 1)
+        {
+            assert_eq!(
+                payload["focal_entity"]["entity_module"],
+                serde_json::json!(core_name),
+                "{payload:#}"
+            );
+            let steps = payload["chain"].as_array().unwrap();
+            for (name, module) in [("direct", &core_name), ("bridge", &bridge_name)] {
+                let step = steps
+                    .iter()
+                    .find(|step| step["entity_name"] == name)
+                    .unwrap_or_else(|| panic!("{name} is a step: {payload:#}"));
+                assert_eq!(
+                    step["entity_module"],
+                    serde_json::json!(module),
+                    "{payload:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scoped_walk_stays_inside_its_module_path() {
+        let graph = kin_db::InMemoryGraph::new();
+        let module = |name: &str, file: &str| {
+            let mut module = make_entity(name, file);
+            module.kind = kin_model::EntityKind::Module;
+            if let Some(span) = module.span.as_mut() {
+                span.end_byte = 10_000;
+            }
+            module
+        };
+        let target = make_entity("target", "src/pkg/core.rs");
+        let direct = make_entity("direct", "src/pkg/core.rs");
+        let leaves = make_entity("leaves", "src/pkg/core.rs");
+        let bridge = make_entity("bridge", "src/other/bridge.rs");
+        for entity in [
+            &module("pkg", "src/pkg/mod.rs"),
+            &module("core", "src/pkg/core.rs"),
+            &module("other", "src/other/mod.rs"),
+            &module("bridge_mod", "src/other/bridge.rs"),
+            &target,
+            &direct,
+            &leaves,
+            &bridge,
+        ] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        calls(&graph, &direct, &target);
+        calls(&graph, &bridge, &target);
+        calls(&graph, &leaves, &bridge);
+
+        let (_temp, binding) = empty_binding();
+        let authority = RequestRepositoryAuthority::pinned(binding);
+        let mut scoped = request(&target, TraceDirection::Callers);
+        scoped.scope = Some(
+            kin_mcp::trace_scope::ScopeRequest::new("pkg", kin_mcp::trace_scope::ScopeMode::Paths)
+                .unwrap(),
+        );
+        for bounded in [false, true] {
+            let response = if bounded {
+                build_trace_data_flow_response_within(
+                    &authority,
+                    &graph,
+                    &scoped,
+                    TraceBudget::default(),
+                )
+            } else {
+                build_trace_data_flow_response_unpaged_within(
+                    &authority,
+                    &graph,
+                    &scoped,
+                    TraceBudget::default(),
+                )
+            }
+            .unwrap();
+            let reach = response
+                .reach
+                .clone()
+                .expect("a callers walk carries reach");
+            let members: Vec<&str> = reach["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(members, vec!["direct"], "bounded: {bounded}: {reach:#}");
+            assert_eq!(reach["scope"]["outside"], 1, "{reach:#}");
+            let scope = response.scope.clone().expect("a scoped walk carries scope");
+            assert_eq!(scope["module"], "pkg");
+            assert_eq!(scope["answer"], "reach");
+            assert!(response
+                .chain
+                .iter()
+                .all(|step| step.entity.entity_name != "bridge"));
+            let json = render_response_json(&response).unwrap();
+            let parsed: TraceDataFlowResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.scope, response.scope);
+        }
+
+        let unscoped = build_trace_data_flow_response_unpaged_within(
+            &authority,
+            &graph,
+            &request(&target, TraceDirection::Callers),
+            TraceBudget::default(),
+        )
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&render_response_json(&unscoped).unwrap()).unwrap();
+        assert!(json.get("scope").is_none());
+        assert!(json["reach"].get("scope").is_none());
+        let request_json = serde_json::to_value(request(&target, TraceDirection::Callers)).unwrap();
+        assert!(request_json.get("scope").is_none(), "{request_json}");
+
+        let mut unknown = request(&target, TraceDirection::Callers);
+        unknown.scope = Some(
+            kin_mcp::trace_scope::ScopeRequest::new(
+                "nosuch",
+                kin_mcp::trace_scope::ScopeMode::Paths,
+            )
+            .unwrap(),
+        );
+        let refused = build_trace_data_flow_response_unpaged_within(
+            &authority,
+            &graph,
+            &unknown,
+            TraceBudget::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("names no module path"), "{refused}");
+    }
+
+    /// A walk whose budget is already spent reports the budget as the bound
+    /// that stopped its closure, never a closed answer.
+    #[test]
+    fn a_spent_budget_is_the_bound_the_closure_names() {
+        let graph = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal", "src/lib.rs");
+        let near = make_entity("near", "src/lib.rs");
+        for entity in [&focal, &near] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        calls(&graph, &near, &focal);
+        let (_temp, binding) = empty_binding();
+        let response = build_trace_data_flow_response_unpaged_within(
+            &RequestRepositoryAuthority::pinned(binding),
+            &graph,
+            &request(&focal, TraceDirection::Callers),
+            TraceBudget {
+                max_edges_scanned: 2,
+                ..TraceBudget::bounded()
+            },
+        )
+        .unwrap();
+        let reach = response.reach.expect("a callers walk carries reach");
+        assert_eq!(reach["state"], "bounded", "{reach:#}");
+        assert_eq!(reach["bounds"][0]["which"], "edge_budget", "{reach:#}");
     }
 }

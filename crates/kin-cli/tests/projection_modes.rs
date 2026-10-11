@@ -496,7 +496,11 @@ fn vfs_status_names_the_bound_root_and_refuses_to_call_an_unserved_one_in_force(
     )
     .expect("write manifest");
     let elsewhere = host.cwd.join("home");
-    std::fs::create_dir_all(&elsewhere).expect("create home");
+    // A different, unserved store is bound by the hook. Give it a real
+    // in-tree marker so the expected socket belongs to that store rather
+    // than predicting where a future default-central store would be created.
+    std::fs::create_dir_all(elsewhere.join(".kin")).expect("create other store");
+    std::fs::write(elsewhere.join(".kin/version"), "2").expect("mark other store");
 
     // The container's shape: the hook bound a directory that is not this
     // repository, and nothing is serving it.

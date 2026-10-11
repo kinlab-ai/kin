@@ -12,9 +12,19 @@
 #   KIN_HOME=~/.kin       Install directory (preferred; default: ~/.kin)
 #   KIN_DIR=~/.kin        Install directory compatibility alias
 #   KIN_NO_SETUP=1        Skip interactive setup after install
-#   KIN_REGISTRY_REPAIR=1 Explicitly repair safe registry modes to 0600
+#   KIN_REGISTRY_REPAIR=1 Explicitly repair safe registry modes (files to 0600, and no
+#                         group or world write on the Kin home)
 
 set -eu
+
+# Kin keeps its registry only in a directory no other user can write, and
+# refuses one that its group or others can. Distributions that set
+# USERGROUPS_ENAB, Ubuntu and Debian among them, give every login a umask of
+# 0002, under which the `mkdir -p` below would create ~/.kin group writable and
+# the registry check would then refuse the install it belongs to. Take group
+# and world write out of this script's umask and leave the rest of it alone,
+# so a stricter umask such as 077 still narrows what is created.
+umask go-w
 
 # ── Config ──────────────────────────────────────────────────────────────
 
@@ -23,7 +33,7 @@ KIN_BIN="$KIN_DIR/bin"
 KIN_LIB="$KIN_DIR/lib"
 export KIN_HOME="$KIN_DIR"
 export KIN_DIR="$KIN_DIR"
-GITHUB_ORG="firelock-ai"
+GITHUB_ORG="kinlab-ai"
 GITHUB_REPO="kin"
 # Override KIN_BASE_URL to install from a mirror or a local `file://` path
 # (offline/airgapped installs and CI smoke tests).
@@ -62,6 +72,13 @@ detect_arch() {
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# Succeeds when $KIN_DIR is a real directory the installing user owns that its
+# group or other users can write. find does not follow a symlink here, so a
+# link in that position never matches.
+kin_dir_is_shared_write() {
+    [ -n "$(find "$KIN_DIR" -prune -type d -user "$(id -u)" \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]
+}
+
 # ── Detect platform ────────────────────────────────────────────────────
 
 OS="$(detect_os)"
@@ -80,7 +97,7 @@ esac
 
 printf '\n'
 printf '  \033[1;36mKin Installer\033[0m\n'
-printf '  Semantic development environment\n'
+printf '  A graph-native code repository for AI agents and the people who build with them.\n'
 printf '\n'
 
 info "Platform: $OS ($ARCH)"
@@ -294,17 +311,40 @@ fi
 # any installed binary. Unsafe existing state is never silently chmodded or
 # overwritten; the operator must explicitly repair it and rerun the installer.
 chmod +x "$EXTRACT_DIR/kin$BIN_EXT"
+# Its report is shown only when the check refuses, so a clean install stays
+# quiet and a refusal still names the paths it inspected.
+REGISTRY_AUTHORITY_STATUS=0
+# KIN_REGISTRY_REPAIR=1 is consent to a permission-only repair. Taking group
+# and world write off the Kin home is one, and doing it here keeps that consent
+# good for whichever release is being installed, including one whose own
+# repair predates the case.
+if is_truthy "${KIN_REGISTRY_REPAIR:-}" && kin_dir_is_shared_write; then
+    chmod go-w "$KIN_DIR"
+    ok "Removed group and world write from $KIN_DIR"
+fi
 if is_truthy "${KIN_REGISTRY_REPAIR:-}"; then
-    REGISTRY_AUTHORITY_STATUS=0
-    "$EXTRACT_DIR/kin$BIN_EXT" registry authority --fix --initialize || REGISTRY_AUTHORITY_STATUS=$?
+    REGISTRY_AUTHORITY_REPORT=$("$EXTRACT_DIR/kin$BIN_EXT" registry authority --fix --initialize 2>&1) || REGISTRY_AUTHORITY_STATUS=$?
 else
-    REGISTRY_AUTHORITY_STATUS=0
-    "$EXTRACT_DIR/kin$BIN_EXT" registry authority --initialize || REGISTRY_AUTHORITY_STATUS=$?
+    REGISTRY_AUTHORITY_REPORT=$("$EXTRACT_DIR/kin$BIN_EXT" registry authority --initialize 2>&1) || REGISTRY_AUTHORITY_STATUS=$?
 fi
 if [ "$REGISTRY_AUTHORITY_STATUS" -ne 0 ]; then
+    printf '%s\n' "$REGISTRY_AUTHORITY_REPORT" >&2
     err "Unsafe local registry authority blocks installation."
     err "No installed binary or registry authority file was replaced."
-    err "Inspect the paths above. For permission-only drift, rerun with KIN_REGISTRY_REPAIR=1."
+    # The umask above keeps a fresh install out of this state, but a directory
+    # left by an earlier install, or made by hand, keeps whatever mode it was
+    # given. Group or world write on the Kin home itself is the one case with
+    # a remedy this script can name exactly, so name it.
+    if kin_dir_is_shared_write; then
+        KIN_DIR_MODE=$(ls -ld "$KIN_DIR" | awk '{print $1}')
+        KIN_DIR_QUOTED="'$(printf '%s' "$KIN_DIR" | sed "s/'/'\\\\''/g")'"
+        err "$KIN_DIR can be written by its group or by other users ($KIN_DIR_MODE), and Kin keeps its registry only in a directory no other user can write."
+        err "Remove that access, then rerun the installer:"
+        err "    chmod go-w $KIN_DIR_QUOTED"
+        err "Or rerun the installer with KIN_REGISTRY_REPAIR=1 to have Kin remove it."
+    else
+        err "Inspect the paths above. For permission-only drift, rerun with KIN_REGISTRY_REPAIR=1."
+    fi
     exit 1
 fi
 
@@ -548,5 +588,5 @@ else
 fi
 
 printf '\n'
-ok "Done! Restart your shell to get started."
+ok "Done! Open a new terminal, then run 'kin init' in a Git repository."
 printf '\n'

@@ -36,11 +36,12 @@ on:
   repository_dispatch:
     types: [release_cut]
   schedule:
-    # Offset from the mint (:11,:26,:41,:56) and the train (:07,:22,:37,:52) so
-    # a cycle selects, arms and proves between two mint evaluations rather than
-    # racing one. GitHub's cron stalled for most of 2026-09-02, so the schedule
-    # is the fallback here and never the only path.
-    - cron: "3,18,33,48 * * * *"
+    # Hourly, offset from the mint (:11,:26,:41,:56) and the train
+    # (:07,:22,:37,:52) so a cycle selects, arms and proves between two mint
+    # evaluations rather than racing one. GitHub's cron stalled for most of
+    # 2026-09-02, so the schedule is the fallback here and never the only path:
+    # CI and RC Build completions (workflow_run) drive the cut between ticks.
+    - cron: "3 * * * *"
 
 permissions:
   contents: read
@@ -1215,10 +1216,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::warning::${CANDIDATE} has its preflight record and needs the stranger; no KIN_STRANGER_RUNNER is set, so the command is in this run's summary and a captain has to run it"
 
-  # A refusal is a real outcome and has to be loud. The selector exits 1 and
-  # names the contexts that disqualified the newest sha, which fails the select
-  # job; this job exists so the refusal reaches the run's conclusion even when
-  # the selector stood down for a reason worth reading.
+  # A refusal is a release hold, not a broken run. The selector emits a
+  # warning naming the contexts that disqualified the newest sha and exits 0;
+  # this job puts the decision and reason in the run summary. Only a select job
+  # that could not decide (exit 2, or a failed binding step) fails the run.
   report:
     name: Report the cut's decision
     needs: select

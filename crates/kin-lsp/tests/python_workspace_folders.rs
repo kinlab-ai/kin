@@ -40,6 +40,7 @@ fn entity(name: &str, path: &str, start: u32, end: u32) -> EntityRef {
         name_line: start,
         name_col: 4,
         declares_name: true,
+        declares_only: false,
         kind: EntityKind::Function,
     }
 }

@@ -82,6 +82,55 @@ impl Run {
     }
 }
 
+fn store_command(home: &Path) -> Command<'static> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+    command
+        .env("HOME", home)
+        .env("KIN_HOME", home.join("kin-home"));
+    command
+}
+
+fn require_store(repo: &Path, home: &Path) {
+    let layout = common::repository_layout(store_command(home), repo);
+    assert!(layout.manifest_path().is_file(), "no store was written");
+}
+
+fn require_no_store(repo: &Path, home: &Path) {
+    let output = store_command(home)
+        .args(["store", "path", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("query refused store");
+    assert!(
+        !output.status.success(),
+        "a refused conversion left a discoverable store"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a Kin repository"));
+    assert!(
+        !repo.join(".kin").exists(),
+        "a refused conversion left an in-tree store"
+    );
+    let stores = home.join("kin-home/stores");
+    match fs::read_dir(&stores) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.expect("inspect central store entry");
+                // Reserving the parent may install its empty Spotlight marker;
+                // no repository store or capture staging is permitted.
+                assert!(
+                    entry.file_name() == ".metadata_never_index"
+                        && entry.file_type().unwrap().is_file()
+                        && entry.metadata().unwrap().len() == 0,
+                    "a refused conversion left central store or staging content: {}",
+                    entry.path().display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("inspect central stores: {error}"),
+    }
+}
+
 fn kin_init(repo: &Path, home: &Path, ceiling: &str) -> Run {
     kin_init_with(repo, home, ceiling, &[])
 }
@@ -133,10 +182,7 @@ fn a_conversion_over_the_ceiling_refuses_before_it_writes_anything() {
         "the refusal printed no memory sentence, which is the silence this guards: {}",
         run.text
     );
-    assert!(
-        !repo.join(".kin").exists(),
-        "a refused conversion left a store behind"
-    );
+    require_no_store(&repo, home.path());
     let stranded: Vec<_> = fs::read_dir(workspace.path())
         .expect("read workspace")
         .filter_map(|entry| entry.ok())
@@ -204,7 +250,7 @@ fn a_conversion_with_room_converts_and_says_nothing_about_memory() {
         run.code,
         run.text
     );
-    assert!(repo.join(".kin").exists(), "no store was written");
+    require_store(&repo, home.path());
     for phrase in ["needs more memory", "is expected to hold about"] {
         assert!(
             !run.contains(phrase),
@@ -240,10 +286,7 @@ fn an_unreadable_ceiling_override_is_refused_rather_than_ignored() {
         "the refusal does not name the variable and what is wrong with it: {}",
         run.text
     );
-    assert!(
-        !repo.join(".kin").exists(),
-        "a refused conversion left a store behind"
-    );
+    require_no_store(&repo, home.path());
 }
 
 /// An empty override is refused for the same reason a malformed one is.
@@ -388,10 +431,7 @@ fn history_only_other_refs_reach_is_refused_before_it_is_derived() {
             run.text
         );
     }
-    assert!(
-        !repo.join(".kin").exists(),
-        "a refused conversion left a store behind"
-    );
+    require_no_store(&repo, home.path());
     let stranded = stranded_staging(workspace.path());
     assert!(
         stranded.is_empty(),
@@ -428,7 +468,7 @@ fn the_same_repository_without_those_refs_converts_under_the_same_pins() {
         run.code,
         run.text
     );
-    assert!(repo.join(".kin").exists(), "no store was written");
+    require_store(&repo, home.path());
     for phrase in [
         "needs more memory",
         "is expected to hold about",

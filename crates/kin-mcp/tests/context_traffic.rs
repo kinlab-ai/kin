@@ -33,20 +33,22 @@ fn entity(name: &str, file: &str) -> Entity {
     }
 }
 
+fn relation(src: &Entity, dst: &Entity, kind: RelationKind) -> Relation {
+    Relation {
+        id: RelationId::new(),
+        kind,
+        src: GraphNodeId::Entity(src.id),
+        dst: GraphNodeId::Entity(dst.id),
+        confidence: 1.0,
+        origin: RelationOrigin::Parsed,
+        created_in: None,
+        import_source: None,
+        evidence: vec![],
+    }
+}
+
 fn edge(graph: &InMemoryGraph, src: &Entity, dst: &Entity, kind: RelationKind) {
-    graph
-        .upsert_relation(&Relation {
-            id: RelationId::new(),
-            kind,
-            src: GraphNodeId::Entity(src.id),
-            dst: GraphNodeId::Entity(dst.id),
-            confidence: 1.0,
-            origin: RelationOrigin::Parsed,
-            created_in: None,
-            import_source: None,
-            evidence: vec![],
-        })
-        .unwrap();
+    graph.upsert_relation(&relation(src, dst, kind)).unwrap();
 }
 
 fn fixture(graph: &InMemoryGraph) -> EntityId {
@@ -419,12 +421,21 @@ fn context_traffic_bounds_expansion_and_preserves_the_output_budget() {
         .traffic
         .iter()
         .any(|row| row.intent.intent_id == oversized.intent_id));
+    // Enough callees that the traffic walk reaches its node budget, landed as
+    // two batches. Upserting them one at a time re-derives the focal's
+    // neighbourhood on every edge, which costs seconds for a graph this wide
+    // and is no part of what this case asks; the graph the walk reads is the
+    // same either way.
     let focal_entity = graph.get_entity(&focal).unwrap().unwrap();
-    for index in 0..4096 {
-        let target = entity(&format!("wide_{index}"), "src/wide.rs");
-        graph.upsert_entity(&target).unwrap();
-        edge(&graph, &focal_entity, &target, RelationKind::Calls);
-    }
+    let targets: Vec<_> = (0..4096)
+        .map(|index| entity(&format!("wide_{index}"), "src/wide.rs"))
+        .collect();
+    graph.upsert_entities_batch(&targets).unwrap();
+    let wide_edges: Vec<_> = targets
+        .iter()
+        .map(|target| relation(&focal_entity, target, RelationKind::Calls))
+        .collect();
+    graph.upsert_relations_batch(&wide_edges).unwrap();
     let error = kin_context::build_context_pack_with_scoped_traffic_and_provenance(
         &graph,
         &focal,

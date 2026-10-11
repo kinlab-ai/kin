@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -20,8 +20,8 @@ use kin_model::{
     RelationOrigin, SourceSpan, Visibility,
 };
 use kin_parser::{
-    is_call_extraction_incomplete_marker, is_python_builtin_name, CallArgShape, ExtractedRelation,
-    FileImport, ImportedName, RelationSyntacticRole,
+    is_call_extraction_incomplete_marker, is_local_scope_name, is_python_builtin_name,
+    CallArgShape, ExtractedRelation, FileImport, ImportedName, RelationSyntacticRole,
 };
 
 use kin_parser::import_witness::{
@@ -29,7 +29,9 @@ use kin_parser::import_witness::{
 };
 
 use crate::error::{IndexError, Result as IndexResult};
-use crate::resolution::{DISPATCH_CANDIDATE_CONFIDENCE, RECEIVER_NAME_FANOUT_CONFIDENCE};
+use crate::resolution::{
+    DISPATCH_CANDIDATE_CONFIDENCE, MODULE_FORK_CONFIDENCE, RECEIVER_NAME_FANOUT_CONFIDENCE,
+};
 use crate::rust_project::RustProjectAuthority;
 
 /// Graph-assigned artifact identities keyed by repository-relative path.
@@ -405,6 +407,23 @@ pub fn bare_entity_name(name: &str) -> &str {
     }
 }
 
+/// Whether the bare-name index, which the name-only call tiers read, holds an
+/// entity of `kind` under the leaf of its name.
+///
+/// A qualified name (`Widget.work`, `Widget::work`) names a member, and its
+/// leaf is the member's own name. A module's name is its path or file stem,
+/// and a separator inside it is part of that name: `http-exception.filter.ts`
+/// is the module `http-exception.filter`, not a member `filter` of anything.
+/// No call written `x.filter()` or `filter()` runs a module, so keying one
+/// under `filter` offered it as a call candidate, and it counted toward the
+/// fan-out cap, which drops every candidate once the count passes it: two
+/// generated `script.output.ts` files were enough to take a real
+/// `ProcedureBuilder.output` out of the candidates for every chained
+/// `.output(...)` call in a repository.
+fn keyed_by_bare_name(kind: EntityKind) -> bool {
+    !is_module_surface_kind(Some(&kind))
+}
+
 /// Resolve cross-file relations for `files` against a broader target universe.
 ///
 /// This is used by warm/incremental indexing paths where only a subset of files
@@ -601,6 +620,9 @@ struct LinkContext<'a> {
     /// keyed per file because class names repeat across a repo (django alone
     /// has dozens of `Command` classes).
     class_bases_by_file_class: HashMap<(&'a str, &'a str), Vec<&'a str>>,
+    /// (file, type name) -> the contracts that type declares it implements,
+    /// sorted and deduped. Read only by the receiver-origin method walk.
+    class_implements_by_file_class: HashMap<(&'a str, &'a str), Vec<&'a str>>,
     /// (file, class name, attribute) -> the type name that class's body
     /// declares for that attribute.
     ///
@@ -624,6 +646,384 @@ struct LinkContext<'a> {
     /// same question from the batch's full class hierarchy instead: it is what
     /// [`DISPATCH_CANDIDATE_CONFIDENCE`] is keyed on.
     overridden_bases: HashSet<EntityId>,
+    /// Adapter value-origin facts (see [`crate::receiver_origin`]), by the
+    /// entity that carries them.
+    value_facts: HashMap<EntityId, Arc<kin_parser::value_origins::ScopeFacts>>,
+    /// Every value provider an entity declares, by the entity's file.
+    value_providers_by_file:
+        HashMap<&'a str, Vec<(EntityId, kin_parser::value_origins::ValueProvider)>>,
+    /// The binding each module's default export names, by the module's file.
+    default_export_by_file: HashMap<&'a str, String>,
+    /// The module entity of each file that carries value-origin facts, for a
+    /// chain that reads a module-level binding of that file.
+    module_entity_by_file: HashMap<&'a str, EntityId>,
+    /// The modules each file's module registers providers from.
+    provider_modules_by_file: HashMap<&'a str, Vec<kin_parser::value_origins::ProviderModule>>,
+    /// Every entity's file and name, for the receiver-origin walk, which
+    /// reaches entities by id and must read where they live.
+    entity_file_by_id: HashMap<EntityId, &'a str>,
+    entity_name_by_id: HashMap<EntityId, &'a str>,
+    /// What each parsed ECMAScript module hands on through re-exports, and the
+    /// module fork families the repository's paths declare. Read only by the
+    /// pinned-import tier, past a module that does not declare the name.
+    module_forwarding: ModuleForwarding<'a>,
+    /// (file, class) -> every class naming it as a base, built on the first
+    /// question the receiver-origin subtype check asks.
+    subclass_index: std::sync::OnceLock<SubclassIndex>,
+    /// Which modules no file of the repository can supply, built on the
+    /// first question the receiver-origin tier asks about an import.
+    import_roots: std::sync::OnceLock<kin_db::call_site_escape::ImportRoots>,
+    /// Imported dotted name -> every class that names it as a base, from the
+    /// classes' own facts, built on first use.
+    outside_base_index: std::sync::OnceLock<OutsideBaseIndex>,
+    /// Every file of each package that spans a directory's files under one
+    /// package clause, by (directory, package), and each such file's key.
+    /// Names a package declares are visible across all of its files, so a
+    /// lookup that finds a name in one file of it finds it in any.
+    package_files: HashMap<(&'a str, &'a str), Vec<&'a str>>,
+    package_of_file: HashMap<&'a str, (&'a str, &'a str)>,
+    /// Calls whose receiver the value-origin facts prove to hold a value of a
+    /// type outside the repository, and calls whose receiver chain stops
+    /// short of a method, by file (see
+    /// [`crate::receiver_origin::prove_receiver_outside`] and
+    /// [`crate::receiver_origin::walk_receiver_call`]).
+    receiver_outside: HashMap<String, ReceiverSites>,
+    /// The same calls, by (caller, receiver, method), for the tier that
+    /// settles them.
+    receiver_outside_keys: HashSet<(EntityId, String, String)>,
+}
+
+/// A named call proved to reach no declaration of the repository, because the
+/// value-origin facts of its caller type the receiver as a type outside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiverOutsideSite {
+    pub(crate) caller: EntityId,
+    pub(crate) receiver: String,
+    pub(crate) method: String,
+    /// The call expression, as the parser recorded its site.
+    pub(crate) site: SourceSpan,
+    pub(crate) chain: String,
+}
+
+/// A named call whose receiver the facts of its caller bind, where the chain
+/// they spell stops short of a method: the links it established and the one
+/// it could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiverGapSite {
+    pub(crate) receiver: String,
+    pub(crate) method: String,
+    /// The call expression, as the parser recorded its site.
+    pub(crate) site: SourceSpan,
+    pub(crate) gap: crate::receiver_origin::OriginGap,
+}
+
+/// What the value-origin facts settle about one file's calls through typed
+/// receivers, beyond the calls they bind: the ones proved to reach outside
+/// the repository, the ones whose chain stops short, and the member reads
+/// that are no call and are proved to read nothing of the repository.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReceiverSites {
+    pub(crate) outside: Vec<ReceiverOutsideSite>,
+    pub(crate) gaps: Vec<ReceiverGapSite>,
+    pub(crate) reads: Vec<crate::coverage_certificate::ReceiverOutsideReadEntry>,
+    /// Member reads that are no call whose receiver is typed as a class of
+    /// the repository.
+    pub(crate) typed_reads: Vec<crate::coverage_certificate::ReceiverTypedReadEntry>,
+}
+
+impl ReceiverSites {
+    fn is_empty(&self) -> bool {
+        self.outside.is_empty()
+            && self.gaps.is_empty()
+            && self.reads.is_empty()
+            && self.typed_reads.is_empty()
+    }
+
+    fn extend(&mut self, other: ReceiverSites) {
+        self.outside.extend(other.outside);
+        self.gaps.extend(other.gaps);
+        self.reads.extend(other.reads);
+        self.typed_reads.extend(other.typed_reads);
+    }
+}
+
+/// Every member read of `file` that is no call, where the facts of the
+/// function it sits in prove the receiver holds a value whose member of that
+/// name is no declaration of the repository.
+///
+/// A call carries a relation; a read that passes a member on as a value
+/// (`partial(runner.invoke, cli)`) carries none, and is on record only in
+/// the file's value-escape record, by its line. That record is where a
+/// census looks for uses that could hand a focal on, so the proof is made
+/// for the reads it lists and addressed the way it addresses them.
+///
+/// A read whose receiver the same facts type as a class of the repository is
+/// recorded with that class, when the repository declares anything under the
+/// member's name: what the read gets is for a census to decide, relative to
+/// the member it is asked about.
+fn receiver_reads(
+    file: &FileParseData,
+    world: &dyn crate::receiver_origin::OriginWorld,
+) -> (
+    Vec<crate::coverage_certificate::ReceiverOutsideReadEntry>,
+    Vec<crate::coverage_certificate::ReceiverTypedReadEntry>,
+) {
+    let Some(record) = file
+        .entities
+        .iter()
+        .find_map(kin_model::FileEscapeRecord::from_entity)
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    // The innermost function or method a line sits in is the scope whose
+    // facts bind a receiver read there.
+    let scope_at = |line: u32| {
+        file.entities
+            .iter()
+            .filter(|entity| matches!(entity.kind, EntityKind::Function | EntityKind::Method))
+            .filter_map(|entity| {
+                let span = entity.span.as_ref()?;
+                (span.start_line <= line && line <= span.end_line)
+                    .then_some((span.end_line - span.start_line, entity.id))
+            })
+            .min()
+            .map(|(_, id)| id)
+    };
+    let mut reads = Vec::new();
+    let mut typed = Vec::new();
+    for (member, occurrences) in &record.values {
+        let declared = std::cell::OnceCell::new();
+        for occurrence in occurrences {
+            if occurrence.binding != kin_model::OccurrenceBinding::Member {
+                continue;
+            }
+            let Some(receiver) = occurrence.receiver.as_deref() else {
+                continue;
+            };
+            let Some(scope) = scope_at(occurrence.line) else {
+                continue;
+            };
+            if let Some(proof) = crate::receiver_origin::prove_receiver_outside(
+                world,
+                scope,
+                &file.file_path,
+                receiver,
+                member,
+            ) {
+                reads.push(crate::coverage_certificate::ReceiverOutsideReadEntry {
+                    line: occurrence.line,
+                    member: member.clone(),
+                    receiver: receiver.to_string(),
+                    owner: proof.owner,
+                    chain: proof.chain,
+                });
+                continue;
+            }
+            // No census asks about a name nothing in the repository carries.
+            if !*declared.get_or_init(|| !world.members_named(member).is_empty()) {
+                continue;
+            }
+            if let Some((_, class)) =
+                crate::receiver_origin::receiver_class(world, scope, &file.file_path, receiver)
+            {
+                typed.push(crate::coverage_certificate::ReceiverTypedReadEntry {
+                    line: occurrence.line,
+                    member: member.clone(),
+                    receiver: receiver.to_string(),
+                    class: bare_entity_name(&class).to_string(),
+                });
+            }
+        }
+    }
+    reads.sort();
+    reads.dedup();
+    typed.sort();
+    typed.dedup();
+    (reads, typed)
+}
+
+/// Every named call of `file` whose receiver the facts of its caller prove to
+/// hold a value of a type outside the repository, and every one whose
+/// receiver they bind through a chain that stops short of a method.
+fn receiver_outside_sites(
+    file: &FileParseData,
+    world: &dyn crate::receiver_origin::OriginWorld,
+) -> ReceiverSites {
+    let carries_facts = file.entities.iter().any(|entity| {
+        entity
+            .metadata
+            .extra
+            .contains_key(kin_parser::value_origins::VALUE_ORIGINS_KEY)
+    });
+    if !carries_facts {
+        return ReceiverSites::default();
+    }
+    let file_id = FilePathId::new(&file.file_path);
+    let source_index = crate::RelationSourceIndex::new(&file.entities);
+    let mut sites = Vec::new();
+    let mut gaps = Vec::new();
+    for rel in &file.relations {
+        if rel.kind != RelationKind::Calls || kin_parser::is_reserved_parser_record(rel) {
+            continue;
+        }
+        let (Some(receiver), Some(site)) = (rel.receiver.as_deref(), rel.site.as_ref()) else {
+            continue;
+        };
+        let Some(caller) = source_index.resolve(rel).map(|entity| entity.id) else {
+            continue;
+        };
+        let method = bare_entity_name(&rel.dst_name);
+        if let Some(proof) = crate::receiver_origin::prove_receiver_outside(
+            world,
+            caller,
+            &file.file_path,
+            receiver,
+            method,
+        ) {
+            sites.push(ReceiverOutsideSite {
+                caller,
+                receiver: receiver.to_string(),
+                method: method.to_string(),
+                site: site.to_source_span(&file_id),
+                chain: proof.chain,
+            });
+            continue;
+        }
+        // Only a call the receiver-origin tier would try to bind: a qualified
+        // callee is settled by its owner, never through the receiver.
+        if split_owner_method(&rel.dst_name).is_some() {
+            continue;
+        }
+        if let Some(crate::receiver_origin::ReceiverWalk::Gap(gap)) =
+            crate::receiver_origin::walk_receiver_call(
+                world,
+                caller,
+                &file.file_path,
+                receiver,
+                method,
+            )
+        {
+            gaps.push(ReceiverGapSite {
+                receiver: receiver.to_string(),
+                method: method.to_string(),
+                site: site.to_source_span(&file_id),
+                gap,
+            });
+        }
+    }
+    let (reads, typed_reads) = receiver_reads(file, world);
+    ReceiverSites {
+        outside: sites,
+        gaps,
+        reads,
+        typed_reads,
+    }
+}
+
+/// (file, class) -> every class naming it as a base, each as (file, class).
+type SubclassIndex = HashMap<(String, String), Vec<(String, String)>>;
+
+/// Imported dotted name -> every class whose facts name it as a base, each as
+/// (file, class), in one order whatever order the classes were read in.
+type OutsideBaseIndex = HashMap<String, Vec<(String, String)>>;
+
+/// The classes that name each imported dotted name as a base, from
+/// (file, class, facts) of every class whose facts are readable.
+fn outside_base_index<'k>(
+    classes: impl Iterator<Item = (&'k str, &'k str, Arc<kin_parser::value_origins::ScopeFacts>)>,
+) -> OutsideBaseIndex {
+    let mut index = OutsideBaseIndex::new();
+    for (file, class, facts) in classes {
+        for qualified in facts.base_origins.values().flatten() {
+            index
+                .entry(qualified.clone())
+                .or_default()
+                .push((file.to_string(), class.to_string()));
+        }
+    }
+    for classes in index.values_mut() {
+        classes.sort();
+        classes.dedup();
+    }
+    index
+}
+
+/// (file, class) -> every class naming it as a base, from a hierarchy index
+/// and the rule that locates a base name.
+fn subclass_index<'k, B: AsRef<str> + 'k>(
+    classes: impl Iterator<Item = (&'k str, &'k str, &'k [B])>,
+    locate: impl Fn(&str, &str) -> Option<(String, String)>,
+) -> SubclassIndex {
+    let mut index = SubclassIndex::new();
+    for (file, class, bases) in classes {
+        for base in bases {
+            if let Some(parent) = locate(file, base.as_ref()) {
+                let children = index.entry(parent).or_default();
+                let child = (file.to_string(), class.to_string());
+                if !children.contains(&child) {
+                    children.push(child);
+                }
+            }
+        }
+    }
+    index
+}
+
+/// The directory a repository path sits in, `""` at the root.
+fn parent_directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+impl<'a> LinkContext<'a> {
+    /// Every file of the package `file` belongs to, itself included, or none
+    /// when its language scopes no names to a package.
+    fn package_peers(&self, file: &str) -> &[&'a str] {
+        self.package_of_file
+            .get(file)
+            .and_then(|key| self.package_files.get(key))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `id` is a type a receiver can hold: a class-like entity, or a
+    /// named type a package declares, which carries methods whatever its
+    /// underlying type (`type IP []byte`).
+    fn is_type_like(&self, id: &EntityId) -> bool {
+        let kind = self.entity_kind_by_id.get(id);
+        is_class_like(kind)
+            || (kind == Some(&EntityKind::TypeAlias) && self.go_package_by_id.contains_key(id))
+    }
+
+    /// The one entity named `name` the files of `file`'s package declare other
+    /// than `file` itself, when `accept` admits it.
+    fn in_package_peers(
+        &self,
+        file: &str,
+        name: &str,
+        accept: impl Fn(&EntityId) -> bool,
+    ) -> Option<(&'a str, EntityId)> {
+        let mut found = None;
+        for peer in self.package_peers(file) {
+            if *peer == file {
+                continue;
+            }
+            if let Some(id) = self
+                .entity_by_file_name
+                .get(&(*peer, name))
+                .filter(|id| accept(id))
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((*peer, *id));
+            }
+        }
+        found
+    }
+}
+
+/// The owner path of an entity name, as a receiver-origin member reads it.
+fn member_owner(name: &str) -> Option<String> {
+    entity_owner_path(name).map(|(owner, _)| owner.to_string())
 }
 
 /// Whether two parser-reported languages may participate in a relation inferred
@@ -752,10 +1152,12 @@ fn build_link_context<'a>(
 
             let bare_name = bare_entity_name(&entity.name);
             if bare_name != entity.name {
-                entity_by_bare_name
-                    .entry(bare_name)
-                    .or_default()
-                    .push((file_path, entity.id));
+                if keyed_by_bare_name(entity.kind) {
+                    entity_by_bare_name
+                        .entry(bare_name)
+                        .or_default()
+                        .push((file_path, entity.id));
+                }
                 if let Some((owner, _)) = entity_owner_path(&entity.name) {
                     entity_owner_segment_by_id.insert(entity.id, owner_type_segment(owner));
                 }
@@ -836,6 +1238,23 @@ fn build_link_context<'a>(
     for bases in class_bases_by_file_class.values_mut() {
         bases.sort_unstable();
     }
+    let mut class_implements_by_file_class: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+    for file in files {
+        for rel in &file.relations {
+            if rel.kind != RelationKind::Implements {
+                continue;
+            }
+            let contracts = class_implements_by_file_class
+                .entry((file.file_path.as_str(), rel.src_name.as_str()))
+                .or_default();
+            if !contracts.contains(&rel.dst_name.as_str()) {
+                contracts.push(rel.dst_name.as_str());
+            }
+        }
+    }
+    for contracts in class_implements_by_file_class.values_mut() {
+        contracts.sort_unstable();
+    }
 
     // Step 4: the declared type of every class attribute, from the reference
     // edge the annotation already produced. Two declarations of one attribute
@@ -848,6 +1267,97 @@ fn build_link_context<'a>(
         .iter()
         .filter_map(|entity| go_package(entity).map(|package| (entity.id, package.to_string())))
         .collect();
+    // Step 4a: the files of each package, from the package clause every
+    // declaration of a file carries.
+    let (package_files, package_of_file) = {
+        let mut package_of_file: HashMap<&str, (&str, &str)> = HashMap::new();
+        for &entity in &sorted_universe {
+            let (Some(package), Some(file)) = (
+                go_package(entity),
+                entity.file_origin.as_ref().map(|path| path.0.as_str()),
+            ) else {
+                continue;
+            };
+            package_of_file
+                .entry(file)
+                .or_insert((parent_directory(file), package));
+        }
+        let mut package_files: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for (file, key) in &package_of_file {
+            package_files.entry(*key).or_default().push(*file);
+        }
+        for files in package_files.values_mut() {
+            files.sort_unstable();
+        }
+        (package_files, package_of_file)
+    };
+    // Step 4b: adapter value-origin facts and the providers they declare.
+    let (
+        value_facts,
+        value_providers_by_file,
+        default_export_by_file,
+        module_entity_by_file,
+        provider_modules_by_file,
+        entity_file_by_id,
+        entity_name_by_id,
+    ) = {
+        let mut value_facts = HashMap::new();
+        let mut value_providers_by_file: HashMap<
+            &str,
+            Vec<(EntityId, kin_parser::value_origins::ValueProvider)>,
+        > = HashMap::new();
+        let mut default_export_by_file: HashMap<&str, String> = HashMap::new();
+        let mut module_entity_by_file: HashMap<&str, EntityId> = HashMap::new();
+        let mut provider_modules_by_file: HashMap<
+            &str,
+            Vec<kin_parser::value_origins::ProviderModule>,
+        > = HashMap::new();
+        let mut entity_file_by_id = HashMap::new();
+        let mut entity_name_by_id = HashMap::new();
+        for &entity in &sorted_universe {
+            entity_name_by_id.insert(entity.id, entity.name.as_str());
+            let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
+                continue;
+            };
+            entity_file_by_id.insert(entity.id, file_path);
+            let Some(facts) = kin_parser::value_origins::read_value_origins(entity) else {
+                continue;
+            };
+            for provider in &facts.provides {
+                value_providers_by_file
+                    .entry(file_path)
+                    .or_default()
+                    .push((entity.id, provider.clone()));
+            }
+            if entity.kind == EntityKind::Module {
+                // Only the file's own module carries facts, so the first one
+                // that does is it.
+                module_entity_by_file.entry(file_path).or_insert(entity.id);
+                if let Some(exported) = &facts.default_export {
+                    default_export_by_file.insert(file_path, exported.clone());
+                }
+                if !facts.provider_modules.is_empty() {
+                    provider_modules_by_file
+                        .entry(file_path)
+                        .or_default()
+                        .extend(facts.provider_modules.iter().cloned());
+                }
+            }
+            value_facts.insert(entity.id, Arc::new(facts));
+        }
+        (
+            value_facts,
+            value_providers_by_file,
+            default_export_by_file,
+            module_entity_by_file,
+            provider_modules_by_file,
+            entity_file_by_id,
+            entity_name_by_id,
+        )
+    };
+    // Re-exports and module fork families, read off the parsed import records
+    // and the known file paths once rather than per relation.
+    let module_forwarding = ModuleForwarding::batch(files, known_files.iter().copied());
     let mut ctx = LinkContext {
         rust_project: None,
         exact_import_witnesses: exact_import_witnesses(files),
@@ -867,9 +1377,42 @@ fn build_link_context<'a>(
         import_map,
         include_graph,
         class_bases_by_file_class,
+        class_implements_by_file_class,
         declared_attribute_types,
         overridden_bases: HashSet::new(),
+        value_facts,
+        value_providers_by_file,
+        default_export_by_file,
+        module_entity_by_file,
+        provider_modules_by_file,
+        entity_file_by_id,
+        entity_name_by_id,
+        module_forwarding,
+        subclass_index: std::sync::OnceLock::new(),
+        import_roots: std::sync::OnceLock::new(),
+        outside_base_index: std::sync::OnceLock::new(),
+        package_files,
+        package_of_file,
+        receiver_outside: HashMap::new(),
+        receiver_outside_keys: HashSet::new(),
     };
+    // Step 4c: calls whose receiver the adapter facts prove to hold a value of
+    // a type outside the repository. Read by the tier that settles them and
+    // by the coverage certificate that records them for the call-site ledger.
+    let outside: Vec<(String, ReceiverSites)> = files
+        .par_iter()
+        .map(|file| (file.file_path.clone(), receiver_outside_sites(file, &ctx)))
+        .filter(|(_, sites)| !sites.is_empty())
+        .collect();
+    for (file, sites) in outside {
+        ctx.receiver_outside_keys.extend(
+            sites
+                .outside
+                .iter()
+                .map(|site| (site.caller, site.receiver.clone(), site.method.clone())),
+        );
+        ctx.receiver_outside.entry(file).or_default().extend(sites);
+    }
     // Step 5: which method/function entities an `Overrides` edge somewhere in
     // the batch names as a base. Every other field above is now in place, so
     // this reuses `derive_override_relations` itself — the batch's own
@@ -929,7 +1472,21 @@ where
             if rel.src_name.is_empty() || rel.dst_name.is_empty() {
                 continue;
             }
-            let key = (file.file_path.as_str(), rel.src_name.as_str(), attribute);
+            // A source-owning field carries its annotation's reference. The
+            // receiver index still keys that declaration by its class.
+            let owner = if file
+                .entities
+                .iter()
+                .any(|entity| entity.kind == EntityKind::Field && entity.name == rel.src_name)
+            {
+                rel.src_name
+                    .rsplit_once('.')
+                    .filter(|(_, leaf)| *leaf == attribute)
+                    .map_or(rel.src_name.as_str(), |(class, _)| class)
+            } else {
+                rel.src_name.as_str()
+            };
+            let key = (file.file_path.as_str(), owner, attribute);
             match declared.get(&key) {
                 Some(seen) if *seen == rel.dst_name.as_str() => {}
                 Some(_) => {
@@ -945,6 +1502,264 @@ where
         declared.remove(&key);
     }
     declared
+}
+
+impl crate::receiver_origin::OriginWorld for LinkContext<'_> {
+    fn facts(&self, entity: EntityId) -> Option<Arc<kin_parser::value_origins::ScopeFacts>> {
+        self.value_facts.get(&entity).cloned()
+    }
+
+    fn entity_file(&self, entity: EntityId) -> Option<String> {
+        self.entity_file_by_id
+            .get(&entity)
+            .map(|file| file.to_string())
+    }
+
+    fn entity_name(&self, entity: EntityId) -> Option<String> {
+        self.entity_name_by_id
+            .get(&entity)
+            .map(|name| name.to_string())
+    }
+
+    fn locate_class(&self, file: &str, name: &str) -> Option<(String, String)> {
+        locate_base_class(file, name, self)
+    }
+
+    fn resolve_method(&self, file: &str, class: &str, method: &str) -> Option<EntityId> {
+        walk_members(
+            file,
+            class,
+            |file, class| {
+                resolve_own_method(file, class, method, self)
+                    .or_else(|| resolve_member_elsewhere(file, class, method, self))
+            },
+            |file, class| {
+                self.class_bases_by_file_class
+                    .get(&(file, class))
+                    .into_iter()
+                    .flatten()
+                    .chain(
+                        self.class_implements_by_file_class
+                            .get(&(file, class))
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .map(|base| (*base).to_string())
+                    .collect()
+            },
+            |file, base| locate_base_class(file, base, self),
+        )
+    }
+
+    fn resolve_callable(&self, file: &str, name: &str) -> Option<EntityId> {
+        let is_function =
+            |id: &EntityId| self.entity_kind_by_id.get(id) == Some(&EntityKind::Function);
+        if let Some(id) = self
+            .entity_by_file_name
+            .get(&(file, name))
+            .filter(|id| is_function(id))
+        {
+            return Some(*id);
+        }
+        if !name.contains('.') {
+            if let Some((_, id)) = self.in_package_peers(file, name, is_function) {
+                return Some(id);
+            }
+        }
+        let (binding, member) = match name.split_once('.') {
+            Some((root, member)) if !member.contains('.') => (root, Some(member)),
+            Some(_) => return None,
+            None => (name, None),
+        };
+        let &(module_path, original) = self.import_map.get(file)?.get(binding)?;
+        let target = resolve_module_path(file, module_path, &self.known_files)?;
+        let wanted = member.unwrap_or(original);
+        self.entity_by_file_name
+            .get(&(target.as_str(), wanted))
+            .copied()
+            .filter(is_function)
+            .or_else(|| {
+                self.in_package_peers(&target, wanted, is_function)
+                    .map(|(_, id)| id)
+            })
+    }
+
+    fn providers_in(
+        &self,
+        file: &str,
+    ) -> Option<Vec<(EntityId, kin_parser::value_origins::ValueProvider)>> {
+        Some(
+            self.value_providers_by_file
+                .get(file)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn file_declares(&self, file: &str, name: &str) -> bool {
+        self.entity_by_file_name.contains_key(&(file, name))
+    }
+
+    fn known_file(&self, path: &str) -> bool {
+        self.known_files.contains(path)
+    }
+
+    fn import_binding(&self, file: &str, local: &str) -> Option<(String, String)> {
+        let &(module_path, original) = self.import_map.get(file)?.get(local)?;
+        let target = resolve_module_path(file, module_path, &self.known_files)?;
+        Some((target, original.to_string()))
+    }
+
+    fn unique_method(&self, method: &str) -> Option<EntityId> {
+        if self.entity_by_name.contains_key(method) {
+            return None;
+        }
+        let holders = self.entity_by_bare_name.get(method)?;
+        let mut ids = holders.iter().map(|(_, id)| *id);
+        let first = ids.next()?;
+        if ids.any(|id| id != first) {
+            return None;
+        }
+        (self.entity_kind_by_id.get(&first) == Some(&EntityKind::Method)).then_some(first)
+    }
+
+    fn compatible(&self, caller: EntityId, target: EntityId) -> bool {
+        blind_inference_target_allowed(caller, target, &self.entity_language_by_id)
+    }
+
+    fn members_named(&self, member: &str) -> Vec<crate::receiver_origin::Member> {
+        let mut seen = HashSet::new();
+        self.entity_by_bare_name
+            .get(member)
+            .into_iter()
+            .flatten()
+            .chain(self.entity_by_name.get(member).into_iter().flatten())
+            .filter(|(_, id)| seen.insert(*id))
+            .map(|(file, id)| crate::receiver_origin::Member {
+                id: *id,
+                file: (*file).to_string(),
+                owner: self
+                    .entity_name_by_id
+                    .get(id)
+                    .and_then(|name| member_owner(name)),
+            })
+            .collect()
+    }
+
+    fn class_bases(&self, file: &str, class: &str) -> Option<Vec<String>> {
+        if let Some(bases) = self.class_bases_by_file_class.get(&(file, class)) {
+            return Some(bases.iter().map(|base| (*base).to_string()).collect());
+        }
+        let id = self.entity_by_file_name.get(&(file, class))?;
+        is_class_like(self.entity_kind_by_id.get(id)).then(Vec::new)
+    }
+
+    fn subclasses(&self, file: &str, class: &str) -> Vec<(String, String)> {
+        self.subclass_index
+            .get_or_init(|| {
+                subclass_index(
+                    self.class_bases_by_file_class
+                        .iter()
+                        .map(|((file, class), bases)| (*file, *class, bases.as_slice())),
+                    |file, base| locate_base_class(file, base, self),
+                )
+            })
+            .get(&(file.to_string(), class.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn declares_class_named(&self, leaf: &str) -> bool {
+        self.entity_by_name
+            .get(leaf)
+            .into_iter()
+            .flatten()
+            .chain(self.entity_by_bare_name.get(leaf).into_iter().flatten())
+            .any(|(_, id)| is_class_like(self.entity_kind_by_id.get(id)))
+    }
+
+    fn default_export(&self, file: &str) -> Option<String> {
+        self.default_export_by_file.get(file).cloned()
+    }
+
+    fn declaration(&self, file: &str, name: &str) -> Option<EntityId> {
+        self.entity_by_file_name.get(&(file, name)).copied()
+    }
+
+    fn nested_import(&self, file: &str, local: &str) -> Option<(String, String)> {
+        let &(module_path, original) = self.import_map.get(file)?.get(local)?;
+        let target = resolve_python_nested_import(file, module_path, &self.known_files)?;
+        Some((target, original.to_string()))
+    }
+
+    fn module_file(&self, file: &str, module: &str) -> Option<String> {
+        resolve_module_path(file, module, &self.known_files)
+    }
+
+    fn provider_modules(
+        &self,
+        file: &str,
+    ) -> Option<Vec<kin_parser::value_origins::ProviderModule>> {
+        Some(
+            self.provider_modules_by_file
+                .get(file)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    fn outside_module(&self, file: &str, qualified: &str) -> bool {
+        self.import_roots
+            .get_or_init(|| {
+                kin_db::call_site_escape::ImportRoots::of(self.known_files.iter().copied())
+            })
+            .outside(file, qualified)
+    }
+
+    fn module_scope(
+        &self,
+        file: &str,
+    ) -> Option<(EntityId, Arc<kin_parser::value_origins::ScopeFacts>)> {
+        let entity = *self.module_entity_by_file.get(file)?;
+        Some((entity, self.value_facts.get(&entity)?.clone()))
+    }
+
+    fn classes_based_on(&self, qualified: &str) -> Vec<(String, String)> {
+        self.outside_base_index
+            .get_or_init(|| {
+                outside_base_index(self.value_facts.iter().filter_map(|(id, facts)| {
+                    if facts.base_origins.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        *self.entity_file_by_id.get(id)?,
+                        *self.entity_name_by_id.get(id)?,
+                        facts.clone(),
+                    ))
+                }))
+            })
+            .get(qualified)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Mark a relation the receiver-origin tier bound with the rule, the chain
+/// that typed its receiver and the same chain as addressable steps, keeping
+/// its occurrence certificates bound to the evidence it now carries.
+fn qualify_receiver_origin(
+    mut relation: Relation,
+    binding: &crate::receiver_origin::OriginBinding,
+) -> Relation {
+    crate::occurrence::remove_fresh_proofs(&mut relation);
+    relation
+        .evidence
+        .push(crate::receiver_origin::chain_record(&binding.chain));
+    if let Some(steps) = crate::receiver_origin::steps_record(&binding.steps) {
+        relation.evidence.push(steps);
+    }
+    crate::occurrence::stamp_fresh(&mut relation);
+    relation
 }
 
 /// The method a two-hop declared receiver dispatches to, or `None` when either
@@ -1056,7 +1871,17 @@ fn resolve_one_file(
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
 
     for rel in &file.relations {
-        if is_call_extraction_incomplete_marker(rel) || claims_import_witness(rel) {
+        if kin_parser::is_reserved_parser_record(rel) {
+            continue;
+        }
+        if crate::relation_source::is_lexical_contains(rel) {
+            if let Some((parent, child)) = source_index.resolve_lexical_contains(rel) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, parent.id, child.id, 1.0),
+                );
+            }
             continue;
         }
         let src_id = go_receiver_owner_source(
@@ -1080,7 +1905,14 @@ fn resolve_one_file(
         let dst_same_file = ctx
             .entity_by_file_name
             .get(&(file.file_path.as_str(), rel.dst_name.as_str()))
-            .filter(|_| !requires_rust_import_authority(rel, &file.file_path));
+            .filter(|_| !requires_rust_import_authority(rel, &file.file_path))
+            .filter(|id| {
+                same_file_slot_binds(
+                    rel.kind,
+                    ctx.entity_kind_by_id.get(id),
+                    ctx.entity_language_by_id.get(id),
+                )
+            });
 
         let src_id = match src_id {
             Some(id) => id,
@@ -1247,6 +2079,51 @@ fn resolve_one_file(
             continue;
         }
 
+        // Python namespace claims require exact source and lexical evidence.
+        // A refused witness is an explicit gap; it cannot revive the older
+        // module-name tier or capture a same-named callable elsewhere.
+        if is_python_source_path(&file.file_path)
+            && rel.kind == RelationKind::Calls
+            && rel.receiver.is_some()
+            && rel.import_source.is_some()
+        {
+            if let Some((dst_id, target_file)) = resolve_witnessed_import(
+                rel,
+                &file.file_path,
+                &ctx.known_files,
+                &ctx.exact_import_witnesses,
+                ctx.rust_project,
+                &mut BTreeMap::new(),
+                &mut BTreeMap::new(),
+                |target_file, name, _| {
+                    let ids: HashSet<_> = ctx
+                        .entity_by_name
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(path, id)| {
+                            *path == target_file
+                                && ctx.entity_kind_by_id.get(id) != Some(&EntityKind::Module)
+                        })
+                        .map(|(_, id)| *id)
+                        .collect();
+                    (ids.len() == 1).then(|| *ids.iter().next().expect("one namespace target"))
+                },
+            ) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    qualify_named_import(
+                        make_relation(rel, src_id, dst_id, 0.95),
+                        rel,
+                        &FilePathId::new(&file.file_path),
+                        &target_file,
+                    ),
+                );
+            }
+            continue;
+        }
+
         // (a0) Receiver-scoped resolution. An attribute call carries its
         // receiver as written; the calling file's imports say whether that
         // receiver is a module or a value, and that decides which entities can
@@ -1289,7 +2166,13 @@ fn resolve_one_file(
                         ctx.import_map.get(file.file_path.as_str()),
                         &ctx.import_map,
                         &ctx.known_files,
-                        |target, name| ctx.entity_by_file_name.get(&(target, name)).copied(),
+                        |target, name| {
+                            reachable_slot(
+                                rel.kind,
+                                ctx.entity_by_file_name.get(&(target, name)).copied(),
+                                &ctx.entity_kind_by_id,
+                            )
+                        },
                     ) {
                         accumulate_relation(
                             &mut resolved,
@@ -1313,6 +2196,56 @@ fn resolve_one_file(
                     accumulate_relation(&mut resolved, &mut relation_indices, external);
                 }
                 continue;
+            }
+        }
+
+        // (a1r) A receiver the adapter's value-origin facts type. The call
+        // arrives as a bare leaf on an object receiver, which every tier
+        // below could only settle by name; the facts of the caller's scope
+        // can follow the receiver to one class through declarations, and
+        // that class is then asked for the method exactly as a declared
+        // receiver's is. See [`crate::receiver_origin`].
+        if receiver_is_object
+            && rel.kind == RelationKind::Calls
+            && split_owner_method(rel.dst_name.as_str()).is_none()
+        {
+            if let Some(binding) = rel.receiver.as_deref().and_then(|receiver| {
+                crate::receiver_origin::bind_receiver_call(
+                    ctx,
+                    src_id,
+                    &file.file_path,
+                    receiver,
+                    &rel.dst_name,
+                )
+            }) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    qualify_receiver_origin(
+                        make_relation(rel, src_id, binding.target, binding.confidence),
+                        &binding,
+                    ),
+                );
+                continue;
+            }
+        }
+
+        // (a1o) A receiver the adapter's value-origin facts type as a value of
+        // a type outside the repository. The call reaches no declaration here,
+        // so every tier below, each of which could only match the leaf against
+        // a same-named repository member, would mint a caller the source never
+        // had. The coverage certificate records the site and its chain, and
+        // the call-site ledger settles it from there.
+        if receiver_is_object && rel.kind == RelationKind::Calls {
+            if let Some(receiver) = rel.receiver.as_deref() {
+                let key = (
+                    src_id,
+                    receiver.to_string(),
+                    bare_entity_name(&rel.dst_name).to_string(),
+                );
+                if ctx.receiver_outside_keys.contains(&key) {
+                    continue;
+                }
             }
         }
 
@@ -1687,10 +2620,13 @@ fn resolve_one_file(
                 if let Some(target_file) =
                     resolve_module_path(&file.file_path, module_path, &ctx.known_files)
                 {
-                    let direct = ctx
-                        .entity_by_file_name
-                        .get(&(target_file.as_str(), original_name))
-                        .copied();
+                    let direct = reachable_slot(
+                        rel.kind,
+                        ctx.entity_by_file_name
+                            .get(&(target_file.as_str(), original_name))
+                            .copied(),
+                        &ctx.entity_kind_by_id,
+                    );
                     let dst_id = if direct.is_some() {
                         direct
                     } else if original_name == "default" {
@@ -1719,10 +2655,13 @@ fn resolve_one_file(
                     if let Some(target_file) =
                         resolve_module_path(&file.file_path, module_path, &ctx.known_files)
                     {
-                        if let Some(&dst_id) = ctx
-                            .entity_by_file_name
-                            .get(&(target_file.as_str(), member_name))
-                        {
+                        if let Some(dst_id) = reachable_slot(
+                            rel.kind,
+                            ctx.entity_by_file_name
+                                .get(&(target_file.as_str(), member_name))
+                                .copied(),
+                            &ctx.entity_kind_by_id,
+                        ) {
                             accumulate_relation(
                                 &mut resolved,
                                 &mut relation_indices,
@@ -1758,8 +2697,15 @@ fn resolve_one_file(
             &file.file_path,
             &ctx.known_files,
             ctx.entity_language_by_id.get(&src_id) == Some(&LanguageId::Go),
-            |target_file, name| ctx.entity_by_file_name.get(&(target_file, name)).copied(),
+            |target_file, name| {
+                reachable_slot(
+                    rel.kind,
+                    ctx.entity_by_file_name.get(&(target_file, name)).copied(),
+                    &ctx.entity_kind_by_id,
+                )
+            },
             &other_file_candidates,
+            &ctx.module_forwarding,
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
                 accumulate_relation(
@@ -1767,6 +2713,20 @@ fn resolve_one_file(
                     &mut relation_indices,
                     make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE),
                 );
+                continue;
+            }
+            ImportPinnedTarget::ModuleFork { stub, members } => {
+                for member in &members {
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        qualify_module_fork(
+                            make_relation(rel, src_id, member.dst_id, MODULE_FORK_CONFIDENCE),
+                            &stub,
+                            &member.variants,
+                        ),
+                    );
+                }
                 continue;
             }
             ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
@@ -1888,16 +2848,26 @@ fn resolve_one_file(
                         )
                 })
                 .collect();
+            // A module whose name has a dotted leaf (`res.get.js`,
+            // `http-exception.filter.ts`) sits in the bare-name bucket of that
+            // leaf, and a call never reaches it.
+            let candidates = drop_module_call_targets(rel.kind, candidates, &ctx.entity_kind_by_id);
             let candidates = prune_pairs_by_arity(candidates, call_arity, &ctx.entity_arity_by_id);
             let candidates = narrow_pairs_by_role(src_id, candidates, &ctx.entity_role_by_id);
             let candidates = narrow_pairs_by_definition(candidates, &ctx.declaration_ids);
-            let candidates = if receiver_is_object {
+            let candidates = if receiver_is_object
+                && imports_name_receiver_owners(ctx.entity_language_by_id.get(&src_id))
+            {
                 let owner_bound = owner_bound_targets(
                     dst_lookup,
+                    &file.file_path,
                     ctx.import_map.get(file.file_path.as_str()),
+                    &ctx.known_files,
+                    ctx.rust_project
+                        .is_some_and(|project| project.contains_source(&file.file_path)),
                     |key, bound| {
                         if let Some(named) = ctx.entity_by_name.get(key) {
-                            bound.extend(named.iter().map(|&(_, id)| id));
+                            bound.extend(named.iter().map(|&(file, id)| (file.to_string(), id)));
                         }
                     },
                 );
@@ -2057,6 +3027,7 @@ fn resolve_one_file(
             // arity-pruned so an overloaded callee (`Catch::Main`) drops the
             // overloads the call site's argument count cannot reach.
             for dst_id in resolve_qualified_suffix(
+                rel.kind,
                 rel.dst_name.as_str(),
                 file.file_path.as_str(),
                 call_arity,
@@ -2105,6 +3076,7 @@ fn resolve_one_file(
         accumulate_relation(&mut resolved, &mut relation_indices, relation);
     }
 
+    retain_callable_targets(&mut resolved, &ctx.entity_kind_by_id);
     resolved
 }
 
@@ -2248,6 +3220,7 @@ fn merge_resolved(
         completeness,
         &ctx.known_files,
         &base_counts,
+        &ctx.receiver_outside,
     );
 
     let derived = ctx
@@ -3269,37 +4242,13 @@ impl ArityBounds {
     }
 }
 
-/// Whether an entity only declares itself, with its body in another file.
-///
-/// C and C++: `declaration_signature` cuts a definition off at its body, so a
-/// definition's stored signature ends at the parameter list while a prototype
-/// keeps the `;` that ended its statement. That trailing semicolon is the whole
-/// discriminator, read off the same stored signature [`parse_signature_arity`]
-/// already parses. TypeScript: an ambient declaration's signature starts with
-/// `declare`. A language whose declarations are spelled neither way is left
-/// alone, so nothing else can be pruned by it.
+/// Whether an entity only declares a callable whose running body is another
+/// entity's: a C or C++ prototype, a TypeScript ambient declaration, a Python
+/// `@overload` stub. The entity's own language adapter says, read off the
+/// stored signature (see [`kin_parser::declaration_only`]), so the fan-out
+/// tiers can prefer the definition without knowing any language's spelling.
 fn callee_is_declaration(entity: &Entity) -> bool {
-    match entity.language {
-        LanguageId::Cpp | LanguageId::C => {
-            matches!(entity.kind, EntityKind::Function | EntityKind::Method)
-                && entity.signature.trim_end().ends_with(';')
-        }
-        // An ambient declaration, `declare const`, `declare let`, `declare var`
-        // or `declare class`, says a binding exists without giving it a body,
-        // and the TypeScript adapter keeps the `declare` at the head of such a
-        // signature. The value lives in another file or outside the repository,
-        // so it is the same shape as a C prototype.
-        LanguageId::TypeScript => {
-            matches!(
-                entity.kind,
-                EntityKind::Function
-                    | EntityKind::Constant
-                    | EntityKind::StaticVar
-                    | EntityKind::Class
-            ) && entity.signature.trim_start().starts_with("declare ")
-        }
-        _ => false,
-    }
+    kin_parser::declaration_only::declares_only(entity.language, entity.kind, &entity.signature)
 }
 
 /// The argument-count bounds of an entity that can be a call target, or `None`
@@ -3557,6 +4506,7 @@ fn call_positional_arity(shape: &Option<CallArgShape>) -> Option<usize> {
 /// to all of them, bounded by [`AMBIGUOUS_CALL_FANOUT_CAP`]; beyond the cap it
 /// stays silent and is logged — a wall of guesses is worse than a missing edge.
 fn resolve_qualified_suffix(
+    kind: RelationKind,
     dst_name: &str,
     current_file: &str,
     arg_count: Option<usize>,
@@ -3631,9 +4581,12 @@ fn resolve_qualified_suffix(
         }
     }
     // Everything this tier links is inferred from a name, so it takes the same
-    // language gate every other name tier applies.
+    // language gate every other name tier applies. A module shares the leaf of
+    // every path that names a function after it (`axum::serve` and the `serve`
+    // module), and no call reaches a module.
     leaf_targets.retain(|&dst_id| {
         blind_inference_target_allowed(src_id, dst_id, &ctx.entity_language_by_id)
+            && reachable_slot(kind, Some(dst_id), &ctx.entity_kind_by_id).is_some()
     });
     let leaf_targets = prune_ids_by_arity(leaf_targets, arg_count, &ctx.entity_arity_by_id);
     match leaf_targets.len() {
@@ -3752,6 +4705,7 @@ fn owner_type_segment(owner: &str) -> &str {
 /// target up to [`AMBIGUOUS_CALL_FANOUT_CAP`]. Returns the targets in the same
 /// deterministic order as the batch resolver; an empty vector is an honest miss.
 fn resolve_qualified_suffix_incremental(
+    kind: RelationKind,
     dst_name: &str,
     current_file: &str,
     arg_count: Option<usize>,
@@ -3823,6 +4777,7 @@ fn resolve_qualified_suffix_incremental(
     }
     leaf_targets.retain(|&dst_id| {
         blind_inference_target_allowed(src_id, dst_id, &linker.entity_language_by_id)
+            && reachable_slot(kind, Some(dst_id), &linker.entity_kind_by_id).is_some()
     });
     let leaf_targets = prune_ids_by_arity(leaf_targets, arg_count, &linker.entity_arity_by_id);
     match leaf_targets.len() {
@@ -3856,6 +4811,70 @@ fn resolve_qualified_suffix_incremental(
 /// last-one-wins behaviour.
 fn file_name_slot_admits(candidate: EntityKind, occupant: EntityKind) -> bool {
     candidate != EntityKind::Module || occupant == EntityKind::Module
+}
+
+/// Whether the entity holding a file's `(file, name)` slot is one a relation
+/// written in that same file reaches by that bare name.
+///
+/// A Module holds the slot only when nothing the file declares shares the
+/// name (see [`file_name_slot_admits`]), and it is never what a call reaches,
+/// in any language: a module is not callable. In Python it is not a name in
+/// its own file at all. A module binds no name for itself in its own
+/// namespace, so `repr(x)` written in `rich/repr.py` reaches `builtins.repr`
+/// unless the file rebinds `repr`, and a rebinding the graph holds is a
+/// declaration, which takes the slot from the Module. Letting the Module
+/// answer proved that call to the module at parser certainty, and kept it
+/// from the builtin gate, the one tier that knows the name is the builtin.
+pub(crate) fn same_file_slot_binds(
+    relation: RelationKind,
+    slot: Option<&EntityKind>,
+    slot_language: Option<&LanguageId>,
+) -> bool {
+    slot != Some(&EntityKind::Module)
+        || (relation != RelationKind::Calls && slot_language != Some(&LanguageId::Python))
+}
+
+/// The entity a `(file, name)` lookup made for a relation of `kind` reaches:
+/// none for a call when the slot holds a Module, which no call reaches.
+///
+/// A tier that looks a name up inside another file meets that file's Module
+/// whenever the file declares nothing under the name, which is exactly the
+/// case in which the name is handed on: `observable/index.ts` re-exporting the
+/// `observable` it imports, or a module binding the name by a plain
+/// assignment. As a miss the lookup leaves the call to the tiers after it,
+/// the pinned tier's re-export forwarding among them.
+fn reachable_slot(
+    kind: RelationKind,
+    slot: Option<EntityId>,
+    kinds: &HashMap<EntityId, EntityKind>,
+) -> Option<EntityId> {
+    slot.filter(|id| kind != RelationKind::Calls || kinds.get(id) != Some(&EntityKind::Module))
+}
+
+/// Drop every `Calls` edge a tier bound to a Module entity.
+///
+/// A module is never what a call reaches. The same-file slot refuses one
+/// (see [`same_file_slot_binds`]), the lookups inside other files miss it
+/// (see [`reachable_slot`]) and the name tiers drop it from their candidates.
+/// This holds the rule for the resolver's output as a whole, so a tier added
+/// later cannot prove a call to a module either: such a call is left
+/// unresolved.
+fn retain_callable_targets(resolved: &mut Vec<Relation>, kinds: &HashMap<EntityId, EntityKind>) {
+    resolved.retain(|relation| {
+        let module_call = relation.kind == RelationKind::Calls
+            && relation
+                .dst
+                .as_entity()
+                .is_some_and(|dst| kinds.get(&dst) == Some(&EntityKind::Module));
+        if module_call {
+            debug!(
+                src = ?relation.src,
+                dst = ?relation.dst,
+                "linker: a call bound to a module, leaving it unresolved"
+            );
+        }
+        !module_call
+    });
 }
 
 /// The entity each name's `(file, name)` slot holds among one file's
@@ -3898,9 +4917,22 @@ fn is_class_like(kind: Option<&EntityKind>) -> bool {
 /// no declaration order, so one uniform order keeps every linking path
 /// bit-identical).
 fn collect_class_bases(relations: &[ExtractedRelation]) -> Vec<(String, Vec<String>)> {
+    collect_hierarchy(relations, RelationKind::Extends)
+}
+
+/// The contracts each type of one file declares it implements, in the shape
+/// [`collect_class_bases`] gives bases.
+fn collect_class_implements(relations: &[ExtractedRelation]) -> Vec<(String, Vec<String>)> {
+    collect_hierarchy(relations, RelationKind::Implements)
+}
+
+fn collect_hierarchy(
+    relations: &[ExtractedRelation],
+    kind: RelationKind,
+) -> Vec<(String, Vec<String>)> {
     let mut classes: Vec<(String, Vec<String>)> = Vec::new();
     for rel in relations {
-        if rel.kind != RelationKind::Extends {
+        if rel.kind != kind {
             continue;
         }
         match classes.iter_mut().find(|(class, _)| class == &rel.src_name) {
@@ -3990,6 +5022,11 @@ fn external_base_binding<S>(
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
+    // A local-scope base names a class declared in a function body of this
+    // file; its first segment is that function, never an import binding.
+    if is_local_scope_name(base_raw) {
+        return None;
+    }
     let (module_path, symbol) = base_import_binding(base_raw, file_imports?)?;
     if resolve_module_path(class_file, &module_path, known_files).is_some() {
         return None;
@@ -3998,6 +5035,12 @@ where
         return None;
     }
     Some((module_path, symbol))
+}
+
+/// Whether an entity is a module or package: a file surface, which a type
+/// name never names.
+fn is_module_surface_kind(kind: Option<&EntityKind>) -> bool {
+    matches!(kind, Some(EntityKind::Module | EntityKind::Package))
 }
 
 /// Locate the class a declared base NAME refers to, from `class_file`'s point
@@ -4019,6 +5062,12 @@ where
 /// and disagreed. The leaf tiers still run afterwards, which is where a
 /// repository that re-exports the class under its own name is found.
 ///
+/// A base the parser already spelled as a local-scope name
+/// (`test_x.<locals>.Base`, from `class Double(Base)` beside a `class Base` in
+/// the same function body) is decided before any of that: the parser resolved
+/// the lexical binding, the name exists nowhere but this file, and its leaf is
+/// no evidence for any other class. It resolves to that class or to nothing.
+///
 /// Returns the (file, class entity name) to continue the walk from, or `None`
 /// when the base is external, builtin, or ambiguous — a walk must never guess a
 /// hierarchy. An external base is not silence: see [`external_base_binding`].
@@ -4027,14 +5076,25 @@ fn locate_base_class(
     base_raw: &str,
     ctx: &LinkContext<'_>,
 ) -> Option<(String, String)> {
+    let type_like = |id: &EntityId| ctx.is_type_like(id);
+    if is_local_scope_name(base_raw) {
+        let id = ctx.entity_by_file_name.get(&(class_file, base_raw))?;
+        return type_like(id).then(|| (class_file.to_string(), base_raw.to_string()));
+    }
     let base_leaf = bare_entity_name(base_raw);
     let qualified = base_raw.contains('.');
+    // A file whose names its package shares with the package's other files.
+    let package_scoped = !ctx.package_peers(class_file).is_empty();
 
     if !qualified {
         if let Some(id) = ctx.entity_by_file_name.get(&(class_file, base_leaf)) {
-            if is_class_like(ctx.entity_kind_by_id.get(id)) {
+            if type_like(id) {
                 return Some((class_file.to_string(), base_leaf.to_string()));
             }
+        }
+        // A type the package declares is visible in every file of it.
+        if let Some((peer, _)) = ctx.in_package_peers(class_file, base_leaf, type_like) {
+            return Some((peer.to_string(), base_leaf.to_string()));
         }
     }
 
@@ -4047,25 +5107,47 @@ fn locate_base_class(
                     .entity_by_file_name
                     .get(&(target_file.as_str(), target_name.as_str()))
                 {
-                    if is_class_like(ctx.entity_kind_by_id.get(id)) {
+                    if type_like(id) {
                         return Some((target_file, target_name));
                     }
+                }
+                // The import reaches one file of a package; the type may be
+                // declared in any file of it, and in no other package.
+                if !ctx.package_peers(&target_file).is_empty() {
+                    return ctx
+                        .in_package_peers(&target_file, &target_name, type_like)
+                        .map(|(peer, _)| (peer.to_string(), target_name));
                 }
             }
         }
     }
 
+    let imports = ctx.import_map.get(class_file);
     if qualified {
         if let Some(id) = ctx.entity_by_file_name.get(&(class_file, base_leaf)) {
-            if is_class_like(ctx.entity_kind_by_id.get(id)) {
+            if type_like(id)
+                && simple_name_may_mean(class_file, base_raw, class_file, imports, &ctx.known_files)
+            {
                 return Some((class_file.to_string(), base_leaf.to_string()));
             }
         }
     }
 
+    // An unqualified name in a package-scoped file is its own package's or
+    // the language's, never a same-named type of another package.
+    if package_scoped && !qualified {
+        return None;
+    }
+
     let mut unique: Option<(&str, EntityId)> = None;
     if let Some(candidates) = ctx.entity_by_name.get(base_leaf) {
         for &(fp, id) in candidates {
+            // A file's module surface is named after the file, and a file is
+            // often named after the class it declares: the surface is never
+            // the class, so it does not make the name ambiguous.
+            if is_module_surface_kind(ctx.entity_kind_by_id.get(&id)) {
+                continue;
+            }
             match unique {
                 None => unique = Some((fp, id)),
                 Some((_, seen)) if seen == id => {}
@@ -4074,11 +5156,176 @@ fn locate_base_class(
         }
     }
     if let Some((fp, id)) = unique {
-        if is_class_like(ctx.entity_kind_by_id.get(&id)) {
+        if type_like(&id)
+            && simple_name_may_mean(class_file, base_raw, fp, imports, &ctx.known_files)
+        {
             return Some((fp.to_string(), base_leaf.to_string()));
         }
     }
     None
+}
+
+/// Whether a repository class declared in `candidate_file`, found by its simple
+/// name alone, may be the type `base_raw` written in `class_file` names.
+///
+/// A name an import binds names whatever that import brings in. When the
+/// import's module is a repository file, the name is the repository's own and
+/// the simple-name match stands. When it is not, the type is the repository's
+/// only if the class lies in the package the import names, spelled as a
+/// directory: `import app.util.Logger` may mean `.../app/util/Logger.java`,
+/// and `import org.slf4j.Logger` never means a repository `Logger` elsewhere.
+/// A qualified name nothing imports names its package the same way. Every
+/// other name keeps the simple-name match.
+fn simple_name_may_mean<S>(
+    class_file: &str,
+    base_raw: &str,
+    candidate_file: &str,
+    imports: Option<&HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+) -> bool
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    if let Some((module_path, symbol)) =
+        imports.and_then(|imports| base_import_binding(base_raw, imports))
+    {
+        return resolve_module_path(class_file, &module_path, known_files).is_some()
+            || names_the_importing_crate(&module_path)
+            || lies_in_package(candidate_file, import_package(&module_path, &symbol))
+            || aliased_module_path_names_file(&module_path, candidate_file);
+    }
+    match base_raw.rsplit_once('.') {
+        Some((qualifier, _)) => lies_in_package(candidate_file, qualifier),
+        None => true,
+    }
+}
+
+/// Whether a Rust module path is anchored at the importing crate itself
+/// (`crate::store`, `self::a`, `super::b`), which only a file of the
+/// repository declares.
+fn names_the_importing_crate(module_path: &str) -> bool {
+    matches!(
+        module_path.split("::").next(),
+        Some("crate" | "self" | "super")
+    )
+}
+
+/// The package an import names, when its module path ends with the imported
+/// name itself (`App\Models\Registry` imports `Registry` from `App\Models`).
+fn import_package<'m>(module_path: &'m str, symbol: &str) -> &'m str {
+    if symbol.is_empty() {
+        return module_path;
+    }
+    for separator in ["\\", "::", ".", "/"] {
+        if let Some(package) = module_path
+            .strip_suffix(symbol)
+            .and_then(|rest| rest.strip_suffix(separator))
+        {
+            return package;
+        }
+    }
+    module_path
+}
+
+/// Whether `file` sits directly in the directory a package path spells: its
+/// segments, separated by `.`, `/`, `::` or `\`, are the directory's last
+/// segments. A backslash namespace matches up to case, since the directory a
+/// namespace root maps to is often its lowercase spelling (`App\Models` in
+/// `app/Models`); a root mapped to a directory of another name is not
+/// matched, and its type keeps no simple-name fallback.
+fn lies_in_package(file: &str, package: &str) -> bool {
+    let wanted: Vec<&str> = package
+        .split("::")
+        .flat_map(|part| part.split(['.', '/', '\\']))
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if wanted.is_empty() || wanted.contains(&"..") {
+        return false;
+    }
+    let directory: Vec<&str> = file
+        .rsplit_once('/')
+        .map_or("", |(dir, _)| dir)
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if package.contains('\\') {
+        return directory.len() >= wanted.len()
+            && directory[directory.len() - wanted.len()..]
+                .iter()
+                .zip(&wanted)
+                .all(|(have, want)| have.eq_ignore_ascii_case(want));
+    }
+    directory.ends_with(&wanted)
+}
+
+/// Whether a module path written from an alias root may name `file`.
+///
+/// A module path whose first segment no package can carry as its name (`~`, a
+/// bare `@`, or a root that starts with `~`, `#` or `$`, as in
+/// `~/db/table.ts`, `@/db/table` or `#db/table`) is a mapping the repository
+/// configures in a compiler, bundler or package manifest the linker does not
+/// read. It is written from inside the repository, so failing to place it is
+/// no evidence that it names a module outside it. The segments after the root
+/// are a path below the directory the root stands for, so a file whose own
+/// path ends with them, or the index file of the directory they spell, may be
+/// the module the import brings in. A root a package can carry
+/// (`lodash/fp`, `@scope/pkg/sub`) is left to the resolver, since the same
+/// spelling names a dependency as often as a workspace member.
+fn aliased_module_path_names_file(module_path: &str, file: &str) -> bool {
+    let mut segments = module_path.split('/');
+    let Some(root) = segments.next() else {
+        return false;
+    };
+    if !(root == "@" || root.starts_with(['~', '#', '$'])) {
+        return false;
+    }
+    let rest: Vec<&str> = segments.filter(|segment| !segment.is_empty()).collect();
+    if rest.iter().any(|segment| matches!(*segment, "." | "..")) {
+        return false;
+    }
+    let Some((written, parents)) = rest.split_last() else {
+        return false;
+    };
+    let file_segments: Vec<&str> = file
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let Some((file_name, directories)) = file_segments.split_last() else {
+        return false;
+    };
+    (directories.ends_with(parents) && module_segment_names_file(written, file_name))
+        || (INDEX_FILENAMES.contains(file_name) && directories.ends_with(&rest))
+}
+
+/// Whether the last segment of a module path names the file `file_name`: as
+/// written, with a module extension left off, or with the extension its
+/// emitted JavaScript carries in place of the source's own.
+fn module_segment_names_file(written: &str, file_name: &str) -> bool {
+    if written == file_name {
+        return true;
+    }
+    if let Some(stem) = file_name
+        .rsplit_once('.')
+        .filter(|(_, extension)| MODULE_EXTENSIONS.contains(extension))
+        .map(|(stem, _)| stem)
+    {
+        if written == stem {
+            return true;
+        }
+    }
+    let Some((written_stem, emitted)) = written.rsplit_once('.') else {
+        return false;
+    };
+    EMITTED_EXTENSION_SOURCES
+        .iter()
+        .filter(|(extension, _)| *extension == emitted)
+        .flat_map(|(_, sources)| sources.iter())
+        .any(|source| {
+            file_name
+                .strip_suffix(source)
+                .and_then(|stem| stem.strip_suffix('.'))
+                == Some(written_stem)
+        })
 }
 
 /// Resolve an inherited receiver-method call (`Sub.method` where `Sub` does
@@ -4107,7 +5354,104 @@ fn resolve_declared_method(
     ctx: &LinkContext<'_>,
 ) -> Option<EntityId> {
     resolve_own_method(owner_file, owner_class, method, ctx)
+        .or_else(|| resolve_member_elsewhere(owner_file, owner_class, method, ctx))
         .or_else(|| resolve_inherited_method(owner_file, owner_class, method, ctx))
+}
+
+/// The member `owner_class` of `owner_file` owns that another file declares:
+/// an out-of-line definition, a method an extension adds, a method another
+/// file of the package declares. A member named for the owner counts only when
+/// its own file's reading of the owner name locates this same class, and a
+/// definition is preferred over a declaration of it. Two left over bind
+/// nothing.
+fn resolve_member_elsewhere(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    let mut found: Vec<EntityId> = Vec::new();
+    for key in receiver_method_keys(owner_class, method) {
+        for &(file, id) in ctx.entity_by_name.get(key.as_str()).into_iter().flatten() {
+            if file == owner_file || found.contains(&id) {
+                continue;
+            }
+            let owner = locate_base_class(file, owner_class, ctx);
+            if owner
+                .as_ref()
+                .is_some_and(|(file, class)| file == owner_file && class == owner_class)
+            {
+                found.push(id);
+            }
+        }
+    }
+    one_definition(found, &ctx.declaration_ids)
+}
+
+/// The method a value of `class` in `file` runs for `method`, walking its
+/// hierarchy through both the bases it extends and the contracts it
+/// implements: the class's own member (wherever the repository declares it),
+/// else the one member every branch of its ancestry agrees on, each branch
+/// stopping at the first class that declares one. Branches that reach two
+/// different members bind nothing, since which one runs depends on an order
+/// the hierarchy index does not keep.
+fn walk_members(
+    file: &str,
+    class: &str,
+    own: impl Fn(&str, &str) -> Option<EntityId>,
+    bases: impl Fn(&str, &str) -> Vec<String>,
+    locate: impl Fn(&str, &str) -> Option<(String, String)>,
+) -> Option<EntityId> {
+    if let Some(id) = own(file, class) {
+        return Some(id);
+    }
+    let mut found: Vec<EntityId> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut frontier: Vec<(String, String)> = bases(file, class)
+        .iter()
+        .filter_map(|base| locate(file, base))
+        .collect();
+    while let Some((base_file, base_class)) = frontier.pop() {
+        if !seen.insert((base_file.clone(), base_class.clone())) {
+            continue;
+        }
+        if seen.len() > INHERITANCE_WALK_CAP {
+            return None;
+        }
+        if let Some(id) = own(&base_file, &base_class) {
+            if !found.contains(&id) {
+                found.push(id);
+            }
+            continue;
+        }
+        frontier.extend(
+            bases(&base_file, &base_class)
+                .iter()
+                .filter_map(|base| locate(&base_file, base)),
+        );
+    }
+    match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
+/// The one member of `found`, preferring definitions over declarations.
+fn one_definition(found: Vec<EntityId>, declarations: &HashSet<EntityId>) -> Option<EntityId> {
+    let definitions: Vec<EntityId> = found
+        .iter()
+        .copied()
+        .filter(|id| !declarations.contains(id))
+        .collect();
+    let pool = if definitions.is_empty() {
+        found
+    } else {
+        definitions
+    };
+    match pool.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
 }
 
 /// The method entity `owner_class` declares under its own name in
@@ -4124,12 +5468,20 @@ fn resolve_own_method(
     method: &str,
     ctx: &LinkContext<'_>,
 ) -> Option<EntityId> {
-    receiver_method_keys(owner_class, method)
-        .iter()
+    let keys = receiver_method_keys(owner_class, method);
+    keys.iter()
         .find_map(|key| {
             ctx.entity_by_file_name
                 .get(&(owner_file, key.as_str()))
                 .copied()
+        })
+        // A package-scoped type's methods may be declared in any file of its
+        // package, and only there.
+        .or_else(|| {
+            keys.iter().find_map(|key| {
+                ctx.in_package_peers(owner_file, key, |_| true)
+                    .map(|(_, id)| id)
+            })
         })
 }
 
@@ -4142,16 +5494,57 @@ fn resolve_declared_method_incremental(
     import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
 ) -> Option<EntityId> {
-    resolve_own_method_incremental(owner_file, owner_class, method, linker).or_else(|| {
-        resolve_inherited_method_incremental(
-            owner_file,
-            owner_class,
-            method,
-            linker,
-            import_map,
-            class_bases,
-        )
-    })
+    resolve_own_method_incremental(owner_file, owner_class, method, linker)
+        .or_else(|| {
+            resolve_member_elsewhere_incremental(
+                owner_file,
+                owner_class,
+                method,
+                linker,
+                import_map,
+            )
+        })
+        .or_else(|| {
+            resolve_inherited_method_incremental(
+                owner_file,
+                owner_class,
+                method,
+                linker,
+                import_map,
+                class_bases,
+            )
+        })
+}
+
+/// The incremental mirror of [`resolve_member_elsewhere`].
+fn resolve_member_elsewhere_incremental(
+    owner_file: &str,
+    owner_class: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+) -> Option<EntityId> {
+    let mut found: Vec<EntityId> = Vec::new();
+    for key in receiver_method_keys(owner_class, method) {
+        for (file, id) in linker
+            .entity_by_name
+            .get(key.as_str())
+            .into_iter()
+            .flatten()
+        {
+            if file == owner_file || found.contains(id) {
+                continue;
+            }
+            let owner = locate_base_class_incremental(file, owner_class, linker, import_map);
+            if owner
+                .as_ref()
+                .is_some_and(|(file, class)| file == owner_file && class == owner_class)
+            {
+                found.push(*id);
+            }
+        }
+    }
+    one_definition(found, &linker.declaration_ids)
 }
 
 /// The incremental mirror of [`resolve_own_method`].
@@ -4161,14 +5554,21 @@ fn resolve_own_method_incremental(
     method: &str,
     linker: &IncrementalLinker,
 ) -> Option<EntityId> {
-    receiver_method_keys(owner_class, method)
-        .iter()
+    let keys = receiver_method_keys(owner_class, method);
+    keys.iter()
         .find_map(|key| {
             linker
                 .entity_by_file_name
                 .get(owner_file)
                 .and_then(|by_name| by_name.get(key.as_str()))
                 .copied()
+        })
+        .or_else(|| {
+            keys.iter().find_map(|key| {
+                linker
+                    .in_package_peers(owner_file, key, |_| true)
+                    .map(|(_, id)| id)
+            })
         })
 }
 
@@ -4465,8 +5865,17 @@ fn locate_base_class_incremental(
     linker: &IncrementalLinker,
     import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
 ) -> Option<(String, String)> {
+    let type_like = |id: &EntityId| linker.is_type_like(id);
+    if is_local_scope_name(base_raw) {
+        let id = linker
+            .entity_by_file_name
+            .get(class_file)
+            .and_then(|by_name| by_name.get(base_raw))?;
+        return type_like(id).then(|| (class_file.to_string(), base_raw.to_string()));
+    }
     let base_leaf = bare_entity_name(base_raw);
     let qualified = base_raw.contains('.');
+    let package_scoped = linker.file_package(class_file).is_some();
 
     if !qualified {
         if let Some(id) = linker
@@ -4474,9 +5883,12 @@ fn locate_base_class_incremental(
             .get(class_file)
             .and_then(|m| m.get(base_leaf))
         {
-            if is_class_like(linker.entity_kind_by_id.get(id)) {
+            if type_like(id) {
                 return Some((class_file.to_string(), base_leaf.to_string()));
             }
+        }
+        if let Some((peer, _)) = linker.in_package_peers(class_file, base_leaf, type_like) {
+            return Some((peer.to_string(), base_leaf.to_string()));
         }
     }
 
@@ -4490,29 +5902,50 @@ fn locate_base_class_incremental(
                     .get(&target_file)
                     .and_then(|m| m.get(target_name.as_str()))
                 {
-                    if is_class_like(linker.entity_kind_by_id.get(id)) {
+                    if type_like(id) {
                         return Some((target_file, target_name));
                     }
+                }
+                if linker.file_package(&target_file).is_some() {
+                    return linker
+                        .in_package_peers(&target_file, &target_name, type_like)
+                        .map(|(peer, _)| (peer.to_string(), target_name));
                 }
             }
         }
     }
 
+    let imports = import_map.get(class_file);
     if qualified {
         if let Some(id) = linker
             .entity_by_file_name
             .get(class_file)
             .and_then(|m| m.get(base_leaf))
         {
-            if is_class_like(linker.entity_kind_by_id.get(id)) {
+            if type_like(id)
+                && simple_name_may_mean(
+                    class_file,
+                    base_raw,
+                    class_file,
+                    imports,
+                    &linker.known_files,
+                )
+            {
                 return Some((class_file.to_string(), base_leaf.to_string()));
             }
         }
     }
 
+    if package_scoped && !qualified {
+        return None;
+    }
+
     let mut unique: Option<(&str, EntityId)> = None;
     if let Some(candidates) = linker.entity_by_name.get(base_leaf) {
         for (fp, id) in candidates {
+            if is_module_surface_kind(linker.entity_kind_by_id.get(id)) {
+                continue;
+            }
             match unique {
                 None => unique = Some((fp.as_str(), *id)),
                 Some((_, seen)) if seen == *id => {}
@@ -4521,7 +5954,9 @@ fn locate_base_class_incremental(
         }
     }
     if let Some((fp, id)) = unique {
-        if is_class_like(linker.entity_kind_by_id.get(&id)) {
+        if type_like(&id)
+            && simple_name_may_mean(class_file, base_raw, fp, imports, &linker.known_files)
+        {
             return Some((fp.to_string(), base_leaf.to_string()));
         }
     }
@@ -5263,22 +6698,54 @@ fn narrow_pairs_by_role<'a>(
 /// decides whether the call has a destination at all: one owner is a
 /// destination the file named, several is a choice nothing at the call site
 /// makes.
-fn owner_bound_targets<'a>(
+///
+/// An import binds a name to what its module holds, so an owner found by that
+/// name counts only when it can be what the import brings in: the import's
+/// module is a repository file, or the owner lies in the package the import
+/// names ([`lies_in_package`]). `import org.slf4j.Logger` names no repository
+/// `Logger`. That refusal needs a module path the linker can place. A path
+/// written from an alias root may name the owner's file
+/// ([`aliased_module_path_names_file`]), and a `::` crate path is placed only
+/// by a project authority that owns the importing file: a crate is not a
+/// directory, and a workspace crate `grep` can hand on `crates/regex` as
+/// `grep::regex`. With `crate_paths_placed` false such a path is placed
+/// nowhere, so it refuses no owner of the imported name. This tier offers
+/// candidates only; the receiver-origin tier, which proves a destination,
+/// still requires the path to be placed.
+fn owner_bound_targets<'a, S>(
     leaf: &str,
+    importer_file: &str,
     file_imports: Option<&HashMap<&'a str, (&'a str, &'a str)>>,
-    mut named_ids: impl FnMut(&str, &mut Vec<EntityId>),
-) -> HashMap<EntityId, &'a str> {
+    known_files: &HashSet<S>,
+    crate_paths_placed: bool,
+    mut named_ids: impl FnMut(&str, &mut Vec<(String, EntityId)>),
+) -> HashMap<EntityId, &'a str>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     let mut bound = HashMap::new();
     let Some(file_imports) = file_imports else {
         return bound;
     };
-    for local_name in file_imports.keys() {
+    for (local_name, &(module_path, original)) in file_imports {
         let mut ids = Vec::new();
         for key in receiver_method_keys(local_name, leaf) {
             named_ids(&key, &mut ids);
         }
-        for id in ids {
-            bound.insert(id, *local_name);
+        if ids.is_empty() {
+            continue;
+        }
+        let in_repository = resolve_module_path(importer_file, module_path, known_files).is_some()
+            || names_the_importing_crate(module_path);
+        let unplaced_crate_path = !crate_paths_placed && module_path.contains("::");
+        for (file, id) in ids {
+            if in_repository
+                || unplaced_crate_path
+                || lies_in_package(&file, import_package(module_path, original))
+                || aliased_module_path_names_file(module_path, &file)
+            {
+                bound.insert(id, *local_name);
+            }
         }
     }
     bound
@@ -5325,6 +6792,21 @@ fn settle_receiver_method_owner<'a>(
     } else {
         Vec::new()
     }
+}
+
+/// Whether [`settle_receiver_method_owner`] can name an owner for a call
+/// written in a file of `language`, that is, whether that language's imports
+/// bind the names of types.
+///
+/// The owner rule reads the types a file can hold from the names its imports
+/// bind. A Go import binds a package, and every type of the file's own package
+/// is in scope without one, so no Go import names an owner, and the rule would
+/// drop every candidate of every Go call through a receiver the value-origin
+/// facts could not type. The Go adapter records such a receiver so the facts
+/// can type it; where they cannot, the call keeps the bare-name candidates it
+/// had before the receiver was recorded.
+fn imports_name_receiver_owners(language: Option<&LanguageId>) -> bool {
+    language != Some(&LanguageId::Go)
 }
 
 /// Confidence for a call through a receiver the file's own imports bind to a
@@ -5416,6 +6898,472 @@ where
     (resolved != target_file).then_some(resolved)
 }
 
+/// Parser rule on the evidence of an edge the module fork tier emitted.
+///
+/// The record is span-free, like the raise-target marker: the call site keeps
+/// its own spanned record, so this one adds no occurrence. `source_path` names
+/// the fork stub the importer wrote and `resolved_path` names the variant file
+/// the destination was reached through. A destination two variants both reach
+/// carries one record per variant.
+pub const MODULE_FORK_EVIDENCE_RULE: &str = "module_fork:v1";
+
+/// Source extensions of an ECMAScript module, the files whose `export * from`
+/// and `export { .. } from` statements hand names on to their importers.
+const ECMASCRIPT_MODULE_EXTENSIONS: &[&str] =
+    &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
+
+/// The directory name a build's module aliases live in, beside the stub they
+/// replace.
+const MODULE_FORKS_DIR: &str = "forks";
+
+/// How many re-export hops an import may follow past the module it names.
+///
+/// Barrels in real repositories nest two or three deep. The bound keeps a long
+/// or cyclic chain from turning one call into a walk over the repository.
+const MODULE_REEXPORT_MAX_HOPS: usize = 4;
+
+fn is_ecmascript_module_path(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| ECMASCRIPT_MODULE_EXTENSIONS.contains(&ext))
+}
+
+/// A TypeScript declaration file describes a module and is never a build
+/// alias for one.
+fn is_declaration_file_name(name: &str) -> bool {
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// What an ECMAScript module hands on from other modules, read from its own
+/// import records.
+///
+/// `export * from './x'` is recorded as a specifier named `*`, and every other
+/// name the module binds from another module (`import { a }`, `export { a }
+/// from`, `export * as ns from`) as a local name with the name it has in that
+/// module. The records do not say which bindings the module also exports. An
+/// importer that asks a module for a name the module binds by import is only
+/// valid when the module exports that binding, so following it answers the
+/// question the importer asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleForwards {
+    /// `export * from` specifiers, in source order, each once.
+    star: Vec<String>,
+    /// (local name, specifier, name in that module), sorted and deduplicated.
+    named: Vec<(String, String, String)>,
+}
+
+impl ModuleForwards {
+    /// The bindings this module holds under `name`.
+    fn bindings(&self, name: &str) -> &[(String, String, String)] {
+        let start = self
+            .named
+            .partition_point(|(local, _, _)| local.as_str() < name);
+        let end = start
+            + self.named[start..]
+                .iter()
+                .take_while(|(local, _, _)| local == name)
+                .count();
+        &self.named[start..end]
+    }
+}
+
+/// The forwards of one parsed file, or `None` when it is not an ECMAScript
+/// module or binds nothing from another module.
+fn module_forwards_of(file: &FileParseData) -> Option<ModuleForwards> {
+    if !is_ecmascript_module_path(&file.file_path) {
+        return None;
+    }
+    let mut forwards = ModuleForwards::default();
+    for import in &file.imports {
+        for spec in &import.specifiers {
+            if spec.local_name == "*" {
+                if !forwards.star.contains(&import.module_path) {
+                    forwards.star.push(import.module_path.clone());
+                }
+                continue;
+            }
+            let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
+            forwards.named.push((
+                spec.local_name.clone(),
+                import.module_path.clone(),
+                original.to_string(),
+            ));
+        }
+    }
+    forwards.named.sort();
+    forwards.named.dedup();
+    (!forwards.star.is_empty() || !forwards.named.is_empty()).then_some(forwards)
+}
+
+/// What one name reached through a module's re-exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedName {
+    /// No declaration was reached.
+    Missing,
+    /// Exactly one declaration was reached.
+    One(EntityId),
+    /// Two routes reached different declarations. ECMAScript exports neither,
+    /// and the linker binds neither.
+    Ambiguous,
+}
+
+impl ForwardedName {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Ambiguous, _) | (_, Self::Ambiguous) => Self::Ambiguous,
+            (Self::One(left), Self::One(right)) if left != right => Self::Ambiguous,
+            (Self::One(id), _) | (_, Self::One(id)) => Self::One(id),
+            (Self::Missing, Self::Missing) => Self::Missing,
+        }
+    }
+}
+
+/// Module forwards and fork families, as the pinned-import tier reads them.
+///
+/// The batch linker records every file it parsed in `fresh`. The incremental
+/// linker records the files this step parsed in `fresh`, where an entry of
+/// `None` hides whatever an earlier parse of that file recorded, and reads
+/// every other file from the forwards it retained when that file was last
+/// parsed. Both then answer through [`resolve_import_pinned_target`], so a
+/// cold, incremental and reopened graph bind one import the same way.
+struct ModuleForwarding<'a> {
+    fresh: HashMap<&'a str, Option<ModuleForwards>>,
+    retained: Option<&'a HashMap<String, ModuleForwards>>,
+    forks: ModuleForkIndex,
+}
+
+impl<'a> ModuleForwarding<'a> {
+    fn batch<'s>(
+        files: &[&'a FileParseData],
+        known_files: impl IntoIterator<Item = &'s str>,
+    ) -> Self {
+        Self {
+            fresh: files
+                .iter()
+                .filter_map(|file| {
+                    module_forwards_of(file)
+                        .map(|forwards| (file.file_path.as_str(), Some(forwards)))
+                })
+                .collect(),
+            retained: None,
+            forks: module_fork_index(known_files),
+        }
+    }
+
+    fn incremental(files: &'a [FileParseData], linker: &'a IncrementalLinker) -> Self {
+        Self {
+            fresh: files
+                .iter()
+                .map(|file| (file.file_path.as_str(), module_forwards_of(file)))
+                .collect(),
+            retained: Some(&linker.module_forwards_by_file),
+            forks: module_fork_index(linker.known_files.iter().map(String::as_str)),
+        }
+    }
+
+    fn forwards_of(&self, file: &str) -> Option<&ModuleForwards> {
+        match self.fresh.get(file) {
+            Some(fresh) => fresh.as_ref(),
+            None => self.retained?.get(file),
+        }
+    }
+}
+
+/// The declaration `name` reaches through the re-exports of `module_file`.
+fn forwarded_declaration<S>(
+    forwarding: &ModuleForwarding<'_>,
+    module_file: &str,
+    name: &str,
+    known_files: &HashSet<S>,
+    lookup_in_file: &dyn Fn(&str, &str) -> Option<EntityId>,
+) -> ForwardedName
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let mut seen = HashMap::new();
+    reach_forwarded_name(
+        forwarding,
+        module_file,
+        name,
+        MODULE_REEXPORT_MAX_HOPS,
+        known_files,
+        lookup_in_file,
+        &mut seen,
+    )
+}
+
+/// One step of [`forwarded_declaration`].
+///
+/// A declaration in the module itself answers first. Otherwise a plain named
+/// binding under the name is followed, and so is every `export * from`; two
+/// routes that reach different declarations are ambiguous and bind nothing.
+///
+/// `seen` holds the most hops any earlier visit of a `(module, name)` pair had
+/// left. A later visit with no more than that learns nothing new, so it stops,
+/// which keeps a cycle finite and a diamond from being walked twice.
+#[allow(clippy::too_many_arguments)]
+fn reach_forwarded_name<S>(
+    forwarding: &ModuleForwarding<'_>,
+    module_file: &str,
+    name: &str,
+    hops_left: usize,
+    known_files: &HashSet<S>,
+    lookup_in_file: &dyn Fn(&str, &str) -> Option<EntityId>,
+    seen: &mut HashMap<(String, String), usize>,
+) -> ForwardedName
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    if let Some(dst_id) = lookup_in_file(module_file, name) {
+        return ForwardedName::One(dst_id);
+    }
+    if hops_left == 0 {
+        return ForwardedName::Missing;
+    }
+    let key = (module_file.to_string(), name.to_string());
+    if seen
+        .get(&key)
+        .is_some_and(|&seen_hops| seen_hops >= hops_left)
+    {
+        return ForwardedName::Missing;
+    }
+    seen.insert(key, hops_left);
+    let Some(forwards) = forwarding.forwards_of(module_file) else {
+        return ForwardedName::Missing;
+    };
+    let hop = |specifier: &str| {
+        resolve_module_path(module_file, specifier, known_files)
+            .filter(|target| target != module_file)
+    };
+
+    // A name the module binds itself. Only a plain named binding can be
+    // followed; a default or namespace binding under this name names no
+    // declaration, and two bindings under one name are not one answer.
+    let named = match forwards.bindings(name) {
+        [] => ForwardedName::Missing,
+        [(_, specifier, original)] if original != "*" && original != "default" => {
+            match hop(specifier) {
+                Some(target) => reach_forwarded_name(
+                    forwarding,
+                    &target,
+                    original,
+                    hops_left - 1,
+                    known_files,
+                    lookup_in_file,
+                    seen,
+                ),
+                None => ForwardedName::Missing,
+            }
+        }
+        _ => return ForwardedName::Missing,
+    };
+
+    // `export *` never hands on a default export.
+    let mut starred = ForwardedName::Missing;
+    if name != "default" {
+        for specifier in &forwards.star {
+            let Some(target) = hop(specifier) else {
+                continue;
+            };
+            starred = starred.combine(reach_forwarded_name(
+                forwarding,
+                &target,
+                name,
+                hops_left - 1,
+                known_files,
+                lookup_in_file,
+                seen,
+            ));
+            if starred == ForwardedName::Ambiguous {
+                break;
+            }
+        }
+    }
+    named.combine(starred)
+}
+
+/// Every declaration `name` reaches through the fork family of `stub`, one
+/// entry per distinct declaration with the variant files that reach it.
+///
+/// Each variant gets its own re-export budget. A variant whose export reaches
+/// no declaration, such as a value read off a configuration object the build
+/// passes in, contributes no member.
+fn module_fork_members<S>(
+    forwarding: &ModuleForwarding<'_>,
+    stub: &str,
+    name: &str,
+    known_files: &HashSet<S>,
+    lookup_in_file: &dyn Fn(&str, &str) -> Option<EntityId>,
+) -> Vec<ModuleForkMember>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let mut members: Vec<ModuleForkMember> = Vec::new();
+    for variant in module_fork_variants(&forwarding.forks, stub) {
+        let ForwardedName::One(dst_id) =
+            forwarded_declaration(forwarding, &variant, name, known_files, lookup_in_file)
+        else {
+            continue;
+        };
+        match members.iter_mut().find(|member| member.dst_id == dst_id) {
+            Some(member) => member.variants.push(variant),
+            None => members.push(ModuleForkMember {
+                dst_id,
+                variants: vec![variant],
+            }),
+        }
+    }
+    members
+}
+
+/// Every module fork family in the repository, read off its file paths.
+///
+/// A family is a stub module `<dir>/<name>.<ext>` and the variant files
+/// `<dir>/forks/<name>.<variant>.<ext>` a build aliases it to. Only the
+/// variant half is indexed here: whether a module is a stub depends on the
+/// name an importer asks it for, which [`resolve_import_pinned_target`]
+/// decides.
+#[derive(Debug, Default)]
+struct ModuleForkIndex {
+    /// `<dir>/forks` -> the ECMAScript file names directly inside it, sorted.
+    names_by_forks_dir: HashMap<String, Vec<String>>,
+}
+
+/// Index the variant files of every fork family among `known_files`.
+fn module_fork_index<'s>(known_files: impl IntoIterator<Item = &'s str>) -> ModuleForkIndex {
+    let mut names_by_forks_dir: HashMap<String, Vec<String>> = HashMap::new();
+    for path in known_files {
+        if !is_ecmascript_module_path(path) {
+            continue;
+        }
+        let Some((dir, name)) = path.rsplit_once('/') else {
+            continue;
+        };
+        let in_forks_dir = dir == MODULE_FORKS_DIR
+            || dir
+                .rsplit_once('/')
+                .is_some_and(|(_, last)| last == MODULE_FORKS_DIR);
+        if in_forks_dir && !is_declaration_file_name(name) {
+            names_by_forks_dir
+                .entry(dir.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+    }
+    for names in names_by_forks_dir.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    ModuleForkIndex { names_by_forks_dir }
+}
+
+/// The variant files of `stub`, sorted, or none when it has no family.
+fn module_fork_variants(index: &ModuleForkIndex, stub: &str) -> Vec<String> {
+    if !is_ecmascript_module_path(stub) {
+        return Vec::new();
+    }
+    let (dir, name) = stub.rsplit_once('/').unwrap_or(("", stub));
+    let Some((stem, _)) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) else {
+        return Vec::new();
+    };
+    let forks_dir = if dir.is_empty() {
+        MODULE_FORKS_DIR.to_string()
+    } else {
+        format!("{dir}/{MODULE_FORKS_DIR}")
+    };
+    let Some(names) = index.names_by_forks_dir.get(&forks_dir) else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .filter(|name| {
+            name.strip_prefix(stem)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .and_then(|rest| rest.rsplit_once('.'))
+                .is_some_and(|(variant, _)| !variant.is_empty())
+        })
+        .map(|name| format!("{forks_dir}/{name}"))
+        .collect()
+}
+
+/// One destination of an import from a fork stub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModuleForkMember {
+    dst_id: EntityId,
+    /// The variant files that reach this declaration, sorted.
+    variants: Vec<String>,
+}
+
+/// Mark a relation the module fork tier emitted with the stub and the variant
+/// files its destination was reached through.
+///
+/// The records are span-free, so the call site's own record and its occurrence
+/// certificate are unchanged. The certificate is still re-minted so the
+/// relation leaves here in the canonical evidence order.
+fn qualify_module_fork(mut relation: Relation, stub: &str, variants: &[String]) -> Relation {
+    crate::occurrence::remove_fresh_proofs(&mut relation);
+    for variant in variants {
+        relation.evidence.push(RelationEvidence {
+            parser_rule: Some(MODULE_FORK_EVIDENCE_RULE.to_string()),
+            source_path: Some(stub.to_string()),
+            resolved_path: Some(variant.clone()),
+            ..RelationEvidence::default()
+        });
+    }
+    crate::occurrence::stamp_fresh(&mut relation);
+    relation
+}
+
+/// What each `Imports` edge among `relations` whose evidence sits in `path`
+/// lands on, for a census that asks what an import statement binds. An edge
+/// binds exactly its target's own definition when it is proven, is no member
+/// of a module fork family, whose set a build chooses from, and lands on a
+/// function, a method or a class. A variable may hold what another
+/// declaration defines, and a module is no declaration of the name.
+pub fn written_imports<'r>(
+    relations: impl Iterator<Item = &'r Relation>,
+    path: &str,
+    kind_of: impl Fn(EntityId) -> Option<EntityKind>,
+) -> Vec<kin_db::call_site_escape::WrittenImport> {
+    let mut written = Vec::new();
+    for relation in relations {
+        if relation.kind != RelationKind::Imports {
+            continue;
+        }
+        let Some(target) = relation.dst.as_entity() else {
+            continue;
+        };
+        let exact = crate::resolution::RelationResolution::of(relation).is_proven()
+            && !relation
+                .evidence
+                .iter()
+                .any(|evidence| evidence.parser_rule.as_deref() == Some(MODULE_FORK_EVIDENCE_RULE))
+            && matches!(
+                kind_of(target),
+                Some(EntityKind::Function | EntityKind::Method | EntityKind::Class)
+            );
+        for evidence in &relation.evidence {
+            let Some(span) = evidence
+                .source_span
+                .as_ref()
+                .filter(|span| span.file.0 == path)
+            else {
+                continue;
+            };
+            written.push(kin_db::call_site_escape::WrittenImport {
+                start: span.start_byte,
+                end: span.end_byte,
+                token: evidence.token.clone(),
+                target,
+                exact,
+            });
+        }
+    }
+    written
+}
+
 /// The single file a receiver's module hands its callee off to, when the
 /// receiver's own file does not define it.
 ///
@@ -5487,6 +7435,16 @@ where
 /// create a value. This is not persisted graph authority by itself.
 #[derive(Debug, Clone)]
 pub struct BoundImportWitness(Arc<ExactImportWitness>);
+
+impl BoundImportWitness {
+    /// Conservative byte charge for the immutable witness and its file key.
+    /// This is a cache resource budget, not a measurement of process RSS.
+    pub fn retained_size_hint(&self) -> usize {
+        serde_json::to_vec(&*self.0).map_or(usize::MAX, |bytes| {
+            bytes.len().saturating_mul(4).saturating_add(512)
+        })
+    }
+}
 
 pub fn bind_import_witness(
     file_path: &str,
@@ -5589,6 +7547,7 @@ fn witnessed_import_site<'a>(
             && pin.caller == rel.src_name
             && pin.local == rel.dst_name
             && pin.kind == kind
+            && pin.receiver == rel.receiver
             && rel.import_source.as_deref() == Some(pin.module.as_str())
     });
     let pin = sites.next()?;
@@ -5868,6 +7827,7 @@ where
             known_files,
             witnesses,
             source_bindings,
+            pin.receiver.is_some(),
         )?;
         let mut original = pin.original.clone();
         let mut seen = HashSet::new();
@@ -5879,8 +7839,14 @@ where
             // admitted source slice. Legacy/unbound carriers cannot prove it.
             let target_witness = witnesses.get(&target)?;
             source_bindings.insert(target.clone(), target_witness.source_digest.clone());
-            if let Some(id) = lookup(&target, &original, rel.kind) {
-                return Some((id, target));
+            if target_witness
+                .python_declarations
+                .as_ref()
+                .is_none_or(|names| names.contains(&original))
+            {
+                if let Some(id) = lookup(&target, &original, rel.kind) {
+                    return Some((id, target));
+                }
             }
             let next = target_witness.python_reexports.get(&original)?;
             original = next.original.clone();
@@ -5891,6 +7857,7 @@ where
                 known_files,
                 witnesses,
                 source_bindings,
+                false,
             )?;
         }
         None
@@ -5997,11 +7964,12 @@ fn resolve_exact_python_module<S>(
     known: &HashSet<S>,
     witnesses: &HashMap<String, Arc<ExactImportWitness>>,
     source_bindings: &mut BTreeMap<String, String>,
+    namespace_read: bool,
 ) -> Option<String>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
-    let mut package_usable = |dir: &str| {
+    let mut package_usable = |dir: &str, child: Option<&str>| {
         if dir.is_empty() {
             return false;
         }
@@ -6022,6 +7990,16 @@ where
             return false;
         };
         source_bindings.insert(initializers[0].clone(), witness.source_digest.clone());
+        if let Some(child) = child {
+            if witness.python_namespace_hazards
+                || witness
+                    .python_module_bindings
+                    .as_ref()
+                    .is_none_or(|names| names.contains(child))
+            {
+                return false;
+            }
+        }
         true
     };
     let level = module.bytes().take_while(|byte| *byte == b'.').count();
@@ -6036,7 +8014,7 @@ where
     }
     let roots = if level > 0 {
         let mut base = parent_dir(importer).to_string();
-        if !package_usable(&base) {
+        if !package_usable(&base, None) {
             return None;
         }
         for _ in 1..level {
@@ -6044,7 +8022,7 @@ where
                 return None;
             }
             base = parent_dir(&base).to_string();
-            if !package_usable(&base) {
+            if !package_usable(&base, None) {
                 return None;
             }
         }
@@ -6058,17 +8036,17 @@ where
     let mut matches = HashSet::new();
     for root in roots {
         let mut package = root.clone();
-        let parents_usable =
-            segments
-                .iter()
-                .take(segments.len().saturating_sub(1))
-                .all(|segment| {
-                    if !package.is_empty() {
-                        package.push('/');
-                    }
-                    package.push_str(segment);
-                    package_usable(&package)
-                });
+        let parents_usable = segments
+            .iter()
+            .take(segments.len().saturating_sub(1))
+            .enumerate()
+            .all(|(index, segment)| {
+                if !package.is_empty() {
+                    package.push('/');
+                }
+                package.push_str(segment);
+                package_usable(&package, namespace_read.then_some(segments[index + 1]))
+            });
         if !parents_usable {
             continue;
         }
@@ -6099,6 +8077,13 @@ where
 enum ImportPinnedTarget {
     /// The pinned module resolved and names exactly one local target.
     Resolved(EntityId),
+    /// The pinned module is a fork stub: it hands on none of the name, and
+    /// the variants a build may alias it to reach these declarations. The set
+    /// is enumerated, never proven closed.
+    ModuleFork {
+        stub: String,
+        members: Vec<ModuleForkMember>,
+    },
     /// The relation is pinned to a module — external, or local without the
     /// symbol — so name-global fallbacks must not run: binding a pinned callee
     /// to a same-named entity in an unrelated file mints a false consumer.
@@ -6112,6 +8097,12 @@ enum ImportPinnedTarget {
 /// pinned to `github.com/.../pr/create`). Looks up the symbol in the resolved
 /// module file first, then uniquely within that file's directory (a Go package
 /// spans multiple files).
+///
+/// An ECMAScript module that does not declare the name is read for what it
+/// hands on: a named re-export or an `export * from`, followed for a bounded
+/// number of hops, is an ordinary pinned resolution when it reaches exactly one
+/// declaration. When it reaches none and the module has a fork family, the
+/// declarations the variants reach are returned as a module fork.
 fn resolve_import_pinned_target<S>(
     rel: &ExtractedRelation,
     caller_file: &str,
@@ -6119,6 +8110,7 @@ fn resolve_import_pinned_target<S>(
     allow_package_siblings: bool,
     lookup_in_file: impl Fn(&str, &str) -> Option<EntityId>,
     same_name_candidates: &[(&str, EntityId)],
+    forwarding: &ModuleForwarding<'_>,
 ) -> ImportPinnedTarget
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
@@ -6147,6 +8139,31 @@ where
     let lookup_name = target_member.as_deref().unwrap_or(&rel.dst_name);
     if let Some(dst_id) = lookup_in_file(&target_file, lookup_name) {
         return ImportPinnedTarget::Resolved(dst_id);
+    }
+    if target_member.is_none() && is_ecmascript_module_path(&target_file) {
+        let forwarded = forwarded_declaration(
+            forwarding,
+            &target_file,
+            lookup_name,
+            known_files,
+            &lookup_in_file,
+        );
+        if let ForwardedName::One(dst_id) = forwarded {
+            return ImportPinnedTarget::Resolved(dst_id);
+        }
+        let members = module_fork_members(
+            forwarding,
+            &target_file,
+            lookup_name,
+            known_files,
+            &lookup_in_file,
+        );
+        if !members.is_empty() {
+            return ImportPinnedTarget::ModuleFork {
+                stub: target_file,
+                members,
+            };
+        }
     }
     if !allow_package_siblings {
         return ImportPinnedTarget::PinnedMiss;
@@ -6253,6 +8270,8 @@ pub(crate) fn relation_evidence(
         RelationSyntacticRole::JsImportedGetterReceiver => {
             JS_IMPORTED_GETTER_REFERENCE_RULE.to_string()
         }
+        RelationSyntacticRole::ModuleContains => "module_contains".to_string(),
+        RelationSyntacticRole::LexicalContains => "lexical_contains".to_string(),
     });
     if evidence.is_empty() {
         let mut only = RelationEvidence {
@@ -6488,7 +8507,7 @@ pub fn trace_crossing_for(entity: &Entity, reached_by: Option<&Relation>) -> Opt
     if let Some(specifier) = specifier {
         return Some(TraceCrossing {
             note: format!(
-                "the importing file named `{specifier}`; the graph holds no entities for what that resolves to"
+                "the importing module named `{specifier}`; the graph holds no entities for what that resolves to"
             ),
             status: "named".to_string(),
             specifier: Some(specifier),
@@ -6816,6 +8835,7 @@ fn make_artifact_import_relation(
 /// repository holds answers to it, which is what `known_files` decides here,
 /// and which is strictly better evidence than the syntactic bare-specifier
 /// proxy JavaScript uses.
+#[cfg(test)]
 fn import_resolution_counts<S>(
     file_path: &str,
     imports: &[FileImport],
@@ -6824,14 +8844,52 @@ fn import_resolution_counts<S>(
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
-    let resolved = imports
-        .iter()
-        .filter(|import| resolve_import_target(file_path, import, known_files).is_some())
-        .count();
-    ImportResolutionCounts {
-        statements: imports.len(),
-        resolved,
+    import_outcomes(file_path, imports, known_files, &HashSet::new()).0
+}
+
+/// [`import_resolution_counts`], with the outcome of every import that reached
+/// no repository file: provably external when the repository holds nothing
+/// named by its specifier's root (see [`crate::coverage_certificate`]), and
+/// listed as unresolved otherwise.
+fn import_outcomes<S>(
+    file_path: &str,
+    imports: &[FileImport],
+    known_files: &HashSet<S>,
+    names: &HashSet<String>,
+) -> (
+    ImportResolutionCounts,
+    crate::coverage_certificate::ImportOutcomes,
+)
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let file = FilePathId::new(file_path);
+    let mut resolved = 0;
+    let mut outcomes = crate::coverage_certificate::ImportOutcomes::default();
+    for import in imports {
+        if resolve_import_target(file_path, import, known_files).is_some() {
+            resolved += 1;
+        } else if crate::coverage_certificate::provably_external(
+            &crate::coverage_certificate::specifier_root(file_path, import),
+            names,
+        ) {
+            outcomes.external += 1;
+        } else {
+            outcomes
+                .unresolved
+                .push(crate::coverage_certificate::UnresolvedImportEntry {
+                    specifier: import.module_path.clone(),
+                    span: import.site.to_source_span(&file),
+                });
+        }
     }
+    (
+        ImportResolutionCounts {
+            statements: imports.len(),
+            resolved,
+        },
+        outcomes,
+    )
 }
 
 /// A file's import statements and how many of them reached this repository.
@@ -6872,16 +8930,24 @@ fn module_entity_by_file<'a>(files: &[&'a FileParseData]) -> HashMap<&'a str, En
                 .filter(|entity| entity.kind == EntityKind::Module)
         };
         let selected = if modules().any(|entity| entity.language == LanguageId::Rust) {
-            // Stored entities may arrive in identity order. Rust also emits
-            // modules declared inside the file, so parser insertion order is
-            // not authority for which one owns the file's imports.
-            kin_parser::adapter::file_module_surface_name(None, &FilePathId::new(&file.file_path))
-                .and_then(|name| {
-                    modules()
-                        .find(|entity| entity.language == LanguageId::Rust && entity.name == name)
-                })
+            // Stored entities may arrive in identity order, and Rust also
+            // emits modules declared inside the file, so neither list order
+            // nor a name is authority for which one owns the file's imports: a
+            // crate root is named by its crate, which its path does not spell,
+            // and may declare a module of that same name. Its own module names
+            // the file in its signature, and without one nothing owns them.
+            modules().find(|entity| {
+                entity.language == LanguageId::Rust && kin_model::is_file_module_surface(entity)
+            })
         } else {
-            modules().next()
+            // The unit's own module, which names the unit in its signature. A
+            // namespace or a declared module (`declare module 'x' {}`) is a
+            // module too, and an adapter that walks declarations first emits
+            // those before the unit's own, so the first module in the list
+            // sourced every import edge in such a unit from a namespace.
+            modules()
+                .find(|entity| kin_model::is_file_module_surface(entity))
+                .or_else(|| modules().next())
         };
         if let Some(entity) = selected {
             out.entry(file.file_path.as_str()).or_insert(entity.id);
@@ -7027,6 +9093,37 @@ where
 /// Parser rule recorded on an entity-level import edge, so a consumer can tell
 /// one apart from the artifact edge that shares its import.
 const IMPORT_SPECIFIER_BINDING_RULE: &str = "import_specifier_binding";
+
+/// The local names other files import `focal` under, when those differ from
+/// the name `focal` declares, read off the entity-level import edges into it.
+///
+/// A call written through an alias, `ReactBrowserEventEmitterSetEnabled(...)`
+/// after `import {setEnabled as ReactBrowserEventEmitterSetEnabled}`, spells
+/// the alias and never the declared name. A reader that scans call sites for
+/// the ones spelling a focal's name has to scan for these too, or it rules out
+/// exactly the sites that call the focal. Each import edge records the local
+/// name it binds as its evidence token; only edges this module authors from a
+/// specifier are read, sorted and deduplicated.
+pub fn import_alias_call_names<'r>(
+    focal: &Entity,
+    incoming: impl IntoIterator<Item = &'r Relation>,
+) -> Vec<String> {
+    let declared = bare_entity_name(&focal.name);
+    let mut names: Vec<String> = incoming
+        .into_iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Imports && relation.dst == GraphNodeId::Entity(focal.id)
+        })
+        .flat_map(|relation| relation.evidence.iter())
+        .filter(|record| record.parser_rule.as_deref() == Some(IMPORT_SPECIFIER_BINDING_RULE))
+        .filter_map(|record| record.token.as_deref())
+        .filter(|local| !local.is_empty() && *local != declared && *local != "*")
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
 
 /// Per-file declared-base counts for the coverage certificate.
 ///
@@ -7230,6 +9327,17 @@ where
     Some(out)
 }
 
+/// The id a file's coverage certificate carries.
+///
+/// The certificate is the self-loop on the file's artifact, and its id is
+/// derived from that loop alone, so a reader that holds one artifact can fetch
+/// its certificate by id instead of walking the artifact's adjacency, which
+/// also holds every import edge into and out of the file.
+pub fn parse_coverage_relation_id(artifact_id: ArtifactId) -> RelationId {
+    let node = GraphNodeId::Artifact(artifact_id);
+    stable_relation_node_id(&node, &node, &RelationKind::DependsOn)
+}
+
 /// Build the graph-owned file-level call-coverage certificate used by
 /// ref-scoped review. Coverage state lives in relation evidence; history paths
 /// compare the complete relation payload and replace changed evidence.
@@ -7245,6 +9353,9 @@ fn make_parse_coverage_relation(
     // instead of publishing `declared 0, bound 0` for a file that declares
     // bases. Same rule the call bucket already follows for an unmeasured file.
     bases: Option<BaseResolutionCounts>,
+    // The per-fact detail entries. `None` rebuilds a certificate an earlier
+    // build minted before they existed, for the superseded-format check.
+    detail: Option<&crate::coverage_certificate::CertificateDetail>,
 ) -> Relation {
     let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
     let (parser_rule, token) = if !call_extraction_complete {
@@ -7303,6 +9414,9 @@ fn make_parse_coverage_relation(
                     ..RelationEvidence::default()
                 });
             }
+            if let Some(detail) = detail {
+                evidence.extend(detail.evidence(file_path));
+            }
             evidence
         },
     }
@@ -7319,6 +9433,16 @@ pub fn build_parse_coverage_relation<S>(
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
+    let names = crate::coverage_certificate::repository_names(
+        known_files.iter().map(std::borrow::Borrow::borrow),
+    );
+    let (imports, outcomes) = import_outcomes(&file.file_path, &file.imports, known_files, &names);
+    let detail = crate::coverage_certificate::CertificateDetail::of_file(
+        &file.file_path,
+        &file.relations,
+        Some(completeness),
+        outcomes,
+    );
     let mut relation = make_parse_coverage_relation(
         &file.file_path,
         artifact_id,
@@ -7327,11 +9451,12 @@ where
             .relations
             .iter()
             .any(is_call_extraction_incomplete_marker),
-        import_resolution_counts(&file.file_path, &file.imports, known_files),
+        imports,
         // No link context here, so the base bucket is unmeasured rather than
         // empty. Binding a declared base needs the repository class universe
         // and this file's import map, and a whole-file builder has neither.
         None,
+        Some(&detail),
     );
     if let Some(digest) = unanimous_entity_source_digest(&file.entities) {
         bind_parse_coverage_source(&mut relation, &file.file_path, digest);
@@ -7347,12 +9472,69 @@ pub fn build_incremental_parse_coverage_relation(
     completeness: &ParseCompleteness,
     linker: &IncrementalLinker,
 ) -> Relation {
-    let overlays = build_incremental_link_overlays(std::slice::from_ref(file), linker);
+    incremental_parse_coverage_relation(file, artifact_id, completeness, linker, None)
+}
+
+/// [`build_incremental_parse_coverage_relation`], reading the value-origin
+/// facts of files outside the step through `graph`, so a receiver proof whose
+/// chain crosses into another file (a fixture in a `conftest.py`, say) is
+/// recorded exactly as a cold link records it.
+pub fn build_incremental_parse_coverage_relation_with_graph<G: EntityStore>(
+    file: &FileParseData,
+    artifact_id: ArtifactId,
+    completeness: &ParseCompleteness,
+    linker: &IncrementalLinker,
+    graph: &G,
+) -> Relation {
+    let read_entity = |id: &EntityId| graph.get_entity(id).ok().flatten();
+    incremental_parse_coverage_relation(file, artifact_id, completeness, linker, Some(&read_entity))
+}
+
+fn incremental_parse_coverage_relation(
+    file: &FileParseData,
+    artifact_id: ArtifactId,
+    completeness: &ParseCompleteness,
+    linker: &IncrementalLinker,
+    source: Option<EntitySource<'_>>,
+) -> Relation {
+    let mut overlays = build_incremental_link_overlays(std::slice::from_ref(file), linker);
+    if source.is_some() {
+        overlays.origin_bindings = incremental_origin_bindings(
+            std::slice::from_ref(file),
+            linker,
+            &overlays.import_map,
+            &overlays.class_bases,
+            source,
+        );
+    }
     let base_counts = base_resolution_counts_incremental(
         std::slice::from_ref(file),
         linker,
         &overlays.import_map,
     );
+    let names = crate::coverage_certificate::repository_names(
+        linker.known_files.iter().map(String::as_str),
+    );
+    let (imports, outcomes) =
+        import_outcomes(&file.file_path, &file.imports, &linker.known_files, &names);
+    let detail = crate::coverage_certificate::CertificateDetail::of_file(
+        &file.file_path,
+        &file.relations,
+        Some(completeness),
+        outcomes,
+    )
+    .with_receiver_outside(outside_entries(
+        overlays.origin_bindings.outside.get(&file.file_path),
+    ))
+    .with_receiver_outside_reads(read_entries(
+        overlays.origin_bindings.outside.get(&file.file_path),
+    ))
+    .with_receiver_typed_reads(typed_read_entries(
+        overlays.origin_bindings.outside.get(&file.file_path),
+    ))
+    .with_receiver_origin_gaps(gap_entries(
+        overlays.origin_bindings.outside.get(&file.file_path),
+    ));
     let mut relation = make_parse_coverage_relation(
         &file.file_path,
         artifact_id,
@@ -7361,13 +9543,14 @@ pub fn build_incremental_parse_coverage_relation(
             .relations
             .iter()
             .any(is_call_extraction_incomplete_marker),
-        import_resolution_counts(&file.file_path, &file.imports, &linker.known_files),
+        imports,
         Some(
             base_counts
                 .get(file.file_path.as_str())
                 .copied()
                 .unwrap_or_default(),
         ),
+        Some(&detail),
     );
     if let Some(digest) = unanimous_entity_source_digest(&file.entities) {
         bind_parse_coverage_source(&mut relation, &file.file_path, digest);
@@ -7417,6 +9600,87 @@ pub fn unanimous_entity_source_digest(entities: &[Entity]) -> Option<kin_model::
         return None;
     }
     Some(digest)
+}
+
+/// The calls a file's certificate records as proved to reach no declaration
+/// of the repository, when `relation` is that file's current-format
+/// certificate and was minted from the body `body`. Empty otherwise: a
+/// certificate for another body names byte ranges that may not be calls any
+/// more.
+pub fn receiver_outside_calls(
+    relation: &Relation,
+    file_path: &str,
+    artifact_id: ArtifactId,
+    body: kin_model::Hash256,
+) -> Vec<crate::coverage_certificate::ReceiverOutsideEntry> {
+    if !is_parse_coverage_relation(relation, file_path, artifact_id)
+        || parse_coverage_source_digest(relation) != Some(body)
+    {
+        return Vec::new();
+    }
+    crate::coverage_certificate::CertificateDetail::from_certificate(relation)
+        .map(|detail| detail.receiver_outside)
+        .unwrap_or_default()
+}
+
+/// The member reads a file's certificate records as proved to read no
+/// declaration of the repository, when `relation` is that file's
+/// current-format certificate and was minted from the body `body`. Empty
+/// otherwise, as [`receiver_outside_calls`] is.
+pub fn receiver_outside_reads_of(
+    relation: &Relation,
+    file_path: &str,
+    artifact_id: ArtifactId,
+    body: kin_model::Hash256,
+) -> Vec<crate::coverage_certificate::ReceiverOutsideReadEntry> {
+    if !is_parse_coverage_relation(relation, file_path, artifact_id)
+        || parse_coverage_source_digest(relation) != Some(body)
+    {
+        return Vec::new();
+    }
+    crate::coverage_certificate::CertificateDetail::from_certificate(relation)
+        .map(|detail| detail.receiver_outside_reads)
+        .unwrap_or_default()
+}
+
+/// The member reads a file's certificate records with the repository class
+/// their receiver is typed as, when `relation` is that file's current-format
+/// certificate and was minted from the body `body`. Empty otherwise, as
+/// [`receiver_outside_calls`] is.
+pub fn receiver_typed_reads_of(
+    relation: &Relation,
+    file_path: &str,
+    artifact_id: ArtifactId,
+    body: kin_model::Hash256,
+) -> Vec<crate::coverage_certificate::ReceiverTypedReadEntry> {
+    if !is_parse_coverage_relation(relation, file_path, artifact_id)
+        || parse_coverage_source_digest(relation) != Some(body)
+    {
+        return Vec::new();
+    }
+    crate::coverage_certificate::CertificateDetail::from_certificate(relation)
+        .map(|detail| detail.receiver_typed_reads)
+        .unwrap_or_default()
+}
+
+/// The calls a file's certificate records as bound through a receiver chain
+/// that stops short of a method, when `relation` is that file's
+/// current-format certificate and was minted from the body `body`. Empty
+/// otherwise, as [`receiver_outside_calls`] is.
+pub fn receiver_origin_gaps(
+    relation: &Relation,
+    file_path: &str,
+    artifact_id: ArtifactId,
+    body: kin_model::Hash256,
+) -> Vec<crate::coverage_certificate::ReceiverOriginGapEntry> {
+    if !is_parse_coverage_relation(relation, file_path, artifact_id)
+        || parse_coverage_source_digest(relation) != Some(body)
+    {
+        return Vec::new();
+    }
+    crate::coverage_certificate::CertificateDetail::from_certificate(relation)
+        .map(|detail| detail.receiver_origin_gaps)
+        .unwrap_or_default()
 }
 
 /// Read the source digest only after validating the complete certificate shape.
@@ -7469,6 +9733,39 @@ pub fn is_parse_coverage_relation(
     file_path: &str,
     artifact_id: ArtifactId,
 ) -> bool {
+    certificate_matches_factory(relation, file_path, artifact_id, true)
+}
+
+/// Whether `relation` is this file's certificate as a build minted it before
+/// the per-fact detail entries existed. Its call, import and base entries still
+/// read as they always did; a re-derivation replaces it with the current
+/// format.
+pub fn is_previous_format_parse_coverage_relation(
+    relation: &Relation,
+    file_path: &str,
+    artifact_id: ArtifactId,
+) -> bool {
+    certificate_matches_factory(relation, file_path, artifact_id, false)
+}
+
+/// Whether `relation` is this file's certificate in the current format (with
+/// the per-fact detail entries) or, when `with_detail` is false, in the format
+/// an earlier build minted before those entries existed.
+fn certificate_matches_factory(
+    relation: &Relation,
+    file_path: &str,
+    artifact_id: ArtifactId,
+    with_detail: bool,
+) -> bool {
+    let detail = crate::coverage_certificate::CertificateDetail::from_certificate(relation);
+    let detail_entries = relation
+        .evidence
+        .iter()
+        .filter(|entry| crate::coverage_certificate::is_detail_entry(entry))
+        .count();
+    if with_detail != detail.is_some() || (!with_detail && detail_entries > 0) {
+        return false;
+    }
     // Entries are located by label, and the certificate's own width is then
     // required to equal the number of entries those labels account for. A
     // trailing entry nobody recognizes therefore still fails, exactly as the
@@ -7490,12 +9787,19 @@ pub fn is_parse_coverage_relation(
     };
     let bases = coverage_evidence(relation, BASE_RESOLUTION_COVERAGE_V1);
     let source = coverage_evidence(relation, PARSE_COVERAGE_SOURCE_DIGEST_V1);
-    let accounted = 2 + usize::from(bases.is_some()) + usize::from(source.is_some());
+    let accounted =
+        2 + usize::from(bases.is_some()) + usize::from(source.is_some()) + detail_entries;
     if relation.evidence.len() != accounted {
         return false;
     }
     let Some((complete, extraction)) = parse_coverage_reading(parse) else {
         return false;
+    };
+    // The detail's own completeness entry is the one that survives an
+    // incomplete call extraction; the combined entry drops it there.
+    let complete = match &detail {
+        Some(detail) => detail.parse.clone(),
+        None => complete,
     };
     let Some(resolved) = imports
         .token
@@ -7539,6 +9843,7 @@ pub fn is_parse_coverage_relation(
             resolved,
         },
         bases,
+        detail.as_ref(),
     );
     if source.is_some() {
         let Some(digest) = parse_coverage_source_digest(relation) else {
@@ -7565,6 +9870,11 @@ pub fn is_superseded_parse_coverage_relation(
     file_path: &str,
     artifact_id: ArtifactId,
 ) -> bool {
+    // The format before the per-fact detail entries: call, import, base and
+    // source entries only.
+    if certificate_matches_factory(relation, file_path, artifact_id, false) {
+        return true;
+    }
     let [parse] = relation.evidence.as_slice() else {
         return false;
     };
@@ -7580,6 +9890,7 @@ pub fn is_superseded_parse_coverage_relation(
             statements: 0,
             resolved: 0,
         },
+        None,
         None,
     );
     expected.evidence.truncate(1);
@@ -7610,12 +9921,16 @@ fn append_parse_coverage_relations<S>(
     completeness: Option<&FileParseCompletenessMap>,
     known_files: &HashSet<S>,
     base_counts: &HashMap<&str, BaseResolutionCounts>,
+    outside: &HashMap<String, ReceiverSites>,
 ) where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
     let Some(completeness) = completeness else {
         return;
     };
+    let names = crate::coverage_certificate::repository_names(
+        known_files.iter().map(std::borrow::Borrow::borrow),
+    );
     let mut seen = HashSet::new();
     for file in files {
         if seen.insert(file.file_path.as_str()) {
@@ -7626,18 +9941,31 @@ fn append_parse_coverage_relations<S>(
                 .relations
                 .iter()
                 .any(is_call_extraction_incomplete_marker);
+            let (imports, outcomes) =
+                import_outcomes(&file.file_path, &file.imports, known_files, &names);
+            let detail = crate::coverage_certificate::CertificateDetail::of_file(
+                &file.file_path,
+                &file.relations,
+                completeness.get(&file.file_path),
+                outcomes,
+            )
+            .with_receiver_outside(outside_entries(outside.get(&file.file_path)))
+            .with_receiver_outside_reads(read_entries(outside.get(&file.file_path)))
+            .with_receiver_typed_reads(typed_read_entries(outside.get(&file.file_path)))
+            .with_receiver_origin_gaps(gap_entries(outside.get(&file.file_path)));
             let mut relation = make_parse_coverage_relation(
                 &file.file_path,
                 artifact_id,
                 completeness.get(&file.file_path),
                 call_extraction_complete,
-                import_resolution_counts(&file.file_path, &file.imports, known_files),
+                imports,
                 Some(
                     base_counts
                         .get(file.file_path.as_str())
                         .copied()
                         .unwrap_or_default(),
                 ),
+                Some(&detail),
             );
             if let Some(digest) = unanimous_entity_source_digest(&file.entities) {
                 bind_parse_coverage_source(&mut relation, &file.file_path, digest);
@@ -7645,6 +9973,62 @@ fn append_parse_coverage_relations<S>(
             resolved.push(relation);
         }
     }
+}
+
+/// The certificate entries for the calls one file's receivers prove to reach
+/// outside the repository.
+fn outside_entries(
+    sites: Option<&ReceiverSites>,
+) -> Vec<crate::coverage_certificate::ReceiverOutsideEntry> {
+    sites
+        .into_iter()
+        .flat_map(|sites| sites.outside.iter())
+        .map(|site| crate::coverage_certificate::ReceiverOutsideEntry {
+            method: site.method.clone(),
+            chain: site.chain.clone(),
+            span: site.site.clone(),
+        })
+        .collect()
+}
+
+/// The certificate entries for the member reads one file's receivers prove
+/// to read nothing of the repository.
+fn read_entries(
+    sites: Option<&ReceiverSites>,
+) -> Vec<crate::coverage_certificate::ReceiverOutsideReadEntry> {
+    sites
+        .into_iter()
+        .flat_map(|sites| sites.reads.iter().cloned())
+        .collect()
+}
+
+/// The certificate entries for the member reads one file's receivers type as
+/// a class of the repository.
+fn typed_read_entries(
+    sites: Option<&ReceiverSites>,
+) -> Vec<crate::coverage_certificate::ReceiverTypedReadEntry> {
+    sites
+        .into_iter()
+        .flat_map(|sites| sites.typed_reads.iter().cloned())
+        .collect()
+}
+
+/// The certificate entries for the calls whose receiver chain one file's
+/// facts spell but cannot finish.
+fn gap_entries(
+    sites: Option<&ReceiverSites>,
+) -> Vec<crate::coverage_certificate::ReceiverOriginGapEntry> {
+    sites
+        .into_iter()
+        .flat_map(|sites| sites.gaps.iter())
+        .map(|site| crate::coverage_certificate::ReceiverOriginGapEntry {
+            receiver: site.receiver.clone(),
+            method: site.method.clone(),
+            steps: site.gap.steps.clone(),
+            missing: site.gap.missing.clone(),
+            span: site.site.clone(),
+        })
+        .collect()
 }
 
 /// Build artifact-level provenance edges for generated projection files.
@@ -7812,7 +10196,10 @@ fn is_projection_artifact_path(path: &str) -> bool {
 }
 
 /// Derive a deterministic RelationId from the (src, dst, kind) triple.
-fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> RelationId {
+///
+/// The pipeline mints same-file edges with this too. A commit seals those
+/// ids, and a daemon start re-derives the tree through the linker.
+pub fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> RelationId {
     stable_relation_node_id(&GraphNodeId::Entity(*src), &GraphNodeId::Entity(*dst), kind)
 }
 
@@ -8055,6 +10442,59 @@ where
     None
 }
 
+/// The module file an absolute Python import names under a project nested in
+/// the repository, when no ordinary source root holds it: the nearest
+/// directory above the importer, the importer's own first, whose tree lays
+/// out the module (directly or under `src`). A directory holding two
+/// candidates answers nothing.
+///
+/// A test beside a nested project's package (`examples/tutorial/tests`
+/// importing `flaskr` from `examples/tutorial/flaskr`) finds it there once
+/// the project is installed, or once pytest puts the test's directory on the
+/// path. Only the receiver-origin walk reads this, to follow a value's origin
+/// into such a project; it mints no import edge.
+pub(crate) fn resolve_python_nested_import<S>(
+    importer_path: &str,
+    module_path: &str,
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    if !is_python_source_path(importer_path) || module_path.starts_with('.') {
+        return None;
+    }
+    if resolve_python_module_import(importer_path, module_path, known_files).is_some() {
+        return None;
+    }
+    let segments: Vec<&str> = module_path.split('.').collect();
+    if segments.is_empty() || segments.len() > 32 || segments.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    let mut dir = parent_dir(importer_path);
+    while !dir.is_empty() {
+        let mut hits: Vec<String> = Vec::new();
+        for root in ["", "src"] {
+            let base = if root.is_empty() {
+                dir.to_string()
+            } else {
+                format!("{dir}/{root}")
+            };
+            if let Some(hit) = python_module_file(&base, &segments, known_files) {
+                if !hits.contains(&hit) {
+                    hits.push(hit);
+                }
+            }
+        }
+        match hits.len() {
+            0 => dir = parent_dir(dir),
+            1 => return hits.pop(),
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn resolve_repo_local_header<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
@@ -8101,6 +10541,8 @@ fn is_header_like_module_path(module_path: &str) -> bool {
 /// - `@scope/pkg` → `packages/pkg/`, `packages/scope-pkg/`
 /// - `@scope/pkg/subpath` → `packages/pkg/src/subpath/`, `packages/scope-pkg/src/subpath/`
 /// - `pkg` (unscoped) → `packages/pkg/`
+/// - `pkg/src/file.js`, a subpath written with its extension → that file, or
+///   the TypeScript source it is emitted from
 fn resolve_package_import<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
@@ -8118,28 +10560,67 @@ fn package_import_candidates(module_path: &str) -> impl Iterator<Item = String> 
                 .flat_map(move |directory| {
                     if subpath.is_empty() {
                         [
-                            format!("packages/{directory}/src"),
-                            format!("packages/{directory}"),
+                            (format!("packages/{directory}/src"), false),
+                            (format!("packages/{directory}"), false),
                         ]
                     } else {
                         [
-                            format!("packages/{directory}/src/{subpath}"),
-                            format!("packages/{directory}/{subpath}"),
+                            (format!("packages/{directory}/src/{subpath}"), true),
+                            (format!("packages/{directory}/{subpath}"), true),
                         ]
                     }
                 })
         })
-        .flat_map(|base| {
+        .flat_map(|(base, has_subpath)| {
+            // A subpath written with its extension names that file. It comes
+            // first, as the direct match does for a relative specifier.
+            let written = if has_subpath {
+                written_module_candidates(&base)
+            } else {
+                Vec::new()
+            };
             let extension_base = base.clone();
-            MODULE_EXTENSIONS
-                .iter()
-                .map(move |extension| format!("{extension_base}.{extension}"))
+            written
+                .into_iter()
+                .chain(
+                    MODULE_EXTENSIONS
+                        .iter()
+                        .map(move |extension| format!("{extension_base}.{extension}")),
+                )
                 .chain(
                     INDEX_FILENAMES
                         .iter()
                         .map(move |index| format!("{base}/{index}")),
                 )
         })
+}
+
+/// The files a package subpath written with an ECMAScript module extension
+/// names as written: the path itself, then the TypeScript source that
+/// extension is emitted from (see [`EMITTED_EXTENSION_SOURCES`]). Empty for a
+/// path that carries no such extension, which only completion can place.
+///
+/// `export * from 'react-markup/src/ReactFizzConfigMarkup.js'` names
+/// `packages/react-markup/src/ReactFizzConfigMarkup.js`. Completing it with a
+/// second extension or an index file never reaches that file, so every import
+/// that came through such a re-export missed its declaration.
+fn written_module_candidates(base: &str) -> Vec<String> {
+    let name = base.rsplit('/').next().unwrap_or(base);
+    let Some((_, written)) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) else {
+        return Vec::new();
+    };
+    if !ECMASCRIPT_MODULE_EXTENSIONS.contains(&written) {
+        return Vec::new();
+    }
+    let stem = &base[..base.len() - written.len() - 1];
+    let mut candidates = vec![base.to_string()];
+    if let Some((_, sources)) = EMITTED_EXTENSION_SOURCES
+        .iter()
+        .find(|(emitted, _)| *emitted == written)
+    {
+        candidates.extend(sources.iter().map(|source| format!("{stem}.{source}")));
+    }
+    candidates
 }
 
 /// Paths whose admission can change a JavaScript/TypeScript workspace-package
@@ -8412,6 +10893,11 @@ pub struct IncrementalLinker {
     pub entity_language_by_id: HashMap<EntityId, LanguageId>,
     /// Parser-recorded Go package clause, retained through incremental reopen.
     pub go_package_by_id: HashMap<EntityId, String>,
+    /// directory -> the files in it whose declarations carry a package clause,
+    /// so the files of one package can be found without walking every file.
+    /// Derived from `go_package_by_id` and `entities_by_file`, so a checkpoint
+    /// does not store it and a restore rebuilds it.
+    package_files_by_dir: HashMap<String, BTreeSet<String>>,
     /// C/C++ callee id -> argument-count bounds parsed from its signature. The
     /// incremental mirror of the batch linker's `entity_arity_by_id`; backs
     /// overload arity pruning on the live-edit path.
@@ -8429,6 +10915,11 @@ pub struct IncrementalLinker {
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
     pub entities_by_file: HashMap<String, Vec<(EntityId, Visibility)>>,
+    /// file_path -> the file's own module, the one whose signature names the
+    /// file ([`kin_model::is_file_module_surface`]). An entity-level import
+    /// edge sources from it, and a file may hold other modules of the same
+    /// name, so it is recorded by what it is rather than found again by name.
+    module_surface_by_file: HashMap<String, EntityId>,
     /// file_path -> resolved include targets (sorted, deduped).
     ///
     /// Evolves across steps alongside the entity indexes so include-closure
@@ -8441,6 +10932,12 @@ pub struct IncrementalLinker {
     /// `include_targets_by_file` so an inheritance walk can cross into files
     /// recorded at earlier steps.
     pub class_bases_by_file: HashMap<String, Vec<(String, Vec<String>)>>,
+    /// file_path -> that file's types with the contracts they declare they
+    /// implement (`Implements` relations), in the same shape as
+    /// `class_bases_by_file`. Read only by the receiver-origin method walk,
+    /// which a language that spells all inheritance as conformance (Swift)
+    /// needs to reach an inherited method.
+    pub class_implements_by_file: HashMap<String, Vec<(String, Vec<String>)>>,
     /// Import bindings that give each recorded hierarchy's base names meaning:
     /// file -> local name -> (module path, original name). Stored with the
     /// hierarchy so a later step need not reparse an unchanged subclass.
@@ -8449,6 +10946,11 @@ pub struct IncrementalLinker {
     exact_import_witnesses: HashMap<String, Arc<ExactImportWitness>>,
     /// Exact ingested body identities captured when files enter the universe.
     source_digests_by_file: HashMap<String, String>,
+    /// What each ECMAScript module hands on through re-exports, recorded when
+    /// the file was last parsed. The incremental mirror of the batch linker's
+    /// forwarding table, retained so an import from an unchanged barrel or fork
+    /// variant resolves exactly as a cold link does.
+    module_forwards_by_file: HashMap<String, ModuleForwards>,
 }
 
 /// Serialization contract for [`IncrementalLinker`] inside history-hydration
@@ -8459,10 +10961,13 @@ pub struct IncrementalLinker {
 /// checkpoint bytes must be reproducible. Every unordered container is stored
 /// as a sorted vector; order-sensitive candidate vectors retain their runtime
 /// order. There are deliberately no serde defaults. Adding a runtime linker
-/// field therefore requires changing both exhaustive conversions below and
-/// bumping [`INCREMENTAL_LINKER_CHECKPOINT_VERSION`], or the build fails.
+/// field therefore requires changing both exhaustive conversions below, or
+/// the build fails. A change to what the linker derives needs no number: this
+/// file decides the graph key stores compare against (see
+/// `derivation-inputs.toml`), so any such change moves it.
 type ClassBasesByFileCheckpointV1 = Vec<(String, Vec<(String, Vec<String>)>)>;
 type ClassImportsByFileCheckpointV1 = Vec<(String, Vec<(String, (String, String))>)>;
+type ModuleForwardsByFileCheckpointV1 = Vec<(String, ModuleForwards)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -8480,48 +10985,15 @@ pub struct IncrementalLinkerCheckpointV1 {
     derived_member_ids: Vec<EntityId>,
     known_files: Vec<String>,
     entities_by_file: Vec<(String, Vec<(EntityId, Visibility)>)>,
+    module_surface_by_file: Vec<(String, EntityId)>,
     include_targets_by_file: Vec<(String, Vec<String>)>,
     class_bases_by_file: ClassBasesByFileCheckpointV1,
+    class_implements_by_file: ClassBasesByFileCheckpointV1,
     class_imports_by_file: ClassImportsByFileCheckpointV1,
     exact_import_witnesses: Vec<(String, String)>,
     source_digests_by_file: Vec<(String, String)>,
+    module_forwards_by_file: ModuleForwardsByFileCheckpointV1,
 }
-
-/// Bump whenever [`IncrementalLinkerCheckpointV1`] or linker semantics change.
-///
-/// Version 12 was a semantics bump, not a shape one: the struct above is
-/// unchanged, but the class bases and import bindings it carries are now read
-/// in a different order (a base written `module.Class` is decided by the import
-/// graph before any leaf-name tier) and can now reach a base outside this
-/// repository. The same checkpoint bytes therefore resolve to a different edge
-/// set than they did at version 11. This lineage already stands at 16 for its
-/// own semantics changes, which is above 12, so that bump is carried by the
-/// higher version rather than by renumbering backwards.
-///
-/// Version 17 is a semantics bump for the same reason version 12 was. The
-/// struct is unchanged, but the file module surface is now minted only for a
-/// file that produced an entity or an import, in every adapter rather than in
-/// Rust alone. A checkpoint written by an earlier build therefore carries
-/// module entities for comment-only JavaScript, TypeScript, Go, Java, PHP,
-/// Kotlin and Swift files that this build mints none for, and resolving
-/// against one would bind an import to an entity the current parser does not
-/// produce.
-///
-/// Version 18 is a semantics bump too. The struct is unchanged, but the
-/// `(file, name)` slot is now filled in source order however the entities were
-/// listed, and the entity holding it decides whether the same-file tier settles
-/// a call or hands it on to same-named entities elsewhere. A checkpoint written
-/// by an earlier build can carry a slot filled in hash order, and TypeScript
-/// ambient declarations it recorded before their `declare` signature existed
-/// read as definitions.
-/// Version 19 selects a Rust file's own module coordinate for import edges,
-/// independently of the entity order a stored graph or checkpoint supplies.
-/// Earlier checkpoints can carry imports owned by a declared child module.
-pub const INCREMENTAL_LINKER_CHECKPOINT_VERSION: u32 = 19;
-
-/// Build-time kin-index identity included in the composite hydration
-/// checkpoint version key.
-pub const KIN_INDEX_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn checkpoint_hash_map<K, V>(
     entries: Vec<(K, V)>,
@@ -8573,17 +11045,21 @@ impl IncrementalLinker {
             entity_kind_by_id: HashMap::new(),
             entity_language_by_id: HashMap::new(),
             go_package_by_id: HashMap::new(),
+            package_files_by_dir: HashMap::new(),
             entity_arity_by_id: HashMap::new(),
             entity_role_by_id: HashMap::new(),
             declaration_ids: HashSet::new(),
             derived_member_ids: HashSet::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
+            module_surface_by_file: HashMap::new(),
             include_targets_by_file: HashMap::new(),
             class_bases_by_file: HashMap::new(),
+            class_implements_by_file: HashMap::new(),
             class_imports_by_file: HashMap::new(),
             exact_import_witnesses: HashMap::new(),
             source_digests_by_file: HashMap::new(),
+            module_forwards_by_file: HashMap::new(),
         }
     }
 
@@ -8638,17 +11114,22 @@ impl IncrementalLinker {
             entity_kind_by_id,
             entity_language_by_id,
             go_package_by_id,
+            // Derived from the package clauses; `from_checkpoint_v1` rebuilds it.
+            package_files_by_dir: _,
             entity_arity_by_id,
             entity_role_by_id,
             declaration_ids,
             derived_member_ids,
             known_files,
             entities_by_file,
+            module_surface_by_file,
             include_targets_by_file,
             class_bases_by_file,
+            class_implements_by_file,
             class_imports_by_file,
             exact_import_witnesses,
             source_digests_by_file,
+            module_forwards_by_file,
         } = self;
 
         let mut artifact_ids: Vec<_> = artifact_ids
@@ -8725,6 +11206,12 @@ impl IncrementalLinker {
             .collect();
         entities_by_file.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let mut module_surface_by_file: Vec<_> = module_surface_by_file
+            .iter()
+            .map(|(file, id)| (file.clone(), *id))
+            .collect();
+        module_surface_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+
         let mut include_targets_by_file: Vec<_> = include_targets_by_file
             .iter()
             .map(|(file, targets)| (file.clone(), targets.clone()))
@@ -8736,6 +11223,12 @@ impl IncrementalLinker {
             .map(|(file, bases)| (file.clone(), bases.clone()))
             .collect();
         class_bases_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut class_implements_by_file: Vec<_> = class_implements_by_file
+            .iter()
+            .map(|(file, bases)| (file.clone(), bases.clone()))
+            .collect();
+        class_implements_by_file.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut class_imports_by_file: Vec<_> = class_imports_by_file
             .iter()
@@ -8765,6 +11258,11 @@ impl IncrementalLinker {
             .map(|(file, digest)| (file.clone(), digest.clone()))
             .collect();
         source_digests_by_file.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut module_forwards_by_file: Vec<_> = module_forwards_by_file
+            .iter()
+            .map(|(file, forwards)| (file.clone(), forwards.clone()))
+            .collect();
+        module_forwards_by_file.sort_by(|a, b| a.0.cmp(&b.0));
         IncrementalLinkerCheckpointV1 {
             artifact_ids,
             entity_by_file_name,
@@ -8779,11 +11277,14 @@ impl IncrementalLinker {
             derived_member_ids,
             known_files,
             entities_by_file,
+            module_surface_by_file,
             include_targets_by_file,
             class_bases_by_file,
+            class_implements_by_file,
             class_imports_by_file,
             exact_import_witnesses,
             source_digests_by_file,
+            module_forwards_by_file,
         }
     }
 
@@ -8803,11 +11304,14 @@ impl IncrementalLinker {
             derived_member_ids,
             known_files,
             entities_by_file,
+            module_surface_by_file,
             include_targets_by_file,
             class_bases_by_file,
+            class_implements_by_file,
             class_imports_by_file,
             exact_import_witnesses,
             source_digests_by_file,
+            module_forwards_by_file,
         } = checkpoint;
 
         let entity_by_file_name = checkpoint_hash_map(
@@ -8887,6 +11391,36 @@ impl IncrementalLinker {
             })
             .collect();
 
+        let go_package_by_id: HashMap<EntityId, String> =
+            checkpoint_hash_map(go_package_by_id, "go_package_by_id")?;
+        let entities_by_file: HashMap<String, Vec<(EntityId, Visibility)>> =
+            checkpoint_hash_map(entities_by_file, "entities_by_file")?;
+        let module_surface_by_file: HashMap<String, EntityId> =
+            checkpoint_hash_map(module_surface_by_file, "module_surface_by_file")?;
+        if module_surface_by_file.iter().any(|(file, id)| {
+            entity_kind_by_id.get(id) != Some(&EntityKind::Module)
+                || !entities_by_file
+                    .get(file)
+                    .is_some_and(|entities| entities.iter().any(|(held, _)| held == id))
+        }) {
+            return Err(
+                "incremental-linker checkpoint module surface is not a module its file holds"
+                    .into(),
+            );
+        }
+        let mut package_files_by_dir: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (file, entities) in &entities_by_file {
+            if entities
+                .iter()
+                .any(|(id, _)| go_package_by_id.contains_key(id))
+            {
+                package_files_by_dir
+                    .entry(parent_directory(file).to_string())
+                    .or_default()
+                    .insert(file.clone());
+            }
+        }
+
         let source_digests_by_file =
             checkpoint_hash_map(source_digests_by_file, "source_digests_by_file")?;
         let carrier_files: HashSet<_> = entities_by_file
@@ -8928,35 +11462,125 @@ impl IncrementalLinker {
             }
             exact_import_witnesses.insert(file, Arc::new(witness));
         }
+        let module_forwards_by_file =
+            checkpoint_hash_map(module_forwards_by_file, "module_forwards_by_file")?;
+        if module_forwards_by_file
+            .keys()
+            .any(|file| !known_files.contains(file) || !is_ecmascript_module_path(file))
+        {
+            return Err(
+                "incremental-linker checkpoint module forwards name an unknown file".into(),
+            );
+        }
+
+        // A checkpoint an earlier build of this version wrote can key a module
+        // under the leaf of its dotted name; read it as a fresh index would be.
+        let mut entity_by_bare_name: HashMap<String, Vec<(String, EntityId)>> =
+            checkpoint_hash_map(entity_by_bare_name, "entity_by_bare_name")?;
+        entity_by_bare_name.retain(|_, holders| {
+            holders.retain(|(_, id)| {
+                entity_kind_by_id
+                    .get(id)
+                    .is_none_or(|kind| keyed_by_bare_name(*kind))
+            });
+            !holders.is_empty()
+        });
 
         Ok(Self {
             rust_project: None,
             artifact_ids,
             entity_by_file_name,
             entity_by_name,
-            entity_by_bare_name: checkpoint_hash_map(entity_by_bare_name, "entity_by_bare_name")?,
+            entity_by_bare_name,
             entity_owner_segment_by_id,
             entity_kind_by_id,
             entity_language_by_id,
-            go_package_by_id: checkpoint_hash_map(go_package_by_id, "go_package_by_id")?,
+            go_package_by_id,
+            package_files_by_dir,
             entity_arity_by_id: checkpoint_hash_map(entity_arity_by_id, "entity_arity_by_id")?,
             entity_role_by_id: checkpoint_hash_map(entity_role_by_id, "entity_role_by_id")?,
             declaration_ids: checkpoint_hash_set(declaration_ids, "declaration_ids")?,
             derived_member_ids,
             known_files,
-            entities_by_file: checkpoint_hash_map(entities_by_file, "entities_by_file")?,
+            entities_by_file,
+            module_surface_by_file,
             include_targets_by_file: checkpoint_hash_map(
                 include_targets_by_file,
                 "include_targets_by_file",
             )?,
             class_bases_by_file: checkpoint_hash_map(class_bases_by_file, "class_bases_by_file")?,
+            class_implements_by_file: checkpoint_hash_map(
+                class_implements_by_file,
+                "class_implements_by_file",
+            )?,
             class_imports_by_file,
             exact_import_witnesses,
             source_digests_by_file,
+            module_forwards_by_file,
         })
     }
 
     /// Remove a file and all its associated entities from the indexes.
+    /// The package clause `file`'s declarations carry, when its language
+    /// scopes names to a package.
+    fn file_package(&self, file: &str) -> Option<&str> {
+        self.entities_by_file
+            .get(file)?
+            .iter()
+            .find_map(|(id, _)| self.go_package_by_id.get(id))
+            .map(String::as_str)
+    }
+
+    /// Every file of the package `file` belongs to, itself included.
+    fn package_peers(&self, file: &str) -> Vec<&str> {
+        let Some(package) = self.file_package(file) else {
+            return Vec::new();
+        };
+        self.package_files_by_dir
+            .get(parent_directory(file))
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|peer| self.file_package(peer) == Some(package))
+            .collect()
+    }
+
+    /// The incremental mirror of the batch linker's type test: a class-like
+    /// entity, or a named type a package declares.
+    fn is_type_like(&self, id: &EntityId) -> bool {
+        let kind = self.entity_kind_by_id.get(id);
+        is_class_like(kind)
+            || (kind == Some(&EntityKind::TypeAlias) && self.go_package_by_id.contains_key(id))
+    }
+
+    /// The one entity named `name` the other files of `file`'s package
+    /// declare, when `accept` admits it.
+    fn in_package_peers(
+        &self,
+        file: &str,
+        name: &str,
+        accept: impl Fn(&EntityId) -> bool,
+    ) -> Option<(&str, EntityId)> {
+        let mut found = None;
+        for peer in self.package_peers(file) {
+            if peer == file {
+                continue;
+            }
+            if let Some(id) = self
+                .entity_by_file_name
+                .get(peer)
+                .and_then(|names| names.get(name))
+                .filter(|id| accept(id))
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((peer, *id));
+            }
+        }
+        found
+    }
+
     pub fn remove_file(&mut self, file_path: &str) {
         self.rust_project = None;
         self.known_files.remove(file_path);
@@ -8989,6 +11613,7 @@ impl IncrementalLinker {
 
         // Every entity the file held, not only the ones that won a name slot
         // above, so an owner entry never outlives the entity it describes.
+        self.module_surface_by_file.remove(file_path);
         if let Some(entities) = self.entities_by_file.remove(file_path) {
             for (entity_id, _) in &entities {
                 self.entity_owner_segment_by_id.remove(entity_id);
@@ -8996,11 +11621,20 @@ impl IncrementalLinker {
                 self.derived_member_ids.remove(entity_id);
             }
         }
+        let dir = parent_directory(file_path);
+        if let Some(files) = self.package_files_by_dir.get_mut(dir) {
+            files.remove(file_path);
+            if files.is_empty() {
+                self.package_files_by_dir.remove(dir);
+            }
+        }
         self.include_targets_by_file.remove(file_path);
         self.class_bases_by_file.remove(file_path);
+        self.class_implements_by_file.remove(file_path);
         self.class_imports_by_file.remove(file_path);
         self.exact_import_witnesses.remove(file_path);
         self.source_digests_by_file.remove(file_path);
+        self.module_forwards_by_file.remove(file_path);
     }
 
     /// Replace (or withdraw) a previously staged source-bound observation.
@@ -9023,9 +11657,22 @@ impl IncrementalLinker {
     /// Entries are cleared when a file loses all class bases. Call
     /// alongside [`IncrementalLinker::record_file_includes`] wherever a step's
     /// parse data is recorded.
+    ///
+    /// The same parse also replaces what an ECMAScript module hands on through
+    /// re-exports, so a later step can follow an import through this file
+    /// without reparsing it.
     pub fn record_class_bases(&mut self, files: &[FileParseData]) {
         let witnessed = exact_import_witnesses(&files.iter().collect::<Vec<_>>());
         for file in files {
+            match module_forwards_of(file) {
+                Some(forwards) => {
+                    self.module_forwards_by_file
+                        .insert(file.file_path.clone(), forwards);
+                }
+                None => {
+                    self.module_forwards_by_file.remove(&file.file_path);
+                }
+            }
             self.exact_import_witnesses.remove(&file.file_path);
             if let Some(witness) = witnessed.get(&file.file_path) {
                 if self.source_digests_by_file.get(&file.file_path) == Some(&witness.source_digest)
@@ -9035,12 +11682,23 @@ impl IncrementalLinker {
                 }
             }
             let classes = collect_class_bases(&file.relations);
-            if classes.is_empty() {
+            let implements = collect_class_implements(&file.relations);
+            if implements.is_empty() {
+                self.class_implements_by_file.remove(&file.file_path);
+            } else {
+                self.class_implements_by_file
+                    .insert(file.file_path.clone(), implements.clone());
+            }
+            if classes.is_empty() && implements.is_empty() {
                 self.class_bases_by_file.remove(&file.file_path);
                 self.class_imports_by_file.remove(&file.file_path);
             } else {
-                self.class_bases_by_file
-                    .insert(file.file_path.clone(), classes);
+                if classes.is_empty() {
+                    self.class_bases_by_file.remove(&file.file_path);
+                } else {
+                    self.class_bases_by_file
+                        .insert(file.file_path.clone(), classes);
+                }
                 let imports: HashMap<String, (String, String)> = file
                     .imports
                     .iter()
@@ -9121,6 +11779,12 @@ impl IncrementalLinker {
         let mut file_entities_map = HashMap::new();
         let mut file_entities_list = Vec::new();
 
+        if entities.iter().any(|entity| go_package(entity).is_some()) {
+            self.package_files_by_dir
+                .entry(parent_directory(file_path).to_string())
+                .or_default()
+                .insert(file_path.to_string());
+        }
         for entity in entities {
             if let Some(package) = go_package(entity) {
                 self.go_package_by_id.insert(entity.id, package.to_string());
@@ -9146,10 +11810,12 @@ impl IncrementalLinker {
 
             let bare = bare_entity_name(&entity.name);
             if bare != entity.name {
-                self.entity_by_bare_name
-                    .entry(bare.to_string())
-                    .or_default()
-                    .push((file_path.to_string(), entity.id));
+                if keyed_by_bare_name(entity.kind) {
+                    self.entity_by_bare_name
+                        .entry(bare.to_string())
+                        .or_default()
+                        .push((file_path.to_string(), entity.id));
+                }
                 if let Some((owner, _)) = entity_owner_path(&entity.name) {
                     self.entity_owner_segment_by_id
                         .insert(entity.id, owner_type_segment(owner).to_string());
@@ -9157,6 +11823,11 @@ impl IncrementalLinker {
             }
 
             file_entities_list.push((entity.id, entity.visibility));
+            if entity.kind == EntityKind::Module && kin_model::is_file_module_surface(entity) {
+                self.module_surface_by_file
+                    .entry(file_path.to_string())
+                    .or_insert(entity.id);
+            }
         }
 
         // The `(file, name)` slot is filled in source order, the order the
@@ -9166,8 +11837,9 @@ impl IncrementalLinker {
         // slot decides whether the same-file tier settles a call or hands it
         // on: a C prototype holding it hands over, the definition below it
         // settles. Only the slot is ordered here. Everything else keeps the
-        // caller's order, which is parse order on a fresh parse. Rust's file
-        // module is selected by its module coordinate, independently of this order.
+        // caller's order, which is parse order on a fresh parse. A file's own
+        // module is recorded by its whole-unit signature, independently of
+        // this order.
         let mut in_source_order: Vec<&Entity> = entities.iter().collect();
         in_source_order.sort_by(|left, right| entity_link_order(left, right));
         for entity in in_source_order {
@@ -9333,6 +12005,16 @@ pub fn link_cross_file_incremental_with_graph<G: EntityStore>(
         },
     )?;
     overlays.overridden_bases.extend(persisted);
+    // A receiver's provider or declared return can live in a file this step
+    // did not parse, so the graph answers for those files.
+    let read_entity = |id: &EntityId| graph.get_entity(id).ok().flatten();
+    overlays.origin_bindings = incremental_origin_bindings(
+        files,
+        linker,
+        &overlays.import_map,
+        &overlays.class_bases,
+        Some(&read_entity),
+    );
     link_cross_file_incremental_internal(files, linker, Some(completeness), overlays)
 }
 
@@ -9437,6 +12119,8 @@ fn link_cross_file_incremental_internal(
         class_bases,
         declared_attribute_types,
         overridden_bases,
+        origin_bindings,
+        module_forwarding,
     } = overlays;
 
     // Resolve each file independently: every relation's source entity is owned
@@ -9463,6 +12147,8 @@ fn link_cross_file_incremental_internal(
                 &class_bases,
                 &declared_attribute_types,
                 &overridden_bases,
+                &origin_bindings,
+                &module_forwarding,
                 completeness,
             );
             if shows_progress_bar(total_files) {
@@ -9493,6 +12179,7 @@ fn link_cross_file_incremental_internal(
         linker,
         completeness,
         &base_counts,
+        &origin_bindings.outside,
     ))
 }
 
@@ -9514,6 +12201,8 @@ fn resolve_one_file_incremental(
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
     declared_attribute_types: &HashMap<(&str, &str, &str), &str>,
     overridden_bases: &HashSet<EntityId>,
+    origin_bindings: &OriginBindings,
+    module_forwarding: &ModuleForwarding<'_>,
     completeness: Option<&FileParseCompletenessMap>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
@@ -9542,7 +12231,17 @@ fn resolve_one_file_incremental(
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
     for rel in &file.relations {
-        if is_call_extraction_incomplete_marker(rel) || claims_import_witness(rel) {
+        if kin_parser::is_reserved_parser_record(rel) {
+            continue;
+        }
+        if crate::relation_source::is_lexical_contains(rel) {
+            if let Some((parent, child)) = source_index.resolve_lexical_contains(rel) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, parent.id, child.id, 1.0),
+                );
+            }
             continue;
         }
         let src_id = go_receiver_owner_source(
@@ -9603,6 +12302,13 @@ fn resolve_one_file_incremental(
             .get(&file.file_path)
             .and_then(|m| m.get(&rel.dst_name))
             .filter(|_| !requires_rust_import_authority(rel, &file.file_path))
+            .filter(|id| {
+                same_file_slot_binds(
+                    rel.kind,
+                    linker.entity_kind_by_id.get(id),
+                    linker.entity_language_by_id.get(id),
+                )
+            })
             .copied();
 
         let src_id = match src_id {
@@ -9770,6 +12476,51 @@ fn resolve_one_file_incremental(
             continue;
         }
 
+        // Python namespace claims require exact source and lexical evidence.
+        // A refused witness is an explicit gap; it cannot revive the older
+        // module-name tier or capture a same-named callable elsewhere.
+        if is_python_source_path(&file.file_path)
+            && rel.kind == RelationKind::Calls
+            && rel.receiver.is_some()
+            && rel.import_source.is_some()
+        {
+            if let Some((dst_id, target_file)) = resolve_witnessed_import(
+                rel,
+                &file.file_path,
+                &linker.known_files,
+                exact_import_witnesses,
+                linker.rust_project.as_deref(),
+                &mut BTreeMap::new(),
+                &mut BTreeMap::new(),
+                |target_file, name, _| {
+                    let ids: HashSet<_> = linker
+                        .entity_by_name
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(path, id)| {
+                            path.as_str() == target_file
+                                && linker.entity_kind_by_id.get(id) != Some(&EntityKind::Module)
+                        })
+                        .map(|(_, id)| *id)
+                        .collect();
+                    (ids.len() == 1).then(|| *ids.iter().next().expect("one namespace target"))
+                },
+            ) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    qualify_named_import(
+                        make_relation(rel, src_id, dst_id, 0.95),
+                        rel,
+                        &FilePathId::new(&file.file_path),
+                        &target_file,
+                    ),
+                );
+            }
+            continue;
+        }
+
         // (a0) Receiver-scoped resolution — mirrors the batch linker: an
         // attribute call's receiver decides which entities can be the
         // destination at all, so a receiver bound to a repo-local module yields
@@ -9813,11 +12564,15 @@ fn resolve_one_file_incremental(
                         import_map,
                         &linker.known_files,
                         |target, name| {
-                            linker
-                                .entity_by_file_name
-                                .get(target)
-                                .and_then(|names| names.get(name))
-                                .copied()
+                            reachable_slot(
+                                rel.kind,
+                                linker
+                                    .entity_by_file_name
+                                    .get(target)
+                                    .and_then(|names| names.get(name))
+                                    .copied(),
+                                &linker.entity_kind_by_id,
+                            )
                         },
                     );
                     if let Some(dst_id) = dst_id {
@@ -9842,6 +12597,44 @@ fn resolve_one_file_incremental(
                     accumulate_relation(&mut resolved, &mut relation_indices, external);
                 }
                 continue;
+            }
+        }
+
+        // (a1r) Mirrors the batch linker's receiver-origin tier, from the
+        // bindings computed for this step before the parallel pass.
+        if receiver_is_object
+            && rel.kind == RelationKind::Calls
+            && split_owner_method(rel.dst_name.as_str()).is_none()
+        {
+            if let Some(binding) = rel.receiver.as_deref().and_then(|receiver| {
+                origin_bindings
+                    .bindings
+                    .get(&(src_id, receiver.to_string(), rel.dst_name.clone()))
+            }) {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    qualify_receiver_origin(
+                        make_relation(rel, src_id, binding.target, binding.confidence),
+                        binding,
+                    ),
+                );
+                continue;
+            }
+        }
+
+        // (a1o) Mirrors the batch linker: a receiver the facts prove to hold a
+        // value of a type outside the repository reaches no declaration here.
+        if receiver_is_object && rel.kind == RelationKind::Calls {
+            if let Some(receiver) = rel.receiver.as_deref() {
+                let key = (
+                    src_id,
+                    receiver.to_string(),
+                    bare_entity_name(&rel.dst_name).to_string(),
+                );
+                if origin_bindings.outside_keys.contains(&key) {
+                    continue;
+                }
             }
         }
 
@@ -10161,11 +12954,15 @@ fn resolve_one_file_incremental(
                 if let Some(target_file) =
                     resolve_module_path(&file.file_path, module_path, &linker.known_files)
                 {
-                    let direct = linker
-                        .entity_by_file_name
-                        .get(&target_file)
-                        .and_then(|m| m.get(original_name))
-                        .copied();
+                    let direct = reachable_slot(
+                        rel.kind,
+                        linker
+                            .entity_by_file_name
+                            .get(&target_file)
+                            .and_then(|m| m.get(original_name))
+                            .copied(),
+                        &linker.entity_kind_by_id,
+                    );
                     let dst_id = if direct.is_some() {
                         direct
                     } else if original_name == "default" {
@@ -10194,11 +12991,15 @@ fn resolve_one_file_incremental(
                     if let Some(target_file) =
                         resolve_module_path(&file.file_path, module_path, &linker.known_files)
                     {
-                        if let Some(&dst_id) = linker
-                            .entity_by_file_name
-                            .get(&target_file)
-                            .and_then(|m| m.get(member_name))
-                        {
+                        if let Some(dst_id) = reachable_slot(
+                            rel.kind,
+                            linker
+                                .entity_by_file_name
+                                .get(&target_file)
+                                .and_then(|m| m.get(member_name))
+                                .copied(),
+                            &linker.entity_kind_by_id,
+                        ) {
                             accumulate_relation(
                                 &mut resolved,
                                 &mut relation_indices,
@@ -10235,13 +13036,18 @@ fn resolve_one_file_incremental(
             &linker.known_files,
             linker.entity_language_by_id.get(&src_id) == Some(&LanguageId::Go),
             |target_file, name| {
-                linker
-                    .entity_by_file_name
-                    .get(target_file)
-                    .and_then(|m| m.get(name))
-                    .copied()
+                reachable_slot(
+                    rel.kind,
+                    linker
+                        .entity_by_file_name
+                        .get(target_file)
+                        .and_then(|m| m.get(name))
+                        .copied(),
+                    &linker.entity_kind_by_id,
+                )
             },
             &other_file_candidates,
+            module_forwarding,
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
                 accumulate_relation(
@@ -10249,6 +13055,20 @@ fn resolve_one_file_incremental(
                     &mut relation_indices,
                     make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE),
                 );
+                continue;
+            }
+            ImportPinnedTarget::ModuleFork { stub, members } => {
+                for member in &members {
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        qualify_module_fork(
+                            make_relation(rel, src_id, member.dst_id, MODULE_FORK_CONFIDENCE),
+                            &stub,
+                            &member.variants,
+                        ),
+                    );
+                }
                 continue;
             }
             ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
@@ -10362,18 +13182,29 @@ fn resolve_one_file_incremental(
                     })
                     .map(|(fp, id)| (fp.as_str(), *id))
                     .collect();
+                // See the batch tier: a module is never a receiver-method target.
+                let candidates =
+                    drop_module_call_targets(rel.kind, candidates, &linker.entity_kind_by_id);
                 let candidates =
                     prune_pairs_by_arity(candidates, call_arity, &linker.entity_arity_by_id);
                 let candidates =
                     narrow_pairs_by_role(src_id, candidates, &linker.entity_role_by_id);
                 let candidates = narrow_pairs_by_definition(candidates, &linker.declaration_ids);
-                let candidates = if receiver_is_object {
+                let candidates = if receiver_is_object
+                    && imports_name_receiver_owners(linker.entity_language_by_id.get(&src_id))
+                {
                     let owner_bound = owner_bound_targets(
                         dst_lookup,
+                        &file.file_path,
                         import_map.get(file.file_path.as_str()),
+                        &linker.known_files,
+                        linker
+                            .rust_project
+                            .as_deref()
+                            .is_some_and(|project| project.contains_source(&file.file_path)),
                         |key, bound| {
                             if let Some(named) = linker.entity_by_name.get(key) {
-                                bound.extend(named.iter().map(|(_, id)| *id));
+                                bound.extend(named.iter().map(|(file, id)| (file.clone(), *id)));
                             }
                         },
                     );
@@ -10517,6 +13348,7 @@ fn resolve_one_file_incremental(
             // Fan out: an ambiguous qualified leaf resolves to every distinct
             // cross-file target, arity-pruned, matching the batch resolver.
             let qualified_targets = resolve_qualified_suffix_incremental(
+                rel.kind,
                 &rel.dst_name,
                 &file.file_path,
                 call_arity,
@@ -10555,12 +13387,591 @@ fn resolve_one_file_incremental(
         accumulate_relation(&mut resolved, &mut relation_indices, relation);
     }
 
+    retain_callable_targets(&mut resolved, &linker.entity_kind_by_id);
     resolved
 }
 
 /// Read-only step-local overlays shared by every per-file incremental
 /// resolution, built once per link so the parallel per-file pass and its serial
 /// reference resolve against byte-identical context.
+/// Receiver-origin bindings for one incremental step, keyed by (caller,
+/// receiver, method). Computed once, serially, before the parallel per-file
+/// pass, because the facts of files outside the step are read through the
+/// graph and a graph handle need not be shareable across threads.
+type OriginBindingMap = HashMap<(EntityId, String, String), crate::receiver_origin::OriginBinding>;
+
+/// What the receiver-origin facts settle for one incremental step: the calls
+/// they bind, and the calls they prove reach no declaration of the repository.
+#[derive(Default)]
+struct OriginBindings {
+    bindings: OriginBindingMap,
+    /// Calls proved to reach outside the repository, by file.
+    outside: HashMap<String, ReceiverSites>,
+    /// The same calls, by (caller, receiver, method).
+    outside_keys: HashSet<(EntityId, String, String)>,
+}
+
+/// Where an incremental step reads entities it did not parse.
+type EntitySource<'a> = &'a dyn Fn(&EntityId) -> Option<Entity>;
+
+/// The incremental linker's answers to the receiver-origin walk. The step's
+/// own files answer from their fresh parse; every other file answers through
+/// `source`, and when there is none its facts are unreadable, so a walk that
+/// needs them stops rather than guessing.
+struct IncrementalOriginWorld<'a> {
+    linker: &'a IncrementalLinker,
+    import_map: &'a HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
+    class_bases: &'a HashMap<String, Vec<(String, Vec<String>)>>,
+    fresh: HashMap<EntityId, &'a Entity>,
+    fresh_files: HashMap<&'a str, Vec<&'a Entity>>,
+    source: Option<EntitySource<'a>>,
+    fetched: std::cell::RefCell<HashMap<EntityId, Option<Entity>>>,
+    facts:
+        std::cell::RefCell<HashMap<EntityId, Option<Arc<kin_parser::value_origins::ScopeFacts>>>>,
+    placed: std::cell::OnceCell<HashMap<EntityId, (String, String)>>,
+    subclasses: std::cell::OnceCell<SubclassIndex>,
+    import_roots: std::cell::OnceCell<kin_db::call_site_escape::ImportRoots>,
+    outside_bases: std::cell::OnceCell<OutsideBaseIndex>,
+    /// The `Implements` hierarchy of the step's own files, which replaces the
+    /// linker's retained one for them.
+    fresh_implements: HashMap<&'a str, Vec<(String, Vec<String>)>>,
+}
+
+impl<'a> IncrementalOriginWorld<'a> {
+    fn new(
+        files: &'a [FileParseData],
+        linker: &'a IncrementalLinker,
+        import_map: &'a HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
+        class_bases: &'a HashMap<String, Vec<(String, Vec<String>)>>,
+        source: Option<EntitySource<'a>>,
+    ) -> Self {
+        let mut fresh = HashMap::new();
+        let mut fresh_files: HashMap<&str, Vec<&Entity>> = HashMap::new();
+        let mut fresh_implements = HashMap::new();
+        for file in files {
+            let held = fresh_files.entry(file.file_path.as_str()).or_default();
+            for entity in &file.entities {
+                fresh.insert(entity.id, entity);
+                held.push(entity);
+            }
+            fresh_implements.insert(
+                file.file_path.as_str(),
+                collect_class_implements(&file.relations),
+            );
+        }
+        Self {
+            linker,
+            import_map,
+            class_bases,
+            fresh,
+            fresh_files,
+            source,
+            fetched: Default::default(),
+            facts: Default::default(),
+            placed: Default::default(),
+            subclasses: Default::default(),
+            import_roots: Default::default(),
+            outside_bases: Default::default(),
+            fresh_implements,
+        }
+    }
+
+    fn with_entity<T>(&self, id: EntityId, read: impl FnOnce(&Entity) -> T) -> Option<T> {
+        if let Some(entity) = self.fresh.get(&id) {
+            return Some(read(entity));
+        }
+        let source = self.source?;
+        let mut fetched = self.fetched.borrow_mut();
+        let entity = fetched.entry(id).or_insert_with(|| source(&id));
+        entity.as_ref().map(read)
+    }
+
+    /// (file, name) of every entity the linker indexes, built on first use.
+    fn placed(&self) -> &HashMap<EntityId, (String, String)> {
+        self.placed.get_or_init(|| {
+            let mut placed = HashMap::new();
+            for (file, names) in &self.linker.entity_by_file_name {
+                for (name, id) in names {
+                    placed.insert(*id, (file.clone(), name.clone()));
+                }
+            }
+            placed
+        })
+    }
+}
+
+impl crate::receiver_origin::OriginWorld for IncrementalOriginWorld<'_> {
+    fn facts(&self, entity: EntityId) -> Option<Arc<kin_parser::value_origins::ScopeFacts>> {
+        if let Some(known) = self.facts.borrow().get(&entity) {
+            return known.clone();
+        }
+        let facts = self
+            .with_entity(entity, kin_parser::value_origins::read_value_origins)
+            .flatten()
+            .map(Arc::new);
+        self.facts.borrow_mut().insert(entity, facts.clone());
+        facts
+    }
+
+    fn entity_file(&self, entity: EntityId) -> Option<String> {
+        if let Some(fresh) = self.fresh.get(&entity) {
+            return fresh.file_origin.as_ref().map(|file| file.0.clone());
+        }
+        self.placed().get(&entity).map(|(file, _)| file.clone())
+    }
+
+    fn entity_name(&self, entity: EntityId) -> Option<String> {
+        if let Some(fresh) = self.fresh.get(&entity) {
+            return Some(fresh.name.clone());
+        }
+        self.placed().get(&entity).map(|(_, name)| name.clone())
+    }
+
+    fn locate_class(&self, file: &str, name: &str) -> Option<(String, String)> {
+        locate_base_class_incremental(file, name, self.linker, self.import_map)
+    }
+
+    fn resolve_method(&self, file: &str, class: &str, method: &str) -> Option<EntityId> {
+        let hierarchy = |map: Option<&Vec<(String, Vec<String>)>>, class: &str| -> Vec<String> {
+            map.and_then(|classes| classes.iter().find(|(name, _)| name == class))
+                .map(|(_, bases)| bases.clone())
+                .unwrap_or_default()
+        };
+        walk_members(
+            file,
+            class,
+            |file, class| {
+                resolve_own_method_incremental(file, class, method, self.linker).or_else(|| {
+                    resolve_member_elsewhere_incremental(
+                        file,
+                        class,
+                        method,
+                        self.linker,
+                        self.import_map,
+                    )
+                })
+            },
+            |file, class| {
+                let implements = match self.fresh_implements.get(file) {
+                    Some(fresh) => Some(fresh),
+                    None => self.linker.class_implements_by_file.get(file),
+                };
+                let mut bases = hierarchy(self.class_bases.get(file), class);
+                bases.extend(hierarchy(implements, class));
+                bases
+            },
+            |file, base| locate_base_class_incremental(file, base, self.linker, self.import_map),
+        )
+    }
+
+    fn resolve_callable(&self, file: &str, name: &str) -> Option<EntityId> {
+        let is_function =
+            |id: &EntityId| self.linker.entity_kind_by_id.get(id) == Some(&EntityKind::Function);
+        let in_file = |file: &str, name: &str| {
+            self.linker
+                .entity_by_file_name
+                .get(file)
+                .and_then(|names| names.get(name))
+                .copied()
+                .filter(is_function)
+        };
+        if let Some(id) = in_file(file, name) {
+            return Some(id);
+        }
+        if !name.contains('.') {
+            if let Some((_, id)) = self.linker.in_package_peers(file, name, is_function) {
+                return Some(id);
+            }
+        }
+        let (binding, member) = match name.split_once('.') {
+            Some((root, member)) if !member.contains('.') => (root, Some(member)),
+            Some(_) => return None,
+            None => (name, None),
+        };
+        let &(module_path, original) = self.import_map.get(file)?.get(binding)?;
+        let target = resolve_module_path(file, module_path, &self.linker.known_files)?;
+        let wanted = member.unwrap_or(original);
+        in_file(&target, wanted).or_else(|| {
+            self.linker
+                .in_package_peers(&target, wanted, is_function)
+                .map(|(_, id)| id)
+        })
+    }
+
+    fn providers_in(
+        &self,
+        file: &str,
+    ) -> Option<Vec<(EntityId, kin_parser::value_origins::ValueProvider)>> {
+        let ids: Vec<EntityId> = match self.fresh_files.get(file) {
+            Some(entities) => entities.iter().map(|entity| entity.id).collect(),
+            None => {
+                self.source?;
+                self.linker
+                    .entities_by_file
+                    .get(file)
+                    .map(|held| held.iter().map(|(id, _)| *id).collect())
+                    .unwrap_or_default()
+            }
+        };
+        let mut providers = Vec::new();
+        for id in ids {
+            if let Some(facts) = self.facts(id) {
+                providers.extend(facts.provides.iter().map(|provider| (id, provider.clone())));
+            }
+        }
+        Some(providers)
+    }
+
+    fn file_declares(&self, file: &str, name: &str) -> bool {
+        self.fresh_files
+            .get(file)
+            .map(|entities| entities.iter().any(|entity| entity.name == name))
+            .unwrap_or_else(|| {
+                self.linker
+                    .entity_by_file_name
+                    .get(file)
+                    .is_some_and(|names| names.contains_key(name))
+            })
+    }
+
+    fn known_file(&self, path: &str) -> bool {
+        self.linker.known_files.contains(path) || self.fresh_files.contains_key(path)
+    }
+
+    fn import_binding(&self, file: &str, local: &str) -> Option<(String, String)> {
+        let &(module_path, original) = self.import_map.get(file)?.get(local)?;
+        let target = resolve_module_path(file, module_path, &self.linker.known_files)?;
+        Some((target, original.to_string()))
+    }
+
+    fn unique_method(&self, method: &str) -> Option<EntityId> {
+        if self.linker.entity_by_name.contains_key(method) {
+            return None;
+        }
+        let holders = self.linker.entity_by_bare_name.get(method)?;
+        let mut ids = holders.iter().map(|(_, id)| *id);
+        let first = ids.next()?;
+        if ids.any(|id| id != first) {
+            return None;
+        }
+        (self.linker.entity_kind_by_id.get(&first) == Some(&EntityKind::Method)).then_some(first)
+    }
+
+    fn compatible(&self, caller: EntityId, target: EntityId) -> bool {
+        blind_inference_target_allowed(caller, target, &self.linker.entity_language_by_id)
+    }
+
+    fn members_named(&self, member: &str) -> Vec<crate::receiver_origin::Member> {
+        let mut seen = HashSet::new();
+        let mut members = Vec::new();
+        // The step's own parse first: an entity it minted or renamed may not be
+        // in the linker's indexes yet.
+        for (file, entities) in &self.fresh_files {
+            for entity in entities {
+                if bare_entity_name(&entity.name) == member && seen.insert(entity.id) {
+                    members.push(crate::receiver_origin::Member {
+                        id: entity.id,
+                        file: (*file).to_string(),
+                        owner: member_owner(&entity.name),
+                    });
+                }
+            }
+        }
+        for (file, id) in self
+            .linker
+            .entity_by_bare_name
+            .get(member)
+            .into_iter()
+            .flatten()
+            .chain(self.linker.entity_by_name.get(member).into_iter().flatten())
+        {
+            if self.fresh_files.contains_key(file.as_str()) || !seen.insert(*id) {
+                continue;
+            }
+            members.push(crate::receiver_origin::Member {
+                id: *id,
+                file: file.clone(),
+                owner: self
+                    .placed()
+                    .get(id)
+                    .and_then(|(_, name)| member_owner(name)),
+            });
+        }
+        members
+    }
+
+    fn class_bases(&self, file: &str, class: &str) -> Option<Vec<String>> {
+        if let Some((_, bases)) = self
+            .class_bases
+            .get(file)
+            .and_then(|classes| classes.iter().find(|(name, _)| name == class))
+        {
+            return Some(bases.clone());
+        }
+        let declared = match self.fresh_files.get(file) {
+            Some(entities) => entities
+                .iter()
+                .any(|entity| entity.name == class && is_class_like(Some(&entity.kind))),
+            None => self
+                .linker
+                .entity_by_file_name
+                .get(file)
+                .and_then(|names| names.get(class))
+                .is_some_and(|id| is_class_like(self.linker.entity_kind_by_id.get(id))),
+        };
+        declared.then(Vec::new)
+    }
+
+    fn subclasses(&self, file: &str, class: &str) -> Vec<(String, String)> {
+        self.subclasses
+            .get_or_init(|| {
+                subclass_index(
+                    self.class_bases.iter().flat_map(|(file, classes)| {
+                        classes.iter().map(move |(class, bases)| {
+                            (file.as_str(), class.as_str(), bases.as_slice())
+                        })
+                    }),
+                    |file, base| {
+                        locate_base_class_incremental(file, base, self.linker, self.import_map)
+                    },
+                )
+            })
+            .get(&(file.to_string(), class.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn declares_class_named(&self, leaf: &str) -> bool {
+        self.fresh.values().any(|entity| {
+            bare_entity_name(&entity.name) == leaf && is_class_like(Some(&entity.kind))
+        }) || self
+            .linker
+            .entity_by_name
+            .get(leaf)
+            .into_iter()
+            .flatten()
+            .chain(
+                self.linker
+                    .entity_by_bare_name
+                    .get(leaf)
+                    .into_iter()
+                    .flatten(),
+            )
+            .any(|(_, id)| is_class_like(self.linker.entity_kind_by_id.get(id)))
+    }
+
+    fn default_export(&self, file: &str) -> Option<String> {
+        // Only a module entity carries the fact, so only the file's modules
+        // are read.
+        let modules: Vec<EntityId> = match self.fresh_files.get(file) {
+            Some(entities) => entities
+                .iter()
+                .filter(|entity| entity.kind == EntityKind::Module)
+                .map(|entity| entity.id)
+                .collect(),
+            None => {
+                self.source?;
+                self.linker
+                    .entities_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .map(|(id, _)| *id)
+                    .filter(|id| self.linker.entity_kind_by_id.get(id) == Some(&EntityKind::Module))
+                    .collect()
+            }
+        };
+        modules
+            .into_iter()
+            .find_map(|id| self.facts(id)?.default_export.clone())
+    }
+
+    fn declaration(&self, file: &str, name: &str) -> Option<EntityId> {
+        match self.fresh_files.get(file) {
+            Some(entities) => entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .map(|entity| entity.id),
+            None => self
+                .linker
+                .entity_by_file_name
+                .get(file)
+                .and_then(|names| names.get(name))
+                .copied(),
+        }
+    }
+
+    fn nested_import(&self, file: &str, local: &str) -> Option<(String, String)> {
+        let &(module_path, original) = self.import_map.get(file)?.get(local)?;
+        let target = resolve_python_nested_import(file, module_path, &self.linker.known_files)?;
+        Some((target, original.to_string()))
+    }
+
+    fn module_file(&self, file: &str, module: &str) -> Option<String> {
+        resolve_module_path(file, module, &self.linker.known_files)
+    }
+
+    fn provider_modules(
+        &self,
+        file: &str,
+    ) -> Option<Vec<kin_parser::value_origins::ProviderModule>> {
+        // Only a module entity carries the fact, so only the file's modules
+        // are read.
+        let modules: Vec<EntityId> = match self.fresh_files.get(file) {
+            Some(entities) => entities
+                .iter()
+                .filter(|entity| entity.kind == EntityKind::Module)
+                .map(|entity| entity.id)
+                .collect(),
+            None => {
+                self.source?;
+                self.linker
+                    .entities_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .map(|(id, _)| *id)
+                    .filter(|id| self.linker.entity_kind_by_id.get(id) == Some(&EntityKind::Module))
+                    .collect()
+            }
+        };
+        Some(
+            modules
+                .into_iter()
+                .filter_map(|id| self.facts(id))
+                .flat_map(|facts| facts.provider_modules.clone())
+                .collect(),
+        )
+    }
+
+    fn outside_module(&self, file: &str, qualified: &str) -> bool {
+        self.import_roots
+            .get_or_init(|| {
+                kin_db::call_site_escape::ImportRoots::of(
+                    self.linker
+                        .known_files
+                        .iter()
+                        .map(String::as_str)
+                        .chain(self.fresh_files.keys().copied()),
+                )
+            })
+            .outside(file, qualified)
+    }
+
+    fn module_scope(
+        &self,
+        file: &str,
+    ) -> Option<(EntityId, Arc<kin_parser::value_origins::ScopeFacts>)> {
+        // Only a module entity carries the facts, so only the file's modules
+        // are read, as for a default export.
+        let modules: Vec<EntityId> = match self.fresh_files.get(file) {
+            Some(entities) => entities
+                .iter()
+                .filter(|entity| entity.kind == EntityKind::Module)
+                .map(|entity| entity.id)
+                .collect(),
+            None => {
+                self.source?;
+                self.linker
+                    .entities_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .map(|(id, _)| *id)
+                    .filter(|id| self.linker.entity_kind_by_id.get(id) == Some(&EntityKind::Module))
+                    .collect()
+            }
+        };
+        modules
+            .into_iter()
+            .find_map(|id| Some((id, self.facts(id)?)))
+    }
+
+    fn classes_based_on(&self, qualified: &str) -> Vec<(String, String)> {
+        self.outside_bases
+            .get_or_init(|| {
+                // Only a class that names a base can name an imported one,
+                // and the hierarchy overlay lists exactly those.
+                outside_base_index(self.class_bases.iter().flat_map(|(file, classes)| {
+                    classes.iter().filter_map(move |(class, _)| {
+                        let facts = self.facts(self.declaration(file, class)?)?;
+                        Some((file.as_str(), class.as_str(), facts))
+                    })
+                }))
+            })
+            .get(qualified)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Bind every call in the step whose receiver the caller's facts type, and
+/// prove the calls whose receiver they type as a value of a type outside the
+/// repository.
+fn incremental_origin_bindings(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+    source: Option<EntitySource<'_>>,
+) -> OriginBindings {
+    let mut bindings = OriginBindings::default();
+    let carries_facts = files.iter().any(|file| {
+        file.entities.iter().any(|entity| {
+            entity
+                .metadata
+                .extra
+                .contains_key(kin_parser::value_origins::VALUE_ORIGINS_KEY)
+        })
+    });
+    if !carries_facts {
+        return bindings;
+    }
+    let world = IncrementalOriginWorld::new(files, linker, import_map, class_bases, source);
+    for file in files {
+        let source_index = crate::RelationSourceIndex::new(&file.entities);
+        for rel in &file.relations {
+            if rel.kind != RelationKind::Calls || split_owner_method(&rel.dst_name).is_some() {
+                continue;
+            }
+            let Some(receiver) = rel.receiver.as_deref() else {
+                continue;
+            };
+            let Some(caller) = source_index.resolve(rel).map(|entity| entity.id) else {
+                continue;
+            };
+            let key = (caller, receiver.to_string(), rel.dst_name.clone());
+            if bindings.bindings.contains_key(&key) {
+                continue;
+            }
+            if let Some(binding) = crate::receiver_origin::bind_receiver_call(
+                &world,
+                caller,
+                &file.file_path,
+                receiver,
+                &rel.dst_name,
+            ) {
+                bindings.bindings.insert(key, binding);
+            }
+        }
+        let outside = receiver_outside_sites(file, &world);
+        if !outside.is_empty() {
+            bindings.outside_keys.extend(
+                outside
+                    .outside
+                    .iter()
+                    .map(|site| (site.caller, site.receiver.clone(), site.method.clone())),
+            );
+            bindings
+                .outside
+                .entry(file.file_path.clone())
+                .or_default()
+                .extend(outside);
+        }
+    }
+    bindings
+}
+
 struct IncrementalLinkOverlays<'a> {
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
     exact_import_witnesses: HashMap<String, Arc<ExactImportWitness>>,
@@ -10586,6 +13997,11 @@ struct IncrementalLinkOverlays<'a> {
     /// stays correct across step boundaries the same way `class_bases` already
     /// does.
     overridden_bases: HashSet<EntityId>,
+    /// Calls in the step whose receiver the caller's value-origin facts type.
+    origin_bindings: OriginBindings,
+    /// Re-exports of the files this step parsed over the ones the linker
+    /// retained, and the fork families of every known path.
+    module_forwarding: ModuleForwarding<'a>,
 }
 
 /// The incremental mirror of [`resolve_two_hop_declared_method`]. Same three
@@ -10749,6 +14165,8 @@ fn build_incremental_link_overlays<'a>(
     let overridden_bases = compute_overridden_bases_incremental(linker, &import_map, &class_bases);
 
     let exact_import_witnesses = import_witness_overlay(files, linker);
+    let origin_bindings =
+        incremental_origin_bindings(files, linker, &import_map, &class_bases, None);
     IncrementalLinkOverlays {
         exact_import_witnesses,
         import_map,
@@ -10756,6 +14174,8 @@ fn build_incremental_link_overlays<'a>(
         class_bases,
         declared_attribute_types: build_declared_attribute_types(files.iter()),
         overridden_bases,
+        origin_bindings,
+        module_forwarding: ModuleForwarding::incremental(files, linker),
     }
 }
 
@@ -10770,6 +14190,7 @@ fn merge_incremental_resolved(
     linker: &IncrementalLinker,
     completeness: Option<&FileParseCompletenessMap>,
     base_counts: &HashMap<&str, BaseResolutionCounts>,
+    outside: &HashMap<String, ReceiverSites>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut relation_indices = HashMap::new();
@@ -10796,20 +14217,11 @@ fn merge_incremental_resolved(
         if entities.iter().any(|(id, _)| {
             is_module(id) && linker.entity_language_by_id.get(id) == Some(&LanguageId::Rust)
         }) {
-            let name = kin_parser::adapter::file_module_surface_name(None, &FilePathId::new(path))?;
-            // The callable name slot intentionally prefers a function over
-            // a same-named module (for example `fn app` in app.rs). Import
-            // ownership instead needs the complete per-name entity index.
-            return linker
-                .entity_by_name
-                .get(&name)?
-                .iter()
-                .find_map(|(file, id)| {
-                    (file == path
-                        && is_module(id)
-                        && linker.entity_language_by_id.get(id) == Some(&LanguageId::Rust))
-                    .then_some(*id)
-                });
+            // The file's own module, recorded by its whole-unit signature when
+            // the file was added, as the batch linker selects it. Its name
+            // cannot find it: a crate root is named by its crate, which its
+            // path does not spell, and may declare a module of that name.
+            return linker.module_surface_by_file.get(path).copied();
         }
         entities
             .iter()
@@ -10863,6 +14275,7 @@ fn merge_incremental_resolved(
         completeness,
         &linker.known_files,
         base_counts,
+        outside,
     );
 
     limit_derived_relations(&mut resolved, &linker.derived_member_ids);
@@ -10888,6 +14301,8 @@ fn link_cross_file_incremental_serial(
         class_bases,
         declared_attribute_types,
         overridden_bases,
+        origin_bindings,
+        module_forwarding,
     } = build_incremental_link_overlays(files, linker);
     let per_file_relations: Vec<Vec<Relation>> = files
         .iter()
@@ -10901,12 +14316,21 @@ fn link_cross_file_incremental_serial(
                 &class_bases,
                 &declared_attribute_types,
                 &overridden_bases,
+                &origin_bindings,
+                &module_forwarding,
                 None,
             )
         })
         .collect();
     let base_counts = base_resolution_counts_incremental(files, linker, &import_map);
-    merge_incremental_resolved(per_file_relations, files, linker, None, &base_counts)
+    merge_incremental_resolved(
+        per_file_relations,
+        files,
+        linker,
+        None,
+        &base_counts,
+        &origin_bindings.outside,
+    )
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the filesystem.
@@ -10923,6 +14347,21 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
     components.iter().collect()
 }
+
+#[cfg(test)]
+mod receiver_origin_tests;
+
+#[cfg(test)]
+mod receiver_outside_tests;
+
+#[cfg(test)]
+mod candidate_recall_tests;
+
+#[cfg(test)]
+mod receiver_binding_tests;
+
+#[cfg(test)]
+mod fixture_receiver_tests;
 
 #[cfg(test)]
 mod tests {
@@ -14280,6 +17719,63 @@ void f();
         assert!(candidates.len() <= 4 * (MODULE_EXTENSIONS.len() + INDEX_FILENAMES.len()));
     }
 
+    /// React's markup fork re-exports its host config with the extension
+    /// written. Completion alone tried `...Markup.js.js` and index files, so
+    /// the file itself was never a candidate.
+    #[test]
+    fn a_package_subpath_written_with_its_extension_names_that_file() {
+        let importer = "packages/react-server/src/forks/ReactFizzConfig.markup.js";
+        let module = "react-markup/src/ReactFizzConfigMarkup.js";
+        let file = "packages/react-markup/src/ReactFizzConfigMarkup.js";
+        assert_eq!(
+            resolve_module_path(importer, module, &HashSet::from([file])),
+            Some(file.to_string())
+        );
+        assert!(
+            workspace_package_import_candidate_paths(importer, module).contains(&file.to_string())
+        );
+        // The same specifier without the extension keeps resolving.
+        assert_eq!(
+            resolve_module_path(
+                importer,
+                "react-markup/src/ReactFizzConfigMarkup",
+                &HashSet::from([file])
+            ),
+            Some(file.to_string())
+        );
+        // An emitted extension stands for the TypeScript source held instead.
+        assert_eq!(
+            resolve_module_path(
+                "packages/app/src/main.ts",
+                "@scope/wire/feature.js",
+                &HashSet::from(["packages/wire/src/feature.ts"])
+            ),
+            Some("packages/wire/src/feature.ts".to_string())
+        );
+        // The file as written wins over a completion of the same spelling.
+        assert_eq!(
+            resolve_module_path(
+                importer,
+                module,
+                &HashSet::from([
+                    file,
+                    "packages/react-markup/src/ReactFizzConfigMarkup.js.js"
+                ])
+            ),
+            Some(file.to_string())
+        );
+        // A package named like a file is a package, never a file beside it.
+        assert_eq!(
+            resolve_module_path(importer, "chart.js", &HashSet::from(["packages/chart.js"])),
+            None
+        );
+        // An extension no module carries is left to completion.
+        assert!(
+            !workspace_package_import_candidate_paths(importer, "wire/feature.config")
+                .contains(&"packages/wire/src/feature.config".to_string())
+        );
+    }
+
     #[test]
     fn workspace_package_nominations_do_not_claim_other_import_routes() {
         for (importer, module) in [
@@ -17574,6 +21070,16 @@ void f();
                 "inherited dispatch",
             ),
             (
+                crate::resolution::RECEIVER_ORIGIN_CONFIDENCE,
+                RelationResolution::TypeResolved,
+                "receiver origin chain",
+            ),
+            (
+                crate::resolution::RECEIVER_ORIGIN_NAME_CONFIDENCE,
+                RelationResolution::NameOnly,
+                "receiver origin through a unique method name",
+            ),
+            (
                 IMPORT_PINNED_CONFIDENCE,
                 RelationResolution::ImportScoped,
                 "parser-pinned module",
@@ -17587,6 +21093,11 @@ void f();
                 LOCALITY_DISAMBIGUATED_CONFIDENCE,
                 RelationResolution::ImportScoped,
                 "locality",
+            ),
+            (
+                MODULE_FORK_CONFIDENCE,
+                RelationResolution::ImportScoped,
+                "module fork member",
             ),
             (0.7, RelationResolution::NameOnly, "exact name"),
             (
@@ -18722,6 +22233,30 @@ void f();
         assert!(!callee_is_declaration(&record));
     }
 
+    /// Python spells its declaration with a decorator: `typing.overload`
+    /// stubs declare signatures of the implementation that follows them, and
+    /// the adapter writes `@overload` at the head of each stub's signature.
+    #[test]
+    fn a_python_overload_stub_is_a_declaration_and_its_implementation_is_not() {
+        let mut stub = make_entity("locate_app", "src/flask/cli.py");
+        stub.language = LanguageId::Python;
+        stub.signature = "@overload def locate_app(module_name: str) -> Flask".to_string();
+        assert!(callee_is_declaration(&stub));
+        stub.kind = EntityKind::Method;
+        assert!(callee_is_declaration(&stub));
+
+        let mut implementation = stub.clone();
+        implementation.signature = "def locate_app(module_name)".to_string();
+        assert!(!callee_is_declaration(&implementation));
+
+        let mut cached = implementation.clone();
+        cached.signature = "@functools.cache def locate_app(module_name)".to_string();
+        assert!(
+            !callee_is_declaration(&cached),
+            "another decorator declares nothing"
+        );
+    }
+
     #[test]
     fn a_prototype_and_its_definition_stop_being_an_unresolvable_ambiguity() {
         // Two same-name cross-file candidates with no scope signal are left
@@ -18842,7 +22377,37 @@ void f();
                 resolved: 2,
             },
             bases,
+            Some(&minimal_detail(path)),
         )
+    }
+
+    /// The detail a file with no census, no gaps and no unresolved import
+    /// carries: completeness, receiver and external-import entries.
+    fn minimal_detail(path: &str) -> crate::coverage_certificate::CertificateDetail {
+        crate::coverage_certificate::CertificateDetail::of_file(
+            path,
+            &[],
+            Some(&ParseCompleteness::Full),
+            Default::default(),
+        )
+    }
+
+    /// Entries every current-format certificate carries beyond the call and
+    /// import ones.
+    const DETAIL_WIDTH: usize = 3;
+
+    #[test]
+    fn a_certificate_is_found_by_the_id_its_artifact_derives() {
+        let artifact = ArtifactId::new();
+        let mut bound = certificate("app.py", artifact, None);
+        bind_parse_coverage_source(&mut bound, "app.py", Hash256::from_bytes([3u8; 32]));
+        for relation in [certificate("app.py", artifact, None), bound] {
+            assert_eq!(relation.id, parse_coverage_relation_id(artifact));
+        }
+        assert_ne!(
+            parse_coverage_relation_id(artifact),
+            parse_coverage_relation_id(ArtifactId::new())
+        );
     }
 
     #[test]
@@ -18853,7 +22418,7 @@ void f();
             coverage_evidence(&without, BASE_RESOLUTION_COVERAGE_V1).is_none(),
             "a caller that measured nothing must publish no base bucket"
         );
-        assert_eq!(without.evidence.len(), 2);
+        assert_eq!(without.evidence.len(), 2 + DETAIL_WIDTH);
 
         let measured = certificate(
             "app.py",
@@ -18891,13 +22456,13 @@ void f();
         // [parse, imports, source]
         let mut with_source = certificate("app.py", artifact, None);
         bind_parse_coverage_source(&mut with_source, "app.py", digest);
-        assert_eq!(with_source.evidence.len(), 3);
+        assert_eq!(with_source.evidence.len(), 3 + DETAIL_WIDTH);
         assert!(is_parse_coverage_relation(&with_source, "app.py", artifact));
         assert_eq!(parse_coverage_source_digest(&with_source), Some(digest));
 
         // [parse, imports, bases]
         let with_bases = certificate("app.py", artifact, bases);
-        assert_eq!(with_bases.evidence.len(), 3);
+        assert_eq!(with_bases.evidence.len(), 3 + DETAIL_WIDTH);
         assert!(is_parse_coverage_relation(&with_bases, "app.py", artifact));
         assert_eq!(
             parse_coverage_source_digest(&with_bases),
@@ -18908,7 +22473,7 @@ void f();
         // [parse, imports, bases, source]
         let mut both = certificate("app.py", artifact, bases);
         bind_parse_coverage_source(&mut both, "app.py", digest);
-        assert_eq!(both.evidence.len(), 4);
+        assert_eq!(both.evidence.len(), 4 + DETAIL_WIDTH);
         assert!(is_parse_coverage_relation(&both, "app.py", artifact));
         assert_eq!(parse_coverage_source_digest(&both), Some(digest));
     }
@@ -18955,6 +22520,133 @@ void f();
             .expect("the measured certificate carries a base bucket");
         entry.token = Some("9".into());
         assert!(!is_parse_coverage_relation(&impossible, "app.py", artifact));
+    }
+
+    #[test]
+    fn a_certificate_without_detail_entries_is_the_superseded_format() {
+        let artifact = ArtifactId::new();
+        let previous = make_parse_coverage_relation(
+            "app.py",
+            artifact,
+            Some(&ParseCompleteness::Full),
+            true,
+            ImportResolutionCounts {
+                statements: 2,
+                resolved: 2,
+            },
+            None,
+            None,
+        );
+        assert!(!is_parse_coverage_relation(&previous, "app.py", artifact));
+        assert!(
+            is_superseded_parse_coverage_relation(&previous, "app.py", artifact),
+            "a store an earlier build wrote must stay replaceable"
+        );
+        let current = certificate("app.py", artifact, None);
+        assert!(is_parse_coverage_relation(&current, "app.py", artifact));
+        assert!(!is_superseded_parse_coverage_relation(
+            &current, "app.py", artifact
+        ));
+    }
+
+    #[test]
+    fn parse_completeness_survives_incomplete_call_extraction() {
+        use kin_parser::file_evidence::{
+            call_extraction_census_record, call_extraction_gap_record,
+        };
+        let artifact = ArtifactId::new();
+        let site = kin_parser::RelationSite {
+            start_byte: 4,
+            end_byte: 9,
+            start_line: 0,
+            start_col: 4,
+            end_line: 0,
+            end_col: 9,
+            syntactic_role: None,
+        };
+        let file = FileParseData {
+            file_path: "app.py".into(),
+            entities: Vec::new(),
+            relations: vec![
+                kin_parser::scoped_call_extraction_incomplete_marker(
+                    "handler".into(),
+                    site.clone(),
+                    Some("pop".into()),
+                ),
+                call_extraction_census_record(3),
+                call_extraction_gap_record(
+                    kin_parser::file_evidence::GAP_CALLEE_NOT_NAMEABLE,
+                    Some("handler"),
+                    site,
+                ),
+            ],
+            imports: Vec::new(),
+        };
+        let relation = build_parse_coverage_relation(
+            &file,
+            artifact,
+            &ParseCompleteness::Full,
+            &std::collections::HashSet::<String>::new(),
+        );
+        assert!(is_parse_coverage_relation(&relation, "app.py", artifact));
+        assert!(
+            coverage_evidence(&relation, CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1).is_some(),
+            "the combined entry still says extraction was incomplete"
+        );
+        let detail = crate::coverage_certificate::CertificateDetail::from_certificate(&relation)
+            .expect("current-format detail");
+        assert_eq!(detail.parse, Some(ParseCompleteness::Full));
+        assert_eq!(detail.receiver_unresolved, 1);
+        assert_eq!(detail.extraction_complete(), Some(false));
+        let extraction = detail.call_extraction.expect("the census was recorded");
+        assert_eq!(extraction.census, 3);
+        assert_eq!(extraction.gaps.len(), 1);
+    }
+
+    #[test]
+    fn unresolved_imports_split_into_external_and_listed() {
+        let known: std::collections::HashSet<String> = [
+            "src/flask/app.py".to_string(),
+            "src/flask/ctx.py".to_string(),
+        ]
+        .into();
+        let import = |module: &str| FileImport {
+            module_path: module.into(),
+            specifiers: Vec::new(),
+            site: kin_parser::RelationSite {
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 1,
+                syntactic_role: None,
+            },
+        };
+        let names = crate::coverage_certificate::repository_names(known.iter().map(String::as_str));
+        let (counts, outcomes) = import_outcomes(
+            "src/flask/app.py",
+            &[
+                import("os"),
+                import(".ctx"),
+                import("flask.missing"),
+                import(".gone"),
+            ],
+            &known,
+            &names,
+        );
+        assert_eq!(counts.statements, 4);
+        assert_eq!(counts.resolved, 1, "the relative sibling resolves");
+        assert_eq!(
+            outcomes.external, 1,
+            "nothing in the repository is named os"
+        );
+        let listed: Vec<_> = outcomes
+            .unresolved
+            .iter()
+            .map(|entry| entry.specifier.as_str())
+            .collect();
+        assert_eq!(listed, vec!["flask.missing", ".gone"]);
     }
 
     #[test]

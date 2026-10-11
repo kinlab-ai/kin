@@ -30,18 +30,30 @@ fn run_git(path: &Path, args: &[&str]) {
     );
 }
 
-fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_kin"))
-        .args(args)
+fn status_command(home: &Path) -> Command<'static> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+    command
         .env("HOME", home)
+        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_REGISTRY_PATH", home.join(".kin/registry.toml"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", kin_git::empty_global_git_config())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("KIN_DAEMON_URL")
-        .env_remove("KIN_VFS_WORKSPACE")
+        .env_remove("KIN_VFS_WORKSPACE");
+    command
+}
+
+fn run_kin(repo: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    status_command(home)
+        .args(args)
         .current_dir(repo)
         .output()
         .expect("run kin")
+}
+
+fn status_layout(repo: &Path, home: &Path) -> kin_core::KinLayout {
+    common::repository_layout(status_command(home), repo)
 }
 
 #[cfg(unix)]
@@ -199,7 +211,7 @@ fn seeded_status_repository(root: &Path) -> (std::path::PathBuf, std::path::Path
     fs::write(repo.join("source.rs"), "pub fn canonical() -> u32 { 7 }\n").unwrap();
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-m", "Canonical source"]);
-    let initialized = run_kin(&repo, &home, &["init", "--no-enrich", "--json"]);
+    let initialized = run_kin(&repo, &home, &["init", "--defer-enrich", "--json"]);
     assert!(
         matches!(initialized.status.code(), Some(0) | Some(7) | Some(8)),
         "{}",
@@ -208,8 +220,8 @@ fn seeded_status_repository(root: &Path) -> (std::path::PathBuf, std::path::Path
     (repo, home)
 }
 
-fn inspect_canonical_status(repo: &Path) -> kin_cli::commands::status::StatusReport {
-    let layout = kin_core::KinLayout::discover(repo).unwrap();
+fn inspect_canonical_status(repo: &Path, home: &Path) -> kin_cli::commands::status::StatusReport {
+    let layout = status_layout(repo, home);
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).unwrap();
     kin_cli::commands::status::inspect(
         &layout,
@@ -238,11 +250,11 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
     use std::sync::{Arc, Mutex};
     let root = tempdir().unwrap();
     let (repo, home) = seeded_status_repository(root.path());
-    let before = inspect_canonical_status(&repo);
+    let before = inspect_canonical_status(&repo, &home);
     let projection = "pub fn unadmitted() -> u32 { 999 }\n";
     fs::write(repo.join("source.rs"), projection).unwrap();
     fs::write(repo.join("untracked.rs"), "pub fn untracked() {}\n").unwrap();
-    let marker = repo.join(".kin/last-admission.json");
+    let marker = status_layout(&repo, &home).kindb_last_admission_path();
     let marker_before = fs::read(&marker).ok();
     let response = serde_json::to_value(kin_cli::commands::status::CommandStatusResponse {
         report: before.clone(),
@@ -282,7 +294,7 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
         axum::serve(listener, app).await.unwrap();
     });
     for json in [false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+        let mut command = status_command(&home);
         command
             .arg("status")
             .env("HOME", &home)
@@ -342,7 +354,7 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
         "{seen:?}"
     );
     assert_eq!(
-        inspect_canonical_status(&repo),
+        inspect_canonical_status(&repo, &home),
         before,
         "canonical roots and generations changed"
     );
@@ -366,12 +378,21 @@ async fn default_status_admits_before_it_reads_and_names_a_refused_pass() {
 /// report success for a directory that is not a Kin repository.
 #[test]
 fn status_needs_no_author_or_daemon_and_real_authority_errors_still_fail() {
+    if !kin_core::test_env::alone_in_process() {
+        return;
+    }
     let root = tempdir().unwrap();
     let home = root.path().join("home");
     let repo = root.path().join("repo");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&repo).unwrap();
-    let initialized = kin_core::init(&repo).unwrap();
+    let initialized = run_kin(&repo, &home, &["init", "--defer-enrich", "--json"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let layout = status_layout(&repo, &home);
     {
         let _identity_env = kin_core::test_env::EnvVarGuard::new()
             .with("GIT_CONFIG_NOSYSTEM", "1")
@@ -379,12 +400,12 @@ fn status_needs_no_author_or_daemon_and_real_authority_errors_still_fail() {
             .with("HOME", &home)
             .without("XDG_CONFIG_HOME");
         assert!(
-            kin_core::resolve_commit_identity(&initialized.layout).is_err(),
+            kin_core::resolve_commit_identity(&layout).is_err(),
             "the fixture unexpectedly has a commit author"
         );
     }
     fs::write(repo.join("unadmitted.rs"), "pub fn unadmitted() {}\n").unwrap();
-    let before = inspect_canonical_status(&repo);
+    let before = inspect_canonical_status(&repo, &home);
     for args in [
         vec!["status"],
         vec!["status", "--json", "--wait-quiesce", "1"],
@@ -398,11 +419,11 @@ fn status_needs_no_author_or_daemon_and_real_authority_errors_still_fail() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            !repo.join(".kin/daemon.pid").exists(),
+            !layout.root().join("daemon.pid").exists(),
             "status started a daemon"
         );
     }
-    assert_eq!(inspect_canonical_status(&repo), before);
+    assert_eq!(inspect_canonical_status(&repo, &home), before);
     let outside = root.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
     let invalid = run_kin(&outside, &home, &["status", "--json"]);
@@ -414,8 +435,8 @@ fn status_needs_no_author_or_daemon_and_real_authority_errors_still_fail() {
 fn status_refuses_corrupt_canonical_source_without_repairing_from_projection() {
     let root = tempdir().unwrap();
     let (repo, home) = seeded_status_repository(root.path());
-    let before = inspect_canonical_status(&repo);
-    let layout = kin_core::KinLayout::discover(&repo).unwrap();
+    let before = inspect_canonical_status(&repo, &home);
+    let layout = status_layout(&repo, &home);
     let hash = kin_blobs::digest(b"pub fn canonical() -> u32 { 7 }\n").to_string();
     let blob = layout
         .kindb_namespace_path(before.repository.repository_id.as_str())

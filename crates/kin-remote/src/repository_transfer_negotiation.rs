@@ -35,8 +35,8 @@ use crate::repository_transfer::{
     validate_limits, validate_pack, verify_transfer_source_readiness, with_collaboration,
     RepositoryAuthorityMetadata, RepositoryRefAdvertisement, RepositoryTransferError,
     RepositoryTransferExpectation, RepositoryTransferLimits, RepositoryTransferPack,
-    RepositoryTransferReceipt, RepositoryTransferStatus, Result, REPOSITORY_TRANSFER_PROTOCOL,
-    REPOSITORY_TRANSFER_SCHEMA_VERSION,
+    RepositoryTransferReceipt, RepositoryTransferStatus, Result, SourceHydrationProvenance,
+    REPOSITORY_TRANSFER_PROTOCOL, REPOSITORY_TRANSFER_SCHEMA_VERSION,
 };
 
 fn invalid(message: impl Into<String>) -> RepositoryTransferError {
@@ -682,12 +682,13 @@ pub fn push_to_remote<B, T>(
     repository_id: &RepositoryId,
     source_ref: &RefName,
     destination_ref: &RefName,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: impl Into<SourceHydrationProvenance>,
 ) -> Result<RepositoryTransferOutcome>
 where
     B: StorageBackend + ?Sized + 'static,
     T: RepositoryTransferTransport + ?Sized,
 {
+    let source_hydration_semantics = source_hydration_semantics.into();
     let mut receipts = Vec::new();
     let mut originally_at = None;
     let mut published_changes = 0usize;
@@ -728,7 +729,7 @@ where
             local,
             source_ref,
             &expectation,
-            source_hydration_semantics,
+            &source_hydration_semantics,
         )?;
         // A segment with no changes is the answer to a review export, which the
         // ref phase never asks for: this replica's ref moved back under the
@@ -779,7 +780,7 @@ where
         repository_id,
         source_ref,
         destination_ref,
-        source_hydration_semantics,
+        &source_hydration_semantics,
     );
     Ok(RepositoryTransferOutcome {
         direction: RepositoryTransferDirection::Push,
@@ -808,7 +809,7 @@ fn push_review_records<B, T>(
     repository_id: &RepositoryId,
     source_ref: &RefName,
     destination_ref: &RefName,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: &SourceHydrationProvenance,
 ) -> CollaborationTransfer
 where
     B: StorageBackend + ?Sized + 'static,
@@ -842,7 +843,7 @@ fn try_push_review_records<B, T>(
     repository_id: &RepositoryId,
     source_ref: &RefName,
     destination_ref: &RefName,
-    source_hydration_semantics: Option<u32>,
+    source_hydration_semantics: &SourceHydrationProvenance,
 ) -> Result<CollaborationTransfer>
 where
     B: StorageBackend + ?Sized + 'static,
@@ -1445,6 +1446,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -1767,6 +1769,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: Some(records),
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -1826,6 +1829,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: Some(records),
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();
@@ -3691,6 +3695,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         drop(lease);
         manager.commit_repository_transaction(transaction).unwrap();

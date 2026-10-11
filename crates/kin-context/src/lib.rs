@@ -24,9 +24,10 @@ pub use error::{ContextError, Result};
 pub use external::{focal_external_calls, ExternalEdge, ExternalEdgeProof, ExternalEdgeReader};
 pub use multi::{
     build_multi_focal_pack, build_multi_focal_pack_with_provider, method_line,
-    neighborhood_depth_for, render_multi_focal_lines, water_fill, FocalContribution,
-    FocalResolution, MultiFocalOptions, MultiFocalReport, PackElision, RouteReport, RouteSearch,
-    ELISION_REASON_TOKEN_BUDGET, FOCAL_GROUP, ROUTE_GROUP, ROUTE_MARKER, ROUTE_MAX_HOPS,
-    ROUTE_VISIT_MAX,
+    neighborhood_depth_for, render_multi_focal_lines, render_route_edges, water_fill,
+    ContextRowProvenance, ContextRowReason, FocalContribution, FocalResolution, MultiFocalOptions,
+    MultiFocalReport, PackElision, RouteEdgeReport, RouteReport, RouteSearch, WithheldRow,
+    BODY_OVER_ALLOWANCE, ELISION_REASON_TOKEN_BUDGET, FOCAL_GROUP, ROUTE_GROUP, ROUTE_MARKER,
+    ROUTE_MAX_HOPS, ROUTE_VISIT_MAX, WITHHELD_BODY, WITHHELD_ROW,
 };
 pub use tokens::estimate_tokens;

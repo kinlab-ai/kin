@@ -70,6 +70,11 @@ impl InitializeParams {
     /// - `experimental.serverStatusNotification`, only when the launch waits
     ///   for the server to report its project loaded. rust-analyzer then says
     ///   when it has finished loading and whether that load failed.
+    /// - `window.workDoneProgress`, for a server that indexes its workspace
+    ///   after it starts. It then reports that work as `$/progress`, which is
+    ///   how a sweep learns the server has finished indexing rather than
+    ///   guessing from a workspace-wide probe (see
+    ///   [`crate::lifecycle::LspServer::wait_until_indexed`]).
     pub fn for_launch(
         workspace_root: &std::path::Path,
         launch: &crate::adapters::ServerLaunch,
@@ -81,6 +86,9 @@ impl InitializeParams {
         if launch.load_check == Some(crate::adapters::LoadCheck::ServerStatus) {
             params.capabilities.experimental =
                 Some(serde_json::json!({ "serverStatusNotification": true }));
+        }
+        if launch.readiness == crate::adapters::Readiness::WorkspaceIndex {
+            params.capabilities.window = Some(serde_json::json!({ "workDoneProgress": true }));
         }
         params
     }
@@ -117,6 +125,9 @@ pub struct ClientCapabilities {
     /// Claimed only by a launch that waits for rust-analyzer's server status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<serde_json::Value>,
+    /// Claimed only by a launch whose server indexes its workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -582,6 +593,7 @@ pub fn kin_capabilities() -> ClientCapabilities {
         }),
         workspace: None,
         experimental: None,
+        window: None,
     }
 }
 
@@ -891,16 +903,21 @@ mod initialize_params_tests {
 
     /// A launch with settings claims `workspace.configuration`, so the server
     /// asks for them; one that waits for server status claims rust-analyzer's
-    /// status notification. A launch with neither claims neither, and its
-    /// payload is exactly the plain workspace start.
+    /// status notification; one whose server indexes its workspace claims
+    /// work done progress, which is how it says it finished. A per-document
+    /// launch with none of these claims none, and its payload is exactly the
+    /// plain workspace start.
     #[test]
     fn a_launch_claims_only_the_capabilities_it_serves() {
-        use crate::adapters::{LoadCheck, ServerLaunch};
+        use crate::adapters::{LoadCheck, Readiness, ServerLaunch};
         let root = std::env::temp_dir().join("repo");
 
         let plain = serde_json::to_value(InitializeParams::for_launch(
             &root,
-            &ServerLaunch::with_initialization_options(Some(serde_json::json!({"a": 1}))),
+            &ServerLaunch {
+                readiness: Readiness::PerDocument,
+                ..ServerLaunch::with_initialization_options(Some(serde_json::json!({"a": 1})))
+            },
         ))
         .unwrap();
         assert_eq!(
@@ -911,6 +928,21 @@ mod initialize_params_tests {
             ))
             .unwrap()
         );
+        assert!(plain["capabilities"].get("window").is_none(), "{plain}");
+        let mut indexing = serde_json::to_value(InitializeParams::for_launch(
+            &root,
+            &ServerLaunch::with_initialization_options(Some(serde_json::json!({"a": 1}))),
+        ))
+        .unwrap();
+        assert_eq!(
+            indexing["capabilities"]["window"],
+            serde_json::json!({"workDoneProgress": true})
+        );
+        indexing["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("window");
+        assert_eq!(indexing, plain, "work done progress is all it adds");
         assert!(plain["capabilities"].get("workspace").is_none(), "{plain}");
         assert!(
             plain["capabilities"].get("experimental").is_none(),

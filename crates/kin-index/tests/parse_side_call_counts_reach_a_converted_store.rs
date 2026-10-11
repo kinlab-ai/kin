@@ -35,6 +35,10 @@ use kin_model::{
     RepositoryId, SemanticChange,
 };
 
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
 /// The focal's file. Nothing here reaches outward, so it never joins its own
 /// family.
 const STORE_PY: &str = r#"def audited(fn):
@@ -248,9 +252,10 @@ fn a_file_that_was_already_measured_reports_the_number_it_always_did() {
     );
 }
 
-/// A call written where no callable entity owns the edge is still a call site
-/// the graph holds no edge for, so it counts. Module scope is the cheapest
-/// instance and the one a converted repository is full of.
+/// A call written outside every function body is still a call site, so it
+/// counts. Module scope is the cheapest instance and the one a converted
+/// repository is full of. It is charged to the innermost entity holding it,
+/// here the constant it initializes, so the count and the relations agree.
 #[test]
 fn a_call_outside_every_function_body_is_still_a_call_site() {
     let indexed = index(
@@ -258,10 +263,16 @@ fn a_call_outside_every_function_body_is_still_a_call_site() {
         "from notepkg import store\n\nDB = store.open_db()\n\n\ndef reader(note_id):\n    return DB\n",
     );
 
+    let callers: Vec<(&str, &str)> = indexed
+        .extracted_relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::Calls)
+        .map(|relation| (relation.src_name.as_str(), relation.dst_name.as_str()))
+        .collect();
     assert_eq!(
-        emitted_call_relations(&indexed),
-        0,
-        "a module-scope call owns no calling entity, so the extractor emits no relation for it"
+        callers,
+        vec![("DB", "open_db")],
+        "a module-scope call is charged to the constant whose initializer makes it"
     );
     assert_eq!(
         stamped_call_sites(&indexed.entities, "notepkg/toplevel.py"),
@@ -427,7 +438,7 @@ fn admit_repository(dir: &Path, repository_id: &str, files: &[(&str, &str)]) -> 
 
     let blob_store = BlobStore::new(dir.join(".fixture-cas")).unwrap();
     let snapshot = capture_lossless_git_repository(
-        dir,
+        &worktree(dir),
         RepositoryId::new(repository_id).unwrap(),
         &blob_store,
     )

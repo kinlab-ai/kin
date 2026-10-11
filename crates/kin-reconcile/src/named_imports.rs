@@ -9,8 +9,11 @@ use std::collections::HashSet;
 
 use crate::error::{ReconcileError, Result};
 use kin_index::{
-    binding_debt::{build_local_binding_debt, decode_local_binding_debt},
-    linker::{named_import_evidence, NamedImportObservation},
+    binding_debt::{
+        build_local_binding_debt, decode_local_binding_debt, LocalBindingDebt,
+        LocalBindingObligation,
+    },
+    linker::{named_import_evidence, FileParseData, NamedImportObservation},
     IndexedFile,
 };
 use kin_model::{
@@ -324,7 +327,10 @@ fn accepted<G: GraphStore>(
             .iter()
             .any(kin_parser::is_call_extraction_incomplete_marker),
     );
-    let matches = produced.iter().any(|relation| {
+    // Keep the exact proof and the staged identity together. Other producers
+    // (for example an LSP) may hold the same endpoints and kind with a
+    // different identity and evidence; their iteration order is not authority.
+    let accepted_relation = produced.iter().find(|relation| {
         relation.src.as_entity() == Some(observation.source)
             && relation.dst.as_entity() == Some(target)
             && relation.kind == observation.raw.kind
@@ -336,11 +342,6 @@ fn accepted<G: GraphStore>(
                 .iter()
                 .all(|evidence| relation.evidence.contains(evidence))
     });
-    let accepted_relation = produced.iter().find(|relation| {
-        relation.src.as_entity() == Some(observation.source)
-            && relation.dst.as_entity() == Some(target)
-            && relation.kind == observation.raw.kind
-    });
     let remains = if let Some(relation) = accepted_relation {
         effective(
             crate::binding_debt::exact(graph, relation.id)?,
@@ -351,12 +352,66 @@ fn accepted<G: GraphStore>(
     } else {
         false
     };
-    if !matches || !remains {
+    if !remains {
         return Err(invalid(
             "resolved exact occurrence was not admitted in this transaction",
         ));
     }
     Ok(true)
+}
+
+/// An identical callable body provides an exact occurrence relocation, even
+/// when a module-level import changed outside it. Every relocated old site
+/// must have a fresh positive resolver outcome, not merely a matching name.
+fn unchanged_body_sites_are_proven(
+    relation: &Relation,
+    before: &Entity,
+    after: &Entity,
+    old_bytes: &[u8],
+    new_bytes: &[u8],
+    observations: &[NamedImportObservation],
+) -> bool {
+    let (Some(was), Some(now)) = (&before.span, &after.span) else {
+        return false;
+    };
+    if was.file != now.file {
+        return false;
+    }
+    let (Some(old_body), Some(new_body)) = (
+        old_bytes.get(was.start_byte..was.end_byte),
+        new_bytes.get(now.start_byte..now.end_byte),
+    ) else {
+        return false;
+    };
+    if old_body.is_empty() || old_body != new_body {
+        return false;
+    }
+    let Some(evidence) = kin_index::occurrence::uniform_original_evidence(relation) else {
+        return false;
+    };
+    !evidence.is_empty()
+        && evidence.into_iter().all(|evidence| {
+            let Some(site) = &evidence.source_span else {
+                return false;
+            };
+            if site.file != was.file
+                || site.start_byte < was.start_byte
+                || site.end_byte > was.end_byte
+            {
+                return false;
+            }
+            let start = now.start_byte + (site.start_byte - was.start_byte);
+            let end = now.start_byte + (site.end_byte - was.start_byte);
+            let mut matches = observations.iter().filter(|observation| {
+                observation.source == after.id
+                    && observation.target.is_some()
+                    && observation.raw.kind == relation.kind
+                    && observation.raw.site.as_ref().is_some_and(|current| {
+                        current.start_byte == start && current.end_byte == end
+                    })
+            });
+            matches.next().is_some() && matches.next().is_none()
+        })
 }
 
 /// A repeated exact named-import payload is fresh evidence only when every
@@ -400,6 +455,286 @@ pub(crate) fn independently_reproves<G: GraphStore>(
         }
     }
     Ok(true)
+}
+
+/// A caller edit can invalidate a namespace binding without changing the
+/// callable's body or the name it calls. Reproduce ownership from the old
+/// immutable blob, then withdraw only this factory's proof when the current
+/// admitted pass no longer proves that edge. Refusal records uncertainty;
+/// it never claims that the runtime dependency disappeared.
+pub(crate) fn refresh_changed_source<G: GraphStore>(
+    graph: &G,
+    blobs: &kin_blobs::BlobStore,
+    current: &IndexedFile,
+    previous_entities: &[Entity],
+    current_entities: &[Entity],
+    observations: &[NamedImportObservation],
+    produced: &[Relation],
+    delta: &mut TransactionDelta,
+) -> Result<()> {
+    if !matches!(current.parse_state, kin_model::ParseState::Valid) {
+        return Ok(());
+    }
+    let Some((artifact_id, digest)) = artifact(graph, &current.file_id)? else {
+        return Ok(());
+    };
+    if digest.to_string() != current.blob_hash.to_string() {
+        return Err(invalid("edited caller differs from admitted source"));
+    }
+    // Only current, independently resolved exact observations can discharge
+    // these obligations. A surviving old edge is not a new proof of itself.
+    let mut proven_keys = HashSet::new();
+    for site in observations.iter().filter(|site| {
+        site.target.is_some()
+            && current_entities
+                .iter()
+                .any(|caller| caller.id == site.source)
+    }) {
+        accepted(graph, current, site, produced, delta)?;
+        proven_keys.insert((
+            site.source,
+            site.target.expect("positive outcome"),
+            site.raw.kind,
+        ));
+    }
+    let mut proven = Vec::new();
+    for relation in produced {
+        let (Some(source), Some(target)) = (relation.src.as_entity(), relation.dst.as_entity())
+        else {
+            continue;
+        };
+        if !proven_keys.contains(&(source, target, relation.kind)) {
+            continue;
+        }
+        let Some(destination) = entity(graph, target, delta)? else {
+            continue;
+        };
+        let Some(file) = destination.file_origin else {
+            continue;
+        };
+        let Some(sites) = owned_occurrences(relation, current, &file.0, observations)? else {
+            continue;
+        };
+        if sites.iter().all(|site| site.target == Some(target)) {
+            proven.push(relation.clone());
+        }
+    }
+    let mut prior_parses = std::collections::HashMap::new();
+    let prior_project = kin_index::GraphProjectFiles::new(graph, blobs);
+    let mut current_bytes = None;
+    let mut withdrawals = Vec::new();
+    for old_caller in previous_entities {
+        if old_caller.language != kin_model::LanguageId::Python {
+            continue;
+        }
+        let Some(current_caller) = entity(graph, old_caller.id, delta)? else {
+            continue;
+        };
+        if current_caller.file_origin.as_ref() != Some(&current.file_id) {
+            continue;
+        }
+        let Some(previous_digest) = old_caller
+            .metadata
+            .extra
+            .get("blob_hash")
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        if previous_digest == digest.to_string() {
+            continue;
+        }
+        let old_relations = graph
+            .get_all_relations_for_entity(&old_caller.id)
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?;
+        for relation in old_relations.into_iter().filter(|relation| {
+            relation.src.as_entity() == Some(old_caller.id)
+                && kin_index::linker::has_named_import_factory_identity(relation)
+                && relation.origin == RelationOrigin::Inferred
+                && relation.confidence.to_bits() == 0.95_f32.to_bits()
+                && relation.import_source.is_none()
+                && matches!(
+                    relation.kind,
+                    RelationKind::Calls | RelationKind::References
+                )
+        }) {
+            // The ordinary retire pass already owns a removed occurrence.
+            if effective(Some(relation.clone()), relation.id, delta)?.is_none() {
+                continue;
+            }
+            let Some(target_id) = relation.dst.as_entity() else {
+                continue;
+            };
+            let Some(target) = entity(graph, target_id, delta)? else {
+                continue;
+            };
+            let Some(target_file) = &target.file_origin else {
+                continue;
+            };
+            if target_file == &current.file_id {
+                continue;
+            }
+            if !prior_parses.contains_key(previous_digest) {
+                let hash = kin_blobs::Hash256::from_hex(previous_digest).map_err(invalid)?;
+                let bytes = blobs.read(&hash)?;
+                if kin_blobs::digest(&bytes) != hash {
+                    return Err(invalid("prior caller source digest mismatch"));
+                }
+                let old = kin_index::IndexPipeline::new()
+                    .index_file_content_in(&current.file_id, &bytes, hash, &prior_project)?
+                    .indexed_file;
+                prior_parses.insert(previous_digest.to_owned(), (old, bytes));
+            }
+            let (old, bytes) = &prior_parses[previous_digest];
+            if !matches!(old.parse_state, kin_model::ParseState::Valid) {
+                continue;
+            }
+            let mut parse = FileParseData {
+                file_path: old.file_id.0.clone(),
+                entities: old.entities.clone(),
+                relations: old.extracted_relations.clone(),
+                imports: old.imports.clone(),
+            };
+            let matches: Vec<_> = parse
+                .entities
+                .iter_mut()
+                .filter(|declaration| {
+                    declaration.name == old_caller.name
+                        && declaration.kind == old_caller.kind
+                        && declaration.span == old_caller.span
+                        && declaration.fingerprint == old_caller.fingerprint
+                })
+                .collect();
+            let [declaration] = matches.as_slice() else {
+                continue;
+            };
+            let parsed_id = declaration.id;
+            parse
+                .entities
+                .iter_mut()
+                .find(|declaration| declaration.id == parsed_id)
+                .expect("unique prior declaration")
+                .id = old_caller.id;
+            if kin_index::linker::reproduce_named_import_evidence(
+                &parse,
+                &current.file_id,
+                &relation,
+                &target_file.0,
+            )
+            .as_ref()
+                != Some(&relation)
+            {
+                continue;
+            }
+            let (target_artifact, _) = artifact(graph, target_file)?
+                .ok_or_else(|| invalid("withdrawn target has no admitted source"))?;
+            let obligation = LocalBindingObligation {
+                retired_relation: relation.clone(),
+                source_name: old_caller.name.clone(),
+                source_digest: kin_model::Hash256::from_bytes(old.blob_hash.0),
+                prior_source_file: None,
+                target_artifact,
+                target_file: target_file.clone(),
+                target_name: target.name,
+            };
+            if current_bytes.is_none() {
+                let bytes = blobs.read(&current.blob_hash)?;
+                if kin_blobs::digest(&bytes) != current.blob_hash {
+                    return Err(invalid("edited caller source digest mismatch"));
+                }
+                current_bytes = Some(bytes);
+            }
+            if !unchanged_body_sites_are_proven(
+                &relation,
+                old_caller,
+                &current_caller,
+                bytes,
+                current_bytes.as_ref().expect("verified current source"),
+                observations,
+            ) && !kin_index::binding_debt::obligation_is_satisfied(
+                graph,
+                artifact_id,
+                &obligation,
+                old,
+                bytes,
+                current,
+                current_entities,
+                &proven,
+                &mut |id| entity(graph, id, delta).map_err(|error| error.to_string()),
+            )
+            .map_err(invalid)?
+            {
+                withdrawals.push(obligation);
+            }
+            // A partial current proof keeps its accepted sites while the full
+            // immutable prior payload remains in debt for its unproven sites.
+            let replacement = proven
+                .iter()
+                .find(|fresh| fresh.id == relation.id)
+                .cloned()
+                .map(|mut fresh| {
+                    fresh.created_in = relation.created_in;
+                    fresh
+                });
+            set_final(Some(relation), replacement, delta)?;
+        }
+    }
+    if withdrawals.is_empty() {
+        return Ok(());
+    }
+    let reserved = kin_index::binding_debt::local_binding_debt_id(artifact_id);
+    let mut debt = LocalBindingDebt {
+        source_file: current.file_id.clone(),
+        observed_source_digest: digest,
+        obligations: withdrawals,
+    };
+    for held in held(graph, artifact_id, delta)? {
+        let Some(previous) =
+            decode_local_binding_debt(&current.file_id, artifact_id, &held).map_err(invalid)?
+        else {
+            continue;
+        };
+        if previous.observed_source_digest != digest {
+            return Err(invalid(
+                "edited caller debt was not settled to current source",
+            ));
+        }
+        for obligation in previous.obligations {
+            if let Some(new) = debt
+                .obligations
+                .iter_mut()
+                .find(|new| new.retired_relation.id == obligation.retired_relation.id)
+            {
+                if new != &obligation {
+                    // Later caller observations may withdraw the remaining
+                    // sites of this same canonical edge. Keep its first
+                    // immutable obligation, never replace it with a reduced
+                    // live payload from a different source version.
+                    let mut comparable = new.retired_relation.clone();
+                    comparable.evidence = obligation.retired_relation.evidence.clone();
+                    if comparable != obligation.retired_relation
+                        || new.target_artifact != obligation.target_artifact
+                        || new.target_file != obligation.target_file
+                        || new.target_name != obligation.target_name
+                        || !kin_index::linker::has_named_import_factory_identity(
+                            &obligation.retired_relation,
+                        )
+                    {
+                        return Err(invalid("edited caller obligation identity collision"));
+                    }
+                    *new = obligation;
+                }
+            } else {
+                debt.obligations.push(obligation);
+            }
+        }
+    }
+    let old = crate::binding_debt::exact(graph, reserved)?;
+    let mut new = build_local_binding_debt(artifact_id, debt).map_err(invalid)?;
+    if let Some(old) = &old {
+        new.created_in = old.created_in;
+    }
+    set_final(old, Some(new), delta)
 }
 
 /// Run after ordinary settlement. Inputs are freshly reparsed unchanged sources
@@ -717,4 +1052,206 @@ pub(crate) fn stage_project_derivations<G: GraphStore>(
         accepted.push(fresh);
     }
     Ok(accepted)
+}
+
+#[cfg(test)]
+mod accepted_occurrence_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use kin_db::InMemoryGraph;
+    use kin_model::{ArtifactId, EntityStore, LocatedEntry, TreeDelta};
+
+    struct Fixture {
+        graph: InMemoryGraph,
+        source: IndexedFile,
+        observation: NamedImportObservation,
+        exact: Relation,
+        lsp: Relation,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let graph = InMemoryGraph::new();
+            let parse = |path: &str, text: &str| {
+                kin_index::IndexPipeline::new()
+                    .index_file_content_with_tests(
+                        &FilePathId::new(path),
+                        text.as_bytes(),
+                        kin_blobs::digest(text.as_bytes()),
+                    )
+                    .expect("parse actual source")
+                    .indexed_file
+            };
+            let source = parse(
+                "caller.py",
+                "from target import normalize_rate\ndef run(value):\n    return normalize_rate(value)\n",
+            );
+            let target = parse(
+                "target.py",
+                "def normalize_rate(value):\n    return value / 100\n",
+            );
+            for file in [&source, &target] {
+                graph
+                    .apply_transaction_delta(&TransactionDelta {
+                        tree_deltas: vec![TreeDelta::Added {
+                            artifact_id: ArtifactId::new(),
+                            new: LocatedEntry::new(
+                                RepoPath::from_utf8(file.file_id.0.clone()).unwrap(),
+                                TreeEntry::blob(
+                                    kin_model::Hash256::from_bytes(file.blob_hash.0),
+                                    false,
+                                ),
+                            ),
+                        }],
+                        ..Default::default()
+                    })
+                    .expect("admit actual source body");
+                for entity in &file.entities {
+                    graph
+                        .upsert_entity(entity)
+                        .expect("admit parsed declaration");
+                }
+            }
+            let source_id = source.entities.iter().find(|e| e.name == "run").unwrap().id;
+            let target_id = target
+                .entities
+                .iter()
+                .find(|e| e.name == "normalize_rate")
+                .unwrap()
+                .id;
+            let raw = source
+                .extracted_relations
+                .iter()
+                .find(|r| r.kind == RelationKind::Calls)
+                .unwrap()
+                .clone();
+            let observation = NamedImportObservation {
+                source: source_id,
+                raw,
+                target: Some(target_id),
+                source_bindings: BTreeMap::from([
+                    (source.file_id.0.clone(), source.blob_hash.to_string()),
+                    (target.file_id.0.clone(), target.blob_hash.to_string()),
+                ]),
+                candidate_presence: BTreeMap::new(),
+                rust_project_tree: None,
+            };
+            let evidence = named_import_evidence(
+                &observation.raw,
+                &source.file_id,
+                &target.file_id.0,
+                &ParseCompleteness::Full,
+                true,
+            );
+            assert!(!evidence.is_empty());
+            let exact = Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(source_id),
+                dst: GraphNodeId::Entity(target_id),
+                confidence: 0.95,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence,
+            };
+            let lsp = Relation {
+                id: RelationId::new(),
+                confidence: 1.0,
+                origin: RelationOrigin::Lsp,
+                evidence: vec![],
+                ..exact.clone()
+            };
+            graph.upsert_relation(&exact).unwrap();
+            graph.upsert_relation(&lsp).unwrap();
+            Self {
+                graph,
+                source,
+                observation,
+                exact,
+                lsp,
+            }
+        }
+
+        fn check(&self, produced: &[Relation], delta: &TransactionDelta) -> Result<bool> {
+            accepted(
+                &self.graph,
+                &self.source,
+                &self.observation,
+                produced,
+                delta,
+            )
+        }
+    }
+
+    #[test]
+    fn exact_import_proof_survives_lsp_row_before_or_after_it() {
+        let fixture = Fixture::new();
+        for produced in [
+            vec![fixture.lsp.clone(), fixture.exact.clone()],
+            vec![fixture.exact.clone(), fixture.lsp.clone()],
+        ] {
+            assert!(fixture
+                .check(&produced, &TransactionDelta::default())
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn a_matching_lsp_row_does_not_replace_missing_exact_evidence() {
+        let fixture = Fixture::new();
+        assert!(fixture
+            .check(
+                std::slice::from_ref(&fixture.lsp),
+                &TransactionDelta::default()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn retracted_exact_import_proof_is_not_rescued_by_a_matching_lsp_row() {
+        let fixture = Fixture::new();
+        let delta = TransactionDelta {
+            relation_deltas: vec![RelationDelta::Removed {
+                old: fixture.exact.clone(),
+            }],
+            ..Default::default()
+        };
+        assert!(fixture
+            .check(&[fixture.lsp.clone(), fixture.exact.clone()], &delta)
+            .is_err());
+    }
+
+    #[test]
+    fn staged_exact_import_must_retain_the_observed_occurrence() {
+        let fixture = Fixture::new();
+        let mut without_occurrence = fixture.exact.clone();
+        without_occurrence.evidence.clear();
+        let delta = TransactionDelta {
+            relation_deltas: vec![RelationDelta::Modified {
+                old: fixture.exact.clone(),
+                new: without_occurrence,
+            }],
+            ..Default::default()
+        };
+        assert!(fixture
+            .check(&[fixture.lsp.clone(), fixture.exact.clone()], &delta)
+            .is_err());
+    }
+
+    #[test]
+    fn exact_import_selection_keeps_source_binding_validation() {
+        let mut fixture = Fixture::new();
+        fixture
+            .observation
+            .source_bindings
+            .insert("caller.py".into(), "0".repeat(64));
+        assert!(fixture
+            .check(
+                &[fixture.lsp.clone(), fixture.exact.clone()],
+                &TransactionDelta::default()
+            )
+            .is_err());
+    }
 }

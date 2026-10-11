@@ -31,8 +31,9 @@ For each `kin locate` query:
 
 ## Where data goes
 
-All telemetry is written **locally only** to `.kin/telemetry/*.jsonl` in your
-repository. No data is uploaded to Firelock or any third party in this
+All telemetry is written **locally only** to `telemetry/*.jsonl` in your
+repository's Kin store (`kin store path` prints where it is; `.kin/` for a
+repository an earlier version initialized). No data is uploaded to Firelock or any third party in this
 version. A future opt-in upload feature (described in the roadmap) will
 require a separate, explicit consent step.
 
@@ -55,7 +56,7 @@ kin telemetry purge    # delete all local spool files
 You can also delete the spool directory directly:
 
 ```sh
-rm -rf .kin/telemetry/
+rm -rf "$(kin store path)/telemetry/"
 ```
 
 And you can override consent per-session with an environment variable:

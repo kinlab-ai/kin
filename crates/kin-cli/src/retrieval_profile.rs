@@ -316,7 +316,7 @@ pub fn cross_encoder_model_ever_fetched(model_id: &str) -> bool {
 
 /// The cache root for this process, with the platform and home resolvers the
 /// two probes above both need bound once.
-fn resolved_hf_cache_base() -> Option<PathBuf> {
+pub(crate) fn resolved_hf_cache_base() -> Option<PathBuf> {
     hf_cache_base(
         cfg!(windows),
         |key| std::env::var_os(key),
@@ -858,6 +858,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_relocated_cache_resolves_under_hf_home_and_never_under_the_home_root() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let hf_home = temp.path().join("relocated");
         let home = temp.path().join("home");

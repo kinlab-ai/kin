@@ -292,8 +292,13 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:

@@ -163,10 +163,12 @@ fn routed_texts() -> Vec<(String, String)> {
     let mut texts = Vec::new();
     for surface in [RoutedSurface::WITH_WRITES, RoutedSurface::READ_ONLY] {
         let profile = surface.profile();
-        texts.push((
-            format!("{profile} instructions"),
-            served_instructions(surface),
-        ));
+        let instructions = served_instructions(surface);
+        assert!(
+            instructions.contains("Pass returned UUIDs as entity_id, semantic names as query"),
+            "{profile} instructions must distinguish returned UUIDs from names: {instructions}"
+        );
+        texts.push((format!("{profile} instructions"), instructions));
         let listed = kin_mcp::routed::tool_definition(surface);
         texts.push((
             format!("{profile} tools/list"),
@@ -274,15 +276,28 @@ fn every_routed_spelling_runs_in_a_shell_or_names_the_kin_tool() {
             .map(|words| words.join(" "))
             .collect();
         for expected in [
-            "source by entity id",
+            "source by entity_id",
             "describe lists every other",
-            "call runs any of them",
             "call graph_neighborhood",
-            "tool up front and you",
         ] {
             assert!(
                 all.iter().any(|spelled| spelled.starts_with(expected)),
                 "no spelling reads `kin {expected}`"
+            );
+        }
+        // The agent surface no longer runs programs or sets folders up, so no
+        // text a routed client reads offers either through `kin call`.
+        for retired in [
+            "call exec",
+            "call kin_session_exec",
+            "call init",
+            "call kin_init",
+        ] {
+            assert!(
+                !all.iter().any(
+                    |spelled| spelled == retired || spelled.starts_with(&format!("{retired} "))
+                ),
+                "a routed text still reads `kin {retired}`"
             );
         }
     });
@@ -291,6 +306,14 @@ fn every_routed_spelling_runs_in_a_shell_or_names_the_kin_tool() {
 /// The reader takes each spelling whole and nothing that is not one.
 #[test]
 fn the_spelling_reader_reads_what_a_person_would() {
+    assert_eq!(
+        kin_spellings("Read entity code with kin source by entity_id."),
+        vec![vec![
+            "source".to_string(),
+            "by".to_string(),
+            "entity_id".to_string()
+        ]]
+    );
     assert_eq!(
         kin_spellings("Use kin refs and kin context before source."),
         vec![

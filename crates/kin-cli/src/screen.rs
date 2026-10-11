@@ -103,6 +103,88 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `text` with every line too long for `width` columns wrapped at a word,
+/// each continuation hanging under where that line's words start.
+///
+/// A two-column line, an indented term, two or more spaces and then its
+/// description, hangs under the description, so a command list keeps its
+/// column at any width. Any other line hangs under its own indent. A line that
+/// fits is left exactly as it is, and so is a word longer than the room it
+/// has, because the long words here are commands a person copies.
+pub fn hang_wrap(text: &str, width: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line.chars().count() <= width {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let body = &line[indent..];
+        // The description column, when the line has one with room to read.
+        let column = description_column(body)
+            .map(|offset| indent + offset)
+            .filter(|column| width.saturating_sub(*column) >= HANG_MIN_DESCRIPTION);
+        let (head, hang, words) = match column {
+            Some(column) => (line[..column].to_string(), column, &line[column..]),
+            None => (" ".repeat(indent), indent, body),
+        };
+        let room = width.saturating_sub(hang).max(1);
+        for (index, part) in wrap_exact(words, room).into_iter().enumerate() {
+            if index == 0 {
+                out.push(format!("{head}{part}"));
+            } else {
+                out.push(format!("{}{part}", " ".repeat(hang)));
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// The fewest columns a description keeps beside its term before the line
+/// gives up its column and hangs under its own indent instead.
+const HANG_MIN_DESCRIPTION: usize = 16;
+
+/// Where a two-column line's description starts, counted from its first
+/// non-space: after the first run of two or more spaces that follows a word.
+fn description_column(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b' ' && bytes[index + 1] == b' ' && index > 0 {
+            let mut end = index;
+            while end < bytes.len() && bytes[end] == b' ' {
+                end += 1;
+            }
+            return (end < bytes.len()).then_some(end);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Greedy word wrap at exactly `width` columns, a word longer than the width
+/// kept whole on its own line. [`wrap`] floors its width for prose; a hanging
+/// column cannot afford that floor.
+fn wrap_exact(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 /// How often the live line redraws.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -590,6 +672,56 @@ fn live_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command list keeps its description column at any width, and no word
+    /// is broken across lines.
+    #[test]
+    fn hang_wrap_keeps_the_description_column_and_whole_words() {
+        let text = "Start here:\n  kin setup           set up AI clients and your shell\n  kin status          see changes and Kin's progress";
+        assert_eq!(hang_wrap(text, 80), text, "a line that fits is untouched");
+        let narrow = hang_wrap(text, 40);
+        assert_eq!(
+            narrow,
+            "Start here:\n  kin setup           set up AI clients\n                      and your shell\n  kin status          see changes and\n                      Kin's progress"
+        );
+        for line in narrow.lines() {
+            assert!(line.chars().count() <= 40, "{line:?}");
+        }
+    }
+
+    /// Prose hangs under its own indent, and a description with no room
+    /// beside its term hangs under the line's indent instead.
+    #[test]
+    fn hang_wrap_hangs_prose_under_its_indent() {
+        let canon =
+            "A graph-native code repository for AI agents and the people who build with them.";
+        let wrapped = hang_wrap(canon, 56);
+        assert_eq!(
+            wrapped,
+            "A graph-native code repository for AI agents and the\npeople who build with them."
+        );
+        let cramped = hang_wrap("  kin mcp start --help  how AI clients connect to Kin", 30);
+        assert_eq!(
+            cramped,
+            "  kin mcp start --help how AI\n  clients connect to Kin"
+        );
+        let indented = hang_wrap(
+            "  kin locate / search / trace / impact / refs / context",
+            30,
+        );
+        for line in indented.lines() {
+            assert!(
+                line.starts_with("  ") && line.chars().count() <= 30,
+                "{line:?}"
+            );
+        }
+        // A word wider than the room is kept whole, never cut.
+        let long = hang_wrap(
+            "  run  https://example.com/a/very/long/address/that/does/not/fit",
+            40,
+        );
+        assert!(long.contains("https://example.com/a/very/long/address/that/does/not/fit"));
+    }
 
     #[test]
     fn the_short_form_is_for_a_person_at_a_terminal() {

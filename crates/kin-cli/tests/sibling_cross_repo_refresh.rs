@@ -121,7 +121,11 @@ fn find_references(
     let stderr_path = frames.with_extension("stderr");
     let mut child = runtime
         .kin_command()
-        .args(["mcp", "start", "--repo", repo_arg])
+        // The `full` profile, because this test reads what the agent profiles
+        // no longer serve: the codes behind the verdict and the `call_sites`
+        // block, which an agent profile's short answer drops whatever
+        // `answer_only` the call sends.
+        .args(["mcp", "start", "--repo", repo_arg, "--tool-profile", "full"])
         .env("KIN_MCP_REPO", repo_arg)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("KIN_EMBED_BACKEND", "cpu")

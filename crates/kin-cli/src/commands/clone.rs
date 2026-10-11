@@ -153,6 +153,7 @@ async fn clone_native(source: NativeCloneSource, target: &Path) -> Result<()> {
                     transaction: bootstrap.transaction,
                     bodies: bootstrap.bodies,
                     source_hydration_semantics: bootstrap.source_hydration_semantics,
+                    source_hydration_derivation: bootstrap.source_hydration_derivation,
                 }))
             };
             fetch()
@@ -226,7 +227,7 @@ async fn clone_native(source: NativeCloneSource, target: &Path) -> Result<()> {
             "native clone workspace does not track the adopted default ref");
         ensure!(status.repository.source_cas_verified && !status.workspace.dirty,
             "native clone could not verify its source bodies and exact workspace");
-        let history = client.log(&crate::commands::log::LogRequest { count: 1 }).await?.report
+        let history = client.log(&crate::commands::log::LogRequest { count: 1, skip: 0 }).await?.report
             .context("native clone daemon did not report exact history")?;
         let expected_head = match response.as_ref().map(|response| &response.outcome.plan) {
             Some(RepositoryTransferPlan::UpToDate { head }) => *head,
@@ -372,6 +373,18 @@ pub async fn run(
         }
     }
 
+    // A store this machine already prepared from exactly the Git state this
+    // clone produced is reused rather than derived again.
+    if let Some(code) = crate::commands::init::reuse_prepared_store(
+        &target,
+        false,
+        crate::commands::init::InitEnrichment::Now,
+    )
+    .await?
+    {
+        return Ok(code);
+    }
+
     let admitted = crate::commands::init::admit_showing_progress(view.as_ref(), || {
         kin_core::init_from_git(&target).map_err(anyhow::Error::from)
     });
@@ -397,7 +410,12 @@ pub async fn run(
     // first embedding pass. A clone used to stop at admission and say
     // "Semantic enrichment: not run", and nothing told its reader that a
     // separate `kin daemon sweep` was what finished it.
-    let after = crate::commands::init::after_admission(&result, false, view.clone()).await;
+    let after = crate::commands::init::after_admission(
+        &result,
+        crate::commands::init::EnrichmentPlan::Sweep,
+        view.clone(),
+    )
+    .await;
 
     match &view {
         Some(screen) => {

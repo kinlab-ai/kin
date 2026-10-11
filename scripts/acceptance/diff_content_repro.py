@@ -234,6 +234,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["KIN_REGISTRY_PATH"] = os.path.join(self.home, "registry.toml")
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DAEMON_URL", None)

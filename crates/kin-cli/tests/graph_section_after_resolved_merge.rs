@@ -130,8 +130,8 @@ fn base_change(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> String {
         .collect()
 }
 
-fn configure_author(repo: &Path) {
-    let path = repo.join(".kin/config.toml");
+fn configure_author(runtime: &common::IsolatedDaemonRuntime, repo: &Path) {
+    let path = runtime.layout_for(repo).config_path();
     let mut config = kin_core::KinConfig::load_or_default(&path).unwrap();
     config.default_author =
         Some("Graph Section Resolved Merge Test <graph-section@example.invalid>".to_string());
@@ -170,9 +170,8 @@ fn a_merge_published_through_resolve_continue_leaves_a_section_serving_its_merge
     let runtime = common::IsolatedDaemonRuntime::new(&source);
 
     fs::create_dir(&source).unwrap();
-    let initialized = kin_core::init_replica(&source, "trunk").unwrap();
-    drop(initialized);
-    configure_author(&source);
+    runtime.initialize_native_replica(&source, "trunk");
+    configure_author(&runtime, &source);
     fs::create_dir(source.join("src")).unwrap();
     fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 42 }\n").unwrap();
     commit(&runtime, &source, "Add a native source body");
@@ -277,9 +276,8 @@ fn a_cold_reopen_after_a_resolved_merge_still_serves_from_its_section() {
     let runtime = common::IsolatedDaemonRuntime::new(&source);
 
     fs::create_dir(&source).unwrap();
-    let initialized = kin_core::init_replica(&source, "trunk").unwrap();
-    drop(initialized);
-    configure_author(&source);
+    runtime.initialize_native_replica(&source, "trunk");
+    configure_author(&runtime, &source);
     fs::create_dir(source.join("src")).unwrap();
     fs::write(source.join("src/lib.rs"), b"pub fn answer() -> u8 { 42 }\n").unwrap();
     commit(&runtime, &source, "Add a native source body");

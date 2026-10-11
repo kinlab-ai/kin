@@ -26,7 +26,7 @@ On first run it:
 - starts (or reuses) the repo daemon automatically, and only then serves tools;
 - never sets a folder up on its own. When the folder is not a Kin repository,
   the first answer says so, and your agent can set it up by calling the
-  `kin_init` tool (`init` on the `agent-routed` profile) when you ask it to. It
+  `init` tool (the `init` command on the `agent-routed` profile) when you ask it to. It
   is a write, so the read-only profiles do not offer it. From a
   terminal, `npx -y @kinlab/kin init .` does the same with no install. Set
   `KIN_MCP_AUTO_INIT=1` to have the wrapper run `kin init .` at launch instead;
@@ -47,8 +47,12 @@ while `kin mcp start` is coming up waits for it. A client that does not refresh
 its tools on that notification sees them after one reconnect. Later launches of
 the same version start from the cache and skip all of this.
 
-With `KIN_MCP_AUTO_INIT=1` and no `.kin/`, the first launch runs `kin init .`
+With `KIN_MCP_AUTO_INIT=1` and no Kin store, the first launch runs `kin init .`
 after the download, and `kin_startup_status` says so while it runs.
+The resolved binary answers `kin store path --json` before that decision, so an
+existing central store is recognized too. If discovery times out or returns an
+unreadable answer, the wrapper starts MCP without automatically initializing;
+Kin resolves the repository when a tool needs it.
 
 If a runnable Kin cannot be provisioned, the wrapper gives a precise guided fix
 instead of a stack trace. An unsupported target is refused at once, on stderr. A
@@ -101,7 +105,7 @@ the line was typed.
 
 - Node.js 20+
 - macOS, Linux, or native Windows x64
-- A Git repository, or an empty folder, for Kin to set up; the `kin_init` tool
+- A Git repository, or an empty folder, for Kin to set up; the `init` tool
   or `npx -y @kinlab/kin init .` does it
 
 Native Windows x64 support is early. The end-to-end install proof runs agent
@@ -136,7 +140,7 @@ Stopping the daemons leaves these in place:
 | `~/Library/Caches/kin-mcp` (macOS), `~/.cache/kin-mcp` (Linux), `%LOCALAPPDATA%\kin-mcp\Cache` (Windows) | about 150 MB per version | the `kin` and `kin-daemon` binaries this wrapper downloaded |
 | `~/.kin` | grows with the repositories Kin has embedded | Kin's home: daemon records, logs and the embedding cache |
 | `~/.cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5` | about 523 MB | the embedding model, fetched the first time Kin embeds a repository |
-| `.kin/` in each repository you initialized | grows with history | that repository's graph |
+| `~/.kin/stores/<name>` for each repository you initialized (`.kin/` for one an earlier version initialized) | grows with history | that repository's graph |
 
 `kin-mcp --stop` prints each path with its size on your machine and the command
 that removes it. By hand, once the daemons have stopped (macOS shown):
@@ -157,7 +161,7 @@ Set `KIN_MCP_CACHE_DIR` to move the binary cache.
   one (you are then responsible for its `kin-daemon`)
 - `KIN_BINARY_PATH`: alias for `KIN_MCP_KIN_BINARY`
 - `KIN_MCP_CACHE_DIR`: override the cache directory
-- `KIN_MCP_AUTO_INIT=1`: allow the wrapper to run `kin init .` when `.kin/` is missing
+- `KIN_MCP_AUTO_INIT=1`: allow the wrapper to run `kin init .` when no Kin store serves the folder
 - `KIN_MCP_TOOL_PROFILE`: override the default `agent-default` tool profile
 - `KIN_MCP_RELEASE_BASE_URL`: override the GitHub release download base URL
 
@@ -176,7 +180,7 @@ Then initialize a repository and let the MCP client launch `kin-mcp`.
 `test/smoke-first-run.mjs` exercises the whole first-run path against built Kin
 binaries: it stages `kin` + `kin-daemon` into a throwaway cache (no pre-existing
 daemon, no dev `PATH` state), runs the wrapper, and drives the MCP stdio protocol
-through one safe semantic tool (`kin_graph_status`). Run it with:
+through one safe semantic tool (`status`). Run it with:
 
 ```sh
 cargo build --release -p kin-cli -p kin-daemon

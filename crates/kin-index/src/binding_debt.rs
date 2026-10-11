@@ -287,36 +287,9 @@ pub fn obligation_is_satisfied<G: GraphStore>(
         return Ok(true);
     }
 
-    let sites: Vec<_> = held
-        .evidence
-        .iter()
-        .filter_map(|e| e.source_span.as_ref())
-        .collect();
-    if sites.is_empty() {
+    let Some(prior) = prior_occurrences(obligation, old) else {
         return Ok(false);
-    }
-    let prior: Vec<_> =
-        old.extracted_relations
-            .iter()
-            .filter(|raw| {
-                raw.kind == held.kind
-                    && raw.src_name == obligation.source_name
-                    && raw.site.as_ref().is_some_and(|site| {
-                        sites.contains(&&site.to_source_span(prior_source_file))
-                    })
-            })
-            .collect();
-    if prior.is_empty()
-        || sites.iter().any(|site| {
-            !prior.iter().any(|raw| {
-                raw.site
-                    .as_ref()
-                    .is_some_and(|raw_site| raw_site.to_source_span(prior_source_file) == **site)
-            })
-        })
-    {
-        return Ok(false);
-    }
+    };
     // An inferred target is a guess. A current, source-sealed proof of the
     // exact callee may correct that guess, including to an external symbol.
     // Stronger origins and unplaced/ambiguous answers keep their obligations.
@@ -331,6 +304,7 @@ pub fn obligation_is_satisfied<G: GraphStore>(
             current_entities,
             produced,
             &prior,
+            ParseRequirement::Valid,
         )?
     {
         return Ok(true);
@@ -408,6 +382,85 @@ pub fn obligation_is_satisfied<G: GraphStore>(
     Ok(true)
 }
 
+/// The parser occurrences in the prior body that minted `obligation`'s
+/// retired relation: one for every site its evidence cites, all by the
+/// obligation's own source. `None` when a site has none, or none is cited.
+fn prior_occurrences<'a>(
+    obligation: &LocalBindingObligation,
+    old: &'a IndexedFile,
+) -> Option<Vec<&'a ExtractedRelation>> {
+    let held = &obligation.retired_relation;
+    let prior_source_file = &old.file_id;
+    let sites: Vec<_> = held
+        .evidence
+        .iter()
+        .filter_map(|e| e.source_span.as_ref())
+        .collect();
+    if sites.is_empty() {
+        return None;
+    }
+    let prior: Vec<_> =
+        old.extracted_relations
+            .iter()
+            .filter(|raw| {
+                raw.kind == held.kind
+                    && raw.src_name == obligation.source_name
+                    && raw.site.as_ref().is_some_and(|site| {
+                        sites.contains(&&site.to_source_span(prior_source_file))
+                    })
+            })
+            .collect();
+    let every_site_found = sites.iter().all(|site| {
+        prior.iter().any(|raw| {
+            raw.site
+                .as_ref()
+                .is_some_and(|raw_site| raw_site.to_source_span(prior_source_file) == **site)
+        })
+    });
+    (!prior.is_empty() && every_site_found).then_some(prior)
+}
+
+/// Settle an inferred call guess in a source whose parse recovered from a
+/// syntax error.
+///
+/// A recovered parse cannot support a proof by absence, since the region it
+/// skipped could hold an occurrence it never recorded, so every other proof
+/// in [`obligation_is_satisfied`] refuses it. This one argues from presence
+/// alone: the body is byte-identical to the one the guess was made from, each
+/// prior occurrence is re-found at the same bytes, its callee token is read
+/// off a callee holding no error, and a current language-server proof at
+/// that token refutes the guess. Only a name-only (`Inferred`) `Calls` guess
+/// is settled this way.
+#[allow(clippy::too_many_arguments)]
+pub fn inferred_guess_is_refuted_under_recovered_parse<G: GraphStore>(
+    graph: &G,
+    obligation: &LocalBindingObligation,
+    old: &IndexedFile,
+    old_source: &[u8],
+    current: &IndexedFile,
+    current_entities: &[Entity],
+    produced: &[Relation],
+) -> std::result::Result<bool, String> {
+    let held = &obligation.retired_relation;
+    if held.origin != RelationOrigin::Inferred || held.kind != RelationKind::Calls {
+        return Ok(false);
+    }
+    let Some(prior) = prior_occurrences(obligation, old) else {
+        return Ok(false);
+    };
+    inferred_calls_are_refined(
+        graph,
+        obligation,
+        old,
+        old_source,
+        current,
+        current_entities,
+        produced,
+        &prior,
+        ParseRequirement::Recovered,
+    )
+}
+
 /// Project a parser-recorded call expression to its actual callee token.
 /// The syntax tree, not containment in an argument list, owns this mapping.
 /// Unsupported call forms remain unproved.
@@ -421,23 +474,46 @@ fn exact_callee_token<'t>(
     if call.start_byte() != site.start_byte
         || call.end_byte() != site.end_byte
         || !matches!(call.kind(), "call" | "call_expression")
-        || call.has_error()
     {
         return None;
     }
     let function = call.child_by_field_name("function")?;
+    // A syntax error inside the arguments, such as an annotation the grammar
+    // does not read, leaves the callee as it was parsed. One inside the
+    // callee leaves nothing certain about which name is called.
+    if function.has_error() {
+        return None;
+    }
+    // A turbofish call names its callee inside the generic, and a path call
+    // (`module::f(..)`, `Type::new(..)`) in the path's last segment: the same
+    // token the language server's call-site ledger is keyed by.
+    let function = match function.kind() {
+        "generic_function" => function.child_by_field_name("function")?,
+        _ => function,
+    };
     let token = match function.kind() {
         "identifier" | "field_identifier" | "property_identifier" => function,
+        "scoped_identifier" => function.child_by_field_name("name")?,
         "attribute" => function.child_by_field_name("attribute")?,
         "member_expression" => function.child_by_field_name("property")?,
         "field_expression" | "selector_expression" => function.child_by_field_name("field")?,
         _ => return None,
     };
-    matches!(
+    (matches!(
         token.kind(),
         "identifier" | "field_identifier" | "property_identifier"
-    )
+    ) && !token.is_missing())
     .then_some(token)
+}
+
+/// How much of a file's parse a refinement proof may stand on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParseRequirement {
+    /// Both parses must be complete.
+    Valid,
+    /// A recovered parse is enough: the proof re-finds each prior occurrence
+    /// in the same bytes and never argues from the absence of one.
+    Recovered,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -450,6 +526,7 @@ fn inferred_calls_are_refined<G: GraphStore>(
     current_entities: &[Entity],
     produced: &[Relation],
     prior: &[&ExtractedRelation],
+    parse: ParseRequirement,
 ) -> Result<bool, String> {
     use kin_model::{CallSiteState, ContextValidationState, ResolutionRecord, ResolutionRecordId};
     let digest = obligation.source_digest;
@@ -476,8 +553,9 @@ fn inferred_calls_are_refined<G: GraphStore>(
         || old.blob_hash.0 != digest.0
         || current.blob_hash.0 != digest.0
         || kin_blobs::digest(old_source).0 != digest.0
-        || !matches!(old.parse_state, kin_model::ParseState::Valid)
-        || !matches!(current.parse_state, kin_model::ParseState::Valid)
+        || (parse == ParseRequirement::Valid
+            && (!matches!(old.parse_state, kin_model::ParseState::Valid)
+                || !matches!(current.parse_state, kin_model::ParseState::Valid)))
     {
         return Ok(false);
     }
@@ -599,6 +677,19 @@ fn inferred_calls_are_refined<G: GraphStore>(
             return Ok(false);
         };
         let destination = match answer.state {
+            // The resolver proved the call leaves the repository without
+            // naming the symbol, which refutes the in-repository guess and
+            // leaves no edge to require.
+            CallSiteState::ProvenOutside => continue,
+            // The resolver proved the call reaches a declaration inside the
+            // caller itself, a nested function or the caller recursing, which
+            // refutes a guess naming any other declaration. No edge carries a
+            // proof onto its own caller, as `validate_backing` above accepts.
+            CallSiteState::ProvenTarget { target }
+                if target == source.id && held.dst != GraphNodeId::Entity(target) =>
+            {
+                continue
+            }
             CallSiteState::ProvenTarget { target }
                 if graph
                     .get_entity(&target)
@@ -619,8 +710,8 @@ fn inferred_calls_are_refined<G: GraphStore>(
             }
             _ => return Ok(false),
         };
-        // Require the edge even for recursion: a ledger's special recursive
-        // exemption does not by itself retire a different old local target.
+        // Every other proof names a node, and its language-server edge must
+        // carry this exact callee token.
         let context_token = ledger.context.context_token();
         if !produced.iter().any(|edge| {
             edge.kind == RelationKind::Calls
@@ -653,6 +744,9 @@ enum AnnotatedOccurrence<'a> {
     /// An extracted relation whose site is the token, or a call whose callee
     /// the token names.
     Extracted(&'a ExtractedRelation),
+    /// A parser-recorded call whose target remains unknown. This establishes
+    /// syntax for retaining/removing debt, never a resolved relationship.
+    IncompleteCall(&'a ExtractedRelation),
 }
 
 fn within(outer: &kin_model::SourceSpan, inner: &kin_model::SourceSpan) -> bool {
@@ -717,6 +811,19 @@ fn annotated_occurrences<'a>(
         let Some(site) = raw.site.as_ref().map(|site| site.to_source_span(file)) else {
             continue;
         };
+        if kin_parser::is_scoped_call_extraction_incomplete_marker(raw)
+            && raw
+                .receiver
+                .as_deref()
+                .is_some_and(|callee| callee.rsplit(['.', ':']).next() == Some(token))
+            && within(&site, cited)
+            && old_source
+                .get(site.start_byte..cited.start_byte)
+                .is_some_and(|ahead| !ahead.contains(&b'('))
+        {
+            found.push(AnnotatedOccurrence::IncompleteCall(raw));
+            continue;
+        }
         // A call's site is its whole expression, arguments included, so the
         // token has to be the callee: the called name, ahead of the argument
         // list. A name read inside the arguments is not this call.
@@ -852,6 +959,56 @@ fn annotated_occurrence_is_settled<G: GraphStore>(
                             else {
                                 return Ok(false);
                             };
+                            if !re_resolved_at(
+                                graph,
+                                source_artifact,
+                                obligation,
+                                &candidate.src_name,
+                                &[site],
+                                import_module(candidate, current).as_deref(),
+                                current_entities,
+                                produced,
+                                target,
+                            )? {
+                                every = false;
+                                break;
+                            }
+                        }
+                        every
+                    }
+                }
+                AnnotatedOccurrence::IncompleteCall(raw) => {
+                    let callee = raw.receiver.as_deref().expect("known scoped callee");
+                    let matching: Vec<_> = current
+                        .extracted_relations
+                        .iter()
+                        .filter(|candidate| {
+                            (candidate.kind == RelationKind::Calls
+                                && candidate.dst_name.rsplit(['.', ':']).next()
+                                    == callee.rsplit(['.', ':']).next())
+                                || (kin_parser::is_scoped_call_extraction_incomplete_marker(
+                                    candidate,
+                                ) && candidate.receiver.as_deref() == Some(callee))
+                        })
+                        .collect();
+                    if matching.is_empty() {
+                        !current
+                            .extracted_relations
+                            .iter()
+                            .any(kin_parser::is_call_extraction_incomplete_marker)
+                    } else {
+                        let mut every = true;
+                        for candidate in matching {
+                            let Some(site) = candidate
+                                .site
+                                .as_ref()
+                                .map(|site| site.to_source_span(source_file))
+                            else {
+                                return Ok(false);
+                            };
+                            // Negative syntax cannot settle itself. Only an
+                            // accepted proof of the obligation's actual kind
+                            // and target at this current site can do so.
                             if !re_resolved_at(
                                 graph,
                                 source_artifact,
@@ -1008,4 +1165,96 @@ fn matches_target<G: GraphStore>(
                     && e.resolved_path.as_deref() == Some(file.0.as_str())
             })
     }))
+}
+
+#[cfg(test)]
+mod callee_token_tests {
+    use super::exact_callee_token;
+
+    /// Each call expression's callee token in `source`, read the way the
+    /// refinement proof reads it.
+    fn callee_tokens(language: kin_model::LanguageId, source: &str) -> Vec<Option<String>> {
+        let registry = kin_parser::AdapterRegistry::default();
+        let tree = registry
+            .get_by_language(language)
+            .unwrap()
+            .parse(source.as_bytes())
+            .unwrap();
+        let file = kin_model::FilePathId::new("src/lib.rs");
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression" {
+                calls.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        calls.sort_by_key(|node| node.start_byte());
+        calls
+            .into_iter()
+            .map(|call| {
+                let span = kin_parser::adapter::span_from_node(&call, &file);
+                exact_callee_token(&tree, &span)
+                    .map(|token| token.utf8_text(source.as_bytes()).unwrap().to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_error_in_the_arguments_leaves_the_callee_token() {
+        // The JavaScript grammar does not read these Flow annotations, and
+        // its recovery puts an error inside the call's arguments while the
+        // callee parses cleanly.
+        let registry = kin_parser::AdapterRegistry::default();
+        let adapter = registry
+            .get_by_language(kin_model::LanguageId::JavaScript)
+            .unwrap();
+        let file = kin_model::FilePathId::new("src/handle.js");
+        for source in [
+            "setTimeout(error: any, 0);\n",
+            "setTimeout(() => { throw error; }: any);\n",
+        ] {
+            let tree = adapter.parse(source.as_bytes()).unwrap();
+            let end = source.rfind(')').unwrap() + 1;
+            let call = tree
+                .root_node()
+                .named_descendant_for_byte_range(0, end)
+                .unwrap();
+            assert_eq!(
+                call.kind(),
+                "call_expression",
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            assert!(call.has_error(), "{source}: {}", tree.root_node().to_sexp());
+            assert!(
+                !call.child_by_field_name("function").unwrap().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+            let span = kin_parser::adapter::span_from_node(&call, &file);
+            assert_eq!(
+                super::exact_callee_token(&tree, &span)
+                    .map(|token| token.utf8_text(source.as_bytes()).unwrap()),
+                Some("setTimeout"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_path_and_turbofish_calls_name_their_last_segment() {
+        let source = "fn run() {\n    crate::util::helper(1);\n    Vec::<u8>::new();\n    parse::<u8>(\"2\");\n    local(3);\n    value.method(4);\n}\n";
+        assert_eq!(
+            callee_tokens(kin_model::LanguageId::Rust, source),
+            vec![
+                Some("helper".to_string()),
+                Some("new".to_string()),
+                Some("parse".to_string()),
+                Some("local".to_string()),
+                Some("method".to_string()),
+            ]
+        );
+    }
 }

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Kin</title>
+  <link rel="icon" href="__KIN_BASE__/workspace/mark.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="__KIN_BASE__/workspace/style.css" />
+</head>
+<body data-api-base="__KIN_BASE__">
+  <a class="workspace-skip" href="#workspace-main">Skip to content</a>
+  <div class="workspace-app" id="workspace-app">
+    <aside class="workspace-sidebar" aria-label="Workspace">
+      <a class="workspace-brand" href="#/home" id="workspace-brand" aria-label="Home">
+        <img src="__KIN_BASE__/workspace/mark.svg" alt="" width="28" height="28" />
+        <span class="workspace-brand-text">
+          <span class="workspace-repository-name" id="repository-name">Kin</span>
+          <span class="workspace-repository-branch" id="repository-branch"></span>
+        </span>
+      </a>
+      <div id="workspace-repository-picker"></div>
+      <nav class="workspace-nav" id="workspace-nav" aria-label="Primary">
+        <a href="#/home" data-route="home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4.5l8 6.7V19a1 1 0 0 1-1 1h-4.5v-5.5h-5V20H5a1 1 0 0 1-1-1z"/></svg><span>Home</span></a>
+        <a href="#/explore" data-route="explore"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.3-4.3"/></svg><span>Explore</span><kbd>/</kbd></a>
+        <a href="#/changes" data-route="changes"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6"/></svg><span>Changes</span></a>
+        <a href="__KIN_BASE__/review/" id="workspace-review-link" data-route="review"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h10M4 12h7M4 17.5h6"/><path d="m14.5 16 2.2 2.2 4.3-4.7"/></svg><span>Review</span></a>
+        <a href="#/branches" data-route="branches"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="18" cy="8" r="2.2"/><path d="M6 7.7v8.6M18 10.2c0 4-6 3.2-11 6.5"/></svg><span>Branches</span></a>
+      </nav>
+      <button class="workspace-menu-toggle" id="workspace-menu-toggle" type="button" aria-expanded="false" aria-controls="workspace-sidebar-bottom" aria-label="More"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+      <div class="workspace-sidebar-bottom" id="workspace-sidebar-bottom">
+        <div class="workspace-fresh">
+          <span class="workspace-status" id="workspace-status" data-state="loading"><span class="workspace-status-dot" aria-hidden="true"></span><span id="workspace-status-text">Loading</span></span>
+          <button class="workspace-icon-button" id="workspace-refresh" type="button" aria-label="Refresh" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 8a7 7 0 0 1 11.6-1.7L20 9M4 15l2.3 2.7A7 7 0 0 0 17.9 16"/></svg></button>
+        </div>
+        <div class="workspace-menu-picker" id="workspace-menu-picker"></div>
+        <div class="workspace-sidebar-meta">
+          <span id="workspace-version">Kin</span>
+          <button class="workspace-theme" id="workspace-theme" type="button">Auto</button>
+        </div>
+      </div>
+    </aside>
+    <main class="workspace-main" id="workspace-main" tabindex="-1">
+      <span class="skeleton skeleton-line" aria-hidden="true"></span>
+    </main>
+  </div>
+  <div class="map-tip" id="workspace-tip" role="presentation" hidden></div>
+  <div class="workspace-sr" id="workspace-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+  <noscript><p class="workspace-noscript">This page needs JavaScript. The same changes read in a terminal with <code>kin review guide</code>.</p></noscript>
+  <script src="__KIN_BASE__/review/highlight.js"></script>
+  <script src="__KIN_BASE__/workspace/graph.js"></script>
+  <script src="__KIN_BASE__/workspace/workspace.js"></script>
+</body>
+</html>

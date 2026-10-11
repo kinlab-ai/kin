@@ -175,7 +175,18 @@ fn render_summary(review: &Review, pending: Option<PendingEnrichment<'_>>) -> St
         })
         .collect();
     let recorded_pending = observation.map(|observation| PendingEnrichment {
-        code: &observation.status,
+        // Owed work reads as pending enrichment. An observation that owes
+        // nothing leads with the code of what its entities do hold, because
+        // waiting for enrichment would not change it.
+        code: if observation.owed_entities > 0 {
+            &observation.status
+        } else {
+            observation
+                .pending_by_code
+                .keys()
+                .next()
+                .map_or(observation.status.as_str(), String::as_str)
+        },
         total_pending_entities: observation.total_pending_entities,
         limitation: observation.limitation.as_deref(),
         entities: &entities,
@@ -247,10 +258,20 @@ pub fn not_settled_line(pending: &PendingEnrichment<'_>) -> String {
 
 fn not_settled_line_with_hint(pending: &PendingEnrichment<'_>, include_sweep_hint: bool) -> String {
     let count = pending.total_pending_entities;
+    // Only owed work is pending enrichment. A code a resolver already
+    // answered under says the sites are unsettled, not unfinished.
+    let answered = crate::enrichment::ANSWERED_UNSETTLED_CODES.contains(&pending.code);
     let mut line = format!(
-        "not settled: {}: {count} {} still pending enrichment.",
+        "not settled: {}: {count} {} {}.",
         pending.code,
         plural(count, "entity", "entities"),
+        if !answered {
+            "still pending enrichment"
+        } else if count == 1 {
+            "holds call sites that are not settled"
+        } else {
+            "hold call sites that are not settled"
+        },
     );
     if let Some(limitation) = pending
         .limitation
@@ -786,6 +807,43 @@ fn render_impact(impact: &ImpactReport, entity_name: &dyn Fn(&EntityId) -> Strin
         .unwrap();
         for entity in &impact.affected_dependents {
             writeln!(out, "  {} ({:?})", entity.name, entity.kind).unwrap();
+        }
+    }
+
+    if !impact.affected_overrides.is_empty() {
+        writeln!(
+            out,
+            "\nAffected overrides ({}):",
+            impact.affected_overrides.len(),
+        )
+        .unwrap();
+        for entity in &impact.affected_overrides {
+            writeln!(out, "  {} ({:?})", entity.name, entity.kind).unwrap();
+        }
+    }
+
+    // A caller of an override changes with the overridden method's signature
+    // exactly as a direct caller does; each line names the override it calls.
+    for (rows, heading) in [
+        (
+            &impact.affected_override_callers,
+            "Callers of the overrides",
+        ),
+        (
+            &impact.override_caller_candidates,
+            "Possible callers of the overrides, matched by name only",
+        ),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        writeln!(out, "\n{heading} ({}):", rows.len()).unwrap();
+        for row in rows {
+            let via = row
+                .primary()
+                .map(|call| format!(", calls {} ({})", call.override_name, call.resolution))
+                .unwrap_or_default();
+            writeln!(out, "  {} ({:?}){via}", row.entity.name, row.entity.kind).unwrap();
         }
     }
 
@@ -1644,6 +1702,9 @@ mod tests {
             total_pending_entities: 7,
             pending_entities,
             entities_withheld: 2,
+            owed_entities: 7,
+            pending_by_code: Default::default(),
+            clauses: Vec::new(),
         });
         for output in [format_review(&review), format_summary(&review)] {
             assert_eq!(output.matches("not settled:").count(), 1, "{output}");
@@ -1696,6 +1757,48 @@ mod tests {
         let output = format_review(&review);
         assert!(!output.contains("not settled"), "{output}");
         assert!(!output.contains("kin daemon sweep"), "{output}");
+    }
+
+    /// An observation that owes nothing never reads as pending enrichment:
+    /// it leads with the code its entities hold.
+    #[test]
+    fn a_review_whose_pending_entities_owe_nothing_names_what_they_hold() {
+        use crate::enrichment::{
+            EnrichmentObservation, EnrichmentProjection, PendingEnrichmentEntity,
+        };
+        let (mut review, _) = rename_after_import();
+        review.impact.enrichment = Some(EnrichmentObservation {
+            scope: "selected_graph_impact".into(),
+            selected_change: None,
+            status: "bounded".into(),
+            basis: "persisted_call_site_ledgers".into(),
+            limitation: Some("call_sites_unresolved: 2 entities hold call sites.".into()),
+            total_pending_entities: 2,
+            pending_entities: (0..2)
+                .map(|index| PendingEnrichmentEntity {
+                    entity_id: EntityId::new(),
+                    name: format!("conf_{index}"),
+                    projection: EnrichmentProjection {
+                        path: Some("docs/conf.py".into()),
+                    },
+                    states: vec!["unresolved".into()],
+                    validation_reason: None,
+                })
+                .collect(),
+            entities_withheld: 0,
+            owed_entities: 0,
+            pending_by_code: [("call_sites_unresolved".to_string(), 2)].into(),
+            clauses: Vec::new(),
+        });
+        let output = format_summary(&review);
+        assert!(
+            output.contains(
+                "not settled: call_sites_unresolved: 2 entities hold call sites that are not \
+                 settled."
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("pending enrichment"), "{output}");
     }
 
     #[test]

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Capabilities for filesystem and process access at Kin's declared boundaries"
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+cap-std = "=4.0.2"
+kin-blobs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

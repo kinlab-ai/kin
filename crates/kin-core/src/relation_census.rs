@@ -709,7 +709,7 @@ impl CensusContext {
     {
         Self {
             previous: read(layout),
-            causes: known_causes(vars),
+            causes: known_causes_for(layout, vars),
         }
     }
 }
@@ -721,11 +721,12 @@ impl CensusContext {
 /// able to present as "nothing changed".
 pub fn read(layout: &KinLayout) -> RelationCensusRead {
     let path = layout.kindb_relation_census_path();
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RelationCensusRead::Absent
-        }
+    let raw = match crate::store_records::read(layout.root(), &path) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) => return RelationCensusRead::Unreadable(error.to_string()),
+        },
+        Ok(None) => return RelationCensusRead::Absent,
         Err(error) => return RelationCensusRead::Unreadable(error.to_string()),
     };
     match serde_json::from_str::<RelationCensus>(&raw) {
@@ -748,26 +749,9 @@ pub fn read(layout: &KinLayout) -> RelationCensusRead {
 /// unreadable forever. This is the same publication the last-admission marker
 /// beside it uses.
 pub fn write(layout: &KinLayout, recorded: &RelationCensus) -> std::io::Result<()> {
-    use std::io::Write;
-
     let path = layout.kindb_relation_census_path();
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("relation-census path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-    let staged = path.with_extension(format!("tmp-{}", std::process::id()));
     let body = serde_json::to_vec(recorded).map_err(std::io::Error::other)?;
-    {
-        let mut file = std::fs::File::create(&staged)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = std::fs::rename(&staged, &path) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error);
-    }
-    sync_directory_metadata(parent)?;
-    Ok(())
+    crate::store_records::write(layout.root(), &path, &body)
 }
 
 /// What [`record`] did with the census it was handed.
@@ -835,7 +819,7 @@ impl CensusHold {
     /// record does: this exists to report a degradation and must never become
     /// one.
     pub fn read(kin_root: &std::path::Path) -> Option<Self> {
-        let raw = std::fs::read(census_hold_path(kin_root)).ok()?;
+        let raw = crate::store_records::read(kin_root, &census_hold_path(kin_root)).ok()??;
         serde_json::from_slice(&raw).ok()
     }
 
@@ -860,15 +844,12 @@ fn publish_hold(layout: &KinLayout, hold: Option<&CensusHold>) {
     let path = census_hold_path(layout.root());
     match hold {
         Some(hold) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
             if let Ok(body) = serde_json::to_vec(hold) {
-                let _ = std::fs::write(&path, body);
+                let _ = crate::store_records::write(layout.root(), &path, &body);
             }
         }
         None => {
-            let _ = std::fs::remove_file(&path);
+            let _ = crate::store_records::remove(layout.root(), &path);
         }
     }
 }
@@ -986,18 +967,6 @@ pub fn record_settled(
     }
 }
 
-#[cfg(unix)]
-fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(path).and_then(|directory| directory.sync_all())
-}
-
-/// Non-unix platforms expose no portable directory handle to sync, so the
-/// rename's own ordering guarantees are all there is.
-#[cfg(not(unix))]
-fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 /// The conditions in an environment that are known to reduce relation coverage.
 ///
 /// Derived from the same audit that emits `correctness-relevant override
@@ -1018,6 +987,21 @@ where
         .into_iter()
         .map(|finding| format!("{} {}", finding.var, finding.message))
         .collect()
+}
+
+/// [`known_causes`] for one store: the environment's conditions, then the
+/// store's own setting when it switches language-server enrichment off.
+///
+/// The setting is a condition of the store rather than of any environment, so
+/// a census recorded by a daemon and one recorded by `kin upgrade` name it the
+/// same way whoever started them.
+pub fn known_causes_for<I>(layout: &KinLayout, vars: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut causes = known_causes(vars);
+    causes.extend(crate::enrichment_setting::census_cause(layout));
+    causes
 }
 
 #[cfg(test)]

@@ -231,7 +231,9 @@ fn callee_chain(graph: &InMemoryGraph, files: &[FileParseData], focal: &str) -> 
             include_body: Some(false),
             max_response_chars: None,
             include_type_edges: None,
+            scope: None,
             target: None,
+            include_tests: None,
         },
     )
     .expect("trace fixture");

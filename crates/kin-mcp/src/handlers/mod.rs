@@ -12,12 +12,16 @@ pub mod bench;
 pub mod entities;
 pub mod external_symbols;
 pub mod file_entities;
+pub(crate) mod held_text;
+pub(crate) mod implementation_family;
 pub mod lexical;
+pub(crate) mod overrides;
 pub mod path;
 pub mod provenance;
 pub(crate) mod repository_authority;
 pub mod review;
 pub mod sessions;
+mod text_match;
 pub mod tool_search;
 pub mod verification;
 pub mod work;
@@ -28,6 +32,10 @@ mod call_sites_tests;
 mod confirmed_sites_tests;
 #[cfg(test)]
 mod external_symbols_tests;
+#[cfg(test)]
+mod receiver_binding_tests;
+#[cfg(test)]
+mod same_name_tests;
 
 pub use repository_authority::{
     ActiveRepositoryAuthority, LocalRepositoryAuthorityBinding, RequestRepositoryAuthority,
@@ -47,10 +55,11 @@ use crate::working_copy::WorkingCopySurface;
 /// Dispatch a tool call to the appropriate handler.
 ///
 /// `host` is the working copy graph truth is supposed to be level with, offered
-/// by whichever layer knows what this repository's checkout is. It is a
-/// disclosure input only: a handler may read one host entry through it to refuse
-/// certifying an answer, and no row of any answer is ever produced from it
-/// ([`crate::working_copy`]). It names which of three standings holds rather
+/// by whichever layer knows what this repository's checkout is. Query handlers
+/// use it only for disclosure: a handler may read one host entry through it to
+/// refuse certifying an answer, and no answer row is produced from it
+/// ([`crate::working_copy`]). Session startup also derives its private context
+/// from the bound probe. It names which of three standings holds rather
 /// than passing an `Option`, because a bare `None` said both "nothing will
 /// compare" and nothing at all about whether something should have.
 pub async fn handle_tool_call<G: GraphStore>(
@@ -125,6 +134,9 @@ fn attach_outside_graph<G: GraphStore>(
     arguments: &HashMap<String, serde_json::Value>,
     store: &G,
 ) {
+    if crate::file_coordinate_query::recognizes_result(result) {
+        return;
+    }
     let Some(question) = crate::outside_graph::question_argument(arguments) else {
         return;
     };
@@ -158,7 +170,7 @@ async fn dispatch_tool_call<G: GraphStore>(
     sessions: &SessionRegistry,
     session_authority_mode: SessionAuthorityMode,
     repository_authority: Option<&RequestRepositoryAuthority>,
-    _host: WorkingCopySurface<'_>,
+    host: WorkingCopySurface<'_>,
     source_scope: common::EntitySourceScope,
 ) -> Result<ToolCallResult> {
     if let Some(message) = crate::tools::retired_file_operation(tool_name) {
@@ -176,7 +188,12 @@ async fn dispatch_tool_call<G: GraphStore>(
         // be what THIS server would serve; see `handlers::tool_search`.
         tool_search::TOOL_NAME => tool_search::handle_tool_search(arguments),
         // Entities
-        "semantic_search" => entities::handle_semantic_search(arguments, store),
+        "semantic_search" => entities::handle_semantic_search_with_sources(
+            arguments,
+            store,
+            repository_authority,
+            source_scope,
+        ),
         "semantic_locate" => entities::handle_semantic_locate(arguments, store),
         "get_entity" => entities::handle_get_entity(arguments, store, repository_authority),
         "get_entity_source" | "get_entity_body" => {
@@ -236,7 +253,13 @@ async fn dispatch_tool_call<G: GraphStore>(
         // Sessions
         "register_session" => sessions::handle_register_session(arguments, sessions),
         "kin_session_start" => {
-            sessions::handle_session_start(arguments, sessions, session_authority_mode).await
+            sessions::handle_session_start_bound(
+                arguments,
+                sessions,
+                session_authority_mode,
+                host.session_root(),
+            )
+            .await
         }
         "kin_session_heartbeat" => {
             sessions::handle_session_heartbeat(arguments, sessions, session_authority_mode).await
@@ -286,7 +309,6 @@ async fn dispatch_tool_call<G: GraphStore>(
         "kin_annotation_add" => work::handle_annotation_add(arguments, store),
         "kin_annotation_list" => work::handle_annotation_list(arguments, store),
         "kin_annotation_mark_resolved" => work::handle_annotation_mark_resolved(arguments, store),
-        "kin_todo_import" => work::handle_todo_import(arguments, store),
         // Verification, security, release, contract
         "kin_verify_entity" => verification::handle_verify_entity(arguments, store),
         "kin_coverage_summary" => verification::handle_coverage_summary(store),
@@ -726,6 +748,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         authority
             .commit_repository_transaction(transaction)
@@ -829,6 +852,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         authority
             .commit_repository_transaction(transaction)
@@ -979,6 +1003,7 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         authority
             .commit_repository_transaction(transaction)
@@ -1894,6 +1919,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_start_requires_trusted_context_and_rejects_client_location() {
+        let store = EmptyStore::default();
+        let sessions = SessionRegistry::new();
+        let args = HashMap::from([
+            ("vendor".into(), serde_json::json!("test")),
+            ("client_name".into(), serde_json::json!("test")),
+        ]);
+        for host in [
+            WorkingCopySurface::NotApplicable,
+            WorkingCopySurface::Unchecked,
+        ] {
+            let result = handle_tool_call(
+                "kin_session_start",
+                &args,
+                &store,
+                &sessions,
+                SessionAuthorityMode::OfflineFallback,
+                None,
+                host,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert!(tool_result_text(&result).contains("Session context is unavailable"));
+        }
+        let mut supplied = args;
+        supplied.insert("cwd".into(), serde_json::json!("/client-chosen"));
+        let probe = crate::working_copy::WorkingCopyProbe::new("/server-bound-project");
+        let result = handle_tool_call(
+            "kin_session_start",
+            &supplied,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+            None,
+            WorkingCopySurface::Probe(&probe),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(!tool_result_text(&result).contains("/client-chosen"));
+        assert!(sessions.list_agent_sessions().is_empty());
+    }
+
+    #[tokio::test]
     async fn session_start_and_heartbeat_and_end() {
         let store = EmptyStore::default();
         let sessions = SessionRegistry::new();
@@ -1902,7 +1972,7 @@ mod tests {
         let mut start_args = HashMap::new();
         start_args.insert("vendor".into(), serde_json::json!("claude-code"));
         start_args.insert("client_name".into(), serde_json::json!("test-client"));
-        start_args.insert("cwd".into(), serde_json::json!("/project"));
+        let session_probe = crate::working_copy::WorkingCopyProbe::new("/server-bound-project");
         start_args.insert("transport".into(), serde_json::json!("mcp"));
 
         let result = handle_tool_call(
@@ -1912,7 +1982,7 @@ mod tests {
             &sessions,
             SessionAuthorityMode::OfflineFallback,
             None,
-            WorkingCopySurface::NotApplicable,
+            WorkingCopySurface::Probe(&session_probe),
         )
         .await
         .unwrap();
@@ -1924,6 +1994,14 @@ mod tests {
         assert_eq!(response["vendor"], "claude-code");
 
         let session_id = response["session_id"].as_str().unwrap().to_string();
+
+        let held = sessions
+            .get_agent_session(&kin_model::SessionId(
+                uuid::Uuid::parse_str(&session_id).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(held.cwd, std::path::PathBuf::from("/server-bound-project"));
+        assert!(response.get("cwd").is_none());
 
         // Heartbeat
         let mut hb_args = HashMap::new();
@@ -2343,15 +2421,20 @@ mod tests {
                         focal.get("body").is_none_or(serde_json::Value::is_null),
                         "{focal}"
                     );
-                    assert!(focal["body_unavailable"]
-                        .as_str()
-                        .unwrap()
-                        .contains("whole file"));
+                    assert_eq!(
+                        focal["semantic_gap"],
+                        crate::container_shape::MODULE_MEMBER_GAP
+                    );
                     let args = HashMap::from([("entity_id".into(), serde_json::json!(entity.id))]);
-                    assert!(entities::handle_get_entity_source(&args, &store, None)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("whole file"));
+                    let source = tool_result_json(
+                        entities::handle_get_entity_source(&args, &store, None).unwrap(),
+                    );
+                    assert!(source["body"].is_null());
+                    assert!(source["source_base"].is_null());
+                    assert_eq!(
+                        source["semantic_gap"],
+                        crate::container_shape::MODULE_MEMBER_GAP
+                    );
                 } else if entity.kind == EntityKind::Module {
                     assert!(
                         kin_model::require_independent_source(entity).is_ok(),
@@ -2373,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn module_source_reads_refuse_persisted_widened_span_and_keep_bounded_declaration() {
+    fn module_source_reads_withhold_bounded_and_widened_declarations_including_history() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2402,10 +2485,11 @@ mod tests {
         install_empty_store_exact_tree(&mut store, fixture._dir.path());
         let authority = test_repository_authority(fixture._dir.path());
         let held = HeldSourceAuthority::new(&store, Some(&authority));
-        let source = read_entity_source_exact(&held, &module, usize::MAX)
+        // Semantic reads never expose a module's aggregate body, even when
+        // its declaration has valid coordinates or the caller selects history.
+        assert!(read_entity_source_exact(&held, &module, usize::MAX)
             .unwrap()
-            .unwrap();
-        assert_eq!(source.body, "pub mod defaults { pub fn inside() {} }");
+            .is_none());
         let mut legacy = module.clone();
         let span = legacy.span.as_mut().unwrap();
         span.start_byte = 0;
@@ -2415,9 +2499,8 @@ mod tests {
         span.end_col = 0;
         let before = serde_json::to_value(&legacy).unwrap();
         assert!(read_entity_source_exact(&held, &legacy, usize::MAX)
-            .unwrap_err()
-            .to_string()
-            .contains("reparse/reconcile"));
+            .unwrap()
+            .is_none());
         assert!(read_entity_source_excerpt_detailed_held(
             &held,
             &legacy,
@@ -2425,24 +2508,20 @@ mod tests {
             10000,
             EntitySourceScope::WorkspaceHead
         )
-        .unwrap_err()
-        .to_string()
-        .contains("declaration span"));
+        .unwrap()
+        .is_none());
         assert_eq!(serde_json::to_value(&legacy).unwrap(), before);
-        // Historical reads must validate the revision selected by that history,
-        // not the live node's changed signature or invalid coordinates.
         legacy.signature = "pub mod later_signature".into();
         let change = *store.changes_by_id.keys().next().unwrap();
-        let historical = read_entity_source_excerpt_detailed_held(
+        assert!(read_entity_source_excerpt_detailed_held(
             &held,
             &legacy,
             100,
             10000,
-            EntitySourceScope::At(change),
+            EntitySourceScope::At(change)
         )
         .unwrap()
-        .unwrap();
-        assert_eq!(historical.body, source.body);
+        .is_none());
     }
 
     #[tokio::test]
@@ -2453,12 +2532,18 @@ mod tests {
             "embedding_body_preview",
             "file_import_context",
             "file_surface_context",
+            kin_index::pipeline::OWN_CODE_KEY,
         ] {
             caller.metadata.extra.insert(
                 key.into(),
                 serde_json::json!(format!("private_source_{key}")),
             );
         }
+        let own_code = "private_source_own_code_middle ".repeat(1_000);
+        caller.metadata.extra.insert(
+            kin_index::pipeline::OWN_CODE_KEY.into(),
+            serde_json::json!(&own_code),
+        );
         caller
             .metadata
             .extra
@@ -2468,14 +2553,48 @@ mod tests {
         store.insert_test_entity(caller.clone());
         store.insert_test_calls_relation(&caller, &callee);
         store.dead_entities.push(caller.clone());
+        // A module's metadata path serves its recorded inventory without
+        // opening source authority or turning the ranking input into a body.
+        let mut module = caller.clone();
+        module.id = EntityId::new();
+        module.kind = EntityKind::Module;
+        module.name = "preview_metadata_module".into();
+        store.insert_test_entity(module.clone());
+        let direct = tool_result_json(
+            entities::handle_get_entity(
+                &HashMap::from([("entity_id".into(), serde_json::json!(module.id))]),
+                &store,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(direct["metadata"]["retained_fact"], "retained");
+        assert!(
+            !direct.to_string().contains("private_source_"),
+            "entity metadata returned a stored retrieval body"
+        );
         let sessions = SessionRegistry::new();
         let args = HashMap::from([
             ("entity_ids".into(), serde_json::json!([callee.id])),
             ("include_traffic".into(), serde_json::json!(false)),
             ("format".into(), serde_json::json!("json")),
         ]);
-        let impact = tool_result_json(
+        // A compact impact row serves no metadata at all, so it cannot serve
+        // a preview. The raw rows, asked for, keep every other metadata key.
+        let compact = tool_result_json(
             review::handle_impact_analysis(&args, &store, &sessions)
+                .await
+                .unwrap(),
+        );
+        assert!(compact.to_string().contains("preview_caller"));
+        assert!(
+            !compact.to_string().contains("private_source_"),
+            "{compact}"
+        );
+        let mut raw_args = args.clone();
+        raw_args.insert("compact".into(), serde_json::json!(false));
+        let impact = tool_result_json(
+            review::handle_impact_analysis(&raw_args, &store, &sessions)
                 .await
                 .unwrap(),
         );
@@ -2489,8 +2608,10 @@ mod tests {
             assert!(text.contains("retained_fact"), "{text}");
             assert!(!text.contains("private_source_"), "{text}");
         }
-        let domain =
-            serde_json::json!({"metadata":{"embedding_body_preview":"ordinary domain metadata"}});
+        let domain = serde_json::json!({"metadata":{
+            "embedding_body_preview":"ordinary domain metadata",
+            "own_code":"ordinary domain metadata"
+        }});
         assert_eq!(semantic_metadata_json(&domain).unwrap(), domain);
         assert!(store
             .get_entity(&caller.id)
@@ -2499,6 +2620,25 @@ mod tests {
             .metadata
             .extra
             .contains_key("embedding_body_preview"));
+        assert_eq!(
+            store
+                .get_entity(&caller.id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .extra[kin_index::pipeline::OWN_CODE_KEY],
+            serde_json::json!(own_code),
+            "metadata projection must leave the complete ranking input stored"
+        );
+        assert_eq!(
+            store
+                .get_entity(&module.id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .extra[kin_index::pipeline::OWN_CODE_KEY],
+            serde_json::json!(own_code)
+        );
     }
 
     struct GraphBackedSource {
@@ -2653,24 +2793,31 @@ mod tests {
             let file = FilePathId::new("validate.ts");
             let registry = kin_parser::AdapterRegistry::new();
             let adapter = registry.get_by_language(LanguageId::TypeScript).unwrap();
-            let parsed = adapter
-                .extract(
-                    &adapter.parse(content.as_bytes()).unwrap(),
-                    content.as_bytes(),
-                    &file,
-                )
-                .unwrap();
-            let entities: Vec<_> = parsed
+            let tree = adapter.parse(content.as_bytes()).unwrap();
+            let parsed = adapter.extract(&tree, content.as_bytes(), &file).unwrap();
+            let mut entities: Vec<_> = parsed
                 .entities
                 .into_iter()
                 .map(|entity| {
-                    entity.into_entity_with_source(
+                    let mut entity = entity.into_entity_with_source(
                         LanguageId::TypeScript,
                         &file,
                         Some(content.as_bytes()),
-                    )
+                    );
+                    entity.metadata.extra.insert(
+                        "blob_hash".into(),
+                        serde_json::json!(fixture.hash.to_string()),
+                    );
+                    entity
                 })
                 .collect();
+            // The value-escape record the ingest pipeline attaches.
+            let census = kin_parser::value_escape::census_file(
+                &tree,
+                content.as_bytes(),
+                LanguageId::TypeScript,
+            );
+            kin_parser::value_escape::attach(census.as_ref(), &mut entities);
             let target = entities
                 .iter()
                 .find(|entity| entity.name == "target")
@@ -2768,7 +2915,9 @@ mod tests {
                 review::AnalysisEscapeEvidence::new(&graph, None, EntitySourceScope::At(change.id))
                     .observe(std::slice::from_ref(target), None);
             assert_eq!(unavailable.selected_change, Some(change.id));
-            assert!(unavailable.readings[0].may_escape());
+            // The census reads the record stored on the committed entity, so a
+            // missing blob store answers the same containment the replay does.
+            assert_eq!(unavailable.readings[0].may_escape(), value_escape);
         }
     }
 
@@ -2788,15 +2937,14 @@ mod tests {
         assert_eq!(before.len(), after.len());
         let fixture = make_source_backed_entity(before);
         let file = FilePathId::new("validate.ts");
-        let parse = |content: &str| -> Vec<Entity> {
+        let blobs = kin_blobs::BlobStore::new(fixture._dir.path().join(".kin/objects")).unwrap();
+        let new_hash = model_blob_hash(&blobs, after.as_bytes());
+        let parse = |content: &str, hash: Hash256| -> Vec<Entity> {
             let registry = kin_parser::AdapterRegistry::new();
             let adapter = registry.get_by_language(LanguageId::TypeScript).unwrap();
-            adapter
-                .extract(
-                    &adapter.parse(content.as_bytes()).unwrap(),
-                    content.as_bytes(),
-                    &file,
-                )
+            let tree = adapter.parse(content.as_bytes()).unwrap();
+            let mut entities: Vec<Entity> = adapter
+                .extract(&tree, content.as_bytes(), &file)
                 .unwrap()
                 .entities
                 .into_iter()
@@ -2812,19 +2960,31 @@ mod tests {
                         .extra
                         .remove(kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY);
                     entity
+                        .metadata
+                        .extra
+                        .insert("blob_hash".into(), serde_json::json!(hash.to_string()));
+                    entity
                 })
-                .collect()
+                .collect();
+            // The value-escape record the ingest pipeline attaches.
+            let census = kin_parser::value_escape::census_file(
+                &tree,
+                content.as_bytes(),
+                LanguageId::TypeScript,
+            );
+            kin_parser::value_escape::attach(census.as_ref(), &mut entities);
+            entities
         };
-        let old_entities = parse(before);
-        let new_entities = parse(&after);
+        let old_entities = parse(before, fixture.hash);
+        let new_entities = parse(&after, new_hash);
         let target = old_entities
             .iter()
             .find(|entity| entity.name == "target")
             .unwrap();
-        let consumer = old_entities
-            .iter()
-            .find(|entity| entity.name == "consumer")
-            .unwrap();
+        assert!(
+            old_entities.iter().any(|entity| entity.name == "consumer"),
+            "the fixture holds the caller that calls through the escaped value"
+        );
         let factory = old_entities
             .iter()
             .find(|entity| entity.name == "factory")
@@ -2888,8 +3048,6 @@ mod tests {
             graph.create_change(&old_change).unwrap();
         }
         initialize_test_repository(fixture._dir.path(), &old_change);
-        let blobs = kin_blobs::BlobStore::new(fixture._dir.path().join(".kin/objects")).unwrap();
-        let new_hash = model_blob_hash(&blobs, after.as_bytes());
         let new_records = records(&new_entities, &after, new_hash);
         let mut new_change = exact_test_change(
             vec![old_change.id],
@@ -2968,10 +3126,24 @@ mod tests {
             "{historical}"
         );
         assert_eq!(historical["call_sites"]["settled"], false);
-        assert_eq!(historical["call_sites"]["candidate_count"], 1);
+        // The consumer calls through the escaped value without spelling the
+        // focal's name, so the site is a value call: counted once with the
+        // census that kept it, never listed as a named leftover.
         assert_eq!(
-            historical["call_sites"]["candidates"][0]["caller"],
-            consumer.id.to_string()
+            historical["call_sites"]["candidate_count"], 0,
+            "{historical}"
+        );
+        assert_eq!(
+            historical["call_sites"]["value_calls"]["sites"], 1,
+            "{historical}"
+        );
+        assert_eq!(
+            historical["call_sites"]["value_calls"]["callers"], 1,
+            "{historical}"
+        );
+        assert_eq!(
+            historical["call_sites"]["value_calls"]["census"]["escape"], "escapes",
+            "{historical}"
         );
         let head = tool_result_json(
             entities::handle_find_references_with_authority_at(
@@ -2993,6 +3165,7 @@ mod tests {
             "{head}"
         );
         assert_eq!(head["call_sites"]["candidate_count"], 0);
+        assert!(head["call_sites"].get("value_calls").is_none(), "{head}");
         // Exact semantic quotes use the same historical scope as the census.
         let held = HeldSourceAuthority::new(&selected, Some(&authority));
         let text = external_symbols::CalleeText::with_read_limit_at(
@@ -3061,9 +3234,13 @@ mod tests {
                 "every candidate id must be re-targetable: {error}"
             );
         }
-        // `file:line` is pasted into an editor, so the candidate list carries the
-        // 1-based line: the fixture's graph row 40 is line 41.
-        assert!(error.contains("src/cli/host.ts:41"), "{error}");
+        for entity in [&first, &second, &third] {
+            assert!(error.contains(&entity.signature), "{error}");
+            assert!(
+                !error.contains(&entity.file_origin.as_ref().unwrap().0),
+                "{error}"
+            );
+        }
         assert!(
             !error.contains(&unrelated.id.to_string()),
             "only exact-name matches are candidates: {error}"
@@ -3079,6 +3256,37 @@ mod tests {
         assert!(sessions::resolve_target_entity(&store, "absent")
             .unwrap_err()
             .contains("not found in the graph"));
+    }
+
+    #[test]
+    fn ambiguous_targets_omit_synthetic_module_signatures_without_rewriting_program_signatures() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut first = make_dead_code_entity("src/a.ts", "duplicate", 12);
+        first.kind = EntityKind::Module;
+        first.signature = "module src/a.ts".into();
+        let mut second = make_dead_code_entity("src/b.ts", "duplicate", 24);
+        second.kind = EntityKind::Package;
+        second.signature = "package src/b.ts".into();
+        let mut real = make_dead_code_entity("src/c.ts", "duplicate", 36);
+        real.signature = "function duplicate(value = \"data/template.json\")".into();
+        for entity in [&first, &second, &real] {
+            store.upsert_entity(entity).unwrap();
+        }
+        let error = sessions::resolve_target_entity(&store, "duplicate").unwrap_err();
+        for entity in [&first, &second, &real] {
+            assert!(error.contains(&entity.id.to_string()), "{error}");
+            assert!(
+                !error.contains(&entity.file_origin.as_ref().unwrap().0),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            error
+                .matches("semantic declaration name unavailable")
+                .count(),
+            2
+        );
+        assert!(error.contains(&real.signature), "{error}");
     }
 
     fn make_dead_code_entity(file_path: &str, name: &str, start_line: u32) -> Entity {
@@ -3320,6 +3528,74 @@ mod tests {
             }]),
             "{row:#}"
         );
+    }
+
+    /// A reference made at the top level of a file has the file's module
+    /// surface as its caller. Its site is quoted from the surface's text, one
+    /// line, while the surface itself is still never served whole.
+    #[test]
+    fn a_module_level_site_is_quoted_while_the_module_stays_unserved() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "import { Store } from './store';\nconst probe = new Store(4);\nexport default probe;\n";
+        let source = make_source_backed_entity(content);
+        let mut module = source.entity.clone();
+        module.kind = EntityKind::Module;
+        module.name = "validate".into();
+        module.signature = "module validate.ts".into();
+        assert!(kin_model::is_file_module_surface(&module));
+
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(module.id, module.clone());
+        store
+            .file_hashes
+            .insert(module.file_origin.clone().unwrap(), source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        let span = module.span.clone().unwrap();
+        let at = content.find("Store(4)").unwrap();
+        let site = kin_model::entity::SourceSpan {
+            file: span.file.clone(),
+            start_byte: at,
+            end_byte: at + "Store".len(),
+            start_line: 1,
+            start_col: 18,
+            end_line: 1,
+            end_col: 23,
+        };
+        let held = HeldSourceAuthority::new(&store, Some(&authority));
+        let text = HeldCallerText::new(&held, EntitySourceScope::WorkspaceHead);
+        let sites =
+            address_reference_sites(&module, &[2], &[(RelationKind::References, site)], &text);
+        let quoted = &sites[&2];
+        assert_eq!(
+            quoted.callee,
+            Ok("Store".to_string()),
+            "{:?}",
+            quoted.callee
+        );
+        assert_eq!(
+            quoted.expr.as_ref().map(|expr| expr.expr.as_str()),
+            Ok("new Store(4)"),
+            "{:?}",
+            quoted.expr
+        );
+
+        // The module's inventory is served, while the relationship-targeted
+        // quote above is the only source expression read from it.
+        let args = HashMap::from([("entity_id".into(), serde_json::json!(module.id))]);
+        let inventory = tool_result_json(
+            entities::handle_get_entity_source(&args, &store, Some(&authority)).unwrap(),
+        );
+        assert!(inventory["body"].is_null());
+        assert_eq!(
+            inventory["semantic_gap"],
+            crate::container_shape::MODULE_MEMBER_GAP
+        );
+        assert!(!inventory.to_string().contains("new Store(4)"));
     }
 
     /// A focal's own call sites, served by the pack and the neighborhood with
@@ -3658,6 +3934,7 @@ mod tests {
             vec![serde_json::json!({
                 "line_in_entity": call_site_row,
                 "callee": "validate_probe_range_1d8f8275",
+                "expr": "validate_probe_range_1d8f8275(1, 0, 2)",
             })],
             "{row:?}"
         );
@@ -4048,16 +4325,13 @@ mod tests {
         // `get_entity_source` left the other block running and the test green. A
         // guard that skips the assertion when the thing under test is missing
         // cannot fail when the thing under test is missing.
-        let profile: std::collections::HashSet<&str> = crate::tools::agent_default_tool_names()
-            .iter()
-            .copied()
-            .collect();
+        let profile = crate::tools::name_set(crate::tools::agent_default_tool_names());
         assert!(
-            profile.contains("get_entity_source"),
+            crate::verbs::allows(&profile, "get_entity_source"),
             "the agent-default profile must carry a direct entity-body read"
         );
         assert!(
-            profile.contains("get_context_pack"),
+            crate::verbs::allows(&profile, "get_context_pack"),
             "the agent-default profile must carry the context pack"
         );
 
@@ -4814,14 +5088,59 @@ mod tests {
             "a compact pack must still serve the focal body: {compact}"
         );
 
-        // The neighbour rows are what compact actually trims, and the control
-        // that keeps this test from passing on a compact mode that trims
-        // nothing at all.
+        // The neighbour rows are what compact actually trims. Each one serves
+        // its identity and signature, never a body, and says so as its view.
         let rows = compact["dependencies"].as_array().expect("rows");
+        assert!(!rows.is_empty(), "{compact}");
         assert!(
-            rows.iter()
-                .all(|row| row.get("body").is_none() && row.get("projection").is_none()),
-            "compact must still drop the neighbour bodies and projections: {compact}"
+            rows.iter().all(|row| row.get("body").is_none()
+                && row.get("projection").and_then(serde_json::Value::as_str)
+                    == Some("SignatureOnly")),
+            "compact must drop the neighbour bodies and disclose the signature view: {compact}"
+        );
+        // The control that keeps this test from passing on a compact mode that
+        // trims nothing at all: asked for neighbour bodies, full mode serves
+        // them and compact still does not.
+        let with_bodies = |compact: bool| {
+            let sessions = SessionRegistry::new();
+            let args = HashMap::from([
+                (
+                    "entity_id".to_string(),
+                    serde_json::json!(fixture.note_store.id.to_string()),
+                ),
+                ("compact".to_string(), serde_json::json!(compact)),
+                ("neighbor_bodies".to_string(), serde_json::json!(true)),
+            ]);
+            tool_result_json(
+                entities::handle_get_context_pack(
+                    &args,
+                    &fixture.store,
+                    &sessions,
+                    Some(&fixture.authority),
+                )
+                .unwrap(),
+            )
+        };
+        // Full mode answers for every requested neighbour body, served or
+        // explained; compact never reads one.
+        let body_keys = ["body", "body_complete", "body_unavailable"];
+        let full_bodies = with_bodies(false);
+        let full_rows = full_bodies["dependencies"].as_array().expect("rows");
+        assert!(!full_rows.is_empty(), "{full_bodies}");
+        assert!(
+            full_rows
+                .iter()
+                .all(|row| row["body"].is_string() || row["body_unavailable"].is_string()),
+            "full mode answers for each requested neighbour body: {full_bodies}"
+        );
+        let compact_bodies = with_bodies(true);
+        assert!(
+            compact_bodies["dependencies"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .all(|row| body_keys.iter().all(|key| row.get(*key).is_none())),
+            "compact drops neighbour bodies even when asked: {compact_bodies}"
         );
         let full = context_pack_json(&fixture, &fixture.note_store, false);
         assert!(
@@ -5616,8 +5935,378 @@ mod tests {
         );
     }
 
+    /// A class served whole was a whole-file read by another name: its body is
+    /// its members' bodies. It is served as its header and its members by id,
+    /// and whole only when asked for by name.
     #[test]
-    fn context_body_controls_are_refused_on_multi_focal_packs() {
+    fn a_container_is_served_as_its_shape_unless_its_whole_body_is_asked_for() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let method = |name: &str| {
+            format!(
+                "  {name}(value: number): boolean {{\n{}    return value > 0;\n  }}\n",
+                "    value = value + 1;\n".repeat(120)
+            )
+        };
+        let header = "class Store {\n  // Holds the element tree.\n  size = 0;\n";
+        let first = method("containsElement");
+        let second = method("removeElement");
+        let content = format!("{header}{first}{second}}}\n");
+        assert!(content.len() > crate::container_shape::CONTAINER_INLINE_MAX_BYTES);
+        let source = make_source_backed_entity(&content);
+        let mut class = source.entity.clone();
+        class.kind = EntityKind::Class;
+        class.name = "Store".into();
+        class.signature = "class Store".into();
+        let file = class.file_origin.clone().unwrap();
+        let member = |name: &str, start: usize, end: usize| {
+            let mut member = source.entity.clone();
+            member.id = EntityId::new();
+            member.kind = EntityKind::Method;
+            member.name = format!("Store.{name}");
+            member.signature = format!("{name}(value: number): boolean");
+            member.span = Some(kin_model::entity::SourceSpan {
+                file: file.clone(),
+                start_byte: start,
+                end_byte: end,
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 0,
+            });
+            member
+        };
+        let contains = member("containsElement", header.len(), header.len() + first.len());
+        let removes = member(
+            "removeElement",
+            header.len() + first.len(),
+            header.len() + first.len() + second.len(),
+        );
+        let mut store = EmptyStore::default();
+        for entity in [&class, &contains, &removes] {
+            store.entities_by_id.insert(entity.id, (*entity).clone());
+        }
+        store.insert_test_relation(RelationKind::Contains, &class, &contains);
+        store.insert_test_relation(RelationKind::Contains, &class, &removes);
+        store.file_hashes.insert(file, source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(class.id.to_string()),
+        )]);
+        let value = tool_result_json(
+            entities::handle_get_entity_source(&args, &store, Some(&authority)).unwrap(),
+        );
+        assert_eq!(value["projection"], "Shape", "{value}");
+        assert!(value.get("body").is_none(), "{value}");
+        assert_eq!(value["header"], header.trim_end(), "{value}");
+        assert_eq!(value["header_complete"], true);
+        let members: Vec<&str> = value["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            members,
+            vec![contains.id.to_string(), removes.id.to_string()],
+            "members in source order: {value}"
+        );
+        assert_eq!(value["body_bytes"], content.len());
+
+        let mut whole = args.clone();
+        whole.insert("full_body".into(), serde_json::json!(true));
+        let value = tool_result_json(
+            entities::handle_get_entity_source(&whole, &store, Some(&authority)).unwrap(),
+        );
+        assert_eq!(value["body"].as_str(), Some(content.as_str()));
+        assert!(value.get("members").is_none(), "{value}");
+
+        // The pack serves the same shape for a container focal.
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let value = tool_result_json(
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap(),
+        );
+        let focal = &value["focal_entity"];
+        assert_eq!(focal["projection"], "Shape", "{focal}");
+        assert!(focal.get("body").is_none(), "{focal}");
+        assert_eq!(
+            focal["members"].as_array().map(Vec::len),
+            Some(2),
+            "{focal}"
+        );
+        // The note says how to read a member, and does not steer a reader to
+        // the whole body, which is a whole-file read by another name.
+        assert!(
+            value["notes"]
+                .as_array()
+                .is_some_and(|notes| notes.iter().any(|note| note
+                    .as_str()
+                    .is_some_and(|note| note.contains("Read the member you need by its id")
+                        && !note.contains("full_body")))),
+            "{value}"
+        );
+    }
+
+    /// A long function, nested definitions and all, is read whole by every
+    /// internal source path and served to a client as excerpts. The handler's
+    /// reply keeps the whole body and its base. The presented reply is one
+    /// excerpt, and its cursors walk the rest of that exact body. It is longer
+    /// than `full_body` serves whole, so `full_body` serves the same first
+    /// excerpt, and each excerpt keeps the base: a write's source ticket taken
+    /// from one still resolves against the whole body, and a patch copied
+    /// from its lines applies to that body.
+    #[test]
+    fn a_long_function_is_served_as_excerpts_and_read_whole_for_writes() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let budget = crate::source_pages::SOURCE_PAGE_BYTES;
+        let mut content = String::from("export function renderTree(node: Node): number {\n");
+        let mut helpers = Vec::new();
+        while content.len() < 280_000 {
+            let start = content.len();
+            content.push_str(&format!(
+                "  function helper{index}(value: number): number {{\n    const scaled = value * \
+                 {index};\n    return scaled + 1;\n  }}\n",
+                index = helpers.len()
+            ));
+            helpers.push((start, content.len()));
+        }
+        content.push_str("  return helper0(node.size);\n}\n");
+        let source = make_source_backed_entity(&content);
+        let mut outer = source.entity.clone();
+        // The digest of the bytes its span was derived from, so the read is
+        // verified and issues a base.
+        outer.metadata.extra.insert(
+            "blob_hash".into(),
+            serde_json::json!(source.hash.to_string()),
+        );
+        let file = outer.file_origin.clone().unwrap();
+        let mut store = EmptyStore::default();
+        store.entities_by_id.insert(outer.id, outer.clone());
+        // Nested definitions are entities of their own, and none makes the
+        // outer function an outline: callable code is read as its body.
+        for (index, (start, end)) in helpers.iter().take(3).enumerate() {
+            let mut nested = outer.clone();
+            nested.id = EntityId::new();
+            nested.name = format!("helper{index}");
+            nested.signature = format!("function helper{index}(value: number): number");
+            nested.span = Some(kin_model::entity::SourceSpan {
+                file: file.clone(),
+                start_byte: *start,
+                end_byte: *end,
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 0,
+            });
+            store.entities_by_id.insert(nested.id, nested.clone());
+            store.insert_test_relation(RelationKind::Contains, &outer, &nested);
+        }
+        store.file_hashes.insert(file, source.hash);
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let read = |arguments: serde_json::Value| {
+            let arguments: HashMap<String, serde_json::Value> =
+                serde_json::from_value(arguments).unwrap();
+            let result =
+                entities::handle_get_entity_source(&arguments, &store, Some(&authority)).unwrap();
+            (arguments, result)
+        };
+        let text_of = |result: &crate::types::ToolCallResult| {
+            let crate::types::ContentBlock::Text { text } = &result.content[0];
+            text.clone()
+        };
+
+        // Internally the read is whole, with its base, as it always was.
+        let (arguments, internal) = read(serde_json::json!({"entity_id": outer.id}));
+        let whole = tool_result_json(internal.clone());
+        assert_eq!(whole["body"].as_str(), Some(content.as_str()));
+        assert!(whole["source_base"].is_object(), "{}", {
+            let mut shown = whole.clone();
+            shown["body"] = serde_json::json!("...");
+            shown
+        });
+
+        // A client is served one excerpt within the budget, with no base.
+        let mut presented = internal;
+        crate::source_pages::present("get_entity_source", &arguments, &mut presented);
+        let first = tool_result_json(presented.clone());
+        let served = first["body"].as_str().unwrap().to_string();
+        assert!(served.len() <= budget && content.starts_with(&served));
+        assert!(
+            text_of(&presented).len() <= budget + 4_096,
+            "{}",
+            text_of(&presented).len()
+        );
+        assert_eq!(first["source_base"], whole["source_base"], "{}", first);
+        assert!(first.get("source_base_unavailable").is_none(), "{}", first);
+        assert!(first.get("members").is_none(), "{}", first);
+        assert_eq!(first["body_excerpt"]["body_bytes"], content.len());
+        assert_eq!(
+            first["body_excerpt"]["body_digest"],
+            whole["source_base"]["body_hash"]
+        );
+
+        // Each cursor reads the same exact body again and serves what follows.
+        let served_first = served.clone();
+        let mut joined = served;
+        let mut page = first;
+        while let Some(cursor) = page.get("next_cursor").cloned() {
+            let (arguments, mut result) =
+                read(serde_json::json!({"entity_id": outer.id, "cursor": cursor}));
+            assert_eq!(
+                text_of(&result),
+                text_of(&read(serde_json::json!({"entity_id": outer.id})).1),
+                "the handler reads the whole body whatever the cursor"
+            );
+            crate::source_pages::present("get_entity_source", &arguments, &mut result);
+            assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+            page = tool_result_json(result);
+            assert_eq!(page["source_base"], whole["source_base"]);
+            joined.push_str(page["body"].as_str().unwrap());
+        }
+        assert_eq!(joined, content, "the excerpts are the body byte for byte");
+
+        // full_body pages it like any long body: the same first excerpt.
+        let (arguments, mut full) =
+            read(serde_json::json!({"entity_id": outer.id, "full_body": true}));
+        crate::source_pages::present("get_entity_source", &arguments, &mut full);
+        assert_ne!(full.is_error, Some(true), "{}", text_of(&full));
+        assert_eq!(text_of(&full), text_of(&presented));
+        let full = tool_result_json(full);
+        assert_eq!(full["body"].as_str(), Some(served_first.as_str()));
+        assert_eq!(full["body_complete"], false);
+        assert_eq!(full["source_base"], whole["source_base"]);
+
+        // A write's ticket taken from the excerpt resolves against the whole
+        // body, as before, and the patch it carries, copied from the lines
+        // the excerpt served, applies to that body.
+        let ticket = crate::source_ticket::compact(&full["source_base"]).unwrap();
+        let mut write: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({"operations": [{
+                "verb": "patch", "target": outer.id, "description": "Return one more",
+                "payload": {"EntitySourcePatch": {"source_base": ticket, "edits": [{
+                    "old_text": "return scaled + 1;\n  }\n  function helper1(",
+                    "new_text": "return scaled + 2;\n  }\n  function helper1(",
+                }]}},
+            }]}))
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(crate::source_ticket::resolve_call(
+                "kin_mutate",
+                &mut write,
+                |entity_id| {
+                    let read = entities::handle_get_entity_source(
+                        &crate::source_ticket::source_arguments(&entity_id),
+                        &store,
+                        Some(&authority),
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| crate::source_ticket::source_reply(&result));
+                    async move { read }
+                },
+            ))
+            .unwrap();
+        let resolved = write["operations"][0]["payload"]["EntitySourcePatch"].clone();
+        assert_eq!(resolved["source_base"], whole["source_base"]);
+        let patch: crate::source_base::EntitySourcePatch =
+            serde_json::from_value(resolved).unwrap();
+        assert_eq!(
+            patch.apply_to_exact_body(&content).unwrap().len(),
+            content.len()
+        );
+    }
+
+    /// A file path is not an entity address, and the refusal says what is.
+    #[test]
+    fn a_file_path_entity_id_is_refused_with_the_form_that_works() {
+        let store = EmptyStore::default();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!("src/flask/sessions.py"),
+        )]);
+        let result = entities::handle_get_entity_source(&args, &store, None).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = format!("{result:?}");
+        assert!(text.contains("is a file path"), "{text}");
+        assert!(text.contains("get_entity_source and its id"), "{text}");
+        assert!(
+            !crate::negative::is_qualified_resolution_miss("get_entity_source", &text),
+            "a wrong form is not a name miss: {text}"
+        );
+    }
+
+    /// The body controls shape a pack built from `entities` or `question`
+    /// exactly as they shape a single one. 0.8.2 refused both there, which cost
+    /// agents every multi-entity body read they tried.
+    #[test]
+    fn context_body_controls_shape_multi_focal_packs() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(4);
+        let (source, dependency, store, authority) = context_focal_with_a_dependency(&content);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let focals =
+            serde_json::json!([{"entity_id": source.entity.id.to_string(), "route": "id"}]);
+        let row = |value: &serde_json::Value, id: String| {
+            value["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} in {value}"))
+        };
+
+        // focal_body: false serves the focal as its signature, not requested.
+        let args = HashMap::from([
+            ("question_focals".into(), focals.clone()),
+            ("focal_body".into(), serde_json::json!(false)),
+        ]);
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value = tool_result_json(result);
+        let focal = row(&value, source.entity.id.to_string());
+        assert_eq!(focal["body_omitted"], "focal_body:false", "{focal}");
+        assert!(focal.get("body").is_none(), "{focal}");
+
+        // neighbor_bodies: true serves the dependency's exact body beside the
+        // focal's own.
+        let args = HashMap::from([
+            ("question_focals".into(), focals),
+            ("neighbor_bodies".into(), serde_json::json!(true)),
+        ]);
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value = tool_result_json(result);
+        let focal = row(&value, source.entity.id.to_string());
+        assert_eq!(focal["body"].as_str(), Some(content.as_str()), "{focal}");
+        let neighbour = row(&value, dependency.to_string());
+        assert_eq!(
+            neighbour["body"].as_str(),
+            Some(content.as_str()),
+            "{neighbour}"
+        );
+        assert_eq!(neighbour["body_complete"], true, "{neighbour}");
+    }
+
+    /// An argument the pack has no use for is named and ignored, never
+    /// refused.
+    #[test]
+    fn context_pack_names_ignored_arguments_instead_of_refusing() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -5625,26 +6314,266 @@ mod tests {
         let content = "return café;\r\n".repeat(4);
         let (source, _dependency, store, authority) = context_focal_with_a_dependency(&content);
         let sessions = crate::session::SessionRegistry::empty_for_test();
-        for (control, value) in [
-            ("focal_body", serde_json::json!(false)),
-            ("neighbor_bodies", serde_json::json!(true)),
+        let args = HashMap::from([
+            (
+                "question_focals".into(),
+                serde_json::json!([{"entity_id": source.entity.id.to_string(), "route": "id"}]),
+            ),
+            ("compact".into(), serde_json::json!(true)),
+            ("verbosity".into(), serde_json::json!("high")),
+        ]);
+        let result =
+            entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority)).unwrap();
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value = tool_result_json(result);
+        let notes = value["notes"].as_array().expect("notes");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("`compact`")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("`verbosity`")),
+            "{notes:?}"
+        );
+        assert!(value["entities"][0]["body"].is_string(), "{value}");
+    }
+
+    #[test]
+    fn context_details_is_accepted_without_hiding_unknown_argument_notes() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(4);
+        let (source, _dependency, store, authority) = context_focal_with_a_dependency(&content);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        for mut args in [
+            HashMap::from([(
+                "entity_id".into(),
+                serde_json::json!(source.entity.id.to_string()),
+            )]),
+            HashMap::from([(
+                "question_focals".into(),
+                serde_json::json!([{"entity_id": source.entity.id.to_string(), "route": "id"}]),
+            )]),
         ] {
-            let args = HashMap::from([
+            args.insert("verbosity".into(), serde_json::json!("high"));
+            let baseline = tool_result_json(
+                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                    .unwrap(),
+            );
+            assert_eq!(
+                baseline["notes"],
+                serde_json::json!([
+                    "`verbosity` is not a get_context_pack argument and was ignored"
+                ])
+            );
+            for details in [false, true] {
+                args.insert("details".into(), serde_json::json!(details));
+                let result =
+                    entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                        .unwrap();
+                assert_ne!(result.is_error, Some(true), "{result:?}");
+                // Presentation chooses the metadata later. Assembly, body,
+                // authority and budgets are identical to the default call,
+                // including the honest note about the unsupported argument.
+                assert_eq!(tool_result_json(result), baseline);
+            }
+        }
+    }
+
+    /// The token budget bounds the code a pack serves. The call-site ledger,
+    /// coverage and the envelope ride beside it, so a budget that holds the
+    /// focal's body serves it even when the readings alone are larger.
+    #[test]
+    fn context_metadata_never_spends_the_answer_budget() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = "return café;\r\n".repeat(4);
+        let (source, _dependency, store, authority) = context_focal_with_a_dependency(&content);
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let body_tokens = kin_context::estimate_tokens(&content);
+        for args in [
+            HashMap::from([
                 (
-                    "question_focals".into(),
+                    "entity_id".to_string(),
+                    serde_json::json!(source.entity.id.to_string()),
+                ),
+                ("token_budget".into(), serde_json::json!(body_tokens + 40)),
+            ]),
+            HashMap::from([
+                (
+                    "question_focals".to_string(),
                     serde_json::json!([{"entity_id": source.entity.id.to_string(), "route": "id"}]),
                 ),
-                (control.to_string(), value),
-            ]);
+                ("token_budget".into(), serde_json::json!(body_tokens + 40)),
+            ]),
+        ] {
             let result =
                 entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
                     .unwrap();
-            assert_eq!(result.is_error, Some(true), "{control}: {result:?}");
-            let text = format!("{result:?}");
-            assert!(
-                text.contains("applies to a single `entity_id` context pack"),
-                "{control}: {text}"
+            let budget = crate::budget::ResponseBudget::from_arguments(&args);
+            let finalized = crate::envelope::finalize_bounded(
+                result,
+                crate::envelope::Envelope::offline(),
+                "get_context_pack",
+                &budget,
             );
+            assert_ne!(finalized.is_error, Some(true), "{finalized:?}");
+            let value = tool_result_json(finalized);
+            let focal = if value.get("focal_entity").is_some() {
+                value["focal_entity"].clone()
+            } else {
+                value["entities"][0].clone()
+            };
+            assert_eq!(focal["body"].as_str(), Some(content.as_str()), "{value}");
+            let answer = value[crate::budget::CONTEXT_ANSWER_TOKENS_KEY]
+                .as_u64()
+                .expect("answer_tokens") as usize;
+            assert!(answer <= body_tokens + 40, "{answer} in {value}");
+            let whole = value["tokens_used"].as_u64().unwrap() as usize;
+            assert!(
+                whole > body_tokens + 40,
+                "the readings cost more than the budget: {whole}"
+            );
+        }
+    }
+
+    /// A withheld body or whole neighbour row is named by its exact id, so
+    /// the reader can recover the graph-owned source in either case.
+    #[test]
+    fn context_withheld_bodies_are_named_by_id() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Short bodies leave too little room for the readings and neighbour
+        // signature. Larger bodies allow a body-only cut to fit the whole
+        // reply, including those readings and the withheld-id ledger.
+        for (repetitions, keep_neighbour_row) in [(40, false), (400, true)] {
+            let content = "return café;\r\n".repeat(repetitions);
+            let (source, dependency, store, authority) = context_focal_with_a_dependency(&content);
+            let dependency_id = dependency.to_string();
+            let sessions = crate::session::SessionRegistry::empty_for_test();
+            let body_tokens = kin_context::estimate_tokens(&content);
+            let pack = |token_budget: usize| {
+                let args = HashMap::from([
+                    (
+                        "question_focals".to_string(),
+                        serde_json::json!([{"entity_id": source.entity.id.to_string(), "route": "id"}]),
+                    ),
+                    ("neighbor_bodies".into(), serde_json::json!(true)),
+                    ("token_budget".into(), serde_json::json!(token_budget)),
+                ]);
+                let result =
+                    entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                        .unwrap();
+                let budget = crate::budget::ResponseBudget::from_arguments(&args);
+                let finalized = crate::envelope::finalize_bounded(
+                    result,
+                    crate::envelope::Envelope::offline(),
+                    "get_context_pack",
+                    &budget,
+                );
+                assert_ne!(finalized.is_error, Some(true), "{finalized:?}");
+                let crate::types::ContentBlock::Text { text } = &finalized.content[0];
+                assert!(text.len() <= budget.max_chars, "{finalized:?}");
+                tool_result_json(finalized)
+            };
+            let whole = pack(16_000);
+            assert!(whole.get("withheld").is_none(), "{whole}");
+            let whole_neighbour = whole["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == dependency_id)
+                .expect("the full pack carries the neighbour body");
+            assert_eq!(whole_neighbour["body"].as_str(), Some(content.as_str()));
+
+            let token_budget = if keep_neighbour_row {
+                // Price the whole reply, so the retained signature and its
+                // readings fit after the neighbour body is withheld.
+                whole["tokens_used"].as_u64().unwrap() as usize - body_tokens / 2
+            } else {
+                // An answer-only budget cannot also hold the readings. The
+                // final whole-reply fit may remove the entire neighbour row.
+                whole[crate::budget::CONTEXT_ANSWER_TOKENS_KEY]
+                    .as_u64()
+                    .unwrap() as usize
+                    - body_tokens / 2
+            };
+            let value = pack(token_budget);
+            assert!(
+                value[crate::budget::CONTEXT_ANSWER_TOKENS_KEY]
+                    .as_u64()
+                    .unwrap() as usize
+                    <= token_budget,
+                "{value}"
+            );
+            let rows = value["entities"].as_array().unwrap();
+            let focal = rows
+                .iter()
+                .find(|row| row["id"] == source.entity.id.to_string())
+                .expect("the highest-ranked focal remains");
+            assert_eq!(focal["body"].as_str(), Some(content.as_str()));
+            assert_eq!(focal["body_complete"], true);
+
+            let listed_id = if keep_neighbour_row {
+                let bodies = value["withheld"]["bodies"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("withheld bodies: {value}"));
+                assert_eq!(bodies, &vec![serde_json::json!(dependency_id)], "{value}");
+                assert!(value["withheld"].get("rows").is_none(), "{value}");
+                let neighbour = rows
+                    .iter()
+                    .find(|row| row["id"] == dependency_id)
+                    .expect("the neighbour remains as its signature");
+                assert_eq!(rows.len(), 2, "{value}");
+                assert_eq!(neighbour["name"], "dependency");
+                assert_eq!(neighbour["signature"], source.entity.signature);
+                assert!(neighbour["body"].is_null(), "{neighbour}");
+                assert_eq!(neighbour["body_complete"], false);
+                assert_eq!(neighbour["projection"], "SignatureOnly");
+                assert!(value["tokens_used"].as_u64().unwrap() <= token_budget as u64);
+                assert!(!says_over_token_budget(&value), "{value}");
+                bodies[0].as_str().unwrap()
+            } else {
+                let dependencies = value["withheld"]["rows"]["dependencies"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("withheld dependency row: {value}"));
+                assert_eq!(
+                    dependencies,
+                    &vec![serde_json::json!(dependency_id)],
+                    "{value}"
+                );
+                assert!(value["withheld"].get("bodies").is_none(), "{value}");
+                assert_eq!(rows.len(), 1, "{value}");
+                assert!(!rows.iter().any(|row| row["id"] == dependency_id));
+                assert!(value["tokens_used"].as_u64().unwrap() > token_budget as u64);
+                assert!(says_over_token_budget(&value), "{value}");
+                dependencies[0].as_str().unwrap()
+            };
+
+            // Use the served handle itself, rather than a name or a saved
+            // fixture id: both forms must recover the exact graph-owned body.
+            assert_eq!(listed_id, dependency_id);
+            let recovered = entities::handle_get_entity_source(
+                &HashMap::from([("entity_id".into(), serde_json::json!(listed_id))]),
+                &store,
+                Some(&authority),
+            )
+            .unwrap();
+            assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+            let recovered = tool_result_json(recovered);
+            assert_eq!(recovered["id"], dependency_id);
+            assert_eq!(recovered["name"], "dependency");
+            assert_eq!(recovered["body"].as_str(), Some(content.as_str()));
         }
     }
 
@@ -5811,15 +6740,16 @@ mod tests {
         let _env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
         let tag = "trace9f31";
 
+        let entry_body = format!(
+            "export function probeFinalTransform_{tag}(n: number): number {{\n  const literal = 'config/settings.json';\n  return probeReduce_{tag}(n) + 17;\n}}\n"
+        );
         let entry = make_trace_entity(
             &dir,
             &format!("src/_kin_probe_{tag}/compute/step4_{tag}.ts"),
             &format!("probeFinalTransform_{tag}"),
             EntityKind::Function,
             &format!("function probeFinalTransform_{tag}(n: number): number"),
-            &format!(
-                "export function probeFinalTransform_{tag}(n: number): number {{\n  return probeReduce_{tag}(n) + 17;\n}}\n"
-            ),
+            &entry_body,
         );
         let reduce_step = make_trace_entity(
             &dir,
@@ -5905,6 +6835,20 @@ mod tests {
         insert_trace_relation(&mut store, &base_step, &constant, RelationKind::Imports);
         install_empty_store_exact_tree(&mut store, dir.path());
         let authority = test_repository_authority(dir.path());
+        // Compare egress with the held source read, whose bounded entity
+        // projection excludes the fixture's final line separator. The public
+        // boundary must preserve every byte that source authority returned.
+        let expected_body = read_entity_source_excerpt_detailed(
+            &store,
+            &entry,
+            MCP_SOURCE_MAX_LINES,
+            MCP_SOURCE_MAX_CHARS,
+            Some(&authority),
+            EntitySourceScope::WorkspaceHead,
+        )
+        .unwrap()
+        .expect("the entry has graph-owned source")
+        .body;
 
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entry.name));
@@ -5912,29 +6856,55 @@ mod tests {
         args.insert("token_budget".into(), serde_json::json!(8000));
 
         let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
-        let text = match &result.content[0] {
-            crate::types::ContentBlock::Text { text } => text.clone(),
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let content = parsed["content"].as_str().unwrap();
+        let mut wire = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut wire, "explore_codebase");
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        let content = &parsed["content"];
+        assert_eq!(parsed["tokens_used"], kin_context::estimate_tokens(text));
 
-        let entry_pos = content.find(&entry.name).unwrap();
-        let reduce_pos = content.find(&reduce_step.name).unwrap();
-        let import_only_pos = content.find(&import_only_step.name).unwrap();
-        let step_pos = content.find(&step.name).unwrap();
-        let base_step_pos = content.find(&base_step.name).unwrap();
-
-        assert!(content.contains("## Ordered Call Chain"));
-        assert!(entry_pos < reduce_pos);
-        assert!(reduce_pos < import_only_pos);
-        assert!(import_only_pos < step_pos);
-        assert!(step_pos < base_step_pos);
-        assert!(content.contains("Imported constants"));
-        assert!(content.contains(&constant.name));
-        assert!(content.contains("export const"));
-        assert!(content.contains("## Similar Matches"));
-        assert!(content.contains(&decoy.name));
-        assert!(content.contains("return n + PROBE_BASE"));
+        let chain = content["chain"].as_array().unwrap();
+        let names: Vec<_> = chain
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                entry.name.as_str(),
+                reduce_step.name.as_str(),
+                import_only_step.name.as_str(),
+                step.name.as_str(),
+                base_step.name.as_str()
+            ]
+        );
+        assert_eq!(chain[0]["body"], expected_body);
+        assert_eq!(chain[0]["next"]["id"], reduce_step.id.to_string());
+        let constants = chain.last().unwrap()["constants"].as_array().unwrap();
+        assert!(constants.iter().any(|row| row["name"] == constant.name
+            && row["body"].as_str().unwrap().contains("export const")));
+        assert!(content["similar_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["name"] == decoy.name));
+        assert!(chain.last().unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("return n + PROBE_BASE"));
+        assert!(
+            !text.contains("src/_kin_probe_"),
+            "generated coordinates reached public output: {text}"
+        );
+        for coordinate in [
+            "file_path",
+            "read_path",
+            "start_line",
+            "end_line",
+            "source_span",
+        ] {
+            assert!(!text.contains(&format!("\"{coordinate}\":")), "{text}");
+        }
     }
 
     #[test]
@@ -5979,15 +6949,16 @@ mod tests {
         args.insert("token_budget".into(), serde_json::json!(8000));
 
         let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
-        let text = match &result.content[0] {
-            crate::types::ContentBlock::Text { text } => text.clone(),
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let content = parsed["content"].as_str().unwrap();
+        let mut wire = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut wire, "explore_codebase");
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        let content = &parsed["content"];
+        assert_eq!(parsed["tokens_used"], kin_context::estimate_tokens(text));
 
-        assert!(content.contains("Imported constants"));
-        assert!(content.contains(&constant.name));
-        assert!(content.contains("export const"));
+        let constants = content["chain"][0]["constants"].as_array().unwrap();
+        assert!(constants.iter().any(|row| row["name"] == constant.name
+            && row["body"].as_str().unwrap().contains("export const")));
     }
 
     #[test]
@@ -6113,18 +7084,27 @@ mod tests {
         args.insert("token_budget".into(), serde_json::json!(8000));
 
         let result = entities::handle_explore_codebase(&args, &store, Some(&authority)).unwrap();
-        let text = match &result.content[0] {
-            crate::types::ContentBlock::Text { text } => text.clone(),
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let content = parsed["content"].as_str().unwrap();
+        let mut wire = serde_json::to_value(result).unwrap();
+        crate::semantic_surface::present_result(&mut wire, "explore_codebase");
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        let content = &parsed["content"];
+        assert_eq!(parsed["tokens_used"], kin_context::estimate_tokens(text));
 
-        assert!(content.contains("## Evaluation Walkthrough"));
-        assert!(content.contains("Input: 5"));
-        assert!(content.contains("probe_add_offset"));
-        assert!(content.contains("36 is even, so 36 + 3"));
-        assert!(content.contains("102 is even, so 102 + 7"));
-        assert!(content.contains("Final result: 126"));
+        assert_eq!(content["input"], 5);
+        assert_eq!(content["final_result"], 126);
+        let evaluation = content["evaluation"].as_array().unwrap();
+        assert!(evaluation
+            .iter()
+            .any(|row| row["name"].as_str().unwrap().contains("probe_add_offset")));
+        assert!(evaluation.iter().any(|row| row["expression"]
+            .as_str()
+            .unwrap()
+            .contains("36 is even, so 36 + 3")));
+        assert!(evaluation.iter().any(|row| row["expression"]
+            .as_str()
+            .unwrap()
+            .contains("102 is even, so 102 + 7")));
     }
 
     #[test]
@@ -7727,7 +8707,9 @@ mod tests {
             assert!(text.starts_with("read_only_session: "), "{text}");
             assert!(text.contains(&format!("{door} writes")), "{text}");
             assert!(text.contains(missing), "{text}");
-            assert!(text.contains("kin_session_start"), "{text}");
+            // The fix is the connection's own session, never a session tool.
+            assert!(text.contains("without session_id"), "{text}");
+            assert!(!text.contains("kin_session_start"), "{text}");
         }
         let offline = SessionAuthorityMode::OfflineFallback;
         let start = |label: &str, capabilities: SessionCapabilities| {
@@ -8619,6 +9601,62 @@ mod tests {
             calls.lock().unwrap()[1].1["operations"][0]["payload"]["EntitySourceBase"]["entity_id"],
             entity.id.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_mutate_forwards_exact_tickets_and_rejects_malformed_mixed_operations() {
+        let entity = EntityId::new();
+        let mut operations = body_update_operations(entity, "pub fn widget() {}");
+        // Build a public operation rather than serde's private optional fields.
+        operations[0].as_object_mut().unwrap().remove("destination");
+        let ticket =
+            crate::source_ticket::compact(&operations[0]["payload"]["EntitySourceBase"]).unwrap();
+        operations[0]["payload"]["EntitySourceBase"] = ticket;
+        let args = HashMap::from([
+            ("session_id".into(), serde_json::json!(SESSIONED)),
+            ("operations".into(), operations.clone()),
+        ]);
+        let calls: Recorded = Default::default();
+        let result = sessions::mutate_through(
+            &args,
+            scripted_forward(
+                calls.clone(),
+                || Ok(Some(ToolCallResult::text(r#"{"status":"committed"}"#))),
+                || Err("a landed commit is never aborted".into()),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", tool_result_text(&result));
+        assert_eq!(
+            forwarded(&calls),
+            ["kin_transaction_begin", "kin_transaction_commit"]
+        );
+        assert_eq!(calls.lock().unwrap()[1].1["operations"], operations);
+
+        let mut malformed = operations.clone();
+        malformed[0]["content"] = serde_json::json!("unsupported outer field");
+        let mut mixed = operations;
+        mixed.as_array_mut().unwrap().push(serde_json::json!({"verb":"update","target":entity,"body":"pub fn unguarded() {}","description":"missing base"}));
+        for operations in [malformed, mixed] {
+            let args = HashMap::from([
+                ("session_id".into(), serde_json::json!(SESSIONED)),
+                ("operations".into(), operations),
+            ]);
+            let calls: Recorded = Default::default();
+            let result = sessions::mutate_through(
+                &args,
+                scripted_forward(
+                    calls.clone(),
+                    || Err("malformed work must not commit".into()),
+                    || Err("nothing began".into()),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert!(forwarded(&calls).is_empty());
+        }
     }
 
     /// A commit the daemon refuses is aborted, and the abort names the transaction.
@@ -10356,8 +11394,20 @@ mod tests {
             "graph row 41 must reach the agent as line 42: {}",
             rows[0]
         );
-        // The nested raw span stays graph truth, the established convention.
-        assert_eq!(rows[0]["span"]["start_line"], 41);
+        // A compact row carries the presentation line and not the raw span.
+        assert!(rows[0].get("span").is_none(), "{}", rows[0]);
+
+        // The raw row, asked for, keeps the nested span as graph truth, the
+        // established convention, beside the same presentation line.
+        let mut raw_args = args.clone();
+        raw_args.insert("compact".to_string(), serde_json::json!(false));
+        let raw = tool_result_json(
+            review::handle_impact_analysis(&raw_args, &store, &sessions)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(raw["affected_callers"][0]["start_line"], 42);
+        assert_eq!(raw["affected_callers"][0]["span"]["start_line"], 41);
     }
 
     /// FIR-2452 clause 2, on the real handler output. `impact_analysis` emits
@@ -10399,7 +11449,7 @@ mod tests {
         assert_eq!(
             coverage["requested_classes"],
             serde_json::json!(["calls", "imports", "references"]),
-            "the observation covers exactly what negative::absence_cross_file_classes \
+            "the observation covers exactly what negative::absence_cross_unit_classes \
              declares this tool reads: {coverage}"
         );
 
@@ -10556,12 +11606,33 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&text_of(&by_file_result))
                 .unwrap_or_else(|_| panic!("{tool} by file must answer in JSON"));
             assert_eq!(value["deprecations"][0]["tool"], tool, "{value}");
-            assert!(
-                value["message"].is_string(),
-                "{tool} keeps its text: {value}"
+            assert_eq!(value["deprecations"][0]["parameter"], "files", "{value}");
+            assert_eq!(
+                value["deprecations"][0]["replacement"], "entity_ids",
+                "{value}"
             );
+            assert_eq!(
+                value["deprecations"][0]["removed_after"],
+                crate::budget::DEPRECATION_REMOVED_AFTER,
+                "{value}"
+            );
+            let by_id_value: serde_json::Value = serde_json::from_str(&text_of(&by_id_result))
+                .unwrap_or_else(|_| panic!("{tool} by entity id must answer in JSON"));
+            assert_eq!(value["diff"], by_id_value["diff"], "{tool}");
+            let entity_change = &value["diff"]["entity_changes"][0];
+            assert_eq!(entity_change["entity_id"], present.id.to_string(), "{tool}");
+            assert_eq!(
+                entity_change["kind"]["Added"]["name"], present.name,
+                "{tool}"
+            );
+            if tool == "semantic_review" {
+                assert!(
+                    value["message"].is_string(),
+                    "{tool} keeps its summary: {value}"
+                );
+            }
             assert!(
-                !text_of(&by_id_result).contains("\"deprecations\""),
+                by_id_value.get("deprecations").is_none(),
                 "{tool} by entity id must carry no deprecation"
             );
         }
@@ -10801,17 +11872,27 @@ mod tests {
         // The invariant, stated exactly. Every hit resolves against the SAME base
         // change, so the committed state is ONE replay however long the page is.
         // The introducing TREE is keyed by `introduced_by`, which varies per
-        // entity, so it is one replay per DISTINCT introducing change -- not one
-        // per hit, and not a constant. This fixture commits all six entities in
-        // one change, so D = 1 and the total is 2; that 2 is a property of the
-        // fixture, and only the formula below is the property of the fix.
-        let distinct_introducing_changes = 1;
+        // entity, and each introducing change is an ancestor of the base on
+        // its first-parent chain, so its tree is folded from the tree deltas
+        // the state replay already read: no replay of its own, however many
+        // distinct introducing changes the page spans.
         assert_eq!(
             held.replays_performed(),
-            1 + distinct_introducing_changes,
-            "the page must replay committed state once and the introducing tree once per \
-             distinct introducing change, not either of them once per hit"
+            1,
+            "the page must replay committed state once, and serve every introducing tree \
+             from the chain that replay read, not replay per hit or per introducing change"
         );
+        // Each file's blob was read once, and reading the page again reads
+        // neither history nor a blob: a walk that quotes many entities of few
+        // files pays for the files, not for the entities.
+        assert_eq!(held.blob_reads_performed(), PAGE as u64);
+        for entity in &page {
+            read_bounded_entity_snippet_held(&held, entity, EntitySourceScope::WorkspaceHead)
+                .expect("the second read is the first one again")
+                .expect("every fixture entity has source coordinates");
+        }
+        assert_eq!(held.blob_reads_performed(), PAGE as u64);
+        assert_eq!(held.replays_performed(), 1);
 
         // Falsification: the pre-fix shape, one session per read, on this exact
         // fixture. If the counts above were an artifact of the fixture rather
@@ -11156,8 +12237,14 @@ mod tests {
                     "callee": null,
                     "callee_unavailable": "site_outside_caller",
                 }),
-                serde_json::json!({ "line_in_entity": 1, "callee": "target" }),
-                serde_json::json!({ "line_in_entity": 2, "callee": "other.target" }),
+                serde_json::json!({ "line_in_entity": 1, "callee": "target", "expr": "target(1)" }),
+                // A call written over three lines reads as one.
+                serde_json::json!({
+                    "line_in_entity": 2,
+                    "callee": "other.target",
+                    "expr": "other.target(2,)",
+                    "receiver": "other",
+                }),
             ],
             "each site inside its caller, never a file line"
         );
@@ -11986,5 +13073,630 @@ mod tests {
             first["blockers"], second["blockers"],
             "blockers must be deterministic across identical-state runs"
         );
+    }
+
+    /// A pack-shaped store over real source bytes: five focals, each with a
+    /// body of a few hundred tokens, eight callers and six helpers apiece, and
+    /// one shared helper every focal calls, which routes each pair of focals.
+    struct ReplySizeFixture {
+        _source: GraphBackedSource,
+        store: EmptyStore,
+        focals: Vec<Entity>,
+        shared: Entity,
+        authority: RequestRepositoryAuthority,
+    }
+
+    fn reply_size_fixture() -> ReplySizeFixture {
+        let shared_body =
+            "export function shared_total(value: number): number {\n    return value + 1;\n}";
+        let source = make_source_backed_entity(shared_body);
+        let mut store = EmptyStore::default();
+        let mut shared = source.entity.clone();
+        shared.name = "shared_total".into();
+        shared.signature = "export function shared_total(value: number): number".into();
+        store.insert_test_entity(shared.clone());
+        store
+            .file_hashes
+            .insert(shared.file_origin.clone().unwrap(), source.hash);
+        let blobs = kin_blobs::BlobStore::new(source._dir.path().join(".kin/objects")).unwrap();
+        let add = |store: &mut EmptyStore, name: &str, body: String| -> Entity {
+            let mut entity = impact_probe_entity(name, Some(0));
+            entity.signature = body
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end_matches(" {")
+                .to_string();
+            let span = entity.span.as_mut().unwrap();
+            span.end_byte = body.len();
+            span.end_line = (body.lines().count() as u32).saturating_sub(1);
+            let hash = blobs.write(body.as_bytes()).unwrap();
+            store
+                .file_hashes
+                .insert(entity.file_origin.clone().unwrap(), hash);
+            store.insert_test_entity(entity.clone());
+            entity
+        };
+        let mut focals = Vec::new();
+        for focal_index in 0..5 {
+            let helpers: Vec<Entity> = (0..6)
+                .map(|helper| {
+                    add(
+                        &mut store,
+                        &format!("helper_{focal_index}_{helper}"),
+                        format!(
+                            "export function helper_{focal_index}_{helper}(value: number): number {{\n    const scaled = value * {helper};\n    return scaled - {focal_index};\n}}"
+                        ),
+                    )
+                })
+                .collect();
+            let mut body = format!(
+                "export function focal_total_{focal_index}(input: Record<string, number>): number {{\n    let total = 0;\n"
+            );
+            for line in 0..24 {
+                let helper = line % 6;
+                body.push_str(&format!(
+                    "    total += helper_{focal_index}_{helper}(input[\"key_{line}\"] ?? {line});\n"
+                ));
+            }
+            body.push_str("    return shared_total(total);\n}");
+            let focal = add(&mut store, &format!("focal_total_{focal_index}"), body);
+            for helper in &helpers {
+                store.insert_test_calls_relation(&focal, helper);
+            }
+            store.insert_test_calls_relation(&focal, &shared);
+            for caller in 0..8 {
+                let caller = add(
+                    &mut store,
+                    &format!("caller_{focal_index}_{caller}"),
+                    format!(
+                        "export function caller_{focal_index}_{caller}(): number {{\n    return focal_total_{focal_index}({{ key_0: {caller} }});\n}}"
+                    ),
+                );
+                store.insert_test_calls_relation(&caller, &focal);
+            }
+            focals.push(focal);
+        }
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        ReplySizeFixture {
+            _source: source,
+            store,
+            focals,
+            shared,
+            authority,
+        }
+    }
+
+    /// The whole reply a client receives for `args`, finalized the way the
+    /// server finalizes it.
+    fn finalized_reply(
+        tool: &str,
+        args: &HashMap<String, serde_json::Value>,
+        raw: ToolCallResult,
+    ) -> (String, serde_json::Value) {
+        let result = crate::envelope::finalize_bounded(
+            raw,
+            crate::envelope::Envelope::daemon(),
+            tool,
+            &crate::budget::ResponseBudget::from_arguments(args),
+        );
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        (text.clone(), serde_json::from_str(text).unwrap())
+    }
+
+    fn served_bodies(reply: &serde_json::Value) -> Vec<String> {
+        let mut rows: Vec<&serde_json::Value> = Vec::new();
+        if let Some(focal) = reply.get("focal_entity") {
+            rows.push(focal);
+        }
+        for key in ["entities", "dependencies", "dependents", "tests"] {
+            if let Some(list) = reply.get(key).and_then(serde_json::Value::as_array) {
+                rows.extend(list);
+            }
+        }
+        rows.into_iter()
+            .filter(|row| row["body_complete"] == true)
+            .filter_map(|row| row["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// A certified caller the builder's token budget refused and the
+    /// dependents cap then kept out is one withheld row, reported by the cap,
+    /// not two: before, 24 served callers of 40 read as 24 kept and 32
+    /// withheld.
+    #[test]
+    fn a_caller_refused_by_the_budget_and_capped_is_withheld_once() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let source = make_source_backed_entity("function validate() {\n    return 1;\n}");
+        let entity = &source.entity;
+        let mut store = EmptyStore::default();
+        store.insert_test_entity(entity.clone());
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+        let blobs = kin_blobs::BlobStore::new(source._dir.path().join(".kin/objects")).unwrap();
+        for index in 0..40 {
+            let mut caller =
+                impact_probe_entity(&format!("validate_range_caller_{index}"), Some(0));
+            let caller_body = format!("{} {{\n    validate();\n}}", caller.signature);
+            caller.span.as_mut().unwrap().end_byte = caller_body.len();
+            let hash = blobs.write(caller_body.as_bytes()).unwrap();
+            store
+                .file_hashes
+                .insert(caller.file_origin.clone().unwrap(), hash);
+            store.insert_test_entity(caller.clone());
+            store.insert_test_calls_relation(&caller, entity);
+        }
+        install_empty_store_exact_tree(&mut store, source._dir.path());
+        let authority = test_repository_authority(source._dir.path());
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        for token_budget in [120u64, 400, 2000] {
+            let args = HashMap::from([
+                ("entity_id".into(), serde_json::json!(entity.id.to_string())),
+                ("token_budget".into(), serde_json::json!(token_budget)),
+            ]);
+            let raw = tool_result_json(
+                entities::handle_get_context_pack(&args, &store, &sessions, Some(&authority))
+                    .unwrap(),
+            );
+            let kept = raw["dependents"].as_array().unwrap().len();
+            let withheld = raw["dependents_withheld"].as_u64().unwrap_or(0) as usize;
+            assert_eq!(kept + withheld, 40, "{token_budget}: {raw}");
+            assert_eq!(
+                raw["elisions"]["dependents"]["elided"]
+                    .as_u64()
+                    .unwrap_or(0) as usize,
+                withheld,
+                "{token_budget}: {raw}"
+            );
+        }
+    }
+
+    /// A multi-focal pack over `fixture`, finalized. `scores` ranks the focals
+    /// as a question's ranking would; `None` names them, as `entities` does.
+    fn question_pack(
+        fixture: &ReplySizeFixture,
+        scores: Option<&[f64]>,
+        token_budget: u64,
+    ) -> (String, serde_json::Value) {
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        let focals: Vec<serde_json::Value> = fixture
+            .focals
+            .iter()
+            .enumerate()
+            .map(|(index, focal)| match scores {
+                Some(scores) => serde_json::json!({
+                    "entity_id": focal.id.to_string(),
+                    "route": "question",
+                    "score": scores[index],
+                }),
+                None => serde_json::json!({
+                    "entity_id": focal.id.to_string(),
+                    "route": "name",
+                    "query": focal.name,
+                }),
+            })
+            .collect();
+        let mode = if scores.is_some() {
+            (
+                "question",
+                serde_json::json!("how do the focal totals add up"),
+            )
+        } else {
+            (
+                "entities",
+                serde_json::json!(fixture
+                    .focals
+                    .iter()
+                    .map(|focal| focal.name.clone())
+                    .collect::<Vec<_>>()),
+            )
+        };
+        let mut args = HashMap::from([
+            (mode.0.to_string(), mode.1),
+            ("question_focals".into(), serde_json::json!(focals)),
+            ("token_budget".into(), serde_json::json!(token_budget)),
+            ("focal_body".into(), serde_json::json!(true)),
+            ("neighbor_bodies".into(), serde_json::json!(true)),
+        ]);
+        crate::agent_belt::apply_belt_defaults("get_context_pack", &mut args);
+        let raw = entities::handle_get_context_pack(
+            &args,
+            &fixture.store,
+            &sessions,
+            Some(&fixture.authority),
+        )
+        .unwrap();
+        finalized_reply("get_context_pack", &args, raw)
+    }
+
+    /// Whether a reply says it ships over its token budget.
+    fn says_over_token_budget(reply: &serde_json::Value) -> bool {
+        reply["degradations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| entry["reason"] == crate::budget::OVER_TOKEN_BUDGET_REASON)
+    }
+
+    /// The metadata a compact context or neighbourhood reply may not carry.
+    fn assert_compact_metadata(reply: &serde_json::Value, text: &str) {
+        let envelope = reply["_kin"].as_object().expect("an envelope");
+        for key in envelope.keys() {
+            assert!(
+                [
+                    "envelope_version",
+                    "verdict",
+                    "completeness",
+                    "response",
+                    "self_check",
+                    "advice",
+                    "provenance"
+                ]
+                .contains(&key.as_str()),
+                "`_kin.{key}` restates a reading: {text}"
+            );
+        }
+        assert!(envelope["provenance"].is_string(), "{text}");
+        for key in [
+            "source_derivation",
+            "measurement_scope",
+            "projection_measurement_scope",
+        ] {
+            assert!(reply.get(key).is_none(), "`{key}` is restated: {text}");
+        }
+        let rows = reply.get("focal_entity").into_iter().chain(
+            ["entities", "dependencies", "dependents", "tests"]
+                .iter()
+                .filter_map(|key| reply.get(*key).and_then(serde_json::Value::as_array))
+                .flatten(),
+        );
+        for row in rows {
+            for key in crate::budget::CONTEXT_ROW_PROVENANCE_KEYS {
+                assert!(row.get(key).is_none(), "a row restates `{key}`: {row}");
+            }
+        }
+    }
+
+    /// The question-mode pack the 0.8.3 pilot measured at 21,677 to 27,394
+    /// bytes for a 3,000-token budget with no body served. The whole reply,
+    /// metadata included, is now held to its token budget, its metadata is
+    /// compact, and the bodies it serves are the highest-ranked focals', in
+    /// whatever order the ranking handed them over. A focal the budget cannot
+    /// hold at all is named by id as a withheld focal.
+    #[test]
+    fn a_multi_focal_pack_serves_its_top_focal_bodies_within_its_token_budget() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = reply_size_fixture();
+        let names: Vec<String> = fixture.focals.iter().map(|f| f.name.clone()).collect();
+        let ascending = [750.0, 740.0, 730.0, 720.0, 710.0];
+        let descending = [710.0, 720.0, 730.0, 740.0, 750.0];
+        let by_name = [f64::INFINITY; 5];
+        for (token_budget, scores) in [
+            (8000, Some(&ascending)),
+            (3000, Some(&ascending)),
+            (3000, Some(&descending)),
+            (3000, None),
+            (1500, Some(&ascending)),
+        ] {
+            let (text, reply) = question_pack(&fixture, scores.map(|s| s.as_slice()), token_budget);
+            let label = format!("{token_budget} {scores:?}");
+            let tokens = kin_context::estimate_tokens(&text);
+            assert_eq!(reply["tokens_used"], tokens);
+            assert!(text.len() <= crate::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS as usize);
+            // Held to the budget, or over it only by the floor it says it
+            // could not shed.
+            assert_eq!(
+                says_over_token_budget(&reply),
+                tokens as u64 > token_budget,
+                "{label}: {tokens} tokens: {text}"
+            );
+            if token_budget >= 3000 {
+                assert!(tokens as u64 <= token_budget, "{label}: {tokens}: {text}");
+            }
+            assert_compact_metadata(&reply, &text);
+
+            // The bodies served are a prefix of the focals by rank; names
+            // rank in the order they were given.
+            let ranks = scores.unwrap_or(&by_name);
+            let mut ranked: Vec<(&String, f64)> = names.iter().zip(ranks.iter().copied()).collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let served = served_bodies(&reply);
+            let focal_bodies: Vec<&String> = ranked
+                .iter()
+                .map(|(name, _)| *name)
+                .filter(|name| served.contains(name))
+                .collect();
+            assert!(!focal_bodies.is_empty(), "{label}: no focal body: {text}");
+            let expected: Vec<&String> = ranked
+                .iter()
+                .take(focal_bodies.len())
+                .map(|(name, _)| *name)
+                .collect();
+            assert_eq!(focal_bodies, expected, "{label}: {text}");
+            if token_budget == 8000 {
+                assert_eq!(focal_bodies.len(), 5, "{label}: every body fits: {text}");
+            }
+
+            // Every focal is served or named by id as withheld; every
+            // withheld body is a row the reply still carries.
+            let rows: Vec<&serde_json::Value> =
+                reply["entities"].as_array().unwrap().iter().collect();
+            let withheld_focals: Vec<&str> = reply["withheld"]["rows"]["focal"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            for focal in &fixture.focals {
+                let id = focal.id.to_string();
+                assert!(
+                    rows.iter().any(|row| row["id"] == id.as_str())
+                        || withheld_focals.contains(&id.as_str()),
+                    "{label}: focal {} is neither served nor named: {text}",
+                    focal.name
+                );
+            }
+            for id in reply["withheld"]["bodies"].as_array().into_iter().flatten() {
+                let id = id.as_str().expect("a withheld body is an id");
+                let row = rows
+                    .iter()
+                    .find(|row| row["id"] == id)
+                    .expect("its row stays");
+                assert_eq!(row["body_elided"], serde_json::json!(["body"]), "{row}");
+            }
+            for ids in reply["withheld"]["rows"]
+                .as_object()
+                .into_iter()
+                .flat_map(|groups| groups.values())
+            {
+                for id in ids.as_array().unwrap() {
+                    let id = id.as_str().expect("a withheld row is an id");
+                    assert!(rows.iter().all(|row| row["id"] != id), "{id}");
+                }
+            }
+
+            // Focals by id and resolution, routes as one rendered line.
+            for focal in reply["focals"].as_array().unwrap() {
+                for key in focal.as_object().unwrap().keys() {
+                    assert!(
+                        ["entity_id", "name", "projection", "resolution"].contains(&key.as_str()),
+                        "{focal}"
+                    );
+                }
+            }
+            for route in reply["routes"].as_array().unwrap() {
+                assert!(
+                    route["path"]
+                        .as_str()
+                        .is_some_and(|path| path.contains("-Calls->")),
+                    "{route}"
+                );
+            }
+
+            // The pack's coverage is measured, so neither clause a context
+            // pack used to carry for want of it applies.
+            assert!(reply.get("edge_coverage").is_some(), "{text}");
+            let factor = reply["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(!factor.contains("edge_coverage_unreported"), "{factor}");
+            assert!(!factor.contains("substrate_unknown"), "{factor}");
+        }
+    }
+
+    /// A single-focal pack is held to the same whole-reply budget and serves
+    /// its focal's body.
+    #[test]
+    fn a_single_focal_pack_stays_within_its_token_budget() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = reply_size_fixture();
+        let sessions = crate::session::SessionRegistry::empty_for_test();
+        for token_budget in [3000u64, 1200, 400] {
+            let mut args = HashMap::from([
+                (
+                    "entity_id".into(),
+                    serde_json::json!(fixture.focals[0].id.to_string()),
+                ),
+                ("token_budget".into(), serde_json::json!(token_budget)),
+                ("neighbor_bodies".into(), serde_json::json!(true)),
+            ]);
+            crate::agent_belt::apply_belt_defaults("get_context_pack", &mut args);
+            let raw = entities::handle_get_context_pack(
+                &args,
+                &fixture.store,
+                &sessions,
+                Some(&fixture.authority),
+            )
+            .unwrap();
+            let (text, reply) = finalized_reply("get_context_pack", &args, raw);
+            let tokens = kin_context::estimate_tokens(&text);
+            assert_eq!(
+                says_over_token_budget(&reply),
+                tokens as u64 > token_budget,
+                "{token_budget}: {tokens}: {text}"
+            );
+            if token_budget >= 3000 {
+                assert!(
+                    tokens as u64 <= token_budget,
+                    "{tokens} over {token_budget}: {text}"
+                );
+            } else if tokens as u64 > token_budget {
+                // Over only at the floor: every neighbour and evidence row the
+                // fit may withhold is withheld and named, and what is left is
+                // the focal's body and the readings that qualify it.
+                for group in ["dependencies", "dependents"] {
+                    assert_eq!(reply[group], serde_json::json!([]), "{group}: {text}");
+                }
+                assert!(reply["withheld"]["rows"].is_object(), "{text}");
+            }
+            assert_compact_metadata(&reply, &text);
+            // The focal's body is served whenever it fits the budget on its
+            // own (about 470 tokens here); below that it is named by id.
+            if token_budget >= 1200 {
+                assert_eq!(reply["focal_entity"]["body_complete"], true, "{text}");
+            } else {
+                let id = fixture.focals[0].id.to_string();
+                assert!(
+                    reply["withheld"]["bodies"]
+                        .as_array()
+                        .is_some_and(|bodies| bodies.iter().any(|body| body == id.as_str())),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// The neighbourhood lists only edges whose two ends it lists, so a walk
+    /// cut to `limit` does not ship edges to ids the reader cannot look up, and
+    /// its metadata is the compact envelope.
+    #[test]
+    fn a_neighborhood_lists_only_edges_between_the_entities_it_returns() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = reply_size_fixture();
+        for limit in [50u64, 12] {
+            let args = HashMap::from([
+                (
+                    "entity_id".into(),
+                    serde_json::json!(fixture.shared.id.to_string()),
+                ),
+                ("direction".into(), serde_json::json!("in")),
+                ("depth".into(), serde_json::json!(2)),
+                ("limit".into(), serde_json::json!(limit)),
+                ("max_chars".into(), serde_json::json!(60000)),
+            ]);
+            let raw = entities::handle_graph_neighborhood_with_authority(
+                &args,
+                &fixture.store,
+                Some(&fixture.authority),
+            )
+            .unwrap();
+            let (text, reply) = finalized_reply("graph_neighborhood", &args, raw);
+            assert!(text.len() <= 60000);
+            assert_compact_metadata(&reply, &text);
+            let listed: HashSet<&str> = reply["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row["id"].as_str())
+                .collect();
+            let relations = reply["relations"].as_array().unwrap();
+            for edge in relations {
+                for end in ["src", "dst"] {
+                    let id = edge[end]["Entity"].as_str().unwrap();
+                    assert!(listed.contains(id), "{end} {id} is not listed: {edge}");
+                }
+            }
+            // Every edge the walk crossed is still counted.
+            assert_eq!(reply["relation_count"], 45, "{text}");
+            if limit == 12 {
+                assert_eq!(reply["truncated"], true);
+                assert!(relations.len() < 45, "{text}");
+            }
+        }
+
+        // The whole reply, envelope included, stays inside the caller's byte
+        // ceiling, and says what it withheld to get there.
+        for max_chars in [6000u64, 3000] {
+            let args = HashMap::from([
+                (
+                    "entity_id".into(),
+                    serde_json::json!(fixture.shared.id.to_string()),
+                ),
+                ("direction".into(), serde_json::json!("in")),
+                ("depth".into(), serde_json::json!(2)),
+                ("limit".into(), serde_json::json!(50)),
+                ("max_chars".into(), serde_json::json!(max_chars)),
+            ]);
+            let raw = entities::handle_graph_neighborhood_with_authority(
+                &args,
+                &fixture.store,
+                Some(&fixture.authority),
+            )
+            .unwrap();
+            let (text, reply) = finalized_reply("graph_neighborhood", &args, raw);
+            let over = reply["degradations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["reason"] == crate::budget::OVER_BUDGET_REASON);
+            // Inside the ceiling, or over it only at the floor the ladder
+            // keeps (one row per list and the readings) and saying so.
+            assert_eq!(over, text.len() as u64 > max_chars, "{text}");
+            if max_chars >= 6000 {
+                assert!(
+                    text.len() as u64 <= max_chars,
+                    "{} over {max_chars}",
+                    text.len()
+                );
+            } else {
+                assert!(reply["entities"].as_array().unwrap().len() <= 1, "{text}");
+            }
+            assert_eq!(reply["_kin"]["response"]["bounded"], true, "{text}");
+            assert_eq!(reply["_kin"]["response"]["chars_after_budget"], text.len());
+            assert_compact_metadata(&reply, &text);
+        }
+    }
+
+    /// The whole route a client takes, `locate` with mode `text` through the
+    /// server: the argument it is routed with passes the tool's contract, and
+    /// a server with no source authority says it could not read the modules
+    /// back rather than that the text is absent.
+    #[tokio::test]
+    async fn locate_mode_text_is_served_end_to_end_and_says_what_it_could_not_read() {
+        use crate::server::{
+            present_for_client, process_message, McpServerConfig, SessionAuthorityMode,
+        };
+        use crate::session::SessionRegistry;
+        // Content no other test hands a search, since read-back text is kept
+        // by digest for the life of the process.
+        let graph = kin_db::InMemoryGraph::default();
+        crate::declaration_coverage::fixtures::admit(
+            &graph,
+            "src/route_only.py",
+            "def only_in_the_route_test():\n    return 2\n",
+            false,
+        );
+        let config = McpServerConfig {
+            session_authority_mode: SessionAuthorityMode::OfflineFallback,
+            plain_replies: true,
+            agent_belt: true,
+            reply_format: crate::text_reply::ReplyFormat::Text,
+            session_handles: Some(std::sync::Arc::new(
+                crate::session_handles::SessionHandles::default(),
+            )),
+            ..Default::default()
+        };
+        let message = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "locate", "arguments": {"query": "NEVER_HANDED_OVER_TEXT", "mode": "text"}}})
+        .to_string();
+        let response = process_message(&message, &graph, &config, &SessionRegistry::new())
+            .await
+            .expect("response");
+        let result = present_for_client(response, &message, &config)
+            .result
+            .unwrap();
+        assert_ne!(result["isError"], serde_json::json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Answer (partial):"), "{text}");
+        assert!(
+            text.contains("could not read back 1 parsed module"),
+            "{text}"
+        );
+        assert!(text.contains("Current repository source authority is unavailable"));
     }
 }

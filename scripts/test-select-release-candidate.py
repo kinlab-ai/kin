@@ -137,6 +137,8 @@ def check_run(
     status: str = "completed",
     conclusion: str | None = "success",
     app: tuple[int, str] = selector.GITHUB_ACTIONS_APP,
+    started_at: str | None = None,
+    completed_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -144,6 +146,8 @@ def check_run(
         "conclusion": conclusion,
         "check_suite": {"id": suite},
         "app": {"id": app[0], "slug": app[1]},
+        "started_at": started_at,
+        "completed_at": completed_at,
     }
 
 
@@ -311,6 +315,52 @@ class GradeShaTests(unittest.TestCase):
             any("ambiguous required check: Falsify guards" in line for line in verdict["dead"]),
             verdict["dead"],
         )
+
+    def retried(self, first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+        checks = [check for check in green_checks() if check["name"] != "Falsify guards"]
+        checks += [first, second]
+        return self.grade(checks, green_workflow_runs())
+
+    def test_one_failed_attempt_retried_to_success_is_green_and_reported(self) -> None:
+        verdict = self.retried(
+            check_run("Falsify guards", suite=CI_SUITE, conclusion="failure",
+                      started_at="2026-09-28T10:00:00Z", completed_at="2026-09-28T10:20:00Z"),
+            check_run("Falsify guards", suite=CI_SUITE,
+                      started_at="2026-09-28T10:25:00Z", completed_at="2026-09-28T10:45:00Z"),
+        )
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        self.assertEqual(verdict["retried"], ["Falsify guards"])
+
+    def test_a_pass_followed_by_a_failure_is_not_a_retry(self) -> None:
+        verdict = self.retried(
+            check_run("Falsify guards", suite=CI_SUITE,
+                      started_at="2026-09-28T10:00:00Z", completed_at="2026-09-28T10:20:00Z"),
+            check_run("Falsify guards", suite=CI_SUITE, conclusion="failure",
+                      started_at="2026-09-28T10:25:00Z", completed_at="2026-09-28T10:45:00Z"),
+        )
+        self.assertEqual(verdict["verdict"], selector.DEAD, verdict)
+
+    def test_attempts_that_overlap_are_not_a_retry(self) -> None:
+        verdict = self.retried(
+            check_run("Falsify guards", suite=CI_SUITE, conclusion="failure",
+                      started_at="2026-09-28T10:00:00Z", completed_at="2026-09-28T10:30:00Z"),
+            check_run("Falsify guards", suite=CI_SUITE,
+                      started_at="2026-09-28T10:25:00Z", completed_at="2026-09-28T10:45:00Z"),
+        )
+        self.assertEqual(verdict["verdict"], selector.DEAD, verdict)
+
+    def test_a_second_retry_stays_ambiguous(self) -> None:
+        checks = [check for check in green_checks() if check["name"] != "Falsify guards"]
+        checks += [
+            check_run("Falsify guards", suite=CI_SUITE, conclusion="failure",
+                      started_at="2026-09-28T10:00:00Z", completed_at="2026-09-28T10:20:00Z"),
+            check_run("Falsify guards", suite=CI_SUITE, conclusion="failure",
+                      started_at="2026-09-28T10:25:00Z", completed_at="2026-09-28T10:45:00Z"),
+            check_run("Falsify guards", suite=CI_SUITE,
+                      started_at="2026-09-28T10:50:00Z", completed_at="2026-09-28T11:10:00Z"),
+        ]
+        verdict = self.grade(checks, green_workflow_runs())
+        self.assertEqual(verdict["verdict"], selector.DEAD, verdict)
 
     def test_a_red_required_context_is_dead(self) -> None:
         """59c2239c2: the Windows leg was cancelled at the job cap."""
@@ -1421,8 +1471,8 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(decision["decision"], selector.ARM)
         self.assertEqual(decision["candidate"], NEWEST)
 
-    def test_a_refusal_exits_one_and_a_broken_read_exits_two(self) -> None:
-        """A refusal and an unreadable snapshot must not share an exit code."""
+    def test_a_refusal_exits_zero_and_a_broken_read_exits_two(self) -> None:
+        """A refusal is a hold and exits 0 with a warning; an unreadable snapshot still fails."""
 
         document = snapshot()
         document["grades"] = {
@@ -1433,8 +1483,9 @@ class CommandLineTests(unittest.TestCase):
             json.dump(document, handle)
             path = handle.name
         refusal = self.run_selector("select", "--snapshot", path)
-        self.assertEqual(refusal.returncode, 1, refusal.stdout)
-        self.assertIn("Release cut refused", refusal.stderr)
+        self.assertEqual(refusal.returncode, 0, refusal.stdout)
+        self.assertEqual(json.loads(refusal.stdout)["decision"], selector.REFUSE)
+        self.assertIn("::warning title=Release cut refused", refusal.stderr)
 
         document.pop("grades")
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:

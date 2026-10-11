@@ -207,8 +207,13 @@ pub enum GitError {
     /// under it. What the message has to add is the way out, because
     /// `actions/checkout` clones at depth 1 by default and this is therefore the
     /// first thing Kin says to anyone trying it inside CI.
-    #[error("shallow Git repositories cannot be imported losslessly; run 'git fetch --unshallow' first (in CI, actions/checkout needs fetch-depth: 0)")]
+    #[error("shallow Git repositories cannot be imported losslessly; run 'git fetch --unshallow' first (in CI, actions/checkout needs fetch-depth: 0), or run 'kin init --history none' to admit only the checked-out commit")]
     ShallowRepository,
+
+    /// A snapshot that stops at a history boundary was offered to a path that
+    /// needs complete history, such as writing a Git repository from it.
+    #[error("this snapshot holds only part of its Git history ({boundary} commit(s) admitted without their parents), so it cannot be written out as a complete Git repository")]
+    PartialHistory { boundary: usize },
 
     #[error("Git object {oid} is missing while traversing {context}")]
     MissingObject { oid: String, context: String },

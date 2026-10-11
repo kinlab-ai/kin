@@ -528,6 +528,28 @@ pub trait ChangeStore: Send + Sync {
         state.tree = replay_tree_history(tree_history).map_err(Self::Error::from)?;
         Ok(state)
     }
+    /// [`Self::resolve_graph_at`], with the tree history of `head`'s
+    /// first-parent chain beside the state.
+    ///
+    /// A reader that resolves the state at `head` and then the tree at
+    /// several of its ancestors reads every change of the chain once here.
+    /// [`Self::resolve_tree_at`] reads and decodes the whole chain again for
+    /// each ancestor, entity and relation deltas included, to use nothing of
+    /// them but the tree deltas this keeps.
+    fn resolve_graph_with_tree_history_at(
+        &self,
+        head: &SemanticChangeId,
+    ) -> std::result::Result<(ResolvedGraphState, TreeHistory), Self::Error> {
+        let mut first_parent_history = collect_changes_first_parent(self, head)?;
+        let history = TreeHistory {
+            steps: take_tree_history(&mut first_parent_history),
+        };
+        // The graph replay runs first, as in `resolve_graph_at`, so a history
+        // that is invalid both ways reports the error it always reported.
+        let mut state = replay_graph_state(first_parent_history)?;
+        state.tree = history.replay_all().map_err(Self::Error::from)?;
+        Ok((state, history))
+    }
     /// Resolve the exact repository tree at `head`.
     fn resolve_tree_at(
         &self,
@@ -1223,6 +1245,54 @@ fn resolve_tree_states(
 /// One change's contribution to a tree replay: its identity, which names it
 /// in an error, and its tree deltas.
 type TreeHistoryStep = (SemanticChangeId, Vec<crate::change::TreeDelta>);
+
+/// The tree deltas of every change on one first-parent chain, oldest first:
+/// what replays the repository tree at any change of the chain without
+/// reading the changes again.
+///
+/// The tree at a change is its first parent's tree with the change's own
+/// deltas applied, so the tree at any change on the chain is a fold over a
+/// prefix of these steps, the same fold [`ChangeStore::resolve_tree_at`] runs
+/// over the changes it reads.
+#[derive(Debug, Clone, Default)]
+pub struct TreeHistory {
+    steps: Vec<TreeHistoryStep>,
+}
+
+impl TreeHistory {
+    /// Whether `change` is on the chain.
+    pub fn contains(&self, change: &SemanticChangeId) -> bool {
+        self.steps.iter().any(|(id, _)| id == change)
+    }
+
+    /// The repository tree at `change`, or `None` when `change` is not on
+    /// the chain.
+    pub fn tree_at(
+        &self,
+        change: &SemanticChangeId,
+    ) -> Option<std::result::Result<ResolvedTree, ModelError>> {
+        let through = self.steps.iter().position(|(id, _)| id == change)?;
+        Some(replay_tree_steps(&self.steps[..=through]))
+    }
+
+    /// The tree at the chain's last change.
+    fn replay_all(&self) -> std::result::Result<ResolvedTree, ModelError> {
+        replay_tree_steps(&self.steps)
+    }
+}
+
+/// Fold `steps` into the tree they leave, each read where it is.
+fn replay_tree_steps(steps: &[TreeHistoryStep]) -> std::result::Result<ResolvedTree, ModelError> {
+    let mut tree = ResolvedTree::default();
+    for (change_id, tree_deltas) in steps {
+        tree = tree.apply(tree_deltas).map_err(|error| {
+            ModelError::Conflict(format!(
+                "invalid repository tree transition in change {change_id}: {error}"
+            ))
+        })?;
+    }
+    Ok(tree)
+}
 
 /// Take every change's tree deltas out of `history`, leaving the changes
 /// otherwise intact for a graph replay, which never reads them.
@@ -3165,6 +3235,68 @@ mod tests {
         let error = store.resolve_tree_at(&head).unwrap_err();
 
         assert_missing_change(error, missing_parent);
+    }
+
+    /// One read of a chain serves the state at its head and the tree at
+    /// every change on it: each equals what resolving that change alone
+    /// returns, and a change off the chain is not answered.
+    #[test]
+    fn a_tree_history_replays_the_tree_at_every_change_of_its_chain() {
+        let ids = [
+            make_change_id(246),
+            make_change_id(247),
+            make_change_id(248),
+        ];
+        let off_chain = make_change_id(249);
+        let artifacts = [ArtifactId::new(), ArtifactId::new(), ArtifactId::new()];
+        let entry = |byte: u8| TreeEntry::blob(Hash256::from_bytes([byte; 32]), false);
+        let mut changes = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let parents = if index == 0 {
+                vec![]
+            } else {
+                vec![ids[index - 1]]
+            };
+            let mut change = make_semantic_change(*id, parents, vec![], vec![]);
+            change.tree_deltas = vec![TreeDelta::Added {
+                artifact_id: artifacts[index],
+                new: LocatedEntry::new(
+                    repo_path(&format!("file{index}")),
+                    entry(0xa0 + index as u8),
+                ),
+            }];
+            changes.push(change);
+        }
+        let mut side = make_semantic_change(off_chain, vec![ids[0]], vec![], vec![]);
+        side.tree_deltas = vec![TreeDelta::Added {
+            artifact_id: ArtifactId::new(),
+            new: LocatedEntry::new(repo_path("side"), entry(0xb0)),
+        }];
+        changes.push(side);
+        let store = HistoryStore::from_changes(changes);
+
+        let (state, history) = store.resolve_graph_with_tree_history_at(&ids[2]).unwrap();
+        assert_eq!(state.tree, store.resolve_graph_at(&ids[2]).unwrap().tree);
+        for (index, id) in ids.iter().enumerate() {
+            assert!(history.contains(id));
+            let tree = history.tree_at(id).expect("on the chain").unwrap();
+            assert_eq!(tree, store.resolve_tree_at(id).unwrap(), "change {index}");
+            assert_eq!(
+                artifacts
+                    .iter()
+                    .filter(|artifact| tree.get(artifact).is_some())
+                    .count(),
+                index + 1
+            );
+        }
+        assert!(!history.contains(&off_chain));
+        assert!(history.tree_at(&off_chain).is_none());
+        // A chain that cannot be read fails as the plain replay fails.
+        let missing = make_change_id(250);
+        let error = store
+            .resolve_graph_with_tree_history_at(&missing)
+            .unwrap_err();
+        assert_missing_change(error, missing);
     }
 
     #[test]

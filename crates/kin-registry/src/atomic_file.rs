@@ -177,7 +177,7 @@ impl AuthorityRoot {
                 Ok(next) => next,
                 Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                     mkdir_at(&current, name)?;
-                    current.sync_all()?;
+                    kin_blobs::durable::sync_all(&current)?;
                     open_directory_at(&current, name)?
                 }
                 Err(error) => return Err(error),
@@ -457,7 +457,7 @@ impl AuthorityRoot {
             if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            parent.sync_all()
+            kin_blobs::durable::sync_all(&parent)
         }
         #[cfg(not(unix))]
         {
@@ -492,13 +492,13 @@ impl AuthorityRoot {
                 Err(error) => return Err(error),
             }
             rename_at(&from_parent, &from_name, &to_parent, &to_name)?;
-            to_parent.sync_all()?;
+            kin_blobs::durable::sync_all(&to_parent)?;
             let from_identity = stat_file(&from_parent)?;
             let to_identity = stat_file(&to_parent)?;
             if from_identity.st_dev != to_identity.st_dev
                 || from_identity.st_ino != to_identity.st_ino
             {
-                from_parent.sync_all()?;
+                kin_blobs::durable::sync_all(&from_parent)?;
             }
             Ok(())
         }
@@ -890,6 +890,14 @@ fn create_capability_staged_file(
     ))
 }
 
+/// Flush a capability-opened file through kin-blobs. cap-std wraps a standard
+/// library `File`, borrowed here without a copy.
+#[cfg(not(unix))]
+fn sync_capability_file(file: &cap_std::fs::File) -> io::Result<()> {
+    use cap_std::io_lifetimes::AsFilelike;
+    kin_blobs::durable::sync_all(&file.as_filelike_view::<std::fs::File>())
+}
+
 #[cfg(not(unix))]
 fn write_capability_at<F>(
     parent: &CapabilityDir,
@@ -905,7 +913,7 @@ where
     let result = (|| {
         staged.write_all(bytes)?;
         staged.flush()?;
-        staged.sync_all()?;
+        sync_capability_file(&staged)?;
         pre_commit(Path::new(&staged_name))?;
         let named = validate_capability_named_regular_file(
             parent,
@@ -942,7 +950,7 @@ where
         // cap-std makes the rename capability-relative and atomic, but Windows
         // has no portable directory-fsync primitive. Flush the published file;
         // directory-entry crash durability remains bounded by the platform.
-        staged.sync_all()
+        sync_capability_file(&staged)
     })();
 
     if result.is_err()
@@ -1028,7 +1036,7 @@ where
     let result = (|| {
         staged.write_all(bytes)?;
         staged.flush()?;
-        staged.sync_all()?;
+        kin_blobs::durable::sync_all(&staged)?;
         pre_commit(&staged_path)?;
         verify_named_identity(
             &anchor.file,
@@ -1050,7 +1058,7 @@ where
             staged_identity,
             "published registry artifact",
         )?;
-        anchor.file.sync_all()?;
+        kin_blobs::durable::sync_all(&anchor.file)?;
         Ok(())
     })();
 
@@ -1067,7 +1075,7 @@ fn write_at(parent: &File, destination_name: &std::ffi::OsStr, bytes: &[u8]) -> 
     let result = (|| {
         staged.write_all(bytes)?;
         staged.flush()?;
-        staged.sync_all()?;
+        kin_blobs::durable::sync_all(&staged)?;
         verify_named_identity(
             parent,
             &staged_name,
@@ -1088,7 +1096,7 @@ fn write_at(parent: &File, destination_name: &std::ffi::OsStr, bytes: &[u8]) -> 
             staged_identity,
             "published registry artifact",
         )?;
-        parent.sync_all()
+        kin_blobs::durable::sync_all(&parent)
     })();
     if result.is_err() {
         let _ = unlink_if_same(parent, &staged_name, staged_identity);
@@ -1206,7 +1214,7 @@ fn open_or_create_directory(path: &Path) -> io::Result<DirectoryAnchor> {
             Ok(next) => next,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 mkdir_at(&current, name)?;
-                current.sync_all()?;
+                kin_blobs::durable::sync_all(&current)?;
                 open_directory_at(&current, name)?
             }
             Err(error) => return Err(error),
@@ -1533,10 +1541,10 @@ mod tests {
 
         let mut file = authority.open_append(relative).unwrap();
         file.write_all(b"-uncommitted").unwrap();
-        file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&file).unwrap();
         assert_eq!(authority.read(relative).unwrap(), b"durable-uncommitted");
         file.set_len(b"durable".len() as u64).unwrap();
-        file.sync_all().unwrap();
+        kin_blobs::durable::sync_all(&file).unwrap();
         drop(file);
 
         assert_eq!(authority.read(relative).unwrap(), b"durable");

@@ -16,7 +16,7 @@ const packageJson = require('../package.json');
 
 export const PACKAGE_VERSION = packageJson.version;
 export const DEFAULT_RELEASE_BASE_URL =
-  'https://github.com/firelock-ai/kin/releases/download';
+  'https://github.com/kinlab-ai/kin/releases/download';
 
 /**
  * The base URL the release archive and its checksum are both fetched from.
@@ -302,7 +302,7 @@ export async function runKinMcp(argv = [], options = {}) {
   };
 
   const cwd = options.cwd || process.cwd();
-  const repository = await findKinRepository(cwd, { env });
+  const repository = await findKinRepository(cwd, { env: spawnOptions.env, binaryPath });
   if (repository && !samePath(repository, cwd)) {
     // A folder inside another Kin repository, with no repository of its own,
     // is served by that one. Say so before anything is answered from it.
@@ -311,7 +311,7 @@ export async function runKinMcp(argv = [], options = {}) {
         profile: spawnOptions.env.KIN_MCP_TOOL_PROFILE
       })
     );
-  } else if (!repository) {
+  } else if (repository === null) {
     if (!isTruthyEnv(env.KIN_MCP_AUTO_INIT)) {
       // Start anyway. This wrapper used to exit 2 here, and the configuration
       // every client is handed points at this wrapper, so the advertised
@@ -327,7 +327,7 @@ export async function runKinMcp(argv = [], options = {}) {
         })
       );
     } else {
-      stderr.write('No .kin/ found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
+      stderr.write('No Kin store found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
       firstLaunch?.initializing(cwd);
       const initOutput = outputTail(INIT_OUTPUT_TAIL_BYTES);
       const initCode = await spawnKin(
@@ -551,7 +551,7 @@ export function renderFootprint(entries, platform = process.platform) {
     lines.push(`              ${entry.what}`);
   }
   lines.push(
-    '  Each repository you ran `kin init` in also keeps its graph in a .kin directory beside its code.'
+    '  Repository graphs live in the Kin home stores directory; older in-tree stores remain beside their code.'
   );
   lines.push('To remove them once the daemons have stopped:');
   for (const entry of entries) {
@@ -563,7 +563,7 @@ export function renderFootprint(entries, platform = process.platform) {
       lines.push(`  ${remove(entry.path)}`);
     }
   }
-  lines.push(`  and ${remove('.kin')} in each repository you initialized.`);
+  lines.push('  Use `kin store path` in a repository to find its graph before removing any store.');
   lines.push('');
   return lines.join('\n');
 }
@@ -931,13 +931,15 @@ function sha256(bytes) {
 
 // Every tool profile `kin mcp start` accepts, the one it serves when none is
 // named or the name is not a profile, and the ones that serve `kin_init`, by
-// name or as the routed `init` command. Setting a folder up is a write, so only
-// the profiles that write carry it, and a notice offers it only there. A test
-// in kin-cli's `commands/mcp.rs` holds all three to the Rust registry.
+// name or as the routed `init` command. None does: setting a folder up is a
+// command a person runs, not semantic agent work, so no agent surface carries
+// it and every notice names the command instead. A test in kin-cli's
+// `commands/mcp.rs` holds all three to the Rust registry.
 const TOOL_PROFILES = new Set([
   'agent-default',
   'agent-query',
   'agent-search',
+  'agent-ask',
   'agent-routed',
   'agent-routed-query',
   'full',
@@ -945,7 +947,7 @@ const TOOL_PROFILES = new Set([
   'context-bench'
 ]);
 const DEFAULT_TOOL_PROFILE = 'agent-default';
-const PROFILES_SERVING_INIT = new Set(['agent-default', 'agent-routed', 'full']);
+const PROFILES_SERVING_INIT = new Set([]);
 
 /**
  * The profile `kin mcp start` serves for a KIN_MCP_TOOL_PROFILE value, resolved
@@ -959,7 +961,7 @@ export function servedToolProfile(profile) {
 
 /**
  * Whether `profile` serves `kin_init`, once resolved as `kin mcp start`
- * resolves it (`servedToolProfile`). The default serves it.
+ * resolves it (`servedToolProfile`). No profile serves it.
  */
 export function profileServesInit(profile) {
   return PROFILES_SERVING_INIT.has(servedToolProfile(profile));
@@ -974,7 +976,7 @@ export function profileServesInit(profile) {
  */
 export function noRepositoryNotice(cwd, version = PACKAGE_VERSION, { profile } = {}) {
   const setUp = profileServesInit(profile)
-    ? 'To set this folder up, ask your agent to call kin_init, or run'
+    ? 'To set this folder up, ask your agent to call the init tool, or run'
     : 'To set this folder up, run';
   return [
     `kin-mcp: ${cwd} is not a Kin repository, and neither is any folder above it, so no`,
@@ -1041,7 +1043,7 @@ export function enclosingRepositoryNotice(
   { profile, version = PACKAGE_VERSION } = {}
 ) {
   const setUp = profileServesInit(profile)
-    ? 'repository and ask your agent to call kin_init, or run'
+    ? 'repository and ask your agent to call the init tool, or run'
     : 'repository and run';
   return [
     `kin-mcp: ${cwd} is not a Kin repository of its own, so Kin serves the Kin repository at`,
@@ -1052,12 +1054,6 @@ export function enclosingRepositoryNotice(
   ].join('\n');
 }
 
-// The entries Kin's own install root carries, two of which settle that a
-// `.kin` is the toolchain rather than a repository store. The same list and
-// quorum as `kin_core::layout::is_managed_kin_home`.
-const MANAGED_HOME_MARKERS = ['registry.toml', 'bin', 'lib', 'shell'];
-const MANAGED_HOME_MARKER_QUORUM = 2;
-
 async function pathExists(target) {
   try {
     await fsp.stat(target);
@@ -1065,30 +1061,6 @@ async function pathExists(target) {
   } catch {
     return false;
   }
-}
-
-async function isDirectory(target) {
-  try {
-    return (await fsp.stat(target)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-async function isManagedKinHome(candidate, { env = process.env, homeDir = os.homedir() } = {}) {
-  let markers = 0;
-  for (const name of MANAGED_HOME_MARKERS) {
-    if (await pathExists(path.join(candidate, name))) markers += 1;
-  }
-  if (markers >= MANAGED_HOME_MARKER_QUORUM) return true;
-  const homes = [path.join(homeDir, '.kin')];
-  if (env.KIN_HOME) homes.push(path.resolve(env.KIN_HOME));
-  for (const home of homes) {
-    if (samePath(candidate, home)) {
-      return !(await pathExists(path.join(candidate, 'manifest.json')));
-    }
-  }
-  return false;
 }
 
 function realPath(target) {
@@ -1104,29 +1076,27 @@ function samePath(left, right) {
 }
 
 /**
- * The Kin repository `kin mcp start` would serve from `start`, or null.
- *
- * The walk `kin_core::KinLayout::discover` makes: up from `start` to the first
- * `.kin` that is not Kin's own install root, and never across a folder that is
- * a Git repository with no `.kin` of its own, unless KIN_ALLOW_PARENT_STORE is
- * set. Kept in step with it so this notice names the repository the server
- * will actually answer from.
+ * Ask the resolved product binary which repository it would serve. Store
+ * placement and repository boundaries belong to Kin, including central stores.
+ * `null` means the product reported no repository; `undefined` means discovery
+ * was unreadable, so the wrapper must not initialize over a possibly valid store.
  */
-export async function findKinRepository(start, { env = process.env, homeDir = os.homedir() } = {}) {
-  let current = realPath(start);
-  let crossedBoundary = false;
-  for (;;) {
-    const candidate = path.join(current, '.kin');
-    if ((await isDirectory(candidate)) && !(await isManagedKinHome(candidate, { env, homeDir }))) {
-      if (crossedBoundary && !env.KIN_ALLOW_PARENT_STORE) return null;
-      return current;
-    }
-    if (!crossedBoundary && (await pathExists(path.join(current, '.git')))) {
-      crossedBoundary = true;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) return null;
-    current = parent;
+export async function findKinRepository(start, {
+  env = process.env, binaryPath, run = execFile
+} = {}) {
+  if (!binaryPath) return undefined;
+  try {
+    const { stdout } = await run(binaryPath, ['store', 'path', '--json', start], {
+      cwd: start, env, timeout: 3_000, maxBuffer: 64 * 1024, encoding: 'utf8'
+    });
+    const answer = JSON.parse(stdout);
+    if (answer?.schema !== 'kin.store-path.v1' ||
+        typeof answer.working_dir !== 'string' || !path.isAbsolute(answer.working_dir) ||
+        typeof answer.store !== 'string' || !path.isAbsolute(answer.store) ||
+        typeof answer.external !== 'boolean') return undefined;
+    return realPath(answer.working_dir);
+  } catch (error) {
+    return error.code === 1 && /not a Kin repository/i.test(error.message) ? null : undefined;
   }
 }
 

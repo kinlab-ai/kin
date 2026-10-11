@@ -1261,3 +1261,269 @@ fn an_admitted_unindexed_competing_module_blocks_a_new_exact_caller() {
         .is_some());
     assert!(!repo.root.path().join("pkg.py").exists());
 }
+
+fn namespace_intermediate_edit(cold: bool) {
+    let mut repo = Repo::new();
+    repo.edit("pkg/old_impl.py", "def execute():\n    return 'old'\n");
+    repo.edit("pkg/new_impl.py", "def execute():\n    return 'new'\n");
+    repo.edit(
+        "pkg/bridge.py",
+        "VERSION = 1\nfrom .old_impl import execute as forward\n",
+    );
+    repo.edit(
+        "pkg/__init__.py",
+        "VERSION = 1\nfrom .bridge import forward as public\n",
+    );
+    repo.edit(
+        "app.py",
+        "import pkg\ndef run():\n    return pkg.public()\n",
+    );
+    let caller = repo.function("app.py", "run");
+    let old = repo.function("pkg/old_impl.py", "execute");
+    let new = repo.function("pkg/new_impl.py", "execute");
+    let assert_target = |repo: &Repo, expected: EntityId| {
+        let calls = repo.calls(caller.id);
+        assert_eq!(
+            calls.len(),
+            1,
+            "namespace authority must publish exactly one current call: {calls:?}"
+        );
+        assert_eq!(calls[0].dst.as_entity(), Some(expected));
+        assert!(!kin_index::occurrence::static_proof_sites(&calls[0]).is_empty());
+    };
+    assert_target(&repo, old.id);
+    let caller_tree = repo
+        .graph
+        .get_tree_entry(&FilePathId::new("app.py"))
+        .unwrap();
+    assert!(
+        !repo.root.path().join("app.py").exists(),
+        "live evidence must read admitted CAS, not working files"
+    );
+    if cold {
+        repo.reopen();
+        assert_target(&repo, old.id);
+    }
+    repo.edit(
+        "pkg/bridge.py",
+        "VERSION = 1\nfrom .new_impl import execute as forward\n",
+    );
+    assert_eq!(
+        repo.function("app.py", "run").fingerprint,
+        caller.fingerprint
+    );
+    assert_eq!(
+        repo.graph
+            .get_tree_entry(&FilePathId::new("app.py"))
+            .unwrap(),
+        caller_tree
+    );
+    assert_target(&repo, new.id);
+    // A guarded competing write withdraws the exact derivation, including
+    // after reopen, while recovery reuses the unchanged consumer source.
+    repo.edit(
+        "pkg/bridge.py",
+        "from .new_impl import execute as forward\nif enabled:\n    forward = replacement\n",
+    );
+    assert!(
+        repo.calls(caller.id).is_empty(),
+        "a rebound export must withdraw namespace proof"
+    );
+    if cold {
+        repo.reopen();
+        assert!(repo.calls(caller.id).is_empty());
+    }
+    repo.edit(
+        "pkg/bridge.py",
+        "VERSION = 1\nfrom .old_impl import execute as forward\n",
+    );
+    assert_target(&repo, old.id);
+}
+
+#[test]
+fn a_namespace_reexport_edit_retargets_and_withdraws_the_unchanged_live_caller() {
+    namespace_intermediate_edit(false);
+}
+
+#[test]
+fn namespace_reexport_authority_survives_cold_reopen_and_revalidates() {
+    namespace_intermediate_edit(true);
+}
+
+#[test]
+fn namespace_caller_mutation_or_refused_budget_withdraws_persisted_proof() {
+    const SOURCE: &str = "import pkg\ndef run():\n    return pkg.public()\n";
+    for changed in [
+        "import pkg\npkg.public = replacement\ndef run():\n    return pkg.public()\n".to_string(),
+        "import pkg\nfor pkg.public in replacements:\n    pass\ndef run():\n    return pkg.public()\n".to_string(),
+        "import pkg\nwith manager as pkg.public:\n    pass\ndef run():\n    return pkg.public()\n".to_string(),
+        format!(
+            "import pkg\n#{}\ndef run():\n    return pkg.public()\n",
+            "x".repeat(256 * 1024)
+        ),
+    ] {
+        let mut repo = Repo::new();
+        repo.edit("pkg/impl.py", "def execute():\n    return 1\n");
+        repo.edit(
+            "pkg/__init__.py",
+            "VERSION = 1\nfrom .impl import execute as public\n",
+        );
+        repo.edit("app.py", SOURCE);
+        let caller = repo.function("app.py", "run");
+        let target = repo.function("pkg/impl.py", "execute");
+        let original = single_call(&repo, caller.id, target.id);
+        let original_digest = caller.metadata.extra["blob_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        repo.reopen();
+        repo.edit("app.py", &changed);
+        let current = repo.function("app.py", "run");
+        assert_eq!(current.id, caller.id);
+        assert_eq!(current.fingerprint, caller.fingerprint);
+        assert!(
+            repo.calls(current.id).is_empty(),
+            "refused caller authority must withdraw its earlier proof"
+        );
+        let debt = repo.debt("app.py").expect("refusal retains a semantic gap");
+        assert_eq!(debt.obligations.len(), 1);
+        assert_eq!(debt.obligations[0].retired_relation, original);
+        assert_eq!(
+            debt.obligations[0].source_digest.to_string(),
+            original_digest
+        );
+        repo.reopen();
+        assert!(repo.calls(current.id).is_empty());
+        assert_eq!(repo.debt("app.py"), Some(debt));
+        repo.edit("app.py", SOURCE);
+        single_call(&repo, caller.id, target.id);
+        assert!(repo.debt("app.py").is_none());
+    }
+}
+
+#[test]
+fn a_namespace_caller_edit_preserves_foreign_and_legacy_evidence() {
+    let mut repo = Repo::new();
+    repo.edit("pkg/impl.py", "def execute():\n    return 1\n");
+    repo.edit("pkg/__init__.py", "from .impl import execute as public\n");
+    repo.edit(
+        "app.py",
+        "import pkg\ndef run():\n    return pkg.public()\n",
+    );
+    let caller = repo.function("app.py", "run");
+    let target = repo.function("pkg/impl.py", "execute");
+    let original = single_call(&repo, caller.id, target.id);
+    let foreign: Vec<_> = [
+        RelationOrigin::Manual,
+        RelationOrigin::Lsp,
+        RelationOrigin::Inferred,
+    ]
+    .into_iter()
+    .map(|origin| {
+        let mut relation = original.clone();
+        relation.id = RelationId::new();
+        relation.origin = origin;
+        relation
+    })
+    .collect();
+    repo.graph
+        .apply_transaction_delta(&TransactionDelta {
+            relation_deltas: foreign
+                .iter()
+                .cloned()
+                .map(|new| RelationDelta::Added { new })
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    // Foreign evidence may re-anchor through the declaration, but this
+    // factory must not retire it when its own binding becomes unproven.
+    repo.edit(
+        "app.py",
+        "import pkg;pkg.public=x\ndef run():\n    return pkg.public()\n",
+    );
+    for relation in &foreign {
+        let kept = repo.graph.get_relation_by_id(&relation.id).unwrap();
+        assert_eq!(kept.origin, relation.origin);
+        assert_eq!(kept.dst, relation.dst);
+    }
+    assert!(repo.graph.get_relation_by_id(&original.id).is_none());
+    repo.reopen();
+    for relation in &foreign {
+        assert!(repo.graph.get_relation_by_id(&relation.id).is_some());
+    }
+    assert_eq!(
+        repo.debt("app.py").unwrap().obligations[0].retired_relation,
+        original
+    );
+}
+
+#[test]
+fn a_changed_namespace_import_retargets_without_inventing_binding_debt() {
+    let mut repo = Repo::new();
+    repo.edit("old.py", "def execute():\n    return 'old'\n");
+    repo.edit("new.py", "def execute():\n    return 'new'\n");
+    repo.edit(
+        "app.py",
+        "import old as pkg\ndef run():\n    return pkg.execute()\n",
+    );
+    let caller = repo.function("app.py", "run");
+    let old = repo.function("old.py", "execute");
+    let new = repo.function("new.py", "execute");
+    single_call(&repo, caller.id, old.id);
+    repo.reopen();
+    repo.edit(
+        "app.py",
+        "import new as pkg\ndef run():\n    return pkg.execute()\n",
+    );
+    single_call(&repo, caller.id, new.id);
+    assert!(repo.debt("app.py").is_none(), "{:?}", repo.debt("app.py"));
+    repo.reopen();
+    single_call(&repo, caller.id, new.id);
+    assert!(repo.debt("app.py").is_none());
+}
+
+#[test]
+fn a_caller_mutation_keeps_proven_sites_and_records_the_full_prior_binding() {
+    const SOURCE: &str = "import pkg\ndef run():\n    pkg.public()\n    return pkg.other()\n";
+    let mut repo = Repo::new();
+    repo.edit("pkg/impl.py", "def execute():\n    return 1\n");
+    repo.edit(
+        "pkg/__init__.py",
+        "from .impl import execute as public, execute as other\n",
+    );
+    repo.edit("app.py", SOURCE);
+    let caller = repo.function("app.py", "run");
+    let target = repo.function("pkg/impl.py", "execute");
+    let original = single_call(&repo, caller.id, target.id);
+    assert_eq!(
+        kin_index::occurrence::static_proof_sites(&original).len(),
+        2
+    );
+    repo.edit("app.py", "import pkg\npkg.public = replacement\ndef run():\n    pkg.public()\n    return pkg.other()\n");
+    let kept = single_call(&repo, caller.id, target.id);
+    assert_eq!(kin_index::occurrence::static_proof_sites(&kept).len(), 1);
+    assert_eq!(
+        repo.debt("app.py").unwrap().obligations[0].retired_relation,
+        original
+    );
+    repo.reopen();
+    assert_eq!(
+        kin_index::occurrence::static_proof_sites(&single_call(&repo, caller.id, target.id)).len(),
+        1
+    );
+    repo.edit("app.py", "import pkg\npkg.public = replacement\npkg.other = replacement\ndef run():\n    pkg.public()\n    return pkg.other()\n");
+    assert!(repo.calls(caller.id).is_empty());
+    assert_eq!(
+        repo.debt("app.py").unwrap().obligations[0].retired_relation,
+        original
+    );
+    repo.reopen();
+    assert!(repo.calls(caller.id).is_empty());
+    repo.edit("app.py", SOURCE);
+    assert_eq!(
+        kin_index::occurrence::static_proof_sites(&single_call(&repo, caller.id, target.id)).len(),
+        2
+    );
+    assert!(repo.debt("app.py").is_none());
+}

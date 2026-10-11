@@ -90,6 +90,24 @@ fn added_declarations(delta: &TransactionDelta) -> Vec<&Entity> {
         .collect()
 }
 
+/// Commit every relation a reconcile added, changed or removed, so the graph
+/// holds what the reconciled source derives: a unit's module contains its
+/// declarations, and a commit that left those edges out reads as a change
+/// on the next reconcile.
+fn commit_relations(graph: &InMemoryGraph, delta: &TransactionDelta) {
+    for relation_delta in &delta.relation_deltas {
+        match relation_delta {
+            kin_model::RelationDelta::Added { new }
+            | kin_model::RelationDelta::Modified { new, .. } => {
+                graph.upsert_relation(new).expect("upsert relation")
+            }
+            kin_model::RelationDelta::Removed { old } => {
+                graph.remove_relation(&old.id).expect("remove relation")
+            }
+        }
+    }
+}
+
 fn modified_entities(delta: &TransactionDelta) -> Vec<(&Entity, &Entity)> {
     delta
         .entity_deltas
@@ -583,6 +601,7 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     for entity in added_entities(&reconcile1.delta) {
         graph.upsert_entity(entity).expect("upsert must succeed");
     }
+    commit_relations(&graph, &reconcile1.delta);
 
     // --- Step 3: Externally edit the file — change alpha's body ---
     let edited_content = b"pub fn alpha(x: i32) -> i32 { x * 2 }\npub fn beta() -> i32 { 2 }\n";
@@ -651,6 +670,7 @@ fn comprehensive_round_trip_with_projection_and_verify() {
     for (_, new) in &modified2 {
         graph.upsert_entity(new).expect("upsert modified entity");
     }
+    commit_relations(&graph, &reconcile2.delta);
 
     // --- Step 6: Re-reconcile — should be idempotent (no further changes) ---
     // Read the file again after edit — it should still match edited_content.

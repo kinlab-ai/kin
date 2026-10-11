@@ -73,6 +73,9 @@ TICKET = "FIR-2467"
 # every repository on the operator's machine.
 PIN_WARNING = "sibling repository authority could not be pinned at daemon startup"
 PIN_SUMMARY = "sibling repository authority pinning was incomplete"
+OTHER_LOCATION_SUMMARY = (
+    "registry rows naming another location of a selected repository were not pinned"
+)
 PIN_DETAIL_LIMIT = 8
 BULK_PIN_FAILURES = PIN_DETAIL_LIMIT + 5
 
@@ -244,26 +247,34 @@ def listed_ids(output):
     return ids
 
 
-def pin_summary(output):
-    """One aggregate pin diagnostic with integer fields, or None.
-
-    A missing aggregate and two aggregates are both unreadable. One startup has
-    one complete count surface; accepting the first of several would let a
-    restart or one warning per row hide in the same log and still pass.
-    """
-    lines = [line for line in strip_ansi(output or "").splitlines()
-             if PIN_SUMMARY in line]
+def aggregate_counts(output, message, names):
+    """One diagnostic with every requested integer field exactly once, or None."""
+    lines = [line for line in strip_ansi(output or "").splitlines() if message in line]
     if len(lines) != 1:
         return None
     fields = {}
-    for name in ("registry_rows", "self_rows_skipped", "pinned", "refused",
-                 "duplicate_identities", "detailed", "suppressed"):
-        match = re.search(r"\b%s=(\d+)\b" % re.escape(name), lines[0])
-        if match is None:
+    for name in names:
+        matches = re.findall(r"\b%s=(\d+)\b" % re.escape(name), lines[0])
+        if len(matches) != 1:
             return None
-        fields[name] = int(match.group(1))
+        fields[name] = int(matches[0])
     return fields
 
+
+def pin_summary(output):
+    """The six refusal counts emitted once per incomplete startup, or None.
+
+    Selected repositories registered at another location are represented, so
+    they are reported separately and are never counted as refused authority.
+    """
+    return aggregate_counts(output, PIN_SUMMARY,
+                            ("registry_rows", "self_rows_skipped", "pinned", "refused",
+                             "detailed", "suppressed"))
+
+
+def other_location_summary(output):
+    """The separate informational count of represented duplicate locations."""
+    return aggregate_counts(output, OTHER_LOCATION_SUMMARY, ("other_locations", "pinned"))
 
 class Result(object):
     def __init__(self, check_id, ticket, title):
@@ -325,12 +336,19 @@ class Suite(object):
         os.makedirs(self.scratch_home, exist_ok=True)
 
         base = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        base["KIN_STORE_LAYOUT"] = "in-tree"
         # A scratch KIN_HOME keeps this run off the fleet's stores and the
         # auto-embed opt-out keeps it off the GPU. Neither is a nicety: this
         # suite is meant to run on every pull request beside other work.
         base["KIN_DAEMON_AUTO_EMBED"] = "0"
         base["KIN_EMBED_BACKEND"] = "cpu"
         base["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        base["KIN_INIT_HISTORY"] = "full"
+        # This probe grades both the warning and informational count surfaces.
+        base["RUST_LOG"] = "info"
         base["HOME"] = self.real_home
         base.pop("KIN_MCP_REPO", None)
         base.pop("KIN_DIR", None)
@@ -359,6 +377,7 @@ class Suite(object):
         self.scratch_registry = os.path.join(self.scratch_home, "registry.toml")
         self.repos = {}
         self.bulk_pin_failures = 0
+        self.other_location_rows = 0
 
     # -- fixture construction
 
@@ -440,6 +459,24 @@ class Suite(object):
                 )
         self.bulk_pin_failures = count
 
+    def append_other_location_row(self):
+        """Copy this stopped daemon's durable store, preserving its identity.
+
+        A different location of the primary repository must not replace its
+        authority in the spine or be classified as a refused sibling. This is
+        a reader fixture, appended after the product registration checks.
+        """
+        copy_root = os.path.join(self.workdir, "probe-copy")
+        os.makedirs(copy_root)
+        shutil.copytree(os.path.join(self.probe, ".kin"), os.path.join(copy_root, ".kin"),
+                        ignore=shutil.ignore_patterns("daemon.*"))
+        with open(self.scratch_registry, "a") as handle:
+            handle.write(
+                "\n[[repos]]\nid = \"probe-copy\"\npath = %s\nentities = 0\n"
+                "last_commit = \"\"\ndependencies = []\n" % json.dumps(copy_root)
+            )
+        self.other_location_rows = 1
+
     def setup(self):
         """Build both homes and leave registries in product-written state."""
         self.probe = self.fixture("probe", self.env)
@@ -477,6 +514,8 @@ class Suite(object):
         # warning cardinality check 2 grades.
         if self.bulk_pin_failures == 0:
             self.append_bulk_unbindable_rows(BULK_PIN_FAILURES)
+        if self.other_location_rows == 0:
+            self.append_other_location_row()
         try:
             with open(self.daemon_log(), "w"):
                 pass
@@ -666,11 +705,11 @@ def check_2(suite):
 
     summary = pin_summary(log)
     expected_summary = {
-        "registry_rows": len(suite.own_repos()) + suite.bulk_pin_failures,
+        "registry_rows": (len(suite.own_repos()) + suite.bulk_pin_failures
+                          + suite.other_location_rows),
         "self_rows_skipped": 1,
         "pinned": 1,
         "refused": expected_refused,
-        "duplicate_identities": 0,
         "detailed": expected_detailed,
         "suppressed": expected_refused - expected_detailed,
     }
@@ -682,6 +721,15 @@ def check_2(suite):
     else:
         res.bad("aggregate pin warning was %s, wanted %s"
                 % (summary, expected_summary))
+
+    locations = other_location_summary(log)
+    expected_locations = {"other_locations": suite.other_location_rows, "pinned": 1}
+    if locations == expected_locations:
+        res.ok("the copied primary store was reported as another selected location, "
+               "not pinned as a sibling or counted as a refusal: %s" % locations)
+    else:
+        res.bad("selected-location diagnostic was %s, wanted %s"
+                % (locations, expected_locations))
     return res
 
 
@@ -801,18 +849,37 @@ def self_test():
     summary_line = (
         "WARN sibling repository authority pinning was incomplete "
         "registry_rows=16 self_rows_skipped=1 pinned=1 refused=14 "
-        "duplicate_identities=0 detailed=8 suppressed=6"
+        "detailed=8 suppressed=6"
     )
     case("aggregate pin summary reads exact integer fields",
          pin_summary(summary_line),
          {"registry_rows": 16, "self_rows_skipped": 1, "pinned": 1,
-          "refused": 14, "duplicate_identities": 0, "detailed": 8,
+          "refused": 14, "detailed": 8,
           "suppressed": 6})
     case("a missing pin summary is unreadable", pin_summary("ordinary log"), None)
     case("two pin summaries are unreadable",
          pin_summary(summary_line + "\n" + summary_line), None)
     case("a pin summary missing a field is unreadable",
          pin_summary(summary_line.replace(" suppressed=6", "")), None)
+    case("a pin summary repeating a field is unreadable",
+         pin_summary(summary_line + " refused=0"), None)
+    case("a negative refusal count is unreadable",
+         pin_summary(summary_line.replace("refused=14", "refused=-1")), None)
+
+    location_line = (
+        "INFO registry rows naming another location of a selected repository were not pinned "
+        "other_locations=1 pinned=1"
+    )
+    case("selected locations have their own informational counts",
+         other_location_summary(location_line), {"other_locations": 1, "pinned": 1})
+    case("selected locations do not change the refusal aggregate",
+         pin_summary(location_line + "\n" + summary_line), pin_summary(summary_line))
+    case("refusal counts cannot stand in for selected-location evidence",
+         other_location_summary(summary_line), None)
+    case("a missing selected-location count is unreadable",
+         other_location_summary(location_line.replace("other_locations=1", "")), None)
+    case("two selected-location aggregates are unreadable",
+         other_location_summary(location_line + "\n" + location_line), None)
 
     scratch = {"probe": "/w/probe", "roommate": "/w/roommate"}
     case("id for a known path", id_for_path(scratch, "/w/roommate"), "roommate")
@@ -956,6 +1023,35 @@ def self_test():
              (unfixed_status, "registered only in the operator's home" in unfixed_detail,
               "outsider" in unfixed_detail),
              (FAIL, True, True))
+
+        # Falsify the full startup grader, including represented locations.
+        startup_log = (
+            (PIN_WARNING + " repo_id=stranger\n") * PIN_DETAIL_LIMIT
+            + summary_line.replace("registry_rows=16", "registry_rows=17")
+            + "\n" + location_line
+        )
+
+        def startup_status(log):
+            f = fake(fixed_scratch, fixed_real)
+            f.bulk_pin_failures = BULK_PIN_FAILURES
+            f.other_location_rows = 1
+            f.restart_probe_daemon = lambda: (0, "started")
+            f.read_daemon_log = lambda: log
+            return check_2(f).status
+
+        case("sealed startup with a copied primary and genuine refusals passes",
+             startup_status(startup_log), PASS)
+        case("a copied primary counted as a refusal fails",
+             startup_status(startup_log.replace("refused=14", "refused=15")), FAIL)
+        case("a copied primary pinned as a sibling fails",
+             startup_status(startup_log.replace("pinned=1", "pinned=2")), FAIL)
+        case("missing selected-location evidence fails",
+             startup_status(startup_log.replace(location_line, "")), FAIL)
+        case("a foreign-home identity in the startup log fails",
+             startup_status(startup_log + "\nrepo_id=outsider"), FAIL)
+        case("a suppressed unbindable-sibling control is unreadable",
+             startup_status(startup_log.replace("repo_id=stranger", "repo_id=bulk-01")),
+             UNREADABLE)
 
         # The fixed shape: two registries, the outsider only in the real one.
         res = Result("h", TICKET, "homes")

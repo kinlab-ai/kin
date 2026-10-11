@@ -38,6 +38,11 @@ pub enum IndexError {
 
     #[error(transparent)]
     IncompleteRepositoryScan(#[from] crate::repository::IncompleteRepositoryScan),
+
+    /// A manifest a unit's name depends on is held by the tree and cannot be
+    /// read, so the unit is not parsed rather than named without it.
+    #[error(transparent)]
+    UnreadableManifest(#[from] kin_parser::project_manifest::UnreadableManifest),
 }
 
 impl IndexError {

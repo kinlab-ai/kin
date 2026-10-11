@@ -50,13 +50,13 @@ use serde_json::Value;
 
 /// The tool one round trip calls.
 ///
-/// `kin_graph_status` is the cheapest real tool in the agent-default profile:
+/// `status` is the cheapest real tool in the agent-default profile:
 /// it answers from the repo daemon the same way every other graph-backed tool
 /// does, over the same `/mcp/tools/call` route, and its successful payload is
 /// contract-validated before it crosses the stdio boundary. Calling it proves
 /// the transport and the tool surface at once, and its answer is a number a
 /// person can read.
-pub(crate) const ROUND_TRIP_TOOL: &str = "kin_graph_status";
+pub(crate) const ROUND_TRIP_TOOL: &str = kin_mcp::verbs::STATUS;
 
 /// The one call a round trip makes, chosen by the profile the entry serves.
 ///
@@ -348,6 +348,9 @@ fn probe_frames() -> String {
 /// its workspace roots by the server, and answering that is a conversation this
 /// check has no reason to hold: the launch directory is the repository under
 /// test, which is what a bare launch binds from anyway.
+///
+/// It does ask for machine replies: an agent profile answers an agent in plain
+/// words, and this check reads the `_kin` flags a machine reply carries.
 fn probe_frames_for(round_trip: RoundTrip) -> String {
     let client = serde_json::json!({
         "name": "kin-setup-round-trip",
@@ -360,7 +363,9 @@ fn probe_frames_for(round_trip: RoundTrip) -> String {
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {},
+                "capabilities": {"experimental": {"kin": {
+                    "machineReplies": true,
+                }}},
                 "clientInfo": client,
             },
         }),
@@ -439,10 +444,25 @@ fn run_session(
         None => Ok(()),
     };
     if let Err(error) = written {
-        kill_and_reap(&mut child);
+        // A launch that exits before it reads its stdin, such as a recorded
+        // launcher that is not a Kin binary, closes the pipe under the write.
+        // Whether that exit or the write comes first is the host's timing, so
+        // this failure names the command and quotes what the launch said, as
+        // a failure found after the write does, rather than only the pipe.
+        let collect_by = Instant::now() + PIPE_COLLECT_GRACE;
+        let ended = match wait_bounded(&mut child, collect_by) {
+            Some(status) => format!("exited ({status})"),
+            None => "was killed".to_string(),
+        };
+        let stderr = collect_by_deadline(stderr, collect_by);
         return Err((
             ProofStage::Handshake,
-            format!("the probe session could not be written to the server's stdin: {error}"),
+            format!(
+                "the probe session could not be written to the server's stdin: {error}; {} \
+                 {ended} before reading it{}",
+                launch.display_command(),
+                evidence_suffix("stderr", &String::from_utf8_lossy(&stderr)),
+            ),
         ));
     }
 
@@ -806,7 +826,7 @@ pub(crate) fn prove_launch(launch: &McpLaunch, working_dir: &Path, budget: Durat
 /// as one would teach a stranger to distrust a check that was right.
 fn round_trip_repo() -> Option<PathBuf> {
     let root = super::managed_config_scope::discover_repo_root()?;
-    root.join(".kin").is_dir().then_some(root)
+    kin_core::layout::store_exists_for(&root).then_some(root)
 }
 
 /// Prove every client this run registered, in order, under one shared budget.
@@ -1178,9 +1198,20 @@ mod tests {
     fn a_launch_that_outlives_its_deadline_is_killed_rather_than_waited_on() {
         let root = tempfile::tempdir().expect("temp root");
         let marker = root.path().join("the-child-outlived-its-kill");
+        let pid_file = root.path().join("the-child-pid");
+        // The child records its pid first. Its sleep outlasts the deadline and,
+        // because the orphaned sleep keeps the output pipes open after the
+        // kill, outlasts two pipe graces too, so a wait that paid the grace
+        // once per pipe would break the bound below.
+        let child_sleep = Duration::from_secs(5);
         let launch = launch_from_entry(&serde_json::json!({
             "command": "/bin/sh",
-            "args": ["-c", format!("sleep 5; : > {}", marker.display())],
+            "args": ["-c", format!(
+                "echo $$ > {}; sleep {}; : > {}",
+                pid_file.display(),
+                child_sleep.as_secs(),
+                marker.display()
+            )],
         }))
         .expect("the launch parses");
 
@@ -1201,11 +1232,54 @@ mod tests {
             "the deadline must bound the wait; waited {elapsed:?}"
         );
 
-        std::thread::sleep(Duration::from_secs(6));
+        // A child that has stopped can never write the marker, so waiting for
+        // its recorded pid to stop proves the kill directly instead of sleeping
+        // past the child's sleep and inferring it. A child killed before it
+        // recorded a pid leaves nothing to wait on, so then the wait runs past
+        // its sleep, by which time a survivor would have written the marker.
+        let unrecorded_settle_at = started + child_sleep + Duration::from_secs(3);
+        let give_up_at = unrecorded_settle_at + Duration::from_secs(5);
+        loop {
+            let recorded = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            let settled = match recorded {
+                Some(pid) => !process_is_running(pid),
+                None => Instant::now() >= unrecorded_settle_at,
+            };
+            if settled {
+                break;
+            }
+            assert!(
+                Instant::now() < give_up_at,
+                "the child (pid {recorded:?}) is still running after its deadline, so it was \
+                 never killed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             !marker.exists(),
             "the child ran to completion after its deadline, so it was never killed"
         );
+    }
+
+    /// Whether `pid` still names a running process. One that has exited but
+    /// has not been reaped runs nothing, so it counts as stopped.
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        system.process(pid).is_some_and(|process| {
+            !matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Dead | sysinfo::ProcessStatus::Zombie
+            )
+        })
     }
 
     /// The envelope trap. The payload is a JSON string inside the first content
@@ -1390,7 +1464,7 @@ mod tests {
     fn a_tool_list_without_the_round_trip_tool_fails_instead_of_calling_it() {
         let proof = classify(&session(vec![
             initialize_response(),
-            tools_response(&["semantic_locate"]),
+            tools_response(&["locate"]),
             call_response(&graph_status_payload(1, 1), false),
         ]));
         assert!(
@@ -1399,7 +1473,7 @@ mod tests {
                 McpProof::Failed {
                     stage: ProofStage::ToolList,
                     error,
-                } if error.contains(ROUND_TRIP_TOOL) && error.contains("semantic_locate")
+                } if error.contains("does not carry status") && error.contains("locate")
             ),
             "a tool list missing the tool an agent needs is a failure: {proof:?}"
         );
@@ -1410,7 +1484,7 @@ mod tests {
         assert_eq!(
             classify(&session(vec![
                 initialize_response(),
-                tools_response(&[ROUND_TRIP_TOOL, "semantic_locate"]),
+                tools_response(&[ROUND_TRIP_TOOL, "locate"]),
                 call_response(&graph_status_payload(5289, 18211), false),
             ])),
             McpProof::Proven {
@@ -1446,7 +1520,7 @@ mod tests {
         assert_eq!(frames.len(), 4, "the session is four frames: {frames:?}");
         assert_eq!(
             frames[0].pointer("/params/capabilities"),
-            Some(&serde_json::json!({})),
+            Some(&serde_json::json!({"experimental": {"kin": {"machineReplies": true}}})),
             "advertising roots would start a conversation this check cannot answer"
         );
         assert_eq!(

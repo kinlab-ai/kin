@@ -166,10 +166,60 @@ impl BeltProfile {
     }
 }
 
-/// Optional metadata and traversal tools on the wider belt.
+/// Optional metadata and traversal tools on the wider belt, by the verb a
+/// server serves them under or the name it served them under before.
 /// Whole-artifact source reading is retired, not an opt-in capability.
 pub fn is_opt_in(name: &str) -> bool {
-    matches!(name, "graph_neighborhood" | "kin_provenance_query")
+    matches!(
+        name,
+        "graph_neighborhood" | "kin_provenance_query" | "neighbors" | "history"
+    )
+}
+
+/// The verb a server serves the session under: `start`, `heartbeat`, `end`
+/// and `exec`, by `action`.
+pub const SESSION_VERB: &str = "session";
+
+/// The server's write tool, by the verb it serves it under or the name it
+/// served it under before.
+pub fn is_mutate(name: &str) -> bool {
+    matches!(name, "mutate" | "kin_mutate")
+}
+
+/// The fields of the session verb a model sends for a toolchain run. The
+/// harness owns the session, so the model never names one, and `exec` is the
+/// only action it takes.
+const EXEC_FIELDS: [&str; 5] = ["argv", "env", "timeout_secs", "max_output_bytes", "summary"];
+
+/// The model's form of a server's `session` verb: its `exec` action alone.
+///
+/// Starting, keeping alive and ending the session is the harness's job, as it
+/// always was, so the model is shown the one action that is its own, a build,
+/// test or run of the project, with the fields that action takes. The harness
+/// fills in `action` and its own session when the call goes out
+/// (`run::with_harness_session`).
+pub fn session_exec_form(declared: &Value) -> (String, Value) {
+    let properties: Map<String, Value> = declared
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter(|(name, _)| EXEC_FIELDS.contains(&name.as_str()))
+                .map(|(name, property)| (name.clone(), property.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        "Build, test or run this project with its toolchain, in the session this run opened. \
+         argv is the command as separate words, run with no shell."
+            .to_string(),
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["argv"],
+        }),
+    )
 }
 
 /// File catalogs and whole-artifact reads stay retired even if an older server
@@ -525,7 +575,7 @@ impl Belt {
         if let Some(tool) = self.kin_tools.iter().find(|tool| tool.exposed == name) {
             if calls_retired_file_operation(&tool.bare, arguments) {
                 return RoutedCall {
-                    route: Route::Refused("File operations are unavailable on the agent belt. Find entities with semantic_search or semantic_locate and follow their relationships.".into()),
+                    route: Route::Refused("File operations are unavailable on the agent belt. Find entities with locate and follow their relationships.".into()),
                     arguments: arguments.clone(),
                 };
             }
@@ -559,15 +609,25 @@ impl Belt {
         // to change code, so the refusal says how a change is made instead, and it
         // names only a write tool this belt actually carries.
         if name == "edit_file" || name == "write_file" {
-            let how = if self.has_kin_tool("kin_mutate") {
+            let mutate = self
+                .kin_tools
+                .iter()
+                .map(|tool| tool.bare.as_str())
+                .find(|bare| is_mutate(bare));
+            let how = if let Some(mutate) = mutate {
+                let source = if self.has_kin_tool("source") {
+                    "source"
+                } else {
+                    "get_entity_source"
+                };
                 format!(
-                    "Every change goes through `{prefix}kin_mutate`, naming the entity by its \
-                     UUID and carrying the exact source_base `{prefix}get_entity_source` \
+                    "Every change goes through `{prefix}{mutate}`, naming the entity by its \
+                     UUID and carrying the exact source_base `{prefix}{source}` \
                      returned for it. Prefer verb 'patch' with an EntitySourcePatch of exact \
                      anchored edits over sending the whole body; add a top-level function with \
                      verb 'create' and an EntityCreate payload, and delete one with verb \
-                     'remove' and an EntityRemove payload, as the kin_mutate schema describes. \
-                     There is no file creation. If the change needs something kin_mutate cannot \
+                     'remove' and an EntityRemove payload, as the {mutate} schema describes. \
+                     There is no file creation. If the change needs something {mutate} cannot \
                      make, stop and say so.",
                     prefix = self.kin_prefix()
                 )
@@ -715,6 +775,11 @@ fn describe(value: &Value) -> &'static str {
 /// local-model run did before the harness staged on its own behalf. Hiding the whole set
 /// leaves `kin_mutate`, which opens and commits its own transaction, as the one way a
 /// change reaches the graph.
+///
+/// A server that serves verbs serves the transaction as one `transaction` tool,
+/// which is hidden whole for the same reason. Its `session` tool carries the
+/// toolchain run as well as the lifecycle, so it is not hidden: the model is
+/// served its `exec` action alone ([`session_exec_form`]).
 pub fn is_harness_owned(name: &str) -> bool {
     matches!(
         name,
@@ -726,6 +791,7 @@ pub fn is_harness_owned(name: &str) -> bool {
             | "kin_transaction_validate"
             | "kin_transaction_commit"
             | "kin_transaction_abort"
+            | "transaction"
     )
 }
 

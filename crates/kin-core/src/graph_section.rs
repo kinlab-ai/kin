@@ -577,23 +577,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let working = directory.path().join("repo");
         std::fs::create_dir_all(working.join("src")).unwrap();
-        let git = |args: &[&str]| {
-            let output = kin_git::test_support::fixture_git_in(&working)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "git {args:?}: {output:?}");
-        };
-        git(&["init", "--initial-branch=main"]);
-        git(&["config", "user.email", "kin@example.invalid"]);
-        git(&["config", "user.name", "Kin"]);
         std::fs::write(
             working.join("src/lib.rs"),
             b"pub fn one() -> u8 {\n    1\n}\n",
         )
         .unwrap();
-        git(&["add", "--all"]);
-        git(&["commit", "-m", "one function"]);
+        // One fixture launch for the seed, the same commands in the same order.
+        kin_git::test_support::FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "user.name", "Kin"])
+            .git(["add", "--all"])
+            .git(["commit", "-m", "one function"])
+            .run_in(&working);
 
         let admitted = crate::init_from_git(&working).unwrap();
         let binding =

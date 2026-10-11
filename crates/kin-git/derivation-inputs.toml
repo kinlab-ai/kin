@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/admission_history.rs",
+    "src/authority.rs",
+    "src/lib.rs",
+    "src/lossless.rs",
+    "src/preflight.rs",
+    "src/semantic_import.rs",
+]
+
+[[excluded]]
+reason = "tests: subprocess isolation for Git fixtures, compiled only under cfg(test) or the test-support feature"
+files = [
+    "src/test_support.rs",
+]
+
+[[excluded]]
+reason = "not compiled: lib.rs has declared no module for them since 561a35b8d (Make Git migration byte-exact) removed pub mod cochange, export and genesis, and cochange.rs still imports the deleted crate::import, so no build runs this code"
+files = [
+    "src/cochange.rs",
+    "src/export.rs",
+    "src/genesis.rs",
+]
+
+[[excluded]]
+reason = "temporary disk storage that keeps imported changes off the heap; it returns each change in append order and refuses a record whose SHA-256, id or origin differs from what was written, so it changes where history waits, not what it holds"
+files = [
+    "src/history_spool.rs",
+]
+
+[[excluded]]
+reason = "verification: proves every admitted tree entry resolves to a byte-exact body the store owns and refuses admission otherwise; its summary and fingerprint are compared between staged and published stores and never written to a stored record (kin-model SealedObservationBinding has no producer)"
+files = [
+    "src/sealed_observation.rs",
+]
+
+[[excluded]]
+reason = "refusal report before admission (hooks, checkout filters, sparse checkout, registered worktrees); preflight uses its hook surface only to refuse, and it admits nothing and writes no record"
+files = [
+    "src/admission_blockers.rs",
+]
+
+[[excluded]]
+reason = "bounded wait on a live same-host git gc.pid before admission; a stale, unreadable, expired or other-host record is ignored, and the wait writes no entity, relation or change"
+files = [
+    "src/gc_lock.rs",
+]
+
+[[excluded]]
+reason = "export of stored history back to Git objects (kin eject, kin git export); it reads the store and writes Git, deriving nothing"
+files = [
+    "src/repository_export.rs",
+]
+
+[[excluded]]
+reason = "identity of a checkout's raw refs and HEAD, which kin-core prepared_store uses to match a prepared store to a checkout for reuse; it reads refs only and writes no entity, relation or change"
+files = [
+    "src/ref_identity.rs",
+]
+
+[[excluded]]
+reason = "the path Git child processes bind as GIT_CONFIG_GLOBAL; import reads Git in process through gix, and the only non-test callers are CLI setup, eject and bench, the daemon commit path and kin-migrate"
+files = [
+    "src/global_config.rs",
+]
+
+[[excluded]]
+reason = "error and refusal types with their messages; a refusal stores nothing, and none of these facts reaches a kin-core, kin-db or kin-model record"
+files = [
+    "src/error.rs",
+]
+
+[dependencies]
+kin-io = { reason = "worktree authority tokens passed to existing Git capture and ref readers; no source selection, decoding or replay policy" }
+kin-model = { decides = ["graph"] }
+kin-blobs = { reason = "content-addressed blob storage IO for capture and import bodies; the digests taken from it are SHA-256 of the bytes, fixed by the specification" }
+gix = { decides = ["graph"] }
+thiserror = { reason = "error type derive; it shapes error messages, not derived data" }
+tracing = { reason = "logging only; among this crate's files only the uncompiled export.rs uses it" }
+chrono = { reason = "converts commit seconds to UTC timestamps, fixed by the proleptic Gregorian calendar; a release changes no timestamp" }
+sha2 = { reason = "SHA-256, fixed by FIPS 180-4; a release changes no digest" }
+hex = { reason = "hexadecimal encoding of object ids and non-UTF-8 author and message bytes, fixed by definition" }
+rayon = { reason = "data-parallel scheduling inside sealed_observation's verification only" }
+uuid = { reason = "UUID layout and name-based v5 artifact ids fixed by RFC 9562; a release changes no id" }
+rustix = { reason = "system calls for staging and publishing a rehydrated repository in lossless.rs, and for reading whether a same-host git gc process is alive; no derived value passes through them" }
+tempfile = { reason = "scratch files for the history spool and rehydration staging; every byte read back is verified" }
+serde_json = { reason = "JSON with a fixed, specified format for history spool records, each checked against its digest and identity on read" }
+which = { reason = "optional, enabled only by the test-support feature for test fixtures" }
+cap-std = { reason = "capability-scoped directory handles for staging and publishing a rehydrated repository; no derived value passes through them" }
+kin-daemon-spawn = { reason = "optional, enabled only by the test-support feature for fixture process groups" }
+libc = { reason = "optional, enabled only by the test-support feature for test fixtures" }
+windows-sys = { reason = "Windows system calls for publication durability and test fixtures; no derived value passes through them" }

@@ -3,7 +3,7 @@
 
 //! Cargo-only authority changes through the actual CLI and owned daemon.
 use serde_json::Value;
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 mod common;
 
 const MANIFEST: &str = "[package]\nname='fixture'\nedition='2021'\nautolib=false\nautobins=false\n[lib]\npath='app.rs'\n";
@@ -62,13 +62,69 @@ fn trace(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
     )
 }
 
-fn owned_work(report: &Value) -> Vec<&Value> {
+/// The ids the graph gives each `work` declared in `file`.
+///
+/// A trace reply is the agent's semantic surface, which names no file, so a
+/// chain step is matched to the declaration it must reach by entity id. The
+/// ids come from `kin graph export`, the operator's drawable projection, which
+/// still carries each node's file. The declaration stays in the working tree
+/// in every state these tests reach, so an empty set would make every
+/// withdrawal assertion vacuous and is refused.
+fn work_declared_in(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    file: &str,
+) -> BTreeSet<String> {
+    let export = kin(
+        runtime,
+        repo,
+        &["graph", "export", "--limit", "0", "--path", file, "--json"],
+    );
+    let declared: BTreeSet<String> = export["nodes"]
+        .as_array()
+        .expect("graph export nodes")
+        .iter()
+        .filter(|node| {
+            node["file"] == file
+                && node["name"]
+                    .as_str()
+                    .is_some_and(|name| name == "work" || name.ends_with("::work"))
+        })
+        .filter_map(|node| node["id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        !declared.is_empty(),
+        "the graph must hold the `work` declared in {file}: {export}"
+    );
+    declared
+}
+
+/// The chain steps that reach the `work` declared in `file`.
+fn local_work<'a>(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    report: &'a Value,
+    file: &str,
+) -> Vec<&'a Value> {
+    let declared = work_declared_in(runtime, repo, file);
     report["chain"]
         .as_array()
         .expect("trace chain")
         .iter()
-        .filter(|step| step["entity_file"] == "owner.rs" && step["entity_name"] == "work")
+        .filter(|step| {
+            step["entity_id"]
+                .as_str()
+                .is_some_and(|id| declared.contains(id))
+        })
         .collect()
+}
+
+fn owned_work<'a>(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    report: &'a Value,
+) -> Vec<&'a Value> {
+    local_work(runtime, repo, report, "owner.rs")
 }
 
 #[test]
@@ -98,7 +154,7 @@ fn cargo_only_retarget_and_recovery_change_real_trace_across_cold_reopen() {
     kin(&runtime, repo, &["init", ".", "--json"]);
     let before = trace(&runtime, repo);
     println!("CARGO_INITIAL_TRACE={before}");
-    let calls = owned_work(&before);
+    let calls = owned_work(&runtime, repo, &before);
     assert_eq!(
         calls.len(),
         1,
@@ -119,14 +175,14 @@ fn cargo_only_retarget_and_recovery_change_real_trace_across_cold_reopen() {
     let after = trace(&runtime, repo);
     println!("CARGO_RETARGET_TRACE={after}");
     assert!(
-        owned_work(&after).is_empty(),
+        owned_work(&runtime, repo, &after).is_empty(),
         "obsolete Cargo authority must withdraw: {after}"
     );
     assert_eq!(after["focal_entity"]["entity_id"], caller);
     kin(&runtime, repo, &["daemon", "stop"]);
     let cold = trace(&runtime, repo);
     assert!(
-        owned_work(&cold).is_empty(),
+        owned_work(&runtime, repo, &cold).is_empty(),
         "cold view must not resurrect Cargo authority: {cold}"
     );
     fs::write(repo.join("Cargo.toml"), MANIFEST).unwrap();
@@ -137,13 +193,20 @@ fn cargo_only_retarget_and_recovery_change_real_trace_across_cold_reopen() {
     );
     let recovered = trace(&runtime, repo);
     println!("CARGO_RECOVERED_TRACE={recovered}");
-    assert_eq!(owned_work(&recovered).len(), 1, "{recovered}");
-    assert_eq!(owned_work(&recovered)[0]["entity_id"], target);
+    assert_eq!(
+        owned_work(&runtime, repo, &recovered).len(),
+        1,
+        "{recovered}"
+    );
+    assert_eq!(
+        owned_work(&runtime, repo, &recovered)[0]["entity_id"],
+        target
+    );
     assert_eq!(recovered["focal_entity"]["entity_id"], caller);
     kin(&runtime, repo, &["daemon", "stop"]);
     let cold = trace(&runtime, repo);
-    assert_eq!(owned_work(&cold).len(), 1, "{cold}");
-    assert_eq!(owned_work(&cold)[0]["entity_id"], target);
+    assert_eq!(owned_work(&runtime, repo, &cold).len(), 1, "{cold}");
+    assert_eq!(owned_work(&runtime, repo, &cold)[0]["entity_id"], target);
 }
 
 fn init_git_fixture(repo: &Path) {
@@ -153,20 +216,6 @@ fn init_git_fixture(repo: &Path) {
     git(repo, &["config", "user.email", "cargo@example.invalid"]);
     git(repo, &["add", "--all"]);
     git(repo, &["commit", "-m", "initial Rust project"]);
-}
-
-fn local_work<'a>(report: &'a Value, file: &str) -> Vec<&'a Value> {
-    report["chain"]
-        .as_array()
-        .expect("trace chain")
-        .iter()
-        .filter(|step| {
-            step["entity_file"] == file
-                && step["entity_name"]
-                    .as_str()
-                    .is_some_and(|name| name == "work" || name.ends_with("::work"))
-        })
-        .collect()
 }
 
 #[test]
@@ -184,11 +233,11 @@ fn single_source_crate_manifest_removal_withdraws_and_restores_real_binding() {
     kin(&runtime, repo, &["init", ".", "--json"]);
     let before = trace(&runtime, repo);
     assert_eq!(
-        local_work(&before, "app.rs").len(),
+        local_work(&runtime, repo, &before, "app.rs").len(),
         1,
         "initial one-source binding: {before}"
     );
-    let target = local_work(&before, "app.rs")[0]["entity_id"].clone();
+    let target = local_work(&runtime, repo, &before, "app.rs")[0]["entity_id"].clone();
     let caller = before["focal_entity"]["entity_id"].clone();
     fs::remove_file(repo.join("Cargo.toml")).unwrap();
     kin(
@@ -198,24 +247,35 @@ fn single_source_crate_manifest_removal_withdraws_and_restores_real_binding() {
     );
     let after = trace(&runtime, repo);
     assert!(
-        local_work(&after, "app.rs").is_empty(),
+        local_work(&runtime, repo, &after, "app.rs").is_empty(),
         "one-source removal must withdraw: {after}"
     );
     assert_eq!(after["focal_entity"]["entity_id"], caller);
     kin(&runtime, repo, &["daemon", "stop"]);
     let cold = trace(&runtime, repo);
     assert!(
-        local_work(&cold, "app.rs").is_empty(),
+        local_work(&runtime, repo, &cold, "app.rs").is_empty(),
         "cold withdrawal: {cold}"
     );
     fs::write(repo.join("Cargo.toml"), MANIFEST).unwrap();
     kin(&runtime, repo, &["commit", "-m", "restore Cargo authority"]);
     let recovered = trace(&runtime, repo);
-    assert_eq!(local_work(&recovered, "app.rs").len(), 1, "{recovered}");
-    assert_eq!(local_work(&recovered, "app.rs")[0]["entity_id"], target);
+    assert_eq!(
+        local_work(&runtime, repo, &recovered, "app.rs").len(),
+        1,
+        "{recovered}"
+    );
+    assert_eq!(
+        local_work(&runtime, repo, &recovered, "app.rs")[0]["entity_id"],
+        target
+    );
     kin(&runtime, repo, &["daemon", "stop"]);
     let cold = trace(&runtime, repo);
-    assert_eq!(local_work(&cold, "app.rs").len(), 1, "{cold}");
+    assert_eq!(
+        local_work(&runtime, repo, &cold, "app.rs").len(),
+        1,
+        "{cold}"
+    );
 }
 
 #[test]
@@ -238,8 +298,8 @@ fn empty_or_use_only_root_change_rechecks_unchanged_real_callers() {
     init_git_fixture(repo);
     kin(&runtime, repo, &["init", ".", "--json"]);
     let before = trace(&runtime, repo);
-    assert_eq!(owned_work(&before).len(), 1, "{before}");
-    let target = owned_work(&before)[0]["entity_id"].clone();
+    assert_eq!(owned_work(&runtime, repo, &before).len(), 1, "{before}");
+    let target = owned_work(&runtime, repo, &before)[0]["entity_id"].clone();
     let caller = before["focal_entity"]["entity_id"].clone();
     for body in ["", "use std::fmt::Debug;"] {
         fs::write(repo.join("app.rs"), body).unwrap();
@@ -250,13 +310,13 @@ fn empty_or_use_only_root_change_rechecks_unchanged_real_callers() {
         );
         let after = trace(&runtime, repo);
         assert!(
-            owned_work(&after).is_empty(),
+            owned_work(&runtime, repo, &after).is_empty(),
             "entity-free root change must withdraw: {after}"
         );
         assert_eq!(after["focal_entity"]["entity_id"], caller);
         kin(&runtime, repo, &["daemon", "stop"]);
         let cold = trace(&runtime, repo);
-        assert!(owned_work(&cold).is_empty(), "{cold}");
+        assert!(owned_work(&runtime, repo, &cold).is_empty(), "{cold}");
         fs::write(repo.join("app.rs"), ROOT).unwrap();
         kin(
             &runtime,
@@ -264,8 +324,15 @@ fn empty_or_use_only_root_change_rechecks_unchanged_real_callers() {
             &["commit", "-m", "restore original module membership"],
         );
         let recovered = trace(&runtime, repo);
-        assert_eq!(owned_work(&recovered).len(), 1, "{recovered}");
-        assert_eq!(owned_work(&recovered)[0]["entity_id"], target);
+        assert_eq!(
+            owned_work(&runtime, repo, &recovered).len(),
+            1,
+            "{recovered}"
+        );
+        assert_eq!(
+            owned_work(&runtime, repo, &recovered)[0]["entity_id"],
+            target
+        );
     }
 }
 
@@ -289,11 +356,11 @@ fn unrelated_python_name_does_not_withdraw_existing_cargo_binding() {
     kin(&runtime, repo, &["init", ".", "--json"]);
     let before = trace(&runtime, repo);
     assert_eq!(
-        owned_work(&before).len(),
+        owned_work(&runtime, repo, &before).len(),
         1,
         "initial Rust binding: {before}"
     );
-    let target = owned_work(&before)[0]["entity_id"].clone();
+    let target = owned_work(&runtime, repo, &before)[0]["entity_id"].clone();
     for body in ["def work():\n    return 1\n", "def work():\n    return 2\n"] {
         fs::write(repo.join("unrelated.py"), body).unwrap();
         kin(
@@ -303,14 +370,18 @@ fn unrelated_python_name_does_not_withdraw_existing_cargo_binding() {
         );
         let after = trace(&runtime, repo);
         assert_eq!(
-            owned_work(&after).len(),
+            owned_work(&runtime, repo, &after).len(),
             1,
             "unrelated source must preserve Rust binding: {after}"
         );
-        assert_eq!(owned_work(&after)[0]["entity_id"], target);
+        assert_eq!(owned_work(&runtime, repo, &after)[0]["entity_id"], target);
         kin(&runtime, repo, &["daemon", "stop"]);
         let cold = trace(&runtime, repo);
-        assert_eq!(owned_work(&cold).len(), 1, "cold Rust binding: {cold}");
-        assert_eq!(owned_work(&cold)[0]["entity_id"], target);
+        assert_eq!(
+            owned_work(&runtime, repo, &cold).len(),
+            1,
+            "cold Rust binding: {cold}"
+        );
+        assert_eq!(owned_work(&runtime, repo, &cold)[0]["entity_id"], target);
     }
 }

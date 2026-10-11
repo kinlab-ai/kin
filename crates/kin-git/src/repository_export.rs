@@ -8,6 +8,7 @@
 //! from exact `TreeDelta` history. No checkout or raw filesystem file is ever
 //! consulted as repository authority.
 
+use kin_io::WorktreeRoot;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,11 +25,17 @@ use kin_model::{
 use crate::admission_history::admit_semantic_git_import;
 use crate::error::{GitError, Result};
 use crate::lossless::{
-    capture_lossless_git_repository, claim_staging_path, head_edit, publish_staging, ref_edit,
-    reject_existing_destination, require_anchored_publication_platform,
-    GitObjectFormat as LosslessObjectFormat, LosslessGitRepository,
+    claim_staging_path, head_edit, publish_staging, ref_edit, reject_existing_destination,
+    require_anchored_publication_platform, GitObjectFormat as LosslessObjectFormat,
+    LosslessGitRepository,
 };
 use crate::semantic_import::{plan_semantic_git_import, HistoricalSemanticBinding};
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 /// Complete graph-owned input needed to project one Kin repository to Git.
 #[derive(Debug, Clone)]
@@ -87,11 +94,12 @@ pub struct RepositoryGitCommitBinding {
 pub fn export_repository_to_git<L>(
     plan: &RepositoryGitExportPlan,
     source: &mut L,
-    output_path: &Path,
+    output_path: &WorktreeRoot,
 ) -> Result<RepositoryGitExportResult>
 where
     L: GitObjectBodyLoader,
 {
+    let output_path = output_path.path();
     reject_existing_destination(output_path)?;
     validate_plan_shape(plan)?;
     let object_format = plan
@@ -137,10 +145,11 @@ where
 /// read twice by the lossless capture boundary, so ref or object drift during
 /// verification fails closed.
 pub fn verify_repository_git_export(
-    repo_path: &Path,
+    repo_path: &WorktreeRoot,
     proof: &RepositoryGitExportProof,
     expected_tree: &ResolvedTree,
 ) -> Result<()> {
+    let repo_path = repo_path.path();
     reject_external_staged_git_object_sources(repo_path)?;
     let repository_parent = repo_path.parent().ok_or_else(|| {
         GitError::InvalidSnapshot(format!(
@@ -163,10 +172,11 @@ pub fn verify_repository_git_export(
         .tempdir_in(proof_parent)
         .map_err(|error| GitError::io(proof_parent, error))?;
     let proof_store = kin_blobs::BlobStore::new(proof_directory.path().to_path_buf())?;
-    let actual = capture_lossless_git_repository(
+    let actual = crate::lossless::capture_lossless_git_repository_at(
         repo_path,
         proof.expected.repository_id.clone(),
         &proof_store,
+        crate::lossless::CaptureScope::Reachable,
     )?;
     reject_external_staged_git_object_sources(repo_path)?;
     if actual != proof.expected {
@@ -627,40 +637,149 @@ where
             ))
         })?;
     let rebuilt = admit_semantic_git_import(&rebuilt, &proof_store)?;
-    let supplied_changes = plan
-        .changes
-        .iter()
-        .filter(|change| matches!(change.origin, ChangeOrigin::GitCommit { .. }))
-        .map(|change| (change.id, change))
-        .collect::<BTreeMap<_, _>>();
-    let mut changes_match = supplied_changes.len() == rebuilt.changes.len();
-    for expected in rebuilt.changes.iter() {
-        let expected = expected?;
-        if supplied_changes.get(&expected.id).copied() != Some(&expected) {
-            changes_match = false;
+    let supplied = SuppliedImportedHistory {
+        changes: plan
+            .changes
+            .iter()
+            .filter(|change| matches!(change.origin, ChangeOrigin::GitCommit { .. }))
+            .map(|change| (change.id, change))
+            .collect(),
+        aliases: plan
+            .aliases
+            .iter()
+            .cloned()
+            .map(|alias| (alias.oid, alias))
+            .collect(),
+    };
+    // A store an earlier import wrote recorded each commit's whole
+    // author line, and its change identities were computed over it. That
+    // history is still exact; it is proved under the rule it was written with,
+    // re-derived from the same raw objects, rather than refused or rewritten.
+    if !supplied.matches(&rebuilt, None)? {
+        let legacy_authors = legacy_commit_authors(authority, &proof_store)?;
+        if !supplied.matches(&rebuilt, Some(&legacy_authors))? {
+            return Err(GitError::InvalidSnapshot(
+                "imported semantic history does not rebuild exactly from stored Git authority"
+                    .to_string(),
+            ));
         }
-    }
-    let expected_aliases = rebuilt
-        .aliases
-        .into_iter()
-        .map(|alias| (alias.oid, alias))
-        .collect::<BTreeMap<_, _>>();
-    let supplied_aliases = plan
-        .aliases
-        .iter()
-        .cloned()
-        .map(|alias| (alias.oid, alias))
-        .collect::<BTreeMap<_, _>>();
-    if !changes_match || supplied_aliases != expected_aliases {
-        return Err(GitError::InvalidSnapshot(
-            "imported semantic history does not rebuild exactly from stored Git authority"
-                .to_string(),
-        ));
     }
 
     drop(proof_store);
     fs::remove_dir_all(&proof_path).map_err(|error| GitError::io(&proof_path, error))?;
     Ok(())
+}
+
+/// The imported history an export was handed, keyed for comparison with the
+/// history its stored Git authority rebuilds.
+struct SuppliedImportedHistory<'a> {
+    changes: BTreeMap<SemanticChangeId, &'a SemanticChange>,
+    aliases: BTreeMap<GitObjectId, ExternalChangeAlias>,
+}
+
+impl SuppliedImportedHistory<'_> {
+    /// Whether `rebuilt` is exactly the supplied history, change for change and
+    /// alias for alias.
+    ///
+    /// With `legacy_authors`, each rebuilt change first takes the author an
+    /// earlier import recorded for its commit, and is re-identified in
+    /// parent-first order with its parents renamed, which is exactly the
+    /// history that import derived from the same raw objects. Every other byte
+    /// is the rebuild's own, so the proof is no weaker for the older rule.
+    fn matches(
+        &self,
+        rebuilt: &crate::AdmittedSemanticGitImportPlan,
+        legacy_authors: Option<&BTreeMap<GitObjectId, kin_model::AuthorId>>,
+    ) -> Result<bool> {
+        let mut changes_match = self.changes.len() == rebuilt.changes.len();
+        let mut renamed = BTreeMap::new();
+        for expected in rebuilt.changes.iter() {
+            let mut expected = expected?;
+            if let Some(authors) = legacy_authors {
+                let ChangeOrigin::GitCommit { oid } = expected.origin else {
+                    return Err(GitError::InvalidSnapshot(format!(
+                        "rebuilt imported change {} has no Git commit origin",
+                        expected.id
+                    )));
+                };
+                let rebuilt_id = expected.id;
+                expected.author = authors.get(&oid).cloned().ok_or_else(|| {
+                    GitError::InvalidSnapshot(format!(
+                        "stored Git authority holds no commit body for imported commit {oid}"
+                    ))
+                })?;
+                expected.parents = expected
+                    .parents
+                    .iter()
+                    .map(|parent| {
+                        renamed.get(parent).copied().ok_or_else(|| {
+                            GitError::InvalidSnapshot(format!(
+                                "parent {parent} was not re-identified before change {rebuilt_id}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                expected.id = kin_model::compute_semantic_change_id(&expected)?;
+                validate_semantic_change_id(&expected)?;
+                renamed.insert(rebuilt_id, expected.id);
+            }
+            if self.changes.get(&expected.id).copied() != Some(&expected) {
+                changes_match = false;
+            }
+        }
+        let expected_aliases = rebuilt
+            .aliases
+            .iter()
+            .map(|alias| {
+                let change_id = match legacy_authors {
+                    Some(_) => renamed.get(&alias.change_id).copied().ok_or_else(|| {
+                        GitError::InvalidSnapshot(format!(
+                            "alias for commit {} names a change the rebuild did not hold",
+                            alias.oid
+                        ))
+                    })?,
+                    None => alias.change_id,
+                };
+                Ok((
+                    alias.oid,
+                    ExternalChangeAlias::new(alias.repository_id.clone(), alias.oid, change_id),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        Ok(changes_match && self.aliases == expected_aliases)
+    }
+}
+
+/// The author an earlier import recorded for each commit in a stored
+/// Git authority, read from the commit bodies the proof store holds.
+fn legacy_commit_authors(
+    authority: &GitExternalAuthority,
+    proof_store: &kin_blobs::BlobStore,
+) -> Result<BTreeMap<GitObjectId, kin_model::AuthorId>> {
+    let hash_kind = match authority.object_format {
+        GitObjectFormat::Sha1 => gix::hash::Kind::Sha1,
+        GitObjectFormat::Sha256 => gix::hash::Kind::Sha256,
+    };
+    let mut authors = BTreeMap::new();
+    for entry in &authority.closure.objects {
+        if entry.record.object.kind != ExternalObjectKind::Commit {
+            continue;
+        }
+        let body = proof_store.read(&kin_blobs::Hash256::from_bytes(
+            *entry.record.body_hash.as_bytes(),
+        ))?;
+        let commit = gix::objs::CommitRef::from_bytes(&body, hash_kind).map_err(|error| {
+            GitError::InvalidSnapshot(format!(
+                "decode commit {}: {error}",
+                entry.record.object.oid
+            ))
+        })?;
+        authors.insert(
+            entry.record.object.oid,
+            crate::semantic_import::legacy_git_author(commit.author.as_ref()),
+        );
+    }
+    Ok(authors)
 }
 
 fn lossless_snapshot_from_authority(
@@ -707,6 +826,9 @@ fn lossless_snapshot_from_authority(
             .collect(),
         refs,
         head,
+        // A persisted Git external authority is always a complete closure.
+        history_boundary: std::collections::BTreeSet::new(),
+        scope: crate::lossless::CaptureScope::Reachable,
     })
 }
 
@@ -858,10 +980,24 @@ fn write_native_commit(
     tree: gix::ObjectId,
     parents: &[GitObjectId],
 ) -> Result<GitObjectId> {
-    let author_name = sanitize_actor(&change.author.0);
+    // The author's name and address go to the signature's own fields, the
+    // way Git means them, so a change recorded as `Name <email>` exports as
+    // that person rather than as a name with the address folded into it.
+    let author_name = sanitize_actor(&change.author.name());
+    let author_email = change
+        .author
+        .email()
+        .map(|email| {
+            email
+                .bytes()
+                .filter(|byte| !matches!(*byte, b'\n' | b'\r' | b'<' | b'>'))
+                .collect::<Vec<_>>()
+        })
+        .filter(|email| !email.is_empty())
+        .unwrap_or_else(|| b"kin@localhost".to_vec());
     let author = gix::actor::Signature {
         name: author_name.into(),
-        email: b"kin@localhost".as_slice().into(),
+        email: author_email.into(),
         time: gix::date::Time::new(change.timestamp.0.timestamp(), 0),
     };
     let parent_ids = parents
@@ -967,8 +1103,12 @@ fn prove_staging_projection(
 ) -> Result<LosslessGitRepository> {
     let proof_path = staging.join(".kin-export-proof-cas");
     let proof_store = kin_blobs::BlobStore::new(proof_path.clone())?;
-    let recaptured =
-        capture_lossless_git_repository(staging, plan.repository_id.clone(), &proof_store)?;
+    let recaptured = crate::lossless::capture_lossless_git_repository_at(
+        staging,
+        plan.repository_id.clone(),
+        &proof_store,
+        crate::lossless::CaptureScope::Reachable,
+    )?;
     if recaptured.object_format != LosslessObjectFormat::Sha1
         || recaptured.refs != *refs
         || recaptured.head != *head
@@ -1088,7 +1228,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::test_support::{fixture_git, FixtureGitCommand};
+    use crate::test_support::{fixture_git, FixtureGitBatch, FixtureGitCommand};
     use crate::{
         admit_semantic_git_import, build_git_external_authority, plan_semantic_git_import,
     };
@@ -1118,9 +1258,6 @@ mod tests {
         let root = tempdir().unwrap();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
-        git(&source, &["init", "--initial-branch=main"]);
-        git(&source, &["config", "user.email", "kin@example.invalid"]);
-        git(&source, &["config", "user.name", "Kin Test"]);
 
         write_parent(
             &source,
@@ -1138,29 +1275,41 @@ mod tests {
         );
         write_parent(&source, "assets/payload.bin", &[0, 1, 2, 255, 0, 128]);
         symlink("scripts/run.sh", source.join("run")).unwrap();
-        git(&source, &["add", "--all"]);
+        // The same Git commands in the same order, one fixture launch for
+        // each run of them that needs no input.
+        FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "user.name", "Kin Test"])
+            .git(["add", "--all"])
+            .run_in(&source);
         add_raw_index_entry(&source, b"fixtures/imported-\xff.bin", &[17, 0, 255, 34]);
         let gitlink_target = GitObjectId::sha1([0x42; 20]);
         let gitlink_oid = "4242424242424242424242424242424242424242";
-        git(
-            &source,
-            &[
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                &format!("160000,{gitlink_oid},vendor/dependency"),
-            ],
-        );
-        git(&source, &["commit", "-m", "import exact mixed repository"]);
-        let imported_oid = String::from_utf8(git(&source, &["rev-parse", "HEAD"]))
-            .unwrap()
-            .trim()
-            .to_string();
+        let imported_oid = String::from_utf8(
+            FixtureGitBatch::new()
+                .git([
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{gitlink_oid},vendor/dependency"),
+                ])
+                .git(["commit", "-m", "import exact mixed repository"])
+                .git_stdout(["rev-parse", "HEAD"])
+                .run_in(&source),
+        )
+        .unwrap()
+        .trim()
+        .to_string();
 
         let store = BlobStore::new(root.path().join("source-cas")).unwrap();
         let repository_id = RepositoryId::new("mixed-export").unwrap();
-        let snapshot =
-            capture_lossless_git_repository(&source, repository_id.clone(), &store).unwrap();
+        let snapshot = crate::lossless::capture_lossless_git_repository(
+            &worktree(&source),
+            repository_id.clone(),
+            &store,
+        )
+        .unwrap();
         let imported = admit_semantic_git_import(
             &plan_semantic_git_import(&snapshot, &store).unwrap(),
             &store,
@@ -1284,8 +1433,9 @@ mod tests {
         };
         let exported = root.path().join("export.git");
         let mut loader = StoreLoader { store: &store };
-        let result = export_repository_to_git(&export_plan, &mut loader, &exported).unwrap();
-        verify_repository_git_export(&exported, &result.proof, &expected_tree).unwrap();
+        let result =
+            export_repository_to_git(&export_plan, &mut loader, &worktree(&exported)).unwrap();
+        verify_repository_git_export(&worktree(&exported), &result.proof, &expected_tree).unwrap();
         let wrong_gitlink_tree =
             ResolvedTree::from_artifacts(expected_tree.artifacts().map(|artifact| {
                 ResolvedArtifact::new(
@@ -1299,14 +1449,15 @@ mod tests {
                 )
             }))
             .unwrap();
-        let error = verify_repository_git_export(&exported, &result.proof, &wrong_gitlink_tree)
-            .expect_err("the export proof must bind the exact Gitlink commit pointer");
+        let error =
+            verify_repository_git_export(&worktree(&exported), &result.proof, &wrong_gitlink_tree)
+                .expect_err("the export proof must bind the exact Gitlink commit pointer");
         assert!(
             error.to_string().contains("graph-owned projection tree"),
             "unexpected Gitlink export-proof error: {error}"
         );
         let wrong_tree = ResolvedTree::default();
-        let error = verify_repository_git_export(&exported, &result.proof, &wrong_tree)
+        let error = verify_repository_git_export(&worktree(&exported), &result.proof, &wrong_tree)
             .expect_err("the export proof must bind the graph-owned HEAD tree");
         assert!(error.to_string().contains("graph-owned projection tree"));
         assert_eq!(result.imported_commits_reused, 1);
@@ -1399,8 +1550,9 @@ mod tests {
             &exported,
             &["update-ref", "refs/heads/unproved", "refs/heads/main"],
         );
-        let error = verify_repository_git_export(&exported, &result.proof, &expected_tree)
-            .expect_err("a new ref must invalidate the exact repository export proof");
+        let error =
+            verify_repository_git_export(&worktree(&exported), &result.proof, &expected_tree)
+                .expect_err("a new ref must invalidate the exact repository export proof");
         assert!(
             error
                 .to_string()
@@ -1422,7 +1574,8 @@ mod tests {
             git_authority: Some(authority),
         };
         let rejected = root.path().join("rejected.git");
-        let error = export_repository_to_git(&tampered, &mut loader, &rejected).unwrap_err();
+        let error =
+            export_repository_to_git(&tampered, &mut loader, &worktree(&rejected)).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1456,8 +1609,13 @@ mod tests {
         };
         let exported = root.path().join("unborn.git");
         let mut loader = StoreLoader { store: &store };
-        let result = export_repository_to_git(&plan, &mut loader, &exported).unwrap();
-        verify_repository_git_export(&exported, &result.proof, &ResolvedTree::default()).unwrap();
+        let result = export_repository_to_git(&plan, &mut loader, &worktree(&exported)).unwrap();
+        verify_repository_git_export(
+            &worktree(&exported),
+            &result.proof,
+            &ResolvedTree::default(),
+        )
+        .unwrap();
         assert_eq!(result.imported_commits_reused, 0);
         assert_eq!(result.native_commits_written, 0);
         assert_eq!(result.refs_written, 0);
@@ -1476,6 +1634,203 @@ mod tests {
             .unwrap();
         assert_eq!(show_ref.status.code(), Some(1));
         assert!(show_ref.stdout.is_empty());
+    }
+
+    /// A store an earlier import wrote recorded each commit's whole
+    /// author line, time and offset included, and computed every change
+    /// identity over it. Export proves that history under the rule it was
+    /// written with, so it leaves Kin without being rewritten, and the older
+    /// rule excuses nothing else: a byte changed anywhere but the author is
+    /// still refused.
+    #[test]
+    fn exports_a_history_an_older_import_recorded_with_whole_author_lines() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write_parent(&source, "src/lib.rs", b"pub fn first() {}\n");
+        FixtureGitBatch::new()
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.email", "kin@example.invalid"])
+            .git(["config", "user.name", "Kin Test"])
+            .git(["add", "--all"])
+            .git(["commit", "-m", "first"])
+            .run_in(&source);
+        write_parent(&source, "src/lib.rs", b"pub fn second() {}\n");
+        FixtureGitBatch::new()
+            .git(["add", "--all"])
+            .git(["commit", "-m", "second"])
+            .run_in(&source);
+
+        let store = BlobStore::new(root.path().join("source-cas")).unwrap();
+        let repository_id = RepositoryId::new("legacy-author-export").unwrap();
+        let snapshot = crate::lossless::capture_lossless_git_repository(
+            &worktree(&source),
+            repository_id.clone(),
+            &store,
+        )
+        .unwrap();
+        let imported = admit_semantic_git_import(
+            &plan_semantic_git_import(&snapshot, &store).unwrap(),
+            &store,
+        )
+        .unwrap();
+        let authority = build_git_external_authority(&snapshot, &store).unwrap();
+        let current = imported
+            .changes
+            .iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(current.len(), 2);
+        for change in &current {
+            assert_eq!(
+                change.author,
+                AuthorId::new("Kin Test <kin@example.invalid>"),
+                "an import records the author as Git names them, never the whole line"
+            );
+        }
+
+        // What the older import recorded, every identity recomputed over it.
+        let older = older_import_history(&current, &imported.aliases, &snapshot, &store);
+        for change in &older.0 {
+            assert!(
+                change
+                    .author
+                    .0
+                    .starts_with("Kin Test <kin@example.invalid> "),
+                "{}",
+                change.author
+            );
+            assert_eq!(change.author.name(), "Kin Test");
+        }
+
+        let plan = |(changes, aliases, renamed): (
+            Vec<SemanticChange>,
+            Vec<ExternalChangeAlias>,
+            BTreeMap<SemanticChangeId, SemanticChangeId>,
+        )| {
+            let mut refs = imported.refs.clone();
+            for repository_ref in &mut refs.refs {
+                if let RefTarget::Change { change_id } = &mut repository_ref.target {
+                    *change_id = renamed.get(change_id).copied().unwrap_or(*change_id);
+                }
+            }
+            RepositoryGitExportPlan {
+                repository_id: repository_id.clone(),
+                changes,
+                aliases,
+                refs,
+                head: imported.head.clone(),
+                git_authority: Some(authority.clone()),
+            }
+        };
+        let mut loader = StoreLoader { store: &store };
+        for (name, history) in [
+            (
+                "current.git",
+                (current.clone(), imported.aliases.clone(), BTreeMap::new()),
+            ),
+            ("older.git", older.clone()),
+        ] {
+            let result = export_repository_to_git(
+                &plan(history),
+                &mut loader,
+                &worktree(&root.path().join(name)),
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(result.imported_commits_reused, 2, "{name}");
+        }
+
+        let (mut changes, aliases, _) = older.clone();
+        changes[1].message.push_str(" amended");
+        let tampered = older_import_identities(changes, &aliases);
+        let error = export_repository_to_git(
+            &plan(tampered),
+            &mut loader,
+            &worktree(&root.path().join("tampered.git")),
+        )
+        .expect_err("a history that differs beyond its author lines is refused");
+        assert!(
+            error.to_string().contains("does not rebuild exactly"),
+            "{error}"
+        );
+    }
+
+    /// `current` as an earlier import recorded it: each commit's whole
+    /// author line, with every identity recomputed in parent-first order.
+    fn older_import_history(
+        current: &[SemanticChange],
+        aliases: &[ExternalChangeAlias],
+        snapshot: &LosslessGitRepository,
+        store: &BlobStore,
+    ) -> (
+        Vec<SemanticChange>,
+        Vec<ExternalChangeAlias>,
+        BTreeMap<SemanticChangeId, SemanticChangeId>,
+    ) {
+        let changes = current
+            .iter()
+            .cloned()
+            .map(|mut change| {
+                let ChangeOrigin::GitCommit { oid } = change.origin else {
+                    panic!("an import holds only Git-origin changes");
+                };
+                let record = snapshot
+                    .objects
+                    .iter()
+                    .find(|record| record.object.oid == oid)
+                    .unwrap();
+                let body = store
+                    .read(&kin_blobs::Hash256::from_bytes(
+                        *record.body_hash.as_bytes(),
+                    ))
+                    .unwrap();
+                let commit =
+                    gix::objs::CommitRef::from_bytes(&body, gix::hash::Kind::Sha1).unwrap();
+                change.author = crate::semantic_import::legacy_git_author(commit.author.as_ref());
+                change
+            })
+            .collect();
+        older_import_identities(changes, aliases)
+    }
+
+    /// Recompute every identity, parent and alias of a parent-first history.
+    fn older_import_identities(
+        changes: Vec<SemanticChange>,
+        aliases: &[ExternalChangeAlias],
+    ) -> (
+        Vec<SemanticChange>,
+        Vec<ExternalChangeAlias>,
+        BTreeMap<SemanticChangeId, SemanticChangeId>,
+    ) {
+        let mut renamed = BTreeMap::new();
+        let changes = changes
+            .into_iter()
+            .map(|mut change| {
+                let before = change.id;
+                change.parents = change
+                    .parents
+                    .iter()
+                    .map(|parent| renamed[parent])
+                    .collect();
+                change.id = compute_semantic_change_id(&change).unwrap();
+                renamed.insert(before, change.id);
+                change
+            })
+            .collect();
+        let aliases = aliases
+            .iter()
+            .map(|alias| {
+                ExternalChangeAlias::new(
+                    alias.repository_id.clone(),
+                    alias.oid,
+                    renamed
+                        .get(&alias.change_id)
+                        .copied()
+                        .unwrap_or(alias.change_id),
+                )
+            })
+            .collect();
+        (changes, aliases, renamed)
     }
 
     #[test]
@@ -1554,7 +1909,7 @@ mod tests {
         };
         let exported = root.path().join("merge.git");
         let mut loader = StoreLoader { store: &store };
-        let result = export_repository_to_git(&plan, &mut loader, &exported).unwrap();
+        let result = export_repository_to_git(&plan, &mut loader, &worktree(&exported)).unwrap();
         assert_eq!(result.imported_commits_reused, 0);
         assert_eq!(result.native_commits_written, 4);
         assert_eq!(result.refs_written, 2);

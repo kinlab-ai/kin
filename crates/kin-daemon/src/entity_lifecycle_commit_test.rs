@@ -26,14 +26,29 @@ fn lifecycle_base(
     };
     let bytes = crate::repository_commit::load_native_source_blob(&context, hash).unwrap();
     let span = entity.span.as_ref().unwrap();
-    kin_mcp::source_base::EntitySourceBase::from_exact_body(
+    let mut base = kin_mcp::source_base::EntitySourceBase::from_exact_body(
         source_context,
         entity,
         artifact.artifact_id,
         hash,
         std::str::from_utf8(&bytes[span.start_byte..span.end_byte]).unwrap(),
     )
-    .unwrap()
+    .unwrap();
+    // A class too large to be served whole is read as its own code, and the
+    // base of that read guards that code: what a `source` read of it returns.
+    if kin_mcp::module_code::serves_class_code(state.graph.as_ref(), entity) {
+        let entities = state
+            .graph
+            .query_entities(&kin_model::EntityFilter {
+                file_path: entity.file_origin.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        let code = kin_mcp::module_code::ModuleCode::build(entity, &bytes, &entities).unwrap();
+        base.end_byte = base.start_byte + code.text().len();
+        base.body_hash = kin_blobs::digest(code.text().as_bytes()).to_string();
+    }
+    base
 }
 
 fn lifecycle_create(
@@ -522,7 +537,9 @@ fn entity_lifecycle_remove_retains_call_obligation_and_recovers_receipt() {
     );
     assert_eq!(
         std::fs::read_to_string(state.layout.working_dir().join("pkg/provider.go")).unwrap(),
-        "package sample\n\n\n"
+        // The function goes with its own line and the blank line that set
+        // it apart from the package clause.
+        "package sample\n"
     );
 }
 
@@ -615,15 +632,12 @@ fn entity_lifecycle_new_go_unit_refuses_unmodeled_build_owners() {
 }
 
 fn go_unit(package: &str, name: &str, test: bool) -> kin_mcp::source_unit::SourceUnit {
-    kin_mcp::source_unit::SourceUnit::Go {
-        package: package.into(),
-        name: name.into(),
-        role: if test {
-            kin_mcp::source_unit::UnitRole::Test
-        } else {
-            kin_mcp::source_unit::UnitRole::Source
-        },
-    }
+    let role = if test {
+        kin_mcp::source_unit::UnitRole::Test
+    } else {
+        kin_mcp::source_unit::UnitRole::Source
+    };
+    kin_mcp::source_unit::SourceUnit::go(package, name, role)
 }
 
 fn current_base(state: &Arc<DaemonState>) -> kin_mcp::source_unit::RepositoryBase {
@@ -1001,13 +1015,27 @@ fn unit_create_refuses_stale_base_occupied_names_and_foreign_packages_without_pu
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&observed, go_unit("cmd/tool", "main", false), "main", Kind::Function, "func main() {}", &[])],
+        vec![unit_create_op(
+            &observed,
+            go_unit("cmd/tool", "main", false),
+            "main",
+            Kind::Function,
+            "func main() {}",
+            &[],
+        )],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&observed, go_unit(".", "main", false), "main", Kind::Function, "func main() {}", &[])],
+        vec![unit_create_op(
+            &observed,
+            go_unit(".", "main", false),
+            "main",
+            Kind::Function,
+            "func main() {}",
+            &[],
+        )],
     );
     assert_eq!(result.is_error, Some(true));
     assert!(
@@ -1023,10 +1051,20 @@ fn unit_create_refuses_stale_base_occupied_names_and_foreign_packages_without_pu
     let retried = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&fresh, go_unit(".", "main", false), "main", Kind::Function, "func main() {}", &[])],
+        vec![unit_create_op(
+            &fresh,
+            go_unit(".", "main", false),
+            "main",
+            Kind::Function,
+            "func main() {}",
+            &[],
+        )],
     );
     assert_ne!(retried.is_error, Some(true), "{}", result_text(&retried));
-    assert_eq!(project(&state, "main.go"), "package main\n\nfunc main() {}\n");
+    assert_eq!(
+        project(&state, "main.go"),
+        "package main\n\nfunc main() {}\n"
+    );
 
     // A generation that advanced over an unchanged head and tree (a toolchain
     // run that published nothing) is not a conflict: unit work is planned
@@ -1036,21 +1074,44 @@ fn unit_create_refuses_stale_base_occupied_names_and_foreign_packages_without_pu
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&advanced, go_unit(".", "main", false), "version", Kind::Const, "const version = \"0.1.0\"", &[])],
+        vec![unit_create_op(
+            &advanced,
+            go_unit(".", "main", false),
+            "version",
+            Kind::Const,
+            "const version = \"0.1.0\"",
+            &[],
+        )],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
     // Any other difference is: a changed tree, head, repository or workspace.
     for (label, edit) in [
-        ("tree", (|base: &mut kin_mcp::source_unit::RepositoryBase| base.context.workspace_tree_hash = "0".repeat(64)) as fn(&mut kin_mcp::source_unit::RepositoryBase)),
-        ("head", |base| base.context.workspace_head_hash = "0".repeat(64)),
-        ("workspace", |base| base.context.workspace_id = uuid::Uuid::new_v4().to_string()),
+        (
+            "tree",
+            (|base: &mut kin_mcp::source_unit::RepositoryBase| {
+                base.context.workspace_tree_hash = "0".repeat(64)
+            }) as fn(&mut kin_mcp::source_unit::RepositoryBase),
+        ),
+        ("head", |base| {
+            base.context.workspace_head_hash = "0".repeat(64)
+        }),
+        ("workspace", |base| {
+            base.context.workspace_id = uuid::Uuid::new_v4().to_string()
+        }),
     ] {
         let mut changed = current_base(&state);
         edit(&mut changed);
         let result = commit_unit_ops(
             &state,
             &sessions,
-            vec![unit_create_op(&changed, go_unit(".", "main", false), "Other", Kind::Function, "func Other() {}", &[])],
+            vec![unit_create_op(
+                &changed,
+                go_unit(".", "main", false),
+                "Other",
+                Kind::Function,
+                "func Other() {}",
+                &[],
+            )],
         );
         assert!(
             kin_mcp::source_unit::is_repository_base_conflict(result_text(&result)),
@@ -1361,13 +1422,17 @@ fn member_patch(
     }
 }
 
-fn member_update(state: &Arc<DaemonState>, entity: &Entity, body: &str) -> kin_mcp::McpMutationOperation {
+fn member_update(
+    state: &Arc<DaemonState>,
+    entity: &Entity,
+    body: &str,
+) -> kin_mcp::McpMutationOperation {
     kin_mcp::McpMutationOperation {
         verb: "update".into(),
         target: entity.id.to_string(),
-        payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(lifecycle_base(
-            state, entity,
-        ))),
+        payload: Some(kin_mcp::McpMutationPayload::EntitySourceBase(
+            lifecycle_base(state, entity),
+        )),
         body: Some(body.into()),
         destination: None,
         description: "rewrite the type".into(),
@@ -1400,8 +1465,22 @@ fn guarded_type_edits_add_remove_and_rename_nested_members() {
         &state,
         &sessions,
         vec![
-            unit_create_op(&current_base(&state), store(), "Store", Kind::Struct, "type Store struct {\n\tmu    sync.Mutex\n\titems map[string]string\n}", &["sync"]),
-            unit_create_op(&current_base(&state), store(), "Getter", Kind::Interface, "type Getter interface {\n\tGet(key string) (string, error)\n}", &[]),
+            unit_create_op(
+                &current_base(&state),
+                store(),
+                "Store",
+                Kind::Struct,
+                "type Store struct {\n\tmu    sync.Mutex\n\titems map[string]string\n}",
+                &["sync"],
+            ),
+            unit_create_op(
+                &current_base(&state),
+                store(),
+                "Getter",
+                Kind::Interface,
+                "type Getter interface {\n\tGet(key string) (string, error)\n}",
+                &[],
+            ),
         ],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
@@ -1417,9 +1496,19 @@ fn guarded_type_edits_add_remove_and_rename_nested_members() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![member_patch(&state, &go_entity(&state, "Store"), "\titems map[string]string\n", "\titems map[string]string\n\tcount int\n")],
+        vec![member_patch(
+            &state,
+            &go_entity(&state, "Store"),
+            "\titems map[string]string\n",
+            "\titems map[string]string\n\tcount int\n",
+        )],
     );
-    assert_ne!(result.is_error, Some(true), "add a field: {}", result_text(&result));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "add a field: {}",
+        result_text(&result)
+    );
     let count = go_entity(&state, "Store.count");
     assert_eq!(count.kind, kin_model::EntityKind::Field);
     assert_eq!(entity_bytes(&state, &count), "count int");
@@ -1430,19 +1519,41 @@ fn guarded_type_edits_add_remove_and_rename_nested_members() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![member_patch(&state, &go_entity(&state, "Getter"), "\tGet(key string) (string, error)\n", "\tGet(key string) (string, error)\n\tLen() int\n")],
+        vec![member_patch(
+            &state,
+            &go_entity(&state, "Getter"),
+            "\tGet(key string) (string, error)\n",
+            "\tGet(key string) (string, error)\n\tLen() int\n",
+        )],
     );
-    assert_ne!(result.is_error, Some(true), "add an interface method: {}", result_text(&result));
-    assert_eq!(go_entity(&state, "Getter.Len").kind, kin_model::EntityKind::Method);
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "add an interface method: {}",
+        result_text(&result)
+    );
+    assert_eq!(
+        go_entity(&state, "Getter.Len").kind,
+        kin_model::EntityKind::Method
+    );
     assert_eq!(held(&state, "Getter.Get"), get);
 
     // A whole-body update removes a field.
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![member_update(&state, &go_entity(&state, "Store"), "Store struct {\n\tmu    sync.Mutex\n\titems map[string]string\n}")],
+        vec![member_update(
+            &state,
+            &go_entity(&state, "Store"),
+            "type Store struct {\n\tmu    sync.Mutex\n\titems map[string]string\n}",
+        )],
     );
-    assert_ne!(result.is_error, Some(true), "remove a field: {}", result_text(&result));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "remove a field: {}",
+        result_text(&result)
+    );
     assert!(absent(&state, "Store.count"));
     assert_eq!(held(&state, "Store.mu"), mu);
     assert_eq!(held(&state, "Store.items"), items);
@@ -1451,11 +1562,23 @@ fn guarded_type_edits_add_remove_and_rename_nested_members() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![member_update(&state, &go_entity(&state, "Store"), "Store struct {\n\tmu     sync.Mutex\n\tvalues map[string]string\n}")],
+        vec![member_update(
+            &state,
+            &go_entity(&state, "Store"),
+            "type Store struct {\n\tmu     sync.Mutex\n\tvalues map[string]string\n}",
+        )],
     );
-    assert_ne!(result.is_error, Some(true), "rename a field: {}", result_text(&result));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "rename a field: {}",
+        result_text(&result)
+    );
     assert!(absent(&state, "Store.items"));
-    assert_eq!(entity_bytes(&state, &go_entity(&state, "Store.values")), "values map[string]string");
+    assert_eq!(
+        entity_bytes(&state, &go_entity(&state, "Store.values")),
+        "values map[string]string"
+    );
     assert_eq!(go_entity(&state, "Store.mu").id, mu.0);
     assert_eq!(
         project(&state, "internal/store/store.go"),
@@ -1468,10 +1591,22 @@ fn guarded_type_edits_add_remove_and_rename_nested_members() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![member_patch(&state, &go_entity(&state, "Getter"), "\tLen() int\n}", "\tLen() int\n}\n\ntype Extra int")],
+        vec![member_patch(
+            &state,
+            &go_entity(&state, "Getter"),
+            "\tLen() int\n}",
+            "\tLen() int\n}\n\ntype Extra int",
+        )],
     );
-    assert_eq!(result.is_error, Some(true), "a top-level declaration smuggled into an edit");
-    assert_eq!(load_native_commit_base(&state.layout).unwrap().roots, before);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a top-level declaration smuggled into an edit"
+    );
+    assert_eq!(
+        load_native_commit_base(&state.layout).unwrap().roots,
+        before
+    );
 }
 
 /// `var _ Iface = (*T)(nil)` is created by name `_`; each assertion is its own
@@ -1487,13 +1622,62 @@ fn blank_interface_assertions_are_created_with_derived_identities() {
         &state,
         &sessions,
         vec![
-            unit_create_op(&base, store(), "Getter", Kind::Interface, "type Getter interface {\n\tGet(key string) string\n}", &[]),
-            unit_create_op(&base, store(), "Store", Kind::Struct, "type Store struct{}", &[]),
-            unit_create_op(&base, store(), "Cache", Kind::Struct, "type Cache struct{}", &[]),
-            unit_create_op(&base, store(), "Store.Get", Kind::Method, "func (s *Store) Get(key string) string { return key }", &[]),
-            unit_create_op(&base, store(), "Cache.Get", Kind::Method, "func (c *Cache) Get(key string) string { return \"\" }", &[]),
-            unit_create_op(&base, store(), "_", Kind::Var, "var _ Getter = (*Store)(nil)", &[]),
-            unit_create_op(&base, store(), "_", Kind::Var, "var _ Getter = (*Cache)(nil)", &[]),
+            unit_create_op(
+                &base,
+                store(),
+                "Getter",
+                Kind::Interface,
+                "type Getter interface {\n\tGet(key string) string\n}",
+                &[],
+            ),
+            unit_create_op(
+                &base,
+                store(),
+                "Store",
+                Kind::Struct,
+                "type Store struct{}",
+                &[],
+            ),
+            unit_create_op(
+                &base,
+                store(),
+                "Cache",
+                Kind::Struct,
+                "type Cache struct{}",
+                &[],
+            ),
+            unit_create_op(
+                &base,
+                store(),
+                "Store.Get",
+                Kind::Method,
+                "func (s *Store) Get(key string) string { return key }",
+                &[],
+            ),
+            unit_create_op(
+                &base,
+                store(),
+                "Cache.Get",
+                Kind::Method,
+                "func (c *Cache) Get(key string) string { return \"\" }",
+                &[],
+            ),
+            unit_create_op(
+                &base,
+                store(),
+                "_",
+                Kind::Var,
+                "var _ Getter = (*Store)(nil)",
+                &[],
+            ),
+            unit_create_op(
+                &base,
+                store(),
+                "_",
+                Kind::Var,
+                "var _ Getter = (*Cache)(nil)",
+                &[],
+            ),
         ],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
@@ -1509,7 +1693,7 @@ fn blank_interface_assertions_are_created_with_derived_identities() {
         );
     }
     let first = go_entity(&state, "_ Getter = (*Store)(nil)");
-    assert_eq!(entity_bytes(&state, &first), "_ Getter = (*Store)(nil)");
+    assert_eq!(entity_bytes(&state, &first), "var _ Getter = (*Store)(nil)");
     assert_ne!(first.id, go_entity(&state, "_ Getter = (*Cache)(nil)").id);
 
     // Blank specs that differ only inside a literal are distinct entities,
@@ -1518,8 +1702,22 @@ fn blank_interface_assertions_are_created_with_derived_identities() {
         &state,
         &sessions,
         vec![
-            unit_create_op(&current_base(&state), store(), "_", Kind::Var, "var _ = fmt.Sprint(\"a  b\")", &["fmt"]),
-            unit_create_op(&current_base(&state), store(), "_", Kind::Var, "var _ = fmt.Sprint(\"a b\")", &["fmt"]),
+            unit_create_op(
+                &current_base(&state),
+                store(),
+                "_",
+                Kind::Var,
+                "var _ = fmt.Sprint(\"a  b\")",
+                &["fmt"],
+            ),
+            unit_create_op(
+                &current_base(&state),
+                store(),
+                "_",
+                Kind::Var,
+                "var _ = fmt.Sprint(\"a b\")",
+                &["fmt"],
+            ),
         ],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
@@ -1532,11 +1730,25 @@ fn blank_interface_assertions_are_created_with_derived_identities() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&current_base(&state), store(), "_", Kind::Var, "var _ Getter = (*Store)(nil)", &[])],
+        vec![unit_create_op(
+            &current_base(&state),
+            store(),
+            "_",
+            Kind::Var,
+            "var _ Getter = (*Store)(nil)",
+            &[],
+        )],
     );
     assert_eq!(result.is_error, Some(true));
-    assert!(result_text(&result).contains("already names a declaration"), "{}", result_text(&result));
-    assert_eq!(load_native_commit_base(&state.layout).unwrap().roots, before);
+    assert!(
+        result_text(&result).contains("already names a declaration"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(
+        load_native_commit_base(&state.layout).unwrap().roots,
+        before
+    );
 }
 
 /// A repository-base conflict on a transaction that also edits an existing
@@ -1551,7 +1763,14 @@ fn a_mixed_conflict_names_the_entities_that_need_a_fresh_source_read() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&current_base(&state), main(), "main", Kind::Function, "func main() {\n\tprintln(\"hi\")\n}", &[])],
+        vec![unit_create_op(
+            &current_base(&state),
+            main(),
+            "main",
+            Kind::Function,
+            "func main() {\n\tprintln(\"hi\")\n}",
+            &[],
+        )],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
     let observed = current_base(&state);
@@ -1561,7 +1780,14 @@ fn a_mixed_conflict_names_the_entities_that_need_a_fresh_source_read() {
     let result = commit_unit_ops(
         &state,
         &sessions,
-        vec![unit_create_op(&observed, main(), "helper", Kind::Function, "func helper() {}", &[])],
+        vec![unit_create_op(
+            &observed,
+            main(),
+            "helper",
+            Kind::Function,
+            "func helper() {}",
+            &[],
+        )],
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
     let result = commit_unit_ops(
@@ -1576,7 +1802,10 @@ fn a_mixed_conflict_names_the_entities_that_need_a_fresh_source_read() {
         serde_json::json!([{"operation": 0, "entity_id": entity.id}])
     );
     let next = refusal["next_step"].as_str().unwrap();
-    assert!(next.contains("source (get_entity_source)") && next.contains("source_reads_required"), "{next}");
+    assert!(
+        next.contains("source (get_entity_source)") && next.contains("source_reads_required"),
+        "{next}"
+    );
     let fresh: kin_mcp::source_unit::RepositoryBase =
         serde_json::from_value(refusal["current_repository_base"].clone()).unwrap();
 
@@ -1593,4 +1822,573 @@ fn a_mixed_conflict_names_the_entities_that_need_a_fresh_source_read() {
     );
     assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
     assert!(project(&state, "main.go").contains("import (\n\t\"fmt\"\n)"));
+}
+
+fn lifecycle_create_as(
+    state: &Arc<DaemonState>,
+    anchor: &Entity,
+    placement: kin_mcp::entity_lifecycle::EntityPlacement,
+    kind: kin_mcp::source_unit::DeclarationKind,
+    name: &str,
+    body: &str,
+) -> kin_mcp::McpMutationOperation {
+    let mut operation = lifecycle_create(state, anchor, placement, body);
+    let Some(kin_mcp::McpMutationPayload::EntityCreate(create)) = operation.payload.as_mut() else {
+        unreachable!()
+    };
+    create.kind = kind;
+    create.name = name.into();
+    operation
+}
+
+fn lifecycle_commit(
+    state: &Arc<DaemonState>,
+    sessions: &kin_mcp::SessionRegistry,
+    operation: kin_mcp::McpMutationOperation,
+) -> kin_mcp::ToolCallResult {
+    let arguments = lifecycle_stage(sessions, vec![operation]);
+    commit_exact_transaction(state, sessions, &arguments, None)
+}
+
+fn lifecycle_entity(
+    state: &Arc<DaemonState>,
+    name: &str,
+    kind: kin_model::EntityKind,
+) -> Option<Entity> {
+    state
+        .graph
+        .query_entities(&EntityFilter {
+            name_pattern: Some(name.into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .find(|entity| entity.name == name && entity.kind == kind)
+}
+
+/// How many methods [`large_python_class`] begins with.
+const LARGE_CLASS_METHODS: usize = 48;
+
+/// A Python class larger than any class a source read serves whole: methods
+/// with long docstrings, a nested function in one of them, and a function
+/// after the class.
+fn large_python_class() -> String {
+    let mut source = String::from(
+        "import os\n\n\nclass Big(Base):\n    \"\"\"A class too large to resend.\"\"\"\n\n    limit = 3\n",
+    );
+    let prose = "Answers with the value it is given and its own place in the class. ".repeat(5);
+    for index in 0..LARGE_CLASS_METHODS {
+        source.push_str(&format!(
+            "\n    def method_{index}(self, value):\n        \"\"\"{}\"\"\"\n        return value + {index}\n",
+            prose.trim_end()
+        ));
+    }
+    source.push_str(
+        "\n    def wraps(self, f):\n        def decorator(*args):\n            return f(*args)\n\n        return decorator\n",
+    );
+    source.push_str("\n\ndef helper():\n    return 1\n");
+    source
+}
+
+fn lifecycle_remove(state: &Arc<DaemonState>, entity: &Entity) -> kin_mcp::McpMutationOperation {
+    kin_mcp::McpMutationOperation {
+        verb: "remove".into(),
+        target: entity.id.to_string(),
+        payload: Some(kin_mcp::McpMutationPayload::EntityRemove(
+            kin_mcp::entity_lifecycle::EntityRemove {
+                source_base: lifecycle_base(state, entity),
+            },
+        )),
+        body: None,
+        destination: None,
+        description: "remove a method".into(),
+    }
+}
+
+/// What a commit's receipt says it did, as (change, entity name) pairs.
+fn lifecycle_changes(result: &kin_mcp::ToolCallResult) -> Vec<(String, String)> {
+    let receipt: serde_json::Value = serde_json::from_str(&result_text(result)).unwrap();
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+    receipt[kin_mcp::write_reply::ENTITY_CHANGES_KEY]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| (text(&row["change"]), text(&row["name"])))
+        .collect()
+}
+
+fn lifecycle_disk(state: &Arc<DaemonState>, file: &str) -> String {
+    std::fs::read_to_string(state.layout.working_dir().join(file)).unwrap()
+}
+
+/// A method is added to a class, and removed from it, by naming a sibling
+/// method or the class and sending the method alone. The class, here over
+/// 16 KB, is never read back or resent, keeps its identity, and every other
+/// declaration in it keeps its exact bytes and its identity.
+#[test]
+fn entity_lifecycle_adds_and_removes_python_methods_without_resending_the_class() {
+    use kin_mcp::entity_lifecycle::EntityPlacement::{Member, SiblingAfter};
+    use kin_mcp::source_unit::DeclarationKind;
+    use kin_model::EntityKind;
+    let file = "pkg/big.py";
+    let original = large_python_class();
+    let (_dir, state) = test_state();
+    let (anchor, _) = install_exact_source(&state, file, original.as_bytes(), "Big.method_7");
+    assert_eq!(anchor.kind, EntityKind::Method);
+    let class = lifecycle_entity(&state, "Big", EntityKind::Class).unwrap();
+    let class_span = class.span.as_ref().unwrap();
+    assert!(
+        class_span.end_byte - class_span.start_byte > 16 * 1024,
+        "the fixture class must be larger than a source read serves whole"
+    );
+    let sessions = test_sessions();
+    let members_before = state
+        .graph
+        .query_entities(&EntityFilter::default())
+        .unwrap()
+        .into_iter()
+        .filter(|entity| entity.kind == EntityKind::Method)
+        .map(|entity| (entity.id, entity.name))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(members_before.len(), LARGE_CLASS_METHODS + 1);
+
+    // Beside a sibling, sent the way a method's source is served: first line
+    // at the margin, the rest where the class has them.
+    let method =
+        "def added(self, value):\n        \"\"\"Added.\"\"\"\n        return self.limit + value";
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        lifecycle_create_as(
+            &state,
+            &anchor,
+            SiblingAfter,
+            DeclarationKind::Method,
+            "added",
+            method,
+        ),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    // The receipt names the method it created, behind its class, and lists
+    // it with the entities a caller can read or patch next.
+    assert_eq!(
+        lifecycle_changes(&result),
+        [("created".to_string(), "Big.added".to_string())]
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+    assert_eq!(
+        receipt["created_entities"][0]["name"], "Big.added",
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt[kin_mcp::write_reply::UNITS_WRITTEN_KEY],
+        1,
+        "{receipt}"
+    );
+    assert_eq!(
+        receipt[kin_mcp::write_reply::ENTITY_CHANGES_KEY][0]["module"],
+        "pkg.big",
+        "{receipt}"
+    );
+    assert!(
+        receipt
+            .get(kin_mcp::write_reply::REPOSITORY_BASE_SENT_KEY)
+            .is_none(),
+        "{receipt}"
+    );
+    assert!(lifecycle_entity(&state, "Big.added", EntityKind::Method).is_some());
+    // The file is the one it was with the method set in after its sibling,
+    // and nothing else moved.
+    let with_added = original.replacen(
+        "        return value + 7\n",
+        &format!("        return value + 7\n\n    {method}\n"),
+        1,
+    );
+    assert_eq!(lifecycle_disk(&state, file), with_added);
+
+    // As the last member of the class named as its container, sent at the
+    // margin, with a declaration nested in it.
+    let class = lifecycle_entity(&state, "Big", EntityKind::Class).unwrap();
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        lifecycle_create_as(
+            &state,
+            &class,
+            Member,
+            DeclarationKind::Method,
+            "last",
+            "def last(self):\n    def inner():\n        return 9\n\n    return inner()\n",
+        ),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    // The function nested in it is part of the method, not a second change.
+    assert_eq!(
+        lifecycle_changes(&result),
+        [("created".to_string(), "Big.last".to_string())]
+    );
+    assert!(lifecycle_entity(&state, "Big.last", EntityKind::Method).is_some());
+    let with_last = with_added.replacen(
+        "        return decorator\n",
+        "        return decorator\n\n    def last(self):\n        def inner():\n            return 9\n\n        return inner()\n",
+        1,
+    );
+    assert_eq!(lifecycle_disk(&state, file), with_last);
+
+    // Removed: the method goes, with the function declared inside it, and
+    // its neighbours stay one blank line apart.
+    let wraps = lifecycle_entity(&state, "Big.wraps", EntityKind::Method).unwrap();
+    let result = lifecycle_commit(&state, &sessions, lifecycle_remove(&state, &wraps));
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert_eq!(
+        lifecycle_changes(&result),
+        [("removed".to_string(), "Big.wraps".to_string())]
+    );
+    assert!(state.graph.get_entity(&wraps.id).unwrap().is_none());
+    let without_wraps = with_last.replacen(
+        "\n    def wraps(self, f):\n        def decorator(*args):\n            return f(*args)\n\n        return decorator\n",
+        "",
+        1,
+    );
+    assert!(!without_wraps.contains("def decorator"));
+    assert_eq!(lifecycle_disk(&state, file), without_wraps);
+
+    // The class is the same entity, and so is every method it kept.
+    assert_eq!(
+        lifecycle_entity(&state, "Big", EntityKind::Class)
+            .unwrap()
+            .id,
+        class.id
+    );
+    for (id, name) in &members_before {
+        if name == "Big.wraps" {
+            continue;
+        }
+        assert_eq!(
+            state
+                .graph
+                .get_entity(id)
+                .unwrap()
+                .map(|entity| entity.name),
+            Some(name.clone())
+        );
+    }
+    // The published file is the graph's file, and it reopens.
+    let layout = state.layout.clone();
+    drop(state);
+    let reopened = Arc::new(DaemonState::open(layout).unwrap());
+    assert_eq!(lifecycle_disk(&reopened, file), without_wraps);
+    assert!(lifecycle_entity(&reopened, "Big.last", EntityKind::Method).is_some());
+}
+
+/// The same work between siblings of a small class: a name the class has is
+/// refused, a method is removed from between two others, and a class and a
+/// function are created after a top-level class.
+#[test]
+fn entity_lifecycle_removes_a_python_method_between_siblings_and_creates_a_class() {
+    use kin_mcp::entity_lifecycle::EntityPlacement::SiblingAfter;
+    use kin_mcp::source_unit::DeclarationKind;
+    use kin_model::EntityKind;
+    let file = "pkg/app.py";
+    let original = "class App(Base):\n    \"\"\"Doc.\"\"\"\n\n    limit = 3\n\n    def first(self):\n        return 1\n\n    @property\n    def second(self):\n        return 2\n\n    def third(self):\n        return 3\n\n\ndef helper():\n    return 1\n";
+    let (_dir, state) = test_state();
+    let (first, _) = install_exact_source(&state, file, original.as_bytes(), "App.first");
+    let sessions = test_sessions();
+
+    // A name the class already has is refused, and nothing is written.
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        lifecycle_create_as(
+            &state,
+            &first,
+            SiblingAfter,
+            DeclarationKind::Method,
+            "third",
+            "def third(self):\n    return 0\n",
+        ),
+    );
+    assert_eq!(result.is_error, Some(true), "{}", result_text(&result));
+    assert!(
+        result_text(&result).contains("App.third already exists"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(lifecycle_disk(&state, file), original);
+
+    // A decorated method leaves with its decorator.
+    let second = lifecycle_entity(&state, "App.second", EntityKind::Method).unwrap();
+    let result = lifecycle_commit(&state, &sessions, lifecycle_remove(&state, &second));
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    let without_second = original.replacen(
+        "    @property\n    def second(self):\n        return 2\n\n",
+        "",
+        1,
+    );
+    assert_eq!(lifecycle_disk(&state, file), without_second);
+
+    // A class after the class, and a function after that.
+    let class = lifecycle_entity(&state, "App", EntityKind::Class).unwrap();
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        lifecycle_create_as(
+            &state,
+            &class,
+            SiblingAfter,
+            DeclarationKind::Class,
+            "Small",
+            "class Small(App):\n    limit = 4\n\n    def get(self):\n        return self.limit\n",
+        ),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert_eq!(
+        lifecycle_changes(&result),
+        [("created".to_string(), "Small".to_string())]
+    );
+    let small = lifecycle_entity(&state, "Small", EntityKind::Class).unwrap();
+    assert!(lifecycle_entity(&state, "Small.get", EntityKind::Method).is_some());
+    let with_small = without_second.replacen(
+        "        return 3\n",
+        "        return 3\n\n\nclass Small(App):\n    limit = 4\n\n    def get(self):\n        return self.limit\n",
+        1,
+    );
+    assert_eq!(lifecycle_disk(&state, file), with_small);
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        lifecycle_create_as(
+            &state,
+            &small,
+            SiblingAfter,
+            DeclarationKind::Function,
+            "build",
+            "def build():\n    return Small()\n",
+        ),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert!(lifecycle_entity(&state, "build", EntityKind::Function).is_some());
+    assert_eq!(
+        lifecycle_disk(&state, file),
+        with_small.replacen(
+            "        return self.limit\n",
+            "        return self.limit\n\n\ndef build():\n    return Small()\n",
+            1,
+        )
+    );
+    // What the class kept is what it was.
+    assert_eq!(
+        state
+            .graph
+            .get_entity(&first.id)
+            .unwrap()
+            .map(|entity| entity.name),
+        Some("App.first".to_string())
+    );
+    assert_eq!(
+        lifecycle_entity(&state, "App", EntityKind::Class)
+            .unwrap()
+            .id,
+        class.id
+    );
+}
+
+/// What the member path does not do is said, and nothing is written.
+#[test]
+fn entity_lifecycle_refuses_python_member_work_it_cannot_place() {
+    use kin_mcp::entity_lifecycle::EntityPlacement::{Member, NewSourceUnit, SiblingAfter};
+    use kin_mcp::source_unit::DeclarationKind;
+    use kin_model::EntityKind;
+    let file = "pkg/small.py";
+    let original =
+        "class Only:\n    def one(self):\n        return 1\n\n\ndef top():\n    return 2\n";
+    let (_dir, state) = test_state();
+    let (one, _) = install_exact_source(&state, file, original.as_bytes(), "Only.one");
+    let class = lifecycle_entity(&state, "Only", EntityKind::Class).unwrap();
+    let top = lifecycle_entity(&state, "top", EntityKind::Function).unwrap();
+    let sessions = test_sessions();
+    let method = "def two(self):\n    return 2\n";
+    for (operation, said) in [
+        (
+            lifecycle_create_as(&state, &one, Member, DeclarationKind::Method, "two", method),
+            "placement member needs a class",
+        ),
+        (
+            lifecycle_create_as(
+                &state,
+                &top,
+                SiblingAfter,
+                DeclarationKind::Method,
+                "two",
+                method,
+            ),
+            "a method is created beside a method",
+        ),
+        (
+            lifecycle_create_as(
+                &state,
+                &class,
+                NewSourceUnit,
+                DeclarationKind::Class,
+                "Two",
+                "class Two:\n    pass\n",
+            ),
+            "new_source_unit creates one top-level function",
+        ),
+        (
+            lifecycle_create_as(
+                &state,
+                &one,
+                SiblingAfter,
+                DeclarationKind::Method,
+                "two",
+                "def three(self):\n    return 3\n",
+            ),
+            "declares the function three",
+        ),
+        (
+            lifecycle_create_as(
+                &state,
+                &one,
+                SiblingAfter,
+                DeclarationKind::Method,
+                "two",
+                "import os\ndef two(self):\n    return 2\n",
+            ),
+            "exactly one function",
+        ),
+    ] {
+        let result = lifecycle_commit(&state, &sessions, operation);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{said}: {}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains(said),
+            "{said}: {}",
+            result_text(&result)
+        );
+    }
+    // Removing a class's only method would leave it without a body.
+    let remove = kin_mcp::McpMutationOperation {
+        verb: "remove".into(),
+        target: one.id.to_string(),
+        payload: Some(kin_mcp::McpMutationPayload::EntityRemove(
+            kin_mcp::entity_lifecycle::EntityRemove {
+                source_base: lifecycle_base(&state, &one),
+            },
+        )),
+        body: None,
+        destination: None,
+        description: "remove the only method".into(),
+    };
+    let result = lifecycle_commit(&state, &sessions, remove);
+    assert_eq!(result.is_error, Some(true), "{}", result_text(&result));
+    assert!(
+        result_text(&result).contains("without a body"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.layout.working_dir().join(file)).unwrap(),
+        original
+    );
+}
+
+/// A commit parses the source it writes, once, and no other. Every other
+/// source in the graph is unchanged bytes the process has already indexed,
+/// and so are the edited source's previous bytes by its second commit.
+/// Before, each commit parsed every source in the repository again, and the
+/// edited one two to four times.
+#[test]
+fn a_commit_parses_the_source_it_writes_and_no_other() {
+    use kin_mcp::entity_lifecycle::EntityPlacement::SiblingAfter;
+    use kin_mcp::source_unit::DeclarationKind;
+    // Paths no other test uses, since the counts are this process's.
+    let edited = "parse_once_probe/app.py";
+    let others = [
+        "parse_once_probe/models.py",
+        "parse_once_probe/views.py",
+        "parse_once_probe/util.py",
+    ];
+    let (_dir, state) = test_state();
+    for (at, other) in others.iter().enumerate() {
+        let source = format!(
+            "import os\n\n\nclass Other{at}(Base):\n    def run(self, value):\n        return os.path.join(str(value), helper_{at}())\n\n\ndef helper_{at}():\n    return \"{at}\"\n"
+        );
+        install_exact_source(&state, other, source.as_bytes(), &format!("helper_{at}"));
+    }
+    let source = "import os\n\n\nclass App(Base):\n    def first(self):\n        return 1\n\n    def second(self):\n        return 2\n\n    def third(self):\n        return os.getcwd()\n";
+    let (first, _) = install_exact_source(&state, edited, source.as_bytes(), "App.first");
+    let sessions = test_sessions();
+    let parses = kin_index::shared_index::parses_of;
+    let patch = |name: &str, from: &str, to: &str| {
+        let target = lifecycle_entity(&state, name, kin_model::EntityKind::Method).unwrap();
+        kin_mcp::McpMutationOperation {
+            verb: "patch".into(),
+            target: target.id.to_string(),
+            payload: Some(kin_mcp::McpMutationPayload::EntitySourcePatch(
+                kin_mcp::source_base::EntitySourcePatch {
+                    source_base: lifecycle_base(&state, &target),
+                    edits: vec![kin_mcp::source_base::EntityTextEdit {
+                        old_text: from.into(),
+                        new_text: to.into(),
+                    }],
+                },
+            )),
+            body: None,
+            destination: None,
+            description: "change what it returns".into(),
+        }
+    };
+
+    // The first commit may read each source once: nothing in this process
+    // has indexed them through the shared reader yet.
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        patch("App.first", "return 1", "return 10"),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    let edited_after_first = parses(edited);
+    let others_after_first: Vec<u64> = others.iter().map(|other| parses(other)).collect();
+
+    // From then on a patch parses the bytes it writes and nothing else.
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        patch("App.second", "return 2", "return 20"),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert_eq!(parses(edited), edited_after_first + 1);
+    assert_eq!(
+        others.iter().map(|other| parses(other)).collect::<Vec<_>>(),
+        others_after_first
+    );
+
+    // So does a method created beside a sibling.
+    let first = state.graph.get_entity(&first.id).unwrap().unwrap();
+    let result = lifecycle_commit(
+        &state,
+        &sessions,
+        lifecycle_create_as(
+            &state,
+            &first,
+            SiblingAfter,
+            DeclarationKind::Method,
+            "added",
+            "def added(self):\n    return 4\n",
+        ),
+    );
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert_eq!(parses(edited), edited_after_first + 2);
+    assert_eq!(
+        others.iter().map(|other| parses(other)).collect::<Vec<_>>(),
+        others_after_first
+    );
+    // What the commits wrote is what a fresh parse of the result holds.
+    assert!(lifecycle_entity(&state, "App.added", kin_model::EntityKind::Method).is_some());
+    assert!(lifecycle_disk(&state, edited).contains("        return 20\n"));
 }

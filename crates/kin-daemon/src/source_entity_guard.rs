@@ -54,13 +54,30 @@ fn is_member_of(member: &kin_model::Entity, owner: &kin_model::Entity, file: &Fi
         && span_contains(owner.span.as_ref(), member.span.as_ref())
 }
 
+/// Whether `inner` is declared inside `outer`: in the edited source unit,
+/// within `outer`'s span and not `outer` itself.
+///
+/// A function defined in the body of a function, a class in a method, a
+/// method in a class: whatever kind it is and however it is named, it is
+/// part of the code of the entity it stands in.
+fn is_declared_inside(
+    inner: &kin_model::Entity,
+    outer: &kin_model::Entity,
+    file: &FilePathId,
+) -> bool {
+    inner.id != outer.id
+        && inner.file_origin.as_ref() == Some(file)
+        && span_contains(outer.span.as_ref(), inner.span.as_ref())
+}
+
 /// [`first_unsupported_entity_change`] for an edit of the entities in `edited`.
 ///
-/// Editing a struct, interface, trait or enum is how its members change, so a
-/// member nested inside an edited owner may appear (inside the owner's new
-/// span) or disappear (from inside its old span) with the edit. Every other
-/// creation or removal is still refused, so an edit can never add or drop a
-/// declaration beside the one it names.
+/// An edit changes the code of the entity it names, and whatever that code
+/// declares inside itself is part of it. So an entity may appear inside an
+/// edited entity's new span, or disappear from inside its old one, with the
+/// edit: a member of an edited type, a function nested in an edited function.
+/// Every other creation or removal is still refused, so an edit can never
+/// add or drop a declaration beside the one it names.
 pub(crate) fn first_unsupported_entity_change_for_edit<'a, G: EntityStore>(
     delta: &'a TransactionDelta,
     graph: &G,
@@ -86,13 +103,14 @@ pub(crate) fn first_unsupported_entity_change_for_edit<'a, G: EntityStore>(
         let member = match change {
             EntityDelta::Added { new } => {
                 graph.get_entity(&new.id)?.is_none()
-                    && owners_after
-                        .iter()
-                        .any(|owner| is_member_of(new, owner, source_file))
+                    && owners_after.iter().any(|owner| {
+                        is_member_of(new, owner, source_file)
+                            || is_declared_inside(new, owner, source_file)
+                    })
             }
-            EntityDelta::Removed { old } => owners_before
-                .iter()
-                .any(|owner| is_member_of(old, owner, source_file)),
+            EntityDelta::Removed { old } => owners_before.iter().any(|owner| {
+                is_member_of(old, owner, source_file) || is_declared_inside(old, owner, source_file)
+            }),
             EntityDelta::Modified { .. } => false,
         };
         if !member && change_is_unsupported(change, delta, graph, source_file)? {

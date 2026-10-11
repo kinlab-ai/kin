@@ -24,6 +24,7 @@ pub mod artifacts;
 pub mod binding_debt;
 pub mod binding_history;
 pub mod classifier;
+pub mod coverage_certificate;
 pub mod dispatch;
 pub mod error;
 pub mod fingerprint;
@@ -32,15 +33,19 @@ pub mod history;
 /// this repository. Private: the linker owns what an import binding becomes.
 mod import_binding;
 pub mod key_domain;
+pub mod kind;
 pub mod linker;
 pub mod overlay;
 pub mod overrides;
 pub mod pipeline;
+pub mod project_files;
+pub mod receiver_origin;
 pub mod relation_read;
 mod relation_source;
 pub mod repository;
 pub mod resolution;
 pub mod rust_project;
+pub mod shared_index;
 pub mod support;
 pub mod watcher;
 
@@ -66,35 +71,42 @@ pub use history::{
     rederive_tree_semantics, rederive_tree_semantics_from, HistoricalSemanticDelta,
     HistoricalSemanticFold, RederivedTreeSemantics,
 };
+pub use linker::import_alias_call_names;
+pub use linker::written_imports;
 pub use linker::{
     bare_entity_name, bind_parse_coverage_source, build_incremental_parse_coverage_relation,
-    build_parse_coverage_relation, build_projection_derived_relations_for_file,
-    build_projection_derived_relations_from_markers, coverage_evidence,
-    extract_projection_source_markers, is_parse_coverage_relation, is_self_dispatch_candidate,
+    build_incremental_parse_coverage_relation_with_graph, build_parse_coverage_relation,
+    build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
+    coverage_evidence, extract_projection_source_markers, is_parse_coverage_relation,
+    is_previous_format_parse_coverage_relation, is_self_dispatch_candidate,
     is_superseded_parse_coverage_relation, link_cross_file, link_cross_file_against_entities,
     link_cross_file_against_entities_with_completeness, link_cross_file_borrowed_with_completeness,
     link_cross_file_incremental, link_cross_file_incremental_with_completeness,
     link_cross_file_incremental_with_graph, link_cross_file_with_completeness,
-    parse_coverage_source_digest, unanimous_entity_source_digest,
-    workspace_package_import_candidate_paths, CrossFileLinker, FileParseCompletenessMap,
-    FileParseData, IncrementalLinker, IncrementalLinkerCheckpointV1, LinkingOutcome,
-    UnresolvedRelation, BASE_RESOLUTION_COVERAGE_V1, CALL_SHAPE_EVIDENCE_AGGREGATION_V1,
-    CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1,
-    CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1, CALL_SHAPE_PARSE_COVERAGE_FULL_V1,
-    CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1, IMPORT_RESOLUTION_COVERAGE_V1,
-    INCREMENTAL_LINKER_CHECKPOINT_VERSION, KIN_INDEX_CRATE_VERSION,
-    SELF_DISPATCH_OVERRIDE_EVIDENCE_V1,
+    parse_coverage_relation_id, parse_coverage_source_digest, receiver_origin_gaps,
+    receiver_outside_calls, receiver_outside_reads_of, receiver_typed_reads_of,
+    unanimous_entity_source_digest, workspace_package_import_candidate_paths, CrossFileLinker,
+    FileParseCompletenessMap, FileParseData, IncrementalLinker, IncrementalLinkerCheckpointV1,
+    LinkingOutcome, UnresolvedRelation, BASE_RESOLUTION_COVERAGE_V1,
+    CALL_SHAPE_EVIDENCE_AGGREGATION_V1, CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1,
+    CALL_SHAPE_EVIDENCE_INCOMPLETE_PARSE_V1, CALL_SHAPE_EXTRACTION_COVERAGE_INCOMPLETE_V1,
+    CALL_SHAPE_PARSE_COVERAGE_FULL_V1, CALL_SHAPE_PARSE_COVERAGE_INCOMPLETE_V1,
+    IMPORT_RESOLUTION_COVERAGE_V1, SELF_DISPATCH_OVERRIDE_EVIDENCE_V1,
 };
 pub use linker::{
     is_external_import_occurrence, is_external_import_placeholder, is_js_imported_getter_receiver,
     is_raise_classifiable_call_edge, is_raise_target_edge, trace_crossing_for, TraceCrossing,
-    EXTERNAL_IMPORT_REFERENCE_RULE, JS_IMPORTED_GETTER_REFERENCE_RULE, RAISE_TARGET_CALL_RULE,
+    EXTERNAL_IMPORT_REFERENCE_RULE, JS_IMPORTED_GETTER_REFERENCE_RULE, MODULE_FORK_EVIDENCE_RULE,
+    RAISE_TARGET_CALL_RULE,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use overrides::{overriding_methods, OverrideCandidate, OVERRIDDEN_BY_FIELD};
 pub use pipeline::{
     classify_file_role, normalize_file_path_id, IndexPipeline, IndexedAny, IndexedFile,
     COMMAND_EFFECT_CONTRACT_KEY,
+};
+pub use project_files::{
+    naming_manifest_bodies, sources_renamed_by_manifests, GraphProjectFiles, TreeProjectFiles,
 };
 pub use relation_source::{relation_source_entity, RelationSourceIndex};
 pub use repository::{
@@ -110,7 +122,9 @@ pub use repository::{
 };
 pub use resolution::{RelationResolution, RESOLUTION_FIELD, RESOLUTION_TIER_LADDER};
 pub use support::{compute_coverage_report, CoverageReport};
-pub use watcher::{EventsOutsideRoot, FileEvent, FileWatcher, LostEvents};
+pub use watcher::{
+    DeliveryCanary, DeliveryCheck, EventsOutsideRoot, FileEvent, FileWatcher, LostEvents,
+};
 
 use std::path::Path;
 

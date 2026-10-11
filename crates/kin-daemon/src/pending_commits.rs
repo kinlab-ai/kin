@@ -79,7 +79,18 @@ impl PendingCommits {
     /// Whether any commit is inside the daemon right now, or is on its way and
     /// has said so.
     pub(crate) fn any(&self) -> bool {
-        self.inside.load(Ordering::SeqCst) > 0 || self.approaching.load(Ordering::SeqCst)
+        self.inside() || self.approaching.load(Ordering::SeqCst)
+    }
+
+    /// Whether a commit has entered this daemon and not left it, ignoring any
+    /// announcement on disk.
+    ///
+    /// The narrower question a round asks once it has stood down as many times
+    /// in a row as it may. A commit inside the daemon is queued on the gate or
+    /// holding it, so it is certain to publish; an announcement is a client that
+    /// may still be starting, or may have been killed.
+    pub(crate) fn inside(&self) -> bool {
+        self.inside.load(Ordering::SeqCst) > 0
     }
 
     /// Re-read the on-disk announcement for `kin_root` and wake any waiter that

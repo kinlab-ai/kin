@@ -244,7 +244,7 @@ test('the promotions CLI emits the tab-separated lines the workflow reads', () =
 // away. It is unquoted and sits above the marker, and stripPendingNotice cuts
 // forward from the marker, which is exactly what keeps it.
 test('the two-line summary above the marker survives the strip', () => {
-  const summary = 'A graph-native code repository for people and AI agents.\nv1.2.3 lands 4 changes, listed below.\n';
+  const summary = 'A graph-native code repository for AI agents and the people who build with them.\nv1.2.3 lands 4 changes, listed below.\n';
   const notes = '## Notes\n\n- a real change\n';
   // A modern body: summary, then the marker, then the notes.
   const modern = `${summary}\n${PENDING_MARKER}\n\n${notes}`;

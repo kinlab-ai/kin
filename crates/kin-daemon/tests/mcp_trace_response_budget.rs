@@ -183,25 +183,51 @@ fn questioned_hub_source() -> String {
 
 /// Pin the daemon supervisor to a scratch registry, so nothing here reads or
 /// writes the registry of the machine running the test.
-fn install_scratch_registry() {
-    static REGISTRY: OnceLock<std::path::PathBuf> = OnceLock::new();
-    let path = REGISTRY.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!(
-            "kin-trace-budget-registry-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("registry.toml");
-        kin_core::registry::KinRegistry { repos: Vec::new() }
-            .save_to(&path)
-            .unwrap();
-        path
-    });
-    kin_core::test_env::install_process_wide("KIN_REGISTRY_PATH", path);
+/// Hold this file's tests to one at a time.
+///
+/// Trace continuations live in one process-wide snapshot cache that keeps the
+/// newest sixteen pages, which is right for a daemon serving one repository.
+/// `cargo test` runs every test here in one process, so the fixtures' traces
+/// evicted each other's continuations and a paging assertion read "trace
+/// continuation expired or was evicted" instead of its next page. nextest
+/// gives each test its own process and never saw it. The cache's own unit
+/// tests serialize the same way.
+async fn serial_trace_cache() -> tokio::sync::MutexGuard<'static, ()> {
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
-async fn post(state: &Arc<DaemonState>, uri: &str, body: Value) -> (StatusCode, String) {
-    let response = kin_daemon::api::router(Arc::clone(state))
+fn install_scratch_registry() {
+    kin_core::test_env::install_test_registry();
+}
+
+/// One daemon under test: its state and the router it serves.
+///
+/// A daemon builds its router once and serves every request through clones of
+/// it. Building a fresh router for each request repeated the package-registry
+/// setup a router performs when it is built, and on this file's paging sweeps
+/// that setup cost more than the pages it served. The router holds the state
+/// by `Arc`, so a graph change made through `state` reaches every later call.
+struct Daemon {
+    state: Arc<DaemonState>,
+    app: axum::Router,
+}
+
+impl std::ops::Deref for Daemon {
+    type Target = DaemonState;
+
+    fn deref(&self) -> &DaemonState {
+        &self.state
+    }
+}
+
+async fn post(daemon: &Daemon, uri: &str, body: Value) -> (StatusCode, String) {
+    let response = daemon
+        .app
+        .clone()
         .oneshot(
             Request::post(uri)
                 .header("host", "127.0.0.1")
@@ -220,7 +246,7 @@ async fn post(state: &Arc<DaemonState>, uri: &str, body: Value) -> (StatusCode, 
 
 /// One call to the daemon's `/mcp/tools/call`, the route the stdio server
 /// forwards every graph tool to.
-async fn daemon_mcp(state: &Arc<DaemonState>, name: &str, arguments: &Value) -> ToolCallResult {
+async fn daemon_mcp(state: &Daemon, name: &str, arguments: &Value) -> ToolCallResult {
     let (status, body) = post(
         state,
         "/mcp/tools/call",
@@ -249,17 +275,14 @@ fn arguments(value: &Value) -> HashMap<String, Value> {
 
 /// The answer a stdio client receives: the daemon's result, then the envelope
 /// pass `kin mcp start` applies under the budget read from the same arguments.
-async fn served_page(
-    state: &Arc<DaemonState>,
-    arguments_json: &Value,
-) -> (ToolCallResult, ToolCallResult) {
+async fn served_page(state: &Daemon, arguments_json: &Value) -> (ToolCallResult, ToolCallResult) {
     let daemon = daemon_mcp(state, TOOL, arguments_json).await;
     let budget = ResponseBudget::from_arguments(&arguments(arguments_json));
     let client = finalize_bounded(daemon.clone(), Envelope::daemon(), TOOL, &budget);
     (daemon, client)
 }
 
-async fn served(state: &Arc<DaemonState>, query: &Value) -> (ToolCallResult, ToolCallResult) {
+async fn served(state: &Daemon, query: &Value) -> (ToolCallResult, ToolCallResult) {
     let mut args = query.clone();
     let ceiling = ResponseBudget::from_arguments(&arguments(query)).max_chars;
     let mut assembly = TraceAssembly::default();
@@ -305,7 +328,7 @@ fn step_ids(payload: &Value) -> Vec<String> {
         .collect()
 }
 
-async fn fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
+async fn fixture() -> (tempfile::TempDir, Daemon) {
     fixture_with(&[
         ("src/chain.py", chain_source()),
         ("src/owners.py", owners_source()),
@@ -316,7 +339,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<DaemonState>) {
 
 /// Admit a legacy source fixture through conversion before semantic queries.
 /// File creation is fixture preparation, never an agent transaction operation.
-async fn fixture_with(sources: &[(&str, String)]) -> (tempfile::TempDir, Arc<DaemonState>) {
+async fn fixture_with(sources: &[(&str, String)]) -> (tempfile::TempDir, Daemon) {
     install_scratch_registry();
     let dir = tempfile::tempdir().unwrap();
     for (path, body) in sources {
@@ -327,7 +350,12 @@ async fn fixture_with(sources: &[(&str, String)]) -> (tempfile::TempDir, Arc<Dae
     for args in [
         vec!["init", "--quiet"],
         vec!["add", "."],
+        // The seed commit is fixture data, so it runs none of the hooks the
+        // host's Git configuration installs. A host-wide hook that starts an
+        // interpreter cost more than every other Git step here together.
         vec![
+            "-c",
+            "core.hooksPath=/dev/null",
             "-c",
             "user.name=Trace fixture",
             "-c",
@@ -357,7 +385,8 @@ async fn fixture_with(sources: &[(&str, String)]) -> (tempfile::TempDir, Arc<Dae
     state
         .is_initialized
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    (dir, state)
+    let app = kin_daemon::api::router(Arc::clone(&state));
+    (dir, Daemon { state, app })
 }
 
 fn walk_with(budget: Option<(&str, usize)>) -> Value {
@@ -376,6 +405,7 @@ fn walk_with(budget: Option<(&str, usize)>) -> Value {
 
 #[tokio::test]
 async fn mcp_trace_pages_fit_the_floor_and_preserve_ambiguity() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let (_, whole) = served(
         &state,
@@ -490,16 +520,25 @@ async fn mcp_trace_pages_fit_the_floor_and_preserve_ambiguity() {
         )),
         true,
     );
-    let belt_trace = belt.tools.iter().find(|tool| tool.name == TOOL).unwrap();
-    assert_eq!(
-        belt_trace.input_schema["properties"]["max_chars"]["default"],
-        kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS
-    );
+    // The belt lists the plain verb that serves this tool; the old name is a
+    // hidden alias there.
+    let served = kin_mcp::verbs::verb_for(TOOL).unwrap_or(TOOL);
+    let belt_trace = belt
+        .tools
+        .iter()
+        .find(|tool| tool.name == served)
+        .unwrap_or_else(|| panic!("the agent belt lists no `{served}` tool"));
+    // Plain verbs expose the canonical byte budget. Legacy spellings still
+    // dispatch, but are absent from the served typed request schema.
     assert!(
-        belt_trace.input_schema["properties"]["max_chars"]["description"]
-            .as_str()
-            .unwrap()
-            .starts_with("Hard")
+        belt_trace.input_schema["properties"]
+            .get("max_chars")
+            .is_none(),
+        "agent belt trace schema still advertises the hidden max_chars alias"
+    );
+    assert_eq!(
+        belt_trace.input_schema["properties"]["max_output_bytes"]["default"],
+        kin_mcp::agent_belt::AGENT_CHAIN_RESPONSE_MAX_CHARS
     );
     let listing = kin_mcp::tools::tool_definitions();
     let trace = listing.tools.iter().find(|tool| tool.name == TOOL).unwrap();
@@ -524,6 +563,7 @@ const CUT_CEILINGS: [usize; 3] = [RESPONSE_MIN_MAX_CHARS, 6_000, 13_000];
 /// Totals and terminal counters describe the complete reconstructed chain.
 #[tokio::test]
 async fn mcp_trace_step_counters_describe_the_reconstructed_chain() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     for ceiling in CUT_CEILINGS {
         let (_, result) = served(&state, &walk_with(Some(("max_chars", ceiling)))).await;
@@ -538,6 +578,7 @@ async fn mcp_trace_step_counters_describe_the_reconstructed_chain() {
 /// The floor emits a qualified bounded page, unchanged by stdio finalization.
 #[tokio::test]
 async fn mcp_trace_raw_page_accounting_is_bounded_and_stdio_preserves_it() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let query = walk_with(Some(("max_chars", RESPONSE_MIN_MAX_CHARS)));
     let (daemon, client) = served_page(&state, &query).await;
@@ -605,6 +646,7 @@ fn step_sum_contradiction(label: &str, answer: &Value) -> Option<String> {
 /// Requested entity bodies and absolute parent/step identities survive every page.
 #[tokio::test]
 async fn mcp_trace_paging_preserves_requested_bodies_and_step_identity() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture_with(&[("src/padded.py", padded_source())]).await;
     let mut wide = walk_with(Some(("max_chars", RESPONSE_MAX_MAX_CHARS)));
     wide["include_body"] = json!(true);
@@ -730,6 +772,7 @@ fn chain_contradictions(label: &str, answer: &Value) -> Vec<String> {
 /// walk's, and its count and `chain_withheld` add up to `steps_omitted`.
 #[tokio::test]
 async fn mcp_trace_counts_beside_the_chain_describe_the_chain_that_ships() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let mut problems: Vec<String> = Vec::new();
     for ceiling in [
@@ -790,6 +833,7 @@ async fn mcp_trace_counts_beside_the_chain_describe_the_chain_that_ships() {
 /// wrong number.
 #[tokio::test]
 async fn the_in_process_walk_reads_the_budget_the_envelope_grades() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let in_process = |walk: &Value| {
         kin_mcp::handlers::entities::handle_trace_data_flow(&arguments(walk), state.graph.as_ref())
@@ -861,6 +905,7 @@ async fn the_in_process_walk_reads_the_budget_the_envelope_grades() {
 /// Both byte-budget spellings and their precedence govern the exact emitted page.
 #[tokio::test]
 async fn the_daemon_route_pages_under_the_budget_the_envelope_grades() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let mut both = walk_with(Some(("max_chars", 12000)));
     both["max_response_chars"] = json!(2000);
@@ -908,7 +953,7 @@ fn spine_report(walk: &Value) -> Value {
     json!({
         "clips": clips,
         "spine_clipped_steps": walk["spine_clipped_steps"],
-        "spine_dropped_crossing_file": walk["spine_dropped_crossing_file"],
+        "spine_dropped_crossing_unit": walk["spine_dropped_crossing_unit"],
         "disclosure": disclosure,
     })
 }
@@ -925,6 +970,7 @@ fn spine_report(walk: &Value) -> Value {
 /// cut.
 #[tokio::test]
 async fn both_trace_walkers_report_spine_clipping() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let mut problems: Vec<String> = Vec::new();
     for (focal, limit) in [("root", 3), ("root", 2), ("branch_0", 3)] {
@@ -1024,11 +1070,11 @@ fn spine_contradictions(
         .iter()
         .map(|name| walked_crossing.get(name).copied().unwrap_or(0))
         .sum();
-    if answer["spine_dropped_crossing_file"].as_u64().unwrap_or(0) != crossing {
+    if answer["spine_dropped_crossing_unit"].as_u64().unwrap_or(0) != crossing {
         problems.push(format!(
-            "{label}: spine_dropped_crossing_file is {} and the shipped spine's nodes dropped \
+            "{label}: spine_dropped_crossing_unit is {} and the shipped spine's nodes dropped \
              {crossing} crossing a file",
-            answer["spine_dropped_crossing_file"]
+            answer["spine_dropped_crossing_unit"]
         ));
     }
     // The number after `prefix` in `text`, and the quoted name after `quote`.
@@ -1161,6 +1207,7 @@ fn spine_contradictions(
 /// the whole disclosure then described a chain the reply no longer carried.
 #[tokio::test]
 async fn mcp_trace_spine_disclosure_describes_the_chain_that_ships() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let mut problems: Vec<String> = Vec::new();
     // Whether the sweep reached the two cases this test exists for.
@@ -1199,7 +1246,7 @@ async fn mcp_trace_spine_disclosure_describes_the_chain_that_ships() {
                     for clip in answer["clipped_steps"].as_array().into_iter().flatten() {
                         walked_crossing.insert(
                             clip["entity_name"].as_str().unwrap_or_default().to_string(),
-                            clip["dropped_crossing_file"].as_u64().unwrap_or(0),
+                            clip["dropped_crossing_unit"].as_u64().unwrap_or(0),
                         );
                     }
                 }
@@ -1250,7 +1297,7 @@ async fn mcp_trace_spine_disclosure_describes_the_chain_that_ships() {
 
 /// When the envelope pass restates a reply's spine, every clipped node the
 /// reply ships on it is read from its own clip record, so its crossing count is
-/// known and `spine_dropped_crossing_file` is exact.
+/// known and `spine_dropped_crossing_unit` is exact.
 ///
 /// The restatement reads each node from the clip records the passes before it
 /// handed over. The daemon route bounds a trace twice before the stdio envelope
@@ -1262,6 +1309,7 @@ async fn mcp_trace_spine_disclosure_describes_the_chain_that_ships() {
 /// shipped spine node ever reached the envelope pass without its record.
 #[tokio::test]
 async fn the_envelope_pass_reads_every_shipped_spine_nodes_clip_record() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture().await;
     let mut problems: Vec<String> = Vec::new();
     let mut route_withheld_records = 0usize;
@@ -1349,7 +1397,7 @@ async fn the_envelope_pass_reads_every_shipped_spine_nodes_clip_record() {
 
 /// A spine node whose clip record an earlier pass withheld reaches the
 /// envelope pass with its crossing count unknown, and the reply then marks
-/// `spine_dropped_crossing_file` as a floor; a reply whose every spine record
+/// `spine_dropped_crossing_unit` as a floor; a reply whose every spine record
 /// arrived never does.
 ///
 /// The daemon route adds its outside-graph block after the walk has fit
@@ -1359,6 +1407,7 @@ async fn the_envelope_pass_reads_every_shipped_spine_nodes_clip_record() {
 /// marker against what actually reached the envelope pass on every arm.
 #[tokio::test]
 async fn a_spine_crossing_count_the_envelope_pass_cannot_read_whole_is_marked_a_floor() {
+    let _serial = serial_trace_cache().await;
     let (_dir, state) = fixture_with(&[("src/hub.js", questioned_hub_source())]).await;
     let walk = |ceiling: usize| {
         json!({
@@ -1419,14 +1468,14 @@ async fn a_spine_crossing_count_the_envelope_pass_cannot_read_whole_is_marked_a_
                 shipped.contains(*node) && parents.contains(*node) && !recorded.contains(*node)
             })
             .count();
-        let marked = answer["spine_dropped_crossing_file_is_floor"] == json!(true);
+        let marked = answer["spine_dropped_crossing_unit_is_floor"] == json!(true);
         occurred += usize::from(unread > 0);
         withheld_arms += usize::from(recorded.len() < clipped.len());
         if marked != (unread > 0) {
             problems.push(format!(
                 "{label}: {unread} shipped spine node(s) reached the envelope pass without \
-                 their clip record, and spine_dropped_crossing_file_is_floor is {}",
-                answer["spine_dropped_crossing_file_is_floor"]
+                 their clip record, and spine_dropped_crossing_unit_is_floor is {}",
+                answer["spine_dropped_crossing_unit_is_floor"]
             ));
         }
         println!(
@@ -1438,7 +1487,7 @@ async fn a_spine_crossing_count_the_envelope_pass_cannot_read_whole_is_marked_a_
             handed["clipped_steps_withheld"],
             chain.len(),
             answer["spine_clipped_steps"],
-            answer["spine_dropped_crossing_file_is_floor"]
+            answer["spine_dropped_crossing_unit_is_floor"]
         );
     }
     println!(
@@ -1457,6 +1506,7 @@ async fn a_spine_crossing_count_the_envelope_pass_cannot_read_whole_is_marked_a_
 /// reported as a focal the graph lacks.
 #[tokio::test]
 async fn a_walk_from_an_external_symbol_is_refused_as_one_the_walk_does_not_serve() {
+    let _serial = serial_trace_cache().await;
     use kin_model::EntityStore as _;
     let (_dir, state) = fixture().await;
     let symbol = kin_model::ExternalSymbol::new(

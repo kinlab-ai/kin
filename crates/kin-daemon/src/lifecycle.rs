@@ -2271,7 +2271,10 @@ fn write_launch_agent_stage(plist_path: &Path, contents: &[u8]) -> Result<PathBu
                 stage_path.display()
             )
         })?;
-    if let Err(error) = stage.write_all(contents).and_then(|_| stage.sync_all()) {
+    if let Err(error) = stage
+        .write_all(contents)
+        .and_then(|_| kin_blobs::durable::sync_all(&stage))
+    {
         let _ = std::fs::remove_file(&stage_path);
         return Err(format!(
             "write staged digest LaunchAgent {}: {error}",
@@ -2374,7 +2377,8 @@ fn render_launch_agent_plist(
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
-    let working_dir = kin_root.parent().ok_or("no parent")?;
+    let working_dir = kin_core::layout::working_dir_of_store(kin_root).ok_or("no parent")?;
+    let working_dir = working_dir.as_path();
     let canonical_working_dir = working_dir.canonicalize().map_err(|error| {
         format!(
             "canonicalize repository root {} for LaunchAgent registration: {error}",
@@ -2468,10 +2472,10 @@ pub(crate) fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn unregister_launch_agent(kin_root: &Path) {
-    let working_dir = match kin_root.parent() {
-        Some(p) => p,
-        None => return,
+    let Some(working_dir) = kin_core::layout::working_dir_of_store(kin_root) else {
+        return;
     };
+    let working_dir = working_dir.as_path();
     let label = match launch_agent_label(working_dir) {
         Ok(label) => label,
         Err(error) => {
@@ -3777,8 +3781,11 @@ mod tests {
         // A second daemon on the SAME repo must be refused while the first
         // holds the lock — this is the multiplicity bug fix. flock(2) treats
         // each open() independently, so a fresh acquire in-process conflicts
-        // exactly as a separate daemon process would.
-        let second = acquire_singleton_lock(root).expect("lock IO should succeed");
+        // exactly as a separate daemon process would. The first lock is held
+        // for the whole check, so a zero retry budget proves the same refusal
+        // without waiting out SINGLETON_LOCK_RETRY_BUDGET.
+        let second =
+            acquire_singleton_lock_within(root, Duration::ZERO).expect("lock IO should succeed");
         assert!(
             second.is_none(),
             "second daemon must refuse to start while the first holds the lock"

@@ -78,7 +78,7 @@ What it judges, and where:
                       release-shaped archives for a branch or tag without cutting
                       one. Dispatch it ON the candidate branch, which is how the run
                       resolves its workflow and its cache scope from the candidate:
-                      `gh workflow run rc-build.yml --repo firelock-ai/kin --ref <branch>`
+                      `gh workflow run rc-build.yml --repo kinlab-ai/kin --ref <branch>`
   Every leg runs kin scripts/acceptance/magic_repro.py against the installed binaries and requires
   every check to pass.
 
@@ -130,7 +130,7 @@ Runbook:
     bin/kin-release-preflight --archive dist/kin-macos-aarch64.tar.gz --archive dist/kin-linux-aarch64.tar.gz
   on a release candidate that has no tag yet, which is the only form that runs
   the Linux leg before the cut:
-    gh workflow run rc-build.yml --repo firelock-ai/kin --ref <candidate-branch>
+    gh workflow run rc-build.yml --repo kinlab-ai/kin --ref <candidate-branch>
     bin/kin-release-preflight --rc-run <run-id>
   read the FINAL line and the report path it names; nothing is tagged without PASS.
 USAGE
@@ -230,7 +230,7 @@ if [ "${KIN_PREFLIGHT_DEFINITIONS_ONLY:-0}" = 1 ]; then return 0 2>/dev/null || 
 BUILD_DIR=""; BIN_KIN=""; BIN_DAEMON=""; BASE_ARCHIVE=""; KIN_REPO=""; KIN_REF=""
 EXPECT_COMMIT=""; ALLOW_DIRTY=0; LANE=""; LOCK_WAIT=900; EMBED_SECONDS=300; LEG_TIMEOUT=2700
 NO_LINUX=0; NO_REPRO=0; LINUX_IMAGE=""; RUN_ROOT=""; KEEP=0; CPU_EMBED=0
-RC_RUN=""; RC_REPO="firelock-ai/kin"
+RC_RUN=""; RC_REPO="kinlab-ai/kin"
 ARCHIVES=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -559,7 +559,7 @@ resolve_lock_sha() { # <commit> -> prints sha256 of that commit's Cargo.lock, or
     git -C "$KIN_REPO" show "$commit:Cargo.lock" > "$tmp" && sha256_of "$tmp"; return
   fi
   if command -v curl >/dev/null 2>&1 \
-     && bounded 60 curl -fsSL "https://raw.githubusercontent.com/firelock-ai/kin/$commit/Cargo.lock" -o "$tmp" 2>/dev/null; then
+     && bounded 60 curl -fsSL "https://raw.githubusercontent.com/kinlab-ai/kin/$commit/Cargo.lock" -o "$tmp" 2>/dev/null; then
     sha256_of "$tmp"; return
   fi
   return 1
@@ -634,13 +634,13 @@ fetch_base_archive() { # prints the path of a base archive for the host target
   fi
   command -v gh >/dev/null 2>&1 || die "gh is required to fetch a base archive (or pass --base-archive)"
   local tag dest
-  tag="$(bounded 60 gh release view --repo firelock-ai/kin --json tagName --jq .tagName 2>/dev/null || true)"
+  tag="$(bounded 60 gh release view --repo kinlab-ai/kin --json tagName --jq .tagName 2>/dev/null || true)"
   [ -n "$tag" ] || die "could not resolve the newest kin release tag through gh; pass --base-archive"
   dest="$STATE_DIR/base/$tag"
   mkdir -p "$dest"
   if [ ! -f "$dest/kin-$HOST_TARGET.tar.gz" ] || [ ! -f "$dest/kin-$HOST_TARGET.tar.gz.sha256" ]; then
     say "fetching base archive kin-$HOST_TARGET.tar.gz from release $tag" >&2
-    ( cd "$dest" && bounded 600 gh release download "$tag" --repo firelock-ai/kin \
+    ( cd "$dest" && bounded 600 gh release download "$tag" --repo kinlab-ai/kin \
         -p "kin-$HOST_TARGET.tar.gz" -p "kin-$HOST_TARGET.tar.gz.sha256" --clobber ) >&2 \
       || die "gh release download failed for $tag"
   fi

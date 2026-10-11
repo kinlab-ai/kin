@@ -258,13 +258,14 @@ fn refs_lines(graph: &InMemoryGraph, entity: &str) -> String {
 
 #[test]
 fn find_references_lists_every_consumer_that_only_annotates() {
-    // The defect, reproduced and closed. Each of these three names `ParsedNote`
-    // in an annotation and nowhere else, so before annotations carried an edge
-    // every one of them was invisible here.
+    // The defect, reproduced and closed. Each of these names `ParsedNote` in an
+    // annotation and nowhere else. A class-body annotation is owned by the
+    // field (`NoteRow.note`); a function or return annotation stays on the
+    // function.
     let (files, graph) = notes_project();
     let found = find_references(&graph, entity_id(&files, "parsing.py", "ParsedNote"));
 
-    for consumer in ["upsert_note", "latest", "NoteRow"] {
+    for consumer in ["upsert_note", "latest", "NoteRow.note"] {
         assert!(
             found.contains(&("storage.py".to_string(), consumer.to_string())),
             "`{consumer}` annotates ParsedNote and must be listed, got {found:?}"
@@ -274,7 +275,7 @@ fn find_references_lists_every_consumer_that_only_annotates() {
     // And the same answer through the rendered CLI surface, so the edge is
     // proven to reach a shipped command rather than only the relation table.
     let lines = refs_lines(&graph, "ParsedNote");
-    for consumer in ["upsert_note", "latest", "NoteRow"] {
+    for consumer in ["upsert_note", "latest", "NoteRow.note"] {
         assert!(
             lines.contains(consumer),
             "`kin refs ParsedNote` must name `{consumer}`, got:\n{lines}"
@@ -285,14 +286,13 @@ fn find_references_lists_every_consumer_that_only_annotates() {
 #[test]
 fn find_references_on_an_element_type_reaches_the_class_built_from_it() {
     // The second half of the reported miss. `WikiLink` is named only as the
-    // element type of `NoteRow.links`, which is why the context pack for the
-    // annotated class carried no dependency on it.
+    // element type of `NoteRow.links`, and that field owns the reference edge.
     let (files, graph) = notes_project();
     let found = find_references(&graph, entity_id(&files, "parsing.py", "WikiLink"));
 
     assert!(
-        found.contains(&("storage.py".to_string(), "NoteRow".to_string())),
-        "the class whose field type is WikiLink must be listed, got {found:?}"
+        found.contains(&("storage.py".to_string(), "NoteRow.links".to_string())),
+        "the field whose type is WikiLink must be listed, got {found:?}"
     );
 }
 

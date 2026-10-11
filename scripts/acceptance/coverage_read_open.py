@@ -366,10 +366,15 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         # `kin_core` is load-bearing and was missing, which is why check 2 failed.
         # The funnel line this suite counts is emitted by
         # `kin-core/src/repository_authority.rs:367`, and a filter that does not
@@ -456,7 +461,7 @@ class Suite(object):
             handle.write('[project]\nname = "fixture"\nversion = "0.1.0"\n')
         self.git(["add", "-A"])
         self.git(["commit", "-m", "fixture"])
-        rc, out = self.kin_run(["init", "--no-enrich"])
+        rc, out = self.kin_run(["init", "--defer-enrich"])
         if rc != 0:
             raise RuntimeError("kin init exited %d: %s" % (rc, tail(out)))
         return repo

@@ -55,11 +55,14 @@ pub mod external_reference;
 pub mod external_symbol;
 pub mod federation;
 pub mod git_authority;
+pub mod git_snapshot_proof;
 pub mod graph;
 pub mod identity;
 pub mod ids;
+pub mod language_profile;
 pub mod layout;
 pub mod merge;
+pub mod metadata_map;
 pub mod parser_occurrence;
 pub mod preset;
 pub mod projection;
@@ -77,7 +80,9 @@ pub mod session;
 pub mod spec;
 pub mod stats;
 pub mod temporal;
+pub mod test_paths;
 pub mod timestamp;
+pub mod value_escape;
 pub mod verification;
 pub mod work;
 pub mod workspace_tree;
@@ -93,9 +98,11 @@ pub use admission::{
 pub use branch::MergeState;
 pub use call_site_reading::{
     calling_languages, focal_call_names, holds_dynamic_access, in_a_file_without_calls,
-    language_of_path, read_caller_sites, scope_caller_sites, site_could_call, site_could_call_at,
-    site_state_reason, site_text, unplaceable_access, CallSiteFacts, CallSiteTally, CallerSites,
-    FocalEscape, NoResolver, SiteStateKind, UnplaceableAccess,
+    language_of_path, member_dispatch_decorators, member_dispatches_by_construction,
+    member_may_dispatch_without_its_name, reach_is_named, read_caller_sites, scope_caller_sites,
+    site_could_call, site_could_call_at, site_state_reason, site_text, spells_identifier,
+    unplaceable_access, CallSiteFacts, CallSiteTally, CallerSites, FocalEscape, NoResolver,
+    SiteStateKind, UnplaceableAccess,
 };
 pub use change::{
     ChangeOrigin, EntityDelta, LocatedEntry, RelationDelta, ResolvedArtifact, ResolvedTree,
@@ -110,8 +117,10 @@ pub use context::{
 };
 pub use contract::{Contract, ContractKind};
 pub use derivation::{
-    entity_derivation, is_derived_member, is_file_module_surface, require_independent_source,
-    EntityDerivation,
+    entity_derivation, is_derived_member, is_file_module_surface, is_module_container,
+    is_module_value_kind, module_code_syntax, require_guarded_source, require_independent_source,
+    require_targeted_source, serves_module_code, whole_file_refusal_tail, EntityDerivation,
+    ModuleCodeSyntax,
 };
 pub use entity::{
     Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, ParseState,
@@ -142,6 +151,7 @@ pub use git_authority::{
     GitRawTarget, GitTreeEntryMode, GitTreeEntryName, GitTreeEntryNameError,
     GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION,
 };
+pub use git_snapshot_proof::GitSnapshotProof;
 pub use graph::{
     BindingHistoryObservation, ChangeStore, EntityFilter, EntityPage, EntityPageResult,
     EntityStore, GraphStore, ProvenanceStore, RelationLookup, ReviewStore, SessionStore, SubGraph,
@@ -157,9 +167,11 @@ pub use ids::{
     RelationRevisionId, RepoPath, RepoPathError, RepositoryId, RepositoryIdError, SemanticChangeId,
     SessionId, SpecId, WorkspaceId,
 };
+pub use language_profile::{BlockStyle, LanguageProfile};
 pub use layout::{
-    ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact, ParseCompleteness,
-    ShallowTrackedFile, SourceRegion, StructuredArtifact, TrackedFile,
+    is_entity_source_path, ArtifactKind, FileLayout, ImportItem, ImportSection, OpaqueArtifact,
+    ParseCompleteness, ShallowTrackedFile, SourceRegion, StructuredArtifact, TrackedFile,
+    ENTITY_SOURCE_EXTENSIONS,
 };
 pub use merge::{
     MergeConflictEntry, MergeConflictSubject, MergeDivergence, MergeEntryResolution, MergeOpening,
@@ -167,6 +179,7 @@ pub use merge::{
     MergeSideValue, MergeTransactionDelta, MergeTransactionRecord, MergeTransactionState,
     MergeWorkspaceRestorePoint, MERGE_TRANSACTION_SCHEMA_VERSION,
 };
+pub use metadata_map::{MetadataEntries, MetadataMap};
 pub use preset::{
     BrokenAstBehavior, DirectoryPreset, FormattingPolicy, PolicyOverrides, PresetConfig,
     ProjectionMode, ReconcilePolicy, ReconcilePolicyProvider, ValidationLevel, WorldPreset,
@@ -190,6 +203,15 @@ pub use spec::Spec;
 pub use stats::GraphStats;
 pub use temporal::{is_active_at, ArtifactRevision, EntityRevision, RelationRevision};
 pub use timestamp::Timestamp;
+pub use value_escape::{
+    readable_record_version, record_value_lists_mentions, ClassBases, EscapeResidue,
+    FileEscapeRecord, LookupReceiver, MentionForm, MentionResidue, ModuleScope, OccurrenceBinding,
+    OccurrenceContext, OutsideReceiver, OutsideValueRead, ProtocolForm, ProtocolMember,
+    ProtocolResidue, ProtocolSite, ReceiverKind, ReflectiveForm, ReflectiveReach, ReflectiveSite,
+    ResidueSite, UnparsedRegion, UnrelatedReceiver, ValueOccurrence, CLASS_MARKS_RECORD_VERSION,
+    EXCERPT_MAX, NON_ENUMERABLE_MEMBER_KEY, PROTOCOL_MEMBER_KEY, RECEIVER_TEXT_MAX,
+    VALUE_ESCAPE_RECORD_KEY, VALUE_ESCAPE_RECORD_VERSION, VALUE_ESCAPE_RECORD_VERSION_MIN,
+};
 
 pub use provenance::{
     Actor, ActorId, ActorKind, Approval, ApprovalDecision, ApprovalId, AuditEvent, AuditEventId,
@@ -201,7 +223,7 @@ pub use refs::{
 };
 pub use relation::{
     CallArgShape, GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
-    LSP_PROVEN_METHOD_REFERENCES_RULE, LSP_REFERENCES_RULE,
+    LSP_PROVEN_METHOD_REFERENCES_RULE, LSP_REFERENCES_RULE, LSP_REFERENCE_UNDECIDED_RULE,
 };
 mod enrichment_proof;
 pub use enrichment_proof::{enrichment_proof_inputs_by_file, ENRICHMENT_PROOF_MARK_VERSION};

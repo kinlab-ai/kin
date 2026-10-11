@@ -14,16 +14,25 @@ fn kin_process_group_guardian_worker() {
     assert_eq!(dispatched, requested);
 }
 
-fn git(root: &Path, args: &[&str]) {
-    let output = kin_git::test_support::fixture_git_in(root)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn git_batch(root: &Path, steps: &[&[&str]]) {
+    let mut batch = kin_git::test_support::FixtureGitBatch::new();
+    for args in steps {
+        batch.git(*args);
+    }
+    batch.run_in(root);
+}
+
+/// How the workspace's lineage starts: the qualification of its first step.
+fn lineage_start(result: &kin_core::InitResult) -> Option<String> {
+    let manager = kin_db::RepositoryAuthorityManager::open(
+        result.repository_id.clone(),
+        Arc::new(kin_db::LocalFileBackend::new(result.layout.kindb_dir())),
+    )
+    .unwrap();
+    let metadata = serde_json::to_value(manager.read_authority().metadata()).unwrap();
+    metadata["binding_history"][0]["proof"][0]["qualification"]
+        .as_str()
+        .map(str::to_string)
 }
 
 fn observe(result: &kin_core::InitResult) -> (BindingHistoryObservation, usize) {
@@ -56,30 +65,15 @@ fn binding_history_actual_native_genesis_is_checked_on_cold_read() {
     ));
 }
 
+/// A Git history whose every transition is accounted for starts its lineage at
+/// the history's genesis. One with a withdrawal the transition verifier cannot
+/// account for makes no claim about that history: its lineage starts at the
+/// bootstrap instead, as a re-derivation of the graph init just derived, so the
+/// store is still checked from its first generation.
 #[test]
-fn binding_history_actual_git_healthy_history_is_checked_but_unaccounted_withdrawal_is_not() {
+fn binding_history_actual_git_history_genesis_is_claimed_only_when_every_withdrawal_is_accounted() {
     for removed in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        git(root.path(), &["init", "--initial-branch=main"]);
-        git(
-            root.path(),
-            &["config", "user.email", "binding-history@example.invalid"],
-        );
-        git(
-            root.path(),
-            &["config", "user.name", "Binding History Test"],
-        );
-        let excludes = root.path().join(".git/fixture-excludes");
-        std::fs::write(&excludes, "").unwrap();
-        git(
-            root.path(),
-            &["config", "core.excludesFile", excludes.to_str().unwrap()],
-        );
-        let hooks = root.path().join(".git/hooks");
-        git(
-            root.path(),
-            &["config", "core.hooksPath", hooks.to_str().unwrap()],
-        );
         std::fs::write(
             root.path().join("caller.py"),
             "from local import work\ndef run():\n    return work(value=1)\n",
@@ -90,11 +84,24 @@ fn binding_history_actual_git_healthy_history_is_checked_but_unaccounted_withdra
             "def work(value):\n    return value\n",
         )
         .unwrap();
-        git(root.path(), &["add", "."]);
-        git(
+        // The same Git commands in the same order, one fixture launch for
+        // each run of them, since every launch starts its own guardian.
+        let excludes = root.path().join(".git/fixture-excludes");
+        let hooks = root.path().join(".git/hooks");
+        git_batch(
             root.path(),
-            &["commit", "-m", "Actual initial local binding"],
+            &[
+                &["init", "--initial-branch=main"],
+                &["config", "user.email", "binding-history@example.invalid"],
+                &["config", "user.name", "Binding History Test"],
+                &["config", "core.excludesFile", excludes.to_str().unwrap()],
+                &["config", "core.hooksPath", hooks.to_str().unwrap()],
+                &["add", "."],
+                &["commit", "-m", "Actual initial local binding"],
+            ],
         );
+        // Written once `git init` has made `.git`, before init reads it.
+        std::fs::write(&excludes, "").unwrap();
         if removed {
             std::fs::remove_file(root.path().join("local.py")).unwrap();
         } else {
@@ -104,16 +111,30 @@ fn binding_history_actual_git_healthy_history_is_checked_but_unaccounted_withdra
             )
             .unwrap();
         }
-        git(root.path(), &["add", "-A"]);
-        git(
+        git_batch(
             root.path(),
-            &["commit", "-m", "Second historical observation"],
+            &[
+                &["add", "-A"],
+                &["commit", "-m", "Second historical observation"],
+            ],
         );
         let initialized = kin_core::init_from_git(root.path()).unwrap();
         let (observation, calls) = observe(&initialized);
         if removed {
-            assert_eq!(observation, BindingHistoryObservation::Unproven);
+            assert!(
+                matches!(observation, BindingHistoryObservation::Checked { .. }),
+                "{observation:?}"
+            );
+            assert_eq!(
+                lineage_start(&initialized).as_deref(),
+                Some("CheckedRederivation"),
+                "an unaccounted withdrawal must not be claimed as a checked history genesis"
+            );
         } else {
+            assert_eq!(
+                lineage_start(&initialized).as_deref(),
+                Some("CheckedHistoryGenesis")
+            );
             assert!(calls > 0, "fixture must contain a real admitted call");
             assert!(
                 matches!(observation, BindingHistoryObservation::Checked { .. }),

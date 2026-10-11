@@ -199,6 +199,14 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
         (b"raw-\xf0\x9f\xa7\xac.dat", b"renamed-\xf0\x9f\xa7\xaa.dat");
     #[cfg(not(target_vendor = "apple"))]
     let (raw_old_bytes, raw_new_bytes): (&[u8], &[u8]) = (b"raw-\xff.dat", b"renamed-\xfe.dat");
+    // The rename below keeps the artifact's content and mode. Git import
+    // records that exact move of an entity Kin holds without parsing as one
+    // update carrying its identity from the old path to the new, and it reads
+    // a path as such an entity by its UTF-8 name. Darwin's names here are
+    // UTF-8, so there the rename is that move. The other names are not UTF-8,
+    // and the import records them as one removal and one addition.
+    let raw_rename_is_a_move =
+        std::str::from_utf8(raw_old_bytes).is_ok() && std::str::from_utf8(raw_new_bytes).is_ok();
     let raw_old = OsString::from_vec(raw_old_bytes.to_vec());
     let raw_new = OsString::from_vec(raw_new_bytes.to_vec());
     fs::write(repo.join(&raw_old), b"byte-exact path\n").expect("write raw path");
@@ -269,9 +277,17 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
     assert_eq!(report["authority_generation"], 1);
     assert_eq!(report["base"]["source"], "git_object");
     assert_eq!(report["head"]["source"], "git_object");
-    assert_eq!(report["summary"]["artifacts_added"], 2);
-    assert_eq!(report["summary"]["artifacts_updated"], 8);
-    assert_eq!(report["summary"]["artifacts_removed"], 2);
+    // notes.random is added, Dockerfile removed and eight artifacts updated in
+    // place; the raw-named rename is one more update when it is a move, and
+    // one more addition and removal when it is not.
+    let (added, updated, removed) = if raw_rename_is_a_move {
+        (1, 9, 1)
+    } else {
+        (2, 8, 2)
+    };
+    assert_eq!(report["summary"]["artifacts_added"], added);
+    assert_eq!(report["summary"]["artifacts_updated"], updated);
+    assert_eq!(report["summary"]["artifacts_removed"], removed);
     // Admission binds the semantics of every imported change, so a diff across
     // imported history carries entity deltas as well as the exact tree. Both
     // edited supported-language files keep their declaration set and change one
@@ -310,7 +326,7 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
     );
 
     let deltas = deltas_by_representative_path(&report);
-    assert_eq!(deltas.len(), 12);
+    assert_eq!(deltas.len(), added + updated + removed);
     assert!(!deltas.contains_key(&path_hex(b"unchanged.data")));
 
     for path in [
@@ -364,30 +380,56 @@ fn diff_is_exact_for_polyglot_non_code_binary_modes_symlinks_gitlinks_and_raw_pa
         symlink_delta["new"]["entry"]["target_blob"]
     );
 
-    // Imported Git history intentionally does not invent rename identity from
-    // similarity: the exact raw tree records one removal and one addition.
-    // The unit-level exact-tree fixture separately proves that a graph-native
-    // stable artifact ID is rendered as one byte-exact move.
-    let raw_removed = deltas
-        .get(&path_hex(raw_old_bytes))
-        .expect("byte-exact removal");
-    let raw_added = deltas
-        .get(&path_hex(raw_new_bytes))
-        .expect("byte-exact addition");
-    assert_eq!(raw_removed["operation"], "removed");
-    assert_eq!(raw_added["operation"], "added");
-    assert_eq!(
-        raw_removed["old"]["path"]["bytes_hex"],
-        path_hex(raw_old_bytes)
-    );
-    assert_eq!(
-        raw_added["new"]["path"]["bytes_hex"],
-        path_hex(raw_new_bytes)
-    );
-    assert_eq!(
-        raw_removed["old"]["entry"], raw_added["new"]["entry"],
-        "raw Git rename did not preserve exact material identity"
-    );
+    // Either way both paths are rendered byte for byte and the material is
+    // the same on both sides. Identity follows only an exact move, never
+    // similarity, and the move rule's own cases are pinned in kin-git.
+    if raw_rename_is_a_move {
+        assert!(
+            !deltas.contains_key(&path_hex(raw_old_bytes)),
+            "a move is one delta, keyed by its new path"
+        );
+        let raw_moved = deltas
+            .get(&path_hex(raw_new_bytes))
+            .expect("byte-exact move");
+        assert_eq!(raw_moved["operation"], "updated");
+        assert_eq!(
+            raw_moved["old"]["path"]["bytes_hex"],
+            path_hex(raw_old_bytes)
+        );
+        assert_eq!(
+            raw_moved["new"]["path"]["bytes_hex"],
+            path_hex(raw_new_bytes)
+        );
+        assert_eq!(
+            raw_moved["old"]["entry"], raw_moved["new"]["entry"],
+            "raw Git move did not preserve exact material identity"
+        );
+    } else {
+        let raw_removed = deltas
+            .get(&path_hex(raw_old_bytes))
+            .expect("byte-exact removal");
+        let raw_added = deltas
+            .get(&path_hex(raw_new_bytes))
+            .expect("byte-exact addition");
+        assert_eq!(raw_removed["operation"], "removed");
+        assert_eq!(raw_added["operation"], "added");
+        assert_eq!(
+            raw_removed["old"]["path"]["bytes_hex"],
+            path_hex(raw_old_bytes)
+        );
+        assert_eq!(
+            raw_added["new"]["path"]["bytes_hex"],
+            path_hex(raw_new_bytes)
+        );
+        assert_eq!(
+            raw_removed["old"]["entry"], raw_added["new"]["entry"],
+            "raw Git rename did not preserve exact material identity"
+        );
+        assert_ne!(
+            raw_removed["artifact_id"], raw_added["artifact_id"],
+            "a rename the import does not record as a move keeps no identity"
+        );
+    }
 
     let gitlink = deltas
         .get(&path_hex(b"vendor/submodule"))

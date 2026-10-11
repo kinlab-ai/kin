@@ -78,6 +78,9 @@ pub struct CoordinationSurfaceMeta {
 pub(crate) struct EmbeddingMeta {
     vector_enabled: bool,
     embeddings_enabled: bool,
+    local_inference_enabled: bool,
+    external_embeddings_enabled: bool,
+    provider: String,
     metal_enabled: bool,
     model_id: Option<String>,
     model_revision: Option<String>,
@@ -296,17 +299,12 @@ fn coordination_meta_with_source(
 
 /// Whether the Metal embedding backend is *actually* compiled into this binary.
 ///
-/// The real `kin-db/metal` -> `kin-infer/metal` backend is pulled in by the
-/// `[target.'cfg(target_os = "macos")'.dependencies] kin-db = { features = ["metal"] }`
-/// block in kin-cli/Cargo.toml. Cargo target-dependency sections are gated by the build
-/// *target* only — never by the crate's own cargo features (`feature = ...` isn't even
-/// allowed in a `[target.'cfg(...)']` key) — so that block is UNCONDITIONAL on macOS:
-/// Metal is built for every macOS build, even under `--no-default-features`. The `metal`
-/// cargo feature is therefore vestigial for "is Metal built"; the honest predicate is the
-/// target OS alone. (`cfg!(feature = "metal")` would be wrong both ways: true on Linux where
-/// Metal isn't compiled, and false for a macOS `--no-default-features` build where it is.)
+/// The `metal` feature asks for `kin-db/metal` -> `kin-infer/metal`, and kin-infer
+/// compiles its Metal backend only on macOS, so both halves are needed: the feature
+/// alone is true on Linux where nothing Metal is built, and the target alone is true
+/// for a macOS build without embeddings, which carries no inference engine at all.
 const fn metal_active() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(all(feature = "metal", target_os = "macos"))
 }
 
 fn feature_flags() -> Vec<&'static str> {
@@ -317,6 +315,12 @@ fn feature_flags() -> Vec<&'static str> {
     if cfg!(feature = "embeddings") {
         flags.push("embeddings");
     }
+    if cfg!(feature = "external-embeddings") {
+        flags.push("external-embeddings");
+    }
+    if cfg!(feature = "decision") {
+        flags.push("decision");
+    }
     if metal_active() {
         flags.push("metal");
     }
@@ -325,24 +329,31 @@ fn feature_flags() -> Vec<&'static str> {
 }
 
 fn embedding_meta() -> Result<EmbeddingMeta> {
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     {
         let runtime = kin_db::embed::resolved_embedding_runtime()?;
+        let selected = kin_db::embed::embedding_slot_enabled();
         Ok(EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: true,
+            local_inference_enabled: cfg!(any(feature = "embeddings", feature = "decision")),
+            external_embeddings_enabled: cfg!(feature = "external-embeddings"),
+            provider: runtime.provider,
             metal_enabled: metal_active(),
-            model_id: Some(runtime.model_id),
-            model_revision: Some(runtime.revision),
-            pipeline_epoch: Some(runtime.pipeline_epoch),
+            model_id: selected.then_some(runtime.model_id),
+            model_revision: selected.then_some(runtime.revision),
+            pipeline_epoch: selected.then_some(runtime.pipeline_epoch),
         })
     }
 
-    #[cfg(not(feature = "embeddings"))]
+    #[cfg(not(any(feature = "embeddings", feature = "external-embeddings")))]
     {
         Ok(EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: false,
+            local_inference_enabled: cfg!(feature = "decision"),
+            external_embeddings_enabled: false,
+            provider: "none".into(),
             metal_enabled: metal_active(),
             model_id: None,
             model_revision: None,
@@ -1056,6 +1067,10 @@ wait
         } else {
             assert!(!flags.contains(&"vector"));
         }
+        assert_eq!(
+            flags.contains(&"external-embeddings"),
+            cfg!(feature = "external-embeddings")
+        );
         if cfg!(feature = "embeddings") {
             assert!(flags.contains(&"embeddings"));
         } else {
@@ -1067,11 +1082,22 @@ wait
     fn embedding_meta_matches_feature_flags() {
         let meta = embedding_meta().unwrap();
         assert_eq!(meta.vector_enabled, cfg!(feature = "vector"));
-        assert_eq!(meta.embeddings_enabled, cfg!(feature = "embeddings"));
-        // metal_enabled must track the ACTUAL compiled backend (macOS-only), not the
-        // no-op `metal` marker feature which stays on for every target.
+        assert_eq!(
+            meta.embeddings_enabled,
+            cfg!(any(feature = "embeddings", feature = "external-embeddings"))
+        );
+        assert_eq!(
+            meta.local_inference_enabled,
+            cfg!(any(feature = "embeddings", feature = "decision"))
+        );
+        assert_eq!(
+            meta.external_embeddings_enabled,
+            cfg!(feature = "external-embeddings")
+        );
+        // metal_enabled must track the ACTUAL compiled backend: the `metal` feature
+        // on macOS, and never the feature alone, which compiles nothing elsewhere.
         assert_eq!(meta.metal_enabled, metal_active());
-        if cfg!(feature = "embeddings") {
+        if meta.embeddings_enabled && kin_db::embed::embedding_slot_enabled() {
             assert!(meta.model_id.is_some());
             assert!(meta.model_revision.is_some());
             assert!(meta.pipeline_epoch.is_some());

@@ -11,8 +11,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use kin_model::{
     Entity, EntityDelta, EntityId, ExternalReference, ExternalReferenceDelta, ExternalReferenceId,
-    GraphNodeId, Relation, RelationDelta, RelationId, ResolutionRecord, ResolutionRecordDelta,
-    ResolutionRecordId, WorkspaceSemanticDelta,
+    GraphNodeId, Relation, RelationDelta, RelationEvidence, RelationId, ResolutionRecord,
+    ResolutionRecordDelta, ResolutionRecordId, WorkspaceSemanticDelta,
 };
 
 /// Whether two versions of one entity hold the same CONTENT.
@@ -67,6 +67,54 @@ pub fn entity_sides_agree(left: Option<&Entity>, right: Option<&Entity>) -> bool
         (Some(left), Some(right)) => entity_content_agrees(left, right),
         (Some(_), None) | (None, Some(_)) => false,
     }
+}
+
+/// Whether two versions of one relation hold the same content.
+///
+/// A neighbour's edit moves the byte span of every edge in that file, the same
+/// way it moves the span of every entity below it. The span is where the
+/// syntax sat in that revision. The edge is still the same edge.
+///
+/// `created_in` stays content. A legacy certificate records a different
+/// revision on each side, and that disagreement is a conflict. Call shape,
+/// the parser rule, the token, the paths and the occurrence count stay
+/// content too. A merge that ignored those would publish one side's call as
+/// the other's. Exact relation deltas are unchanged: a file-level edit still
+/// records the span it moved. This comparison is only for deciding whether
+/// that movement is its own conflict.
+pub fn relation_content_agrees(left: &Relation, right: &Relation) -> bool {
+    left.kind == right.kind
+        && left.src == right.src
+        && left.dst == right.dst
+        && left.confidence == right.confidence
+        && left.origin == right.origin
+        && left.import_source == right.import_source
+        && left.created_in == right.created_in
+        && evidence_content_agrees(&left.evidence, &right.evidence)
+}
+
+/// [`relation_content_agrees`] where a side may not hold the relation.
+///
+/// Absent on both sides is agreement. Present on one side only is a real
+/// disagreement about whether the edge exists.
+pub fn relation_sides_agree(left: Option<&Relation>, right: Option<&Relation>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => relation_content_agrees(left, right),
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+fn evidence_content_agrees(left: &[RelationEvidence], right: &[RelationEvidence]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.parser_rule == right.parser_rule
+                && left.token == right.token
+                && left.source_path == right.source_path
+                && left.resolved_path == right.resolved_path
+                && left.occurrence_count == right.occurrence_count
+                && left.call_shape == right.call_shape
+        })
 }
 
 /// Derive the exact incremental semantic transition from one workspace graph
@@ -173,7 +221,9 @@ mod tests {
             visibility: Visibility::Public,
             role: EntityRole::Source,
             doc_summary: None,
-            metadata: EntityMetadata { extra },
+            metadata: EntityMetadata {
+                extra: extra.into(),
+            },
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
@@ -222,6 +272,90 @@ mod tests {
         assert!(entity_sides_agree(None, None));
         assert!(!entity_sides_agree(Some(&before), None));
         assert!(!entity_sides_agree(None, Some(&before)));
+    }
+
+    fn relation(start: usize, positional: Option<u32>) -> Relation {
+        use kin_model::{
+            CallArgShape, FilePathId, GraphNodeId, RelationEvidence, RelationKind, RelationOrigin,
+            SourceSpan,
+        };
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Contains,
+            src: GraphNodeId::Entity(EntityId::new()),
+            dst: GraphNodeId::Entity(EntityId::new()),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                source_span: Some(SourceSpan {
+                    file: FilePathId::new("pkg/core.py"),
+                    start_byte: start,
+                    end_byte: start + 24,
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 2,
+                    end_col: 0,
+                }),
+                call_shape: positional
+                    .map(|positional| CallArgShape::new(positional, vec![], false, false)),
+                ..RelationEvidence::default()
+            }],
+        }
+    }
+
+    /// The over-report for an edge. One changed function moves the span of the
+    /// containment edge above it and of the edge below it. Those are the same
+    /// edges.
+    #[test]
+    fn a_shifted_relation_span_is_not_a_change() {
+        let before = relation(0, None);
+        let mut after = relation(40, None);
+        after.id = before.id;
+        after.src = before.src;
+        after.dst = before.dst;
+        assert_ne!(
+            before, after,
+            "the fixture is the noisy case it claims to be"
+        );
+        assert!(relation_content_agrees(&before, &after));
+        assert!(relation_sides_agree(Some(&before), Some(&after)));
+    }
+
+    /// A different call shape is a change. Without this, a predicate that
+    /// ignored every evidence field would satisfy the test above.
+    #[test]
+    fn a_different_call_shape_is_a_change() {
+        let before = relation(0, Some(1));
+        let mut after = relation(0, Some(2));
+        after.id = before.id;
+        after.src = before.src;
+        after.dst = before.dst;
+        assert!(!relation_content_agrees(&before, &after));
+    }
+
+    /// A legacy certificate stamps a different revision on each side. That is
+    /// a disagreement about which change recorded the edge.
+    #[test]
+    fn a_different_created_in_is_a_change() {
+        let before = relation(0, None);
+        let mut after = relation(0, None);
+        after.id = before.id;
+        after.src = before.src;
+        after.dst = before.dst;
+        after.created_in = Some(kin_model::SemanticChangeId::from_hash(Hash256::from_bytes(
+            [7; 32],
+        )));
+        assert!(!relation_content_agrees(&before, &after));
+    }
+
+    #[test]
+    fn a_relation_present_on_one_side_only_disagrees() {
+        let held = relation(0, None);
+        assert!(relation_sides_agree(None, None));
+        assert!(!relation_sides_agree(Some(&held), None));
+        assert!(!relation_sides_agree(None, Some(&held)));
     }
 }
 

@@ -79,13 +79,13 @@ pub(super) fn prepare(
         BatchPredecessor::StartupLoaded => None,
     };
     let current_tree = graph.resolved_tree();
+    crate::source_cas::restage_naming_manifests(state, &current_tree);
     // Cargo/module inputs can change a caller without changing its own bytes.
     // Nominate those callers from the exact admitted trees, not from the set
     // of host files that happened to produce watcher events or declarations.
-    let project_requested = paths.iter().any(|path| {
-        path.as_bytes().ends_with(b".rs")
-            || path.as_bytes().rsplit(|byte| *byte == b'/').next() == Some(b"Cargo.toml")
-    });
+    let project_requested = paths
+        .iter()
+        .any(|path| kin_index::rust_project::is_project_input_of(&current_tree, path.as_bytes()));
     let unknown_previous = kin_model::ResolvedTree::default();
     let project = if project_requested {
         kin_index::rust_project::affected_source_batch(
@@ -139,6 +139,10 @@ pub(super) fn prepare(
     let before = graph.semantic_observation();
     let mut files = Vec::new();
     let pipeline = IndexPipeline::new();
+    // The manifests of the tree the sources are read from name them, so a
+    // Cargo change that renames a crate re-derives its root under the new name.
+    let manifests =
+        kin_index::TreeProjectFiles::from_blobs(&before.resolved_tree, state.blobs.as_ref());
     for path in &paths {
         let Some(file) = semantic_file_id(path) else {
             continue;
@@ -164,7 +168,7 @@ pub(super) fn prepare(
                 };
             }
         };
-        let index = || pipeline.index_any_content(&file, &content, digest);
+        let index = || pipeline.index_any_content_in(&file, &content, digest, &manifests);
         // The injected canonical index failure reaches the one-source batch
         // too, so it models the same fault on both derivation paths.
         #[cfg(test)]

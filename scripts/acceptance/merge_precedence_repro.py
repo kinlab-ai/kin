@@ -332,13 +332,24 @@ def grade_bytes(actual, expected, what):
     return PASS, "%s holds %r" % (what, actual)
 
 
-def grade_refusal_names_both_decisions(stderr, path, entity_names):
+def grade_refusal_names_both_decisions(stderr, unit, entity_names, unit_identity=None):
     """A refusal that does not name both decisions is the defect wearing a
-    refusal costume: the caller still cannot see which two choices collided."""
+    refusal costume: the caller still cannot see which two choices collided.
+
+    The unit that holds both decisions is named the way Kin names any member, as
+    an entity by its kind and its own name (source `lib.rs`), never by where it
+    is projected. `unit` is that own name. `unit_identity`, when the conflict
+    listing carries one, is the selector the caller re-settles the unit with,
+    and the refusal has to name it too, or its remedy names nothing to act on.
+    """
     if not isinstance(stderr, str) or not stderr.strip():
         return UNREADABLE, "the refusal printed nothing at all"
-    if path not in stderr:
-        return FAIL, "the refusal does not name the file %s: %r" % (path, failure_excerpt(stderr))
+    if "`%s`" % unit not in stderr:
+        return FAIL, ("the refusal does not name the unit `%s` that holds both decisions: %r"
+                      % (unit, failure_excerpt(stderr)))
+    if unit_identity and unit_identity not in stderr:
+        return FAIL, ("the refusal names `%s` but not its identity %s, the selector that "
+                      "re-settles it: %r" % (unit, unit_identity, failure_excerpt(stderr)))
     missing = [name for name in entity_names if name not in stderr]
     if missing:
         return FAIL, (
@@ -351,7 +362,7 @@ def grade_refusal_names_both_decisions(stderr, path, entity_names):
             "the refusal does not name the %s side(s) that were chosen: %r"
             % (", ".join(absent), failure_excerpt(stderr))
         )
-    return PASS, "the refusal names %s and both decisions" % (path,)
+    return PASS, "the refusal names the unit `%s` and both decisions" % (unit,)
 
 
 def grade_nothing_published(log_text, before_head):
@@ -393,6 +404,8 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["KIN_REGISTRY_PATH"] = os.path.join(self.home, "registry.toml")
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DAEMON_URL", None)
@@ -528,6 +541,29 @@ class Suite(object):
                 "expected exactly one parked conflict named %s, found %r" % (name, found))
         return found[0]
 
+    def artifact_conflict(self, report, place):
+        """The identity of the one parked member conflict the record places at
+        `place`, or None. The record's label keeps the place as structured detail
+        for the resolver; the refusal a reader sees names the member instead."""
+        found = [(entry.get("subject") or {}).get("artifact")
+                 for entry in (report.get("record") or {}).get("entries") or []
+                 if (entry.get("subject") or {}).get("subject") == "artifact"
+                 and entry.get("label") == place]
+        return found[0] if len(found) == 1 else None
+
+    def entity_candidates(self, report, name):
+        """Every parked entity conflict named `name`, as (identity, own name of the
+        unit that holds it), from the labels `kin conflicts --json` records."""
+        prefix = "%s in " % name
+        found = []
+        for entry in (report.get("record") or {}).get("entries") or []:
+            subject = entry.get("subject") or {}
+            label = entry.get("label")
+            if subject.get("subject") == "entity" and isinstance(label, str) \
+                    and label.startswith(prefix):
+                found.append((subject.get("entity"), label[len(prefix):].rsplit("/", 1)[-1]))
+        return sorted(found)
+
     def head_change(self, repo):
         rc, out, err = self.kin_run(["log", "-n", "1"], repo)
         if rc != 0:
@@ -616,6 +652,7 @@ def check_refusal(suite):
     report = suite.conflicts(repo)
     alpha = suite.entity_conflict(report, "alpha")
     beta = suite.entity_conflict(report, "beta")
+    unit = suite.artifact_conflict(report, "src/lib.rs")
     rc, out, err = suite.kin_run(["resolve", "--theirs", alpha], repo)
     if rc != 0:
         return Result("refusal", UNREADABLE,
@@ -634,8 +671,8 @@ def check_refusal(suite):
                       "%s two contradictory settlements published anyway, with %r on disk"
                       % (TICKET, suite.read_bytes(repo, "src/lib.rs")))
     verdicts = [
-        ("named", grade_refusal_names_both_decisions(err or out, "src/lib.rs",
-                                                     ["alpha", "beta"])),
+        ("named", grade_refusal_names_both_decisions(err or out, "lib.rs",
+                                                     ["alpha", "beta"], unit)),
         ("head", grade_nothing_published(suite.kin_run(["log", "-n", "1"], repo)[1], before)),
     ]
     return _combine("refusal", verdicts)
@@ -1098,19 +1135,36 @@ def grade_name_selector(rc, out, err, marker):
     return (PASS, "the bare name settled")
 
 
-def grade_ambiguous_name_refuses_with_candidates(rc, out, err):
-    """The control. A name two files share must refuse and say which two, or the
-    widened match would settle whichever entry happened to sort first."""
+def grade_ambiguous_name_refuses_with_candidates(rc, out, err, candidates):
+    """The control. A name two units share must refuse and say which two, or the
+    widened match would settle whichever entry happened to sort first.
+
+    `candidates` is (identity, own name of the unit that holds it) for every
+    conflict the name matches, read from `kin conflicts --json`. The refusal has
+    to name each identity, which is what the caller passes back, and each unit,
+    which is how a reader tells two entities of one name apart. A unit is named
+    the way Kin names any member, by its own name, never by its place.
+    """
     text = (err or "") + (out or "")
     if rc is None:
         return (UNREADABLE, "the ambiguous run produced no exit code")
     if rc == 0:
         return (FAIL, "an ambiguous name settled something instead of refusing")
+    if len(candidates or []) != 2:
+        return (UNREADABLE, "the conflict listing carries %d conflicts of that name, not the "
+                            "2 the fixture plants" % len(candidates or []))
     if "matches 2 recorded merge conflicts" not in text:
         return (FAIL, "the refusal does not say how many it matched: %s" % failure_excerpt(text))
-    if "pkg/one.py" not in text or "pkg/two.py" not in text:
-        return (FAIL, "the refusal does not name both candidates: %s" % failure_excerpt(text))
-    return (PASS, "an ambiguous name refuses and names both candidates")
+    unnamed = [identity for identity, _unit in candidates if identity not in text]
+    if unnamed:
+        return (FAIL, "the refusal does not name both candidates (%s missing): %s"
+                % (", ".join(unnamed), failure_excerpt(text)))
+    untold = [unit for _identity, unit in candidates if "`%s`" % unit not in text]
+    if untold:
+        return (FAIL, "the refusal names both candidates but does not tell them apart by the "
+                      "unit that holds each (%s missing): %s"
+                % (", ".join(untold), failure_excerpt(text)))
+    return (PASS, "an ambiguous name refuses and names both candidates by identity and unit")
 
 
 def check_byname(suite):
@@ -1121,10 +1175,12 @@ def check_byname(suite):
     rc, out, err = suite.kin_run(["resolve", "--theirs", "summarize"], repo)
     ambiguous = suite.repo("byname-ambiguous", AMBIG_FILES)
     suite.kin_run(["merge", "feature"], ambiguous)
+    candidates = suite.entity_candidates(suite.conflicts(ambiguous), "summarize")
     arc, aout, aerr = suite.kin_run(["resolve", "--theirs", "summarize"], ambiguous)
     return _combine("byname", [
         ("accepted", grade_name_selector(rc, out, err, "summarize")),
-        ("ambiguous", grade_ambiguous_name_refuses_with_candidates(arc, aout, aerr)),
+        ("ambiguous", grade_ambiguous_name_refuses_with_candidates(arc, aout, aerr,
+                                                                   candidates)),
     ], ticket=WORKFLOW_TICKET)
 
 
@@ -1214,24 +1270,35 @@ MERGE_LOG_NO_TREE = (
 LOG_NO_DELTAS = "change 5f3cd725aa\nParents: 37b6e37b81 3b1d3eeeb7\n"
 
 REFUSAL_FULL = (
-    "Error: the recorded resolutions disagree about src/lib.rs: entity alpha (0ce7fbfa) was "
-    "settled `--theirs`, entity beta (899c1130) was settled `--ours`, and artifact src/lib.rs "
-    "(ce183603) was settled `--ours`, whose bytes do not carry 1 decision(s)"
+    "Error: daemon refused operation 059c65a7 at /commands/resolve with HTTP 409 Conflict and "
+    "published nothing: the recorded resolutions disagree about source `lib.rs`: source "
+    "`lib.rs` (15a4bc33) was settled `--ours`, while inside it entity `alpha` (ae847be0) was "
+    "settled `--theirs`, entity `beta` (f39e0ce1) was settled `--ours`. no side of source "
+    "`lib.rs` carries every one of those entity decisions"
 )
-# Names both decisions and never names the file, which only the path arm catches.
-REFUSAL_NO_PATH = (
+# Names both decisions and never names the unit, which only the unit arm catches.
+REFUSAL_NO_UNIT = (
     "Error: the recorded resolutions disagree: entity alpha was settled `--theirs`, entity beta "
     "was settled `--ours`"
 )
-# Names the file and both flags and neither entity, which only the entity arm catches.
-REFUSAL_NO_ENTITY = (
-    "Error: the recorded resolutions disagree about src/lib.rs: something was settled "
-    "`--theirs` and something else was settled `--ours`"
+# Names where the unit is projected and never the unit, the wording before refusals
+# named members as entities. Only the unit arm catches it.
+REFUSAL_PLACE_ONLY = (
+    "Error: the recorded resolutions disagree about src/lib.rs: entity alpha (0ce7fbfa) was "
+    "settled `--theirs`, entity beta (899c1130) was settled `--ours`, and artifact src/lib.rs "
+    "(15a4bc33) was settled `--ours`, whose bytes do not carry 1 decision(s)"
 )
-# Names the file and both entities and only one flag, which only the flag arm catches.
+# Names the unit by its own name and never by the identity that re-settles it.
+REFUSAL_NO_IDENTITY = REFUSAL_FULL.replace(" (15a4bc33)", "")
+# Names the unit and both flags and neither entity, which only the entity arm catches.
+REFUSAL_NO_ENTITY = (
+    "Error: the recorded resolutions disagree about source `lib.rs` (15a4bc33): something was "
+    "settled `--theirs` and something else was settled `--ours`"
+)
+# Names the unit and both entities and only one flag, which only the flag arm catches.
 REFUSAL_NO_FLAGS = (
-    "Error: the recorded resolutions disagree about src/lib.rs: alpha and beta were settled "
-    "to opposite sides, one of them `--ours`"
+    "Error: the recorded resolutions disagree about source `lib.rs` (15a4bc33): alpha and beta "
+    "were settled to opposite sides, one of them `--ours`"
 )
 
 
@@ -1290,20 +1357,30 @@ def self_test():
     expect("bytes cannot read a file that is not there",
            grade_bytes(None, THEIRS_LIB, "src/lib.rs"), UNREADABLE)
 
-    expect("refusal passes text naming the file and both decisions",
-           grade_refusal_names_both_decisions(REFUSAL_FULL, "src/lib.rs", ["alpha", "beta"]),
+    decisions = ["alpha", "beta"]
+    expect("refusal passes text naming the unit, its identity and both decisions",
+           grade_refusal_names_both_decisions(REFUSAL_FULL, "lib.rs", decisions, "15a4bc33"),
            PASS)
-    expect("refusal fails text that names no file",
-           grade_refusal_names_both_decisions(REFUSAL_NO_PATH, "src/lib.rs", ["alpha", "beta"]),
-           FAIL)
+    expect("refusal passes text naming the unit when the listing carries no identity",
+           grade_refusal_names_both_decisions(REFUSAL_NO_IDENTITY, "lib.rs", decisions),
+           PASS)
+    expect("refusal fails text that names no unit",
+           grade_refusal_names_both_decisions(REFUSAL_NO_UNIT, "lib.rs", decisions,
+                                              "15a4bc33"), FAIL)
+    expect("refusal fails text that names the unit only by its place",
+           grade_refusal_names_both_decisions(REFUSAL_PLACE_ONLY, "lib.rs", decisions,
+                                              "15a4bc33"), FAIL)
+    expect("refusal fails text that names the unit but not the identity that re-settles it",
+           grade_refusal_names_both_decisions(REFUSAL_NO_IDENTITY, "lib.rs", decisions,
+                                              "15a4bc33"), FAIL)
     expect("refusal fails text that names neither entity",
-           grade_refusal_names_both_decisions(REFUSAL_NO_ENTITY, "src/lib.rs", ["alpha", "beta"]),
-           FAIL)
+           grade_refusal_names_both_decisions(REFUSAL_NO_ENTITY, "lib.rs", decisions,
+                                              "15a4bc33"), FAIL)
     expect("refusal fails text that names only one side",
-           grade_refusal_names_both_decisions(REFUSAL_NO_FLAGS, "src/lib.rs", ["alpha", "beta"]),
-           FAIL)
+           grade_refusal_names_both_decisions(REFUSAL_NO_FLAGS, "lib.rs", decisions,
+                                              "15a4bc33"), FAIL)
     expect("refusal cannot read an empty stderr",
-           grade_refusal_names_both_decisions("", "src/lib.rs", ["alpha"]), UNREADABLE)
+           grade_refusal_names_both_decisions("", "lib.rs", ["alpha"]), UNREADABLE)
 
     expect("head passes a branch that did not move",
            grade_nothing_published("change 37b6e37b81\n", "37b6e37b81"), PASS)
@@ -1436,16 +1513,39 @@ def self_test():
     expect("exit code cannot read a missing code",
            grade_exit_code(None, 8, "a parked merge"), UNREADABLE)
 
-    ambiguous_good = ("summarize matches 2 recorded merge conflicts; name one exactly: "
-                      "entity summarize in pkg/one.py (a), entity summarize in pkg/two.py (b)")
-    expect("ambiguity passes a refusal naming both candidates",
-           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_good), PASS)
+    candidates = [("a5f468c9", "one.py"), ("ae112670", "two.py")]
+    ambiguous_good = ("Error: daemon refused operation b60e4326 at /commands/resolve with HTTP "
+                      "400 Bad Request and published nothing: summarize matches 2 recorded "
+                      "merge conflicts; name one exactly: entity `summarize` in source "
+                      "`one.py` (a5f468c9), entity `summarize` in source `two.py` (ae112670)")
+    # The refusal 0.8.2 shipped: both identities, and nothing that tells the two
+    # entities of one name apart.
+    ambiguous_untold = ("summarize matches 2 recorded merge conflicts; name one exactly: "
+                        "entity `summarize` (a5f468c9), entity `summarize` (ae112670)")
+    ambiguous_one = ("summarize matches 2 recorded merge conflicts; name one exactly: "
+                     "entity `summarize` in source `one.py` (a5f468c9), entity `summarize` "
+                     "in source `two.py`")
+    expect("ambiguity passes a refusal naming both candidates by identity and unit",
+           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_good, candidates),
+           PASS)
     expect("ambiguity fails a run that settled instead of refusing",
-           grade_ambiguous_name_refuses_with_candidates(0, "", ambiguous_good), FAIL)
+           grade_ambiguous_name_refuses_with_candidates(0, "", ambiguous_good, candidates),
+           FAIL)
     expect("ambiguity fails a refusal that names neither candidate",
            grade_ambiguous_name_refuses_with_candidates(1, "", "summarize matches 2 recorded "
-                                                              "merge conflicts; name one exactly"),
+                                                              "merge conflicts; name one exactly",
+                                                        candidates),
            FAIL)
+    expect("ambiguity fails a refusal that names one candidate's identity",
+           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_one, candidates),
+           FAIL)
+    expect("ambiguity fails a refusal that cannot tell the candidates apart",
+           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_untold, candidates),
+           FAIL)
+    expect("ambiguity cannot grade without the two candidates the listing carries",
+           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_good,
+                                                        candidates[:1]),
+           UNREADABLE)
     expect("selector fails a bare name that was refused",
            grade_name_selector(1, "", "no recorded merge conflict matches summarize",
                                "summarize"), FAIL)

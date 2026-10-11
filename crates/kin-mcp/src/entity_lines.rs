@@ -3,15 +3,11 @@
 
 //! An entity's source body, with each line marked by its offset in the entity.
 //!
-//! A reader cites a line by its number, and every agent harness numbers the
-//! file text it reads, so an entity body can be served the same way. The
-//! numbers here are the entity's own and never the file's: each line starts
+//! A reader cites an entity line by its offset: each line starts
 //! with `+N` and a tab, where `N` counts from `+0` at the entity's first line.
-//! The plus sign is there so no reader takes `+12` for line 12 of a file, and
+//! The plus sign marks an offset in the entity, and
 //! the note that says what the offsets are sits directly before the body it
-//! describes. Where the answer carries the graph's own span, the note also
-//! gives the arithmetic back to the file, `start_line + N`, because there
-//! `start_line` is the line the body starts on.
+//! describes. It does not expose a physical source coordinate.
 //!
 //! A presentation for an external MCP client and nothing else. It is applied
 //! only on a connection that serves no write path and asked for no exact
@@ -19,8 +15,7 @@
 //! back as the base of an edit, and `kin agent run` copies a body byte for byte
 //! into the text an edit must match, so both are served the exact bytes the
 //! graph holds. `kin agent run` says so when it connects, with the
-//! [`EXACT_BODIES_CAPABILITY`] flag. Whole-file reads are never numbered: a
-//! file's own lines are already its coordinates.
+//! [`EXACT_BODIES_CAPABILITY`] flag.
 
 use serde_json::{Map, Value};
 
@@ -38,22 +33,23 @@ pub const NUMBERING_KEY: &str = "about_body";
 pub const NUMBERING_NOTE: &str = "Each body line starts with +N and a tab, where N is the \
 line's offset from the entity's first line. Strip that prefix for the exact text.";
 
-/// The clause the note gains where `start_line` is the line the body starts on.
-pub const FILE_LINE_CLAUSE: &str = " File line = start_line + N.";
-
 /// The initialize capability, under `capabilities.experimental.kin`, with which
 /// a client asks for exact entity bodies whatever its profile would present.
 pub const EXACT_BODIES_CAPABILITY: &str = "exactEntityBodies";
 
-/// `get_entity_source`'s short description on a connection that numbers.
+/// `source`'s short description on a connection that numbers.
 ///
 /// The same length as the exact form, so a numbering profile's listing costs
 /// what its measured ceiling says.
 pub const NUMBERED_SOURCE_DESCRIPTION: &str = "One entity's source, lines as +N.";
 
-/// Whether `tool` answers with one entity's source body.
+/// Whether `tool` answers with one entity's source body: the registered source
+/// tools, and `source`, the verb that serves one of them.
 pub fn numbers_this_tool(tool: &str) -> bool {
-    matches!(tool, "get_entity_source" | "get_entity_body")
+    matches!(
+        tool,
+        "get_entity_source" | "get_entity_body" | crate::verbs::SOURCE
+    )
 }
 
 /// Whether an `initialize` request asks for exact entity bodies.
@@ -90,16 +86,15 @@ pub fn number_entity_body(result: &mut ToolCallResult) {
         let Some(body) = object.get("body").and_then(Value::as_str) else {
             continue;
         };
-        let numbered = number_lines(body);
-        // The daemon's record carries the graph's own span, and there
-        // `start_line` is the line the body starts on. The offline record's
-        // `start_line` prefers the declaration line below any doc comment, so
-        // the arithmetic would be off by the comment there and is not given.
-        let note = if object.get("start_byte").is_some_and(Value::is_u64) {
-            format!("{NUMBERING_NOTE}{FILE_LINE_CLAUSE}")
-        } else {
-            NUMBERING_NOTE.to_string()
-        };
+        // An excerpt's lines keep the offsets they have in the whole body.
+        let first = object
+            .get(crate::source_pages::EXCERPT_KEY)
+            .and_then(|excerpt| excerpt.get("first_line_in_entity"))
+            .and_then(Value::as_u64)
+            .and_then(|first| usize::try_from(first).ok())
+            .unwrap_or(0);
+        let numbered = number_lines_from(body, first);
+        let note = NUMBERING_NOTE.to_string();
         let mut presented = Map::with_capacity(object.len() + 1);
         for (key, value) in object {
             if key == "body" {
@@ -119,10 +114,16 @@ pub fn number_entity_body(result: &mut ToolCallResult) {
 /// within the body. Line endings are kept as they were, and a final newline
 /// starts no line.
 pub fn number_lines(body: &str) -> String {
+    number_lines_from(body, 0)
+}
+
+/// [`number_lines`] for an excerpt whose first line is line `first` of its
+/// entity.
+pub fn number_lines_from(body: &str, first: usize) -> String {
     let mut numbered = String::with_capacity(body.len() + body.len() / 8 + 8);
     for (offset, line) in body.split_inclusive('\n').enumerate() {
         numbered.push('+');
-        numbered.push_str(&offset.to_string());
+        numbered.push_str(&(first + offset).to_string());
         numbered.push('\t');
         numbered.push_str(line);
     }
@@ -151,10 +152,10 @@ mod tests {
     }
 
     /// The daemon's record shape: the body is marked, the note sits directly
-    /// before it and gives the arithmetic back to the file, and the file
-    /// coordinates are exactly what they were.
+    /// before it and describes only entity-relative offsets. Raw metadata is
+    /// left for the semantic egress projection to remove.
     #[test]
-    fn a_daemon_record_gains_offsets_and_the_file_line_arithmetic() {
+    fn a_daemon_record_gains_only_entity_relative_offsets() {
         let record = json!({
             "id": "e1", "name": "target", "kind": "Function",
             "file_path": "src/lib.rs", "start_line": 120, "end_line": 122,
@@ -170,10 +171,7 @@ mod tests {
             numbered["body"],
             "+0\tfn target() {\n+1\t    call();\n+2\t}"
         );
-        assert_eq!(
-            numbered[NUMBERING_KEY],
-            format!("{NUMBERING_NOTE}{FILE_LINE_CLAUSE}")
-        );
+        assert_eq!(numbered[NUMBERING_KEY], NUMBERING_NOTE.to_string());
         for key in [
             "file_path",
             "start_line",
@@ -210,15 +208,30 @@ mod tests {
     /// The note cannot be read as file line numbers.
     #[test]
     fn the_note_says_the_numbers_are_offsets() {
-        let note = format!("{NUMBERING_NOTE}{FILE_LINE_CLAUSE}");
+        let note = NUMBERING_NOTE.to_string();
         assert!(note.contains("offset from the entity's first line"));
         assert!(note.contains("Strip that prefix for the exact text"));
         assert!(!note.contains('\u{2014}'));
+        assert!(!note.contains("File line"));
+        assert!(!note.contains("start_line"));
         assert_eq!(
             NUMBERED_SOURCE_DESCRIPTION.len(),
             "One entity's exact source, by id.".len(),
             "a numbering listing must cost what the exact one does"
         );
+    }
+
+    /// An excerpt's lines are numbered from where they sit in the whole body,
+    /// so offsets read across excerpts address one entity.
+    #[test]
+    fn an_excerpt_is_numbered_from_its_first_line_in_the_entity() {
+        let record = json!({
+            "id": "e1", "body": "    b();\n}",
+            "body_excerpt": {"first_line_in_entity": 41, "byte_offset": 900},
+        });
+        let mut result = ToolCallResult::text(record.to_string());
+        number_entity_body(&mut result);
+        assert_eq!(text_of(&result)["body"], "+41\t    b();\n+42\t}");
     }
 
     /// Nothing that is not a successful body is touched.

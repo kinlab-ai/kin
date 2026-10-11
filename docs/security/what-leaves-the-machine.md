@@ -43,15 +43,14 @@ same GitHub releases. It runs when you invoke it, and the policy you record with
 `kin update --set-policy` decides whether an available update may interrupt you.
 Requests carry the version ask and nothing else; no repository data is attached.
 
-**Embedding model weights.** The default embedding provider is `local`: embedding and
-reranking run in-process on your hardware. The first time the embedder needs a model it
-does not already hold, it fetches the weights for `KIN_EMBED_MODEL_ID` (default
-`nomic-ai/nomic-embed-text-v1.5`, about 523 MB) from `huggingface.co` into the standard
-`hf_hub` cache. That cache is the home-directory root, `~/.cache/huggingface/hub`: the
-embedder builds its hub client with `hf_hub`'s default constructor, which does not read
-`HF_HOME`, so setting that variable relocates neither the download nor the lookup. After
-the fetch, inference is fully local. The download sends nothing outbound but the fetch
-itself; entity text never rides along.
+**Optional model weights.** Embedding and reranking providers default to `none`:
+graph and lexical retrieval need no model download. Standard CLI and daemon builds
+support external HTTP models. A build with optional local inference can instead run a
+built-in model on your hardware. Explicitly selecting that provider may fetch its
+configured model weights from `huggingface.co` into the standard `hf_hub` cache when
+they are not already cached. The cache is `~/.cache/huggingface/hub`; this client does
+not use `HF_HOME` to relocate it. After the fetch, inference is local. The weight
+download carries no entity text.
 
 **Hosted login and remote surfaces (opt-in).** `kin auth login` speaks to the host you
 name (default `https://kinlab.ai`), and the credential it stores is sent only to that
@@ -67,20 +66,20 @@ the encrypted tier instead. The remote command families (`remote`, `publish`, an
 other hosted surfaces) send exactly what the command says they send, to the remote you
 configured, and nothing runs against a remote you never set up.
 
-**Remote embedding providers (opt-in).** Setting `KIN_EMBED_PROVIDER` to an
-OpenAI-compatible provider sends entity text to the endpoint you configure, because that
-is what remote embedding is. The default is `local`, and nothing selects a remote
-provider on its own.
+**External graph models (opt-in).** Setting `KIN_MODEL_EMBEDDINGS_PROVIDER` or
+`KIN_MODEL_RERANKING_PROVIDER` to `external` sends the selected entity text needed for
+that stage to the endpoint you configure. Model identity, endpoint and credential
+environment variable name are explicit settings. The default is `none`.
+Legacy `KIN_EMBED_PROVIDER` settings remain accepted for compatibility. Nothing
+selects an external provider on its own.
 
 **Agent runs against a model endpoint (opt-in).** `kin agent run --base-url <URL>` posts
 repository-derived text to the OpenAI-compatible endpoint you name. The endpoint is a
 required argument, so there is no default and no host to be surprised by, but the content
 is worth stating plainly: the run drives Kin's own MCP tools and pushes every tool result
 back into the conversation as a message (`crates/kin-agent/src/run.rs`, the `"role":
-"tool"` push), so graph answers and entity source ride along to that endpoint. Together
-with remote embedding this is the second configuration in which source-derived text
-leaves the machine, and the sentence that used to call remote embedding the only one was
-wrong.
+"tool"` push), so graph answers and entity source ride along to that endpoint. Agent runs and explicitly configured external graph models are paths by which
+source-derived text leaves the machine.
 
 **Language-server install (opt-in).** `kin doctor --fix --install-language-servers`
 downloads rust-analyzer's own release binary from `github.com/rust-lang/rust-analyzer`

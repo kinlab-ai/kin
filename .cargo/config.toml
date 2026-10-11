@@ -15,3 +15,11 @@ index = "sparse+https://kinlab.ai/registry/cargo/"
 # kin-lsp fails if this is removed.
 [env]
 KIN_ANALYSIS_ENVIRONMENTS = "0"
+
+# Plain `cargo test` gives every test binary the same environment nextest's
+# setup script gives every test process: a fresh temporary directory for the
+# run, a private Kin registry and relaxed drive flushes. The runner starts any
+# other executable, `cargo run` included, unchanged. See
+# scripts/test-env/cargo-runner.sh.
+[target.'cfg(unix)']
+runner = "scripts/test-env/cargo-runner.sh"

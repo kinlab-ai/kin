@@ -397,10 +397,33 @@ fn source_report_separates_current_body_from_import_and_parse_completeness() {
     graph.upsert_relation(&certificate).unwrap();
     let partial = source_report(&graph);
     assert_eq!(partial.body_binding, SourceBinding::Current);
-    assert_eq!(partial.parse_coverage, DerivationCoverage::Unproven);
-    assert_eq!(partial.call_extraction, DerivationCoverage::Incomplete);
+    // The certificate records parse completeness on its own, so a clean parse
+    // still reads complete when the combined entry says calls were not all
+    // proven. Call extraction reads from the adapter's census, which carried
+    // every call site in a named relation; the combined entry's narrower
+    // call-shape proof is still withdrawn.
+    assert_eq!(partial.parse_coverage, DerivationCoverage::Complete);
+    assert_eq!(partial.call_extraction, DerivationCoverage::Complete);
     assert!(!partial.call_shape_parse_coverage_complete);
     assert!(!complete(&graph));
+}
+
+#[test]
+fn source_report_lists_call_extraction_gaps_and_keeps_parse_complete() {
+    use crate::source_derivation::DerivationCoverage;
+    let (graph, _, _) = fixture(
+        b"import os\n\ndef value(handlers):\n    return handlers['x']()\n\nprint(value({}))\n",
+    );
+    let report = source_report(&graph);
+    assert_eq!(report.parse_coverage, DerivationCoverage::Complete);
+    assert_eq!(report.call_extraction, DerivationCoverage::Incomplete);
+    // `handlers['x']()` names no callee. `print(...)` and `value(...)` sit in
+    // module code, which the module entity owns, so they are calls and not
+    // gaps.
+    assert_eq!(report.call_extraction_gaps, 1, "{report:?}");
+    // Nothing in the repository is named `os`, so the import is external.
+    assert_eq!(report.import_resolution, DerivationCoverage::Complete);
+    assert_eq!(report.unresolved_imports, 0);
 }
 
 #[test]

@@ -46,9 +46,12 @@ pub(crate) fn execute(
     request: &PurgeIgnoredRequest,
 ) -> Result<PurgeIgnoredResponse> {
     let working_dir = state.layout.working_dir();
-    let ignore = kin_index::RepositoryIgnore::load(working_dir)
-        .map_err(kin_index::IndexError::from)
-        .context("load repository ignore rules")?;
+    let ignore = kin_index::RepositoryIgnore::load(&kin_io::WorktreeRoot::new(
+        working_dir,
+        &kin_io::Grant::ambient(),
+    ))
+    .map_err(kin_index::IndexError::from)
+    .context("load repository ignore rules")?;
     let previous = state.graph.resolved_tree();
 
     let mut tracked = Vec::new();
@@ -107,7 +110,7 @@ pub(crate) fn execute(
     // A purge publishes the tree its own walk observed, so it is judged by the
     // same admission policy and must not propose what that policy excludes.
     let scan = kin_index::scan_repository_preserving_graph_only(
-        working_dir,
+        &kin_io::WorktreeRoot::new(working_dir, &kin_io::Grant::ambient()),
         &ignore,
         policy.as_ref(),
         retained_tracked.into_iter(),

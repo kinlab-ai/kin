@@ -8,7 +8,7 @@
 //! at this boundary.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kin_blobs::BlobStore;
 use kin_model::{
@@ -22,7 +22,7 @@ use kin_model::{
 
 use crate::error::{GitError, Result};
 use crate::history_spool::{SemanticChangeSpool, SemanticChangeSpoolWriter};
-use crate::lossless::{GitObjectFormat, LosslessGitRepository};
+use crate::lossless::{CaptureScope, GitObjectFormat, LosslessGitRepository};
 use crate::sealed_observation::AdmittedContentSummary;
 use crate::semantic_import::{
     derive_enriched_semantic_git_history, GitWorkspaceSeed, SemanticGitImportPlan,
@@ -59,6 +59,10 @@ pub struct AdmittedSemanticGitImportPlan {
     pub workspace_base_change_id: Option<SemanticChangeId>,
     pub ref_mutations: Vec<RefMutation>,
     pub default_ref_mutation: Option<DefaultRefMutation>,
+    /// The same history boundary the pre-admission plan holds.
+    pub history_boundary: BTreeSet<GitObjectId>,
+    /// The same capture scope the pre-admission plan holds.
+    pub scope: CaptureScope,
 }
 
 /// Refusal when an admitted plan does not match what its own raw objects,
@@ -70,6 +74,11 @@ impl AdmittedSemanticGitImportPlan {
     /// Effective shared policy for the workspace base tree.
     pub const fn workspace_policy(&self) -> &SharedAdmissionPolicy {
         &self.workspace_policy
+    }
+
+    /// Whether this plan admits the complete reachable history.
+    pub fn is_complete_history(&self) -> bool {
+        self.scope == CaptureScope::Reachable && self.history_boundary.is_empty()
     }
 
     /// Admitted semantic change corresponding to the workspace base commit.
@@ -109,6 +118,8 @@ impl AdmittedSemanticGitImportPlan {
             objects: self.external_objects.clone(),
             refs: self.refs.clone(),
             head: self.head.clone(),
+            history_boundary: self.history_boundary.clone(),
+            scope: self.scope,
         };
         let held_semantics = |oid: GitObjectId| {
             Ok(self
@@ -238,6 +249,7 @@ impl AdmittedSemanticGitImportPlan {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         Ok((transaction, self.changes))
     }
@@ -389,6 +401,8 @@ fn derive_admitted_semantic_git_history(
         objects: plan.external_objects.clone(),
         refs: plan.refs.clone(),
         head: plan.head.clone(),
+        history_boundary: plan.history_boundary.clone(),
+        scope: plan.scope,
     };
     let held_semantics = |oid: GitObjectId| {
         Ok(plan
@@ -488,6 +502,8 @@ fn build_admitted_semantic_git_import_plan(
         workspace_base_change_id: derived.workspace_base_change_id,
         ref_mutations: plan.ref_mutations.clone(),
         default_ref_mutation: plan.default_ref_mutation.clone(),
+        history_boundary: plan.history_boundary.clone(),
+        scope: plan.scope,
     })
 }
 

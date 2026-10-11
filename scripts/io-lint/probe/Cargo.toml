@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# The filesystem boundary lint's own probe. scripts/check-io-lint.py lints this
+# crate with scripts/io-lint/clippy.toml and requires every line marked
+# `io-lint: reported` to be reported with the method it names, and every line
+# marked `io-lint: clean` to be reported for nothing. It is its own workspace so
+# the Kin workspace never builds it.
+
+[package]
+name = "io-lint-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+
+# The workspace's iteration profile, so the same cargo arguments work here.
+[profile.iteration]
+inherits = "dev"

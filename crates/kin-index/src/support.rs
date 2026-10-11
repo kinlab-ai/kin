@@ -6,6 +6,7 @@
 //! Walks a directory tree, classifies every file, and produces a summary
 //! showing how many files fall into each classification bucket.
 
+use kin_io::WorktreeRoot;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -13,6 +14,11 @@ use rayon::prelude::*;
 
 use crate::classifier::{FileClassification, FileClassifier};
 use kin_model::ArtifactKind;
+
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 /// Aggregated coverage report over a directory tree.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -33,7 +39,7 @@ pub struct CoverageReport {
 }
 
 /// Walk `root` and classify every file, returning a [`CoverageReport`].
-pub fn compute_coverage_report(root: &Path) -> crate::Result<CoverageReport> {
+pub fn compute_coverage_report(root: &WorktreeRoot) -> crate::Result<CoverageReport> {
     let files = collect_all_files(root)?;
 
     // Each file is classified independently — the work includes reading file
@@ -283,7 +289,7 @@ fn sorted_map(map: &HashMap<String, usize>) -> Vec<(&String, &usize)> {
 /// [`crate::RepositoryIgnore::admit_everything`]. Coverage answers "how much of
 /// what Kin tracks is enriched", so counting build output Kin never admits would
 /// inflate the denominator with files that can never gain coverage.
-fn collect_all_files(root: &Path) -> crate::Result<Vec<std::path::PathBuf>> {
+fn collect_all_files(root: &WorktreeRoot) -> crate::Result<Vec<std::path::PathBuf>> {
     let ignore = crate::RepositoryIgnore::load(root)?;
     let scan = crate::scan_repository(root, &ignore, std::iter::empty())?;
     Ok(scan
@@ -300,7 +306,7 @@ mod tests {
     #[test]
     fn coverage_report_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = compute_coverage_report(tmp.path()).unwrap();
+        let report = compute_coverage_report(&worktree(tmp.path())).unwrap();
         assert_eq!(report.total_files, 0);
         assert_eq!(report.entity_source_count, 0);
         assert_eq!(report.structured_artifact_count, 0);
@@ -331,7 +337,7 @@ mod tests {
         fs::write(root.join("README.md"), "# Hello").unwrap();
         fs::write(root.join("logo.png"), [0u8; 4]).unwrap();
 
-        let report = compute_coverage_report(root).unwrap();
+        let report = compute_coverage_report(&worktree(root)).unwrap();
 
         assert_eq!(report.total_files, 9);
         assert_eq!(report.entity_source_count, 3);
@@ -386,7 +392,7 @@ mod tests {
         // Opaque
         fs::write(root.join("README.md"), "# Hello").unwrap();
 
-        let report = compute_coverage_report(root).unwrap();
+        let report = compute_coverage_report(&worktree(root)).unwrap();
 
         assert_eq!(report.total_files, 5);
         assert_eq!(report.entity_source_count, 4);
@@ -425,14 +431,14 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("built.rs"), "fn b() {}").unwrap();
 
-        let report = compute_coverage_report(root).unwrap();
+        let report = compute_coverage_report(&worktree(root)).unwrap();
         assert_eq!(report.total_files, 3);
         assert_eq!(report.entity_source_count, 3);
 
         // Falsification: the fixture really does carry the two derived files, so
         // an empty rule set must count all five.
         let everything = crate::scan_repository(
-            root,
+            &worktree(root),
             &crate::RepositoryIgnore::admit_everything(),
             [].iter(),
         )
@@ -454,7 +460,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = compute_coverage_report(root).unwrap();
+        let report = compute_coverage_report(&worktree(root)).unwrap();
         assert_eq!(report.total_files, 2);
         assert_eq!(report.entity_source_count, 2);
         // main.ts has "import " → C5; helper.ts has no imports → C4
@@ -537,7 +543,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("pure.rs"), "fn double(x: i32) -> i32 { x * 2 }").unwrap();
 
-        let report = compute_coverage_report(root).unwrap();
+        let report = compute_coverage_report(&worktree(root)).unwrap();
 
         assert_eq!(report.total_files, 9);
         assert_eq!(report.entity_source_count, 9);
@@ -599,7 +605,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("plain.rb"), "class Bar; end").unwrap();
 
-        let report = compute_coverage_report(root).unwrap();
+        let report = compute_coverage_report(&worktree(root)).unwrap();
 
         assert_eq!(report.entity_source_count, 9);
         assert_eq!(report.c5_cross_file_count, 7);
@@ -620,7 +626,7 @@ mod tests {
     /// Serial counterpart of [`compute_coverage_report`], retained as the
     /// byte-identical reference for the parallel classification pass.
     fn compute_coverage_report_serial(root: &Path) -> crate::Result<CoverageReport> {
-        let files = collect_all_files(root)?;
+        let files = collect_all_files(&worktree(root))?;
         let mut report = CoverageReport::default();
         for file_path in &files {
             report.absorb(classify_file_coverage(file_path));
@@ -669,7 +675,7 @@ mod tests {
             fs::write(dir.join(format!("DATA{i}")), [0u8; 4]).unwrap();
         }
 
-        let parallel = compute_coverage_report(root).unwrap();
+        let parallel = compute_coverage_report(&worktree(root)).unwrap();
         let serial = compute_coverage_report_serial(root).unwrap();
         assert_eq!(
             parallel, serial,
@@ -677,7 +683,7 @@ mod tests {
         );
 
         // Re-running the parallel path must also be stable.
-        let parallel_again = compute_coverage_report(root).unwrap();
+        let parallel_again = compute_coverage_report(&worktree(root)).unwrap();
         assert_eq!(parallel, parallel_again);
         assert!(parallel.total_files >= 240);
     }

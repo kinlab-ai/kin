@@ -365,6 +365,8 @@ class Suite(object):
         self.env["KIN_DAEMON_DISABLE_LSP"] = "1"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         for leaked in ("KIN_MCP_REPO", "KIN_DIR"):
             self.env.pop(leaked, None)
         self._guard = None

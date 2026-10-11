@@ -39,7 +39,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, VersionedAuthorityState};
+use kin_db::{
+    LocalFileBackend, RepositoryAuthorityManager, SourceBlobWriteBatch, VersionedAuthorityState,
+};
 use kin_model::{
     compute_semantic_change_id, ArtifactId, AuthorId, ChangeOrigin, ExternalChangeAlias,
     ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, GitExternalAuthorityDelta,
@@ -572,9 +574,18 @@ fn hashing_the_replication_root_does_not_materialize_the_authority() {
         fixture_bytes
     );
 
-    for (hash, body) in &fixture.bodies.0 {
-        manager.save_source_blob(*hash, body).expect("save body");
-    }
+    // One write session for every body rather than one per body. It persists
+    // exactly the bodies `save_source_blob` would, and the commit below loads
+    // them back, but it takes the repository lock and flushes once instead of
+    // once per object, which was a seventh of this test's time.
+    manager
+        .with_source_blob_write_batch(&mut |batch: &dyn SourceBlobWriteBatch| {
+            for (hash, body) in &fixture.bodies.0 {
+                batch.save(*hash.as_bytes(), body)?;
+            }
+            Ok(())
+        })
+        .expect("save bodies");
 
     let main = RefName::branch(b"main").expect("branch name");
     let mut loader = fixture.bodies.clone();
@@ -632,6 +643,7 @@ fn hashing_the_replication_root_does_not_materialize_the_authority() {
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     drop(lease);
 

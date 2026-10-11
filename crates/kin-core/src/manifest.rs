@@ -169,17 +169,26 @@ impl KinManifest {
         }
     }
 
-    /// Load manifest from a JSON file.
+    /// Load the manifest record at `path`, inside the store directory that
+    /// holds it.
     pub fn load(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;
-        let manifest: Self = serde_json::from_str(&contents)?;
+        let contents = crate::store_records::read(manifest_store(path)?, path)
+            .map_err(|e| KinError::io(path, e))?
+            .ok_or_else(|| {
+                KinError::io(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "no manifest record"),
+                )
+            })?;
+        let manifest: Self = serde_json::from_slice(&contents)?;
         Ok(manifest)
     }
 
-    /// Save manifest to a JSON file.
+    /// Save the manifest record at `path`, replacing it atomically.
     pub fn save(&self, path: &Path) -> Result<()> {
         let contents = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, contents).map_err(|e| KinError::io(path, e))?;
+        crate::store_records::write(manifest_store(path)?, path, contents.as_bytes())
+            .map_err(|e| KinError::io(path, e))?;
         Ok(())
     }
 
@@ -195,6 +204,19 @@ impl KinManifest {
     }
 }
 
+/// The store directory that holds the manifest record at `path`.
+fn manifest_store(path: &Path) -> Result<&Path> {
+    path.parent().ok_or_else(|| {
+        KinError::io(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a manifest record needs a store directory around it",
+            ),
+        )
+    })
+}
+
 /// Read ONLY the `kin_version` from a `.kin/manifest.json` and classify it
 /// against [`MIN_COMPATIBLE_KIN_VERSION`].
 ///
@@ -205,16 +227,17 @@ impl KinManifest {
 /// treat an absent manifest — and a manifest with no `kin_version` is likewise
 /// treated as compatible rather than blocked.
 pub fn check_manifest_compatibility(path: &Path) -> Result<ManifestCompatibility> {
-    if !path.exists() {
+    let Some(contents) = crate::store_records::read(manifest_store(path)?, path)
+        .map_err(|e| KinError::io(path, e))?
+    else {
         return Ok(ManifestCompatibility::Compatible);
-    }
+    };
     #[derive(Deserialize)]
     struct VersionProbe {
         #[serde(default)]
         kin_version: Option<String>,
     }
-    let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;
-    let probe: VersionProbe = serde_json::from_str(&contents)?;
+    let probe: VersionProbe = serde_json::from_slice(&contents)?;
     Ok(match probe.kin_version {
         Some(version) => classify_kin_version(&version),
         None => ManifestCompatibility::Compatible,

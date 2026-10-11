@@ -1,0 +1,390 @@
+{
+ "_kin": {
+  "completeness": {
+   "bound": "at_least",
+   "classes": {
+    "calls": "present",
+    "imports": "present",
+    "references": "present"
+   },
+   "decided_by": [
+    "calls",
+    "imports",
+    "references"
+   ],
+   "limits": [
+    "degraded:memory_pressure",
+    "verdict_inconclusive",
+    "response_bounded"
+   ],
+   "status": "unknown",
+   "substrate": "edges"
+  },
+  "envelope_version": 2,
+  "provenance": "answered by repo-daemon; from graph generation 4; no_admission_recorded; reconciliation settled; source binding current; store semantics current; degraded: memory_pressure; rows served from graph at change 13ccfb15830c (committed) spans digest_verified 1",
+  "response": {
+   "bounded": true,
+   "chars_after_budget": 11846,
+   "chars_before_budget": 30413,
+   "compact": true,
+   "max_chars": 24576,
+   "primary_collection": "dependencies",
+   "primary_rows": 10
+  },
+  "verdict": {
+   "absence_claim": "not_applicable",
+   "inputs": {
+    "absence_gate": "inconclusive",
+    "call_sites": "certified",
+    "completeness": "certified",
+    "degradations": "inconclusive",
+    "edge_coverage": "certified",
+    "response_budget": "inconclusive"
+   },
+   "limiting_factor": "response_bounded; degraded; method_call_resolution_incomplete; retrieval_degraded",
+   "safe_to_conclude_absent": false,
+   "state": "inconclusive"
+  }
+ },
+ "answer_tokens": 613,
+ "call_sites": {
+  "by_state": {
+   "proven_external": 7,
+   "proven_target": 4
+  },
+  "callers": 1,
+  "callers_owed_derivation": 0,
+  "callers_owed_enrichment": 0,
+  "callers_stale": 0,
+  "callers_unproven_no_resolver": 0,
+  "callers_unverified": 0,
+  "clauses": [],
+  "no_resolver": {},
+  "reading": "current",
+  "rows": [],
+  "rows_withheld": 11,
+  "scope": "the focal's own body",
+  "settled": true,
+  "sites": 11,
+  "unverified_contexts": {}
+ },
+ "caller_arrival": {
+  "count_exact": false,
+  "family_files": 5,
+  "family_measured": 5,
+  "files_counted_from_site_ledgers": 4,
+  "owed_caller_count": 0,
+  "scope": "this reading counts a call site as arrived when the graph holds any call edge from it, including a call the linker bound to a same-named definition in the caller's own file, and it reads only the files that hold an import edge into the focal's file, so a caller that reaches the focal without one is not read",
+  "state": "unaccounted",
+  "unaccounted_file_count": 3,
+  "unaccounted_files": [
+   {
+    "count_exact": true,
+    "count_source": "site_ledgers",
+    "file": "src/flask/app.py",
+    "owed_callers": 0,
+    "parsed_call_sites": 207,
+    "resolved_call_edges": 183,
+    "shortfall_is_floor": false,
+    "unaccounted_call_sites": 24,
+    "unsettled_by_state": {
+     "binding": 4,
+     "unresolved": 20
+    }
+   },
+   {
+    "count_exact": true,
+    "count_source": "site_ledgers",
+    "file": "src/flask/sansio/app.py",
+    "owed_callers": 0,
+    "parsed_call_sites": 97,
+    "resolved_call_edges": 86,
+    "shortfall_is_floor": false,
+    "unaccounted_call_sites": 11,
+    "unsettled_by_state": {
+     "binding": 2,
+     "unresolved": 9
+    }
+   },
+   {
+    "count_exact": true,
+    "count_source": "site_ledgers",
+    "file": "src/flask/templating.py",
+    "owed_callers": 0,
+    "parsed_call_sites": 43,
+    "resolved_call_edges": 38,
+    "shortfall_is_floor": false,
+    "unaccounted_call_sites": 5,
+    "unsettled_by_state": {
+     "unresolved": 5
+    }
+   }
+  ],
+  "unaccounted_files_truncated": false,
+  "unmeasured_reason": null
+ },
+ "degradations": [
+  {
+   "chars_before_budget": 30413,
+   "component": "response_budget",
+   "detail": "complete context output was reduced to fit its effective token or byte limit; elisions identify the withheld projections",
+   "reason": "response_bounded"
+  }
+ ],
+ "dependencies": [
+  {
+   "end_line": 1482,
+   "file_path": "src/flask/app.py",
+   "id": "1914f185-6712-41cf-9197-e4fb07636460",
+   "kind": "method",
+   "name": "Flask.do_teardown_appcontext",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "def do_teardown_appcontext(self, ctx: AppContext, exc: BaseException | None = None) -> None",
+   "start_line": 1456
+  },
+  {
+   "end_line": 682,
+   "file_path": "src/flask/helpers.py",
+   "id": "7e80452e-8e52-4530-b61c-18e2daa7cbda",
+   "kind": "method",
+   "name": "_CollectErrors.raise_any",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "def raise_any(self, message: str) -> None",
+   "start_line": 676
+  },
+  {
+   "end_line": 682,
+   "file_path": "src/flask/helpers.py",
+   "id": "9c579cef-25a9-4ba3-a54d-60aea192d570",
+   "kind": "class",
+   "name": "_CollectErrors",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "class _CollectErrors",
+   "start_line": 654
+  },
+  {
+   "end_line": 1454,
+   "file_path": "src/flask/app.py",
+   "id": "e3f7a60f-22fa-4185-9954-7e9ca6c3e675",
+   "kind": "method",
+   "name": "Flask.do_teardown_request",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "def do_teardown_request(self, ctx: AppContext, exc: BaseException | None = None) -> None",
+   "start_line": 1423
+  },
+  {
+   "end_line": 1628,
+   "file_path": "src/flask/app.py",
+   "id": "23644d17-578f-425e-a039-345ea9f5ce84",
+   "kind": "class",
+   "name": "Flask",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "class Flask(App)",
+   "start_line": 110
+  },
+  {
+   "end_line": 1080,
+   "file_path": "src/flask/app.py",
+   "id": "2898318c-4e04-4f54-be35-7c219630ba0d",
+   "kind": "method",
+   "name": "Flask.ensure_sync",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "def ensure_sync(self, func: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]",
+   "start_line": 1068
+  },
+  {
+   "end_line": 40,
+   "file_path": "src/flask/globals.py",
+   "id": "3943bfdf-b70f-477c-a1ed-c2cbd8c9d445",
+   "kind": "constant",
+   "name": "_cv_app",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "_cv_app: ContextVar[AppContext] = ContextVar(\"flask.app_ctx\")",
+   "start_line": 40
+  },
+  {
+   "end_line": 16,
+   "file_path": "src/flask/signals.py",
+   "id": "4a2d1fae-f5f6-4447-a880-3557913692e7",
+   "kind": "constant",
+   "name": "appcontext_popped",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "appcontext_popped = _signals.signal(\"appcontext-popped\")",
+   "start_line": 16
+  },
+  {
+   "end_line": 525,
+   "file_path": "src/flask/ctx.py",
+   "id": "30acb47e-56ec-4536-b310-5d9c40d7188c",
+   "kind": "class",
+   "name": "AppContext",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "class AppContext",
+   "start_line": 260
+  },
+  {
+   "end_line": 219,
+   "file_path": "src/flask/wrappers.py",
+   "id": "f635dce2-850f-41dc-b5cd-dfcad6b4f9f1",
+   "kind": "class",
+   "name": "Request",
+   "projection": "SignatureOnly",
+   "relation": "dependency_edge",
+   "signature": "class Request(RequestBase)",
+   "start_line": 18
+  }
+ ],
+ "dependency_selection": {
+  "certified_dependents": 6,
+  "dependents_returned": 1,
+  "dependents_withheld": 0,
+  "external_calls_returned": 0,
+  "returned": 10,
+  "same_file_candidates": 0,
+  "same_file_dropped": 0,
+  "source": "dependency_edges"
+ },
+ "dependents": [
+  {
+   "end_line": 1619,
+   "file_path": "src/flask/app.py",
+   "id": "5b74db4a-1b06-4643-bebe-3b700a33b4c3",
+   "kind": "method",
+   "name": "Flask.wsgi_app",
+   "projection": "SignatureOnly",
+   "relation": "dependent_edge",
+   "signature": "def wsgi_app(self, environ: WSGIEnvironment, start_response: StartResponse) -> cabc.Iterable[bytes]",
+   "start_line": 1569
+  }
+ ],
+ "dependents_withheld": 5,
+ "edge_coverage": {
+  "budget_exhausted": false,
+  "classes": {
+   "calls": "present",
+   "imports": "present",
+   "references": "present"
+  },
+  "cross_unit_classes": [
+   "calls",
+   "imports",
+   "references"
+  ],
+  "entities_examined": 5,
+  "language": "Python",
+  "limits": [
+   "absence_gate:inconclusive",
+   "degradations:inconclusive"
+  ],
+  "reference_enrichment": "available",
+  "requested_classes": [
+   "calls",
+   "imports",
+   "references"
+  ],
+  "scan": "ran",
+  "scope": "language",
+  "unproduced_evidence": null,
+  "witnessed_by_answer": [
+   "calls",
+   "references"
+  ]
+ },
+ "elisions": {
+  "call_site_rows": {
+   "elided": 11,
+   "kept": 0,
+   "reason": "token_budget",
+   "total": 11
+  },
+  "dependents": {
+   "elided": 5,
+   "kept": 1,
+   "reason": "token_budget",
+   "total": 6
+  },
+  "external_calls": {
+   "elided": 5,
+   "kept": 0,
+   "reason": "token_budget",
+   "total": 5
+  },
+  "tests": {
+   "elided": 4,
+   "kept": 0,
+   "reason": "response_budget",
+   "total": 4
+  },
+  "transitive_deps": {
+   "elided": 102,
+   "kept": 0,
+   "reason": "token_budget, response_budget",
+   "total": 102
+  }
+ },
+ "external_calls": [],
+ "external_calls_withheld": 5,
+ "focal_entity": {
+  "body": "def pop(self, exc: BaseException | None = None) -> None:\n    ...\n",
+  "body_complete": true,
+  "end_line": 504,
+  "file_path": "src/flask/ctx.py",
+  "id": "4bf5cda3-6b30-4361-96cb-b9f72736d582",
+  "kind": "method",
+  "name": "AppContext.pop",
+  "projection": "FullBody",
+  "signature": "def pop(self, exc: BaseException | None = None) -> None",
+  "start_line": 446
+ },
+ "negative": {
+  "advice": "5 dependent rows were found but withheld by the response limits; 1 are returned, so this answer asserts no absence, against graph as-of {\"generation\":4} with graph coverage for Python (calls present, imports present, references present; a language server available for it) and degraded signals [memory_pressure, response_budget:response_bounded]. Treat these rows as a lower bound rather than the whole set, and do not conclude anything from what is missing from them. Limiting factor: see `negative.trust_reason`",
+  "bounding_signals": [
+   "memory_pressure",
+   "response_budget:response_bounded"
+  ],
+  "coverage_basis": "graph_structure",
+  "degraded_signals": [
+   "memory_pressure",
+   "response_budget:response_bounded"
+  ],
+  "graph_as_of": {
+   "generation": 4
+  },
+  "interpretation": "qualified_answer",
+  "kind": "qualified_answer",
+  "result_count": 1,
+  "safe_to_conclude_absent": false,
+  "semantic_coverage": null,
+  "subject": "5 dependent rows were found but withheld by the response limits; 1 are returned, so this answer asserts no absence",
+  "trust": "inconclusive",
+  "trust_reason": "response_bounded: the response budget withheld part of this answer, so its counts are a lower bound and its absence claims are not authoritative; degraded: the daemon reported a degraded signal, so the index may not reflect current truth; method_call_resolution_incomplete: receiver-method calls are linked by bare name and may be unresolved, so an empty result is not an authoritative absence for a method; retrieval_degraded: this query reported degradations [response_budget:response_bounded], so it did not run at full capability; response_bounded: response limits withheld known dependents"
+ },
+ "tests": [],
+ "tests_withheld": 4,
+ "token_budget": 4000,
+ "tokens_used": 3968,
+ "transitive_deps": [],
+ "transitive_deps_withheld": 102,
+ "withheld": {
+  "how": "read any of these by id with get_entity_source",
+  "rows": {
+   "dependents": [
+    "29d669db-6cac-4e96-baac-a2d6f7b77420",
+    "60205f9f-60d6-4587-b420-9c4a922ac362",
+    "b2b5f663-6fa5-400e-a479-7e5576c13e68",
+    "600c6388-0170-48cc-bde5-2bc591e4e8aa",
+    "814d3050-213d-43a8-9fed-d0905c3df9e9"
+   ]
+  },
+  "transitive_rows": 102
+ }
+}

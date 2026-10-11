@@ -294,6 +294,7 @@ pub(crate) fn settle_with<S: EntityStore + ?Sized>(
     answers: &[SiteAnswer],
     outside: OutsideProof<'_>,
 ) -> Result<Settlement, S::Error> {
+    let tree = crate::call_site_ledger::source_tree(file, text);
     let mut proofs: HashMap<(EntityId, usize, usize), Proof> = HashMap::new();
     for answer in answers {
         if answer.site.file.0 != file {
@@ -441,6 +442,7 @@ pub(crate) fn settle_with<S: EntityStore + ?Sized>(
                         file,
                         text,
                         span,
+                        tree: tree.as_ref(),
                         name: &name,
                         bound: &bound_entity,
                         proofs: &proofs,
@@ -575,6 +577,7 @@ struct SiteInput<'a> {
     file: &'a str,
     text: &'a str,
     span: &'a kin_model::SourceSpan,
+    tree: Option<&'a call_sites::SourceTree>,
     /// The bound destination's own name, which the callee token must spell for
     /// a proof to contradict the edge.
     name: &'a str,
@@ -598,7 +601,11 @@ fn settle_site<S: EntityStore + ?Sized>(
     proven_external: &mut ProvenExternal,
     counts: &mut SettlementCounts,
 ) -> Result<SiteOutcome, S::Error> {
-    let Some(token) = call_sites::callee_token(site.file, site.text, site.span) else {
+    let Some(token) = site
+        .tree
+        .and_then(|tree| call_sites::callee_token_in_tree(tree, site.text, site.span))
+        .or_else(|| call_sites::callee_token(site.file, site.text, site.span))
+    else {
         return Ok(SiteOutcome::Kept);
     };
     let Some(proof) = site
@@ -1020,6 +1027,65 @@ mod tests {
     fn sorted(mut ids: Vec<RelationId>) -> Vec<RelationId> {
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn a_tagged_template_guess_matches_the_definition_at_its_tag() {
+        let file = "run.ts";
+        let text = "function run() { return sql`select ${format(value)}`; }";
+        let graph = kin_db::InMemoryGraph::new();
+        let run = entity("run", file, EntityKind::Function);
+        let wrong = entity("sql", "wrong.ts", EntityKind::Function);
+        let target = entity("sql", "query.ts", EntityKind::Function);
+        for e in [&run, &wrong, &target] {
+            graph.upsert_entity(e).unwrap();
+        }
+        let at = text.find("sql").unwrap();
+        let token = SourceSpan {
+            file: FilePathId::new(file),
+            start_byte: at,
+            end_byte: at + 3,
+            start_line: 0,
+            start_col: at as u32,
+            end_line: 0,
+            end_col: at as u32 + 3,
+        };
+        let guessed = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(run.id),
+            dst: GraphNodeId::Entity(wrong.id),
+            confidence: kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                source_span: Some(SourceSpan {
+                    end_byte: text.rfind('`').unwrap() + 1,
+                    ..token.clone()
+                }),
+                ..Default::default()
+            }],
+        };
+        graph.upsert_relation(&guessed).unwrap();
+        let answers = [SiteAnswer {
+            source: run.id,
+            site: token.clone(),
+            target: SiteTarget::Entity(target.id),
+            rule: DEFINITION_RULE,
+        }];
+        let settled = settle(&graph, file, text, &answers).unwrap();
+        assert_eq!(ids(&settled.retired), [guessed.id]);
+        assert_eq!(settled.proven.len(), 1);
+        assert_eq!(
+            settled.proven[0].evidence[0].source_span.as_ref(),
+            Some(&token)
+        );
+        apply(&graph, &settled);
+        assert!(
+            settle(&graph, file, text, &answers).unwrap().is_empty(),
+            "a standing exact tag proof is reused"
+        );
     }
 
     #[test]

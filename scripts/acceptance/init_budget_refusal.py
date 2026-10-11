@@ -436,9 +436,14 @@ class Suite(object):
         self.home = os.path.join(workdir, "home")
         os.makedirs(self.home, exist_ok=True)
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         # A scratch KIN_HOME so nothing here touches the machine's real store
         # registry, and so a daemon this suite starts is never the fleet's.
         self.env["KIN_HOME"] = self.home
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["HOME"] = self.home
         self.env["GIT_CONFIG_NOSYSTEM"] = "1"
         self.env.pop(CEILING_ENV, None)
@@ -682,7 +687,11 @@ def summary_names_a_daemon_death(text):
     attested" names no death.
     """
     text = text or ""
-    return "completion not attested" in text and DEATH_CLAUSE_STEM in text
+    unattested = (
+        "completion not attested" in text
+        or "not confirmed that background analysis finished" in text
+    )
+    return unattested and DEATH_CLAUSE_STEM in text
 
 
 def check_4(suite):

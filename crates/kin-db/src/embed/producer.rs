@@ -28,7 +28,7 @@ pub enum EmbeddingProducer {
 }
 
 impl EmbeddingProducer {
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub(crate) const fn cache_tag(self) -> u8 {
         match self {
             Self::Cpu => 1,
@@ -39,7 +39,7 @@ impl EmbeddingProducer {
         }
     }
 
-    #[cfg(feature = "embeddings")]
+    #[cfg(any(feature = "embeddings", feature = "external-embeddings"))]
     pub(crate) const fn from_cache_tag(tag: u8) -> Option<Self> {
         match tag {
             1 => Some(Self::Cpu),

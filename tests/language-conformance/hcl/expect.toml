@@ -1,0 +1,165 @@
+# Language conformance fixture: HCL. See capabilities.toml for what each
+# capability measures, and crates/kin-parser/src/language_conformance_test.rs
+# for how. Each [capability] declares the outcome Kin has today; the suite
+# fails when the measured outcome differs in either direction.
+language = "hcl"
+
+[sources]
+module = "main.tf"
+helper = "modules/helper/main.tf"
+test = "tests/ledger.tftest.hcl"
+
+[parse_clean]
+status = "pass"
+
+[entities]
+status = "pass"
+expect = [
+  "Module module.helper",
+  "StaticVar var.values",
+  "Constant local.scaled",
+  "StaticVar output.total",
+  "modules/helper/main.tf: StaticVar var.factor",
+]
+
+[module_name]
+status = "n/a"
+reason = "A Terraform module is a directory, so HCL has no per-source module coordinate."
+
+[module_contains]
+status = "n/a"
+reason = "A Terraform module is a directory, so HCL has no per-source module entity to contain blocks."
+
+[declaration_extent]
+status = "pass"
+starts = { "var.values" = "# The values the ledger sums." }
+
+[census_clean]
+status = "pass"
+
+[nested_definition]
+status = "n/a"
+reason = "HCL has no functions to nest definitions in."
+
+[call_same_file]
+status = "n/a"
+reason = "HCL has no user-defined functions to call."
+
+[call_receiver]
+status = "n/a"
+reason = "HCL has no methods and no receivers."
+
+[imports]
+status = "pass"
+module_path = "./modules/helper"
+
+[tests_detected]
+status = "refused"
+reason = "Kin parses .tf and .tfvars as HCL, so a Terraform test (.tftest.hcl) is held as an unparsed entity and no test is detected."
+name = "total"
+runner = "terraform"
+
+[refuse_unparseable]
+status = "pass"
+find = 'variable "values" {'
+replace = 'variable "values" ('
+line = 6
+
+[placement_three_forms]
+status = "pass"
+entity = "var.values"
+
+[create_remove_spacing]
+status = "pass"
+anchor = "module.helper"
+code = '''
+variable "factor" {
+  type = number
+}'''
+entity = "var.factor"
+documented = "var.values"
+doc = "# The values the ledger sums."
+
+[form_generator]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_async]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_bound_lambda]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_default_export]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_overload]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_nested_type]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_decorated]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[form_field]
+status = "n/a"
+reason = "HCL declares blocks and attributes, not functions, types or fields."
+
+[body_edit_keeps_entities]
+status = "n/a"
+reason = "HCL has no function bodies."
+
+[route_source]
+status = "pass"
+entity = "var.values"
+starts = "# The values the ledger sums."
+
+[route_locate]
+status = "pass"
+query = "values"
+entity = "var.values"
+
+[route_refs]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[route_impact]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[route_context]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[route_update]
+status = "pass"
+entity = "var.values"
+find = "1, 2"
+replace = "1, 3"
+
+[route_patch]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[route_body_edit]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[route_create_sibling]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[route_remove]
+status = "n/a"
+reason = "HCL declares blocks, not functions, callers or types."
+
+[form_flow_types]
+status = "n/a"
+reason = "Flow annotates JavaScript only."

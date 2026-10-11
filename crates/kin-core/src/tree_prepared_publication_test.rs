@@ -4,8 +4,17 @@
 use super::*;
 use std::cell::Cell;
 
+// Bare projection fixtures create an in-tree control; initialized repository
+// fixtures use the exact store selected by discovery, including central stores.
+fn reconciliation_dir(root: &Path) -> PathBuf {
+    crate::layout::locate_store(root)
+        .map(|layout| layout.root().to_path_buf())
+        .unwrap_or_else(|| root.join(".kin"))
+        .join("reconciliation")
+}
+
 fn has_wal(root: &Path) -> bool {
-    std::fs::read_dir(root.join(".kin/reconciliation"))
+    std::fs::read_dir(reconciliation_dir(root))
         .unwrap()
         .any(|entry| {
             entry
@@ -49,9 +58,8 @@ fn prepared_workspace_observers_report_actual_payload_ack_and_first_primary_boun
         // so the observer root has to be the resolved one. A macOS temporary
         // root is reached through a symlinked ancestor, and an unresolved join
         // would simply never match the runtime's exact path.
-        let db_root = std::fs::canonicalize(f.root.path())
+        let db_root = std::fs::canonicalize(f.layout.kindb_dir())
             .unwrap()
-            .join(".kin/kindb")
             .join(f.transaction.repository_id.as_str());
         let authority_path = db_root.join("authority.json");
         let prior: serde_json::Value =
@@ -171,7 +179,7 @@ fn assert_projection_locked(root: &Path) {
     let contender = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(root.join(".kin/reconciliation/projection.lock"))
+        .open(reconciliation_dir(root).join("projection.lock"))
         .unwrap();
     assert!(
         fs2::FileExt::try_lock_exclusive(&contender).is_err(),
@@ -352,6 +360,8 @@ fn prepared_publication_finalization_refusal_retains_committed_bytes_and_wal() {
 
 struct StorageFixture {
     root: tempfile::TempDir,
+    #[cfg(feature = "test-support")]
+    layout: crate::layout::KinLayout,
     authority: RepositoryAuthorityManager<LocalFileBackend>,
     transaction: RepositoryTransaction,
     observed: kin_db::GraphSnapshot,
@@ -429,9 +439,12 @@ impl StorageFixture {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         };
         Self {
             root,
+            #[cfg(feature = "test-support")]
+            layout: initialized.layout,
             authority,
             transaction,
             observed,

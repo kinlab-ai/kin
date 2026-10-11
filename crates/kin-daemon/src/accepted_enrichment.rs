@@ -25,6 +25,17 @@
 //! the graph, and an absent or unreadable record degrades to exactly what this
 //! daemon did before it existed.
 //!
+//! What the live graph retires again is withdrawn from the record too. A sweep
+//! over a file it already finished can accept a proof and then retract it in
+//! the same pass, when the file's call-site ledger settles the site otherwise:
+//! Flask's `ScriptInfo.load_app` gets a `Calls` to each of the three
+//! `locate_app` overloads on every sweep, and its ledger retracts all three
+//! because the answers disagree. The live graph then ends exactly where
+//! authority is and keeps its checked binding witness, and nothing is left to
+//! publish, so nothing commits and empties the record. Replaying the retracted
+//! proofs gave every restarted daemon a graph the sweep never left behind, and
+//! with it an unproven binding interval no later sweep could settle.
+//!
 //! # Size
 //!
 //! The record has no size limit, on purpose. It used to refuse new evidence at
@@ -50,7 +61,8 @@
 //! One line of JSON per relation, appended as it is accepted, so a process that
 //! dies mid-write loses only the partial tail and every complete line before it
 //! still parses. A retirement is a line of its own naming the files whose
-//! recorded evidence it drops, applied in order at replay. A node line carries
+//! recorded evidence it drops, and a withdrawal one naming the relations the
+//! live graph removed, each applied in order at replay. A node line carries
 //! the external symbols and proof contexts accepted relations name, which
 //! replay installs before any relation so a recorded edge into a symbol
 //! outside the repository finds its endpoint. Rewriting the whole
@@ -99,6 +111,16 @@ struct Retirement {
 /// first field, so the two can be told apart without parsing a line twice.
 const RETIREMENT_PREFIX: &[u8] = b"{\"retired_files\":";
 
+/// A line that withdraws the recorded evidence of relations the live graph
+/// has since removed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Withdrawal {
+    withdrawn_relations: Vec<RelationId>,
+}
+
+/// How every withdrawal line starts.
+const WITHDRAWAL_PREFIX: &[u8] = b"{\"withdrawn_relations\":";
+
 /// A line carrying the graph nodes and records accepted relations name.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct AcceptedNodes {
@@ -135,6 +157,7 @@ fn encode_lines(relations: &[Relation]) -> serde_json::Result<Vec<u8>> {
 enum Line {
     Relation(Relation),
     Retirement(Vec<String>),
+    Withdrawal(Vec<RelationId>),
     Nodes(NodeSet),
     Blank,
     Unparsed,
@@ -147,6 +170,11 @@ fn parse_line(line: &[u8]) -> Line {
     if line.starts_with(RETIREMENT_PREFIX) {
         return serde_json::from_slice::<Retirement>(line).map_or(Line::Unparsed, |retirement| {
             Line::Retirement(retirement.retired_files)
+        });
+    }
+    if line.starts_with(WITHDRAWAL_PREFIX) {
+        return serde_json::from_slice::<Withdrawal>(line).map_or(Line::Unparsed, |withdrawal| {
+            Line::Withdrawal(withdrawal.withdrawn_relations)
         });
     }
     if line.starts_with(NODES_PREFIX) {
@@ -162,15 +190,52 @@ fn parse_line(line: &[u8]) -> Line {
 struct Index {
     latest: HashMap<RelationId, usize>,
     retired_at: HashMap<String, usize>,
+    withdrawn_at: HashMap<RelationId, usize>,
     lines: usize,
     unparsed: usize,
 }
 
 impl Index {
+    /// Read one line of the record, written at `sequence`. Relation and node
+    /// lines are left to the caller.
+    fn absorb(&mut self, sequence: usize, line: &Line) {
+        match line {
+            Line::Relation(relation) => {
+                self.lines += 1;
+                self.latest.insert(relation.id, sequence);
+            }
+            Line::Retirement(files) => {
+                self.lines += 1;
+                for file in files {
+                    self.retired_at.insert(file.clone(), sequence);
+                }
+            }
+            Line::Withdrawal(relations) => {
+                self.lines += 1;
+                for relation in relations {
+                    self.withdrawn_at.insert(*relation, sequence);
+                }
+            }
+            Line::Nodes(_) => self.lines += 1,
+            Line::Unparsed => self.unparsed += 1,
+            Line::Blank => {}
+        }
+    }
+
+    /// Whether the live graph removed the relation recorded on line
+    /// `sequence` after recording it.
+    fn withdrawn(&self, sequence: usize, relation: &Relation) -> bool {
+        self.withdrawn_at
+            .get(&relation.id)
+            .is_some_and(|withdrawn| *withdrawn > sequence)
+    }
+
     /// Whether the relation recorded on line `sequence` is the one replay
-    /// reinstalls: its latest version, and not retired after it was recorded.
+    /// reinstalls: its latest version, not withdrawn after it was recorded,
+    /// and not retired with its file after it was recorded.
     fn keeps(&self, sequence: usize, relation: &Relation) -> bool {
         self.latest.get(&relation.id) == Some(&sequence)
+            && !self.withdrawn(sequence, relation)
             && !relation.evidence.iter().any(|evidence| {
                 evidence.source_span.as_ref().is_some_and(|span| {
                     self.retired_at
@@ -219,7 +284,7 @@ fn rewrite(
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&staged)?);
         write(&mut writer)?;
         let file = writer.into_inner().map_err(|error| error.into_error())?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
         std::fs::rename(&staged, &target)
     })();
     if replaced.is_err() {
@@ -411,11 +476,12 @@ fn unrecorded_names(relations: &[Relation]) -> String {
 /// since it was recorded, so it is dropped too and the record shrinks back to
 /// the evidence that is still only accepted.
 ///
-/// Two streaming readings: the first learns each relation's latest line and
-/// each file's last retirement, the second reinstalls what survives and writes
-/// it into the replacement as it goes. If indexing cannot read the record to
-/// its end, nothing is replayed: the unread suffix may retire or supersede a
-/// relation in the prefix. The record stays intact for the next start.
+/// Two streaming readings: the first learns each relation's latest line, its
+/// last withdrawal and each file's last retirement, the second reinstalls what
+/// survives and writes it into the replacement as it goes. If indexing cannot
+/// read the record to its end, nothing is replayed: the unread suffix may
+/// retire, withdraw or supersede a relation in the prefix. The record stays
+/// intact for the next start.
 pub(crate) fn replay(layout: &KinLayout, graph: &InMemoryGraph) -> usize {
     replay_with_read(layout, graph, |visit| read(layout, visit))
 }
@@ -428,24 +494,13 @@ fn replay_with_read(
     let _io = record_io();
     let mut index = Index::default();
     let mut nodes = NodeSet::default();
-    let indexed = read_record(&mut |sequence, line| match parse_line(line) {
-        Line::Relation(relation) => {
-            index.lines += 1;
-            index.latest.insert(relation.id, sequence);
-        }
-        Line::Retirement(files) => {
-            index.lines += 1;
-            for file in files {
-                index.retired_at.insert(file, sequence);
-            }
-        }
-        Line::Nodes(set) => {
-            index.lines += 1;
+    let indexed = read_record(&mut |sequence, line| {
+        let line = parse_line(line);
+        index.absorb(sequence, &line);
+        if let Line::Nodes(set) = line {
             nodes.external_references.extend(set.external_references);
             nodes.resolution_records.extend(set.resolution_records);
         }
-        Line::Unparsed => index.unparsed += 1,
-        Line::Blank => {}
     });
     match indexed {
         Ok(false) => return 0,
@@ -472,99 +527,107 @@ fn replay_with_read(
     let mut replayed = 0usize;
     let mut refused = 0usize;
     let mut committed = 0usize;
-    let mut reinstall = |sequence: usize, line: &[u8], out: &mut dyn std::io::Write| {
-        let Line::Relation(relation) = parse_line(line) else {
-            return Ok(());
-        };
-        if !index.keeps(sequence, &relation) {
-            return Ok(());
-        }
-        // This also fences a crash after the upgrade committed its removals
-        // but before it cleaned the journal. Spanless old records are classified
-        // by admitted endpoint language, not by a filename or a guessed name.
-        let scope = serde_json::from_slice::<kin_core::lsp_scope::AcceptedRelation>(line)
-            .ok()
-            .and_then(|record| record.python_workspace_scope);
-        if scope != Some(kin_core::lsp_scope::WORKSPACE_SCOPE)
-            && kin_core::lsp_scope::is_python_relation(&relation, |id| {
-                graph
-                    .get_entity(id)
-                    .ok()
-                    .flatten()
-                    .map(|entity| entity.language)
-            })
-        {
-            refused += 1;
-            return Ok(());
-        }
-        if graph.get_relation_by_id(&relation.id).is_some() {
-            committed += 1;
-            return Ok(());
-        }
-        let endpoints_present = [relation.src, relation.dst]
-            .into_iter()
-            .all(|node| match node {
-                kin_model::GraphNodeId::Entity(id) => {
-                    graph.get_entity(&id).ok().flatten().is_some()
-                }
-                kin_model::GraphNodeId::Artifact(id) => graph.resolved_tree().get(&id).is_some(),
-                kin_model::GraphNodeId::ExternalReference(id) => {
-                    graph.get_external_reference(&id).is_some()
-                }
-                _ => false,
-            });
-        if !endpoints_present {
-            refused += 1;
-            debug!(
-                relation = %relation.id,
-                "this graph refuses a recorded language-server relation with unadmitted endpoint; dropping it"
-            );
-            return Ok(());
-        }
-        match graph.upsert_relation(&relation) {
-            Ok(_) => {
-                replayed += 1;
-                out.write_all(line)?;
-                out.write_all(b"\n")
-            }
-            Err(error) => {
-                refused += 1;
-                debug!(
-                    relation = %relation.id,
-                    %error,
-                    "this graph refuses a recorded language-server relation; dropping it"
-                );
-                Ok(())
-            }
-        }
-    };
-
+    let mut withdrawn = 0usize;
     // The symbols and contexts go in first, so a recorded edge into one finds
     // its endpoint; the ones installed stay recorded until a commit.
     let installed_nodes = install_recorded_nodes(graph, nodes);
-    let rewritten = rewrite(layout, |out| {
-        if !installed_nodes.external_references.is_empty()
-            || !installed_nodes.resolution_records.is_empty()
-        {
-            serde_json::to_writer(
-                &mut *out,
-                &AcceptedNodes {
-                    accepted_nodes: NodeSet {
-                        external_references: installed_nodes.external_references.clone(),
-                        resolution_records: installed_nodes.resolution_records.clone(),
-                    },
-                },
-            )
-            .map_err(std::io::Error::other)?;
-            out.write_all(b"\n")?;
-        }
-        let mut failed = None;
-        read_record(&mut |sequence, line| {
-            if failed.is_none() {
-                failed = reinstall(sequence, line, out).err();
+    let rewritten = graph.with_relation_text_refresh_batch_before_readers(|upsert| {
+        let mut reinstall = |sequence: usize, line: &[u8], out: &mut dyn std::io::Write| {
+            let Line::Relation(relation) = parse_line(line) else {
+                return Ok(());
+            };
+            if !index.keeps(sequence, &relation) {
+                if index.latest.get(&relation.id) == Some(&sequence)
+                    && index.withdrawn(sequence, &relation)
+                {
+                    withdrawn += 1;
+                }
+                return Ok(());
             }
-        })?;
-        failed.map_or(Ok(()), Err)
+            // This also fences a crash after the upgrade committed its removals
+            // but before it cleaned the journal. Spanless old records are classified
+            // by admitted endpoint language, not by a filename or a guessed name.
+            let scope = serde_json::from_slice::<kin_core::lsp_scope::AcceptedRelation>(line)
+                .ok()
+                .and_then(|record| record.python_workspace_scope);
+            if scope != Some(kin_core::lsp_scope::WORKSPACE_SCOPE)
+                && kin_core::lsp_scope::is_python_relation(&relation, |id| {
+                    graph
+                        .get_entity(id)
+                        .ok()
+                        .flatten()
+                        .map(|entity| entity.language)
+                })
+            {
+                refused += 1;
+                return Ok(());
+            }
+            if graph.get_relation_by_id(&relation.id).is_some() {
+                committed += 1;
+                return Ok(());
+            }
+            let endpoints_present = [relation.src, relation.dst]
+                .into_iter()
+                .all(|node| match node {
+                    kin_model::GraphNodeId::Entity(id) => {
+                        graph.get_entity(&id).ok().flatten().is_some()
+                    }
+                    kin_model::GraphNodeId::Artifact(id) => graph.resolved_tree().get(&id).is_some(),
+                    kin_model::GraphNodeId::ExternalReference(id) => {
+                        graph.get_external_reference(&id).is_some()
+                    }
+                    _ => false,
+                });
+            if !endpoints_present {
+                refused += 1;
+                debug!(
+                    relation = %relation.id,
+                    "this graph refuses a recorded language-server relation with unadmitted endpoint; dropping it"
+                );
+                return Ok(());
+            }
+            match upsert(&relation) {
+                Ok(_) => {
+                    replayed += 1;
+                    out.write_all(line)?;
+                    out.write_all(b"\n")
+                }
+                Err(error) => {
+                    refused += 1;
+                    debug!(
+                        relation = %relation.id,
+                        %error,
+                        "this graph refuses a recorded language-server relation; dropping it"
+                    );
+                    Ok(())
+                }
+            }
+        };
+
+        rewrite(layout, |out| {
+            if !installed_nodes.external_references.is_empty()
+                || !installed_nodes.resolution_records.is_empty()
+            {
+                serde_json::to_writer(
+                    &mut *out,
+                    &AcceptedNodes {
+                        accepted_nodes: NodeSet {
+                            external_references: installed_nodes.external_references.clone(),
+                            resolution_records: installed_nodes.resolution_records.clone(),
+                        },
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+                out.write_all(b"\n")?;
+            }
+            let mut failed = None;
+            read_record(&mut |sequence, line| {
+                if failed.is_none() {
+                    failed = reinstall(sequence, line, out).err();
+                }
+            })?;
+            failed.map_or(Ok(()), Err)
+        })
     });
     if let Err(error) = rewritten {
         warn!(
@@ -578,16 +641,50 @@ fn replay_with_read(
     // checked witness back over it restored a checked capability inside an
     // interval a crash prefix has to leave unknown. Two crash-prefix controls
     // grade that directly.
-    if replayed > 0 || refused > 0 || committed > 0 {
+    if replayed > 0 || refused > 0 || committed > 0 || withdrawn > 0 {
         info!(
             replayed,
             committed,
             refused,
+            withdrawn,
             "restored language-server evidence this store accepted and authority has not \
              committed"
         );
     }
     replayed
+}
+
+/// Withdraw the recorded evidence of relations the live graph has removed
+/// again, so a restart does not reinstall what this store itself retired.
+///
+/// Appended rather than rewritten, like [`retire`]: the withdrawal applies to
+/// every line written before it and to none written after, so a relation
+/// accepted again later is replayed. Call it with the relations the graph no
+/// longer holds, while the writer that removed them still holds its graph
+/// mutation guard.
+pub(crate) fn withdraw(layout: &KinLayout, relations: &[RelationId]) {
+    if relations.is_empty() {
+        return;
+    }
+    let mut line = match serde_json::to_vec(&Withdrawal {
+        withdrawn_relations: relations.to_vec(),
+    }) {
+        Ok(line) => line,
+        Err(error) => {
+            warn!(%error, "could not encode an accepted-evidence withdrawal");
+            return;
+        }
+    };
+    line.push(b'\n');
+    let _io = record_io();
+    if let Err(error) = append(layout, &line, false) {
+        warn!(
+            %error,
+            relations = relations.len(),
+            "could not withdraw accepted language-server evidence; the next start may replay \
+             relations this graph retired, and stays unproven over them until a commit"
+        );
+    }
 }
 
 /// Drop the recorded evidence for files whose enrichment marker is being
@@ -680,16 +777,8 @@ mod tests {
     /// The relation ids replay would reinstall, sorted.
     fn surviving(layout: &KinLayout) -> Vec<RelationId> {
         let mut index = Index::default();
-        read(layout, |sequence, line| match parse_line(line) {
-            Line::Relation(relation) => {
-                index.latest.insert(relation.id, sequence);
-            }
-            Line::Retirement(files) => {
-                for file in files {
-                    index.retired_at.insert(file, sequence);
-                }
-            }
-            _ => {}
+        read(layout, |sequence, line| {
+            index.absorb(sequence, &parse_line(line));
         })
         .unwrap();
         let mut kept = Vec::new();
@@ -957,6 +1046,75 @@ mod tests {
         let (_root, layout) = layout();
         retire(&layout, &["pkg/a.go".to_string()]);
         assert!(!path(&layout).exists());
+    }
+
+    /// A withdrawal drops every earlier line of the relations it names, keeps
+    /// a later acceptance of the same relation, and leaves other relations
+    /// recorded for the same file alone.
+    #[test]
+    fn a_withdrawal_applies_to_earlier_lines_of_its_relations_only() {
+        let (_root, layout) = layout();
+        let retracted = relation("pkg/a.go");
+        let kept = relation("pkg/a.go");
+        assert!(record(&layout, &[retracted.clone(), kept.clone()]));
+        assert!(record(&layout, std::slice::from_ref(&retracted)));
+        withdraw(&layout, &[retracted.id]);
+        assert_eq!(surviving(&layout), ids(std::slice::from_ref(&kept)));
+        assert!(record(&layout, std::slice::from_ref(&retracted)));
+        assert_eq!(surviving(&layout), ids(&[retracted, kept]));
+    }
+
+    /// Withdrawing from a store that recorded nothing writes nothing.
+    #[test]
+    fn withdrawing_without_a_record_creates_none() {
+        let (_root, layout) = layout();
+        withdraw(&layout, &[RelationId::new()]);
+        assert!(!path(&layout).exists());
+    }
+
+    /// Replay over a record whose only relation was withdrawn writes nothing
+    /// into the graph, so a graph that is exactly authority keeps the checked
+    /// binding witness it was opened with, and the record shrinks to nothing.
+    #[test]
+    fn replaying_a_withdrawn_relation_leaves_the_graph_untouched() {
+        let (_root, layout) = layout();
+        let graph = InMemoryGraph::new();
+        let retracted = relation("pkg/a.go");
+        admit_endpoints(&graph, &retracted, kin_model::LanguageId::Go);
+        let still_held = relation("pkg/a.go");
+        admit_endpoints(&graph, &still_held, kin_model::LanguageId::Go);
+        assert!(record(&layout, &[retracted.clone(), still_held.clone()]));
+        withdraw(&layout, &[retracted.id]);
+
+        // Only the evidence the live graph still held comes back.
+        assert_eq!(replay(&layout, &graph), 1);
+        assert!(graph.get_relation_by_id(&retracted.id).is_none());
+        assert_eq!(
+            graph.get_relation_by_id(&still_held.id).as_ref(),
+            Some(&still_held)
+        );
+        assert_eq!(surviving(&layout), ids(std::slice::from_ref(&still_held)));
+
+        // With nothing but the withdrawn relation recorded, no write happens.
+        let graph = InMemoryGraph::new();
+        admit_endpoints(&graph, &retracted, kin_model::LanguageId::Go);
+        clear(&layout);
+        assert!(record(&layout, std::slice::from_ref(&retracted)));
+        withdraw(&layout, &[retracted.id]);
+        let epoch = graph.truth_epoch();
+        assert_eq!(replay(&layout, &graph), 0);
+        assert_eq!(
+            graph.truth_epoch(),
+            epoch,
+            "replay must not touch graph truth"
+        );
+        assert!(graph.get_relation_by_id(&retracted.id).is_none());
+        assert!(surviving(&layout).is_empty());
+        assert_eq!(
+            std::fs::read(path(&layout)).unwrap(),
+            b"",
+            "the replacement record holds neither the relation nor its withdrawal"
+        );
     }
 
     /// A torn last line costs that line only, and what is appended after it

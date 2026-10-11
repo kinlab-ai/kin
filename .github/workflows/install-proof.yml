@@ -298,8 +298,8 @@ jobs:
           verified=false
           for attempt in $(seq 1 18); do
             if gh attestation verify "attested-$release_asset" \
-              --repo firelock-ai/kin \
-              --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --repo kinlab-ai/kin \
+              --signer-workflow kinlab-ai/kin/.github/workflows/release.yml \
               --signer-digest "$expected_commit" \
               --source-ref "refs/tags/$expected_tag" \
               --source-digest "$expected_commit" \
@@ -395,8 +395,8 @@ jobs:
           aggregate_verified=false
           for attempt in $(seq 1 18); do
             if gh attestation verify release-provenance.json \
-              --repo firelock-ai/kin \
-              --signer-workflow firelock-ai/kin/.github/workflows/release.yml \
+              --repo kinlab-ai/kin \
+              --signer-workflow kinlab-ai/kin/.github/workflows/release.yml \
               --signer-digest "$expected_commit" \
               --source-ref "refs/tags/$expected_tag" \
               --source-digest "$expected_commit" \
@@ -493,6 +493,9 @@ jobs:
 
           scratch="kin-windows-admission"
           mkdir -p "$scratch"
+          # Absolute, because each fixture's Kin home is read from inside the
+          # fixture.
+          scratch="$(cd "$scratch" && pwd)"
 
           # Every assertion reports and the step exits once at the end. One
           # Windows round is expensive, so stopping at the first failure would
@@ -530,30 +533,136 @@ jobs:
             done
             echo "$matches"
           }
+          # Both admission paths stage a new store in a PARENT directory and
+          # rename it into place: an in-tree store beside its working tree, a
+          # central store beside itself in the stores directory. A count taken
+          # inside the admitted directory could never fail, so this counts in
+          # the tree's parent and in the fixture's stores directory.
           require_no_stage_residue() {
             local parent
             parent="$(dirname "$2")"
+            local stores
+            stores="$(fixture_home "$2")/stores"
             local staged
             staged="$(count_matching "$parent" '.kin.init-*')"
             if [ "$staged" != "0" ]; then
               fail "$1 left $staged unpublished stage entries in $parent" "$3"
             fi
+            staged="$(count_matching "$stores" '.kin.init-*')"
+            if [ "$staged" != "0" ]; then
+              fail "$1 left $staged unpublished stage entries in $stores" "$3"
+            fi
           }
+          # Each fixture gets a Kin home of its own, so a new store lands in a
+          # stores directory this step can count, and the installed home is
+          # never touched.
+          fixture_home() {
+            printf '%s\n' "$(dirname "$1")/kin-home"
+          }
+          # Run a command inside one fixture, against that fixture's Kin home
+          # and store layout. A native Windows process is handed its Kin home
+          # in Windows form rather than trusting Git Bash to convert an
+          # environment value.
+          fixture_kin() {
+            local dir="$1"
+            local layout="$2"
+            shift 2
+            local home
+            home="$(fixture_home "$dir")"
+            if command -v cygpath > /dev/null 2>&1; then
+              home="$(cygpath -w "$home")"
+            fi
+            (
+              cd "$dir"
+              export KIN_HOME="$home"
+              if [ "$layout" = "in-tree" ]; then
+                export KIN_STORE_LAYOUT=in-tree
+              fi
+              "$@"
+            )
+          }
+          # The store Kin's own discovery names for a fixture, in a form this
+          # shell can test, or nothing when no store serves it. A Windows build
+          # may print the verbatim `\\?\C:\...` form, which `cygpath` does not
+          # read.
+          discovered_store() {
+            local answer
+            if ! answer="$(fixture_kin "$1" "$2" kin store path 2>> "$3")"; then
+              return 0
+            fi
+            answer="$(printf '%s\n' "$answer" | tr -d '\r' | tail -n 1)"
+            answer="${answer#'\\?\'}"
+            if [ -n "$answer" ] && command -v cygpath > /dev/null 2>&1; then
+              answer="$(cygpath -u "$answer")"
+            fi
+            printf '%s\n' "$answer"
+          }
+          make_git_fixture() {
+            mkdir -p "$1"
+            (
+              cd "$1"
+              git init -q
+              git config user.email ci@firelock.ai
+              git config user.name ci
+              printf 'fn probe() {}\n' > probe.rs
+              git add probe.rs
+              # Hooks and signing are neutralized for this one invocation and
+              # NOT written into the fixture's config. A recorded
+              # `core.hooksPath` is itself a local compatibility blocker that
+              # admission refuses on before it reaches the boundary under test.
+              git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
+            )
+          }
+          # Admit a fixture under the default (central) layout, or under
+          # `in-tree` when the fourth argument says so. A new store is central
+          # and the tree carries nothing, so publication is what `kin store
+          # path` discovers.
           require_admitted() {
-            if ! (cd "$2" && kin init) > "$3" 2>&1; then
+            local layout="${4:-central}"
+            local home
+            local store
+            home="$(fixture_home "$2")"
+            if ! fixture_kin "$2" "$layout" kin init > "$3" 2>&1; then
               fail "$1 failed" "$3"
             fi
-            if [ ! -d "$2/.kin" ]; then
-              fail "$1 returned success without publishing $2/.kin" "$3"
+            store="$(discovered_store "$2" "$layout" "$3")"
+            if [ -z "$store" ]; then
+              fail "$1 returned success but no store serves $2" "$3"
+            elif [ ! -f "$store/manifest.json" ]; then
+              fail "$1 returned success but the store serving $2 holds no manifest: $store" "$3"
+            fi
+            if [ "$layout" = "in-tree" ]; then
+              if [ ! -d "$2/.kin" ]; then
+                fail "$1 returned success without publishing $2/.kin" "$3"
+              elif [ -n "$store" ] && [ "$(basename "$store")" != ".kin" ]; then
+                fail "$1 is served by $store instead of $2/.kin" "$3"
+              fi
+            else
+              if [ -e "$2/.kin" ]; then
+                fail "$1 wrote $2/.kin although the default layout keeps the working tree clean" "$3"
+              fi
+              if [ "$(count_matching "$home/stores" '*/manifest.json')" != "1" ]; then
+                fail "$1 did not publish exactly one store in $home/stores" "$3"
+              elif [ -n "$store" ] && [ ! -f "$home/stores/$(basename "$store")/manifest.json" ]; then
+                fail "$1 is served by $store instead of its store in $home/stores" "$3"
+              fi
             fi
             require_no_stage_residue "$1" "$2" "$3"
           }
           require_refused() {
-            if (cd "$2" && kin init) > "$3" 2>&1; then
+            local home
+            home="$(fixture_home "$2")"
+            if fixture_kin "$2" central kin init > "$3" 2>&1; then
               fail "$1 unexpectedly succeeded" "$3"
             fi
             if [ -e "$2/.kin" ]; then
               fail "$1 published authority at $2/.kin" "$3"
+            fi
+            if [ "$(count_matching "$home/stores" '*/manifest.json')" != "0" ]; then
+              fail "$1 published a store in $home/stores" "$3"
+            fi
+            if [ -n "$(discovered_store "$2" central "$3")" ]; then
+              fail "$1 left a store serving $2" "$3"
             fi
             require_no_stage_residue "$1" "$2" "$3"
             require_text "$1" "$NON_EMPTY_REFUSAL" "$3"
@@ -561,21 +670,13 @@ jobs:
 
           git_boundary="$scratch/exact-git/repo"
           git_log="$scratch/kin-init-exact-git.txt"
-          mkdir -p "$git_boundary"
-          (
-            cd "$git_boundary"
-            git init -q
-            git config user.email ci@firelock.ai
-            git config user.name ci
-            printf 'fn probe() {}\n' > probe.rs
-            git add probe.rs
-            # Hooks and signing are neutralized for this one invocation and NOT
-            # written into the fixture's config. A recorded `core.hooksPath` is
-            # itself a local compatibility blocker that admission refuses on
-            # before it reaches the boundary under test.
-            git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
-          )
+          make_git_fixture "$git_boundary"
           require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"
+
+          in_tree_boundary="$scratch/exact-git-in-tree/repo"
+          in_tree_log="$scratch/kin-init-exact-git-in-tree.txt"
+          make_git_fixture "$in_tree_boundary"
+          require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree
 
           native_boundary="$scratch/native-unborn/repo"
           native_log="$scratch/kin-init-native-unborn.txt"
@@ -594,7 +695,7 @@ jobs:
             echo "::error::the installed Windows release violated its admission contract ($failures check(s) failed)"
             exit 1
           fi
-          echo "Installed Windows release admitted exact Git and native-empty repositories without stage residue and refused the non-empty native boundary."
+          echo "Installed Windows release admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, without stage residue, and refused the non-empty native boundary."
 
       # Preserve a pre-repository Windows checkpoint in addition to the full
       # repo/daemon/MCP proof below. It binds CLI provenance and proves that
@@ -669,6 +770,9 @@ jobs:
           if (
             meta.embeddings?.vector_enabled !== true ||
             meta.embeddings?.embeddings_enabled !== true ||
+            meta.embeddings?.local_inference_enabled !== false ||
+            meta.embeddings?.external_embeddings_enabled !== true ||
+            meta.embeddings?.provider !== "none" ||
             meta.embeddings?.metal_enabled !== false
           ) {
             throw new Error("installed Windows CLI does not prove the vector feature contract");
@@ -1098,7 +1202,24 @@ jobs:
           # `kin status` deliberately does not auto-start the daemon. The graph
           # query above does, so capture daemon provenance only after that
           # startup path has completed and published its endpoint.
-          daemon_port="$(tr -d '[:space:]' < .kin/daemon.port)"
+          #
+          # The daemon publishes that endpoint in its store's directory, and a
+          # new store is kept outside the working tree, so ask Kin where the
+          # store is rather than assume `.kin`. A release older than `kin store`
+          # keeps every store in the tree. Redirected rather than piped, as the
+          # queries above are. A Windows build may print the verbatim
+          # `\\?\C:\...` form, which `cygpath` does not read.
+          if kin store path --help > /dev/null 2>&1; then
+            kin store path > "$captures/kin-store-path.txt"
+            store_dir="$(tr -d '\r' < "$captures/kin-store-path.txt" | tail -n 1)"
+            store_dir="${store_dir#'\\?\'}"
+            if command -v cygpath > /dev/null 2>&1; then
+              store_dir="$(cygpath -u "$store_dir")"
+            fi
+          else
+            store_dir=.kin
+          fi
+          daemon_port="$(tr -d '[:space:]' < "$store_dir/daemon.port")"
           case "$daemon_port" in
             ''|*[!0-9]*)
               echo "installed daemon published an invalid port: $daemon_port" >&2
@@ -1136,7 +1257,7 @@ jobs:
           kin doctor --json | tee "$captures/kin-doctor.json"
 
           # Drive the absolute installed MCP stdio server through initialize,
-          # tools/list, a real graph-backed semantic_search call, daemon loss,
+          # tools/list, a real graph-backed locate call by name, daemon loss,
           # and a second call that must revive the daemon. Remove the install
           # directory from the child's PATH and clear KIN_DAEMON_BIN: sibling
           # discovery must work on its own, including kin-daemon.exe on Windows.
@@ -1206,16 +1327,16 @@ jobs:
           // startup itself must find the sibling binary without a PATH rescue.
           stopDaemons("before MCP startup");
 
-          const searchArgs = { query: "hello", compact: true, limit: 5 };
+          const searchArgs = { query: "hello", mode: "name", compact: true, limit: 5 };
           // The call takes the shape the launched entry's profile serves: a
           // routed profile lists one `kin` tool, and search goes through it.
-          // Any other profile lists `semantic_search` and is called by name.
+          // Any other profile lists `locate` and is called by name.
           // tools/list must serve the tool the call names, so the listing
           // check below follows the same profile.
           const searchCall = (profile) => (
             typeof profile === "string" && profile.startsWith("agent-routed")
-              ? { name: "kin", arguments: { command: "search", args: searchArgs } }
-              : { name: "semantic_search", arguments: searchArgs }
+              ? { name: "kin", arguments: { command: "locate", args: searchArgs } }
+              : { name: "locate", arguments: searchArgs }
           );
           // What a failure calls the search it made.
           const searchLabel = (call) => (
@@ -1270,13 +1391,33 @@ jobs:
             child.kill("SIGKILL");
             finish(new Error("installed MCP startup/revival proof did not exit within 120 seconds"));
           }, 120_000);
+          // A reply names an entity by its name and the module that holds it,
+          // never by a file, so the seeded function is found as `hello` in
+          // module `probe`.
+          const holdsEntity = (value, name, module) => {
+            if (Array.isArray(value)) return value.some((item) => holdsEntity(item, name, module));
+            if (value && typeof value === "object") {
+              if (value.name === name && value.module === module) return true;
+              return Object.values(value).some((item) => holdsEntity(item, name, module));
+            }
+            return false;
+          };
           const validateSearch = (message, label) => {
             if (!message?.result || message.error || message.result.isError === true) {
               throw new Error(`${label} failed: ${JSON.stringify(message ?? null)}`);
             }
-            const rendered = JSON.stringify(message.result);
-            if (!rendered.includes("hello") || !rendered.includes("probe.py")) {
-              throw new Error(`${label} did not return the seeded hello entity`);
+            const replies = (message.result.content ?? []).flatMap((block) => {
+              try {
+                return [JSON.parse(block?.text)];
+              } catch {
+                return [];
+              }
+            });
+            if (!holdsEntity(replies, "hello", "probe")) {
+              throw new Error(
+                `${label} did not return the seeded hello entity in module probe: ` +
+                JSON.stringify(message.result).slice(0, 500)
+              );
             }
           };
           child.stdout.on("data", (chunk) => {
@@ -1566,21 +1707,43 @@ jobs:
           # the store and asserts on what it read.
           captures="$RUNNER_TEMP/kin-proof-captures"
           mkdir -p "$captures"
-          kin embed --max-seconds 300 --json | tee "$captures/kin-embed.json"
+          # The release archives carry no local embedding model, and a fresh
+          # install selects no external provider (the build metadata the
+          # validator reads proves both). So `kin embed` must refuse before any
+          # work and name what is missing, while every query keeps answering
+          # from the graph. A pass that ran here would mean the archive is not
+          # the engine-free default its metadata claims, and a refusal that
+          # names nothing sends a reader nowhere. Redirected rather than piped,
+          # so a failing command is judged here and not by `pipefail`.
+          set +e
+          kin embed --max-seconds 300 --json \
+            > "$captures/kin-embed.json" 2> "$captures/kin-embed-refusal.txt"
+          embed_rc=$?
+          set -e
+          cat "$captures/kin-embed.json" "$captures/kin-embed-refusal.txt"
+          if [ "$embed_rc" -eq 0 ]; then
+            echo "::error::kin embed ran on an archive with no local embedding model and no provider selected"
+            exit 1
+          fi
+          embed_refusal="$(cat "$captures/kin-embed-refusal.txt")"
+          case "$embed_refusal" in
+            *"kin embed cannot index anything here"*"no local embedding model"*) ;;
+            *)
+              echo "::error::kin embed exited $embed_rc without the refusal that names the missing model and provider"
+              exit 1
+              ;;
+          esac
 
-          # A pass reports on the work it took, and the store can still be
-          # taking on content the pass never saw: kin init admits the worktree,
-          # setup writes the agent config into it, and the watcher admits new
-          # non-ignored files as they arrive. Coverage is an instantaneous
-          # whole-store read, so a capture taken while any of that is still
-          # landing measures a corpus that grows underneath it, which is what
-          # left one leg reading complete coverage in health and 13 of 18 in
-          # locate a second later. Settle the store before measuring it: poll
-          # the counters until an embedding pass has nothing left pending and
-          # two consecutive reads agree that nothing new was admitted between
-          # them. A sleep would be a guess about how long that takes; this is
-          # the measurement itself, bounded, and loud about the exact counter
-          # that never settled when the budget runs out.
+          # The store can still be taking on content after the refusal: kin
+          # init admits the worktree, setup writes the agent config into it, and
+          # the watcher admits new non-ignored files as they arrive. Coverage is
+          # an instantaneous whole-store read, so a capture taken while any of
+          # that is still landing measures a corpus that grows underneath it.
+          # Settle the store before measuring it: poll the counters until two
+          # consecutive reads agree that nothing new was admitted between them.
+          # A sleep would be a guess about how long that takes; this is the
+          # measurement itself, bounded, and loud about the exact counter that
+          # never settled when the budget runs out.
           PROOF_CAPTURES="$captures" node <<'NODE'
           const fs = require("fs");
           const path = require("path");
@@ -1647,13 +1810,7 @@ jobs:
             }
             const current = fingerprint(status);
             last = current;
-            const coverage = status.embedding_coverage ?? {};
-            const drained =
-              coverage.state === "observed" &&
-              coverage.total > 0 &&
-              coverage.pending === 0 &&
-              coverage.indexed === coverage.total;
-            if (drained && current === previous) {
+            if (current === previous) {
               record(`settled after ${reads} reads: ${current}`);
               settled = true;
               break;
@@ -1666,8 +1823,7 @@ jobs:
             flush();
             console.log(
               `::error::the store never settled: ${last}. ` +
-              "Embedding coverage must reach observed with pending 0 and indexed equal to total, " +
-              "and two consecutive reads must agree that nothing new was admitted between them.",
+              "Two consecutive reads must agree that nothing new was admitted between them.",
             );
             process.exit(1);
           }
@@ -1850,8 +2006,11 @@ jobs:
               throw new Error(`${label}: unknown embedding coverage state ${coverage.state ?? "missing"}`);
             }
           };
-          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true) {
-            throw new Error(`${runnerOs} bench metadata does not prove vector and embedding support`);
+          if (cliMeta.embeddings?.vector_enabled !== true || cliMeta.embeddings?.embeddings_enabled !== true ||
+              cliMeta.embeddings?.local_inference_enabled !== false ||
+              cliMeta.embeddings?.external_embeddings_enabled !== true ||
+              cliMeta.embeddings?.metal_enabled !== false || cliMeta.embeddings?.provider !== "none") {
+            throw new Error(`${runnerOs} bench metadata does not prove the engine-free default archive profile`);
           }
           if (!isWindows) {
             validateEmbeddingCoverage(status.embedding_coverage, "kin-status.json");
@@ -1952,10 +2111,11 @@ jobs:
 
           for (const [path, report] of reports) {
             const checks = validateHealthReport(report, path);
-            // Every row a correct fresh Unix install reports beyond healthy and
+            // Every row a correct fresh install reports beyond healthy and
             // not-applicable, named with the statuses it may hold. This capture
-            // runs before `kin embed`, so the daemon graph still has embeddings
-            // pending and the model has never been fetched.
+            // runs before `kin embed`. The archive is engine-free with no
+            // provider selected (asserted above), so nothing will ever embed
+            // here and semantic readiness is unsupported rather than pending.
             //
             // This used to read `report.healthy !== true` with one tolerance for
             // a stale readiness. On the v0.6.1 release run's own
@@ -1966,19 +2126,12 @@ jobs:
             //
             //   projection_mode          stale, the shim is installed and not
             //                            engaged in this shell
-            //   semantic_query_readiness pending while the first pass fills,
-            //                            stale for a store that finished a fill
-            //                            and lost ground
             //   reference_edge_coverage  pending, no language server on the
             //                            runner
-            //   embedding_model          pending, the runner has never fetched
-            //                            the model
             //   memory_floor             degraded, the runner is a small host
             const firstRunAttention = new Map([
               ["projection_mode", ["stale"]],
-              ["semantic_query_readiness", ["pending", "stale"]],
               ["reference_edge_coverage", ["pending"]],
-              ["embedding_model", ["pending"]],
               ["memory_floor", ["degraded"]],
               // The first relation census is its own background pass, so a
               // capture that beats it reads `pending`, the same first-run
@@ -2008,12 +2161,11 @@ jobs:
               }
             }
             const semanticReadiness = checks.get("semantic_query_readiness")?.status;
-            // `pending` is what a fresh install reports while its first
-            // embedding pass is still filling, which is exactly the state this
-            // pre-embed capture is taken in. `stale` stays allowed for a store
-            // that finished a fill and lost ground; `healthy` for one whose
-            // background pass beat the capture.
-            const allowedSemanticReadiness = ["healthy", "pending", "stale"];
+            // Nothing will embed on an engine-free archive with no provider
+            // selected, so the only honest readiness is unsupported. `pending`
+            // here would promise a first pass that never starts, which is the
+            // claim that fenced v0.5.18.
+            const allowedSemanticReadiness = ["unsupported"];
             if (!allowedSemanticReadiness.includes(semanticReadiness)) {
               throw new Error(
                 `${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected ${allowedSemanticReadiness.join(" or ")}`
@@ -2078,9 +2230,16 @@ jobs:
             throw new Error("Antigravity legacy repair did not preserve unrelated user policy");
           }
           if (!isWindows) {
-            const embed = JSON.parse(fs.readFileSync("kin-embed.json", "utf8"));
-            if (embed.pending_entities !== 0 || embed.pending_artifacts !== 0 || embed.time_limited === true) {
-              throw new Error(`bounded clean-install embedding did not reach full coverage: ${JSON.stringify(embed)}`);
+            // The engine-free archive refuses `kin embed`, names what is
+            // missing, and keeps answering from the graph.
+            const embedRefusal = fs.readFileSync("kin-embed-refusal.txt", "utf8");
+            if (
+              !embedRefusal.includes("kin embed cannot index anything here") ||
+              !embedRefusal.includes("no local embedding model")
+            ) {
+              throw new Error(
+                `kin embed did not refuse with the reason an engine-free archive has: ${embedRefusal.trim() || "no output"}`
+              );
             }
             const embeddedStatus = JSON.parse(fs.readFileSync("kin-embedded-status.json", "utf8"));
             if (embeddedStatus.schema !== "kin.status.v3") {
@@ -2088,55 +2247,34 @@ jobs:
             }
             validateEmbeddingCoverage(embeddedStatus.embedding_coverage, "kin-embedded-status.json");
             const embeddedCoverage = embeddedStatus.embedding_coverage;
-            const settleMode = fs.existsSync("kin-status-settle-mode.txt")
-              ? fs.readFileSync("kin-status-settle-mode.txt", "utf8").trim()
-              : "unrecorded";
-            // Two distinct failures, kept apart so the log says which one
-            // happened. Unobserved means the report could not measure coverage
-            // even after the settle above; the counts below mean it measured
-            // and came up short. Only the first is a race, and the state field
-            // is what separates them, so a genuinely incomplete store still
-            // fails here exactly as it did before the settle existed.
-            if (embeddedCoverage.state !== "observed") {
+            // An archive that cannot embed holds no vectors. Unobserved is
+            // what it reports with no vector index attached; observed is
+            // allowed only with nothing indexed.
+            if (embeddedCoverage.state === "observed" && embeddedCoverage.indexed !== 0) {
               throw new Error(
-                `Unix status could not observe embedding coverage after a ${settleMode} read: ` +
-                `${JSON.stringify(embeddedCoverage)}`
+                `an archive that cannot embed reports indexed embeddings: ${JSON.stringify(embeddedCoverage)}`
               );
-            }
-            if (
-              embeddedCoverage.source !== "live_query_graph" ||
-              embeddedCoverage.total === 0 ||
-              embeddedCoverage.indexed !== embeddedCoverage.total ||
-              embeddedCoverage.pending !== 0
-            ) {
-              throw new Error(`Unix status did not prove complete observed embedding coverage: ${JSON.stringify(embeddedCoverage)}`);
             }
             for (const reportPath of ["kin-embedded-health.json", "kin-embedded-doctor.json"]) {
               const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
               const checks = validateHealthReport(report, reportPath);
               const readiness = checks.get("semantic_query_readiness")?.status;
-              if (readiness !== "healthy") {
+              if (readiness !== "unsupported") {
                 throw new Error(
                   `${reportPath}: semantic_query_readiness=${readiness ?? "missing"} after a ` +
-                  `completed embed; verdict=${report.verdict}; every row needing attention: ` +
-                  `${attentionRows(report)}`
+                  `refused embed on an archive that cannot embed; verdict=${report.verdict}; ` +
+                  `every row needing attention: ${attentionRows(report)}`
                 );
               }
-              // What a completed embed leaves behind on this runner, named. The
-              // model is cached and the fill is done, so `embedding_model` and
-              // `semantic_query_readiness` are gone from the list the pre-embed
-              // capture carries; the three below are the runner, not the embed.
-              // This used to read `report.healthy !== true`, which passed on the
-              // v0.6.1 run's own `kin-embedded-health.json` while those three
-              // rows sat inside it unnamed (FIR-2919). Naming them is what makes
-              // a fourth fail.
+              // What the refused embed leaves behind on this runner, named, so
+              // an unnamed fourth row fails: an aggregate that reads healthy
+              // while rows sit inside it unnamed proves nothing.
               const postEmbedAttention = new Map([
                 ["projection_mode", ["stale"]],
                 ["reference_edge_coverage", ["pending"]],
                 ["memory_floor", ["degraded"]],
                 // The census pass is not tied to `kin embed`, so a capture can
-                // still beat it after a completed embed; same measurement as
-                // the pre-embed entry.
+                // still beat it; same measurement as the pre-embed entry.
                 ["relation_census", ["pending"]],
               ]);
               const stillWaiting = report.checks.filter(
@@ -2146,7 +2284,7 @@ jobs:
               );
               if (stillWaiting.length > 0) {
                 throw new Error(
-                  `${reportPath}: rows needing attention after a completed embed that this ` +
+                  `${reportPath}: rows needing attention after the refused embed that this ` +
                   `runner does not expect: ` +
                   `${stillWaiting.map((check) => `${check.id}=${check.status}`).join(", ")}; ` +
                   `verdict=${report.verdict}`
@@ -2155,11 +2293,11 @@ jobs:
             }
             const semanticSearch = JSON.parse(fs.readFileSync("kin-semantic-search.json", "utf8"));
             if (!Array.isArray(semanticSearch) || !semanticSearch.some((record) => record.name === "hello" && record.file === "probe.py")) {
-              throw new Error("semantic kin search did not return the seeded hello entity");
+              throw new Error("kin search --semantic did not answer the seeded hello entity from the graph");
             }
             const semanticLocate = JSON.parse(fs.readFileSync("kin-semantic-locate.json", "utf8"));
-            if (semanticLocate.semantic_coverage?.supported !== true || semanticLocate.semantic_coverage?.complete !== true || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
-              throw new Error("semantic kin locate did not prove complete coverage and return probe.py");
+            if (semanticLocate.semantic_coverage?.embedding_state !== "not_used" || !semanticLocate.files?.some((entry) => entry.path === "probe.py")) {
+              throw new Error("kin locate did not answer probe.py from the graph with embeddings reported unused");
             }
           }
           NODE
