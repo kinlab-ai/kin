@@ -11359,6 +11359,46 @@ def assert_default_core_archive_profile(workflow: str) -> None:
             raise AssertionError("default archive feature evidence is missing " + required)
 
 
+MACOS_ARM64_PER_BINARY_LINK = (
+    'cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon '
+    '--bin "$bin" || { rc=$?; break; }'
+)
+COMBINED_CORE_ARCHIVE_BUILD = (
+    'cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?'
+)
+
+
+def assert_macos_arm64_links_one_at_a_time(workflow: str) -> None:
+    """The macOS arm64 leg links kin and kin-daemon in separate invocations.
+
+    Both 0.8.2 release-candidate attempts reached the 90-minute bound on that
+    leg with both fat-LTO links resident at once on a 7 GB runner. Each
+    per-binary invocation keeps the combined -p pair, so Cargo resolves features
+    exactly as the combined build does, and the combined invocation still runs
+    afterwards, so the shipped bytes are the combined build's.
+    """
+    lines = active_lines(workflow_job_blocks(workflow)["build"])
+    try:
+        guard = lines.index('if [ "$TARGET" = aarch64-apple-darwin ]; then')
+    except ValueError:
+        raise AssertionError(
+            "the macOS arm64 leg must link its binaries one at a time"
+        ) from None
+    if lines[guard + 1 : guard + 3] != [
+        "for bin in kin kin-daemon; do",
+        'echo "linking $bin on its own"',
+    ] or lines[guard + 3] != MACOS_ARM64_PER_BINARY_LINK:
+        raise AssertionError(
+            "the macOS arm64 leg must link kin then kin-daemon, each with the "
+            "combined -p kin-cli -p kin-daemon pair"
+        )
+    if COMBINED_CORE_ARCHIVE_BUILD not in lines[guard + 4 :]:
+        raise AssertionError(
+            "the combined core archive build must still run after the macOS "
+            "arm64 per-binary links"
+        )
+
+
 def main() -> None:
     assert_release_probe_fixtures()
     retired = (
@@ -11378,6 +11418,11 @@ def main() -> None:
     assert_default_core_archive_profile((WORKFLOWS / "rc-build.yml").read_text(encoding="utf-8"))
     expect_assertion("local engine smuggled into a default archive", "must use Cargo defaults", lambda: assert_default_core_archive_profile(release.replace('-p kin-cli -p kin-daemon || rc=$?', '-p kin-cli -p kin-daemon --features kin-cli/embeddings || rc=$?', 1)))
     expect_assertion("engine metadata assertion removed", "feature evidence is missing", lambda: assert_default_core_archive_profile(release.replace('meta.embeddings?.local_inference_enabled !== false', 'false', 1)))
+    assert_macos_arm64_links_one_at_a_time(release)
+    assert_macos_arm64_links_one_at_a_time((WORKFLOWS / "rc-build.yml").read_text(encoding="utf-8"))
+    expect_assertion("macOS arm64 links both binaries at once", "one at a time", lambda: assert_macos_arm64_links_one_at_a_time(release.replace('if [ "$TARGET" = aarch64-apple-darwin ]; then', 'if false; then', 1)))
+    expect_assertion("macOS arm64 per-binary link drops the combined package pair", "combined -p kin-cli -p kin-daemon pair", lambda: assert_macos_arm64_links_one_at_a_time(release.replace('-p kin-cli -p kin-daemon --bin "$bin"', '-p kin-cli --bin "$bin"', 1)))
+    expect_assertion("macOS arm64 skips the combined build", "must still run", lambda: assert_macos_arm64_links_one_at_a_time(release.replace("          if [ \"$rc\" -eq 0 ]; then\n            cargo build --locked --release --target \"$TARGET\" -p kin-cli -p kin-daemon || rc=$?\n          fi\n", "", 1)))
     release_cut = RELEASE_CUT.read_text(encoding="utf-8")
     assert_native_startup_release_proof(release_cut)
     for label, before, after, error in [
