@@ -86,7 +86,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native rows mirror release.yml, including Intel macOS and Windows.
+          # Rows mirror release.yml's targets and artifacts, with one declared
+          # difference: the two macOS archives build on a Depot Apple Silicon
+          # runner instead of release.yml's standard pool. The x86_64 archive
+          # is cross-compiled there and executed under Rosetta 2 by "Verify
+          # native release build provenance", so its provenance is still proved
+          # by running it.
+          #
+          # Measured on the same source, standard pool (rc-build run
+          # 38238857203) against this runner (38255291752), which reported 9
+          # CPUs and 17 GiB: the build step took 77 minutes there on each macOS
+          # leg, and 20.7 here for arm64 and 12.1 for x86_64, with no swap and
+          # the kernel's memory pressure at normal throughout. The arm64 leg
+          # still links one binary at a time. Linking both at once took 12.4
+          # minutes (38255295674) but compressed 8.3 GB and raised the pressure
+          # level to warning, and the Windows leg sets this workflow's critical
+          # path at over 30 minutes either way.
+          #
+          # This workflow may use that pool and release.yml may not. A tag
+          # freezes release.yml, so a pool that stops assigning runners there
+          # strands an immutable release; here, before any tag exists, the
+          # same failure only delays a candidate. RUNNER_DELTAS in
+          # scripts/check-rc-build-drift.mjs declares the difference, and the
+          # release workflow authority suite admits this label for this job
+          # only. The capability job below still installs every archive on the
+          # standard pool's native hardware, Intel included.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: kin-linux-x86_64
@@ -95,11 +119,11 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: kin-linux-aarch64
             cross: false
-          - os: macos-15-intel
+          - os: depot-macos-26
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             cross: false
-          - os: macos-latest
+          - os: depot-macos-26
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
             cross: false
@@ -158,6 +182,25 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
+
+      # An x86_64 macOS archive built on an Apple Silicon runner is executed by
+      # "Verify native release build provenance", and Rosetta 2 is what lets an
+      # arm64 host run x86_64 code. It is installed and proved here, before the
+      # compile, so a host that cannot run the archive fails in seconds rather
+      # than after the link. On every other leg this step does nothing.
+      - name: Install Rosetta 2 (x86_64 macOS on Apple Silicon)
+        if: ${{ runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.target == 'x86_64-apple-darwin' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "Rosetta 2 is already installed"
+          else
+            sudo -n /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/true
+          echo "x86_64 code runs on this $(uname -m) host under Rosetta 2"
 
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
@@ -427,6 +470,16 @@ jobs:
           set -euo pipefail
           case "$RUNNER_ARCH:$TARGET" in
             X64:x86_64-*|ARM64:aarch64-*) ;;
+            # An x86_64 macOS archive built on Apple Silicon runs here under
+            # Rosetta 2, which the "Install Rosetta 2" step installed. Refuse
+            # rather than skip when it cannot, because a skip would leave a
+            # shipped archive with no execution proof.
+            ARM64:x86_64-apple-darwin)
+              if ! /usr/bin/arch -x86_64 /usr/bin/true; then
+                echo "::error::Rosetta 2 cannot run $TARGET on this $RUNNER_ARCH host, so its provenance cannot be executed"
+                exit 1
+              fi
+              ;;
             *)
               echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
               exit 0
@@ -437,6 +490,21 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
           kin_bin="target/$TARGET/release/kin$suffix"
           daemon_bin="target/$TARGET/release/kin-daemon$suffix"
+          # Each macOS binary must be a thin Mach-O of its target's own
+          # architecture. On a cross-built leg this is what ties the bytes
+          # executed under Rosetta 2 below to the x86_64 bytes that ship.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            want_arch="${TARGET%%-*}"
+            [ "$want_arch" = aarch64 ] && want_arch=arm64
+            for bin in "$kin_bin" "$daemon_bin"; do
+              have_arch="$(lipo -archs "$bin")"
+              if [ "$have_arch" != "$want_arch" ]; then
+                echo "::error::$bin is a $have_arch Mach-O, expected $want_arch for $TARGET"
+                exit 1
+              fi
+              echo "$bin is a thin $have_arch Mach-O"
+            done
+          fi
           provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
           mkdir -p "$provenance_dir"
           "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"

@@ -494,29 +494,24 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: kin-linux-aarch64
             cross: false
-          # Use an Intel host so this archive is executed before packaging;
-          # building x86_64 on an arm64 runner would leave it unproven.
+          # Keep both macOS rows on the standard pool. A tag freezes this
+          # workflow, so a paid or custom label whose budget stops assigning
+          # runners can strand an immutable release. The release authority
+          # suite pins the standard-runner boundary and falsifies the
+          # paid-runner regression. rc-build.yml builds these same two archives
+          # on a paid Apple Silicon runner, because before a tag the same
+          # failure only delays a candidate.
           #
-          # Keep this on the standard Intel pool. A tag freezes this workflow,
-          # so a paid or custom label whose budget stops assigning runners can
-          # strand an immutable release. The release authority suite pins the
-          # standard-runner boundary and falsifies the paid-runner regression.
-          #
-          # Cross-compiling x86_64 from the faster Apple Silicon host was the
-          # other candidate and is refused, on provenance rather than on
-          # signing. codesign and notarytool never execute the binary, so both
-          # work fine on a cross-built artifact. "Verify native release build
-          # provenance" does execute it, and its `case "$RUNNER_ARCH:$TARGET"`
-          # declines a cross-architecture artifact and returns before writing
-          # kin-build-meta.json, which "Generate artifact provenance manifest"
-          # then reads unconditionally. Making that path work means either
-          # running the x86_64 binary under Rosetta on the arm64 host, which the
-          # macos-15-arm64 runner image does not list among its software, or
-          # dropping the execution proof for a shipped archive: the version-line
-          # commit match, the dirty refusal, the embedded Cargo.lock provenance,
-          # and the vector/embeddings/metal feature assertions all stop running.
-          # Staying on Intel keeps RUNNER_ARCH X64, so that guard's X64:x86_64-*
-          # arm still matches and nothing else in the job moves.
+          # Provenance no longer needs an Intel host. When x86_64 is
+          # cross-compiled on Apple Silicon, as rc-build.yml does, "Install
+          # Rosetta 2 (x86_64 macOS on Apple Silicon)" makes the host able to
+          # run it and "Verify native release build provenance" executes it
+          # under Rosetta 2 and checks it is a thin x86_64 Mach-O. The
+          # version-line commit match, the dirty refusal, the embedded
+          # Cargo.lock provenance and the feature assertions all still run. On
+          # this Intel row both of those additions are inert. What keeps the
+          # row here is the tag-freeze rule above, until this workflow ships the
+          # candidate's archives rather than rebuilding them.
           - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
@@ -545,6 +540,25 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
+
+      # An x86_64 macOS archive built on an Apple Silicon runner is executed by
+      # "Verify native release build provenance", and Rosetta 2 is what lets an
+      # arm64 host run x86_64 code. It is installed and proved here, before the
+      # compile, so a host that cannot run the archive fails in seconds rather
+      # than after the link. On every other leg this step does nothing.
+      - name: Install Rosetta 2 (x86_64 macOS on Apple Silicon)
+        if: ${{ runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.target == 'x86_64-apple-darwin' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "Rosetta 2 is already installed"
+          else
+            sudo -n /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/true
+          echo "x86_64 code runs on this $(uname -m) host under Rosetta 2"
 
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
@@ -814,6 +828,16 @@ jobs:
           set -euo pipefail
           case "$RUNNER_ARCH:$TARGET" in
             X64:x86_64-*|ARM64:aarch64-*) ;;
+            # An x86_64 macOS archive built on Apple Silicon runs here under
+            # Rosetta 2, which the "Install Rosetta 2" step installed. Refuse
+            # rather than skip when it cannot, because a skip would leave a
+            # shipped archive with no execution proof.
+            ARM64:x86_64-apple-darwin)
+              if ! /usr/bin/arch -x86_64 /usr/bin/true; then
+                echo "::error::Rosetta 2 cannot run $TARGET on this $RUNNER_ARCH host, so its provenance cannot be executed"
+                exit 1
+              fi
+              ;;
             *)
               echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
               exit 0
@@ -824,6 +848,21 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
           kin_bin="target/$TARGET/release/kin$suffix"
           daemon_bin="target/$TARGET/release/kin-daemon$suffix"
+          # Each macOS binary must be a thin Mach-O of its target's own
+          # architecture. On a cross-built leg this is what ties the bytes
+          # executed under Rosetta 2 below to the x86_64 bytes that ship.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            want_arch="${TARGET%%-*}"
+            [ "$want_arch" = aarch64 ] && want_arch=arm64
+            for bin in "$kin_bin" "$daemon_bin"; do
+              have_arch="$(lipo -archs "$bin")"
+              if [ "$have_arch" != "$want_arch" ]; then
+                echo "::error::$bin is a $have_arch Mach-O, expected $want_arch for $TARGET"
+                exit 1
+              fi
+              echo "$bin is a thin $have_arch Mach-O"
+            done
+          fi
           provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
           mkdir -p "$provenance_dir"
           "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"

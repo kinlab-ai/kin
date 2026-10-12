@@ -155,6 +155,59 @@ test("an rc-build target release.yml does not publish is reported", () => {
   );
 });
 
+// The macOS rows run on a different runner in each file, and RUNNER_DELTAS
+// declares exactly that. These cases keep the declaration from becoming a
+// licence for anything else in those rows, or for any other row.
+
+const rcMacosX64 =
+  "          - os: depot-macos-26\n            target: x86_64-apple-darwin\n" +
+  "            artifact: kin-macos-x86_64\n            cross: false";
+
+test("a declared runner delta is the only difference a macOS row may carry", () => {
+  const mutated = rc.replace(rcMacosX64, rcMacosX64.replace("cross: false", "cross: true"));
+  assert.notEqual(mutated, rc);
+  assert.match(only(check(release, mutated)), /kin-macos-x86_64 matrix row differs/);
+});
+
+test("an undeclared runner change in rc-build.yml is reported", () => {
+  const mutated = rc.replace(
+    "          - os: ubuntu-latest\n            target: x86_64-unknown-linux-musl",
+    "          - os: depot-ubuntu-24.04-8\n            target: x86_64-unknown-linux-musl"
+  );
+  assert.notEqual(mutated, rc);
+  assert.match(only(check(release, mutated)), /kin-linux-x86_64 matrix row differs/);
+});
+
+test("an rc-build macOS row off its declared runner is reported", () => {
+  const mutated = rc.replace(
+    "          - os: depot-macos-26\n            target: aarch64-apple-darwin",
+    "          - os: depot-macos-15\n            target: aarch64-apple-darwin"
+  );
+  assert.notEqual(mutated, rc);
+  const problems = check(release, mutated);
+  assert.ok(
+    problems.some((problem) =>
+      /runner delta for kin-macos-aarch64 declares .* on depot-macos-26, which it does not use/.test(problem)
+    ),
+    problems.join("\n")
+  );
+});
+
+test("release.yml reaching the candidate's runner makes its delta stale", () => {
+  const mutated = release.replace(
+    "          - os: macos-latest\n            target: aarch64-apple-darwin",
+    "          - os: depot-macos-26\n            target: aarch64-apple-darwin"
+  );
+  assert.notEqual(mutated, release);
+  const problems = check(mutated, rc);
+  assert.ok(
+    problems.some((problem) =>
+      /runner delta for kin-macos-aarch64 expects .* on macos-latest, which it no longer uses; the delta is stale/.test(problem)
+    ),
+    problems.join("\n")
+  );
+});
+
 // The properties that make rc-build.yml safe to dispatch on an arbitrary ref.
 // Each is one line to break and none of them is visible in a diff of the build
 // steps, which is what the mirror check covers.
