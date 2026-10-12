@@ -66,7 +66,7 @@ const guide = (summary = {}, extra = {}) => ({ schema: "kin.review.guide.v1", ch
 
 // An agent as the workspace server describes it: a name, what it did, what it
 // has open and the change it committed. No session id or place on disk.
-const AGENT_KEY = "a1b2c3d4e5f60718";
+const AGENT_KEY = "00000000000000a1";
 const AGENT_CHANGE = "c".repeat(64);
 const secondsAgo = (n) => new Date(Date.now() - n * 1000).toISOString();
 function agentsPayload({ agents = null, earlier = [] } = {}) {

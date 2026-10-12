@@ -1007,8 +1007,8 @@ test("a guide counts relations that changed apart from ones that only moved, and
 test("an agent's change names the agent and what it looked at first, and a person's change has no such line", async () => {
   const id = "c".repeat(64);
   const [first, second, third] = ["5a1c7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10", "9e2b7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10", "0c3d7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10"];
-  const browser = browserFixture({ initial: id, history: [id], shapeGuide: (body) => body.kind === "change" ? { ...body, change: { ...body.change, author: "Claude Code", author_recorded: null, agent: { name: "Claude Code", key: "a1b2c3d4e5f60718" } } } : body });
-  browser.network.changeAgent = { agent: { name: "Claude Code", key: "a1b2c3d4e5f60718", state: "idle" },
+  const browser = browserFixture({ initial: id, history: [id], shapeGuide: (body) => body.kind === "change" ? { ...body, change: { ...body.change, author: "Claude Code", author_recorded: null, agent: { name: "Claude Code", key: "00000000000000a1" } } } : body });
+  browser.network.changeAgent = { agent: { name: "Claude Code", key: "00000000000000a1", state: "idle" },
     looked_at: { count: 6, complete: true, entity_ids: [first, second, third] },
     names: { [first]: { label: "Signer.verify_signature" }, [second]: { label: "want_bytes" }, [third]: { label: "Signer" } } };
   await browser.start();
