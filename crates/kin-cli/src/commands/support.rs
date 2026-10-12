@@ -37,6 +37,10 @@ pub struct SupportDaemonMemory {
     pub measured_by_pid: u32,
     pub measured_at_unix: u64,
     pub measured_age_secs: u64,
+    /// What the daemon's own figure is made of (GPU memory, compressed
+    /// memory), when its platform could say. Absent from older payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_breakdown: Option<kin_core::memory_pressure::FootprintBreakdown>,
 }
 
 impl SupportDaemonMemory {
@@ -68,6 +72,7 @@ impl SupportDaemonMemory {
             measured_by_pid: published.pid,
             measured_at_unix: published.at_unix,
             measured_age_secs: published.age_secs(now),
+            own_breakdown: published.footprint.own_breakdown,
         })
     }
 
@@ -82,6 +87,7 @@ impl SupportDaemonMemory {
                 children_bytes: self.children_bytes,
                 child_count: self.child_count,
                 kernel_capped: false,
+                own_breakdown: self.own_breakdown,
             },
             budget_bytes: self.allowance_bytes,
             budget_is_derived: self.allowance_is_derived,
@@ -750,6 +756,7 @@ mod tests {
                 children_bytes: 6 * 1024 * 1024 * 1024,
                 child_count: 3,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget: kin_core::memory_pressure::FootprintBudget {
                 bytes: 8 * 1024 * 1024 * 1024,

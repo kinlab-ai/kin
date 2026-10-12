@@ -23,6 +23,9 @@
     },
     {
       "$ref": "#/$defs/graphDeltaApplied"
+    },
+    {
+      "$ref": "#/$defs/toolCall"
     }
   ],
   "$defs": {
@@ -292,6 +295,85 @@
         "relations_removed": {
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "toolCall": {
+      "type": "object",
+      "description": "An agent session's tool call finished. Activity, not graph state: delivered only to a subscriber whose types parameter names ToolCall. Bounded on the bus to one per session per 250 ms and 16 per second across all sessions; a call that falls inside either bound is folded into the session's next frame, which carries the newest call and how many earlier calls it stands for in coalesced. Carries no query text, arguments, answer or path. The full list is GET /session/{id}/calls.",
+      "required": [
+        "type",
+        "seq",
+        "session_id",
+        "call_seq",
+        "at",
+        "tool",
+        "entity_ids",
+        "result_count",
+        "bytes",
+        "duration_ms",
+        "is_error",
+        "coalesced"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "ToolCall"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic position in the delta stream, assigned when the event is emitted rather than when it is delivered. Compare against the seq your export was cut at. A stream narrowed by the types parameter has gaps, so consecutive numbers are not proof that nothing was missed."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "The agent session that made the call."
+        },
+        "call_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based position of the call in its session, the seq of the entry in GET /session/{id}/calls."
+        },
+        "at": {
+          "type": "string",
+          "description": "When the call finished, RFC 3339."
+        },
+        "tool": {
+          "type": "string",
+          "description": "The registered tool the daemon ran."
+        },
+        "entity_ids": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string"
+          },
+          "description": "Graph entities the call was about, each present in the graph."
+        },
+        "result_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Distinct graph entities the answer named."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "repo_id": {
+          "type": "string",
+          "description": "The repository a repo-scoped call named. Absent for a call on the daemon's own repository."
+        },
+        "coalesced": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Earlier calls of this session this frame stands for that got no frame of their own."
         }
       }
     }

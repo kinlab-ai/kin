@@ -57,6 +57,9 @@ new_fixture() {
     "chmod 1777 /w; printf '%s\n' '${PAYLOAD}' > /p/kin-db-0.0.0.crate; chown -R 999:999 /p"
 }
 
+# This contract owns an in-tree store because its packages mount is inside .kin.
+# Pin placement in preparation and every entrypoint arm, independently of the
+# default layout chosen for other callers.
 # Prepare the repository the way the pod's init container does: workspace volume
 # only, no packages volume mounted yet. `break_layout` removes one file that every
 # layout version creates, which is what an interrupted init leaves behind.
@@ -64,12 +67,19 @@ prepare_repo() {
   local break_layout="${1:-no}"
   local script='set -eu
 mkdir -p /w/repo
-kin init /w/repo >/dev/null 2>&1'
+kin init /w/repo >/dev/null 2>&1
+test "$(id -u)" -eq 999
+test -f /w/repo/.kin/manifest.json
+test -f /w/repo/.kin/config.toml
+test -f /w/repo/.kin/version
+test -d /w/repo/.kin/kindb
+test -w /w/repo/.kin'
   if [ "${break_layout}" = "break" ]; then
     script="${script}
 rm -f /w/repo/.kin/manifest.json"
   fi
-  docker run --rm --user 999:999 -v "${WORKSPACE_VOLUME}:/w" \
+  docker run --rm --user 999:999 -e KIN_STORE_LAYOUT=in-tree \
+    -v "${WORKSPACE_VOLUME}:/w" \
     --entrypoint /bin/sh "${IMAGE}" -c "${script}"
 }
 
@@ -89,7 +99,7 @@ fail() { echo "::error::$1" >&2; exit 1; }
 echo "==> [mounted-intact] boot a prepared repo with a volume mounted inside .kin"
 new_fixture
 prepare_repo
-CID="$(docker run -d --user 999:999 \
+CID="$(docker run -d --user 999:999 -e KIN_STORE_LAYOUT=in-tree \
   -v "${WORKSPACE_VOLUME}:/w" -v "${PACKAGES_VOLUME}:/w/repo/.kin/packages" \
   -e KIN_WORKSPACE_DIR=/w/repo -e KIN_STORAGE=local -e KIN_DISABLE_SPINE=1 \
   "${IMAGE}" --port 4219)"
@@ -115,7 +125,7 @@ echo "==> [mounted-incomplete] refuse to re-initialize over a mounted volume"
 new_fixture
 prepare_repo break
 set +e
-out="$(docker run --rm --user 999:999 \
+out="$(docker run --rm --user 999:999 -e KIN_STORE_LAYOUT=in-tree \
   -v "${WORKSPACE_VOLUME}:/w" -v "${PACKAGES_VOLUME}:/w/repo/.kin/packages" \
   -e KIN_WORKSPACE_DIR=/w/repo -e KIN_STORAGE=local -e KIN_DISABLE_SPINE=1 \
   "${IMAGE}" --port 4219 2>&1)"
@@ -137,7 +147,8 @@ cleanup
 echo "==> [unmounted-incomplete] still re-initializes when no volume is at risk"
 new_fixture
 prepare_repo break
-CID="$(docker run -d --user 999:999 -v "${WORKSPACE_VOLUME}:/w" \
+CID="$(docker run -d --user 999:999 -e KIN_STORE_LAYOUT=in-tree \
+  -v "${WORKSPACE_VOLUME}:/w" \
   -e KIN_WORKSPACE_DIR=/w/repo -e KIN_STORAGE=local -e KIN_DISABLE_SPINE=1 \
   "${IMAGE}" --port 4219)"
 started=""

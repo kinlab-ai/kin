@@ -5692,9 +5692,44 @@ fn check_memory_pressure_rows(
     };
     let mut rows = vec![refusal_row];
     if let Some(footprint) = kin_core::memory_pressure::DaemonFootprint::read(layout.root()) {
-        rows.push(daemon_memory_standing_check_for(&footprint, unix_now()));
+        let publisher = publisher_state(layout.root(), footprint.pid);
+        rows.push(daemon_memory_standing_check_for(
+            &footprint,
+            unix_now(),
+            publisher,
+        ));
     }
     rows
+}
+
+/// Whether the daemon that published a standing is still the one serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publisher {
+    /// Still running, so the figure describes memory held now, or as of its
+    /// last publish.
+    Serving,
+    /// Gone, so nothing holds the memory the figure names.
+    Stopped,
+}
+
+/// Whether `pid`, which published this store's standing, is still serving it.
+///
+/// The record outlives its daemon on purpose, so `kin status` can show the
+/// last reading, and `kin init` stops the daemon it started once its work is
+/// done. A doctor run right after init therefore reads a figure taken partway
+/// through the first embedding pass by a process that no longer exists, and
+/// grading that as a daemon over its allowance now is the false alarm this
+/// separates out. Liveness alone could be fooled by a reused pid, so the
+/// store's own record of who serves it has to agree.
+fn publisher_state(kin_root: &std::path::Path, pid: u32) -> Publisher {
+    let named_by_store = kin_daemon_spawn::read_serving_daemon(kin_root)
+        .is_some_and(|serving| serving.pid == pid)
+        || kin_daemon_spawn::recorded_owner_is_alive(kin_root);
+    if named_by_store && kin_daemon_spawn::process_is_alive(pid) {
+        Publisher::Serving
+    } else {
+        Publisher::Stopped
+    }
 }
 
 /// Unix seconds now, or zero when the clock is before the epoch.
@@ -5716,9 +5751,27 @@ fn unix_now() -> u64 {
 fn daemon_memory_standing_check_for(
     footprint: &kin_core::memory_pressure::DaemonFootprint,
     now_unix: u64,
+    publisher: Publisher,
 ) -> HealthCheck {
     const ID: &str = "daemon_memory_standing";
     const LABEL: &str = "Daemon memory standing";
+    if publisher == Publisher::Stopped {
+        // A past reading from a process that is gone holds nothing now, so it
+        // is reported for what it says about that run and graded on nothing.
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Healthy,
+            format!(
+                "the daemon that published this reading (pid {}) has stopped, so it no longer \
+                 holds this memory; at {}, {}s ago, it measured: {}",
+                footprint.pid,
+                kin_daemon_spawn::hhmm_utc(footprint.at_unix),
+                footprint.age_secs(now_unix),
+                footprint.standing().sentence()
+            ),
+        );
+    }
     let status = if footprint.standing().is_over_allowance() {
         HealthStatus::Degraded
     } else {
@@ -13657,6 +13710,7 @@ mod tests {
                 children_bytes: 3 * gib,
                 child_count: 10,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget_bytes: 4 * gib,
             budget_is_derived: true,
@@ -13733,7 +13787,7 @@ mod tests {
             declined_row.detail
         );
 
-        let standing = daemon_memory_standing_check_for(&over, 76_440 + 42);
+        let standing = daemon_memory_standing_check_for(&over, 76_440 + 42, Publisher::Serving);
         assert!(
             standing.detail.contains("7.0 GiB") && standing.detail.contains("10 process(es)"),
             "the live standing is a row of its own: {}",
@@ -13773,10 +13827,11 @@ mod tests {
                 children_bytes: gib,
                 child_count: 2,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             ..over.clone()
         };
-        let inside = daemon_memory_standing_check_for(&under, 76_440);
+        let inside = daemon_memory_standing_check_for(&under, 76_440, Publisher::Serving);
         assert!(
             matches!(inside.status, HealthStatus::Healthy),
             "a tree inside its allowance is healthy"
@@ -13785,6 +13840,108 @@ mod tests {
             !inside.detail.contains("past the allowance"),
             "and says nothing about an overrun it does not have: {}",
             inside.detail
+        );
+    }
+
+    /// The first `kin doctor` on a fresh 8 GiB Mac printed a red row saying
+    /// the daemon held 6.9 GiB of a 4.0 GiB allowance. The figure was real,
+    /// but it was taken partway through the first embedding pass, mostly GPU
+    /// memory, by a daemon `kin init` had already stopped. A reading from a
+    /// process that is gone is reported as that run's reading, with what it
+    /// counted and what it was made of, and is not graded as memory held now.
+    #[test]
+    fn a_standing_from_a_daemon_that_has_stopped_is_reported_and_not_graded() {
+        let gib = 1024 * 1024 * 1024u64;
+        let mib = 1024 * 1024u64;
+        let first_pass = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: 6 * gib + 922 * mib,
+                children_bytes: 0,
+                child_count: 0,
+                kernel_capped: false,
+                own_breakdown: Some(kin_core::memory_pressure::FootprintBreakdown {
+                    gpu_bytes: Some(5 * gib + 870 * mib),
+                    compressed_bytes: 3 * gib + 517 * mib,
+                }),
+            },
+            budget_bytes: 4 * gib,
+            budget_is_derived: true,
+            budget_host_ceiling_bytes: Some(8 * gib),
+            level: "critical".to_string(),
+            pid: 4103,
+            at_unix: 76_440, // 21:14Z
+        };
+
+        let stopped =
+            daemon_memory_standing_check_for(&first_pass, 76_440 + 90, Publisher::Stopped);
+        assert!(
+            matches!(stopped.status, HealthStatus::Healthy),
+            "a stopped daemon holds nothing, so its old reading is not a degraded row: {}",
+            stopped.detail
+        );
+        assert!(
+            stopped.detail.contains("pid 4103) has stopped")
+                && stopped.detail.contains("no longer holds this memory")
+                && stopped.detail.contains("21:14Z")
+                && stopped.detail.contains("90s ago"),
+            "it says whose reading it is and when it was taken: {}",
+            stopped.detail
+        );
+        assert!(
+            stopped
+                .detail
+                .contains("hold 6.9 GiB of the 4.0 GiB it is allowed"),
+            "the figure itself is still reported: {}",
+            stopped.detail
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            stopped.detail.contains("physical footprint")
+                && stopped.detail.contains("Activity Monitor"),
+            "and it says what was counted: {}",
+            stopped.detail
+        );
+        assert!(
+            stopped.detail.contains("5.8 GiB is GPU memory")
+                && stopped
+                    .detail
+                    .contains("3.5 GiB is compressed or swapped out"),
+            "and what the daemon's own share was made of: {}",
+            stopped.detail
+        );
+
+        // The same reading from a daemon still serving is held now, and is
+        // graded exactly as before.
+        let serving =
+            daemon_memory_standing_check_for(&first_pass, 76_440 + 90, Publisher::Serving);
+        assert!(matches!(serving.status, HealthStatus::Degraded));
+        assert!(!blocks_readiness(&serving));
+        assert!(
+            serving.detail.contains("past the allowance"),
+            "{}",
+            serving.detail
+        );
+    }
+
+    /// The store's own record of who serves it is what tells a stopped
+    /// publisher from a live one; a pid that is not alive is never serving.
+    #[test]
+    fn a_publisher_that_is_not_running_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pid that cannot be alive, recorded as the serving daemon.
+        kin_daemon_spawn::publish_serving_daemon(dir.path(), u32::MAX);
+        assert_eq!(publisher_state(dir.path(), u32::MAX), Publisher::Stopped);
+        // This test process is alive and is what the store names.
+        kin_daemon_spawn::publish_serving_daemon(dir.path(), std::process::id());
+        assert_eq!(
+            publisher_state(dir.path(), std::process::id()),
+            Publisher::Serving
+        );
+        // Alive, but not what the store names, and no PID file either.
+        kin_daemon_spawn::publish_serving_daemon(dir.path(), u32::MAX);
+        assert_eq!(
+            publisher_state(dir.path(), std::process::id()),
+            Publisher::Stopped
         );
     }
 
@@ -13811,6 +13968,7 @@ mod tests {
                 children_bytes: 512 * 1024 * 1024,
                 child_count: 1,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget_bytes: 8 * 1024 * 1024 * 1024,
             budget_is_derived: true,
@@ -13833,7 +13991,8 @@ mod tests {
             "the refusal row points at the row that holds the standing: {}",
             gauge.detail
         );
-        let standing_row = daemon_memory_standing_check_for(&published, published.at_unix + 3);
+        let standing_row =
+            daemon_memory_standing_check_for(&published, published.at_unix + 3, Publisher::Serving);
         assert!(matches!(standing_row.status, HealthStatus::Healthy));
         assert!(!blocks_readiness(&standing_row));
         assert!(

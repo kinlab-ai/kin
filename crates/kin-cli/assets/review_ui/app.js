@@ -1782,6 +1782,40 @@
   }
 
   /**
+   * Which agent made this change, and what it read through Kin first, when an
+   * agent session made it. The entities link to their workspace pages when
+   * this review is opened from the workspace. A person's change has no line.
+   */
+  function agentLine(guide) {
+    const agent = guide.kind === "change" && guide.change ? guide.change.agent : null;
+    if (!agent || typeof agent.name !== "string" || !agent.name) return null;
+    const spark = () => h("span", { class: "agent-line-mark", "aria-hidden": "true" });
+    const line = h("p", { class: "agent-line" }, spark(), h("span", {}, `${agent.name} made this change.`));
+    const workspace = document.body.dataset.workspaceUrl;
+    getJson(`/api/change-agent?change=${encodeURIComponent(guide.change.id)}`)
+      .then((found) => {
+        const looked = found && found.looked_at;
+        if (!looked || !Number.isSafeInteger(looked.count)) return;
+        const names = (found && found.names) || {};
+        const shown = (looked.entity_ids || []).filter((id) => names[id] && names[id].label).slice(0, 6);
+        const amount = `${looked.complete ? "" : "at least "}${plural(looked.count, "entity", "entities")}`;
+        const parts = [looked.count ? `${agent.name} made this change after looking at ${amount}` : `${agent.name} made this change without looking anything up through Kin first`];
+        shown.forEach((id, index) => {
+          parts.push(index === 0 ? ": " : index === shown.length - 1 && looked.count === shown.length ? " and " : ", ");
+          const label = h("code", {}, names[id].label);
+          parts.push(workspace ? h("a", { class: "agent-line-entity", href: `${workspace}#/entity/${encodeURIComponent(id)}` }, label) : label);
+        });
+        if (shown.length && looked.count > shown.length) parts.push(` and ${plural(looked.count - shown.length, "other", "others")}`);
+        parts.push(".");
+        line.replaceChildren(spark(), h("span", {}, ...parts));
+      })
+      .catch(() => {
+        // The name above stands on its own; what the agent read is extra.
+      });
+    return line;
+  }
+
+  /**
    * What a guide is called at the top of the page. A range is asked for by
    * two refs, and a reader holds a branch name or a change's own title more
    * easily than sixty-four characters of id.
@@ -1934,6 +1968,7 @@
       "header",
       { class: "change-head" },
       eyebrow(guide),
+      agentLine(guide),
       h("h1", {}, titleOf(guide)),
       rest ? h("p", { class: "message" }, rest) : null,
       noEntity ? null : h("p", { class: "lede" }, lede),

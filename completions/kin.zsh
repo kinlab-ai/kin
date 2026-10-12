@@ -58,6 +58,7 @@ _kin() {
         'git:Git interop commands'
         'intent:Manage agent intents'
         'traffic:Show traffic on a scope'
+        'agents:Show the AI agents working in this repository'
         'assistant:Manage assistant adapters'
         'work:Manage work items'
         'note:Manage annotations'

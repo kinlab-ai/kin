@@ -34,6 +34,21 @@ use crate::resolution::{
 };
 use crate::rust_project::RustProjectAuthority;
 
+mod guarded_receiver;
+mod member_value;
+pub(crate) use guarded_receiver::is_guarded_receiver_call;
+pub use guarded_receiver::{guard_of_occurrence, GUARDED_RECEIVER_RULE};
+pub(crate) use member_value::is_self_member_value;
+pub use member_value::SELF_MEMBER_VALUE_RULE;
+
+/// Whether only the cross-file linker may bind a raw relation, because its
+/// destination depends on facts the intra-file resolver does not hold: a
+/// guard-narrowed call is a possible target, and a member value's destination
+/// depends on the class hierarchy and its overrides.
+pub(crate) fn requires_linker_tier(rel: &ExtractedRelation) -> bool {
+    is_guarded_receiver_call(rel) || is_self_member_value(rel)
+}
+
 /// Graph-assigned artifact identities keyed by repository-relative path.
 ///
 /// Linking never derives identity from a path. Callers must resolve or allocate
@@ -73,11 +88,13 @@ pub const CALL_SHAPE_EVIDENCE_AGGREGATION_V1: &str = "call_shape_aggregation_v1"
 pub const SELF_DISPATCH_OVERRIDE_EVIDENCE_V1: &str = "self_dispatch_override_v1";
 
 pub fn is_self_dispatch_candidate(relation: &Relation) -> bool {
-    relation.kind == RelationKind::Calls
-        && relation
-            .evidence
-            .iter()
-            .any(|record| record.token.as_deref() == Some(SELF_DISPATCH_OVERRIDE_EVIDENCE_V1))
+    matches!(
+        relation.kind,
+        RelationKind::Calls | RelationKind::References
+    ) && relation
+        .evidence
+        .iter()
+        .any(|record| record.token.as_deref() == Some(SELF_DISPATCH_OVERRIDE_EVIDENCE_V1))
 }
 
 fn qualify_self_dispatch(mut relation: Relation) -> Relation {
@@ -1869,6 +1886,10 @@ fn resolve_one_file(
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
+    // Read once per file, and only when a guarded call needs it.
+    let mut receiver_guards: Option<
+        HashMap<(usize, usize), kin_parser::file_evidence::ReceiverGuard>,
+    > = None;
 
     for rel in &file.relations {
         if kin_parser::is_reserved_parser_record(rel) {
@@ -1943,6 +1964,65 @@ fn resolve_one_file(
                 {
                     accumulate_relation(&mut resolved, &mut relation_indices, edge);
                 }
+            }
+            continue;
+        }
+
+        // A call a receiver guard narrowed binds through the guard's class,
+        // as a possible target, or not at all. See
+        // [`guarded_receiver`](self::guarded_receiver).
+        if is_guarded_receiver_call(rel) {
+            let target = split_owner_method(rel.dst_name.as_str())
+                .filter(|_| rel.kind == RelationKind::Calls)
+                .and_then(|(owner, method)| {
+                    let (owner_file, owner_class) = locate_base_class(&file.file_path, owner, ctx)?;
+                    resolve_declared_method(&owner_file, &owner_class, method, ctx)
+                });
+            if let Some(dst_id) = target {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    guarded_receiver::guarded_receiver_relation(
+                        rel,
+                        src_id,
+                        dst_id,
+                        &caller_file,
+                        receiver_guards.get_or_insert_with(|| {
+                            kin_parser::file_evidence::receiver_guards_of(&file.relations)
+                        }),
+                    ),
+                );
+            }
+            continue;
+        }
+
+        // A bound member read through the method's own instance references
+        // the method its class declares or inherits, and nothing else. See
+        // [`member_value`](self::member_value).
+        if is_self_member_value(rel) {
+            let target = split_owner_method(rel.dst_name.as_str())
+                .filter(|_| rel.kind == RelationKind::References)
+                .and_then(|(owner, member)| {
+                    resolve_own_method(&file.file_path, owner, member, ctx)
+                        .map(|id| (id, RECEIVER_TYPE_CONFIDENCE))
+                        .or_else(|| {
+                            resolve_inherited_method(&file.file_path, owner, member, ctx)
+                                .map(|id| (id, INHERITED_METHOD_CONFIDENCE))
+                        })
+                })
+                .filter(|(id, _)| is_overridable_member(ctx.entity_kind_by_id.get(id)));
+            if let Some((dst_id, confidence)) = target {
+                let relation = if ctx.overridden_bases.contains(&dst_id) {
+                    qualify_self_dispatch(make_relation(
+                        rel,
+                        src_id,
+                        dst_id,
+                        DISPATCH_CANDIDATE_CONFIDENCE,
+                    ))
+                } else {
+                    make_relation(rel, src_id, dst_id, confidence)
+                };
+                accumulate_relation(&mut resolved, &mut relation_indices, relation);
             }
             continue;
         }
@@ -8272,6 +8352,8 @@ pub(crate) fn relation_evidence(
         }
         RelationSyntacticRole::ModuleContains => "module_contains".to_string(),
         RelationSyntacticRole::LexicalContains => "lexical_contains".to_string(),
+        RelationSyntacticRole::PythonGuardedReceiver => GUARDED_RECEIVER_RULE.to_string(),
+        RelationSyntacticRole::PythonSelfMemberValue => SELF_MEMBER_VALUE_RULE.to_string(),
     });
     if evidence.is_empty() {
         let mut only = RelationEvidence {
@@ -12230,6 +12312,10 @@ fn resolve_one_file_incremental(
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
+    // Read once per file, and only when a guarded call needs it.
+    let mut receiver_guards: Option<
+        HashMap<(usize, usize), kin_parser::file_evidence::ReceiverGuard>,
+    > = None;
     for rel in &file.relations {
         if kin_parser::is_reserved_parser_record(rel) {
             continue;
@@ -12343,6 +12429,76 @@ fn resolve_one_file_incremental(
                 ) {
                     accumulate_relation(&mut resolved, &mut relation_indices, edge);
                 }
+            }
+            continue;
+        }
+
+        // Mirrors the batch linker's guarded-receiver tier.
+        if is_guarded_receiver_call(rel) {
+            let target = split_owner_method(rel.dst_name.as_str())
+                .filter(|_| rel.kind == RelationKind::Calls)
+                .and_then(|(owner, method)| {
+                    let (owner_file, owner_class) =
+                        locate_base_class_incremental(&file.file_path, owner, linker, import_map)?;
+                    resolve_declared_method_incremental(
+                        &owner_file,
+                        &owner_class,
+                        method,
+                        linker,
+                        import_map,
+                        class_bases,
+                    )
+                });
+            if let Some(dst_id) = target {
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    guarded_receiver::guarded_receiver_relation(
+                        rel,
+                        src_id,
+                        dst_id,
+                        &caller_file,
+                        receiver_guards.get_or_insert_with(|| {
+                            kin_parser::file_evidence::receiver_guards_of(&file.relations)
+                        }),
+                    ),
+                );
+            }
+            continue;
+        }
+
+        // Mirrors the batch linker's member-value tier.
+        if is_self_member_value(rel) {
+            let target = split_owner_method(rel.dst_name.as_str())
+                .filter(|_| rel.kind == RelationKind::References)
+                .and_then(|(owner, member)| {
+                    resolve_own_method_incremental(&file.file_path, owner, member, linker)
+                        .map(|id| (id, RECEIVER_TYPE_CONFIDENCE))
+                        .or_else(|| {
+                            resolve_inherited_method_incremental(
+                                &file.file_path,
+                                owner,
+                                member,
+                                linker,
+                                import_map,
+                                class_bases,
+                            )
+                            .map(|id| (id, INHERITED_METHOD_CONFIDENCE))
+                        })
+                })
+                .filter(|(id, _)| is_overridable_member(linker.entity_kind_by_id.get(id)));
+            if let Some((dst_id, confidence)) = target {
+                let relation = if overridden_bases.contains(&dst_id) {
+                    qualify_self_dispatch(make_relation(
+                        rel,
+                        src_id,
+                        dst_id,
+                        DISPATCH_CANDIDATE_CONFIDENCE,
+                    ))
+                } else {
+                    make_relation(rel, src_id, dst_id, confidence)
+                };
+                accumulate_relation(&mut resolved, &mut relation_indices, relation);
             }
             continue;
         }

@@ -27,7 +27,7 @@ pub use change_shape::{
     classify_change_shape, evidence_note, gate_action_for, BodyShape, Branch, ChangeShape,
     GateAction, Statement, StatementKind,
 };
-pub use contract::{signature_changed, tokens_unchanged, ContractChange};
+pub use contract::{signature_changed, tokens_unchanged, ConsumerReach, ContractChange};
 pub use diff::{
     compute_diff, diff_from_change, diff_from_changes, diff_from_entity_ids, diff_from_files,
     is_semantic_modification, EntityChange, EntityChangeKind, SemanticDiff,

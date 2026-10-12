@@ -18,6 +18,13 @@ use kin_notify::{Level, Notification, Notifier, Outcome, SuppressedBy, Suppressi
 pub const EXIT_SUPPRESSED: i32 = 1;
 /// Exit code for a notification no backend could deliver.
 pub const EXIT_UNDELIVERED: i32 = 6;
+/// `kin notify authorize`: there is no notifier bundle to ask about.
+pub const EXIT_NO_BUNDLE: i32 = 3;
+/// `kin notify authorize`: notifications are not allowed, declined now or
+/// turned off earlier.
+pub const EXIT_NOT_ALLOWED: i32 = 4;
+/// `kin notify authorize`: the question is still open.
+pub const EXIT_NOT_DECIDED: i32 = 7;
 
 /// Deliver one notification.
 pub fn send(
@@ -134,4 +141,70 @@ pub fn status(json: bool) -> Result<i32> {
         println!("held keys: {}", status.held_keys.join(" "));
     }
     Ok(0)
+}
+
+/// Ask macOS whether Kin may post notifications as Kin.
+///
+/// The command every "not decided yet" names. It asks only when the question
+/// is open and this session can reach the Mac's screen, and it waits at most
+/// `wait` for the answer; an unanswered request stays open on screen after it
+/// returns. See `kin_notify::authorization` for each decision.
+pub fn authorize(wait: Duration, json: bool) -> Result<i32> {
+    use kin_notify::authorization::{AuthorizationReport, AuthorizationState};
+
+    if !cfg!(target_os = "macos") {
+        let detail = "only macOS asks before an app may post notifications, so there is \
+                      nothing to decide here";
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "outcome": "not_applicable", "allowed": null, "detail": detail })
+            );
+        } else {
+            println!("{detail}");
+        }
+        return Ok(0);
+    }
+
+    let notifier = Notifier::new()?;
+    let report = notifier.request_authorization(wait, || {
+        if !json {
+            println!(
+                "macOS is asking whether Kin may send you notifications. Answer it on screen; \
+                 this waits up to {} seconds.",
+                wait.as_secs()
+            );
+        }
+    });
+    let code = match &report {
+        AuthorizationReport::NoBundle => EXIT_NO_BUNDLE,
+        AuthorizationReport::Undecided(_) => EXIT_NOT_DECIDED,
+        AuthorizationReport::AlreadyDecided(AuthorizationState::NotDetermined) => EXIT_NOT_DECIDED,
+        report if report.allows() => 0,
+        _ => EXIT_NOT_ALLOWED,
+    };
+    // A missing bundle has a sentence of its own that names the install to
+    // repair, which is more use than saying there is nothing to ask about.
+    let detail = match &report {
+        AuthorizationReport::NoBundle => notifier
+            .status()
+            .degradation()
+            .unwrap_or_else(|| report.sentence()),
+        _ => report.sentence(),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "outcome": report.kind(),
+                "allowed": report.allows(),
+                "detail": detail,
+            })
+        );
+    } else if code == 0 {
+        println!("{detail}");
+    } else {
+        eprintln!("{detail}");
+    }
+    Ok(code)
 }

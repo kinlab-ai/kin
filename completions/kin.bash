@@ -31,7 +31,7 @@ _kin() {
 
     case "${cmd}" in
         kin)
-            opts="init status commit log branch diff eject impact context trace search refs review history dead-code deps spec merge stash blame workspace run mcp auth remote push pull clone import checkout verify exec support audit approvals security semver release rollback bench migrate git intent traffic assistant work note feature todo open mode with reconcile shell overview completions update registry setup help"
+            opts="init status commit log branch diff eject impact context trace search refs review history dead-code deps spec merge stash blame workspace run mcp auth remote push pull clone import checkout verify exec support audit approvals security semver release rollback bench migrate git intent traffic agents assistant work note feature todo open mode with reconcile shell overview completions update registry setup help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]]; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

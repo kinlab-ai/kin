@@ -685,7 +685,9 @@ impl Reconciler {
     }
 
     /// Reconstruct live dependency nominations from current canonical source.
-    /// This runs after canonical semantic debt is paid at daemon startup.
+    /// This runs after canonical semantic debt is paid at daemon startup, over a
+    /// graph that holds a derived layout for every admitted source, so an
+    /// admitted module that declares nothing and holds no layout is a gap.
     pub fn restore_cross_file_dependencies<G: GraphStore>(
         &mut self,
         graph: &G,
@@ -3211,7 +3213,7 @@ impl Reconciler {
             self.cross_file.seed_from_graph_checked(graph)?;
         }
         self.cross_file
-            .restore_dependencies(graph, blob_store, Some(&file_id.0))?;
+            .restore_dependencies_for_edit(graph, blob_store, &file_id.0)?;
         let departing = existing.iter().map(|entity| entity.id).collect();
         let mut incident = Vec::new();
         for entity in &existing {

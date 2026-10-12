@@ -462,6 +462,9 @@
     // A short entrance on the first frames: lines and dots ease in once.
     let bornAt = null, appear = reduced ? 1 : 0;
     let labels = [];
+    // Entities an agent is working on, ringed on the map: "looked" for what
+    // it read, "changing" for what it is editing or just committed.
+    let marks = new Map();
 
     function readColors() {
       const style = view.getComputedStyle ? view.getComputedStyle(host) : null;
@@ -471,6 +474,8 @@
         edge: value("--map-edge", "rgba(120,110,200,0.14)"),
         hot: value("--map-edge-hot", "rgba(120,100,255,0.8)"),
         halo: value("--map-halo", "rgba(120,100,255,0.08)"),
+        agent: value("--map-agent", "#1f9d55"),
+        changing: value("--map-changing", "#d38b00"),
         accent: value("--accent", "#5b45e8"),
         test: value("--map-4", "#00b5d8"),
         surface: value("--surface", "#ffffff"),
@@ -520,9 +525,10 @@
     function buildLabels() {
       labelLayer.replaceChildren();
       labels = [];
-      // Entities in uncommitted work are named first, then the most relied on.
+      // Entities an agent is working on are named first, then those in
+      // uncommitted work, then the most relied on.
       const marked = new Set(options.markIds || []);
-      const priority = new Map([...marked, ...(options.labelIds || [])].map((id, i) => [id, i]).reverse());
+      const priority = new Map([...marks.keys(), ...marked, ...(options.labelIds || [])].map((id, i) => [id, i]).reverse());
       const rank = (node) => priority.has(node.id) ? priority.get(node.id) : Infinity;
       const ranked = nodes.filter((node) => !node.container).sort((a, b) => (b.id === options.focalId) - (a.id === options.focalId) || rank(a) - rank(b) || b.weight - a.weight || a.name.localeCompare(b.name));
       const wanted = mode === "focus" ? ranked : ranked.slice(0, options.labelCount || 10);
@@ -539,7 +545,7 @@
           label.addEventListener("focus", () => setHover(node));
           label.addEventListener("blur", () => setHover(null));
         }
-        label.className = `map-label${focal ? " map-label-focal" : ""}${node.role === "test" ? " map-label-test" : ""}${(options.markIds || []).includes(node.id) ? " map-label-work" : ""}`;
+        label.className = `map-label${focal ? " map-label-focal" : ""}${node.role === "test" ? " map-label-test" : ""}${(options.markIds || []).includes(node.id) ? " map-label-work" : ""}${marks.has(node.id) ? ` map-label-agent map-label-${marks.get(node.id)}` : ""}`;
         label.textContent = node.name;
         if (appear < 1) label.style.opacity = "0";
         const leftSide = mode === "focus" ? node.role !== "out" : node.sx > width * 0.62;
@@ -662,6 +668,24 @@
         }
       }
       context.globalAlpha = 1;
+      if (marks.size) {
+        const beat = reduced ? 0 : (Math.sin(time * 2.4) + 1) / 2;
+        for (const node of nodes) {
+          const tone = marks.get(node.id);
+          if (!tone) continue;
+          const color = tone === "changing" ? colors.changing : colors.agent;
+          const reach = node.radius + 15;
+          const glow = context.createRadialGradient(node.x, node.y, node.radius, node.x, node.y, reach);
+          glow.addColorStop(0, color); glow.addColorStop(1, "rgba(0,0,0,0)");
+          context.globalAlpha = (0.18 + 0.14 * beat) * appear;
+          context.fillStyle = glow;
+          context.beginPath(); context.arc(node.x, node.y, reach, 0, Math.PI * 2); context.fill();
+          context.globalAlpha = appear;
+          context.strokeStyle = color; context.lineWidth = tone === "changing" ? 2.2 : 1.6;
+          context.beginPath(); context.arc(node.x, node.y, node.radius + 4 + beat * 2.5, 0, Math.PI * 2); context.stroke();
+        }
+        context.globalAlpha = 1;
+      }
       for (const item of labels) {
         const x = item.node ? item.node.x + item.dx : item.group.cx + item.group.dx + item.dx;
         const y = item.node ? item.node.y + item.dy : item.group.cy + item.group.dy + item.dy;
@@ -777,6 +801,17 @@
         canvas.remove(); labelLayer.remove();
       },
       get labelled() { return labels.filter((item) => item.node).map((item) => item.node.id); },
+      /** Ring the entities an agent is working on, [[id, "looked" | "changing"], ...], and name them first. */
+      agentMark(entries) {
+        if (disposed) return;
+        const next = new Map((Array.isArray(entries) ? entries : []).filter(([id]) => byId.has(id)));
+        const same = next.size === marks.size && [...next].every(([id, tone]) => marks.get(id) === tone);
+        if (same) return;
+        marks = next;
+        buildLabels();
+        if (!running) draw(0);
+      },
+      get agentMarked() { return [...marks.keys()]; },
       /** Name a different set of entities first, without redrawing the map. */
       relabel(ids) {
         if (disposed) return;

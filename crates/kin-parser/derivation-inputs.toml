@@ -53,6 +53,8 @@ files = [
     "src/languages/python_declarations.rs",
     "src/languages/python_escape.rs",
     "src/languages/python_fields.rs",
+    "src/languages/python_guards.rs",
+    "src/languages/python_member_values.rs",
     "src/languages/ruby_declarations.rs",
     "src/languages/rust_crates.rs",
     "src/languages/rust_declarations.rs",

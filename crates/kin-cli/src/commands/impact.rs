@@ -63,6 +63,76 @@ pub struct ImpactResponse {
     /// Recorded repository-wide call-site limits, including on populated answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrichment: Option<kin_review::enrichment::EnrichmentObservation>,
+    /// What kind of reach the answer reports, and what it leaves unproven.
+    ///
+    /// Present on every resolved answer. It is absent on a refusal and on an
+    /// answer from a daemon that predates it, and a reader must not supply one
+    /// there: an answer that never carried this field never claimed anything
+    /// about feasibility either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpretation: Option<ImpactInterpretation>,
+}
+
+/// How to read an impact answer: structural graph reach, with argument and
+/// branch feasibility left open.
+///
+/// The walk follows graph edges and evaluates nothing along them. A dependent
+/// listed here holds a chain of edges to the entity; whether any argument that
+/// can actually arrive, or any branch that can actually run, carries a change
+/// along that chain is not something this answer establishes, and no field here
+/// claims it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactInterpretation {
+    /// Always [`STRUCTURAL_GRAPH_REACH`].
+    pub reach: String,
+    /// Always [`FEASIBILITY_NOT_ESTABLISHED`].
+    pub argument_and_branch_feasibility: String,
+    /// The relation kinds counted under `through_runtime_calls`: the kinds the
+    /// ranked report places in its `runtime_caller` bucket.
+    pub runtime_call_relations: Vec<kin_model::RelationKind>,
+    /// The dependents one hop from the entity.
+    pub direct: ImpactReachCounts,
+    /// Every dependent within the requested depth, the set the human count
+    /// line prints.
+    pub within_depth: ImpactReachCounts,
+}
+
+/// One set of dependents, split by the relations that reach them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactReachCounts {
+    pub dependents: usize,
+    /// Dependents with at least one shortest path to the entity made of
+    /// runtime-call relations alone. At one hop, a dependent holding a
+    /// runtime-call edge to the entity.
+    pub through_runtime_calls: usize,
+    /// Dependents every one of whose shortest paths to the entity crosses an
+    /// import, reference, type use or other non-call relation.
+    pub through_other_relations: usize,
+}
+
+/// `ImpactInterpretation::reach` on every answer this build produces.
+pub const STRUCTURAL_GRAPH_REACH: &str = "structural_graph";
+/// `ImpactInterpretation::argument_and_branch_feasibility` on every answer this
+/// build produces. Kin does not evaluate arguments or branches on this path.
+pub const FEASIBILITY_NOT_ESTABLISHED: &str = "not_established";
+
+/// The relation kinds through which a dependent reaches an entity by a runtime
+/// call.
+///
+/// The same four kinds `kin_review` ranks into
+/// [`kin_review::ImpactBucket::RuntimeCaller`], so the listing's "direct
+/// callers" heading and the ranked report's bucket cannot disagree about what a
+/// call is. `runtime_call_relations_match_the_ranked_runtime_caller_bucket`
+/// pins that agreement against the ranked report itself.
+const RUNTIME_CALL_RELATIONS: [kin_model::RelationKind; 4] = [
+    kin_model::RelationKind::Calls,
+    kin_model::RelationKind::Spawns,
+    kin_model::RelationKind::Instantiates,
+    kin_model::RelationKind::SendsMessage,
+];
+
+fn is_runtime_call(kind: kin_model::RelationKind) -> bool {
+    RUNTIME_CALL_RELATIONS.contains(&kind)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -228,6 +298,7 @@ pub async fn build_impact_response_with_source(
             ranked: None,
             negative: None,
             enrichment: None,
+            interpretation: None,
         });
     }
     // One resolver for every read command (FIR-3505): the typed qualifiers and
@@ -306,6 +377,7 @@ pub async fn build_impact_response_with_source(
             ranked: None,
             negative: None,
             enrichment: None,
+            interpretation: None,
         });
     }
 
@@ -332,6 +404,7 @@ pub async fn build_impact_response_with_source(
             ranked: None,
             negative: None,
             enrichment: None,
+            interpretation: None,
         });
     }
 
@@ -347,6 +420,7 @@ pub async fn build_impact_response_with_source(
             ranked: None,
             negative: None,
             enrichment: None,
+            interpretation: None,
         });
     }
 
@@ -379,12 +453,14 @@ pub async fn build_impact_response_with_source(
     }
 
     // 1. Local Impact, grouped by traversal distance so a reader can tell the
-    // direct callers from the transitive ripple. The walk below records the hop
-    // at which each entity is first reached, so the count and every group are
-    // read off one traversal of one graph state.
-    let local_impacted = downstream_impact_by_hop(graph, &target.id, depth)?;
+    // direct dependents from the transitive ripple. The walk below records the
+    // hop at which each entity is first reached, and the relations that reached
+    // it there, so the count, every group and the interpretation are read off
+    // one traversal of one graph state.
+    let local_impacted = downstream_impact_walk(graph, &target.id, depth)?;
+    let interpretation = impact_interpretation(&local_impacted);
     let enrichment_targets = std::iter::once(target.clone())
-        .chain(local_impacted.iter().map(|(_, entity)| entity.clone()))
+        .chain(local_impacted.iter().map(|reached| reached.entity.clone()))
         .collect::<Vec<_>>();
     let source = kin_mcp::handlers::review::AnalysisEscapeEvidence::new(
         graph,
@@ -423,12 +499,25 @@ pub async fn build_impact_response_with_source(
             depth,
             if depth == 1 { "" } else { "s" }
         ));
+        // The count above is graph reach, and the line under it says so before
+        // any group is read as a list of things a change will break.
+        lines.push(interpretation_line(&interpretation));
+        // "Direct callers" is a claim about every row under it, so it is made
+        // only when every row holds a runtime-call edge to the entity. An import
+        // or a type use is a dependency, not a call, and one such row turns the
+        // whole heading into the structural one.
+        let direct_heading = if interpretation.direct.through_other_relations == 0 {
+            "  1 hop (direct callers):"
+        } else {
+            "  1 hop (direct graph dependents):"
+        };
         let mut current_hop = 0;
-        for (hop, entity) in &local_impacted {
-            if *hop != current_hop {
-                current_hop = *hop;
-                lines.push(if *hop == 1 {
-                    "  1 hop (direct callers):".to_string()
+        for reached in &local_impacted {
+            let (hop, entity) = (reached.hop, &reached.entity);
+            if hop != current_hop {
+                current_hop = hop;
+                lines.push(if hop == 1 {
+                    direct_heading.to_string()
                 } else {
                     format!("  {hop} hops:")
                 });
@@ -436,7 +525,13 @@ pub async fn build_impact_response_with_source(
             let at = entity_location(graph, entity)
                 .map(|loc| format!(" @ {loc}"))
                 .unwrap_or_default();
-            lines.push(format!("    - {} ({:?}){}", entity.name, entity.kind, at));
+            lines.push(format!(
+                "    - {} ({:?}){}{}",
+                entity.name,
+                entity.kind,
+                at,
+                non_call_suffix(reached)
+            ));
         }
     }
 
@@ -495,7 +590,99 @@ pub async fn build_impact_response_with_source(
         ranked,
         negative,
         enrichment: Some(enrichment),
+        interpretation: Some(interpretation),
     })
+}
+
+/// The interpretation of one walk, counted off the rows the listing prints.
+fn impact_interpretation(reached: &[ReachedDependent]) -> ImpactInterpretation {
+    ImpactInterpretation {
+        reach: STRUCTURAL_GRAPH_REACH.to_string(),
+        argument_and_branch_feasibility: FEASIBILITY_NOT_ESTABLISHED.to_string(),
+        runtime_call_relations: RUNTIME_CALL_RELATIONS.to_vec(),
+        direct: reach_counts(reached.iter().filter(|row| row.hop == 1)),
+        within_depth: reach_counts(reached.iter()),
+    }
+}
+
+fn reach_counts<'a>(rows: impl Iterator<Item = &'a ReachedDependent>) -> ImpactReachCounts {
+    let mut counts = ImpactReachCounts {
+        dependents: 0,
+        through_runtime_calls: 0,
+        through_other_relations: 0,
+    };
+    for row in rows {
+        counts.dependents += 1;
+        if row.call_path {
+            counts.through_runtime_calls += 1;
+        } else {
+            counts.through_other_relations += 1;
+        }
+    }
+    counts
+}
+
+/// The sentence that qualifies the impacted count: what the count measures,
+/// how much of it rides call relations alone, and what it does not establish.
+fn interpretation_line(interpretation: &ImpactInterpretation) -> String {
+    let counts = interpretation.within_depth;
+    let (dependents, reach) = if counts.dependents == 1 {
+        ("dependent", "reaches")
+    } else {
+        ("dependents", "reach")
+    };
+    let split = match (counts.through_runtime_calls, counts.through_other_relations) {
+        (_, 0) if counts.dependents == 1 => "through call relations".to_string(),
+        (_, 0) => "all through call relations".to_string(),
+        (0, _) if counts.dependents == 1 => "through a non-call relation".to_string(),
+        (0, _) => "none through call relations alone".to_string(),
+        (calls, other) => {
+            format!("{calls} through call relations alone, {other} through a non-call relation")
+        }
+    };
+    format!(
+        "  Structural graph reach: {} local graph {dependents} {reach} this entity through graph \
+         edges ({split}); argument and branch feasibility is not established.",
+        counts.dependents
+    )
+}
+
+/// The note a one-hop row carries when no runtime-call edge joins it to the
+/// entity: the relations that do, so a module that only imports the entity is
+/// not read as calling it. Empty for every other row.
+fn non_call_suffix(reached: &ReachedDependent) -> String {
+    if reached.hop != 1 || reached.call_path {
+        return String::new();
+    }
+    let mut words: Vec<String> = reached
+        .joins
+        .iter()
+        .map(|kind| relation_words(*kind))
+        .collect();
+    words.sort();
+    words.dedup();
+    let named = match words.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => return String::new(),
+    };
+    format!(" ({named}, not a call)")
+}
+
+/// A relation kind in lower-case words: `UsesType` is `uses type`.
+fn relation_words(kind: kin_model::RelationKind) -> String {
+    let mut words = String::new();
+    for character in format!("{kind:?}").chars() {
+        if character.is_ascii_uppercase() {
+            if !words.is_empty() {
+                words.push(' ');
+            }
+            words.push(character.to_ascii_lowercase());
+        } else {
+            words.push(character);
+        }
+    }
+    words
 }
 
 /// The Go interface-dispatch candidates for `target`, rendered in impact's own
@@ -686,32 +873,6 @@ fn empty_impact_context(
     Ok(lines)
 }
 
-/// One breadth-first walk over inbound entity edges, pairing every reached
-/// entity with the hop it was first reached at, in discovery order.
-///
-/// Breadth-first order reaches a node by a shortest path, so first-reach hop is
-/// that entity's minimum distance from the target and the caller can group
-/// straight out of this one result. Walking the graph again per hop instead
-/// would cost depth times as much and would read a different graph state each
-/// time, so a concurrent write between two walks could leave the grouped
-/// listing disagreeing with the count printed above it.
-///
-/// The edge set is entity-to-entity relations pointing at the entity being
-/// expanded, with the relation's source as the dependent, selected by
-/// [`kin_review::inbound_impact_relations`]. That function is the ranked
-/// report's own, called rather than restated, so the two walks this command runs
-/// over one target cannot answer differently (FIR-2478). Sharing a whole
-/// selection rather than a per-kind predicate is deliberate: while each side
-/// applied `is_impact_relation` for itself they still diverged, because the rule
-/// that matters needs the `Contains` edge to identify a declaring parent and
-/// that edge is not itself an impact relation.
-///
-/// `both_impact_walks_name_the_same_entities_on_one_graph` pins the agreement by
-/// reading what each walk actually returned and requiring the sets to match,
-/// rather than checking each against its own expectation.
-/// `impact_hop_walk_matches_the_impact_filtered_graph_walk` pins the remaining
-/// equivalence with `GraphStore::get_downstream_impact`, which applies no such
-/// filter and so is the wider set.
 /// The two graph reads the hop walk performs, named so a test can count them.
 trait ImpactWalkGraph {
     /// Entity-to-entity relations that point at `id`.
@@ -733,19 +894,84 @@ impl ImpactWalkGraph for kin_db::InMemoryGraph {
     }
 }
 
-fn downstream_impact_by_hop<G: ImpactWalkGraph>(
+/// One dependent the hop walk reached and can list.
+#[derive(Debug, Clone)]
+struct ReachedDependent {
+    /// The hop it was first reached at, its minimum distance from the target.
+    hop: u32,
+    entity: kin_model::Entity,
+    /// Every impact relation kind joining it to an entity one hop nearer the
+    /// target, in the order the walk met them. These are its edges on the
+    /// shortest paths; an edge to anything farther away is not one.
+    joins: Vec<kin_model::RelationKind>,
+    /// Whether at least one of its shortest paths to the target is made of
+    /// runtime-call relations alone.
+    call_path: bool,
+}
+
+/// What the walk knows about every id it reached, listable or not.
+struct Reach {
+    hop: u32,
+    call_path: bool,
+    /// Its row in the result, when its entity record exists.
+    row: Option<usize>,
+}
+
+/// One breadth-first walk over inbound entity edges, pairing every reached
+/// entity with the hop it was first reached at, in discovery order, and with
+/// the relations that reached it there.
+///
+/// Breadth-first order reaches a node by a shortest path, so first-reach hop is
+/// that entity's minimum distance from the target and the caller can group
+/// straight out of this one result. Walking the graph again per hop instead
+/// would cost depth times as much and would read a different graph state each
+/// time, so a concurrent write between two walks could leave the grouped
+/// listing disagreeing with the count printed above it.
+///
+/// The edge set is entity-to-entity relations pointing at the entity being
+/// expanded, with the relation's source as the dependent, selected by
+/// [`kin_review::inbound_impact_relations`]. That function is the ranked
+/// report's own, called rather than restated, so the two walks this command runs
+/// over one target cannot answer differently (FIR-2478). Sharing a whole
+/// selection rather than a per-kind predicate is deliberate: while each side
+/// applied `is_impact_relation` for itself they still diverged, because the rule
+/// that matters needs the `Contains` edge to identify a declaring parent and
+/// that edge is not itself an impact relation.
+///
+/// Recording the joining relations reads nothing more and changes nothing the
+/// walk returns. A relation from an entity first reached in this same round is
+/// a second shortest-path join and adds its kind; a relation from an entity
+/// reached in an earlier round is not on a shortest path and is skipped, as it
+/// always was.
+///
+/// `both_impact_walks_name_the_same_entities_on_one_graph` pins the agreement by
+/// reading what each walk actually returned and requiring the sets to match,
+/// rather than checking each against its own expectation.
+/// `impact_hop_walk_matches_the_impact_filtered_graph_walk` pins the remaining
+/// equivalence with `GraphStore::get_downstream_impact`, which applies no such
+/// filter and so is the wider set.
+fn downstream_impact_walk<G: ImpactWalkGraph>(
     graph: &G,
     target: &EntityId,
     depth: u32,
-) -> Result<Vec<(u32, kin_model::Entity)>> {
-    let mut visited: std::collections::HashSet<EntityId> =
-        std::collections::HashSet::from([*target]);
-    let mut reached: Vec<(u32, kin_model::Entity)> = Vec::new();
+) -> Result<Vec<ReachedDependent>> {
+    let mut reach: std::collections::HashMap<EntityId, Reach> =
+        std::collections::HashMap::from([(
+            *target,
+            Reach {
+                hop: 0,
+                call_path: true,
+                row: None,
+            },
+        )]);
+    let mut reached: Vec<ReachedDependent> = Vec::new();
     let mut frontier = vec![*target];
 
     for hop in 1..=depth {
         let mut next = Vec::new();
         for current in frontier {
+            // Settled: every join into `current` was read in the round before.
+            let current_call_path = reach.get(&current).is_some_and(|seen| seen.call_path);
             // One policy, both walks, and one function rather than one predicate
             // each side applies for itself. Dropping the `Contains` KIND was not
             // enough on a real graph: a declaring class carries a `UsesType` edge
@@ -756,16 +982,46 @@ fn downstream_impact_by_hop<G: ImpactWalkGraph>(
                 let Some(dependent) = relation.src.as_entity() else {
                     continue;
                 };
-                if !visited.insert(dependent) {
-                    continue;
+                let call_path = current_call_path && is_runtime_call(relation.kind);
+                match reach.entry(dependent) {
+                    std::collections::hash_map::Entry::Occupied(mut seen) => {
+                        let seen = seen.get_mut();
+                        if seen.hop != hop {
+                            continue;
+                        }
+                        seen.call_path |= call_path;
+                        if let Some(index) = seen.row {
+                            let row = &mut reached[index];
+                            row.call_path |= call_path;
+                            if !row.joins.contains(&relation.kind) {
+                                row.joins.push(relation.kind);
+                            }
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        // An id carried by a relation whose entity record is
+                        // missing is still a real step in the walk, so it keeps
+                        // expanding even though it cannot be listed.
+                        let row = match graph.entity(&dependent)? {
+                            Some(entity) => {
+                                reached.push(ReachedDependent {
+                                    hop,
+                                    entity,
+                                    joins: vec![relation.kind],
+                                    call_path,
+                                });
+                                Some(reached.len() - 1)
+                            }
+                            None => None,
+                        };
+                        slot.insert(Reach {
+                            hop,
+                            call_path,
+                            row,
+                        });
+                        next.push(dependent);
+                    }
                 }
-                // An id carried by a relation whose entity record is missing is
-                // still a real step in the walk, so it keeps expanding even
-                // though it cannot be listed.
-                if let Some(entity) = graph.entity(&dependent)? {
-                    reached.push((hop, entity));
-                }
-                next.push(dependent);
             }
         }
         if next.is_empty() {
@@ -775,6 +1031,19 @@ fn downstream_impact_by_hop<G: ImpactWalkGraph>(
     }
 
     Ok(reached)
+}
+
+/// The walk as hop and entity pairs, the shape the walk tests pin.
+#[cfg(test)]
+fn downstream_impact_by_hop<G: ImpactWalkGraph>(
+    graph: &G,
+    target: &EntityId,
+    depth: u32,
+) -> Result<Vec<(u32, kin_model::Entity)>> {
+    Ok(downstream_impact_walk(graph, target, depth)?
+        .into_iter()
+        .map(|reached| (reached.hop, reached.entity))
+        .collect())
 }
 
 /// The answer when a name resolves but the identity qualifiers exclude every
@@ -2132,6 +2401,12 @@ mod tests {
             vec![
                 "Impact analysis for 'changed' (Function) @ src/lib.rs:11:".to_string(),
                 "  2 local entities impacted within 3 hops:".to_string(),
+                // The one inserted line: what the count above measures. Every
+                // edge here is a call, so the heading below keeps its name.
+                "  Structural graph reach: 2 local graph dependents reach this entity through \
+                 graph edges (all through call relations); argument and branch feasibility is \
+                 not established."
+                    .to_string(),
                 "  1 hop (direct callers):".to_string(),
                 "    - direct_caller (Function) @ src/direct.rs:21".to_string(),
                 "  2 hops:".to_string(),
@@ -3023,6 +3298,289 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("not found"), "{text}");
+            assert!(
+                response.interpretation.is_none(),
+                "a refusal reports no reach to interpret"
+            );
         }
+    }
+
+    async fn impact_for(
+        graph: &kin_db::InMemoryGraph,
+        entity: &str,
+        require_unique: bool,
+    ) -> ImpactResponse {
+        let dir = tempfile::tempdir().unwrap();
+        build_impact_response(
+            &kin_core::KinLayout::new(dir.path().join(".kin")),
+            graph,
+            &ImpactRequest {
+                entity: entity.to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique,
+                dispatch_candidates: false,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The listing's "direct callers" heading and the ranked report's
+    /// `runtime_caller` bucket read one rule.
+    ///
+    /// Each impact relation kind is ranked from an ordinary source entity, and
+    /// the report must bucket it as a runtime caller exactly when this command
+    /// counts the kind as a runtime call. Read off the ranked report itself, so
+    /// a kind added to either side without the other fails here.
+    #[test]
+    fn runtime_call_relations_match_the_ranked_runtime_caller_bucket() {
+        let impact_kinds = [
+            RelationKind::Extends,
+            RelationKind::Implements,
+            RelationKind::Overrides,
+            RelationKind::Calls,
+            RelationKind::Spawns,
+            RelationKind::Instantiates,
+            RelationKind::References,
+            RelationKind::UsesMacro,
+            RelationKind::UsesType,
+            RelationKind::Imports,
+            RelationKind::Includes,
+            RelationKind::DependsOn,
+            RelationKind::ConsumesContract,
+            RelationKind::SubscribesTo,
+            RelationKind::SendsMessage,
+            RelationKind::Tests,
+            RelationKind::Covers,
+            RelationKind::DerivedFrom,
+        ];
+        let mut runtime = Vec::new();
+        for kind in impact_kinds {
+            assert!(kin_review::is_impact_relation(kind), "{kind:?}");
+            let graph = kin_db::InMemoryGraph::new();
+            let target = entity("target", "src/target.rs");
+            let dependent = entity("dependent", "src/dependent.rs");
+            graph.upsert_entity(&target).unwrap();
+            graph.upsert_entity(&dependent).unwrap();
+            relate(&graph, &dependent, &target, kind);
+            let report = kin_review::rank_impact(&graph, &target.id, 1).unwrap();
+            assert_eq!(report.candidates.len(), 1, "{kind:?}");
+            assert_eq!(
+                report.candidates[0].bucket == kin_review::ImpactBucket::RuntimeCaller,
+                super::is_runtime_call(kind),
+                "{kind:?}: the heading and the ranked bucket must agree on what a call is"
+            );
+            if super::is_runtime_call(kind) {
+                runtime.push(kind);
+            }
+        }
+        assert_eq!(runtime, super::RUNTIME_CALL_RELATIONS.to_vec());
+    }
+
+    /// An import is a dependency, not a call.
+    ///
+    /// The demo audit's shape: a test module that imports the entity sat at one
+    /// hop under "direct callers", and the count above it read as behaviour a
+    /// change would reach. Here the importing row names its relations and takes
+    /// the heading to the structural one, a row that calls keeps its plain
+    /// spelling, the count says what it measures, and the walk, the count and
+    /// the ranked report are exactly what they were.
+    #[tokio::test]
+    async fn an_importing_dependent_is_not_listed_under_direct_callers() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity_at("parse", "src/parse.rs", 0);
+        let getter = entity_at("getter", "src/parse.rs", 4);
+        let importer = entity_at("parse_test", "tests/parse.rs", 0);
+        let both = entity_at("both", "src/both.rs", 2);
+        let outer = entity_at("outer", "src/outer.rs", 8);
+        let after_import = entity_at("after_import", "tests/after.rs", 1);
+        for e in [&target, &getter, &importer, &both, &outer, &after_import] {
+            graph.upsert_entity(e).unwrap();
+        }
+        relate(&graph, &getter, &target, RelationKind::Calls);
+        relate(&graph, &importer, &target, RelationKind::Imports);
+        relate(&graph, &importer, &target, RelationKind::References);
+        // Calls as well as imports: a caller, whatever else joins the pair.
+        relate(&graph, &both, &target, RelationKind::Calls);
+        relate(&graph, &both, &target, RelationKind::Imports);
+        // Two hops by calls alone, and two hops through the import.
+        relate(&graph, &outer, &getter, RelationKind::Calls);
+        relate(&graph, &after_import, &importer, RelationKind::Calls);
+        // An edge between two rows of the same hop is on no shortest path, so
+        // it must not join `getter` to the entity a second way.
+        relate(&graph, &getter, &importer, RelationKind::References);
+
+        let walked = super::downstream_impact_walk(&graph, &target.id, 3).unwrap();
+        let row = |name: &str| {
+            walked
+                .iter()
+                .find(|row| row.entity.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the walk"))
+        };
+        assert_eq!(row("getter").joins, vec![RelationKind::Calls]);
+        assert!(row("getter").call_path && row("both").call_path && row("outer").call_path);
+        assert!(!row("parse_test").call_path && !row("after_import").call_path);
+        let mut importer_joins = row("parse_test").joins.clone();
+        importer_joins.sort_by_key(|kind| format!("{kind:?}"));
+        assert_eq!(
+            importer_joins,
+            vec![RelationKind::Imports, RelationKind::References]
+        );
+        assert_eq!(
+            walked
+                .iter()
+                .map(|row| (row.hop, row.entity.id))
+                .collect::<Vec<_>>(),
+            downstream_impact_by_hop(&graph, &target.id, 3)
+                .unwrap()
+                .into_iter()
+                .map(|(hop, entity)| (hop, entity.id))
+                .collect::<Vec<_>>(),
+            "recording relations changes nothing the walk returns"
+        );
+
+        let response = impact_for(&graph, "parse", true).await;
+        let rendered = response.lines.join("\n");
+        assert!(
+            response
+                .lines
+                .contains(&"  5 local entities impacted within 3 hops:".to_string()),
+            "the count line keeps its bytes: {rendered}"
+        );
+        assert!(
+            response.lines.contains(
+                &"  Structural graph reach: 5 local graph dependents reach this entity through \
+                  graph edges (3 through call relations alone, 2 through a non-call relation); \
+                  argument and branch feasibility is not established."
+                    .to_string()
+            ),
+            "{rendered}"
+        );
+        assert!(
+            response
+                .lines
+                .contains(&"  1 hop (direct graph dependents):".to_string()),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("direct callers"), "{rendered}");
+        let line_of = |name: &str| {
+            response
+                .lines
+                .iter()
+                .find(|line| line.starts_with(&format!("    - {name} (")))
+                .unwrap_or_else(|| panic!("{name} not listed: {rendered}"))
+        };
+        assert!(
+            line_of("parse_test").starts_with("    - parse_test (Function) @ tests/parse.rs:")
+                && line_of("parse_test").ends_with(" (imports and references, not a call)"),
+            "{rendered}"
+        );
+        for caller in ["getter", "both", "outer", "after_import"] {
+            assert!(!line_of(caller).contains("not a call"), "{rendered}");
+        }
+
+        // Nothing pruned and nothing re-ranked to make the labels come out.
+        let ranked = response.ranked.as_ref().expect("ranked report");
+        assert_eq!(
+            serde_json::to_value(ranked).unwrap(),
+            serde_json::to_value(kin_review::rank_impact(&graph, &target.id, 3).unwrap()).unwrap()
+        );
+        assert_eq!(
+            listed_names(&response.lines)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ranked
+                .candidates
+                .iter()
+                .map(|candidate| candidate.identity.name.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["interpretation"],
+            serde_json::json!({
+                "reach": "structural_graph",
+                "argument_and_branch_feasibility": "not_established",
+                "runtime_call_relations": ["Calls", "Spawns", "Instantiates", "SendsMessage"],
+                "direct": {
+                    "dependents": 3, "through_runtime_calls": 2, "through_other_relations": 1,
+                },
+                "within_depth": {
+                    "dependents": 5, "through_runtime_calls": 3, "through_other_relations": 2,
+                },
+            })
+        );
+    }
+
+    /// One dependent, reached by an import alone: the singular sentence, and
+    /// no row left under a heading that calls it a caller.
+    #[tokio::test]
+    async fn a_single_importer_reads_in_the_singular_without_a_caller_heading() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity_at("parse", "src/parse.rs", 0);
+        let importer = entity_at("parse_test", "tests/parse.rs", 0);
+        for e in [&target, &importer] {
+            graph.upsert_entity(e).unwrap();
+        }
+        relate(&graph, &importer, &target, RelationKind::Imports);
+
+        let response = impact_for(&graph, "parse", false).await;
+        let rendered = response.lines.join("\n");
+        assert!(
+            response.lines.contains(
+                &"  Structural graph reach: 1 local graph dependent reaches this entity through \
+                  graph edges (through a non-call relation); argument and branch feasibility is \
+                  not established."
+                    .to_string()
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("direct callers"), "{rendered}");
+        assert!(
+            rendered.contains("1 hop (direct graph dependents):"),
+            "{rendered}"
+        );
+    }
+
+    /// Every resolved answer carries the interpretation, an empty one included,
+    /// and no refusal invents one.
+    #[tokio::test]
+    async fn the_interpretation_rides_every_resolved_answer_and_no_refusal() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&entity("lonely", "src/lonely.rs"))
+            .unwrap();
+
+        let resolved = impact_for(&graph, "lonely", true).await;
+        assert_eq!(resolved.resolution, "resolved");
+        let interpretation = resolved
+            .interpretation
+            .as_ref()
+            .expect("a resolved answer says what its reach is");
+        assert_eq!(interpretation.reach, "structural_graph");
+        assert_eq!(
+            interpretation.argument_and_branch_feasibility,
+            "not_established"
+        );
+        assert_eq!(interpretation.within_depth.dependents, 0);
+        assert!(
+            !resolved
+                .lines
+                .iter()
+                .any(|line| line.contains("Structural graph reach")),
+            "an answer with no dependents has no reach to qualify: {:?}",
+            resolved.lines
+        );
+
+        let missing = impact_for(&graph, "absent_name", true).await;
+        assert_eq!(missing.resolution, "not_found");
+        assert!(serde_json::to_value(&missing)
+            .unwrap()
+            .get("interpretation")
+            .is_none());
     }
 }

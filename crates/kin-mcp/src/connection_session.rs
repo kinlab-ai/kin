@@ -29,6 +29,15 @@
 //! It declares execution. The toolchain run is gated on a session that opted
 //! in to it, and on a connection that serves `exec` the call to it is that
 //! opt-in; the command policy that decides what may run is unchanged.
+//!
+//! It is opened earlier than the first write when it can be: as soon as the
+//! client initializes and a daemon is already serving, in the background, so
+//! the handshake waits on nothing and no daemon is started for it. Every call
+//! the connection forwards then names it, which is how the daemon can show an
+//! agent that only reads. Opened that way it names no process, so a connection
+//! that never does anything is reaped by the daemon's ordinary idle rule; its
+//! first write attaches this process, and from then on it lives as long as the
+//! process does, as a session opened by a write always has.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -107,16 +116,29 @@ impl ClientIdentity {
     }
 }
 
-/// One connection's write session: its client's identity and, once a write
-/// has needed it, the session id.
+/// How long a refused open for reads holds before a read tries again, so a
+/// connection without a daemon does not pay a failed open on every call.
+pub const READ_OPEN_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One connection's session: its client's identity and, once it is open, the
+/// session id.
 #[derive(Debug, Default)]
 pub struct ConnectionSession {
     client: std::sync::Mutex<ClientIdentity>,
     id: tokio::sync::Mutex<Option<String>>,
+    /// Whether the held session names this process, or an attempt to attach it
+    /// was made. A session opened for a write names it from the start; one
+    /// opened for reads gets it at the first write.
+    names_process: std::sync::atomic::AtomicBool,
+    /// When an open for reads was last refused.
+    reads_refused_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Session ids a test hands out in place of the daemon's, in order, and
     /// how many were asked for.
     #[cfg(test)]
     test_ids: std::sync::Mutex<(std::collections::VecDeque<String>, usize)>,
+    /// Whether a test set ids, so nothing here reaches a real daemon.
+    #[cfg(test)]
+    test_mode: std::sync::atomic::AtomicBool,
 }
 
 impl ConnectionSession {
@@ -143,7 +165,7 @@ impl ConnectionSession {
             ("client_name".to_string(), json!(client.client_name)),
             ("cwd".to_string(), json!(cwd)),
             ("transport".to_string(), json!("mcp")),
-            ("pid".to_string(), json!(std::process::id())),
+            ("pid".to_string(), json!(self.process_id())),
             (
                 "capabilities".to_string(),
                 json!({
@@ -158,9 +180,24 @@ impl ConnectionSession {
         ])
     }
 
+    /// This server's process, which a session that writes names so the daemon
+    /// keeps it while the process runs.
+    pub fn process_id(&self) -> u32 {
+        std::process::id()
+    }
+
+    /// The arguments that open this connection's session for reads: the same
+    /// as [`ConnectionSession::start_arguments`] without this process, so the
+    /// daemon's idle rule reaps it if the connection never does anything.
+    pub fn read_start_arguments(&self, cwd: &str) -> HashMap<String, Value> {
+        let mut start = self.start_arguments(cwd);
+        start.remove("pid");
+        start
+    }
+
     /// The session id, opening the session with `start` the first time. A
     /// failed start is returned and nothing is kept, so the next write tries
-    /// again.
+    /// again. `start` is a write's, which names this process.
     pub async fn id_or_start<F, Fut>(&self, start: F) -> Result<String, String>
     where
         F: FnOnce() -> Fut,
@@ -171,8 +208,65 @@ impl ConnectionSession {
             return Ok(id.clone());
         }
         let started = start().await?;
+        self.names_process
+            .store(true, std::sync::atomic::Ordering::Release);
         *id = Some(started.clone());
         Ok(started)
+    }
+
+    /// The session id for a call that reads, opening the session with `start`
+    /// (from [`ConnectionSession::read_start_arguments`]) when none is held.
+    /// A refused open is not retried for [`READ_OPEN_RETRY`]: a read needs no
+    /// session, so it goes ahead without one rather than paying for a failed
+    /// open on every call.
+    pub async fn id_for_reads<F, Fut>(&self, start: F) -> Option<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<String, String>>,
+    {
+        let mut id = self.id.lock().await;
+        if let Some(id) = id.as_ref() {
+            return Some(id.clone());
+        }
+        let refused_recently = self
+            .reads_refused_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|at| at.elapsed() < READ_OPEN_RETRY);
+        if refused_recently {
+            return None;
+        }
+        match start().await {
+            Ok(started) => {
+                self.names_process
+                    .store(false, std::sync::atomic::Ordering::Release);
+                *id = Some(started.clone());
+                Some(started)
+            }
+            Err(error) => {
+                tracing::debug!("opening this connection's session for reads failed: {error}");
+                *self
+                    .reads_refused_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(std::time::Instant::now());
+                None
+            }
+        }
+    }
+
+    /// Whether the held session already names this process, or an attempt to
+    /// attach it has been made.
+    pub fn names_process(&self) -> bool {
+        self.names_process
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that this process was attached to the held session, or that the
+    /// attempt was made and need not be repeated on every write.
+    pub fn mark_names_process(&self) {
+        self.names_process
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Drop `session_id` if it is still the one held, so the next write opens
@@ -181,6 +275,8 @@ impl ConnectionSession {
         let mut id = self.id.lock().await;
         if id.as_deref() == Some(session_id) {
             *id = None;
+            self.names_process
+                .store(false, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -190,6 +286,14 @@ impl ConnectionSession {
         let mut test_ids = self.test_ids.lock().unwrap();
         test_ids.0 = ids.iter().map(|id| id.to_string()).collect();
         test_ids.1 = 0;
+        self.test_mode
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a test set ids for this connection.
+    #[cfg(test)]
+    pub(crate) fn in_test_mode(&self) -> bool {
+        self.test_mode.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The next test session id, when a test set some.
@@ -288,6 +392,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened, "two");
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_for_reads_names_no_process_until_a_write() {
+        let session = ConnectionSession::default();
+        session.set_client(ClientIdentity::from_initialize(&json!({
+            "params": {"clientInfo": {"name": "claude-code"}}
+        })));
+        let start = session.read_start_arguments("/repo");
+        assert!(
+            !start.contains_key("pid"),
+            "a session opened for reads is reaped by the idle rule"
+        );
+        assert_eq!(start["vendor"], "claude-code");
+        let opened = session
+            .id_for_reads(|| async { Ok("read".to_string()) })
+            .await;
+        assert_eq!(opened.as_deref(), Some("read"));
+        assert!(!session.names_process());
+        // A write reuses it rather than opening another.
+        let write = session
+            .id_or_start(|| async { panic!("the read session is reused") })
+            .await
+            .unwrap();
+        assert_eq!(write, "read");
+        assert!(!session.names_process(), "the write attaches the process");
+        session.mark_names_process();
+        assert!(session.names_process());
+        session.forget("read").await;
+        assert!(!session.names_process());
+        // A session a write opened names the process from the start.
+        session
+            .id_or_start(|| async { Ok("write".to_string()) })
+            .await
+            .unwrap();
+        assert!(session.names_process());
+    }
+
+    #[tokio::test]
+    async fn a_refused_open_for_reads_is_not_retried_on_every_call() {
+        let session = ConnectionSession::default();
+        let refused = session
+            .id_for_reads(|| async { Err("no daemon".to_string()) })
+            .await;
+        assert_eq!(refused, None);
+        let again = session
+            .id_for_reads(|| async { panic!("a refused open waits before it is retried") })
+            .await;
+        assert_eq!(again, None);
+        // A write still opens one at once.
+        let write = session
+            .id_or_start(|| async { Ok("write".to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(write, "write");
+        assert_eq!(
+            session
+                .id_for_reads(|| async { panic!("a held session is reused") })
+                .await
+                .as_deref(),
+            Some("write")
+        );
     }
 
     #[test]

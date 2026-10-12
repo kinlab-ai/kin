@@ -696,6 +696,174 @@ fn macos_phys_footprint(pid: u32) -> Option<u64> {
     Some(info.ri_phys_footprint)
 }
 
+/// What this process's own physical footprint is made of, on macOS.
+///
+/// `ri_phys_footprint` is one number, and the number alone cannot say why a
+/// daemon on a small repository reads several gigabytes. The two parts that
+/// explain it in practice are both inside the footprint and both easy to
+/// mistake for something else:
+///
+/// * GPU memory. On Apple silicon a Metal buffer is ordinary system RAM, and
+///   the kernel charges it to the process through the graphics ledger. An
+///   embedding model running on the GPU holds its weights and its working
+///   buffers there, which is most of what a freshly converted repository's
+///   daemon holds, and `ps` and the resident set do not show it.
+/// * Compressed memory. A page the system compressed, or swapped out from the
+///   compressor, still counts at its full size, so a daemon on an 8 GiB Mac
+///   under pressure is charged for memory that is not resident at all.
+///
+/// Only this process can be read this way: `task_info` on another process
+/// needs that process's task port, which a daemon is not given for its
+/// children. `None` off macOS and when the kernel refuses the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnFootprintParts {
+    /// The whole physical footprint, the figure Activity Monitor shows as
+    /// Memory.
+    pub phys_footprint_bytes: u64,
+    /// Of that, GPU memory charged through the graphics ledger, resident and
+    /// compressed together. `None` on a kernel too old to report the ledger.
+    pub gpu_bytes: Option<u64>,
+    /// Of that, pages held compressed or swapped out of the compressor.
+    pub compressed_bytes: u64,
+}
+
+/// This process's [`OwnFootprintParts`], when the platform can say.
+pub fn own_footprint_parts() -> Option<OwnFootprintParts> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_vm_info::own_footprint_parts()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_vm_info {
+    use super::OwnFootprintParts;
+
+    /// `TASK_VM_INFO` in `<mach/task_info.h>`.
+    const TASK_VM_INFO: libc::task_flavor_t = 22;
+
+    extern "C" {
+        /// What the `mach_task_self()` macro reads: this task's own port,
+        /// which the runtime sets before `main`. Declared here rather than
+        /// taken from `libc`, whose accessor is deprecated in favour of a
+        /// crate this workspace does not otherwise need.
+        static mach_task_self_: libc::mach_port_t;
+    }
+
+    /// `struct task_vm_info` through revision 7, as `<mach/task_info.h>`
+    /// declares it under `#pragma pack(4)`. Declared here because the `libc`
+    /// crate does not carry it. The offsets this module reads are pinned by
+    /// `the_task_vm_info_layout_matches_the_sdk_header` against the SDK.
+    #[repr(C, packed(4))]
+    #[derive(Clone, Copy)]
+    pub(super) struct TaskVmInfo {
+        pub virtual_size: u64,
+        pub region_count: i32,
+        pub page_size: i32,
+        pub resident_size: u64,
+        pub resident_size_peak: u64,
+        pub device: u64,
+        pub device_peak: u64,
+        pub internal: u64,
+        pub internal_peak: u64,
+        pub external: u64,
+        pub external_peak: u64,
+        pub reusable: u64,
+        pub reusable_peak: u64,
+        pub purgeable_volatile_pmap: u64,
+        pub purgeable_volatile_resident: u64,
+        pub purgeable_volatile_virtual: u64,
+        pub compressed: u64,
+        pub compressed_peak: u64,
+        pub compressed_lifetime: u64,
+        // rev1
+        pub phys_footprint: u64,
+        // rev2
+        pub min_address: u64,
+        pub max_address: u64,
+        // rev3
+        pub ledger_phys_footprint_peak: i64,
+        pub ledger_purgeable_nonvolatile: i64,
+        pub ledger_purgeable_novolatile_compressed: i64,
+        pub ledger_purgeable_volatile: i64,
+        pub ledger_purgeable_volatile_compressed: i64,
+        pub ledger_tag_network_nonvolatile: i64,
+        pub ledger_tag_network_nonvolatile_compressed: i64,
+        pub ledger_tag_network_volatile: i64,
+        pub ledger_tag_network_volatile_compressed: i64,
+        pub ledger_tag_media_footprint: i64,
+        pub ledger_tag_media_footprint_compressed: i64,
+        pub ledger_tag_media_nofootprint: i64,
+        pub ledger_tag_media_nofootprint_compressed: i64,
+        pub ledger_tag_graphics_footprint: i64,
+        pub ledger_tag_graphics_footprint_compressed: i64,
+        pub ledger_tag_graphics_nofootprint: i64,
+        pub ledger_tag_graphics_nofootprint_compressed: i64,
+        pub ledger_tag_neural_footprint: i64,
+        pub ledger_tag_neural_footprint_compressed: i64,
+        pub ledger_tag_neural_nofootprint: i64,
+        pub ledger_tag_neural_nofootprint_compressed: i64,
+        // rev4
+        pub limit_bytes_remaining: u64,
+        // rev5
+        pub decompressions: i32,
+        // rev6
+        pub ledger_swapins: i64,
+        // rev7
+        pub ledger_tag_neural_nofootprint_total: i64,
+        pub ledger_tag_neural_nofootprint_peak: i64,
+    }
+
+    /// The structure's size in `natural_t` words, which is how `task_info`
+    /// counts.
+    pub(super) const TASK_VM_INFO_COUNT: libc::mach_msg_type_number_t =
+        (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<libc::natural_t>()) as _;
+
+    /// How many words the kernel must fill for a field ending at `end` bytes
+    /// to be one it wrote rather than one left zeroed.
+    pub(super) fn words_through(end: usize) -> libc::mach_msg_type_number_t {
+        end.div_ceil(std::mem::size_of::<libc::natural_t>()) as _
+    }
+
+    pub(super) fn own_footprint_parts() -> Option<OwnFootprintParts> {
+        // SAFETY: an all-zero `TaskVmInfo` is a valid value of a plain integer
+        // struct, and `task_info` writes at most `count` words into it.
+        let mut info: TaskVmInfo = unsafe { std::mem::zeroed() };
+        let mut count = TASK_VM_INFO_COUNT;
+        let status = unsafe {
+            libc::task_info(
+                mach_task_self_,
+                TASK_VM_INFO,
+                std::ptr::addr_of_mut!(info).cast::<libc::integer_t>(),
+                &mut count,
+            )
+        };
+        if status != libc::KERN_SUCCESS {
+            return None;
+        }
+        let phys_end = std::mem::offset_of!(TaskVmInfo, phys_footprint) + 8;
+        if count < words_through(phys_end) {
+            return None;
+        }
+        let graphics_end =
+            std::mem::offset_of!(TaskVmInfo, ledger_tag_graphics_footprint_compressed) + 8;
+        let gpu_bytes = (count >= words_through(graphics_end)).then(|| {
+            let resident = info.ledger_tag_graphics_footprint.max(0) as u64;
+            let compressed = info.ledger_tag_graphics_footprint_compressed.max(0) as u64;
+            resident.saturating_add(compressed)
+        });
+        Some(OwnFootprintParts {
+            phys_footprint_bytes: info.phys_footprint,
+            gpu_bytes,
+            compressed_bytes: info.compressed,
+        })
+    }
+}
+
 /// How a daemon died, as far as the process watching it could tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -9135,6 +9303,57 @@ Shared_Dirty:          0 kB\n";
             mine > 4096 && mine < (1 << 40),
             "own footprint read as {mine} bytes, which is not a running process"
         );
+    }
+
+    /// The macOS breakdown reads this process's own task, and its whole
+    /// figure agrees with the footprint `proc_pid_rusage` reports, which is the
+    /// one the budget is graded on. The two are taken a moment apart, so they
+    /// are held to a band rather than to equality.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_own_footprint_breakdown_reads_the_same_footprint_as_the_budget() {
+        let parts = own_footprint_parts().expect("this process can read its own task");
+        let rusage = process_footprint_bytes(std::process::id()).expect("rusage reads too");
+        let (low, high) = (
+            parts.phys_footprint_bytes.min(rusage),
+            parts.phys_footprint_bytes.max(rusage),
+        );
+        assert!(
+            high - low < 256 * 1024 * 1024,
+            "task_info read {} and proc_pid_rusage read {rusage}",
+            parts.phys_footprint_bytes
+        );
+        let gpu = parts
+            .gpu_bytes
+            .expect("every macOS this ships on reports the ledger");
+        assert!(gpu <= parts.phys_footprint_bytes, "{parts:?}");
+    }
+
+    /// The offsets this reader takes, against `struct task_vm_info` as the
+    /// macOS SDK lays it out under `#pragma pack(4)`: 372 bytes, `compressed`
+    /// at 120, `phys_footprint` at 144, the graphics ledger at 272, and a
+    /// 32-bit `decompressions` at 344 followed directly by a 64-bit field at
+    /// 348. A layout that drifted from the header would read some other
+    /// counter as GPU memory.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_task_vm_info_layout_matches_the_sdk_header() {
+        use macos_vm_info::TaskVmInfo;
+        assert_eq!(std::mem::size_of::<TaskVmInfo>(), 372);
+        assert_eq!(macos_vm_info::TASK_VM_INFO_COUNT, 93);
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, compressed), 120);
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, phys_footprint), 144);
+        assert_eq!(
+            std::mem::offset_of!(TaskVmInfo, ledger_tag_graphics_footprint),
+            272
+        );
+        assert_eq!(
+            std::mem::offset_of!(TaskVmInfo, ledger_tag_graphics_footprint_compressed),
+            280
+        );
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, decompressions), 344);
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, ledger_swapins), 348);
+        assert_eq!(macos_vm_info::words_through(152), 38);
     }
 
     /// A daemon that outlived its spawner and was then killed leaves a record

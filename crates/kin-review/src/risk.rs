@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::contract::ConsumerReach;
 use crate::diff::{EntityChangeKind, RelationChangeKind, SemanticDiff};
 use crate::impact::{EntityImpact, ImpactReport};
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
@@ -255,8 +256,11 @@ fn change_findings(diff: &SemanticDiff, impact: &ImpactReport) -> Vec<ChangeFind
                     ));
                 }
 
-                // Check test coverage gap
-                if new.role != EntityRole::Test {
+                // Check test coverage gap. A comment or a docstring changes
+                // nothing a test could catch.
+                if new.role != EntityRole::Test
+                    && !crate::contract::ContractChange::of(old, new).consumers_unaffected()
+                {
                     if per_entity(impact, &change.entity_id).covering_tests == 0 {
                         test_coverage_gaps.push(format!(
                             "Modified entity `{}` has no test coverage",
@@ -428,6 +432,7 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
         breaking: !breaking_changes.is_empty(),
         coverage_gap: !test_coverage_gaps.is_empty(),
         blast_radius: impact.total_affected(),
+        reach: diff_reach(diff),
         work_risk: !work_risks.is_empty(),
         unreviewed_agent_change: !impact.unreviewed_agent_changes.is_empty(),
     });
@@ -442,20 +447,42 @@ pub fn assess_risk(diff: &SemanticDiff, impact: &ImpactReport) -> RiskSummary {
     }
 }
 
+/// How far the furthest-reaching entity change in `diff` reaches its
+/// consumers. A diff that changes no entity is read as reaching as far as
+/// anything can, so its relation changes keep every rule they had.
+fn diff_reach(diff: &SemanticDiff) -> ConsumerReach {
+    diff.entity_changes
+        .iter()
+        .map(|change| ConsumerReach::of(&change.kind))
+        .max()
+        .unwrap_or(ConsumerReach::Breaks)
+}
+
 /// The evidence a risk level is read from, for the whole diff or one entity.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct RiskEvidence {
     contract_violation: bool,
     breaking: bool,
     coverage_gap: bool,
     /// Entities the change reaches. Diff-wide only: no single entity owns it.
     blast_radius: usize,
+    /// How far the change reaches what relies on it, which decides what the
+    /// blast radius is worth.
+    reach: ConsumerReach,
     /// In-progress work on changed code. Diff-wide only, for the same reason.
     work_risk: bool,
     unreviewed_agent_change: bool,
 }
 
 /// The one precedence every risk level is read through.
+///
+/// How many entities a change reaches is worth what the change can do to
+/// them. A change that asks nothing of its consumers, such as a comment or a
+/// docstring, is low risk however many rely on it, whoever made it. A body
+/// that changed under a signature that held may need its consumers reviewed,
+/// so its fan-out raises it to medium and no further: only a finding of its
+/// own, a break or a contract violation, takes it higher. A change that can
+/// break a consumer keeps every rule.
 fn level_for(evidence: &RiskEvidence) -> RiskLevel {
     if evidence.contract_violation {
         return RiskLevel::Critical;
@@ -465,7 +492,17 @@ fn level_for(evidence: &RiskEvidence) -> RiskLevel {
         return RiskLevel::High;
     }
 
-    if evidence.coverage_gap && evidence.blast_radius > 5 {
+    if evidence.reach == ConsumerReach::Unaffected {
+        // In-progress work on changed code still needs its owner told.
+        return if evidence.work_risk {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::Low
+        };
+    }
+
+    if evidence.reach == ConsumerReach::Breaks && evidence.coverage_gap && evidence.blast_radius > 5
+    {
         return RiskLevel::High;
     }
 
@@ -506,10 +543,25 @@ pub fn entity_risk_levels(
     let mut evidence: BTreeMap<EntityId, RiskEvidence> = diff
         .entity_changes
         .iter()
-        .map(|change| (change.entity_id, RiskEvidence::default()))
+        .map(|change| {
+            (
+                change.entity_id,
+                RiskEvidence {
+                    contract_violation: false,
+                    breaking: false,
+                    coverage_gap: false,
+                    blast_radius: 0,
+                    reach: ConsumerReach::of(&change.kind),
+                    work_risk: false,
+                    unreviewed_agent_change: false,
+                },
+            )
+        })
         .collect();
     for finding in change_findings(diff, impact) {
-        let entry = evidence.entry(finding.entity_id).or_default();
+        let Some(entry) = evidence.get_mut(&finding.entity_id) else {
+            continue;
+        };
         match finding.class {
             FindingClass::ContractViolation => entry.contract_violation = true,
             FindingClass::Breaking => entry.breaking = true,
@@ -811,15 +863,18 @@ mod tests {
     /// The diff-wide terms raise the overall level and no single entity.
     ///
     /// One entity with a coverage gap, in a diff whose total blast radius is
-    /// six. The overall level escalates to high on that total; the entity keeps
-    /// the medium its own finding earns, because six affected entities describe
-    /// the range and not this one. An unreviewed agent change is the other
-    /// case: the impact report names the entity, so it is attributed.
+    /// six. Its signature changed with nothing outside recorded as calling it,
+    /// so no finding says it breaks anything and the change still reaches as
+    /// far as a break can. The overall level escalates to high on that total;
+    /// the entity keeps the medium its own finding earns, because six affected
+    /// entities describe the range and not this one. An unreviewed agent
+    /// change is the other case: the impact report names the entity, so it is
+    /// attributed.
     #[test]
     fn diff_wide_terms_raise_the_overall_level_without_raising_an_entity() {
         let gap_old = test_entity("render_row");
         let mut gap_new = gap_old.clone();
-        gap_new.doc_summary = Some("renders one row".to_string());
+        gap_new.signature = "fn render_row(row: usize)".to_string();
         let quiet_old = test_entity("format_date");
         let mut quiet_new = quiet_old.clone();
         quiet_new.doc_summary = Some("formats a date".to_string());
@@ -1463,6 +1518,88 @@ mod tests {
             finding.contains("tests_helper"),
             "and the finding names the test, so the reader can judge it: {finding}"
         );
+    }
+
+    /// How many places rely on a change is worth what the change can do to
+    /// them. Sixteen callers, no covering test and an unreviewed agent edit:
+    /// a comment or a docstring is still low, a body change under a signature
+    /// that held is medium and no higher, and a signature change keeps the
+    /// rules it always had.
+    ///
+    /// Falsify by reading the blast radius without the reach in `level_for`:
+    /// the body change reads high, and the docstring medium.
+    #[test]
+    fn fan_out_raises_risk_only_as_far_as_the_change_reaches_its_consumers() {
+        let mut old = test_entity("want_bytes");
+        old.fingerprint.behavior_hash = Hash256::from_bytes([1; 32]);
+        old.fingerprint.ast_hash = Hash256::from_bytes([1; 32]);
+        old.fingerprint.signature_hash = Hash256::from_bytes([1; 32]);
+        old.fingerprint.equivalence_hash = Hash256::from_bytes([7; 32]);
+        let callers: Vec<Entity> = (0..16)
+            .map(|index| test_entity(&format!("caller_{index}")))
+            .collect();
+
+        let mut commented = old.clone();
+        commented.signature = "fn want_bytes(/* bytes pass through */)".to_string();
+        let mut documented = old.clone();
+        documented.doc_summary = Some("Return bytes, encoding a string first.".to_string());
+        documented.fingerprint.behavior_hash = Hash256::from_bytes([2; 32]);
+        documented.fingerprint.ast_hash = Hash256::from_bytes([2; 32]);
+        let mut body = old.clone();
+        body.fingerprint.behavior_hash = Hash256::from_bytes([3; 32]);
+        body.fingerprint.ast_hash = Hash256::from_bytes([3; 32]);
+        body.fingerprint.equivalence_hash = Hash256::from_bytes([8; 32]);
+        let mut signature = old.clone();
+        signature.signature = "fn want_bytes(encoding: &str)".to_string();
+        signature.fingerprint.behavior_hash = Hash256::from_bytes([4; 32]);
+        signature.fingerprint.ast_hash = Hash256::from_bytes([4; 32]);
+        signature.fingerprint.equivalence_hash = Hash256::from_bytes([9; 32]);
+
+        for (new, expected, what) in [
+            (
+                commented,
+                RiskLevel::Low,
+                "a comment inside the declaration",
+            ),
+            (documented, RiskLevel::Low, "a docstring"),
+            (
+                body,
+                RiskLevel::Medium,
+                "a body under a signature that held",
+            ),
+            (signature, RiskLevel::High, "a signature"),
+        ] {
+            let diff = SemanticDiff {
+                entity_changes: vec![EntityChange {
+                    entity_id: old.id,
+                    kind: EntityChangeKind::Modified {
+                        old: old.clone(),
+                        new,
+                    },
+                }],
+                ..Default::default()
+            };
+            let impact = ImpactReport {
+                affected_callers: callers.clone(),
+                changed_ids: vec![old.id],
+                entity_impacts: vec![entity_impact_counts(old.id, 16, 0, 0)],
+                unreviewed_agent_changes: vec![old.id],
+                ..Default::default()
+            };
+            let summary = assess_risk(&diff, &impact);
+            assert_eq!(summary.overall_risk, expected, "{what}: {summary:?}");
+            assert_eq!(
+                entity_risk_levels(&diff, &impact)[&old.id],
+                expected,
+                "{what}: the entity reads as the change does"
+            );
+            if expected == RiskLevel::Low {
+                assert!(
+                    summary.test_coverage_gaps.is_empty() && summary.breaking_changes.is_empty(),
+                    "{what} needs no test and breaks nothing: {summary:?}"
+                );
+            }
+        }
     }
 
     #[test]

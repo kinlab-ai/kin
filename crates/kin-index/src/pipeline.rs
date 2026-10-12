@@ -1629,6 +1629,10 @@ fn resolve_relations(
                     !(slot.language == kin_model::LanguageId::Python
                         && crate::linker::carries_non_rust_import(rel, &file_id.0))
                 })
+                // A guard-narrowed call names a possible owner, never a proven
+                // one, and a member value's destination depends on the class
+                // hierarchy, so only the linker's own tiers may bind them.
+                .filter(|_| !crate::linker::requires_linker_tier(rel))
                 .filter(|_| {
                     // Receiver-shaped fields and unproven local method calls must
                     // reach the linker instead of capturing a bare free symbol.

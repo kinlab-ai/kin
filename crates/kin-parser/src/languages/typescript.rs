@@ -273,12 +273,18 @@ pub(super) fn extract_typescript_tree(
         })
         .collect();
 
-    // Annotate Calls/References relations with import_source
+    // Annotate Calls/References relations with import_source. Only a
+    // receiver-free name is the binding an import introduces. A member call
+    // such as `object.read()` names a property of whatever `object` holds,
+    // so a same-named `import { read }` is not its source, and pinning it
+    // there would bind the call to the imported function.
     for rel in &mut relations {
-        if matches!(
-            rel.kind,
-            kin_model::RelationKind::Calls | kin_model::RelationKind::References
-        ) {
+        if rel.receiver.is_none()
+            && matches!(
+                rel.kind,
+                kin_model::RelationKind::Calls | kin_model::RelationKind::References
+            )
+        {
             if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                 rel.import_source = Some(module.to_string());
             }
@@ -1513,7 +1519,10 @@ fn extract_ts_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
 /// We encode namespace imports as `local_name = util` and `original_name = "*"`
 /// so the linker can later resolve member calls like `util.finalizeIssue(...)`
 /// to the `finalizeIssue` entity exported by that module.
-fn extract_namespace_import_name(node: &tree_sitter::Node, source: &[u8]) -> Option<ImportedName> {
+pub(super) fn extract_namespace_import_name(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<ImportedName> {
     let local_name = node
         .children(&mut node.walk())
         .find(|child| child.is_named())

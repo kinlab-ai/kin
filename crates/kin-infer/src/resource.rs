@@ -498,6 +498,31 @@ pub(crate) const RESIDENT_STACK_ABS_CEILING_BYTES: u64 = 8 * GIB;
 /// keeping the hot recycling path intact for the common (small, repeated) classes.
 pub(crate) const DEFAULT_BUFFER_POOL_CAP_BYTES: u64 = 3 * GIB;
 
+/// The BufferPool ceiling's share of physical RAM: one sixteenth.
+///
+/// The fixed ceiling above was written for a workstation, and the pool is
+/// never trimmed while the model stays loaded, so whatever it reaches is held
+/// for the life of the daemon. On an 8 GiB Mac that was three of the four
+/// gigabytes Kin allows a repository daemon, on top of the weights and the
+/// in-flight transients, and the daemon read as several gigabytes past its
+/// allowance after one embedding pass over a two-hundred-entity repository.
+/// Measured there, holding the pool to a quarter gigabyte brought the settled
+/// footprint from about 4.2 GiB to about 2.8 GiB. A sixteenth leaves every
+/// machine of 48 GiB or more at the fixed ceiling, so large hosts recycle
+/// exactly as before, and gives an 8 GiB machine half a gigabyte.
+pub(crate) const BUFFER_POOL_HW_MEMSIZE_DIVISOR: u64 = 16;
+
+/// The BufferPool free-list ceiling for a machine with this much physical RAM.
+///
+/// The single canonical copy, which the live pool and the inspect-only
+/// [`MetalGovernorPlan`] both call, so the reported and the runtime ceiling
+/// cannot diverge. Unknown RAM keeps the fixed ceiling.
+pub(crate) fn buffer_pool_cap_bytes(system_total_bytes: Option<u64>) -> u64 {
+    system_total_bytes.map_or(DEFAULT_BUFFER_POOL_CAP_BYTES, |total| {
+        DEFAULT_BUFFER_POOL_CAP_BYTES.min(total / BUFFER_POOL_HW_MEMSIZE_DIVISOR)
+    })
+}
+
 /// Per-buffer high-water: pooled buffers whose size-class exceeds this are never
 /// recycled. The largest pooled allocations are the O(seq²) attention-score
 /// buffers, the least likely to be re-hit at the exact same class and the most
@@ -556,7 +581,9 @@ pub struct MetalGovernorPlan {
     /// Resolved resident-stack transient byte budget (the smallest of the three
     /// ceilings below), from the same formula the backend resolves at startup.
     pub resident_stack_budget_bytes: u64,
-    /// Default ceiling on total bytes the BufferPool free-list may hold.
+    /// Ceiling on total bytes the BufferPool free-list may hold on this
+    /// machine: the fixed default, or a sixteenth of physical RAM when that is
+    /// smaller.
     pub buffer_pool_cap_bytes: u64,
     /// Per-buffer high-water above which a size-class is never pooled.
     pub buffer_pool_per_buffer_cap_bytes: u64,
@@ -580,7 +607,7 @@ impl MetalGovernorPlan {
                 recommended_working_set_bytes,
                 system_total_bytes,
             ),
-            buffer_pool_cap_bytes: DEFAULT_BUFFER_POOL_CAP_BYTES,
+            buffer_pool_cap_bytes: buffer_pool_cap_bytes(system_total_bytes),
             buffer_pool_per_buffer_cap_bytes: DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES,
             resident_stack_budget_divisor: DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR,
             resident_stack_hw_memsize_percent: RESIDENT_STACK_HW_MEMSIZE_PERCENT,
@@ -705,10 +732,8 @@ pub fn detect_memory() -> MemoryInfo {
 }
 
 /// Effective total-memory budget: a container `memory.max` cap when present
-/// (kept below the true host RAM if both are known), otherwise the historical
-/// host detection. A bare-metal host with no cgroup limit is unchanged — macOS
-/// reports `hw.memsize`, Linux reports `None` — so the plan only diverges from
-/// host topology when a real container cap exists.
+/// (kept below the true host RAM if both are known), otherwise the host physical
+/// total. macOS reports `hw.memsize`; Linux reports `MemTotal` from `/proc/meminfo`.
 fn detect_effective_total_bytes() -> Option<u64> {
     match detect_cgroup_memory_limit() {
         Some(limit) => Some(detect_host_total_bytes().map_or(limit, |host| limit.min(host))),
@@ -728,7 +753,12 @@ fn detect_system_total_bytes() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn detect_system_total_bytes() -> Option<u64> {
+    detect_host_total_bytes()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn detect_system_total_bytes() -> Option<u64> {
     None
 }
@@ -741,8 +771,8 @@ fn detect_system_total_bytes() -> Option<u64> {
 // budget, not raw host topology, so a Kin process inside a CFS-quota'd container
 // does not over-provision rayon/BLAS threads or embedding working-set ~5x. The
 // FS-reading probes are Linux-only and return `None` when no quota is set (an
-// unlimited group, absent files, or off-Linux), which keeps every bare-metal
-// host on its historical detection. The string/number parsing is factored into
+// unlimited group, absent files, or off-Linux). With no quota, the plan uses
+// the host's physical resources. The string/number parsing is factored into
 // pure helpers so the quota arithmetic is unit-tested on any platform.
 
 /// Effective CPU count from a container CPU quota, or `None` when unlimited,
@@ -792,12 +822,16 @@ fn detect_cgroup_memory_limit() -> Option<u64> {
     None
 }
 
-/// True host physical RAM, used only to keep a container cap below real RAM. On
-/// Linux this reads `/proc/meminfo` (the host detection returns `None`); off
-/// Linux the container branch never runs, so `None` is never observed.
+/// True host physical RAM on Linux, both for uncapped hosts and to keep a
+/// container cap below real RAM. Off Linux the container branch never runs.
 #[cfg(target_os = "linux")]
 fn detect_host_total_bytes() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_linux_memory_total(&contents)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_memory_total(contents: &str) -> Option<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
@@ -1746,6 +1780,27 @@ mod tests {
         let _ = ResourcePlan::detect(Profile::Proof);
     }
 
+    /// A small Mac's pool ceiling follows its RAM, and a workstation's stays
+    /// at the fixed ceiling it has always had.
+    #[test]
+    fn the_buffer_pool_ceiling_follows_a_small_machine_and_holds_on_a_large_one() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(buffer_pool_cap_bytes(Some(8 * GIB)), 512 * MIB);
+        assert_eq!(buffer_pool_cap_bytes(Some(16 * GIB)), GIB);
+        assert_eq!(buffer_pool_cap_bytes(Some(32 * GIB)), 2 * GIB);
+        for large in [48 * GIB, 64 * GIB, 128 * GIB, 512 * GIB] {
+            assert_eq!(
+                buffer_pool_cap_bytes(Some(large)),
+                DEFAULT_BUFFER_POOL_CAP_BYTES
+            );
+        }
+        assert_eq!(buffer_pool_cap_bytes(None), DEFAULT_BUFFER_POOL_CAP_BYTES);
+        assert_eq!(
+            MetalGovernorPlan::derive(5 * GIB, Some(8 * GIB)).buffer_pool_cap_bytes,
+            512 * MIB
+        );
+    }
+
     #[test]
     fn metal_governor_plan_reports_resolved_caps_and_constants() {
         // 64 GiB recommended working set, 128 GiB physical RAM: both the
@@ -1821,6 +1876,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // Container (cgroup) quota parsing
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn linux_memory_total_parses_physical_ram() {
+        let contents =
+            "MemFree:        1234 kB\nMemTotal:       16777216 kB\nMemAvailable:    5678 kB\n";
+        assert_eq!(parse_linux_memory_total(contents), Some(16 * GIB));
+        assert_eq!(
+            parse_linux_memory_total("MemTotal:\t8388608 kB\n"),
+            Some(8 * GIB)
+        );
+    }
+
+    #[test]
+    fn linux_memory_total_missing_or_malformed_is_unknown() {
+        for contents in [
+            "",
+            "MemFree: 1234 kB\n",
+            "MemTotal:\n",
+            "MemTotal: unknown kB\n",
+        ] {
+            assert_eq!(parse_linux_memory_total(contents), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_memory_detection_reports_total_with_or_without_container_cap() {
+        let physical = detect_host_total_bytes().expect("Linux exposes MemTotal");
+        assert_eq!(detect_system_total_bytes(), Some(physical));
+        let expected = detect_cgroup_memory_limit().map_or(physical, |limit| limit.min(physical));
+        assert_eq!(detect_memory().system_total_bytes, Some(expected));
+    }
 
     #[test]
     fn cgroup_v2_cpu_max_parses_quota_and_period() {

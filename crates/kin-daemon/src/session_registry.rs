@@ -161,6 +161,24 @@ pub struct SessionCoordinator {
     active_calls: ActiveCalls,
     /// Source of the ids under which running calls are recorded.
     next_call_id: AtomicU64,
+    /// What each live session has done through this daemon: its bounded call
+    /// log, the changes it committed, and the throttle on the events that
+    /// announce them. Dropped with the session.
+    activity: crate::agent_activity::AgentActivity,
+    /// When each live session was last heard from, kept here rather than in
+    /// its record.
+    ///
+    /// Every call that names a session refreshes its liveness, and most of
+    /// them only read. Writing the refresh into the session record changed the
+    /// graph on every read: the store took it as a reason to make its next save
+    /// a full snapshot, and a save that raced it was re-armed. Liveness is this
+    /// process's own concern, so it lives in this process, and every read of a
+    /// session here sees the later of the record's heartbeat and this one. The
+    /// record is still written where a session changes: when it opens, when it
+    /// names its process, and when it ends. A daemon that restarts keeps only
+    /// what the record holds, and a client whose session it lost opens another
+    /// on its next call.
+    liveness: Mutex<HashMap<SessionId, Timestamp>>,
 }
 
 impl SessionCoordinator {
@@ -185,7 +203,67 @@ impl SessionCoordinator {
             session_idle_ttl: ttl,
             active_calls: Arc::new(Mutex::new(HashMap::new())),
             next_call_id: AtomicU64::new(0),
+            activity: crate::agent_activity::AgentActivity::default(),
+            liveness: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `session` as this coordinator sees it: its record, with the latest
+    /// liveness this process has observed for it.
+    fn with_liveness(&self, mut session: AgentSession) -> AgentSession {
+        let liveness = self
+            .liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(seen) = liveness.get(&session.session_id) {
+            if *seen > session.last_heartbeat {
+                session.last_heartbeat = seen.clone();
+            }
+        }
+        session
+    }
+
+    /// Drop the liveness kept for a session that ended.
+    fn forget_liveness(&self, session_id: &SessionId) {
+        self.liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    /// Make a session look last heard from at `at`, in its record and in the
+    /// liveness kept here, the way a session silent since `at` looks.
+    #[cfg(test)]
+    pub(crate) fn backdate_liveness_for_test(&self, session_id: &SessionId, at: &Timestamp) {
+        self.graph
+            .update_heartbeat(session_id, at)
+            .expect("back-date the session record");
+        self.liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(*session_id, at.clone());
+    }
+
+    /// How many sessions have liveness kept in memory.
+    pub fn liveness_entries(&self) -> usize {
+        self.liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// What each live session has done through this daemon.
+    pub fn activity(&self) -> &crate::agent_activity::AgentActivity {
+        &self.activity
+    }
+
+    /// How many calls the daemon is running for this session right now.
+    pub fn active_call_count(&self, session_id: &SessionId) -> usize {
+        self.active_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map_or(0, BTreeMap::len)
     }
 
     /// The idle TTL this coordinator reaps PID-less sessions against.
@@ -356,13 +434,50 @@ impl SessionCoordinator {
         // the production path pays only an inlined no-op closure.
         before_update();
 
+        // In memory, not in the record: see `liveness`. Taken under the same
+        // arbitration guard the sweep holds, so a refresh and a reap of the
+        // same session are ordered.
         let now = Timestamp::now();
-        self.graph
-            .update_heartbeat(session_id, &now)
-            .map_err(DaemonError::from)?;
+        self.liveness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(*session_id, now.clone());
         session.last_heartbeat = now;
         debug!(session_id = %session_id, "heartbeat recorded");
         Ok(Some(session))
+    }
+
+    /// Name the process a session lives with, so the sweeper keeps it while
+    /// that process runs. `None` when the session does not exist; otherwise
+    /// whether the session now names `pid`. A session already naming another
+    /// process keeps it.
+    pub fn attach_process(&self, session_id: &SessionId, pid: u32) -> Result<Option<bool>> {
+        let _arbitration = self
+            .arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut session) = self
+            .graph
+            .get_session(session_id)
+            .map_err(DaemonError::from)?
+        else {
+            return Ok(None);
+        };
+        match session.pid {
+            Some(existing) => Ok(Some(existing == pid)),
+            None => {
+                // A record change, so it is written; the liveness this process
+                // kept is folded into it on the way.
+                session = self.with_liveness(session);
+                session.pid = Some(pid);
+                session.last_heartbeat = Timestamp::now();
+                self.graph
+                    .upsert_session(&session)
+                    .map_err(DaemonError::from)?;
+                info!(session_id = %session_id, pid, "session names its process");
+                Ok(Some(true))
+            }
+        }
     }
 
     /// Record a heartbeat for a session. Returns an error if the session
@@ -392,20 +507,30 @@ impl SessionCoordinator {
         self.graph
             .delete_session(session_id)
             .map_err(DaemonError::from)?;
+        self.activity.forget(session_id);
+        self.forget_liveness(session_id);
         info!(session_id = %session_id, "deregistered agent session");
         Ok(())
     }
 
     /// Get a session by ID.
     pub fn get_session(&self, session_id: &SessionId) -> Result<Option<AgentSession>> {
-        self.graph
+        Ok(self
+            .graph
             .get_session(session_id)
-            .map_err(DaemonError::from)
+            .map_err(DaemonError::from)?
+            .map(|session| self.with_liveness(session)))
     }
 
     /// List all active sessions.
     pub fn list_sessions(&self) -> Result<Vec<AgentSession>> {
-        self.graph.list_sessions().map_err(DaemonError::from)
+        Ok(self
+            .graph
+            .list_sessions()
+            .map_err(DaemonError::from)?
+            .into_iter()
+            .map(|session| self.with_liveness(session))
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1055,7 +1180,13 @@ impl SessionCoordinator {
             .arbitration
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut sessions = self.graph.list_sessions().map_err(DaemonError::from)?;
+        let mut sessions: Vec<AgentSession> = self
+            .graph
+            .list_sessions()
+            .map_err(DaemonError::from)?
+            .into_iter()
+            .map(|session| self.with_liveness(session))
+            .collect();
         sessions.sort_by_key(|session| session.session_id.to_string());
         let now = Timestamp::now();
         let stale_threshold = self.session_idle_ttl;
@@ -1151,6 +1282,8 @@ impl SessionCoordinator {
                 self.graph
                     .delete_session(&session.session_id)
                     .map_err(DaemonError::from)?;
+                self.activity.forget(&session.session_id);
+                self.forget_liveness(&session.session_id);
                 warn!(
                     session_id = %session.session_id,
                     vendor = %session.vendor,
@@ -1596,6 +1729,151 @@ mod tests {
         let check = coord.check_traffic(&[IntentScope::Entity(entity)]).unwrap();
         assert!(check.has_hard_blocks);
         assert_eq!(check.reports[0].active_intents.len(), 1);
+    }
+
+    fn activity_draft() -> crate::agent_activity::ToolCallDraft {
+        crate::agent_activity::ToolCallDraft {
+            tool: "semantic_locate".to_string(),
+            entity_ids: Vec::new(),
+            result_count: 0,
+            bytes: 1,
+            duration_ms: 1,
+            is_error: false,
+            repo_id: None,
+        }
+    }
+
+    /// A session opened without a process, as an MCP connection's is when its
+    /// client initializes, is reaped by the idle rule if it never does
+    /// anything, and its call log goes with it.
+    #[test]
+    fn an_idle_session_without_a_process_is_reaped_with_its_call_log() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let coord = SessionCoordinator::with_session_idle_ttl(graph, Duration::from_millis(30));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "claude-code",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+        coord
+            .activity()
+            .record_call(&sid, activity_draft(), Timestamp::now());
+        coord.activity().record_change(&sid, "e".repeat(64));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 1);
+        assert!(coord.get_session(&sid).unwrap().is_none());
+        assert_eq!(coord.activity().retained_entries(), 0);
+        assert!(coord.activity().recent_changes(&sid).is_empty());
+    }
+
+    /// Once its connection writes, the session names the process and is kept
+    /// while that process runs, as a session a write opened always was.
+    #[test]
+    fn attaching_the_process_keeps_an_idle_session() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let coord = SessionCoordinator::with_session_idle_ttl(graph, Duration::from_millis(30));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "claude-code",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+        assert_eq!(
+            coord.attach_process(&sid, std::process::id()).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            coord.attach_process(&sid, std::process::id() + 1).unwrap(),
+            Some(false),
+            "a session keeps the process it names"
+        );
+        assert_eq!(coord.attach_process(&SessionId::new(), 1).unwrap(), None);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 0);
+        assert!(coord.get_session(&sid).unwrap().is_some());
+    }
+
+    /// Liveness is kept in memory, so refreshing it writes nothing into the
+    /// graph and gives its next save no reason to be a full snapshot, while the
+    /// idle reap still judges the session by it.
+    #[test]
+    fn liveness_is_kept_in_memory_and_still_holds_off_the_idle_reap() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let coord =
+            SessionCoordinator::with_session_idle_ttl(Arc::clone(&graph), Duration::from_secs(1));
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "claude-code",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                write_capabilities(),
+            )
+            .unwrap();
+        let recorded = graph.get_session(&sid).unwrap().unwrap().last_heartbeat;
+        // Stand in for the save that followed the open.
+        graph.clear_full_snapshot_required();
+
+        std::thread::sleep(Duration::from_millis(700));
+        for _ in 0..25 {
+            coord.heartbeat(&sid).unwrap();
+        }
+        assert!(
+            !graph.full_snapshot_required(),
+            "a liveness refresh must not make the next save a full snapshot"
+        );
+        assert_eq!(
+            graph.get_session(&sid).unwrap().unwrap().last_heartbeat,
+            recorded,
+            "the session record is not rewritten for liveness"
+        );
+        assert!(coord.get_session(&sid).unwrap().unwrap().last_heartbeat > recorded);
+        assert!(coord.list_sessions().unwrap()[0].last_heartbeat > recorded);
+
+        // The record is now older than the idle window and the refresh is not.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 0);
+        assert!(coord.get_session(&sid).unwrap().is_some());
+
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(coord.sweep_stale_sessions().unwrap(), 1);
+        assert_eq!(
+            coord.liveness_entries(),
+            0,
+            "a reaped session leaves no liveness"
+        );
+    }
+
+    #[test]
+    fn deregistering_drops_the_call_log() {
+        let coord = make_coordinator();
+        let sid = coord
+            .register_session(
+                "codex",
+                "codex",
+                SessionTransport::Mcp,
+                None,
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+        coord
+            .activity()
+            .record_call(&sid, activity_draft(), Timestamp::now());
+        assert_eq!(coord.activity().retained_entries(), 1);
+        coord.deregister_session(&sid).unwrap();
+        assert_eq!(coord.activity().retained_entries(), 0);
+        assert_eq!(coord.activity().logged_sessions(), 0);
     }
 
     #[test]

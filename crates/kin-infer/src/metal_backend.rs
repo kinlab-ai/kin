@@ -2492,13 +2492,18 @@ fn buffer_pool_should_recycle(
     }
 }
 
-/// Resolve the BufferPool total-bytes cap, honoring `KIN_INFER_METAL_POOL_CAP_BYTES`.
+/// Resolve the BufferPool total-bytes cap, honoring `KIN_INFER_METAL_POOL_CAP_BYTES`,
+/// and otherwise sized to this machine's physical RAM.
 fn resolve_buffer_pool_cap_bytes() -> usize {
     std::env::var("KIN_INFER_METAL_POOL_CAP_BYTES")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
-        .unwrap_or(crate::resource::DEFAULT_BUFFER_POOL_CAP_BYTES as usize)
+        .unwrap_or_else(|| {
+            crate::resource::buffer_pool_cap_bytes(
+                crate::resource::detect_memory().system_total_bytes,
+            ) as usize
+        })
 }
 
 /// Round a byte count up to its allocation size-class. Powers of two up to 64KB,
@@ -7478,8 +7483,11 @@ mod tests {
         // BufferPool ceilings: the plan reports exactly the constants the live
         // pool is constructed with. Take the profile lock and assert the default
         // (no-override) path so the env-derived cap equals the documented default.
+        // The pool ceiling follows this machine's RAM, so the plan is derived
+        // from the same detected RAM the live pool reads.
         let _guard = profile_test_lock();
-        let plan = MetalGovernorPlan::derive(64 * GIB, Some(128 * GIB));
+        let system_total = crate::resource::detect_memory().system_total_bytes;
+        let plan = MetalGovernorPlan::derive(64 * GIB, system_total);
         if std::env::var_os("KIN_INFER_METAL_POOL_CAP_BYTES").is_none() {
             assert_eq!(
                 resolve_buffer_pool_cap_bytes() as u64,
@@ -7487,7 +7495,7 @@ mod tests {
             );
         }
         assert_eq!(
-            crate::resource::DEFAULT_BUFFER_POOL_CAP_BYTES,
+            crate::resource::buffer_pool_cap_bytes(system_total),
             plan.buffer_pool_cap_bytes
         );
         assert_eq!(

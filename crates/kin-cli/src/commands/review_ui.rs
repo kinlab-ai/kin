@@ -98,6 +98,8 @@ pub(super) struct UiState {
     opening_review: tokio::sync::Mutex<()>,
     pub(super) base_path: String,
     pub(super) catalog: Option<Arc<super::workspace_ui::Catalog>>,
+    /// The agent sessions this server has seen, for the pages that show them.
+    pub(super) agents: super::workspace_agents::AgentMemory,
 }
 
 impl UiState {
@@ -124,6 +126,7 @@ impl UiState {
             opening_review: tokio::sync::Mutex::new(()),
             base_path,
             catalog: Some(catalog),
+            agents: Default::default(),
         }
     }
 }
@@ -264,6 +267,9 @@ struct ChangeRowJson {
     id: String,
     title: String,
     author: String,
+    /// The agent that made the change, when an agent session did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<serde_json::Value>,
     timestamp: String,
     origin: &'static str,
     parents: usize,
@@ -527,6 +533,7 @@ async fn serve_changes(
                         .trim()
                         .to_string(),
                     author: author_display(&entry.author.to_string()),
+                    agent: super::workspace_agents::agent_ref(&entry.author.to_string()),
                     timestamp: entry.timestamp.to_string(),
                     origin: match entry.origin {
                         kin_model::ChangeOrigin::Native => "native",
@@ -615,6 +622,9 @@ fn working_admission_reason(dispatch: crate::daemon_client::AdmitDispatch) -> Op
 /// the address is not the reader's to see, and the time is the change's own
 /// field. A native author, an actor label, is shown as recorded.
 pub(super) fn author_display(raw: &str) -> String {
+    if let Some(agent) = super::workspace_agents::agent_author(raw) {
+        return agent.name;
+    }
     let decoded = raw
         .strip_prefix("git-author-v1:")
         .and_then(|hex_text| hex::decode(hex_text.trim()).ok())
@@ -752,6 +762,7 @@ fn polish_guide(guide: &mut serde_json::Value) {
     if let Some(author) = guide["change"]["author"].as_str() {
         guide["change"]["author"] = author_display(author).into();
     }
+    super::workspace_agents::attribute_change(&mut guide["change"]);
     let rewrite = |message: &mut serde_json::Value| {
         if let Some(plain) = message.as_str().and_then(plain_finding) {
             *message = plain.into();
@@ -1295,6 +1306,10 @@ fn api_routes() -> Router<Arc<UiState>> {
         .route("/api/branches", get(serve_branches))
         .route("/api/decide", post(serve_decide))
         .route("/api/note", post(serve_note))
+        .route(
+            "/api/change-agent",
+            get(super::workspace_agents::serve_change_agent),
+        )
 }
 
 fn router(state: Arc<UiState>) -> Router {
@@ -1355,6 +1370,7 @@ pub async fn run(target: GuideTarget, port: Option<u16>, open_browser: bool) -> 
         opening_review: tokio::sync::Mutex::new(()),
         base_path: String::new(),
         catalog: None,
+        agents: Default::default(),
     });
 
     let url = format!("http://127.0.0.1:{port}/");
@@ -1397,6 +1413,7 @@ mod tests {
             opening_review: tokio::sync::Mutex::new(()),
             base_path: String::new(),
             catalog: None,
+            agents: Default::default(),
         });
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.unwrap();

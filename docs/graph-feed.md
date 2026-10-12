@@ -162,6 +162,38 @@ that changed nothing emits no boundary at all.
 `seq` and its `connected` frame has no root hash, because the VFS daemon and the
 spine depend on its exact frames.
 
+## Agent activity
+
+The daemon also reports what the AI agents working in the repository do through
+Kin. An MCP client served by `kin mcp start` gets a session when it initializes,
+named by the client, and every call it makes names that session, so an agent that
+only reads is shown too.
+
+- `GET /agents` lists the live sessions: client, transport, state (`active` or
+  `idle`), call count and newest calls, open transactions, intents, and the
+  changes each one committed. `kin agents --json` prints the same payload.
+- `GET /session/{id}/calls?limit=N` is one session's call log, newest first, at
+  most 200 entries kept per session and 4096 across all of them.
+- A `ToolCall` frame on `/graph/events` announces each call. It is opt-in: only a
+  subscriber whose `types` names `ToolCall` receives it, and `/vfs/subscribe`
+  never does. The stream carries at most one per session per 250 ms and 16 per
+  second overall. A call inside either bound is folded into that session's next
+  frame, which carries the newest call and counts the others in `coalesced`.
+
+A call log entry holds the tool, the graph entities the call was about, how many
+entities the answer named, its size and duration, and whether it failed. It never
+holds the question, the arguments, the answer, a path, or the folder or process
+the agent runs in. A call on `/repos/{repo_id}/mcp/tools/call` that names a
+session is recorded the same way and carries the `repo_id` it named.
+
+Liveness is kept in the daemon's memory. Refreshing it on every call writes
+nothing to the session's record, so an agent that only reads gives the store
+nothing to save.
+
+An `EntityChanged` frame names the session in `session_id` when an agent's commit
+caused it, and a `Coordination` frame for a committed transaction carries the
+`change_id` it published.
+
 ## Resyncing
 
 The protocol is:

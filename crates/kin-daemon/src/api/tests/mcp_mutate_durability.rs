@@ -728,10 +728,11 @@ async fn mcp_mutate_pending_expired_session_refuses_without_losing_reservation()
     let (record_path, reserved) = mutation_record(&state, "pending-expiry").unwrap();
     let before = mutation_generation(&state);
     let old: Timestamp = serde_json::from_str("\"2020-01-01T00:00:00Z\"").unwrap();
+    // Silent since `old`: liveness is kept in the coordinator as well as the
+    // record, and the session is judged by the later of the two.
     state
-        .graph
-        .update_heartbeat(&SessionId(Uuid::parse_str(&session).unwrap()), &old)
-        .unwrap();
+        .coordinator
+        .backdate_liveness_for_test(&SessionId(Uuid::parse_str(&session).unwrap()), &old);
     let refused = mutate_http(&state, "kin_mutate", args.clone(), &session).await;
     assert_eq!(refused.is_error, Some(true));
     assert!(mcp_result_text(&refused).contains("request_session_expired"));

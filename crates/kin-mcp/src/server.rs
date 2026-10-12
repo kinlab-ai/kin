@@ -524,12 +524,18 @@ where
     // The folder the client works in before any roots arrive: the launch
     // directory the launcher recorded.
     let launch_root = config.client_root.clone();
+    // The background open of the connection's session `initialize` started,
+    // stopped if the client leaves before it finishes.
+    let mut opening_session: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some((message, framed)) = read_stdio_message(&mut *reader).await? {
         let message = config.expand_handles(message);
         // Where this message, when it is a `tools/call` whose client asked for
         // progress, reports how far its wait for the daemon has come.
         let mut call_progress: Option<CallProgressNotifier> = None;
+        // Whether this message is a `tools/call` the daemon answers, which is
+        // the only kind that may open the connection's session on the way.
+        let mut forwards_to_daemon = false;
 
         // The launcher's startup binding runs behind this loop so `initialize`
         // and `tools/list` are answered immediately. Once it settles with a
@@ -556,6 +562,10 @@ where
             if method == Some("initialize") {
                 client_supports_roots = value.pointer("/params/capabilities/roots").is_some();
                 config.apply_client_capabilities(&value);
+                if let Some(earlier) = opening_session.take() {
+                    earlier.abort();
+                }
+                opening_session = open_session_at_initialize(&config, startup.clone());
             }
 
             // Whether `--repo`/`KIN_MCP_REPO` pinned this server's repository.
@@ -586,6 +596,7 @@ where
                 .map(crate::agent_belt::canonical_tool_name)
                 != Some(crate::handlers::tool_search::TOOL_NAME)
                 && !crate::routed::answers_locally(&value, config.routed);
+            forwards_to_daemon = method == Some("tools/call") && call_reads_the_graph;
             if method == Some("tools/call") && call_reads_the_graph {
                 if let Some(startup) = startup.as_ref() {
                     // The first ask for a graph answer, and the only thing that
@@ -718,13 +729,34 @@ where
             }
         }
 
-        let response = match call_progress.as_mut() {
-            Some(notifier) => {
-                forward_reporting_progress(&message, &config, notifier, &mut *writer, framed)
-                    .await?
+        // Every call this connection forwards names its session, so the
+        // daemon records it against the agent that made it. A call that will
+        // reach the daemon opens the session if initialize could not.
+        let session_tag = if forwards_to_daemon {
+            read_session(&config).await
+        } else {
+            config.connection_session.current().await
+        }
+        .map(daemon_delegate::ConnectionSessionTag::new);
+        let response = daemon_delegate::with_connection_session(session_tag.clone(), async {
+            match call_progress.as_mut() {
+                Some(notifier) => {
+                    forward_reporting_progress(&message, &config, notifier, &mut *writer, framed)
+                        .await
+                }
+                None => Ok(process_daemon_message(&message, &config).await),
             }
-            None => process_daemon_message(&message, &config).await,
-        };
+        })
+        .await?;
+        // The daemon no longer holds the session: reaped after its idle
+        // window, or lost to a restart. Open a new one now, so the agent is
+        // shown again from its next call.
+        if let Some(tag) = session_tag.filter(daemon_delegate::ConnectionSessionTag::gone) {
+            config.connection_session.forget(tag.id()).await;
+            // Detached: it finishes on its own, and a client that leaves first
+            // leaves a session the daemon's idle rule reaps.
+            let _reopening = open_session_in_background(&config);
+        }
         if let Some(mut response) = response {
             if is_tools_call(&message) {
                 stamp_client_folder(&mut response, binding.repo_root.as_deref(), &config);
@@ -738,9 +770,140 @@ where
     // The client closed the connection, so the session it wrote in ends with
     // it. A server that dies without getting here leaves the session to the
     // daemon's idle rule, once the process its session names is gone.
+    if let Some(opening) = opening_session.take() {
+        opening.abort();
+    }
     end_connection_session(&config).await;
     tracing::info!("kin-mcp daemon-proxy stdio server shutting down");
     Ok(())
+}
+
+/// Whether the launcher named the session this process works in
+/// (`KIN_SESSION_ID`, set by `kin with` and `kin exec`). That session is the
+/// agent's, every forwarded call already names it, and no second one is
+/// opened for reads.
+fn launcher_names_session() -> bool {
+    std::env::var("KIN_SESSION_ID").is_ok_and(|id| !id.trim().is_empty())
+}
+
+/// Ask the daemon to open a session with `start`, returning its id.
+async fn open_daemon_session(
+    start: HashMap<String, serde_json::Value>,
+) -> std::result::Result<String, String> {
+    let answer = daemon_delegate::forward_tool_call("kin_session_start", &start)
+        .await?
+        .ok_or_else(|| "no Kin daemon is serving this repository".to_string())?;
+    let answer = serde_json::to_value(&answer).map_err(|error| error.to_string())?;
+    crate::connection_session::started_session_id(&answer).ok_or_else(|| {
+        let text = answer
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        format!("the daemon opened no session: {text}")
+    })
+}
+
+/// Open the connection's session for reads with `start`.
+#[cfg(not(test))]
+async fn open_read_session(
+    session: &crate::connection_session::ConnectionSession,
+    start: HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    session.id_for_reads(|| open_daemon_session(start)).await
+}
+
+/// In a test, a connection that set ids is handed its next one and nothing
+/// reaches a daemon; one that set none opens nothing.
+#[cfg(test)]
+async fn open_read_session(
+    session: &crate::connection_session::ConnectionSession,
+    _start: HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    if !session.in_test_mode() {
+        return None;
+    }
+    if let Some(held) = session.current().await {
+        return Some(held);
+    }
+    let next = session.next_test_id();
+    session
+        .id_for_reads(|| async move { next.ok_or_else(|| "no test session id".to_string()) })
+        .await
+}
+
+/// The connection's session for a call the daemon answers, opening it when
+/// initialize could not. `None` when the launcher named the session, the
+/// connection has no folder yet, or the daemon refused.
+async fn read_session(config: &McpServerConfig) -> Option<String> {
+    if launcher_names_session() {
+        return None;
+    }
+    if let Some(held) = config.connection_session.current().await {
+        return Some(held);
+    }
+    let cwd = config.client_root.as_deref()?.display().to_string();
+    let start = config.connection_session.read_start_arguments(&cwd);
+    open_read_session(&config.connection_session, start).await
+}
+
+/// Open the connection's session in the background, so nothing the client
+/// waits on pays for it.
+fn open_session_in_background(config: &McpServerConfig) -> Option<tokio::task::JoinHandle<()>> {
+    if launcher_names_session() {
+        return None;
+    }
+    let cwd = config.client_root.as_deref()?;
+    let start = config
+        .connection_session
+        .read_start_arguments(&cwd.display().to_string());
+    let session = std::sync::Arc::clone(&config.connection_session);
+    Some(tokio::spawn(async move {
+        open_read_session(&session, start).await;
+    }))
+}
+
+/// Open the connection's session once the client has initialized, so an agent
+/// that only reads is shown too.
+///
+/// In the background, so the handshake answers at once, and only against a
+/// daemon that is already serving: this waits for the launcher's binding and
+/// never admits starting a daemon, which only a call that asks for a graph
+/// answer may do. If the binding settles with no daemon, the first such call
+/// opens the session on its way.
+fn open_session_at_initialize(
+    config: &McpServerConfig,
+    startup: Option<std::sync::Arc<StartupDaemonBinding>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if launcher_names_session() {
+        return None;
+    }
+    let Some(startup) = startup else {
+        // No launcher binding to wait on, which only a test runs without; a
+        // test that set no session ids opens nothing.
+        return if cfg!(test) {
+            open_session_in_background(config)
+        } else {
+            None
+        };
+    };
+    let cwd = config.client_root.as_deref()?;
+    let start = config
+        .connection_session
+        .read_start_arguments(&cwd.display().to_string());
+    let session = std::sync::Arc::clone(&config.connection_session);
+    Some(tokio::spawn(async move {
+        loop {
+            match startup.snapshot() {
+                StartupBindingState::Bound(_) => break,
+                StartupBindingState::Unbound { .. } => return,
+                StartupBindingState::Pending => {
+                    startup.wait_until_settled(Duration::from_secs(600)).await;
+                }
+            }
+        }
+        open_read_session(&session, start).await;
+    }))
 }
 
 /// End the write session this connection opened, if it opened one.
@@ -3527,18 +3690,7 @@ async fn adopt_connection_session(
             if let Some(id) = test_id {
                 return Ok(id);
             }
-            let answer = daemon_delegate::forward_tool_call("kin_session_start", &start)
-                .await?
-                .ok_or_else(|| "no Kin daemon is serving this repository".to_string())?;
-            let answer = serde_json::to_value(&answer).map_err(|error| error.to_string())?;
-            crate::connection_session::started_session_id(&answer).ok_or_else(|| {
-                let text = answer
-                    .pointer("/content/0/text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                format!("the daemon opened no session: {text}")
-            })
+            open_daemon_session(start).await
         })
         .await
         .map_err(|error| {
@@ -3547,9 +3699,31 @@ async fn adopt_connection_session(
                  Nothing was written. Retry the write, or name a session_id from session start."
             ))
         })?;
+    attach_process_for_writes(config, &session).await;
     call.arguments
         .insert("session_id".into(), serde_json::json!(session));
     Ok(Some(session))
+}
+
+/// Name this process on a session that was opened for reads, the first time
+/// it writes, so the daemon keeps it while the process runs as it keeps a
+/// session a write opened. Attempted once: a daemon that cannot attach it
+/// leaves the session on the ordinary idle rule, and the write goes ahead.
+async fn attach_process_for_writes(config: &McpServerConfig, session: &str) {
+    if config.connection_session.names_process() {
+        return;
+    }
+    config.connection_session.mark_names_process();
+    #[cfg(test)]
+    if config.connection_session.in_test_mode() {
+        return;
+    }
+    if let Err(error) =
+        daemon_delegate::attach_session_process(session, config.connection_session.process_id())
+            .await
+    {
+        tracing::debug!("attaching this process to the connection's session failed: {error}");
+    }
 }
 
 /// Whether `result` says the connection's session was reaped before the write
@@ -6967,6 +7141,124 @@ mod tests {
             "a tools/call is a caller asking for a graph answer, and must admit the spawn the \
              answer needs"
         );
+    }
+
+    /// A client that initializes is given its session in the background once a
+    /// daemon is serving, so an agent that only reads is shown. The handshake
+    /// waits on none of it, nothing admits starting a daemon, and the session
+    /// names no process, so a connection that never does anything is left to
+    /// the daemon's ordinary idle rule.
+    #[tokio::test]
+    async fn initialize_opens_the_connections_session_once_a_daemon_serves() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        if launcher_names_session() {
+            return;
+        }
+        let startup = StartupDaemonBinding::new();
+        let config = McpServerConfig {
+            allowed_tools: Some(HashSet::new()),
+            client_root: Some(PathBuf::from("/semantic-test-context")),
+            ..McpServerConfig::default()
+        };
+        config.connection_session.open_with(&["read-session"]);
+        let session = std::sync::Arc::clone(&config.connection_session);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, mut server_write) = tokio::io::split(server);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let served = tokio::spawn({
+            let startup = std::sync::Arc::clone(&startup);
+            async move {
+                let mut reader = BufReader::new(server_read);
+                run_stdio_daemon_over(
+                    &mut reader,
+                    &mut server_write,
+                    config,
+                    None,
+                    None,
+                    Some(startup),
+                )
+                .await
+            }
+        });
+        let mut replies = BufReader::new(client_read).lines();
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"clientInfo": {"name": "claude-code", "version": "2"}},
+        });
+        client_write
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await
+            .unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), replies.next_line())
+            .await
+            .expect("initialize is answered at once")
+            .unwrap()
+            .unwrap();
+        assert!(answered.contains("\"id\":1"), "{answered}");
+
+        // No daemon is serving yet. Nothing was opened, and nothing admitted
+        // starting one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.test_opens(), 0);
+        assert!(!startup.daemon_spawn_admitted());
+
+        // A daemon somebody else started comes up.
+        startup.resolve_bound(
+            BoundRepo {
+                root: PathBuf::from("/semantic-test-context"),
+                daemon_url: "http://127.0.0.1:9".to_string(),
+            },
+            false,
+        );
+        let opened = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = session.current().await {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session opens once a daemon serves");
+        assert_eq!(opened, "read-session");
+        assert_eq!(session.test_opens(), 1);
+        assert!(
+            !session.names_process(),
+            "opened for reads, the session names no process"
+        );
+        assert!(!startup.daemon_spawn_admitted());
+
+        // Closing the client's half of the transport is the client leaving.
+        client_write.shutdown().await.unwrap();
+        drop(replies);
+        tokio::time::timeout(Duration::from_secs(30), served)
+            .await
+            .expect("the loop ends with its client")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A call the daemon answers opens the session when initialize could not,
+    /// and every later call reuses it.
+    #[tokio::test]
+    async fn a_forwarded_call_opens_the_session_initialize_could_not() {
+        if launcher_names_session() {
+            return;
+        }
+        let config = McpServerConfig {
+            client_root: Some(PathBuf::from("/semantic-test-context")),
+            ..McpServerConfig::default()
+        };
+        assert_eq!(
+            read_session(&config).await,
+            None,
+            "a test that set no ids reaches no daemon"
+        );
+        config.connection_session.open_with(&["lazy-session"]);
+        assert_eq!(read_session(&config).await.as_deref(), Some("lazy-session"));
+        assert_eq!(read_session(&config).await.as_deref(), Some("lazy-session"));
+        assert_eq!(config.connection_session.test_opens(), 1);
     }
 
     /// Roots a pre-call bind could not follow are kept, not discarded, so the
