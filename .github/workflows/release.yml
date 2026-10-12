@@ -439,11 +439,16 @@ jobs:
     # rc-build.yml bounds the identical compile at 90, and this job had no bound
     # at all, so it inherited the 360-minute default while holding
     # `kin-release-promotion` with cancel-in-progress: false. A hung leg could
-    # block every release-channel mutation for six hours. The slowest leg ever
-    # measured is 40m03s, so 90 leaves better than twice that headroom. This
-    # bounds execution rather than queue time, so it is not a runner-label
-    # safety net; it is the ceiling on a build that stops making progress.
-    timeout-minutes: 90
+    # block every release-channel mutation for six hours. This bounds execution
+    # rather than queue time, so it is not a runner-label safety net; it is the
+    # ceiling on a build that stops making progress. The macOS arm64 leg reached
+    # the old 90-minute bound on both 0.8.2 candidate attempts with its two
+    # links resident at once, and now links them one at a time (see "Build
+    # kin-cli + kin-daemon (native)"). Measured that way on the standard runner
+    # (rc-build run 38238857203) its build step took 77 minutes and the macOS
+    # x86_64 leg's about as long, which left too little margin for a slow
+    # runner day, so the bound is 120. rc-build.yml carries the same bound.
+    timeout-minutes: 120
     environment: release
     # Every advertised platform is release-blocking. A public release must not
     # be created without one of the archives consumed by the installers.
@@ -611,7 +616,9 @@ jobs:
           # The Linux legs are given swap and then sample their own memory and
           # disk into this step's own log while cargo runs. Both halves stay
           # here permanently, because the second is what proves the first is
-          # still enough.
+          # still enough. macOS grows its own swap files and offers no swapfile
+          # to add, so the macOS legs only sample, recording free memory, the
+          # compressor, swap in use and the kernel's pressure level.
           #
           # What this leg ran out of, measured rather than guessed. The
           # linux-aarch64 leg of v0.7.14 died at this step on all three attempts
@@ -648,6 +655,29 @@ jobs:
           # built. The x86_64 leg has headroom today and its swap is insurance;
           # keying the headroom to an architecture would record the accident of
           # which leg crossed first rather than the reason either might.
+          #
+          # The macOS arm64 leg is the one that outgrew its runner, and it is
+          # given the two links one at a time rather than more memory. The
+          # standard Apple Silicon runner has 3 cores and 7 GB of RAM. On the
+          # 0.8.2 candidate (rc-build run 38192967949) the linux-aarch64 leg,
+          # same crates and same backend, fell to 259 MB available with about
+          # 12 GB of its swap in use while both links ran, so the pair now
+          # commits roughly 27 GB, and the link left running alone still held
+          # 9.7 GB resident. The macOS arm64 leg of that run and of its retry
+          # (38198979588) was still inside both links 75 and 81 minutes after
+          # kin-daemon began compiling, and reached this job's 90-minute bound
+          # both times; v0.8.1 had already needed 63 and 73 minutes for the same
+          # phase. Neither macOS log carried a memory reading, so memory is the
+          # cause inferred from that measurement and the runner's size, and the
+          # sampler below is what confirms or refutes it.
+          #
+          # Each binary is its own invocation with the same -p pair, so Cargo
+          # resolves features exactly as the combined build does. The combined
+          # invocation then runs unchanged, finds both binaries fresh and
+          # rebuilds nothing; were it ever to rebuild, the shipped bytes would
+          # still be the combined build's. The other legs keep linking both at
+          # once, because their runners hold the pair and running the links in
+          # series would put the shorter one on the critical path for nothing.
           sampler=""
           if [ "$(uname -s)" = Linux ]; then
             echo "resources before the build"
@@ -702,11 +732,40 @@ jobs:
               done
             ) &
             sampler=$!
+          elif [ "$(uname -s)" = Darwin ]; then
+            echo "resources before the build"
+            sysctl -n hw.ncpu hw.memsize || true
+            sysctl vm.swapusage || true
+            df -h / || true
+            (
+              set +e
+              set +o pipefail
+              page=$(sysctl -n hw.pagesize)
+              while :; do
+                vm=$(vm_stat)
+                free=$(printf '%s\n' "$vm" | awk -v p="$page" '/^Pages free:/{sub(/\./,"",$3); printf "%d", $3*p/1048576}')
+                comp=$(printf '%s\n' "$vm" | awk -v p="$page" '/^Pages occupied by compressor:/{sub(/\./,"",$5); printf "%d", $5*p/1048576}')
+                swap=$(sysctl -n vm.swapusage | awk '{for(i=1;i<NF;i++) if($i=="used"){v=$(i+2); sub(/M$/,"",v); printf "%d", v}}')
+                pressure=$(sysctl -n kern.memorystatus_vm_pressure_level)
+                top=$(ps -axo rss=,ucomm= | sort -rn | head -2 | awk '{printf "%s%s/%dMB", sep, $2, $1/1024; sep=","}')
+                echo "resource-sample $(date -u +%H:%M:%SZ) mem_free_mb=$free compressed_mb=$comp swap_used_mb=$swap pressure=$pressure top_rss=$top"
+                sleep 15
+              done
+            ) &
+            sampler=$!
           fi
           rc=0
+          if [ "$TARGET" = aarch64-apple-darwin ]; then
+            for bin in kin kin-daemon; do
+              echo "linking $bin on its own"
+              cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon --bin "$bin" || { rc=$?; break; }
+            done
+          fi
           # Default archives include graph/vector and optional HTTP support.
           # Local inference is available in explicitly enabled source builds.
-          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?
+          fi
           if [ -n "$sampler" ]; then
             kill "$sampler" 2>/dev/null || true
           fi
@@ -714,6 +773,10 @@ jobs:
             echo "resources after the build"
             free -m || true
             df -h || true
+          elif [ "$(uname -s)" = Darwin ]; then
+            echo "resources after the build"
+            sysctl vm.swapusage || true
+            df -h / || true
           fi
           exit "$rc"
         env:

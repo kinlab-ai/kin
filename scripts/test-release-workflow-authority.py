@@ -449,6 +449,9 @@ DOCS_ONLY_CLASSIFIER_SHELL = textwrap.dedent(
           esac
         done <<< "$changed"
       fi
+      case "${HEAD_REF:-}" in
+        feature/public-export-*) docs_only=false ;;
+      esac
       printf '%s\\n' "$changed"
     fi
     echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
@@ -479,6 +482,7 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
             EVENT_NAME: ${{ github.event_name }}
             BASE_SHA: ${{ github.event.pull_request.base.sha }}
             HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+            HEAD_REF: ${{ github.head_ref }}
           run: |
             set -euo pipefail
             docs_only=false
@@ -529,6 +533,9 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
                   esac
                 done <<< "$changed"
               fi
+              case "${HEAD_REF:-}" in
+                feature/public-export-*) docs_only=false ;;
+              esac
               printf '%s\\n' "$changed"
             fi
             echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
@@ -6948,6 +6955,39 @@ def create_docs_only_git_fixture(directory: Path) -> tuple[Path, str, str]:
     return repository, base_sha, head_sha
 
 
+def assert_export_pull_request_never_docs_only(workflow: str) -> None:
+    """An export pull request runs the release suites even on a docs-only diff.
+
+    land_export.py lands an export only once the release contexts are green on
+    its exact head, and the fast-path stand-ins skip export branches, so a
+    docs-only classification would leave an export that can never land.
+    """
+
+    classifier = workflow_job_blocks(workflow)["changes"]
+    with tempfile.TemporaryDirectory() as directory:
+        fixture, base_sha, head_sha = create_docs_only_git_fixture(Path(directory))
+        for head_ref, expected in (
+            ("feature/public-export-kin-0123abc", "docs_only=false"),
+            ("docs/ordinary-branch", "docs_only=true"),
+        ):
+            result, outputs = execute_docs_only_classifier(
+                classifier,
+                cwd=fixture,
+                environment_overrides={
+                    "EVENT_NAME": "pull_request",
+                    "BASE_SHA": base_sha,
+                    "HEAD_SHA": head_sha,
+                    "HEAD_REF": head_ref,
+                    "WORKSPACE": str(fixture),
+                },
+            )
+            if result.returncode != 0 or not outputs or outputs[-1] != expected:
+                raise AssertionError(
+                    f"a docs-only pull request from {head_ref} must report "
+                    f"{expected}: {outputs} {result.stdout}{result.stderr}"
+                )
+
+
 def create_classifier_authority_attack_fixture(
     directory: Path,
     base_workflow: str,
@@ -11359,6 +11399,46 @@ def assert_default_core_archive_profile(workflow: str) -> None:
             raise AssertionError("default archive feature evidence is missing " + required)
 
 
+MACOS_ARM64_PER_BINARY_LINK = (
+    'cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon '
+    '--bin "$bin" || { rc=$?; break; }'
+)
+COMBINED_CORE_ARCHIVE_BUILD = (
+    'cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?'
+)
+
+
+def assert_macos_arm64_links_one_at_a_time(workflow: str) -> None:
+    """The macOS arm64 leg links kin and kin-daemon in separate invocations.
+
+    Both 0.8.2 release-candidate attempts reached the 90-minute bound on that
+    leg with both fat-LTO links resident at once on a 7 GB runner. Each
+    per-binary invocation keeps the combined -p pair, so Cargo resolves features
+    exactly as the combined build does, and the combined invocation still runs
+    afterwards, so the shipped bytes are the combined build's.
+    """
+    lines = active_lines(workflow_job_blocks(workflow)["build"])
+    try:
+        guard = lines.index('if [ "$TARGET" = aarch64-apple-darwin ]; then')
+    except ValueError:
+        raise AssertionError(
+            "the macOS arm64 leg must link its binaries one at a time"
+        ) from None
+    if lines[guard + 1 : guard + 3] != [
+        "for bin in kin kin-daemon; do",
+        'echo "linking $bin on its own"',
+    ] or lines[guard + 3] != MACOS_ARM64_PER_BINARY_LINK:
+        raise AssertionError(
+            "the macOS arm64 leg must link kin then kin-daemon, each with the "
+            "combined -p kin-cli -p kin-daemon pair"
+        )
+    if COMBINED_CORE_ARCHIVE_BUILD not in lines[guard + 4 :]:
+        raise AssertionError(
+            "the combined core archive build must still run after the macOS "
+            "arm64 per-binary links"
+        )
+
+
 def main() -> None:
     assert_release_probe_fixtures()
     retired = (
@@ -11378,6 +11458,11 @@ def main() -> None:
     assert_default_core_archive_profile((WORKFLOWS / "rc-build.yml").read_text(encoding="utf-8"))
     expect_assertion("local engine smuggled into a default archive", "must use Cargo defaults", lambda: assert_default_core_archive_profile(release.replace('-p kin-cli -p kin-daemon || rc=$?', '-p kin-cli -p kin-daemon --features kin-cli/embeddings || rc=$?', 1)))
     expect_assertion("engine metadata assertion removed", "feature evidence is missing", lambda: assert_default_core_archive_profile(release.replace('meta.embeddings?.local_inference_enabled !== false', 'false', 1)))
+    assert_macos_arm64_links_one_at_a_time(release)
+    assert_macos_arm64_links_one_at_a_time((WORKFLOWS / "rc-build.yml").read_text(encoding="utf-8"))
+    expect_assertion("macOS arm64 links both binaries at once", "one at a time", lambda: assert_macos_arm64_links_one_at_a_time(release.replace('if [ "$TARGET" = aarch64-apple-darwin ]; then', 'if false; then', 1)))
+    expect_assertion("macOS arm64 per-binary link drops the combined package pair", "combined -p kin-cli -p kin-daemon pair", lambda: assert_macos_arm64_links_one_at_a_time(release.replace('-p kin-cli -p kin-daemon --bin "$bin"', '-p kin-cli --bin "$bin"', 1)))
+    expect_assertion("macOS arm64 skips the combined build", "must still run", lambda: assert_macos_arm64_links_one_at_a_time(release.replace("          if [ \"$rc\" -eq 0 ]; then\n            cargo build --locked --release --target \"$TARGET\" -p kin-cli -p kin-daemon || rc=$?\n          fi\n", "", 1)))
     release_cut = RELEASE_CUT.read_text(encoding="utf-8")
     assert_native_startup_release_proof(release_cut)
     for label, before, after, error in [
@@ -15880,6 +15965,7 @@ def main() -> None:
     classifier_end = classifier_start + len("  changes:") + next_job.start()
     classifier = ci_workflow[classifier_start:classifier_end].rstrip("\n")
     assert_docs_only_classifier_guard(ci_workflow)
+    assert_export_pull_request_never_docs_only(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
     toolchain_action = RUST_TOOLCHAIN_ACTION.read_text(encoding="utf-8")
     assert_toolchain_prune_is_wired(toolchain_action)

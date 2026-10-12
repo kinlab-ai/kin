@@ -861,7 +861,11 @@ jobs:
   # satisfy the heavy required checks without a toolchain or registry
   # dependency. Fail closed: any classifier failure or non-pull_request event
   # reports docs_only=false and every gated job runs. ci.yml itself never
-  # qualifies for its own fast path.
+  # qualifies for its own fast path, and neither does an export pull request:
+  # land_export.py lands an export only once the release contexts are green on
+  # its exact head, and the fast-path stand-ins skip export branches, so a
+  # docs-only export could never carry them. The branch name can only add work
+  # here, never skip it.
   changes:
     name: Classify diff scope
     runs-on: ubuntu-latest
@@ -887,6 +891,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           docs_only=false
@@ -939,6 +944,9 @@ jobs:
                 esac
               done <<< "$changed"
             fi
+            case "${HEAD_REF:-}" in
+              feature/public-export-*) docs_only=false ;;
+            esac
             printf '%s\n' "$changed"
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
@@ -2733,7 +2741,12 @@ jobs:
       && needs.changes.outputs.docs_only != 'true'
       && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # "Falsify Zero File-Search guards" grew from about 14 minutes to about 26
+    # on 2026-10-11 and crossed the old 30-minute bound on an export pull
+    # request the next day. GitHub records a job timeout as cancelled, which
+    # the release selector does not admit as a retryable failure, so a bound
+    # this close to the job's own length can kill a release candidate.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
