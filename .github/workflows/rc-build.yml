@@ -80,7 +80,8 @@ jobs:
   build:
     name: RC Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    # Same bound as release.yml's build job; see the note there.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

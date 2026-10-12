@@ -442,10 +442,13 @@ jobs:
     # block every release-channel mutation for six hours. This bounds execution
     # rather than queue time, so it is not a runner-label safety net; it is the
     # ceiling on a build that stops making progress. The macOS arm64 leg reached
-    # it on both 0.8.2 candidate attempts with its two links resident at once,
-    # and now links them one at a time (see "Build kin-cli + kin-daemon
-    # (native)"); the bound stayed where it was.
-    timeout-minutes: 90
+    # the old 90-minute bound on both 0.8.2 candidate attempts with its two
+    # links resident at once, and now links them one at a time (see "Build
+    # kin-cli + kin-daemon (native)"). Measured that way on the standard runner
+    # (rc-build run 38238857203) its build step took 77 minutes and the macOS
+    # x86_64 leg's about as long, which left too little margin for a slow
+    # runner day, so the bound is 120. rc-build.yml carries the same bound.
+    timeout-minutes: 120
     environment: release
     # Every advertised platform is release-blocking. A public release must not
     # be created without one of the archives consumed by the installers.

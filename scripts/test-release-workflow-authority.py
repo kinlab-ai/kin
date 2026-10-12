@@ -449,6 +449,9 @@ DOCS_ONLY_CLASSIFIER_SHELL = textwrap.dedent(
           esac
         done <<< "$changed"
       fi
+      case "${HEAD_REF:-}" in
+        feature/public-export-*) docs_only=false ;;
+      esac
       printf '%s\\n' "$changed"
     fi
     echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
@@ -479,6 +482,7 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
             EVENT_NAME: ${{ github.event_name }}
             BASE_SHA: ${{ github.event.pull_request.base.sha }}
             HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+            HEAD_REF: ${{ github.head_ref }}
           run: |
             set -euo pipefail
             docs_only=false
@@ -529,6 +533,9 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
                   esac
                 done <<< "$changed"
               fi
+              case "${HEAD_REF:-}" in
+                feature/public-export-*) docs_only=false ;;
+              esac
               printf '%s\\n' "$changed"
             fi
             echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
@@ -6946,6 +6953,39 @@ def create_docs_only_git_fixture(directory: Path) -> tuple[Path, str, str]:
     git("commit", "-m", "docs only")
     head_sha = git("rev-parse", "HEAD")
     return repository, base_sha, head_sha
+
+
+def assert_export_pull_request_never_docs_only(workflow: str) -> None:
+    """An export pull request runs the release suites even on a docs-only diff.
+
+    land_export.py lands an export only once the release contexts are green on
+    its exact head, and the fast-path stand-ins skip export branches, so a
+    docs-only classification would leave an export that can never land.
+    """
+
+    classifier = workflow_job_blocks(workflow)["changes"]
+    with tempfile.TemporaryDirectory() as directory:
+        fixture, base_sha, head_sha = create_docs_only_git_fixture(Path(directory))
+        for head_ref, expected in (
+            ("feature/public-export-kin-0123abc", "docs_only=false"),
+            ("docs/ordinary-branch", "docs_only=true"),
+        ):
+            result, outputs = execute_docs_only_classifier(
+                classifier,
+                cwd=fixture,
+                environment_overrides={
+                    "EVENT_NAME": "pull_request",
+                    "BASE_SHA": base_sha,
+                    "HEAD_SHA": head_sha,
+                    "HEAD_REF": head_ref,
+                    "WORKSPACE": str(fixture),
+                },
+            )
+            if result.returncode != 0 or not outputs or outputs[-1] != expected:
+                raise AssertionError(
+                    f"a docs-only pull request from {head_ref} must report "
+                    f"{expected}: {outputs} {result.stdout}{result.stderr}"
+                )
 
 
 def create_classifier_authority_attack_fixture(
@@ -15925,6 +15965,7 @@ def main() -> None:
     classifier_end = classifier_start + len("  changes:") + next_job.start()
     classifier = ci_workflow[classifier_start:classifier_end].rstrip("\n")
     assert_docs_only_classifier_guard(ci_workflow)
+    assert_export_pull_request_never_docs_only(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
     toolchain_action = RUST_TOOLCHAIN_ACTION.read_text(encoding="utf-8")
     assert_toolchain_prune_is_wired(toolchain_action)
