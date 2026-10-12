@@ -2544,6 +2544,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             get(get_session).delete(end_session),
         )
         .route("/session/{session_id}/heartbeat", post(session_heartbeat))
+        .route("/session/{session_id}/process", post(session_process))
+        .route(
+            "/session/{session_id}/calls",
+            get(crate::agent_activity::session_calls_route),
+        )
+        .route("/agents", get(crate::agent_activity::agents_route))
         .route(
             "/session/{session_id}/scope",
             post(set_scope).delete(clear_scope).get(get_scope),
@@ -6993,6 +6999,36 @@ async fn get_session(
     Ok(Json(session))
 }
 
+/// Body of `POST /session/{session_id}/process`.
+#[derive(Debug, Deserialize)]
+struct SessionProcessRequest {
+    pid: u32,
+}
+
+/// POST /session/{session_id}/process — name the process a session lives with.
+///
+/// A connection opens its session when its client initializes, naming no
+/// process, so a connection that never does anything is reaped by the idle
+/// rule. Its first write names the process here, and from then on the session
+/// is kept for as long as that process runs, as a session opened by a write
+/// always was. A session that already names a different process keeps it.
+async fn session_process(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<SessionProcessRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let session_id = parse_session_id(&session_id)?;
+    let attached = state
+        .coordinator
+        .attach_process(&session_id, request.pid)
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, expired_session_message(&session_id)))?;
+    Ok(Json(json!({
+        "session_id": session_id.to_string(),
+        "process_attached": attached,
+    })))
+}
+
 /// POST /session/{session_id}/heartbeat — record a session heartbeat.
 async fn session_heartbeat(
     Path(session_id): Path<String>,
@@ -9386,7 +9422,11 @@ async fn reconcile_session_workspace(
     )? {
         return Err(refusal);
     }
-    crate::session_publication::execute(state, request).await
+    // The entity events this publication emits name the session that
+    // published it. Read leniently, as the refusal above reads it: a malformed
+    // id names no session and is not a new way for this route to fail.
+    let session_id = extract_session_id_from_headers(&headers).ok().flatten();
+    crate::session_publication::execute(state, request, session_id).await
 }
 
 pub(crate) fn session_reconcile_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -10780,7 +10820,8 @@ async fn export_graph_projection(
 #[derive(Debug, Deserialize)]
 struct GraphEventsParams {
     /// Comma-separated event type names to keep, e.g.
-    /// `EntityChanged,RelationChanged`. Absent means every type.
+    /// `EntityChanged,RelationChanged`. Absent means every graph type; agent
+    /// activity (`ToolCall`) is delivered only when named.
     #[serde(default)]
     types: Option<String>,
 }
@@ -10836,9 +10877,12 @@ async fn graph_events(
                 event = rx.recv() => {
                     match event {
                         Ok(sequenced) => {
-                            let keep = wanted
-                                .as_ref()
-                                .is_none_or(|names| names.contains(sequenced.event.type_name()));
+                            // Agent activity is opt-in: a subscriber with no
+                            // filter gets the graph event types it always got.
+                            let keep = match wanted.as_ref() {
+                                Some(names) => names.contains(sequenced.event.type_name()),
+                                None => !sequenced.event.is_activity(),
+                            };
                             if keep {
                                 // The sequence is merged into the event object
                                 // rather than wrapping it, so a consumer reads
@@ -19065,6 +19109,63 @@ async fn repo_mcp_tools_call(
         axum::extract::rejection::JsonRejection,
     >,
 ) -> Response {
+    // A call naming a session is recorded in that session's call log, as a
+    // call on `/mcp/tools/call` is; see `crate::agent_activity`.
+    let activity = extract_session_id_from_headers(&headers)
+        .ok()
+        .flatten()
+        .and_then(|session_id| {
+            let Json(request) = request.as_ref().ok()?;
+            Some((
+                session_id,
+                request.name.clone(),
+                crate::agent_activity::argument_uuids(&request.arguments),
+            ))
+        });
+    let started = Instant::now();
+    let response =
+        repo_mcp_tools_call_answer(headers, repo_id.clone(), Arc::clone(&state), request).await;
+    match activity {
+        Some((session_id, tool, targets)) => {
+            crate::agent_activity::record_repo_scoped_call(
+                &state,
+                &repo_id,
+                session_id,
+                &tool,
+                &targets,
+                response,
+                started.elapsed(),
+            )
+            .await
+        }
+        None => response,
+    }
+}
+
+/// The graph the repo-scoped route answers `repo_id` from, as it cached it for
+/// the call that just ran. Read without re-probing the backend: the call log
+/// only confirms ids against it, and a stale or missing view confirms none.
+pub(crate) async fn cached_repo_scoped_graph(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Option<Arc<kin_db::InMemoryGraph>> {
+    state
+        .repo_semantic_views
+        .read()
+        .await
+        .get(repo_id)
+        .map(|view| Arc::clone(&view.graph))
+}
+
+async fn repo_mcp_tools_call_answer(
+    headers: axum::http::HeaderMap,
+    repo_id: String,
+    state: Arc<DaemonState>,
+    request: std::result::Result<
+        Json<RepoScopedMcpToolCallRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
     let Json(request) = match request {
         Ok(request) => request,
         Err(rejection) => {
@@ -19952,16 +20053,61 @@ async fn mcp_tools_call(
     tokens: Extension<crate::auth_rotation::RotationTokens>,
     state: State<Arc<DaemonState>>,
     request: std::result::Result<Json<McpToolCallRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<kin_mcp::ToolCallResult>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let tool = request
         .as_ref()
         .ok()
         .map(|Json(request)| kin_mcp::verbs::handler_name(&request.name, &request.arguments))
         .unwrap_or_default();
-    mcp_tools_call_internal(headers, tokens, state, request)
-        .await
-        .map(|Json(result)| Json(present_mcp_http_tool_result(result, &tool)))
-        .map_err(|(status, message)| (status, kin_mcp::semantic_surface::diagnostic(&message)))
+    // The session's call log keeps the tool, the entities the call was about
+    // and how much it answered, never the request or the answer. The only part
+    // of the request it may keep is an argument that is a whole entity id, so
+    // those are read here, before the call consumes its arguments.
+    let activity = extract_session_id_from_headers(&headers)
+        .ok()
+        .flatten()
+        .map(|session_id| {
+            let targets = request
+                .as_ref()
+                .map(|Json(request)| crate::agent_activity::argument_uuids(&request.arguments))
+                .unwrap_or_default();
+            (session_id, Arc::clone(&state.0), targets)
+        });
+    let started = Instant::now();
+    let answered = mcp_tools_call_internal(headers, tokens, state, request).await;
+    let mut session_held = true;
+    if let Some((session_id, state, targets)) = activity {
+        let refused;
+        let result = match &answered {
+            Ok(Json(result)) => result,
+            Err((_, message)) => {
+                refused = kin_mcp::ToolCallResult::error(message.clone());
+                &refused
+            }
+        };
+        session_held = crate::agent_activity::record_tool_call(
+            &state,
+            session_id,
+            &tool,
+            &targets,
+            result,
+            started.elapsed(),
+        )
+        .await;
+    }
+    let Json(result) = answered
+        .map_err(|(status, message)| (status, kin_mcp::semantic_surface::diagnostic(&message)))?;
+    let mut response = Json(present_mcp_http_tool_result(result, &tool)).into_response();
+    if !session_held {
+        // The session this call named is not one the daemon holds, so the
+        // call was not recorded against it. A connection that opened that
+        // session reads this and opens a new one.
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-kin-session-status"),
+            axum::http::HeaderValue::from_static("unknown"),
+        );
+    }
+    Ok(response)
 }
 
 async fn mcp_tools_call_internal(
@@ -22489,8 +22635,20 @@ async fn mcp_tools_call_selected(
     }
 
     if request.name == "kin_transaction_commit" && result.is_error != Some(true) {
-        persist_coordination_event(
+        // The change this commit published, attributed to the session that owns
+        // the transaction: on the outcome event, on the agent's own record, and
+        // on the entity events the change produced.
+        let change_id = crate::agent_activity::committed_change_id(&result);
+        if let Some(change_id) = change_id.as_deref() {
+            crate::agent_activity::attribute_commit(
+                &state,
+                transaction_session_id.as_deref(),
+                change_id,
+            );
+        }
+        persist_coordination_event_with_change(
             &state,
+            change_id,
             CoordinationEventDraft {
                 event: "transaction_outcome",
                 outcome: "committed".to_string(),
@@ -25481,6 +25639,12 @@ async fn vfs_subscribe(State(state): State<Arc<DaemonState>>) -> impl IntoRespon
                         // stream stays byte-identical; the sequence is a graph
                         // consumer's concern and rides `/graph/events`.
                         Ok(sequenced) => {
+                            // Agent activity is not invalidation; the frames
+                            // this stream carries stay the ones its readers
+                            // were written against.
+                            if sequenced.event.is_activity() {
+                                continue;
+                            }
                             if let Ok(json) = serde_json::to_string(&sequenced.event) {
                                 yield Ok(format!("data: {json}\n\n"));
                             }
@@ -26596,6 +26760,25 @@ fn persist_coordination_event(
             format!("coordination event persistence failed; action is not claim-eligible: {error}"),
         )
     })
+}
+
+/// [`persist_coordination_event`] for a terminal event that names the change
+/// it published.
+fn persist_coordination_event_with_change(
+    state: &DaemonState,
+    change_id: Option<String>,
+    draft: CoordinationEventDraft,
+) -> Result<crate::state::CoordinationEventEnvelope, (StatusCode, String)> {
+    state
+        .record_coordination_event_with_change(draft, change_id)
+        .map_err(|error| {
+            (
+                StatusCode::INSUFFICIENT_STORAGE,
+                format!(
+                    "coordination event persistence failed; action is not claim-eligible: {error}"
+                ),
+            )
+        })
 }
 
 fn persist_coordination_reservation(
@@ -57030,6 +57213,7 @@ pub(crate) mod tests {
     include!("api/tests/mcp_lifecycle_persistence.rs");
     include!("api/tests/transaction_owner_revocation.rs");
     include!("api/tests/read_only_session_writes.rs");
+    include!("api/tests/agent_activity_routes.rs");
     include!("api/tests/hard_index_freshness.rs");
     include!("api/tests/graph_status_metadata_limits.rs");
     include!("api/tests/mcp_mutate_durability.rs");

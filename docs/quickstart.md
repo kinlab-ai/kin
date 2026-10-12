@@ -149,7 +149,7 @@ what Kin admitted, run `git config --global core.autocrlf false` and clone again
 A Homebrew tap tracks the same release channel:
 
 ```sh
-brew install firelock-ai/kin/kin
+brew install kinlab-ai/kin/kin
 ```
 
 The tap's formula is generated rather than hand-maintained. Its version and its
@@ -163,7 +163,7 @@ as you should on any install path.
 ### Manual archive
 
 For manual installation, each archive and its `.sha256` file is published under
-`https://github.com/firelock-ai/kin/releases/latest/download/`. The moving asset
+`https://github.com/kinlab-ai/kin/releases/latest/download/`. The moving asset
 names are `kin-macos-aarch64`, `kin-macos-x86_64`, `kin-linux-aarch64`,
 `kin-linux-x86_64`, and `kin-windows-x86_64`; use the `.tar.gz` suffix for the
 macOS and Linux archives and the `.zip` suffix for Windows, as shown on the

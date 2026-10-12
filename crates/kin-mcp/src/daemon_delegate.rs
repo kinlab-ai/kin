@@ -1286,21 +1286,127 @@ pub(crate) fn with_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBui
     }
 }
 
-/// Attach the session header (from explicit args or `KIN_SESSION_ID`) to a
-/// forwarded request so the daemon resolves the caller's session graph.
+/// The session a forwarded request names: the call's own `session_id`, else
+/// the one the launcher set in `KIN_SESSION_ID`, else the connection's own
+/// ([`with_connection_session`]).
+fn forwarded_session_id(arguments: &HashMap<String, serde_json::Value>) -> Option<String> {
+    if let Some(session_id) = optional_string(arguments, "session_id") {
+        return Some(session_id.to_string());
+    }
+    if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
+        if !session_id.trim().is_empty() {
+            return Some(session_id);
+        }
+    }
+    CONNECTION_SESSION
+        .try_with(|session| session.id.clone())
+        .ok()
+}
+
+/// Attach the session header to a forwarded request so the daemon resolves the
+/// caller's session graph and records the call against the agent that made it.
 fn with_session_header(
     request: reqwest::RequestBuilder,
     arguments: &HashMap<String, serde_json::Value>,
 ) -> reqwest::RequestBuilder {
-    if let Some(session_id) = optional_string(arguments, "session_id") {
-        return request.header("X-Kin-Session", session_id);
+    match forwarded_session_id(arguments) {
+        Some(session_id) => request.header("X-Kin-Session", session_id),
+        None => request,
     }
-    if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
-        if !session_id.trim().is_empty() {
-            return request.header("X-Kin-Session", session_id);
+}
+
+/// The response header a daemon sets when the session a tool call named is not
+/// one it holds: ended, reaped after its idle window, or lost to a restart.
+pub const SESSION_STATUS_HEADER: &str = "X-Kin-Session-Status";
+
+/// The connection's own session, as the calls of one `tools/call` carry it.
+#[derive(Debug, Clone)]
+pub struct ConnectionSessionTag {
+    id: String,
+    gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConnectionSessionTag {
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            gone: Default::default(),
         }
     }
-    request
+
+    /// Whether a daemon answered that it does not hold this session.
+    pub fn gone(&self) -> bool {
+        self.gone.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+tokio::task_local! {
+    static CONNECTION_SESSION: ConnectionSessionTag;
+}
+
+/// Run `call` with the connection's session on every request it forwards that
+/// names no session of its own and is not under a launcher's `KIN_SESSION_ID`.
+///
+/// The stdio server opens a session for its client when the client
+/// initializes, so the daemon can attribute even a connection that only reads,
+/// and wraps each call it forwards in this. A daemon that no longer holds the
+/// session says so, and [`ConnectionSessionTag::gone`] reports it afterwards.
+pub async fn with_connection_session<F: std::future::Future>(
+    session: Option<ConnectionSessionTag>,
+    call: F,
+) -> F::Output {
+    match session {
+        Some(session) => CONNECTION_SESSION.scope(session, call).await,
+        None => call.await,
+    }
+}
+
+/// Note that the daemon does not hold the session a call carried, when that
+/// session was the connection's own.
+fn note_session_status(
+    response: &reqwest::Response,
+    arguments: &HashMap<String, serde_json::Value>,
+) {
+    let unknown = response
+        .headers()
+        .get(SESSION_STATUS_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("unknown"));
+    if !unknown {
+        return;
+    }
+    let sent = forwarded_session_id(arguments);
+    let _ = CONNECTION_SESSION.try_with(|session| {
+        if sent.as_deref() == Some(session.id.as_str()) {
+            session
+                .gone
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    });
+}
+
+/// Name this process as the one a session lives with, so the daemon keeps the
+/// session for as long as the process runs. The connection's session is opened
+/// without one, so a connection that never does anything is reaped by the
+/// daemon's ordinary idle rule; its first write attaches the process.
+pub async fn attach_session_process(session_id: &str, pid: u32) -> Result<(), String> {
+    let Some(base) = resolved_daemon_base_url().await else {
+        return Err("no Kin daemon is serving this repository".to_string());
+    };
+    let body = serde_json::json!({ "pid": pid });
+    daemon_json_request("session process", &base, |client, base| {
+        with_auth(
+            client
+                .post(format!("{base}/session/{session_id}/process"))
+                .json(&body),
+        )
+    })
+    .await
+    .map(drop)
 }
 
 fn text_result_from_value(value: serde_json::Value) -> Result<ToolCallResult, String> {
@@ -1597,6 +1703,7 @@ impl DaemonCallSeam for RealDaemonSeam {
             .send()
             .await
             .map_err(|e| classify_send_error("MCP tool call", e))?;
+        note_session_status(&resp, args);
         if !resp.status().is_success() {
             return Err(daemon_http_error("MCP tool call", resp).await);
         }
@@ -7757,5 +7864,121 @@ mod tests {
                 assert!(!lowered.contains("entity not found"), "{message}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_session_tests {
+    use super::*;
+
+    fn header_sent(arguments: &HashMap<String, serde_json::Value>) -> Option<String> {
+        let request = with_session_header(
+            reqwest::Client::new().post("http://127.0.0.1:9/"),
+            arguments,
+        )
+        .build()
+        .unwrap();
+        request
+            .headers()
+            .get("X-Kin-Session")
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    fn launcher_session_set() -> bool {
+        std::env::var("KIN_SESSION_ID").is_ok_and(|id| !id.trim().is_empty())
+    }
+
+    /// Every call a connection forwards names its session, so the daemon can
+    /// record it against the agent; a call that names its own keeps it.
+    #[tokio::test]
+    async fn forwarded_calls_name_the_connections_session_unless_they_name_their_own() {
+        if launcher_session_set() {
+            // A launcher's session outranks the connection's, and this
+            // process was started under one.
+            return;
+        }
+        assert_eq!(header_sent(&HashMap::new()), None);
+        let own = HashMap::from([("session_id".to_string(), serde_json::json!("own"))]);
+        let tagged = with_connection_session(
+            Some(ConnectionSessionTag::new("connection".to_string())),
+            async { (header_sent(&HashMap::new()), header_sent(&own)) },
+        )
+        .await;
+        assert_eq!(
+            tagged,
+            (Some("connection".to_string()), Some("own".to_string()))
+        );
+        assert_eq!(
+            header_sent(&HashMap::new()),
+            None,
+            "the tag ends with the call"
+        );
+    }
+
+    /// A daemon that answers that it does not hold the connection's session
+    /// marks the tag, which is how the server knows to open a new one.
+    #[tokio::test]
+    async fn a_daemon_that_does_not_hold_the_session_is_heard() {
+        if launcher_session_set() {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let body = r#"{"content":[{"type":"text","text":"{}"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 x-kin-session-status: unknown\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        let tag = ConnectionSessionTag::new("stale-session".to_string());
+        let answered = with_connection_session(Some(tag.clone()), async {
+            RealDaemonSeam
+                .call_tool(
+                    &format!("http://127.0.0.1:{port}"),
+                    "semantic_locate",
+                    &HashMap::new(),
+                    Duration::from_secs(5),
+                )
+                .await
+        })
+        .await;
+        assert!(matches!(answered, Ok(Some(_))), "{answered:?}");
+        let request = request_rx.await.unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains("x-kin-session: stale-session"),
+            "{request}"
+        );
+        assert!(tag.gone(), "the daemon said it does not hold the session");
+        server.abort();
     }
 }

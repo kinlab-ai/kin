@@ -7,7 +7,7 @@ change might affect, from the same record you inspect with the kin CLI.
 ## Install
 
 ```
-/plugin marketplace add firelock-ai/kin
+/plugin marketplace add kinlab-ai/kin
 /plugin install kin@kin
 ```
 
@@ -29,7 +29,7 @@ Kin answers from a graph, so a repository has to be admitted first. Run `kin ini
 repository, or set `KIN_MCP_AUTO_INIT=1` to let the server do it. Then run `kin embed` to
 build the vector index that `locate` ranks against. The structural tools work as
 soon as admission finishes. The `kin-setup` skill covers this end to end, and
-[llms-install.md](https://github.com/firelock-ai/kin/blob/main/llms-install.md) is the
+[llms-install.md](https://github.com/kinlab-ai/kin/blob/main/llms-install.md) is the
 unattended version.
 
 Every response names the graph state that produced it, and an empty result says whether the
@@ -44,8 +44,8 @@ and review workflows are not yet tested there.
 
 ## Links
 
-- Repository: https://github.com/firelock-ai/kin
-- Tool reference: https://github.com/firelock-ai/kin/blob/main/docs/mcp-tools.md
+- Repository: https://github.com/kinlab-ai/kin
+- Tool reference: https://github.com/kinlab-ai/kin/blob/main/docs/mcp-tools.md
 - Home: https://kinlab.ai
 
 Apache-2.0.

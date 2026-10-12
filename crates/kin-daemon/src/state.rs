@@ -1392,6 +1392,10 @@ pub struct CoordinationEventEnvelope {
     pub intent_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_id: Option<String>,
+    /// The change a committed transaction published. Set only on a
+    /// `transaction_outcome` whose outcome is `committed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
     pub enforcement_mode: String,
@@ -1518,9 +1522,12 @@ impl CoordinationEventLog {
         Ok(log)
     }
 
+    /// Append one event. `change_id` names the change a committed
+    /// transaction published, and is `None` for every other event.
     pub fn append(
         &self,
         draft: CoordinationEventDraft,
+        change_id: Option<String>,
     ) -> std::io::Result<CoordinationEventEnvelope> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(std::io::Error::other(
@@ -1557,6 +1564,7 @@ impl CoordinationEventLog {
             intent_id: draft.intent_id,
             intent_ids,
             transaction_id: draft.transaction_id,
+            change_id,
             scopes,
             enforcement_mode: draft.enforcement_mode,
             blocking_intent_ids,
@@ -1891,6 +1899,36 @@ pub enum DaemonEvent {
         relations_added: usize,
         relations_removed: usize,
     },
+    /// An agent session's tool call finished. Activity, not graph state.
+    ///
+    /// One entry of the session's call log ([`crate::agent_activity`]), with
+    /// no query text, arguments or answer and nothing path-shaped. Bounded on
+    /// the bus: at most one per session per
+    /// [`crate::agent_activity::TOOL_CALL_EVENT_MIN_INTERVAL`] and at most
+    /// [`crate::agent_activity::TOOL_CALL_EVENTS_PER_SECOND`] across all
+    /// sessions per second. A call that fell inside either bound is folded
+    /// into its session's next event, which carries the newest call and how
+    /// many it stands for in `coalesced`.
+    ///
+    /// `call_seq` rather than `seq`, because `/graph/events` stamps every
+    /// frame's stream position as `seq`. Opt-in: `/graph/events` delivers it
+    /// only to a subscriber whose `types` names it, and `/vfs/subscribe`
+    /// never does.
+    ToolCall {
+        session_id: String,
+        call_seq: u64,
+        at: kin_model::Timestamp,
+        tool: String,
+        entity_ids: Vec<EntityId>,
+        result_count: usize,
+        bytes: usize,
+        duration_ms: u64,
+        is_error: bool,
+        /// The repository a repo-scoped call named; absent for this daemon's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_id: Option<String>,
+        coalesced: u32,
+    },
 }
 
 impl DaemonEvent {
@@ -1908,7 +1946,15 @@ impl DaemonEvent {
             Self::RepositoryAuthorityChanged { .. } => "RepositoryAuthorityChanged",
             Self::Coordination { .. } => "Coordination",
             Self::GraphDeltaApplied { .. } => "GraphDeltaApplied",
+            Self::ToolCall { .. } => "ToolCall",
         }
+    }
+
+    /// Whether this event reports what an agent did rather than what the
+    /// graph is. Such an event reaches only a subscriber that asked for it by
+    /// type, so a consumer drawing the graph is never woken by agent traffic.
+    pub const fn is_activity(&self) -> bool {
+        matches!(self, Self::ToolCall { .. })
     }
 }
 
@@ -5864,7 +5910,17 @@ impl DaemonState {
         &self,
         draft: CoordinationEventDraft,
     ) -> std::io::Result<CoordinationEventEnvelope> {
-        match self.coordination_events.append(draft) {
+        self.record_coordination_event_with_change(draft, None)
+    }
+
+    /// [`DaemonState::record_coordination_event`] for a terminal event that
+    /// names the change it published.
+    pub(crate) fn record_coordination_event_with_change(
+        &self,
+        draft: CoordinationEventDraft,
+        change_id: Option<String>,
+    ) -> std::io::Result<CoordinationEventEnvelope> {
+        match self.coordination_events.append(draft, change_id) {
             Ok(event) => {
                 self.emit_event(DaemonEvent::Coordination {
                     event: event.clone(),
@@ -19639,17 +19695,20 @@ mod tests {
         std::fs::create_dir_all(layout.root()).unwrap();
         let log = CoordinationEventLog::open(&layout, "test-repo").expect("open coordination log");
         let first = log
-            .append(CoordinationEventDraft {
-                event: "intent_registration",
-                outcome: "registered".to_string(),
-                session_id: Some("session-1".to_string()),
-                intent_id: Some("intent-1".to_string()),
-                intent_ids: vec!["intent-1".to_string()],
-                transaction_id: None,
-                scopes: vec!["entity:e1".to_string()],
-                enforcement_mode: "warn".to_string(),
-                blocking_intent_ids: vec![],
-            })
+            .append(
+                CoordinationEventDraft {
+                    event: "intent_registration",
+                    outcome: "registered".to_string(),
+                    session_id: Some("session-1".to_string()),
+                    intent_id: Some("intent-1".to_string()),
+                    intent_ids: vec!["intent-1".to_string()],
+                    transaction_id: None,
+                    scopes: vec!["entity:e1".to_string()],
+                    enforcement_mode: "warn".to_string(),
+                    blocking_intent_ids: vec![],
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(first.sequence, 1);
         assert_eq!(first.schema, "kin.coordination-event.v1");
@@ -19657,17 +19716,20 @@ mod tests {
         let reopened =
             CoordinationEventLog::open(&layout, "test-repo").expect("reopen coordination log");
         let second = reopened
-            .append(CoordinationEventDraft {
-                event: "transaction_outcome",
-                outcome: "committed".to_string(),
-                session_id: Some("session-1".to_string()),
-                intent_id: None,
-                intent_ids: Vec::new(),
-                transaction_id: Some("tx-1".to_string()),
-                scopes: vec!["artifact:src/lib.rs".to_string()],
-                enforcement_mode: "enforce".to_string(),
-                blocking_intent_ids: vec![],
-            })
+            .append(
+                CoordinationEventDraft {
+                    event: "transaction_outcome",
+                    outcome: "committed".to_string(),
+                    session_id: Some("session-1".to_string()),
+                    intent_id: None,
+                    intent_ids: Vec::new(),
+                    transaction_id: Some("tx-1".to_string()),
+                    scopes: vec!["artifact:src/lib.rs".to_string()],
+                    enforcement_mode: "enforce".to_string(),
+                    blocking_intent_ids: vec![],
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(second.sequence, 2);
 
@@ -19690,17 +19752,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().join(".kin"));
         let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
-        log.append(CoordinationEventDraft {
-            event: "intent_registration",
-            outcome: "registered".to_string(),
-            session_id: Some("session-1".to_string()),
-            intent_id: Some("intent-1".to_string()),
-            intent_ids: vec!["intent-1".to_string()],
-            transaction_id: None,
-            scopes: vec!["entity:e1".to_string()],
-            enforcement_mode: "warn".to_string(),
-            blocking_intent_ids: Vec::new(),
-        })
+        log.append(
+            CoordinationEventDraft {
+                event: "intent_registration",
+                outcome: "registered".to_string(),
+                session_id: Some("session-1".to_string()),
+                intent_id: Some("intent-1".to_string()),
+                intent_ids: vec!["intent-1".to_string()],
+                transaction_id: None,
+                scopes: vec!["entity:e1".to_string()],
+                enforcement_mode: "warn".to_string(),
+                blocking_intent_ids: Vec::new(),
+            },
+            None,
+        )
         .unwrap();
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -19713,17 +19778,20 @@ mod tests {
         let reopened = CoordinationEventLog::open(&layout, "test-repo").unwrap();
         assert_eq!(reopened.persisted_failure_count(), 1);
         let next = reopened
-            .append(CoordinationEventDraft {
-                event: "transaction_outcome",
-                outcome: "committed".to_string(),
-                session_id: Some("session-1".to_string()),
-                intent_id: None,
-                intent_ids: Vec::new(),
-                transaction_id: Some("tx-1".to_string()),
-                scopes: vec!["entity:e1".to_string()],
-                enforcement_mode: "warn".to_string(),
-                blocking_intent_ids: Vec::new(),
-            })
+            .append(
+                CoordinationEventDraft {
+                    event: "transaction_outcome",
+                    outcome: "committed".to_string(),
+                    session_id: Some("session-1".to_string()),
+                    intent_id: None,
+                    intent_ids: Vec::new(),
+                    transaction_id: Some("tx-1".to_string()),
+                    scopes: vec!["entity:e1".to_string()],
+                    enforcement_mode: "warn".to_string(),
+                    blocking_intent_ids: Vec::new(),
+                },
+                None,
+            )
             .unwrap();
         assert_eq!(next.sequence, 2);
         let records = std::fs::read_to_string(reopened.path()).unwrap();
@@ -19738,17 +19806,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().join(".kin"));
         let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
-        log.append(CoordinationEventDraft {
-            event: "intent_release",
-            outcome: "pending:released".to_string(),
-            session_id: Some("session-1".to_string()),
-            intent_id: Some("intent-1".to_string()),
-            intent_ids: vec!["intent-1".to_string()],
-            transaction_id: None,
-            scopes: vec!["entity:e1".to_string()],
-            enforcement_mode: "enforce".to_string(),
-            blocking_intent_ids: Vec::new(),
-        })
+        log.append(
+            CoordinationEventDraft {
+                event: "intent_release",
+                outcome: "pending:released".to_string(),
+                session_id: Some("session-1".to_string()),
+                intent_id: Some("intent-1".to_string()),
+                intent_ids: vec!["intent-1".to_string()],
+                transaction_id: None,
+                scopes: vec!["entity:e1".to_string()],
+                enforcement_mode: "enforce".to_string(),
+                blocking_intent_ids: Vec::new(),
+            },
+            None,
+        )
         .unwrap();
         drop(log);
 
@@ -19761,17 +19832,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().join(".kin"));
         let log = CoordinationEventLog::open(&layout, "test-repo").unwrap();
-        log.append(CoordinationEventDraft {
-            event: "transaction_outcome",
-            outcome: "committed".to_string(),
-            session_id: Some("session-1".to_string()),
-            intent_id: None,
-            intent_ids: Vec::new(),
-            transaction_id: Some("tx-1".to_string()),
-            scopes: vec!["entity:e1".to_string()],
-            enforcement_mode: "enforce".to_string(),
-            blocking_intent_ids: Vec::new(),
-        })
+        log.append(
+            CoordinationEventDraft {
+                event: "transaction_outcome",
+                outcome: "committed".to_string(),
+                session_id: Some("session-1".to_string()),
+                intent_id: None,
+                intent_ids: Vec::new(),
+                transaction_id: Some("tx-1".to_string()),
+                scopes: vec!["entity:e1".to_string()],
+                enforcement_mode: "enforce".to_string(),
+                blocking_intent_ids: Vec::new(),
+            },
+            None,
+        )
         .unwrap();
         let existing = std::fs::read(log.path()).unwrap();
         let mut file = std::fs::OpenOptions::new()

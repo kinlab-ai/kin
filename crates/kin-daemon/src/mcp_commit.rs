@@ -4547,6 +4547,30 @@ pub(crate) mod tests {
         entity_name: &str,
         link: bool,
     ) -> (Entity, SemanticChangeId) {
+        let change = install_and_commit_source(state, file, content, link);
+        let entity = state
+            .graph
+            .query_entities(&EntityFilter {
+                name_pattern: Some(entity_name.to_string()),
+                file_path: Some(FilePathId::new(file)),
+                ..EntityFilter::default()
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.name == entity_name)
+            .max_by_key(|entity| entity.kind != kin_model::EntityKind::Module)
+            .expect("source fixture must contain requested entity");
+        (entity, change)
+    }
+
+    /// Admit, derive and commit one source, as the fixtures above do, whether
+    /// or not it declares anything.
+    fn install_and_commit_source(
+        state: &Arc<DaemonState>,
+        file: &str,
+        content: &[u8],
+        link: bool,
+    ) -> SemanticChangeId {
         let file_id = FilePathId::new(file);
         let blob_hash = state.blobs.write(content).unwrap();
         let source_hash = Hash256::from_bytes(blob_hash.0);
@@ -4585,18 +4609,6 @@ pub(crate) mod tests {
             .cloned()
             .expect("source reconcile must produce an exact layout");
         state.graph.upsert_file_layout(&layout).unwrap();
-        let entity = state
-            .graph
-            .query_entities(&EntityFilter {
-                name_pattern: Some(entity_name.to_string()),
-                file_path: Some(file_id),
-                ..EntityFilter::default()
-            })
-            .unwrap()
-            .into_iter()
-            .filter(|entity| entity.name == entity_name)
-            .max_by_key(|entity| entity.kind != kin_model::EntityKind::Module)
-            .expect("source fixture must contain requested entity");
 
         let plan = crate::repository_commit::plan_native_commit(
             state.graph.as_ref(),
@@ -4617,7 +4629,7 @@ pub(crate) mod tests {
         state
             .record_repository_authority_commit(committed.receipt.generation)
             .unwrap();
-        (entity, committed.change.id)
+        committed.change.id
     }
 
     fn commit_live_graph(
@@ -5573,6 +5585,69 @@ pub(crate) mod tests {
         assert!(
             reply["change_id"].as_str().is_some_and(|id| !id.is_empty()),
             "the commit must publish a change an agent can review: {reply}"
+        );
+    }
+
+    /// An agent creating source beside a module that declares nothing. The
+    /// planner reconciles the new source in a graph built from repository
+    /// authority, which stores no derived layouts, so that module stays local on
+    /// its checked parse rather than refusing the commit for a missing layout.
+    #[test]
+    fn created_source_commits_beside_a_module_that_declares_nothing() {
+        let (_dir, state) = test_state();
+        install_and_commit_source(
+            &state,
+            "web/quiet.js",
+            b"// nothing is declared in this module\n",
+            false,
+        );
+        let base = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            base.graph
+                .get_file_layout(&FilePathId::new("web/quiet.js"))
+                .unwrap()
+                .is_none(),
+            "the premise: repository authority holds no derived layout"
+        );
+
+        let sessions = test_sessions();
+        let transaction = sessions
+            .begin_transaction(TEST_SESSION, "file:pkg/util.py")
+            .unwrap();
+        sessions
+            .stage_transaction(
+                &transaction.transaction_id,
+                vec![new_source_file("pkg/util.py", NEW_UTIL_PY)],
+            )
+            .unwrap();
+        let result = commit_conversion_fixture(
+            &state,
+            &sessions,
+            &HashMap::from([(
+                "transaction_id".to_string(),
+                serde_json::json!(transaction.transaction_id),
+            )]),
+            None,
+        );
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "creating source beside a module that declares nothing failed: {}",
+            result_text(&result)
+        );
+        let after = load_native_commit_base(&state.layout).unwrap();
+        assert!(
+            after
+                .graph
+                .query_entities(&EntityFilter {
+                    name_pattern: Some("helper".to_string()),
+                    file_path: Some(FilePathId::new("pkg/util.py")),
+                    ..EntityFilter::default()
+                })
+                .unwrap()
+                .iter()
+                .any(|entity| entity.name == "helper"),
+            "the created source's declaration must be a graph entity"
         );
     }
 

@@ -16,7 +16,7 @@ include_verbatim = true
 exclude = [
   "^https://img\\.shields\\.io/",
   "^http://localhost:1234/v1$",
-  "^https://github\\.com/firelock-ai/kin/releases/latest/download/$",
-  "^https://github\\.com/firelock-ai/kin/issues/new/choose$",
+  "^https://github\\.com/kinlab-ai/kin/releases/latest/download/$",
+  "^https://github\\.com/kinlab-ai/kin/issues/new/choose$",
   "^cursor://"
 ]

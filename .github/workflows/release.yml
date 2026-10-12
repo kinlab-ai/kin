@@ -46,7 +46,8 @@ jobs:
   # stops instead.
   #
   # Every other job reaches `config`, and `config` needs this one, so a
-  # `duplicate=true` verdict skips the whole release. The jobs guarded by
+  # `duplicate=true` verdict skips the whole release. locate_rc_build, which
+  # only reads, needs this job directly and carries the same condition. The jobs guarded by
   # `always()` skip with it, because each also requires a named dependency's
   # result to equal 'success' and a skipped dependency's result is 'skipped'.
   duplicate_guard:
@@ -84,8 +85,8 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
   # Resolve a single effective "notarize on Linux" flag for the whole run. The
-  # macOS legs still build + codesign natively; only the Apple Notary submission
-  # moves to a 1x Linux runner (macOS minutes bill 10x) when this is on.
+  # macOS legs still codesign natively; only the Apple Notary submission moves
+  # to a Linux runner when this is on.
   #
   # The repository variable NOTARIZE_ON_LINUX is the cutover switch. Manual
   # dispatch is intentionally disabled: a dispatch can target branch-controlled
@@ -163,30 +164,56 @@ jobs:
               "$version" "$current_version" "GitHub Latest"
           fi
 
-  # Publish the daemon image from the same externally-authorized tag workflow
-  # as every other release surface. Main pushes and manual dispatches never get
-  # package-write authority. The commit tag is an immutable staging identity;
-  # version_tag_image promotes that exact digest only after public install proof.
-  build_daemon_image:
-    name: Build immutable daemon image
-    needs: config
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+  # Find the one RC Build run this tag ships the bytes of.
+  #
+  # release.yml compiles nothing. RC Build (.github/workflows/rc-build.yml)
+  # built the five archives and the daemon image for this exact commit, either
+  # in the merge group that landed it on main or in Release Cut's candidate
+  # dispatch, installed every archive, smoke-tested the image and attested all
+  # of it. scripts/locate-rc-build.mjs reads the preflight record published for
+  # this commit, judges it with the mint's own reader, and admits a run only
+  # when it is rc-build.yml on this repository, head_sha this tag's peeled
+  # commit, concluded success, produced by the merge queue for main or by the
+  # release automation's dispatch on release/v<version>-candidate, and still
+  # holds every artifact. The merge-group run wins over a fallback dispatch.
+  # None is a missing run and two from one producer are ambiguous; both
+  # refuse. Every archive a preflight leg judged must then match its sha256.
+  #
+  # API reads only, so it is seconds rather than a serial download in front of
+  # the jobs below, and it runs beside `config` rather than after it. The
+  # duplicate verdict still stops it, and every job that uses its answer also
+  # needs `config`. Each of those downloads only what it ships and proves those
+  # bytes itself: the exact file set, the sha256 the preflight judged, the
+  # record RC Build wrote, and an attestation signed by this very run.
+  #
+  # WHY THIS IS SAFE. The preflight judged exactly these bytes. Before this
+  # change the Linux and Windows archives a user installed were a second build
+  # of the same commit, made here at the tag, that no preflight had judged, and
+  # a compile that failed here stranded a tag that no later commit could repair.
+  locate_rc_build:
+    name: Locate the RC Build for this tag
+    needs: duplicate_guard
+    if: needs.duplicate_guard.outputs.duplicate != 'true'
     runs-on: ubuntu-latest
-    environment: release
+    timeout-minutes: 10
     permissions:
       contents: read
-      packages: write
+      actions: read
     outputs:
-      digest: ${{ steps.publish.outputs.digest }}
+      run_id: ${{ steps.select.outputs.run_id }}
+      run_attempt: ${{ steps.select.outputs.run_attempt }}
+      event: ${{ steps.select.outputs.event }}
+      head_branch: ${{ steps.select.outputs.head_branch }}
+      preflight: ${{ steps.select.outputs.preflight }}
       commit: ${{ steps.source.outputs.commit }}
+      version: ${{ steps.source.outputs.version }}
     steps:
       - name: Checkout release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-          fetch-depth: 0
 
-      - name: Resolve release commit
+      - name: Resolve the peeled release commit
         id: source
         shell: bash
         run: |
@@ -198,6 +225,90 @@ jobs:
             exit 1
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Select the RC Build run that produced this commit's bytes
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/locate-rc-build.mjs select \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$COMMIT" \
+            --version "$VERSION" \
+            --github-output "$GITHUB_OUTPUT" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+  # Push the daemon image RC Build built and smoke-tested, unchanged. The image
+  # is an OCI layout archive, so `skopeo copy --preserve-digests` serves exactly
+  # the manifest digest RC Build recorded; a push that would change it fails.
+  # Package write stays here, on the externally-authorized tag workflow: main
+  # pushes, merge groups and manual dispatches never get it. The commit tag is
+  # an immutable staging identity; version_tag_image promotes that exact digest
+  # only after public install proof.
+  publish_daemon_image:
+    name: Publish the RC Build daemon image
+    needs: [config, locate_rc_build]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      commit: ${{ needs.locate_rc_build.outputs.commit }}
+    env:
+      RELEASE_COMMIT: ${{ needs.locate_rc_build.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.locate_rc_build.outputs.version }}
+      RC_RUN_ID: ${{ needs.locate_rc_build.outputs.run_id }}
+      RC_RUN_ATTEMPT: ${{ needs.locate_rc_build.outputs.run_attempt }}
+      RC_HEAD_BRANCH: ${{ needs.locate_rc_build.outputs.head_branch }}
+      RC_PREFLIGHT: ${{ needs.locate_rc_build.outputs.preflight }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Download the RC Build image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: kin-daemon-image
+          run-id: ${{ needs.locate_rc_build.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/rc
+
+      - name: Verify the image is the one RC Build built, smoke-tested and attested
+        id: rc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          node scripts/locate-rc-build.mjs verify-artifact \
+            --artifact kin-daemon-image \
+            --dir "$RUNNER_TEMP/rc" \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$RELEASE_COMMIT" \
+            --version "$RELEASE_VERSION" \
+            --run-id "$RC_RUN_ID" \
+            --run-attempt "$RC_RUN_ATTEMPT" \
+            --preflight "$RC_PREFLIGHT"
+          node scripts/locate-rc-build.mjs verify-attestation \
+            --file "$RUNNER_TEMP/rc/kin-daemon-image.oci.tar" \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$RELEASE_COMMIT" \
+            --source-ref "refs/heads/${RC_HEAD_BRANCH}" \
+            --run-id "$RC_RUN_ID"
+          digest="$(jq -er .manifest_digest "$RUNNER_TEMP/rc/kin-daemon-image.json")"
+          echo "manifest_digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.0.0
@@ -206,27 +317,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Same mirror-first base image resolution the pull-request build uses. The
-      # shipped image is built here, so the registry serving its base layers is
-      # part of the release path: mirror first, canonical registry on failure,
-      # and the Dockerfile pins both bases by digest so neither door can serve
-      # different bytes.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-        with:
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
 
-      - name: Publish or verify immutable commit image
+      - name: Push or verify the immutable commit image
         id: publish
         shell: bash
         env:
-          COMMIT: ${{ steps.source.outputs.commit }}
+          COMMIT: ${{ needs.locate_rc_build.outputs.commit }}
+          EXPECTED_DIGEST: ${{ steps.rc.outputs.manifest_digest }}
           IMAGE: ghcr.io/kinlab-ai/kin
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           source_image="${IMAGE}:${COMMIT}"
+          archive="$RUNNER_TEMP/rc/kin-daemon-image.oci.tar"
+          if ! printf '%s\n' "$EXPECTED_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::RC Build recorded no manifest digest for the image"
+            exit 1
+          fi
 
           inspect_digest() {
             local reference="$1"
@@ -250,31 +359,18 @@ jobs:
           }
 
           if digest="$(inspect_digest "$source_image")"; then
-            # A rerun never overwrites the commit identity. Verify the exact
-            # existing digest carries this checkout's source and lock metadata.
-            bash scripts/verify-container-build-info.sh \
-              "${IMAGE}@${digest}" "$COMMIT"
+            # A rerun never overwrites the commit identity, and an identity
+            # that names other bytes than RC Build's is refused, not replaced.
+            if [ "$digest" != "$EXPECTED_DIGEST" ]; then
+              echo "::error::$source_image already names $digest, not RC Build's $EXPECTED_DIGEST; refusing to overwrite it"
+              exit 1
+            fi
             action="Verified existing"
           else
             inspect_status=$?
             if [ "$inspect_status" -ne 44 ]; then
               exit "$inspect_status"
             fi
-
-            docker buildx build \
-              --file Dockerfile \
-              --load \
-              --platform linux/amd64 \
-              --provenance=false \
-              --build-arg "KIN_BUILD_GIT_SHA=${COMMIT}" \
-              --build-arg KIN_BUILD_DIRTY=false \
-              --build-arg "KIN_BUILD_BRANCH=${GITHUB_REF_NAME}" \
-              --cache-from type=gha \
-              --cache-to type=gha,mode=max \
-              --tag "$source_image" \
-              .
-            bash scripts/verify-container-build-info.sh "$source_image" "$COMMIT"
-
             # Release concurrency serializes writers. Recheck immediately before
             # the first write so a surprising pre-existing tag fails closed.
             if existing="$(inspect_digest "$source_image")"; then
@@ -286,42 +382,41 @@ jobs:
                 exit "$inspect_status"
               fi
             fi
-
-            docker push "$source_image"
+            printf '%s' "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+            skopeo copy --preserve-digests "oci-archive:${archive}" "docker://${source_image}"
             digest="$(inspect_digest "$source_image")"
-            bash scripts/verify-container-build-info.sh \
-              "${IMAGE}@${digest}" "$COMMIT"
-            action="Published"
-          fi
-
-          case "$digest" in
-            sha256:*) ;;
-            *)
-              echo "::error::could not resolve an immutable digest for $source_image"
+            if [ "$digest" != "$EXPECTED_DIGEST" ]; then
+              echo "::error::$source_image was pushed as $digest, not RC Build's $EXPECTED_DIGEST"
               exit 1
-              ;;
-          esac
+            fi
+            action="Pushed"
+          fi
+          bash scripts/verify-container-build-info.sh "${IMAGE}@${digest}" "$COMMIT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
-            echo "${action} immutable release image:"
+            echo "${action} the RC Build daemon image:"
             echo ""
             echo "- source: \`${source_image}\`"
             echo "- digest: \`${digest}\`"
+            echo "- RC Build run: ${RC_RUN_ID}"
             echo "- no mutable latest tag was written"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Attestation is intentionally separate from the image build. It may only
-  # inspect the immutable commit tag emitted above, and cannot rebuild or move
-  # it. This keeps OIDC/attestation authority out of the build job while still
-  # blocking every public release surface if exact OCI provenance is absent.
+  # Attestation is intentionally separate from the push. It may only inspect
+  # the immutable commit tag emitted above, and cannot rebuild or move it. This
+  # keeps OIDC/attestation authority out of the job holding package write while
+  # still blocking every public release surface if exact OCI provenance is
+  # absent. RC Build attested the archive these bytes came from; this attests
+  # the pushed digest under release.yml's own identity, which every later GHCR
+  # step and the public install proof verify.
   attest_daemon_image:
     name: Attest immutable daemon image
-    needs: [config, build_daemon_image]
+    needs: [config, publish_daemon_image]
     if: >-
       ${{
         always() &&
         needs.config.result == 'success' &&
-        needs.build_daemon_image.result == 'success' &&
+        needs.publish_daemon_image.result == 'success' &&
         startsWith(github.ref, 'refs/tags/v')
       }}
     runs-on: ubuntu-latest
@@ -342,7 +437,7 @@ jobs:
         id: source
         shell: bash
         env:
-          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
+          EXPECTED_COMMIT: ${{ needs.publish_daemon_image.outputs.commit }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
@@ -372,7 +467,7 @@ jobs:
         shell: bash
         env:
           COMMIT: ${{ steps.source.outputs.commit }}
-          EXPECTED_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+          EXPECTED_DIGEST: ${{ needs.publish_daemon_image.outputs.digest }}
           IMAGE: ghcr.io/kinlab-ai/kin
         run: |
           set -euo pipefail
@@ -384,7 +479,7 @@ jobs:
             exit 1
           fi
           if [ "$digest" != "$EXPECTED_DIGEST" ]; then
-            echo "::error::$reference moved from release-built $EXPECTED_DIGEST to $digest"
+            echo "::error::$reference moved from the pushed $EXPECTED_DIGEST to $digest"
             exit 1
           fi
           bash scripts/verify-container-build-info.sh \
@@ -432,104 +527,40 @@ jobs:
             exit 1
           fi
 
-  build:
-    name: Build (${{ matrix.artifact }})
-    needs: config
+  # Ship the Linux and Windows archives exactly as RC Build made them. Each leg
+  # runs on the hardware its archive targets, downloads only that archive from
+  # the located run, proves it is the bytes the preflight judged and RC Build
+  # attested, executes both binaries again, and writes the release's provenance
+  # manifest beside the unchanged archive.
+  ship_rc_archives:
+    name: Ship RC archive (${{ matrix.artifact }})
+    needs: [config, locate_rc_build]
     runs-on: ${{ matrix.os }}
-    # rc-build.yml bounds the identical compile at 90, and this job had no bound
-    # at all, so it inherited the 360-minute default while holding
-    # `kin-release-promotion` with cancel-in-progress: false. A hung leg could
-    # block every release-channel mutation for six hours. This bounds execution
-    # rather than queue time, so it is not a runner-label safety net; it is the
-    # ceiling on a build that stops making progress. The macOS arm64 leg reached
-    # the old 90-minute bound on both 0.8.2 candidate attempts with its two
-    # links resident at once, and now links them one at a time (see "Build
-    # kin-cli + kin-daemon (native)"). Measured that way on the standard runner
-    # (rc-build run 38238857203) its build step took 77 minutes and the macOS
-    # x86_64 leg's about as long, which left too little margin for a slow
-    # runner day, so the bound is 120. rc-build.yml carries the same bound.
-    timeout-minutes: 120
-    environment: release
-    # Every advertised platform is release-blocking. A public release must not
-    # be created without one of the archives consumed by the installers.
-    # Signing credentials are deliberately step-scoped below. The untrusted
-    # Cargo build matrix never receives Apple secrets or a write-scoped token.
-    # Tagged releases fail closed when any required credential is absent.
-    #
-    # There is no Cargo cache step, and adding one back is a change to what the
-    # shipped bytes are made of rather than a speed tweak. The step that used to
-    # sit before "Assert clean release source" cached ~/.cargo and both target
-    # directories and never restored once. GitHub scopes a cache entry to the
-    # ref that wrote it, this workflow runs only on a v* tag, so every tag wrote
-    # into a scope no later tag could read. Measured on v0.5.41: the exact key
-    # and the prefix restore-key both missed and the step saved anyway, roughly
-    # 1.4 GB per release out of the repository's 10 GB budget, evicting the CI
-    # entries that do restore.
-    #
-    # A cache that did restore would be worse than the dead one. target/ holds
-    # linked objects that go straight into the published binary, "Assert clean
-    # release source" cannot see them because target/ is gitignored, and
-    # "Verify native release build provenance" runs the binary and matches an
-    # embedded commit sha, which a poisoned object still reports correctly. So
-    # a working restore would put unreviewed bytes in a released artifact for
-    # the first time, with no guard able to fail. A release compiles cold.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
     env:
-      # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
-      # zip, and the separate notarize_linux job submits it to Apple Notary via
-      # rcodesign. When false (default), the macOS leg notarizes inline with
-      # xcrun notarytool, the proven fallback path.
-      NOTARIZE_ON_LINUX: ${{ needs.config.outputs.notarize_on_linux }}
+      RELEASE_COMMIT: ${{ needs.locate_rc_build.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.locate_rc_build.outputs.version }}
+      RC_RUN_ID: ${{ needs.locate_rc_build.outputs.run_id }}
+      RC_RUN_ATTEMPT: ${{ needs.locate_rc_build.outputs.run_attempt }}
+      RC_HEAD_BRANCH: ${{ needs.locate_rc_build.outputs.head_branch }}
+      RC_PREFLIGHT: ${{ needs.locate_rc_build.outputs.preflight }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux runtime binaries (kin, kin-daemon) target musl and link static
-          # by default, so a single artifact runs on musl (Alpine) and glibc
-          # (Ubuntu/Debian/RHEL) systems without an OpenSSL or glibc dependency.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: kin-linux-x86_64
-            cross: false
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: kin-linux-aarch64
-            cross: false
-          # Use an Intel host so this archive is executed before packaging;
-          # building x86_64 on an arm64 runner would leave it unproven.
-          #
-          # Keep this on the standard Intel pool. A tag freezes this workflow,
-          # so a paid or custom label whose budget stops assigning runners can
-          # strand an immutable release. The release authority suite pins the
-          # standard-runner boundary and falsifies the paid-runner regression.
-          #
-          # Cross-compiling x86_64 from the faster Apple Silicon host was the
-          # other candidate and is refused, on provenance rather than on
-          # signing. codesign and notarytool never execute the binary, so both
-          # work fine on a cross-built artifact. "Verify native release build
-          # provenance" does execute it, and its `case "$RUNNER_ARCH:$TARGET"`
-          # declines a cross-architecture artifact and returns before writing
-          # kin-build-meta.json, which "Generate artifact provenance manifest"
-          # then reads unconditionally. Making that path work means either
-          # running the x86_64 binary under Rosetta on the arm64 host, which the
-          # macos-15-arm64 runner image does not list among its software, or
-          # dropping the execution proof for a shipped archive: the version-line
-          # commit match, the dirty refusal, the embedded Cargo.lock provenance,
-          # and the vector/embeddings/metal feature assertions all stop running.
-          # Staying on Intel keeps RUNNER_ARCH X64, so that guard's X64:x86_64-*
-          # arm still matches and nothing else in the job moves.
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: kin-macos-x86_64
-            cross: false
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: kin-macos-aarch64
-            cross: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
-            cross: false
-
     steps:
       - name: Preserve tracked bytes on Windows
         if: runner.os == 'Windows'
@@ -540,30 +571,6 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
-      - name: Install Rust stable
-        uses: ./.github/actions/rust-toolchain
-        with:
-          targets: ${{ matrix.target }}
-
-      # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
-      # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
-      # musl legs require it.
-      #
-      # Bounded through the shared helper rather than called directly. A bare
-      # `apt-get update && apt-get install` has no ceiling below the job
-      # timeout: the hosted mirrorlist puts azure.archive.ubuntu.com first and a
-      # stall there trickles bytes slowly enough that no per-fetch timeout
-      # fires. The helper bounds each call, retries three times, and fails over
-      # to archive.ubuntu.com from the second attempt, so a stalled mirror ends
-      # the step with its own error line instead of holding a release build.
-      - name: Install musl C toolchain (Linux musl)
-        if: ${{ contains(matrix.target, '-linux-musl') }}
-        run: ./scripts/ci-apt-install.sh musl-tools
-
-      - name: Install cross (ARM64)
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Verify canonical release input bytes
         shell: bash
@@ -590,320 +597,270 @@ jobs:
           console.log(`Verified canonical Kin Cargo.lock bytes: ${sha256(tracked)}`);
           NODE
 
-      - name: Assert clean release source
+      - name: Download the RC archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          run-id: ${{ needs.locate_rc_build.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/rc
+
+      - name: Verify the archive is the one the preflight judged and RC Build attested
         shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          dirty="$(git status --porcelain --untracked-files=all)"
-          if [ -n "$dirty" ]; then
-            printf '%s\n' "$dirty" >&2
-            echo "::error::release checkout is not clean before compilation"
-            exit 1
-          fi
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          node scripts/locate-rc-build.mjs verify-artifact \
+            --artifact "$ARTIFACT" \
+            --dir "$RUNNER_TEMP/rc" \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$RELEASE_COMMIT" \
+            --version "$RELEASE_VERSION" \
+            --run-id "$RC_RUN_ID" \
+            --run-attempt "$RC_RUN_ATTEMPT" \
+            --preflight "$RC_PREFLIGHT"
+          for archive in "$RUNNER_TEMP/rc/$ARTIFACT.tar.gz" "$RUNNER_TEMP/rc/$ARTIFACT.zip"; do
+            [ -f "$archive" ] || continue
+            node scripts/locate-rc-build.mjs verify-attestation \
+              --file "$archive" \
+              --repo "$GITHUB_REPOSITORY" \
+              --sha "$RELEASE_COMMIT" \
+              --source-ref "refs/heads/${RC_HEAD_BRANCH}" \
+              --run-id "$RC_RUN_ID"
+          done
 
-      - name: Build kin-cli + kin-daemon (native)
-        if: ${{ !matrix.cross }}
+      - name: Unpack the archive (Unix)
+        if: runner.os != 'Windows'
         shell: bash
-        run: |
-          # The daemon is the runtime: `kin init` works without it but
-          # `kin status`/`kin search`/the MCP server all require kin-daemon on
-          # PATH, so a clean public install must ship it alongside `kin`.
-          #
-          # Every platform now builds the same default feature set. Windows was
-          # the only leg that stripped it, and dropping that split is what puts
-          # native vector search in the shipped Windows archive.
-          #
-          # The Linux legs are given swap and then sample their own memory and
-          # disk into this step's own log while cargo runs. Both halves stay
-          # here permanently, because the second is what proves the first is
-          # still enough. macOS grows its own swap files and offers no swapfile
-          # to add, so the macOS legs only sample, recording free memory, the
-          # compressor, swap in use and the kernel's pressure level.
-          #
-          # What this leg ran out of, measured rather than guessed. The
-          # linux-aarch64 leg of v0.7.14 died at this step on all three attempts
-          # of run 34579776198 with "The runner has received a shutdown signal"
-          # and exit code 143, and the step log carried no resource numbers at
-          # all. Re-running the same build on main's head under the sampler
-          # (rc-build run 34642288259, job 103404693178) reproduced it exactly
-          # and said why. Free disk never moved: 108,661 MB on every one of the
-          # 55 samples, with the whole build consuming 1.9 GB. Memory went one
-          # way. The largest rustc climbed from 4,287 MB to 7,789 MB while
-          # available memory fell from 6,602 MB to 253 MB, the kernel then ate
-          # the image's own 3 GB swapfile to nothing by 20:18:51Z, and the
-          # runner was torn down thirteen seconds later, still climbing. The
-          # runner has 15,947 MB of RAM, so the peak needs more than the roughly
-          # 19 GB of RAM plus swap that the image ships with.
-          #
-          # Why the peak is that big: cargo links kin-cli and kin-daemon in one
-          # invocation, and the release profile is fat LTO with one codegen
-          # unit, so the peak is two whole-program links of a large Rust binary
-          # resident at once. The largest single process was 7.8 GB while total
-          # commitment was about 19 GB, which is that shape. Thin LTO on one
-          # architecture would change what ships and the release notes would
-          # have to say so, and the runner label is a cost decision rather than
-          # an engineering one, so the leg is given memory instead.
-          #
-          # Both Linux legs get it rather than the arm row alone, and the
-          # x86_64 leg's own samples from that same run are why the distinction
-          # is not worth a guard. It succeeded on an identically sized runner,
-          # 15,988 MB of RAM and the same 3 GB swapfile, with its largest rustc
-          # peaking at 4,193 MB, 5,006 MB still available and swap never
-          # touched. So the same fat-LTO build of the same crates costs roughly
-          # 1.9 times the peak resident set on aarch64 that it costs on x86_64,
-          # which is a property of the backend rather than of what is being
-          # built. The x86_64 leg has headroom today and its swap is insurance;
-          # keying the headroom to an architecture would record the accident of
-          # which leg crossed first rather than the reason either might.
-          #
-          # The macOS arm64 leg is the one that outgrew its runner, and it is
-          # given the two links one at a time rather than more memory. The
-          # standard Apple Silicon runner has 3 cores and 7 GB of RAM. On the
-          # 0.8.2 candidate (rc-build run 38192967949) the linux-aarch64 leg,
-          # same crates and same backend, fell to 259 MB available with about
-          # 12 GB of its swap in use while both links ran, so the pair now
-          # commits roughly 27 GB, and the link left running alone still held
-          # 9.7 GB resident. The macOS arm64 leg of that run and of its retry
-          # (38198979588) was still inside both links 75 and 81 minutes after
-          # kin-daemon began compiling, and reached this job's 90-minute bound
-          # both times; v0.8.1 had already needed 63 and 73 minutes for the same
-          # phase. Neither macOS log carried a memory reading, so memory is the
-          # cause inferred from that measurement and the runner's size, and the
-          # sampler below is what confirms or refutes it.
-          #
-          # Each binary is its own invocation with the same -p pair, so Cargo
-          # resolves features exactly as the combined build does. The combined
-          # invocation then runs unchanged, finds both binaries fresh and
-          # rebuilds nothing; were it ever to rebuild, the shipped bytes would
-          # still be the combined build's. The other legs keep linking both at
-          # once, because their runners hold the pair and running the links in
-          # series would put the shorter one on the critical path for nothing.
-          sampler=""
-          if [ "$(uname -s)" = Linux ]; then
-            echo "resources before the build"
-            nproc || true
-            free -m || true
-            swapon --show || true
-            df -h || true
-            # Raise total swap to the target, never taking more than half of
-            # what is free, and add to the image's swapfile rather than
-            # replacing it so nothing already paging is disturbed.
-            want_mb=24576
-            free_mb=$(df -m --output=avail / | tail -1 | tr -d ' ')
-            room_mb=$(( free_mb / 2 ))
-            [ "$want_mb" -le "$room_mb" ] || want_mb=$room_mb
-            have_mb=$(awk '/^SwapTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-            add_mb=$(( want_mb - have_mb ))
-            if [ "$add_mb" -gt 512 ]; then
-              swapfile=/kin-release-swapfile
-              sudo rm -f "$swapfile"
-              if sudo fallocate -l "${add_mb}M" "$swapfile" \
-                && sudo chmod 600 "$swapfile" \
-                && sudo mkswap "$swapfile" > /dev/null \
-                && sudo swapon "$swapfile"
-              then
-                echo "added ${add_mb}MB of swap for a ${want_mb}MB total"
-              else
-                # A swapfile the kernel refuses is usually one fallocate left
-                # holding unwritten extents, which a written file cannot have.
-                sudo swapoff "$swapfile" 2> /dev/null || true
-                sudo rm -f "$swapfile"
-                sudo dd if=/dev/zero of="$swapfile" bs=1M count="$add_mb" status=none
-                sudo chmod 600 "$swapfile"
-                sudo mkswap "$swapfile" > /dev/null
-                sudo swapon "$swapfile"
-                echo "added ${add_mb}MB of swap for a ${want_mb}MB total, written rather than allocated"
-              fi
-            else
-              echo "existing ${have_mb}MB of swap already meets the ${want_mb}MB target"
-            fi
-            swapon --show || true
-            free -m || true
-            (
-              set +e
-              set +o pipefail
-              while :; do
-                avail=$(awk '/^MemAvailable:/{printf "%d", $2/1024}' /proc/meminfo)
-                swap=$(awk '/^SwapFree:/{printf "%d", $2/1024}' /proc/meminfo)
-                root=$(df -m / | awk 'NR==2{print $4}')
-                top=$(ps -eo rss=,comm= --sort=-rss | head -1 | awk '{printf "%s/%dMB", $2, $1/1024}')
-                echo "resource-sample $(date -u +%H:%M:%SZ) mem_avail_mb=$avail swap_free_mb=$swap root_free_mb=$root top_rss=$top"
-                sleep 15
-              done
-            ) &
-            sampler=$!
-          elif [ "$(uname -s)" = Darwin ]; then
-            echo "resources before the build"
-            sysctl -n hw.ncpu hw.memsize || true
-            sysctl vm.swapusage || true
-            df -h / || true
-            (
-              set +e
-              set +o pipefail
-              page=$(sysctl -n hw.pagesize)
-              while :; do
-                vm=$(vm_stat)
-                free=$(printf '%s\n' "$vm" | awk -v p="$page" '/^Pages free:/{sub(/\./,"",$3); printf "%d", $3*p/1048576}')
-                comp=$(printf '%s\n' "$vm" | awk -v p="$page" '/^Pages occupied by compressor:/{sub(/\./,"",$5); printf "%d", $5*p/1048576}')
-                swap=$(sysctl -n vm.swapusage | awk '{for(i=1;i<NF;i++) if($i=="used"){v=$(i+2); sub(/M$/,"",v); printf "%d", v}}')
-                pressure=$(sysctl -n kern.memorystatus_vm_pressure_level)
-                top=$(ps -axo rss=,ucomm= | sort -rn | head -2 | awk '{printf "%s%s/%dMB", sep, $2, $1/1024; sep=","}')
-                echo "resource-sample $(date -u +%H:%M:%SZ) mem_free_mb=$free compressed_mb=$comp swap_used_mb=$swap pressure=$pressure top_rss=$top"
-                sleep 15
-              done
-            ) &
-            sampler=$!
-          fi
-          rc=0
-          if [ "$TARGET" = aarch64-apple-darwin ]; then
-            for bin in kin kin-daemon; do
-              echo "linking $bin on its own"
-              cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon --bin "$bin" || { rc=$?; break; }
-            done
-          fi
-          # Default archives include graph/vector and optional HTTP support.
-          # Local inference is available in explicitly enabled source builds.
-          if [ "$rc" -eq 0 ]; then
-            cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?
-          fi
-          if [ -n "$sampler" ]; then
-            kill "$sampler" 2>/dev/null || true
-          fi
-          if [ "$(uname -s)" = Linux ]; then
-            echo "resources after the build"
-            free -m || true
-            df -h || true
-          elif [ "$(uname -s)" = Darwin ]; then
-            echo "resources after the build"
-            sysctl vm.swapusage || true
-            df -h / || true
-          fi
-          exit "$rc"
         env:
-          TARGET: ${{ matrix.target }}
-
-      - name: Build kin-cli + kin-daemon (cross)
-        if: ${{ matrix.cross }}
-        run: cross build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
-        env:
-          TARGET: ${{ matrix.target }}
-
-      # KinNotifier.app carries Kin's notification identity. macOS derives a
-      # notification's sender name, icon, and grouping from the posting
-      # process's bundle, so without this the CLI's notifications are credited
-      # to Script Editor. macOS-only: there is no bundle concept elsewhere.
-      - name: Build and assemble KinNotifier.app (macOS)
-        if: ${{ runner.os == 'macOS' }}
-        shell: bash
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euo pipefail
-          cargo build --locked --release --target "$TARGET" -p kin-notifier-macos
-          crates/kin-notifier-macos/bundle.sh \
-            "target/${TARGET}/release/KinNotifier" \
-            "target/${TARGET}/release" \
-            "${GITHUB_REF_NAME#v}"
-        env:
-          TARGET: ${{ matrix.target }}
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP/rc/$ARTIFACT.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          test -d "$RUNNER_TEMP/unpacked/$ARTIFACT"
 
+      # The zip is the Windows archive every resolver reads; the publish job
+      # proves the tarball beside it carries the same component bytes.
+      - name: Unpack the archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          Expand-Archive -Path "$env:RUNNER_TEMP/rc/$env:ARTIFACT.zip" -DestinationPath "$env:RUNNER_TEMP/unpacked/$env:ARTIFACT"
+
+      # The same check RC Build ran when it linked these binaries, run again on
+      # the published bytes on the hardware they target. --require-execution
+      # refuses a skip: nothing ships that this job did not execute.
       - name: Verify native release build provenance
-        if: ${{ !matrix.cross }}
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euo pipefail
-          case "$RUNNER_ARCH:$TARGET" in
-            X64:x86_64-*|ARM64:aarch64-*) ;;
-            *)
-              echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
-              exit 0
-              ;;
-          esac
-
           suffix=""
           [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
-          kin_bin="target/$TARGET/release/kin$suffix"
-          daemon_bin="target/$TARGET/release/kin-daemon$suffix"
-          provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
-          mkdir -p "$provenance_dir"
-          "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"
-          "$daemon_bin" --version | tee "$provenance_dir/kin-daemon-version.txt"
-          "$kin_bin" bench-meta --json > "$provenance_dir/kin-build-meta.json"
-          expected_sha="$(git rev-parse HEAD)"
+          root="$RUNNER_TEMP/unpacked/$ARTIFACT"
+          node scripts/verify-native-release-provenance.mjs \
+            --kin "$root/kin$suffix" \
+            --daemon "$root/kin-daemon$suffix" \
+            --target "$TARGET" \
+            --expect-commit "$(git rev-parse HEAD)" \
+            --expect-version "${GITHUB_REF_NAME#v}" \
+            --cargo-lock Cargo.lock \
+            --out "$RUNNER_TEMP/kin-release-provenance-$TARGET" \
+            --require-execution
 
-          EXPECTED_SHA="$expected_sha" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
-          const crypto = require("crypto");
-          const fs = require("fs");
-          const expected = process.env.EXPECTED_SHA;
-          const dir = process.env.PROVENANCE_DIR;
-          const lines = ["kin-version.txt", "kin-daemon-version.txt"].map((path) =>
-            fs.readFileSync(`${dir}/${path}`, "utf8").trim()
-          );
-          const shas = lines.map((line) => {
-            const match = line.match(/\(([0-9a-f]{40})(-dirty)?\s/);
-            if (!match) throw new Error(`release version line lacks a full build SHA: ${line}`);
-            if (match[2]) throw new Error(`release binary was built dirty: ${line}`);
-            return match[1];
-          });
-          if (shas.some((sha) => sha !== expected) || shas[0] !== shas[1]) {
-            throw new Error(`release binary SHAs ${shas.join(", ")} do not match checkout ${expected}`);
-          }
+      # The archives and their sidecars are copied, never repacked, so what
+      # publishes is byte for byte what RC Build uploaded and the preflight
+      # judged. The manifest generator refuses any byte that differs from RC
+      # Build's own record of these archives.
+      - name: Generate artifact provenance manifest
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ship"
+          for name in "$ARTIFACT.tar.gz" "$ARTIFACT.zip"; do
+            [ -f "$RUNNER_TEMP/rc/$name" ] || continue
+            cp "$RUNNER_TEMP/rc/$name" "$RUNNER_TEMP/rc/$name.sha256" "$RUNNER_TEMP/ship/"
+            cmp "$RUNNER_TEMP/rc/$name" "$RUNNER_TEMP/ship/$name"
+          done
+          node scripts/write-release-artifact-provenance.cjs \
+            --artifact "$ARTIFACT" \
+            --target "$TARGET" \
+            --content-root "$RUNNER_TEMP/unpacked/$ARTIFACT" \
+            --archive-dir "$RUNNER_TEMP/ship" \
+            --build-meta "$RUNNER_TEMP/kin-release-provenance-$TARGET/kin-build-meta.json" \
+            --rc-manifest "$RUNNER_TEMP/rc/$ARTIFACT.provenance.json" \
+            --rc-run-id "$RC_RUN_ID" \
+            --commit "$(git rev-parse HEAD)" \
+            --cargo-lock Cargo.lock \
+            --tag "$GITHUB_REF_NAME" \
+            --out "$RUNNER_TEMP/ship/$ARTIFACT.provenance.json"
 
-          const meta = JSON.parse(fs.readFileSync(`${dir}/kin-build-meta.json`, "utf8"));
-          if (process.env.GITHUB_REF_TYPE === "tag") {
-            const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-            if (meta.kin_version !== expectedVersion) {
-              throw new Error(`kin package version ${meta.kin_version ?? "missing"} does not match release tag ${expectedVersion}`);
-            }
-          }
-          if (meta.kin_commit !== expected || meta.kin_dirty !== false || meta.kin_source_known !== true) {
-            throw new Error("kin bench-meta did not prove a clean, known release source");
-          }
-          const tagLockSha = crypto.createHash("sha256").update(fs.readFileSync("Cargo.lock")).digest("hex");
-          if (meta.dependency_provenance !== tagLockSha) {
-            throw new Error(
-              `embedded Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} ` +
-              `does not match tagged Cargo.lock ${tagLockSha}`
-            );
-          }
-          // Attest the measured default archive profile on every target.
-          for (const feature of ["vector", "external-embeddings"]) {
-            if (!meta.feature_flags.includes(feature)) {
-              throw new Error(`release build for ${process.env.TARGET} did not enable ${feature}`);
-            }
-          }
-          for (const feature of ["embeddings", "metal"]) {
-            if (meta.feature_flags.includes(feature)) {
-              throw new Error(`default release build unexpectedly enabled ${feature}`);
-            }
-          }
-          if (meta.embeddings?.vector_enabled !== true ||
-              meta.embeddings?.embeddings_enabled !== true ||
-              meta.embeddings?.local_inference_enabled !== false ||
-              meta.embeddings?.external_embeddings_enabled !== true ||
-              meta.embeddings?.metal_enabled !== false ||
-              meta.embeddings?.provider !== "none") {
-            throw new Error("release metadata does not attest the engine-free default archive profile");
-          }
-          NODE
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/ship/${{ matrix.artifact }}.tar.gz
+            ${{ runner.temp }}/ship/${{ matrix.artifact }}.tar.gz.sha256
+            ${{ runner.temp }}/ship/${{ matrix.artifact }}.zip
+            ${{ runner.temp }}/ship/${{ matrix.artifact }}.zip.sha256
+            ${{ runner.temp }}/ship/${{ matrix.artifact }}.provenance.json
 
-      - name: Assert release build did not mutate source
+  # Sign and notarize the two macOS archives RC Build made, on the standard
+  # macOS pool, and package them again. Nothing is compiled: each leg unpacks
+  # the RC archive the preflight judged and RC Build attested, executes it,
+  # signs kin, kin-daemon and KinNotifier.app with the Developer ID, notarizes,
+  # staples the bundle, repacks, and then proves with
+  # scripts/compare-signed-macos-archive.mjs that the result differs from the
+  # RC archive only by its signatures before executing the signed binaries.
+  #
+  # The Apple credentials stay here, in the protected `release` environment,
+  # and are step-scoped as they always were. RC Build never holds them.
+  #
+  # Standard runners on purpose. A tag freezes this workflow, so a paid pool
+  # that stops assigning runners could strand an immutable release, and this
+  # job needs no fast hardware: signing and notarizing takes about a minute.
+  # The x86_64 leg runs on Intel so its bytes execute natively, where RC Build
+  # could only run them under Rosetta 2.
+  sign_macos:
+    name: Sign and notarize (${{ matrix.artifact }})
+    needs: [config, locate_rc_build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    env:
+      # When true, this job codesigns and uploads the signed-but-unnotarized
+      # zip, and the separate notarize_linux job submits it to Apple Notary via
+      # rcodesign. When false (default), this job notarizes inline with xcrun
+      # notarytool, the proven fallback path.
+      NOTARIZE_ON_LINUX: ${{ needs.config.outputs.notarize_on_linux }}
+      RELEASE_COMMIT: ${{ needs.locate_rc_build.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.locate_rc_build.outputs.version }}
+      RC_RUN_ID: ${{ needs.locate_rc_build.outputs.run_id }}
+      RC_RUN_ATTEMPT: ${{ needs.locate_rc_build.outputs.run_attempt }}
+      RC_HEAD_BRANCH: ${{ needs.locate_rc_build.outputs.head_branch }}
+      RC_PREFLIGHT: ${{ needs.locate_rc_build.outputs.preflight }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: kin-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: kin-macos-aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Verify canonical release input bytes
         shell: bash
         run: |
           set -euo pipefail
-          dirty="$(git status --porcelain --untracked-files=all)"
-          if [ -n "$dirty" ]; then
-            printf '%s\n' "$dirty" >&2
-            echo "::error::release build mutated the source checkout"
-            exit 1
-          fi
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+
+          const sha256 = (bytes) =>
+            crypto.createHash("sha256").update(bytes).digest("hex");
+          const tracked = childProcess.execFileSync(
+            "git",
+            ["cat-file", "blob", "HEAD:Cargo.lock"],
+          );
+          const working = fs.readFileSync("Cargo.lock");
+          if (!working.equals(tracked)) {
+            throw new Error(
+              `Kin Cargo.lock working bytes ${sha256(working)} do not match ` +
+              `tracked Git bytes ${sha256(tracked)}; refusing release provenance`
+            );
+          }
+          console.log(`Verified canonical Kin Cargo.lock bytes: ${sha256(tracked)}`);
+          NODE
+
+      - name: Download the RC archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          run-id: ${{ needs.locate_rc_build.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/rc
+
+      - name: Verify the archive is the one the preflight judged and RC Build attested
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          node scripts/locate-rc-build.mjs verify-artifact \
+            --artifact "$ARTIFACT" \
+            --dir "$RUNNER_TEMP/rc" \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$RELEASE_COMMIT" \
+            --version "$RELEASE_VERSION" \
+            --run-id "$RC_RUN_ID" \
+            --run-attempt "$RC_RUN_ATTEMPT" \
+            --preflight "$RC_PREFLIGHT"
+          node scripts/locate-rc-build.mjs verify-attestation \
+            --file "$RUNNER_TEMP/rc/$ARTIFACT.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --sha "$RELEASE_COMMIT" \
+            --source-ref "refs/heads/${RC_HEAD_BRANCH}" \
+            --run-id "$RC_RUN_ID"
+
+      - name: Unpack the RC archive for signing
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/stage"
+          tar -xzf "$RUNNER_TEMP/rc/$ARTIFACT.tar.gz" -C "$RUNNER_TEMP/stage"
+          test -d "$RUNNER_TEMP/stage/$ARTIFACT/KinNotifier.app"
+          echo "STAGE=$RUNNER_TEMP/stage/$ARTIFACT" >> "$GITHUB_ENV"
+
+      - name: Verify native release build provenance of the RC binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-native-release-provenance.mjs \
+            --kin "$STAGE/kin" \
+            --daemon "$STAGE/kin-daemon" \
+            --target "$TARGET" \
+            --expect-commit "$(git rev-parse HEAD)" \
+            --expect-version "${GITHUB_REF_NAME#v}" \
+            --cargo-lock Cargo.lock \
+            --out "$RUNNER_TEMP/kin-release-provenance-rc-$TARGET" \
+            --require-execution
 
       # --- macOS code signing + notarization -------------------------------
       # Tag releases fail closed when signing/notarization credentials are not
       # configured.
       - name: Resolve macOS signing credential availability
         id: mac_signing
-        if: ${{ runner.os == 'macOS' }}
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -942,7 +899,7 @@ jobs:
       # Signing happens BEFORE packaging so the tarball + its published
       # sha256 cover the signed binaries.
       - name: Import code signing certificate (macOS)
-        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' }}
+        if: ${{ steps.mac_signing.outputs.signing_available == 'true' }}
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -960,11 +917,9 @@ jobs:
           rm -f "$CERT_PATH"
 
       - name: Sign macOS binaries
-        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' }}
+        if: ${{ steps.mac_signing.outputs.signing_available == 'true' }}
         run: |
-          for f in \
-            "target/${TARGET}/release/kin" \
-            "target/${TARGET}/release/kin-daemon"; do
+          for f in "$STAGE/kin" "$STAGE/kin-daemon"; do
             test -f "$f"
             codesign --force --options runtime --timestamp \
               --sign "$MACOS_DEVELOPER_ID" "$f"
@@ -973,14 +928,13 @@ jobs:
           # The bundle signs as a unit: codesign seals Info.plist and Resources
           # alongside the executable, which is what makes the identity
           # tamper-evident rather than just a name in a plist.
-          APP="target/${TARGET}/release/KinNotifier.app"
+          APP="$STAGE/KinNotifier.app"
           test -d "$APP"
           codesign --force --options runtime --timestamp \
             --sign "$MACOS_DEVELOPER_ID" "$APP"
           codesign --verify --strict --deep --verbose=2 "$APP"
         env:
           MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
-          TARGET: ${{ matrix.target }}
 
       # Zip the signed Mach-O binaries for notarization. Apple Notary accepts a
       # zip of standalone executables/dylibs (the same input notarytool takes);
@@ -989,29 +943,22 @@ jobs:
       # tool submits the zip. Built once here and reused by whichever backend
       # notarizes (macOS notarytool inline, or rcodesign on the Linux job).
       - name: Stage signed binaries for notarization (macOS)
-        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' && (env.NOTARIZE_ON_LINUX == 'true' || steps.mac_signing.outputs.native_notary_available == 'true') }}
+        if: ${{ steps.mac_signing.outputs.signing_available == 'true' && (env.NOTARIZE_ON_LINUX == 'true' || steps.mac_signing.outputs.native_notary_available == 'true') }}
         run: |
           NOTARIZE_ZIP="${ARTIFACT}-notarize.zip"
-          FILES=()
-          for f in \
-            "target/${TARGET}/release/kin" \
-            "target/${TARGET}/release/kin-daemon"; do
-            [ -f "$f" ] && FILES+=("$f")
-          done
-          zip -j "$NOTARIZE_ZIP" "${FILES[@]}"
+          zip -j "$NOTARIZE_ZIP" "$STAGE/kin" "$STAGE/kin-daemon"
           # The .app goes in with its directory structure intact (-j would
           # flatten the bundle into loose files and destroy it). Notary needs
           # the bundle whole in order to issue a staplable ticket for it.
-          ( cd "target/${TARGET}/release" && zip -qr "$OLDPWD/$NOTARIZE_ZIP" KinNotifier.app )
+          ( cd "$STAGE" && zip -qr "$OLDPWD/$NOTARIZE_ZIP" KinNotifier.app )
         env:
-          TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
 
       # Fallback / default backend: notarize inline on the macOS runner. Runs
       # only when the Linux backend is NOT selected, so flipping NOTARIZE_ON_LINUX
       # cleanly swaps backends without ever double-submitting.
       - name: Notarize macOS binaries (notarytool)
-        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.native_notary_available == 'true' && env.NOTARIZE_ON_LINUX != 'true' }}
+        if: ${{ steps.mac_signing.outputs.native_notary_available == 'true' && env.NOTARIZE_ON_LINUX != 'true' }}
         run: |
           xcrun notarytool submit "${ARTIFACT}-notarize.zip" \
             --apple-id "$APPLE_ID" \
@@ -1023,20 +970,19 @@ jobs:
           # therefore rely on Apple's servers being reachable for Gatekeeper's
           # online check. KinNotifier.app IS a bundle, so its ticket is stapled
           # into it below and verifies offline.
-          xcrun stapler staple "target/${TARGET}/release/KinNotifier.app"
-          xcrun stapler validate "target/${TARGET}/release/KinNotifier.app"
+          xcrun stapler staple "$STAGE/KinNotifier.app"
+          xcrun stapler validate "$STAGE/KinNotifier.app"
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           ARTIFACT: ${{ matrix.artifact }}
-          TARGET: ${{ matrix.target }}
 
       # Linux backend: hand the signed zip to the notarize_linux job, which
       # submits it to Apple Notary via rcodesign on a (10x cheaper) Linux runner.
       # The zip is short-lived job-internal plumbing, not a published artifact.
       - name: Upload signed binaries for Linux notarization
-        if: ${{ runner.os == 'macOS' && steps.mac_signing.outputs.signing_available == 'true' && env.NOTARIZE_ON_LINUX == 'true' }}
+        if: ${{ steps.mac_signing.outputs.signing_available == 'true' && env.NOTARIZE_ON_LINUX == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}-notarize-zip
@@ -1045,25 +991,24 @@ jobs:
           if-no-files-found: error
 
       - name: Package (Unix)
-        if: runner.os != 'Windows'
         run: |
           mkdir "$ARTIFACT"
-          cp "target/${TARGET}/release/kin" "$ARTIFACT/"
+          cp "$STAGE/kin" "$ARTIFACT/"
           # kin-daemon is mandatory (no `|| true`): a daemon-less
           # archive lets `kin init` succeed but then `kin status`/`kin search`
           # fail with no daemon on PATH, so a missing daemon must fail the build.
-          cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
+          cp "$STAGE/kin-daemon" "$ARTIFACT/"
           # KinNotifier.app is macOS-only and is copied whole: -R preserves the
           # bundle structure and the stapled notarization ticket inside it.
-          if [ -d "target/${TARGET}/release/KinNotifier.app" ]; then
-            cp -R "target/${TARGET}/release/KinNotifier.app" "$ARTIFACT/"
-          fi
+          cp -R "$STAGE/KinNotifier.app" "$ARTIFACT/"
           # Words, not just executables. Both arms of the isolated stranger run
           # installed this archive successfully and both scored the packaging
           # below the binaries, because nothing in it says where the two
           # executables go or that the daemon belongs beside the CLI.
           node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "${GITHUB_REF_NAME#v}"
-          tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
+          # No AppleDouble members: a stray ._ file is an archive member the
+          # release shape rules refuse.
+          COPYFILE_DISABLE=1 tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
           # Take the listing once into a file. Piping it into `grep -q` lets grep
           # exit on its first match, and under `pipefail` the SIGPIPE that raises
           # on `tar` fails the pipeline, which reads exactly like the member being
@@ -1080,112 +1025,43 @@ jobs:
           # The notifier is mandatory on macOS. Without it the CLI still runs but
           # every notification is credited to Script Editor, which is a silent
           # downgrade rather than a visible failure, so assert it here.
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            if ! grep -q "KinNotifier.app/Contents/MacOS/KinNotifier$" "$ARCHIVE_LISTING"; then
-              echo "::error::KinNotifier.app missing from ${ARTIFACT}.tar.gz"
-              exit 1
-            fi
+          if ! grep -q "KinNotifier.app/Contents/MacOS/KinNotifier$" "$ARCHIVE_LISTING"; then
+            echo "::error::KinNotifier.app missing from ${ARTIFACT}.tar.gz"
+            exit 1
           fi
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Prove the signed archive differs from the RC archive only by its signatures
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
-          New-Item -ItemType Directory -Path $env:ARTIFACT
-          Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
-          # kin-daemon is mandatory: fail hard if it's missing rather
-          # than ship a daemon-less archive that can `kin init` but nothing else.
-          Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop
-          # See the Unix leg: the archive carries its own README, INSTALL and
-          # checksum manifest so a stranger is not guessing at layout.
-          node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" ($env:GITHUB_REF_NAME -replace '^v', '')
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "failed to write the release archive documentation"
-            exit 1
-          }
-          Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
-          # Assert the produced zip actually contains kin-daemon.exe.
-          $entries = [System.IO.Compression.ZipFile]::OpenRead("$PWD/$env:ARTIFACT.zip").Entries.Name
-          if ($entries -notcontains "kin-daemon.exe") {
-            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip, refusing to publish a daemon-less archive"
-            exit 1
-          }
-          foreach ($doc in @("README.md", "INSTALL.md", "checksums-sha256.txt")) {
-            if ($entries -notcontains $doc) {
-              Write-Error "$doc missing from $env:ARTIFACT.zip"
-              exit 1
-            }
-          }
-          # The POSIX installer builds one archive name for every platform it
-          # detects, "kin-<os>-<arch>.tar.gz", and it detects windows from the
-          # MSYS, MINGW, and CYGWIN uname strings. Piping the documented curl
-          # command into a shell on Windows therefore asked for a tarball this
-          # leg never produced, and every release to date answered that request
-          # with a 404. Publish the same components under that exact name beside
-          # the zip. The zip stays the primary archive: the PowerShell
-          # installer, the npm launcher, and `kin update` all resolve Windows by
-          # that name, and anything already depending on it keeps working.
-          tar -czf "$env:ARTIFACT.tar.gz" "$env:ARTIFACT"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "tar failed to package $env:ARTIFACT.tar.gz"
-            exit 1
-          }
-          $members = @(tar -tzf "$env:ARTIFACT.tar.gz")
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "tar failed to list $env:ARTIFACT.tar.gz"
-            exit 1
-          }
-          $members = @($members | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-          # The Unix legs wrap their contents in a single "<artifact>/" root and
-          # the release shape rules refuse a member carrying a backslash, so
-          # assert both here rather than discovering a Windows path separator in
-          # the publish job after the archive is already built.
-          $prefix = "$env:ARTIFACT/"
-          foreach ($member in $members) {
-            if ($member.Contains("\")) {
-              Write-Error "$env:ARTIFACT.tar.gz member '$member' uses a Windows path separator"
-              exit 1
-            }
-            if (-not $member.StartsWith($prefix)) {
-              Write-Error "$env:ARTIFACT.tar.gz member '$member' is not under $prefix"
-              exit 1
-            }
-          }
-          $TarNames = @(
-            $members |
-              Where-Object { -not $_.EndsWith("/") } |
-              ForEach-Object { $_.Substring($prefix.Length) } |
-              Sort-Object
-          )
-          $ZipNames = @($entries | Sort-Object)
-          if (Compare-Object -ReferenceObject $ZipNames -DifferenceObject $TarNames) {
-            Write-Error "$env:ARTIFACT.tar.gz and $env:ARTIFACT.zip do not carry the same components"
-            exit 1
-          }
-          if ($TarNames -notcontains "kin-daemon.exe") {
-            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.tar.gz"
-            exit 1
-          }
-          # A sidecar is the one LF-terminated line sha256sum writes. Set-Content
-          # ends a line with this platform's CRLF, and sha256sum -c on Linux or
-          # macOS then reads a file name ending in CR and finds no such archive,
-          # so write the LF explicitly and read the bytes back.
-          foreach ($ArchivePath in @("$env:ARTIFACT.zip", "$env:ARTIFACT.tar.gz")) {
-            $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
-            $Sidecar = "$Hash  $ArchivePath`n"
-            Set-Content -NoNewline -Encoding ascii -Path "$ArchivePath.sha256" -Value $Sidecar
-            if ((Get-Content -Raw -Encoding ascii "$ArchivePath.sha256") -cne $Sidecar) {
-              Write-Error "$ArchivePath.sha256 is not the single LF-terminated line sha256sum -c reads"
-              exit 1
-            }
-          }
+          set -euo pipefail
+          node scripts/compare-signed-macos-archive.mjs \
+            --rc-archive "$RUNNER_TEMP/rc/$ARTIFACT.tar.gz" \
+            --signed-archive "$ARTIFACT.tar.gz" \
+            --artifact "$ARTIFACT"
+
+      - name: Verify native release build provenance of the signed binaries
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shipped"
+          tar -xzf "$ARTIFACT.tar.gz" -C "$RUNNER_TEMP/shipped"
+          node scripts/verify-native-release-provenance.mjs \
+            --kin "$RUNNER_TEMP/shipped/$ARTIFACT/kin" \
+            --daemon "$RUNNER_TEMP/shipped/$ARTIFACT/kin-daemon" \
+            --target "$TARGET" \
+            --expect-commit "$(git rev-parse HEAD)" \
+            --expect-version "${GITHUB_REF_NAME#v}" \
+            --cargo-lock Cargo.lock \
+            --out "$RUNNER_TEMP/kin-release-provenance-$TARGET" \
+            --require-execution
 
       - name: Generate artifact provenance manifest
         shell: bash
@@ -1194,159 +1070,40 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          node <<'NODE'
-          const childProcess = require("child_process");
-          const crypto = require("crypto");
-          const fs = require("fs");
-          const path = require("path");
-
-          const artifact = process.env.ARTIFACT;
-          const { readUpdateBuildIdentity } = require("./scripts/read-update-build-identity.cjs");
-          const { classifyReleaseArchiveRoot } = require("./scripts/release-archive-shape.cjs");
-          const target = process.env.TARGET;
-          const root = process.cwd();
-          const authorityNames = new Set(
-            target.includes("-windows-")
-              ? ["kin.exe", "kin-daemon.exe"]
-              : ["kin", "kin-daemon"]
-          );
-          const sha256 = (file) =>
-            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-          const git = (cwd, ...args) =>
-            childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-
-          const kinCommit = git(root, "rev-parse", "HEAD");
-          const kinLockSha = sha256(path.join(root, "Cargo.lock"));
-          const buildMetaPath = path.join(
-            process.env.RUNNER_TEMP,
-            `kin-release-provenance-${target}`,
-            "kin-build-meta.json"
-          );
-          const buildMeta = JSON.parse(fs.readFileSync(buildMetaPath, "utf8"));
-          if (buildMeta.kin_commit !== kinCommit || buildMeta.dependency_provenance !== kinLockSha) {
-            throw new Error("embedded build provenance does not match the tagged Kin source and Cargo.lock");
-          }
-
-          // Windows publishes two containers of the same components: the zip
-          // every Windows resolver already asks for, and the tarball the POSIX
-          // installer builds its name from. The zip stays the manifest's
-          // primary archive because `kin update` and the public install proof
-          // both find the platform record by that exact name; the tarball is
-          // inventoried beside it so its bytes are covered by the same
-          // provenance rather than published unaccounted for.
-          const windowsTarget = target.includes("-windows-");
-          const primaryArchive = windowsTarget ? `${artifact}.zip` : `${artifact}.tar.gz`;
-          const additionalArchiveNames = windowsTarget ? [`${artifact}.tar.gz`] : [];
-          const expectedArchives = [primaryArchive, ...additionalArchiveNames].sort();
-          const archives = [`${artifact}.tar.gz`, `${artifact}.zip`]
-            .filter((file) => fs.existsSync(file))
-            .sort();
-          if (JSON.stringify(archives) !== JSON.stringify(expectedArchives)) {
-            throw new Error(`expected final archives ${expectedArchives.join(", ")} for ${artifact}, found ${archives.join(", ") || "none"}`);
-          }
-          const archive = primaryArchive;
-          const archiveRecord = (name) => ({
-            name,
-            sha256: sha256(name),
-            size_bytes: fs.statSync(name).size,
-          });
-          // The content inventory covers the archive's component files and nothing
-          // else. An installed updater refuses any inventory name outside its
-          // managed component list, so the macOS notification bundle, a sealed
-          // directory rather than a component, and the three documentation
-          // members are classified and shape-checked here but stay out of the
-          // manifest. v0.6.2 refused the v0.6.3 manifest on `checksums-sha256.txt`,
-          // the first documentation record in it, and no managed install could
-          // update across any release from v0.5.45 on. Their bytes are covered by
-          // the archive digest; the bundle's also by its code signature and
-          // stapled notarization, the docs' also by the in-archive checksum file.
-          const contents = classifyReleaseArchiveRoot(artifact, { target })
-            .files
-            .map((name) => {
-              const file = path.join(artifact, name);
-              const record = {
-                name,
-                sha256: sha256(file),
-                size_bytes: fs.statSync(file).size,
-              };
-              if (authorityNames.has(name)) {
-                record.build_identity = readUpdateBuildIdentity(file);
-              }
-              return record;
-            })
-            .sort((left, right) => left.name.localeCompare(right.name));
-          if (contents.length < 2) {
-            throw new Error(`${artifact} does not contain the mandatory kin and kin-daemon binaries`);
-          }
-          const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-          const authorityRecords = contents.filter((record) => authorityNames.has(record.name));
-          if (authorityRecords.length !== authorityNames.size) {
-            throw new Error(`${artifact} does not contain both static build-identity authorities`);
-          }
-          const graphVersions = new Set();
-          for (const record of authorityRecords) {
-            const identity = record.build_identity;
-            if (
-              identity.version !== expectedVersion ||
-              identity.commit !== kinCommit ||
-              identity.clean !== true ||
-              identity.source_known !== true ||
-              identity.dependency_provenance !== kinLockSha
-            ) {
-              throw new Error(`${record.name} static build identity does not match the tagged release source`);
-            }
-            graphVersions.add(identity.graph_snapshot_version);
-          }
-          if (graphVersions.size !== 1) {
-            throw new Error(`${artifact} CLI and daemon graph snapshot identities disagree`);
-          }
-
-          const manifest = {
-            schema_version: 2,
-            release_tag: process.env.GITHUB_REF_NAME,
-            artifact,
-            target,
-            kin: {
-              commit: kinCommit,
-              cargo_lock_sha256: kinLockSha,
-              embedded_dependency_provenance: buildMeta.dependency_provenance,
-            },
-            archive: archiveRecord(archive),
-            ...(additionalArchiveNames.length
-              ? { additional_archives: additionalArchiveNames.map(archiveRecord) }
-              : {}),
-            archive_contents: contents,
-            workflow: {
-              repository: process.env.GITHUB_REPOSITORY,
-              run_id: process.env.GITHUB_RUN_ID,
-              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
-            },
-          };
-          fs.writeFileSync(`${artifact}.provenance.json`, `${JSON.stringify(manifest, null, 2)}\n`);
-          NODE
+          node scripts/write-release-artifact-provenance.cjs \
+            --artifact "$ARTIFACT" \
+            --target "$TARGET" \
+            --content-root "$RUNNER_TEMP/shipped/$ARTIFACT" \
+            --archive-dir . \
+            --build-meta "$RUNNER_TEMP/kin-release-provenance-$TARGET/kin-build-meta.json" \
+            --rc-manifest "$RUNNER_TEMP/rc/$ARTIFACT.provenance.json" \
+            --rc-run-id "$RC_RUN_ID" \
+            --commit "$(git rev-parse HEAD)" \
+            --cargo-lock Cargo.lock \
+            --tag "$GITHUB_REF_NAME" \
+            --out "$ARTIFACT.provenance.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}
+          if-no-files-found: error
           path: |
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.tar.gz.sha256
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.zip.sha256
             ${{ matrix.artifact }}.provenance.json
 
   # Notarize the macOS binaries from a Linux runner via rcodesign (the
   # apple-codesign Rust tool). Runs ONLY when NOTARIZE_ON_LINUX is selected; the
-  # build job has already codesigned natively on macOS and uploaded the signed
-  # zips. rcodesign calls the same Apple Notary API as notarytool and accepts the
+  # sign_macos job has already codesigned natively on macOS and uploaded the
+  # signed zips. rcodesign calls the same Apple Notary API as notarytool and accepts the
   # same zip of standalone Mach-O binaries, so the resulting ticket (server-side,
   # keyed by code-signature hash) covers the identical binaries already packaged
   # into the published .tar.gz, so the published artifacts are unchanged. This job
   # is a gate: if notarization fails, the release fails.
   notarize_linux:
     name: Notarize macOS binaries (Linux / rcodesign)
-    needs: [config, build]
+    needs: [config, sign_macos]
     if: ${{ needs.config.outputs.notarize_on_linux == 'true' }}
     runs-on: ubuntu-latest
     environment: release
@@ -1429,7 +1186,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [config, build, notarize_linux, attest_daemon_image]
+    needs: [config, locate_rc_build, ship_rc_archives, sign_macos, notarize_linux, attest_daemon_image]
     # A skipped Linux notarization job is admissible only when the reviewed
     # config selected native macOS notarytool. Every other direct authority
     # input must report an exact successful result before the first public
@@ -1438,7 +1195,9 @@ jobs:
       ${{
         always() &&
         needs.config.result == 'success' &&
-        needs.build.result == 'success' &&
+        needs.locate_rc_build.result == 'success' &&
+        needs.ship_rc_archives.result == 'success' &&
+        needs.sign_macos.result == 'success' &&
         needs.attest_daemon_image.result == 'success' &&
         (
           (
@@ -1465,9 +1224,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download all artifacts
+      # The archives and manifests the shipping jobs uploaded. Every one of
+      # them is named for its platform, kin-<os>-<arch>; nothing else in this
+      # run is a release asset.
+      - name: Download the shipped archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
+          pattern: kin-*
           merge-multiple: true
 
       - name: Generate release notes from changelog
@@ -1565,6 +1328,64 @@ jobs:
           done
           test -s checksums-sha256.txt
 
+      # The bytes about to be published are the RC Build's. Every per-platform
+      # manifest must name the located run; the Linux and Windows archives must
+      # be byte for byte the RC Build archives; every archive a preflight leg
+      # judged must be, or for macOS must have been signed from, the archive
+      # with the sha256 the preflight recorded.
+      - name: Verify the shipped archives against the RC Build
+        env:
+          RC_RUN_ID: ${{ needs.locate_rc_build.outputs.run_id }}
+          RC_PREFLIGHT: ${{ needs.locate_rc_build.outputs.preflight }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const fail = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const preflight = JSON.parse(process.env.RC_PREFLIGHT);
+          const artifacts = [
+            "kin-linux-x86_64",
+            "kin-linux-aarch64",
+            "kin-macos-x86_64",
+            "kin-macos-aarch64",
+            "kin-windows-x86_64",
+          ];
+          for (const artifact of artifacts) {
+            const manifest = JSON.parse(fs.readFileSync(`${artifact}.provenance.json`, "utf8"));
+            const rc = manifest.rc_build ?? {};
+            fail(rc.workflow === ".github/workflows/rc-build.yml",
+              `${artifact} manifest does not name RC Build as its producer`);
+            fail(String(rc.run_id) === process.env.RC_RUN_ID,
+              `${artifact} manifest names RC Build run ${rc.run_id}, not the located ${process.env.RC_RUN_ID}`);
+            const signed = artifact.startsWith("kin-macos-");
+            const pairs = [[manifest.archive, rc.archive], ...(manifest.additional_archives ?? []).map(
+              (record) => [record, (rc.additional_archives ?? []).find((entry) => entry.name === record.name)],
+            )];
+            for (const [shipped, built] of pairs) {
+              fail(shipped?.name === built?.name, `${artifact} ships ${shipped?.name}, which RC Build did not build`);
+              fail(shipped.sha256 === sha256(shipped.name), `${shipped.name} is not the bytes its manifest names`);
+              if (!signed) {
+                fail(shipped.sha256 === built.sha256,
+                  `${shipped.name} is ${shipped.sha256}, not RC Build's ${built.sha256}`);
+              }
+            }
+            if (artifact in preflight) {
+              fail(rc.archive.sha256 === preflight[artifact],
+                `${artifact} came from ${rc.archive.sha256}, but the preflight judged ${preflight[artifact]}`);
+            }
+            console.log(
+              signed
+                ? `${artifact}: signed from RC Build run ${rc.run_id}'s ${rc.archive.sha256}`
+                : `${artifact}: byte for byte RC Build run ${rc.run_id}'s ${rc.archive.sha256}`,
+            );
+          }
+          NODE
+
       # The inventory above asserts the assets this workflow means to publish.
       # This asserts the other direction, which is the one that shipped broken:
       # every asset name a public installer builds for a supported platform has
@@ -1575,6 +1396,10 @@ jobs:
         run: python3 ./scripts/verify-installer-release-assets.py --assets-dir .
 
       - name: Verify and aggregate release provenance
+        env:
+          RC_RUN_ID: ${{ needs.locate_rc_build.outputs.run_id }}
+          RC_EVENT: ${{ needs.locate_rc_build.outputs.event }}
+          RC_HEAD_BRANCH: ${{ needs.locate_rc_build.outputs.head_branch }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1820,6 +1645,14 @@ jobs:
               run_id: process.env.GITHUB_RUN_ID,
               run_attempt: process.env.GITHUB_RUN_ATTEMPT,
             },
+            // The run every archive above was built by. The per-artifact
+            // manifests carry the archive digests it produced.
+            rc_build: {
+              workflow: ".github/workflows/rc-build.yml",
+              run_id: process.env.RC_RUN_ID,
+              event: process.env.RC_EVENT,
+              head_branch: process.env.RC_HEAD_BRANCH,
+            },
           };
           fs.writeFileSync("release-provenance.json", `${JSON.stringify(releaseManifest, null, 2)}\n`);
           fs.writeFileSync(
@@ -1934,16 +1767,15 @@ jobs:
       contents: read
       attestations: read
 
+  # Read-only, so it runs beside the release rather than after it. It reads
+  # the registry and runs both packages' tests; the publishers re-read the
+  # channel immediately before they write and refuse a rollback, so starting
+  # this early loses no freshness. Both publish jobs still wait for it, for the
+  # GitHub Release, and for the public install proof.
   npm_publish_preflight:
     name: Preflight Both npm Packages
-    needs: [publish, install_proof]
-    if: >-
-      ${{
-        always() &&
-        needs.publish.result == 'success' &&
-        needs.install_proof.result == 'success' &&
-        startsWith(github.ref, 'refs/tags/v')
-      }}
+    needs: config
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -2647,14 +2479,14 @@ jobs:
   # to that already-attested digest and is never rebuilt here.
   promote_ghcr_latest:
     name: Promote stable ghcr latest
-    needs: [config, finalize_release, version_tag_image, build_daemon_image, attest_daemon_image]
+    needs: [config, finalize_release, version_tag_image, publish_daemon_image, attest_daemon_image]
     if: >-
       ${{
         always() &&
         needs.config.result == 'success' &&
         needs.finalize_release.result == 'success' &&
         needs.version_tag_image.result == 'success' &&
-        needs.build_daemon_image.result == 'success' &&
+        needs.publish_daemon_image.result == 'success' &&
         needs.attest_daemon_image.result == 'success' &&
         needs.config.outputs.release_channel == 'latest' &&
         needs.finalize_release.outputs.promoted == 'true' &&
@@ -2691,8 +2523,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ghcr.io/kinlab-ai/kin
-          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
-          EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+          EXPECTED_COMMIT: ${{ needs.publish_daemon_image.outputs.commit }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.publish_daemon_image.outputs.digest }}
         run: |
           set -euo pipefail
 
@@ -2884,7 +2716,7 @@ jobs:
 
           # Initial fail-closed admission. Finalization must already have made
           # this exact stable tag GitHub Latest, and every immutable image
-          # identity must still resolve to the build job's attested digest.
+          # identity must still resolve to the pushed, attested RC Build digest.
           verify_stable_release_authority
           verify_immutable_authority "initial"
 
@@ -3070,14 +2902,14 @@ jobs:
   # No main-push workflow, GCP identity, or mutable latest tag participates.
   version_tag_image:
     name: Version-tag ghcr image
-    needs: [publish, install_proof, build_daemon_image, attest_daemon_image]
+    needs: [publish, install_proof, publish_daemon_image, attest_daemon_image]
     # Only tag real version pushes after every direct authority input succeeds.
     if: >-
       ${{
         always() &&
         needs.publish.result == 'success' &&
         needs.install_proof.result == 'success' &&
-        needs.build_daemon_image.result == 'success' &&
+        needs.publish_daemon_image.result == 'success' &&
         needs.attest_daemon_image.result == 'success' &&
         startsWith(github.ref, 'refs/tags/v')
       }}
@@ -3107,8 +2939,8 @@ jobs:
       - name: Version-tag the release commit's daemon image (no rebuild)
         env:
           IMAGE: ghcr.io/kinlab-ai/kin
-          EXPECTED_COMMIT: ${{ needs.build_daemon_image.outputs.commit }}
-          EXPECTED_SOURCE_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+          EXPECTED_COMMIT: ${{ needs.publish_daemon_image.outputs.commit }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.publish_daemon_image.outputs.digest }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -3131,7 +2963,7 @@ jobs:
               ;;
           esac
           if [ "$source_digest" != "$EXPECTED_SOURCE_DIGEST" ]; then
-            echo "::error::$SRC moved from release-built $EXPECTED_SOURCE_DIGEST to $source_digest"
+            echo "::error::$SRC moved from the pushed $EXPECTED_SOURCE_DIGEST to $source_digest"
             exit 1
           fi
 
@@ -3215,7 +3047,7 @@ jobs:
     name: Seal completed stable release
     needs:
       - config
-      - build_daemon_image
+      - publish_daemon_image
       - finalize_release
       - promote_ghcr_latest
       - publish_boundary_contracts
@@ -3224,7 +3056,7 @@ jobs:
       ${{
         always() &&
         needs.config.result == 'success' &&
-        needs.build_daemon_image.result == 'success' &&
+        needs.publish_daemon_image.result == 'success' &&
         needs.finalize_release.result == 'success' &&
         needs.promote_ghcr_latest.result == 'success' &&
         needs.publish_boundary_contracts.result == 'success' &&
@@ -3250,7 +3082,7 @@ jobs:
 
       - name: Generate deterministic completion marker
         env:
-          GHCR_DIGEST: ${{ needs.build_daemon_image.outputs.digest }}
+          GHCR_DIGEST: ${{ needs.publish_daemon_image.outputs.digest }}
         run: |
           set -euo pipefail
           commit="$(git rev-parse HEAD)"

@@ -41,7 +41,17 @@ The enforced-module list is read from the guard itself rather than restated
 here. A module added to the guard's coverage is falsified automatically, and
 this harness cannot quietly fall behind what the guard claims to cover.
 
-Usage: falsify-zero-file-search.py <tree_root>
+Every probe walks the whole tree with a guard that lexes each file one
+character at a time, about thirty walks in all, and nothing else bounds the
+run: the same tree took 13.8 minutes on one runner and 29.1 on another an hour
+earlier. `--shard K/N` runs a fixed share of the probes so several processes,
+each on its own copy of the tree, can split them. A probe unit is one call to
+`owns()` below, the units are counted in the same order by every shard, and
+unit `i` belongs to shard `i % N`, so the shards together run each probe exactly
+once. Each shard ends with a `FALSIFY_SHARD` line naming how many units it ran
+out of how many exist, which is what lets a caller prove the union was whole.
+
+Usage: falsify-zero-file-search.py [--shard K/N] <tree_root>
 """
 import importlib.util
 import json
@@ -519,10 +529,34 @@ def scan_reported(out, rel):
     return f"[VIOLATION] {rel}" in out
 
 
+def parse_shard(value):
+    """`K/N` with 1 <= K <= N, or None for anything else."""
+    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", value)
+    if match is None:
+        return None
+    index, total = int(match.group(1)), int(match.group(2))
+    if index > total:
+        return None
+    return index, total
+
+
 def main():
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    shard_index, shard_total = 1, 1
+    if len(args) == 3 and args[0] == "--shard":
+        shard = parse_shard(args[1])
+        if shard is None:
+            print(
+                f"falsify-zero-file-search: --shard takes K/N with 1 <= K <= N, not {args[1]!r}",
+                file=sys.stderr,
+            )
+            return 2
+        shard_index, shard_total = shard
+        args = args[2:]
+    if len(args) != 1:
         print(__doc__)
         return 2
+    sys.argv = [sys.argv[0], args[0]]
     # This harness REWRITES source files in place: it plants a probe, runs the
     # guards, and restores the original in a `finally`. Two refusals guard the
     # target, because the damage from a wrong one is done before any verdict
@@ -615,8 +649,24 @@ def main():
     # report, so the per-module guarantee is unchanged. What changes is how many
     # times the tree is walked to check them.
     print(f"Falsifying {len(enforced)} answer modules at up to 4 sites each, batched by site")
+    if shard_total > 1:
+        print(f"  shard {shard_index}/{shard_total}: running the probe units numbered "
+              f"{shard_index - 1} modulo {shard_total}")
     print("  py = Python checker, sh = shell guard\n")
     failures = []
+
+    # One probe unit per call, counted in declared order by every shard. Each
+    # call is placed before anything that can branch on what a probe found, so
+    # every shard counts the same units whatever its own probes report.
+    units = {"counted": 0, "ran": 0}
+
+    def owns():
+        number = units["counted"]
+        units["counted"] += 1
+        if number % shard_total == shard_index - 1:
+            units["ran"] += 1
+            return True
+        return False
 
     def poison_at(entries, label_wanted):
         """Poison every entry at `label_wanted`; return {rel: original}."""
@@ -669,6 +719,8 @@ def main():
     labels = ["eof", "quarter", "half", "last-prod"]
     table = {rel: {} for rel, _, _ in enforced}
     for label in labels:
+        if not owns():
+            continue
         batch = verdicts_for(enforced, label)
         # Only the modules that did NOT come back ok are replayed, and only
         # those are ambiguous. A module the guard NAMED was genuinely reported,
@@ -699,7 +751,8 @@ def main():
                         f"{rel} @ {label}: {tag} guard failed but its scan never "
                         "reported the file"
                     )
-        print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
+        if marks or shard_total == 1:
+            print(f"  {os.path.basename(rel):24} {'  '.join(marks)}")
 
     # A module that was whole-file exempt has no falsification history at all:
     # nothing was ever scanned there, so no probe could fail. Prove the narrowed
@@ -707,6 +760,8 @@ def main():
     # modules get, and require the SCAN to report it rather than settling for a
     # nonzero exit.
     for rel in NARROWED_MODULES:
+        if not owns():
+            continue
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
             failures.append(f"{rel}: narrowed-module falsification target is missing")
@@ -744,6 +799,8 @@ def main():
     # bodies and require an actual scan report: a whole-body exemption would
     # otherwise hide a new source read while leaving the guard green.
     for rel, fn_name, pin in REGROUND_PINS:
+        if not owns():
+            continue
         path = os.path.join(root, rel)
         with open(path, "r", encoding="utf-8") as f:
             original = f.read()
@@ -822,20 +879,21 @@ def main():
         "SPURIOUS": "an item that exists only in a test build was reported as "
         "production",
     }
-    try:
-        verdicts = tracker_verdicts(TRACKER_PROBES)
-        if any(mark != "ok" for mark in verdicts.values()):
-            verdicts = {}
-            for probe in TRACKER_PROBES:
-                verdicts.update(tracker_verdicts([probe]))
-        for label, _, _ in TRACKER_PROBES:
-            mark = verdicts[label]
-            if mark != "ok":
-                failures.append(f"tracker probe {label!r}: {EXPLAIN[mark]}")
-            print(f"  cfg tracker {label:38} {mark}")
-    finally:
-        with open(tracker_path, "w", encoding="utf-8") as f:
-            f.write(tracker_original)
+    if owns():
+        try:
+            verdicts = tracker_verdicts(TRACKER_PROBES)
+            if any(mark != "ok" for mark in verdicts.values()):
+                verdicts = {}
+                for probe in TRACKER_PROBES:
+                    verdicts.update(tracker_verdicts([probe]))
+            for label, _, _ in TRACKER_PROBES:
+                mark = verdicts[label]
+                if mark != "ok":
+                    failures.append(f"tracker probe {label!r}: {EXPLAIN[mark]}")
+                print(f"  cfg tracker {label:38} {mark}")
+        finally:
+            with open(tracker_path, "w", encoding="utf-8") as f:
+                f.write(tracker_original)
 
     # An expression pin must exempt only its own bytes, not the entire source
     # line. Poison every pinned line while retaining the allowed expression on
@@ -844,106 +902,108 @@ def main():
     # exemption; the hardened guard must name every affected file.
     pinned = pinned_allowlist(root)
     fn_scoped = exempt_fn_names(root)
-    originals = {}
-    setup_failed = False
-    try:
-        for rel, matches in pinned.items():
-            path = os.path.join(root, rel)
-            with open(path, "r", encoding="utf-8") as f:
-                original = f.read()
-            originals[path] = original
-            lines = original.split("\n")
-            counts = scanned_pin_counts(
-                guard, root, rel, fn_scoped.get(rel, set()), matches
-            )
-            poisoned_lines = set()
-            for match, want in matches.items():
-                found = counts.get(match, 0)
-                if found != want:
-                    failures.append(
-                        f"{rel}: pinned expression {match!r} occurs "
-                        f"{found} times in scanned code (want {want})"
-                    )
-                    setup_failed = True
-                    continue
-                # Every site a recurring pin covers, not just the first: an
-                # exemption that masked one line and dropped the rest would
-                # pass a single-site probe.
-                poisoned_lines.update(
-                    idx for idx, line in enumerate(lines) if match in line
+    if owns():
+        originals = {}
+        setup_failed = False
+        try:
+            for rel, matches in pinned.items():
+                path = os.path.join(root, rel)
+                with open(path, "r", encoding="utf-8") as f:
+                    original = f.read()
+                originals[path] = original
+                lines = original.split("\n")
+                counts = scanned_pin_counts(
+                    guard, root, rel, fn_scoped.get(rel, set()), matches
                 )
-            for idx in poisoned_lines:
-                lines[idx] = f"{POISON} {lines[idx]}"
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-
-        if not setup_failed:
-            code, out = run([sys.executable, py_guard, root])
-            if code == 0:
-                failures.append(
-                    "Python guard PASSED when poison shared every pinned allowlist line"
-                )
-            else:
-                for rel in pinned:
-                    if not scan_reported(out, rel):
+                poisoned_lines = set()
+                for match, want in matches.items():
+                    found = counts.get(match, 0)
+                    if found != want:
                         failures.append(
-                            f"{rel}: Python same-line falsification failed but "
-                            "the scan never reported the file"
+                            f"{rel}: pinned expression {match!r} occurs "
+                            f"{found} times in scanned code (want {want})"
                         )
-            print(
-                "  pinned same-line poison   "
-                + ("py:ok" if code != 0 else "py:BLIND")
-            )
-    finally:
-        for path, original in originals.items():
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(original)
+                        setup_failed = True
+                        continue
+                    # Every site a recurring pin covers, not just the first: an
+                    # exemption that masked one line and dropped the rest would
+                    # pass a single-site probe.
+                    poisoned_lines.update(
+                        idx for idx, line in enumerate(lines) if match in line
+                    )
+                for idx in poisoned_lines:
+                    lines[idx] = f"{POISON} {lines[idx]}"
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+
+            if not setup_failed:
+                code, out = run([sys.executable, py_guard, root])
+                if code == 0:
+                    failures.append(
+                        "Python guard PASSED when poison shared every pinned allowlist line"
+                    )
+                else:
+                    for rel in pinned:
+                        if not scan_reported(out, rel):
+                            failures.append(
+                                f"{rel}: Python same-line falsification failed but "
+                                "the scan never reported the file"
+                            )
+                print(
+                    "  pinned same-line poison   "
+                    + ("py:ok" if code != 0 else "py:BLIND")
+                )
+        finally:
+            for path, original in originals.items():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(original)
 
     # The shell guard has its own pinned allowlist. Its locate expression is
     # also present in the shared JSON policy, so use that one representative
     # line to prove the dependency-free guard masks rather than drops it.
-    shell_same_line_rel = f"{CMD_DIR}/locate.rs"
-    shell_matches = list(pinned.get(shell_same_line_rel, {}))
-    shell_path = os.path.join(root, shell_same_line_rel)
-    if len(shell_matches) != 1:
-        failures.append(
-            f"{shell_same_line_rel}: expected exactly one shared shell pin"
-        )
-    else:
-        with open(shell_path, "r", encoding="utf-8") as f:
-            original = f.read()
-        lines = original.split("\n")
-        locations = [
-            idx for idx, line in enumerate(lines) if shell_matches[0] in line
-        ]
-        try:
-            if len(locations) != 1:
-                failures.append(
-                    f"{shell_same_line_rel}: shell pin occurs {len(locations)} "
-                    "times (want exactly 1)"
-                )
-            else:
-                idx = locations[0]
-                lines[idx] = f"{POISON} {lines[idx]}"
+    if owns():
+        shell_same_line_rel = f"{CMD_DIR}/locate.rs"
+        shell_matches = list(pinned.get(shell_same_line_rel, {}))
+        shell_path = os.path.join(root, shell_same_line_rel)
+        if len(shell_matches) != 1:
+            failures.append(
+                f"{shell_same_line_rel}: expected exactly one shared shell pin"
+            )
+        else:
+            with open(shell_path, "r", encoding="utf-8") as f:
+                original = f.read()
+            lines = original.split("\n")
+            locations = [
+                idx for idx, line in enumerate(lines) if shell_matches[0] in line
+            ]
+            try:
+                if len(locations) != 1:
+                    failures.append(
+                        f"{shell_same_line_rel}: shell pin occurs {len(locations)} "
+                        "times (want exactly 1)"
+                    )
+                else:
+                    idx = locations[0]
+                    lines[idx] = f"{POISON} {lines[idx]}"
+                    with open(shell_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                    code, out = run(["bash", sh_guard, root])
+                    if code == 0:
+                        failures.append(
+                            "shell guard PASSED when poison shared its pinned locate line"
+                        )
+                    elif os.path.basename(shell_same_line_rel) not in out:
+                        failures.append(
+                            f"{shell_same_line_rel}: shell same-line falsification "
+                            "failed but never named the file"
+                        )
+                    print(
+                        "  shell same-line poison    "
+                        + ("sh:ok" if code != 0 else "sh:BLIND")
+                    )
+            finally:
                 with open(shell_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(lines))
-                code, out = run(["bash", sh_guard, root])
-                if code == 0:
-                    failures.append(
-                        "shell guard PASSED when poison shared its pinned locate line"
-                    )
-                elif os.path.basename(shell_same_line_rel) not in out:
-                    failures.append(
-                        f"{shell_same_line_rel}: shell same-line falsification "
-                        "failed but never named the file"
-                    )
-                print(
-                    "  shell same-line poison    "
-                    + ("sh:ok" if code != 0 else "sh:BLIND")
-                )
-        finally:
-            with open(shell_path, "w", encoding="utf-8") as f:
-                f.write(original)
+                    f.write(original)
 
     # Function-body exemptions need falsifying from both sides. Poison inside
     # an exempt body must NOT be reported, or the exemption does not work;
@@ -953,6 +1013,8 @@ def main():
     # rescue covering a sixtieth of the file, so "the guard names api.rs" is a
     # claim that has to be demonstrated rather than assumed.
     for rel, exempt_fn in DAEMON_FN_SCOPED:
+        if not owns():
+            continue
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
             failures.append(f"{rel}: fn-scoped falsification target is missing")
@@ -1016,6 +1078,8 @@ def main():
     # The daemon crate already carries this spelling in a byte string, so the
     # material for the bypass exists in the tree, not only in theory.
     for rel, exempt_fn in DAEMON_FN_SCOPED:
+        if not owns():
+            continue
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
             failures.append(f"{rel}: brace-desync falsification target is missing")
@@ -1070,6 +1134,8 @@ def main():
     # Counted over scanned code the pin comes up short, is dropped rather than
     # applied, and every line it claimed is reported beside the pin error.
     for rel, pin in COUNTED_PIN_SLACK:
+        if not owns():
+            continue
         path = os.path.join(root, rel)
         want = pinned.get(rel, {}).get(pin)
         if want is None:
@@ -1133,58 +1199,59 @@ def main():
     # metadata calls misses it. Exercise that spelling explicitly in a module
     # covered by both guards, once in the middle of production code and once at
     # EOF so test-module span handling cannot hide either location.
-    metadata_rel = f"{CMD_DIR}/search.rs"
-    metadata_scope = next(
-        (entry for entry in enforced if entry[0] == metadata_rel), None
-    )
-    if metadata_scope is None or not all(metadata_scope[1:]):
-        failures.append(
-            f"{metadata_rel}: bare metadata regression needs coverage from both guards"
+    if owns():
+        metadata_rel = f"{CMD_DIR}/search.rs"
+        metadata_scope = next(
+            (entry for entry in enforced if entry[0] == metadata_rel), None
         )
-    else:
-        path = os.path.join(root, metadata_rel)
-        with open(path, "r", encoding="utf-8") as f:
-            original = f.read()
-        lines = original.split("\n")
-        marks = []
-        try:
-            for label, idx in probe_sites(lines):
-                if label not in ("half", "eof"):
-                    continue
-                poisoned = lines[:idx] + [METADATA_POISON] + lines[idx:]
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(poisoned))
-                cell = []
-                for tag, cmd in (
-                    ("py", [sys.executable, py_guard, root]),
-                    ("sh", ["bash", sh_guard, root]),
-                ):
-                    code, out = run(cmd)
-                    if code == 0:
-                        failures.append(
-                            f"{metadata_rel} @ {label}: {tag} guard PASSED "
-                            "on bare Path::metadata"
-                        )
-                        cell.append("BLIND")
-                    elif not (
-                        scan_reported(out, metadata_rel)
-                        if tag == "py"
-                        else os.path.basename(metadata_rel) in out
+        if metadata_scope is None or not all(metadata_scope[1:]):
+            failures.append(
+                f"{metadata_rel}: bare metadata regression needs coverage from both guards"
+            )
+        else:
+            path = os.path.join(root, metadata_rel)
+            with open(path, "r", encoding="utf-8") as f:
+                original = f.read()
+            lines = original.split("\n")
+            marks = []
+            try:
+                for label, idx in probe_sites(lines):
+                    if label not in ("half", "eof"):
+                        continue
+                    poisoned = lines[:idx] + [METADATA_POISON] + lines[idx:]
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(poisoned))
+                    cell = []
+                    for tag, cmd in (
+                        ("py", [sys.executable, py_guard, root]),
+                        ("sh", ["bash", sh_guard, root]),
                     ):
-                        failures.append(
-                            f"{metadata_rel} @ {label}: {tag} guard failed but "
-                            "never reported the file"
-                        )
-                        cell.append("UNNAMED")
-                    else:
-                        cell.append("ok")
-                marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
-        finally:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(original)
-        print(
-            f"  bare Path::metadata      {'  '.join(marks)}"
-        )
+                        code, out = run(cmd)
+                        if code == 0:
+                            failures.append(
+                                f"{metadata_rel} @ {label}: {tag} guard PASSED "
+                                "on bare Path::metadata"
+                            )
+                            cell.append("BLIND")
+                        elif not (
+                            scan_reported(out, metadata_rel)
+                            if tag == "py"
+                            else os.path.basename(metadata_rel) in out
+                        ):
+                            failures.append(
+                                f"{metadata_rel} @ {label}: {tag} guard failed but "
+                                "never reported the file"
+                            )
+                            cell.append("UNNAMED")
+                        else:
+                            cell.append("ok")
+                    marks.append(f"{label}=py:{cell[0]}/sh:{cell[1]}")
+            finally:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(original)
+            print(
+                f"  bare Path::metadata      {'  '.join(marks)}"
+            )
 
     # Deny-set breadth is itself a release boundary. Exercise the standard
     # fallible existence and symlink probes plus direct and multiline raw-search
@@ -1195,9 +1262,11 @@ def main():
     deny_rel = f"{CMD_DIR}/search.rs"
     deny_scope = next((entry for entry in enforced if entry[0] == deny_rel), None)
     if deny_scope is None or not all(deny_scope[1:]):
-        failures.append(
-            f"{deny_rel}: deny-set falsification needs coverage from both guards"
-        )
+        # One unit, so the refusal is reported by one shard rather than all.
+        if owns():
+            failures.append(
+                f"{deny_rel}: deny-set falsification needs coverage from both guards"
+            )
     else:
         path = os.path.join(root, deny_rel)
         with open(path, "r", encoding="utf-8") as f:
@@ -1205,6 +1274,8 @@ def main():
         base_lines = original.split("\n")
         try:
             for probe_name, probe in DENY_SET_PROBES:
+                if not owns():
+                    continue
                 marks = []
                 for label, idx in probe_sites(base_lines):
                     if label not in ("half", "eof"):
@@ -1241,12 +1312,19 @@ def main():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(original)
 
+    # The receipt a caller sums across shards. Printed on success and failure
+    # alike, because a shard that ran nothing is the failure it exists to catch.
+    print(f"\nFALSIFY_SHARD {shard_index}/{shard_total} ran={units['ran']} total={units['counted']}")
+
     if failures:
         print()
         for f in failures:
             print(f"::error::falsification failed — {f}")
         return 1
 
+    if shard_total > 1:
+        print(f"Every probe in shard {shard_index}/{shard_total} was caught by the guards.")
+        return 0
     print("\nEvery enforced answer module fails its guards when poisoned, at every site.")
     return 0
 

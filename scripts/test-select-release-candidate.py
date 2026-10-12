@@ -18,15 +18,24 @@ fixtures are shaped on real listings read on 2026-09-02:
     has to disqualify a sha its Acceptance run says nothing about.
   * 390fbdc54 carried every required context exactly once and became v0.6.4.
 
+The inheritance and timeout cases read real listings instead, kept in
+scripts/fixtures/release-candidate/pr1848-08d48c27.json: export pull request
+1848, the squash 08d48c27 it landed as on 2026-10-12 with an identical tree,
+main's own runs for that commit, and the RC Build attempts the cut spent on it
+when the macOS arm64 leg hit its 90-minute bound twice. Every negative case is
+the smallest edit to that real read that breaks one condition.
+
 The workflow contract tests pin the shape of release-cut.yml, because a step
 that stops calling the selector reads exactly like one that never needed it.
 """
 
 from __future__ import annotations
 
+import ast
 import copy
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -42,6 +51,7 @@ CUT_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-cut.yml"
 RELEASE_TAG_PATH = ROOT / ".github" / "workflows" / "release-tag.yml"
 RC_BUILD_PATH = ROOT / ".github" / "workflows" / "rc-build.yml"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
+REAL_FIXTURE_PATH = ROOT / "scripts" / "fixtures" / "release-candidate" / "pr1848-08d48c27.json"
 REPO = "kinlab-ai/kin"
 VERSION = "0.6.5"
 NEWEST = "a" * 40
@@ -110,6 +120,12 @@ def job_if(block: str) -> str:
             continue
         lines.append(line.strip())
     return " ".join(lines)
+
+
+def textwrap_dedent(text: str) -> str:
+    import textwrap
+
+    return textwrap.dedent(text)
 
 
 def load_module(name: str, path: Path):
@@ -248,7 +264,7 @@ def rc_build(
     created_at: str = "2026-09-02T20:00:00Z",
 ) -> dict[str, Any]:
     if artifacts is None:
-        artifacts = list(selector.RC_BUILD_ARTIFACTS)
+        artifacts = list(selector.RC_RELEASE_ARTIFACTS)
     return {
         "id": run_id,
         "head_sha": sha,
@@ -560,9 +576,9 @@ class ReadRcBuildsTests(unittest.TestCase):
         }
 
     def test_every_live_archive_is_read_and_the_run_is_usable(self) -> None:
-        listing = [{"name": name, "expired": False} for name in selector.RC_BUILD_ARTIFACTS]
+        listing = [{"name": name, "expired": False} for name in selector.RC_RELEASE_ARTIFACTS]
         builds = self.read([self.run_row(1)], {1: listing})
-        self.assertEqual(builds[0]["artifacts"], sorted(selector.RC_BUILD_ARTIFACTS))
+        self.assertEqual(builds[0]["artifacts"], sorted(selector.RC_RELEASE_ARTIFACTS))
         self.assertTrue(selector._usable(builds[0]))
 
     def test_an_expired_archive_is_dropped_and_costs_the_run_its_usability(self) -> None:
@@ -812,19 +828,23 @@ class JudgeTests(unittest.TestCase):
     def test_the_deadlocked_shape_of_2026_09_02_is_usable(self) -> None:
         """Regression: run 33692452573 for febf5d851, the shape that burned the loop.
 
-        The rc-build succeeded and carried exactly the three archive names, none
-        expired. The selector asked for `kin-release-preflight-` prefixed names,
-        which only release-cut.yml's own preflight job ever uploads and only on
-        the `proof` decision this reading could never produce, so the loop armed
-        a fresh build every cycle and killed the candidate at the attempt limit.
-        These are the live names read from that run's artifacts endpoint.
+        The rc-build succeeded and carried its archives under their bare names,
+        none expired. The selector asked for `kin-release-preflight-` prefixed
+        names, which only release-cut.yml's own preflight job ever uploads and
+        only on the `proof` decision this reading could never produce, so the
+        loop armed a fresh build every cycle and killed the candidate at the
+        attempt limit. That run carried three archives; a run is usable now only
+        when it holds every artifact release.yml ships, under the same bare
+        names, so the three alone no longer are.
         """
 
-        live = rc_build(
+        then = rc_build(
             MIDDLE,
             run_id=33_692_452_573,
             artifacts=["kin-macos-aarch64", "kin-linux-x86_64", "kin-linux-aarch64"],
         )
+        self.assertFalse(selector._usable(then), then["artifacts"])
+        live = rc_build(MIDDLE, run_id=33_692_452_573, artifacts=list(selector.RC_RELEASE_ARTIFACTS))
         self.assertTrue(selector._usable(live), live["artifacts"])
         grader = Grader({MIDDLE: green_grade(MIDDLE)})
         decision = selector.judge(snapshot(candidate=MIDDLE, rc_builds=[live]), grader)
@@ -899,6 +919,1235 @@ class JudgeTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Inheriting an export pull request's grade: the real PR 1848 / 08d48c27 pair.
+# ---------------------------------------------------------------------------
+
+
+REAL = json.loads(REAL_FIXTURE_PATH.read_text(encoding="utf-8"))
+# 08d48c27 staged 0.8.2, which was cancelled and is now retired, so the cut
+# stands down on it whatever it carries. The judgments below are about grading
+# and RC Build attempts, not about the version, so they judge the same real
+# commit as the release it would now be: 0.8.4.
+RELEASABLE = "0.8.4"
+REAL_MAIN = REAL["main"]["sha"]
+REAL_HEAD = REAL["head"]["sha"]
+REAL_BASE = REAL["pull"]["base"]["sha"]
+REAL_TREE = REAL["main"]["tree"]
+REAL_REF = REAL["pull"]["head"]["ref"]
+REAL_CI_RUN = 38_181_962_218
+REAL_ACCEPTANCE_RUN = 38_181_961_757
+# Fifteen minutes after PR 1848 landed at 00:15:52Z. Main's own CI and
+# Acceptance push runs were queued at 00:15:55Z and concluded at 01:42:19Z and
+# 00:53:50Z, so this is the window inheritance exists for.
+AT_LANDING = "2026-10-12T00:30:00Z"
+
+
+def main_listings_at(moment: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Main's real listings as they stood at `moment`, or as read when None.
+
+    A run or check-run that had not started is left out, and one that had not
+    finished reads in progress, which is what the API answered at that time.
+    """
+
+    checks, runs = [], []
+    for run in copy.deepcopy(REAL["main"]["workflow_runs"]):
+        if moment is not None and run["created_at"] > moment:
+            continue
+        if moment is not None and run["status"] == "completed" and run["updated_at"] > moment:
+            run.update(status="in_progress", conclusion=None)
+        runs.append(run)
+    for check in copy.deepcopy(REAL["main"]["check_runs"]):
+        if moment is not None and (check["started_at"] or "") > moment:
+            continue
+        if moment is not None and check["completed_at"] and check["completed_at"] > moment:
+            check.update(status="in_progress", conclusion=None, completed_at=None)
+        checks.append(check)
+    return checks, runs
+
+
+def main_pages_at(moment: str | None = None) -> dict[str, Any]:
+    checks, runs = main_listings_at(moment)
+    return grade_pages(checks, runs)
+
+
+def real_inheritance_read() -> dict[str, Any]:
+    """The read `read_inheritance` makes for 08d48c27, from the real listings."""
+
+    head = REAL["head"]
+    return copy.deepcopy(
+        {
+            "sha": REAL_MAIN,
+            "commit": {"tree": REAL_TREE, "parents": REAL["main"]["parents"]},
+            "associated_pulls": REAL["associated_pulls"],
+            "pull": REAL["pull"],
+            "head": {"sha": head["sha"], "tree": head["tree"], "base_is_ancestor": head["base_is_ancestor"]},
+            "check_runs": pages(head["check_runs"], "check_runs"),
+            "workflow_runs": pages(head["workflow_runs"], "workflow_runs"),
+        }
+    )
+
+
+def head_check(read: dict[str, Any], name: str) -> dict[str, Any]:
+    matches = [check for check in read["check_runs"][0]["check_runs"] if check["name"] == name]
+    if len(matches) != 1:
+        raise AssertionError(f"the real head carries {len(matches)} {name!r} check-runs, not one")
+    return matches[0]
+
+
+def head_workflow(read: dict[str, Any], path: str, event: str) -> dict[str, Any]:
+    matches = [
+        run
+        for run in read["workflow_runs"][0]["workflow_runs"]
+        if run["path"] == path and run["event"] == event
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"the real head carries {len(matches)} {path} {event} runs, not one")
+    return matches[0]
+
+
+def grade_at_landing(read: Any, moment: str | None = AT_LANDING) -> dict[str, Any]:
+    """Grade the real landing with export inheritance switched on for the test.
+
+    It is off in the product (EXPORT_INHERITANCE). These cases keep its binding
+    and grading honest for the day it is switched back on.
+    """
+
+    main = main_pages_at(moment)
+    return selector.grade_candidate(
+        REAL_MAIN, main["check_runs"], main["workflow_runs"], read, REPO, export_inheritance=True
+    )
+
+
+class RealExportHeadTests(unittest.TestCase):
+    """The PR head graded on its own, by the rules the push grade applies."""
+
+    def grade(self, read: dict[str, Any]) -> dict[str, Any]:
+        return selector.grade_sha(
+            REAL_HEAD,
+            read["check_runs"],
+            read["workflow_runs"],
+            provenance=selector.Provenance(REAL_HEAD, REAL_REF, selector.KIND_EXPORT),
+        )
+
+    def test_the_real_head_is_green_on_its_own_runs(self) -> None:
+        verdict = self.grade(real_inheritance_read())
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        self.assertEqual(verdict["runs"], {"CI": REAL_CI_RUN, "Acceptance": REAL_ACCEPTANCE_RUN})
+
+    def test_the_skipped_pull_request_twin_of_gitleaks_is_not_evidence(self) -> None:
+        """secret-scan.yml publishes the name twice at the head: skipped, then green.
+
+        The skipped copy is the pull_request run the workflow's own `if:` skips
+        for a same-repository branch; the green one is the branch push. Reading
+        both as evidence would make every export head ambiguous.
+        """
+
+        read = real_inheritance_read()
+        names = [check["conclusion"] for check in read["check_runs"][0]["check_runs"]
+                 if check["name"] == "gitleaks (full history)"]
+        self.assertEqual(sorted(names), ["skipped", "success"])
+        self.assertEqual(self.grade(read)["verdict"], selector.GREEN)
+        # Under the other event the green copy is no longer evidence, so the
+        # rule is about the event and not merely about picking a green one.
+        head_workflow(read, ".github/workflows/secret-scan.yml", "push")["event"] = "pull_request"
+        head_workflow_runs = read["workflow_runs"][0]["workflow_runs"]
+        self.assertEqual(sum(run["path"].endswith("secret-scan.yml") for run in head_workflow_runs), 2)
+        self.assertEqual(self.grade(read)["verdict"], selector.DEAD)
+
+    def test_the_acceptance_job_must_have_run_on_the_head(self) -> None:
+        read = real_inheritance_read()
+        head_check(read, "Product Acceptance")["conclusion"] = "skipped"
+        verdict = self.grade(read)
+        self.assertEqual(verdict["verdict"], selector.DEAD)
+        self.assertIn("required check not green: Product Acceptance (conclusion=skipped)", verdict["dead"])
+
+    def test_the_head_is_graded_on_its_own_branch_and_sha(self) -> None:
+        read = real_inheritance_read()
+        head_workflow(read, ".github/workflows/ci.yml", "pull_request")["head_branch"] = "feature/lookalike"
+        verdict = self.grade(read)
+        self.assertNotEqual(verdict["verdict"], selector.GREEN)
+        self.assertIn(f"no CI pull_request run on {REAL_REF} at this sha yet", verdict["pending"])
+
+
+class RealInheritanceTests(unittest.TestCase):
+    def assertFallsBack(self, read: dict[str, Any], needle: str) -> dict[str, Any]:
+        verdict = grade_at_landing(read)
+        self.assertEqual(verdict["evidence"]["source"], selector.EVIDENCE_PUSH, verdict["evidence"])
+        self.assertEqual(verdict["verdict"], selector.PENDING, verdict)
+        self.assertIn("refused", verdict["evidence"]["inheritance"])
+        self.assertIn(needle, verdict["evidence"]["inheritance"])
+        return verdict
+
+    def test_the_landing_inherits_the_export_heads_grade(self) -> None:
+        """08d48c27 fifteen minutes after landing, with main's CI still running."""
+
+        verdict = grade_at_landing(real_inheritance_read())
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        evidence = verdict["evidence"]
+        self.assertEqual(evidence["source"], selector.EVIDENCE_EXPORT)
+        self.assertEqual(evidence["pull"], 1848)
+        self.assertEqual(evidence["head_sha"], REAL_HEAD)
+        self.assertEqual(evidence["head_ref"], REAL_REF)
+        self.assertEqual(evidence["base_sha"], REAL_BASE)
+        self.assertEqual(evidence["tree"], REAL_TREE)
+        self.assertEqual(evidence["runs"], {"CI": REAL_CI_RUN, "Acceptance": REAL_ACCEPTANCE_RUN})
+        # What main's own grade was waiting on stays in the record, so the
+        # decision says what it did not wait for.
+        self.assertEqual(evidence["main_push"]["verdict"], selector.PENDING)
+        self.assertIn("CI push run 38187338698 is in_progress", evidence["main_push"]["pending"])
+
+    def test_the_squash_subject_locates_the_pull_request_while_the_index_lags(self) -> None:
+        """The landing push can wake the cut before GitHub indexes the merge."""
+
+        read = real_inheritance_read()
+        read["associated_pulls"] = []
+        read["subject_pull"] = 1848
+        verdict = grade_at_landing(read)
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        self.assertEqual(verdict["evidence"]["pull"], 1848)
+
+        # The subject only locates. Another pull request claiming the commit,
+        # or a subject naming one that did not merge as it, still refuses.
+        claimed = real_inheritance_read()
+        claimed["subject_pull"] = 1848
+        claimed["associated_pulls"] = [{"number": 1849, "merge_commit_sha": REAL_MAIN}]
+        self.assertEqual(grade_at_landing(claimed)["verdict"], selector.PENDING)
+
+    def test_main_graded_without_inheritance_is_pending_at_landing(self) -> None:
+        """The control: this is the 86 to 93 minutes inheritance takes off the path."""
+
+        verdict = grade_at_landing(None)
+        self.assertEqual(verdict["verdict"], selector.PENDING)
+        self.assertEqual(verdict["evidence"], {"source": selector.EVIDENCE_PUSH, "sha": REAL_MAIN})
+
+    def test_main_green_on_its_own_is_graded_as_before_and_reads_nothing_more(self) -> None:
+        def unread() -> dict[str, Any]:
+            raise AssertionError("a green push grade must not spend the inheritance reads")
+
+        verdict = grade_at_landing(unread, moment=None)
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        self.assertEqual(verdict["evidence"]["source"], selector.EVIDENCE_PUSH)
+        self.assertEqual(verdict["runs"], {"CI": 38_187_338_698, "Acceptance": 38_187_338_482})
+
+    def test_an_unreadable_inheritance_read_falls_back_rather_than_failing_the_cut(self) -> None:
+        def unreadable() -> dict[str, Any]:
+            raise selector.SelectionError("gh api repos/kinlab-ai/kin/pulls/1848 failed: HTTP 502")
+
+        verdict = grade_at_landing(unreadable)
+        self.assertEqual(verdict["verdict"], selector.PENDING)
+        self.assertIn("unreadable, so not considered", verdict["evidence"]["inheritance"])
+        self.assertIn("HTTP 502", verdict["evidence"]["inheritance"])
+
+    def test_a_tree_that_differs_falls_back(self) -> None:
+        read = real_inheritance_read()
+        read["head"]["tree"] = "f" * 40
+        self.assertFallsBack(read, f"{REAL_MAIN}'s tree {REAL_TREE} is not #1848's head tree")
+
+    def test_a_commit_that_is_not_the_squash_merge_falls_back(self) -> None:
+        read = real_inheritance_read()
+        read["pull"]["merge_commit_sha"] = "e" * 40
+        self.assertFallsBack(read, f"#1848 is not merged as {REAL_MAIN}")
+
+        unmerged = real_inheritance_read()
+        unmerged["pull"]["merged"] = False
+        self.assertFallsBack(unmerged, f"#1848 is not merged as {REAL_MAIN}")
+
+        unnamed = real_inheritance_read()
+        unnamed["associated_pulls"] = [{"number": 1848, "merge_commit_sha": "e" * 40}]
+        self.assertFallsBack(unnamed, f"no pull request names {REAL_MAIN} as its merge commit")
+
+        named_elsewhere = real_inheritance_read()
+        named_elsewhere["associated_pulls"] = []
+        named_elsewhere["subject_pull"] = 1848
+        named_elsewhere["pull"]["merge_commit_sha"] = "e" * 40
+        self.assertFallsBack(named_elsewhere, f"#1848 is not merged as {REAL_MAIN}")
+
+        twice = real_inheritance_read()
+        twice["associated_pulls"].append({"number": 1849, "merge_commit_sha": REAL_MAIN})
+        self.assertFallsBack(twice, f"2 pull requests name {REAL_MAIN} as their merge commit")
+
+        merge_commit = real_inheritance_read()
+        merge_commit["commit"]["parents"] = [REAL_BASE, REAL_HEAD]
+        self.assertFallsBack(merge_commit, "has 2 parents, so it is not the squash of #1848")
+
+    def test_a_parent_that_is_not_the_base_falls_back(self) -> None:
+        read = real_inheritance_read()
+        read["commit"]["parents"] = ["9" * 40]
+        self.assertFallsBack(read, f"{REAL_MAIN}'s parent {'9' * 40} is not #1848's base {REAL_BASE}")
+
+    def test_a_base_that_is_not_the_heads_ancestor_falls_back(self) -> None:
+        """Then a pull_request run could have tested the head merged with other commits."""
+
+        read = real_inheritance_read()
+        read["head"]["base_is_ancestor"] = False
+        self.assertFallsBack(read, "is not an ancestor of its head")
+
+    def test_a_head_that_reads_back_differently_falls_back(self) -> None:
+        read = real_inheritance_read()
+        read["head"]["sha"] = "8" * 40
+        self.assertFallsBack(read, f"#1848's head read back as {'8' * 40}, not {REAL_HEAD}")
+
+    def test_only_an_export_branch_of_this_repository_is_admitted(self) -> None:
+        other_branch = real_inheritance_read()
+        other_branch["pull"]["head"]["ref"] = "chore/lane-x"
+        self.assertFallsBack(other_branch, "is not an export branch")
+
+        fork = real_inheritance_read()
+        fork["pull"]["head"]["repo"]["full_name"] = "someone/kin"
+        self.assertFallsBack(fork, "#1848's head is not a branch of kinlab-ai/kin")
+
+        elsewhere = real_inheritance_read()
+        elsewhere["pull"]["base"]["ref"] = "release/v0.8.2"
+        self.assertFallsBack(elsewhere, "#1848 does not target kinlab-ai/kin main")
+
+    def test_a_red_context_on_the_head_falls_back(self) -> None:
+        read = real_inheritance_read()
+        head_check(read, "Falsify guards")["conclusion"] = "failure"
+        self.assertFallsBack(read, "required check not green: Falsify guards (conclusion=failure)")
+
+    def test_a_duplicated_context_on_the_head_falls_back(self) -> None:
+        read = real_inheritance_read()
+        twin = copy.deepcopy(head_check(read, "cargo-deny"))
+        twin["id"] += 1
+        read["check_runs"][0]["check_runs"].append(twin)
+        read["check_runs"][0]["total_count"] += 1
+        self.assertFallsBack(read, "ambiguous required check: cargo-deny (2 check-runs under one provenance")
+
+    def test_a_context_from_the_wrong_app_falls_back(self) -> None:
+        read = real_inheritance_read()
+        head_check(read, "Check & Test (ubuntu-latest)")["app"] = {"id": 99, "slug": "impostor"}
+        self.assertFallsBack(
+            read, "required check name claimed by another app: Check & Test (ubuntu-latest) ('impostor')"
+        )
+
+    def test_a_context_from_the_wrong_workflow_falls_back(self) -> None:
+        read = real_inheritance_read()
+        head_workflow(read, ".github/workflows/sast.yml", "pull_request")["workflow_id"] = 999
+        self.assertFallsBack(read, "required check workflow provenance mismatch: cargo-deny")
+
+    def test_a_head_still_being_graded_falls_back(self) -> None:
+        read = real_inheritance_read()
+        head_workflow(read, ".github/workflows/acceptance.yml", "pull_request").update(
+            status="in_progress", conclusion=None
+        )
+        self.assertFallsBack(read, f"Acceptance pull_request run {REAL_ACCEPTANCE_RUN} is in_progress")
+
+    def test_a_red_on_mains_own_runs_is_never_overridden(self) -> None:
+        """The same tree failing on main is a verdict, whatever the pull request said."""
+
+        main = main_pages_at(AT_LANDING)
+        for check in main["check_runs"][0]["check_runs"]:
+            if check["name"] == "cargo-deny":
+                check["conclusion"] = "failure"
+        verdict = selector.grade_candidate(
+            REAL_MAIN, main["check_runs"], main["workflow_runs"], real_inheritance_read(), REPO,
+            export_inheritance=True,
+        )
+        self.assertEqual(verdict["verdict"], selector.DEAD)
+        self.assertIn("not considered", verdict["evidence"]["inheritance"])
+        self.assertIn("cargo-deny", verdict["evidence"]["inheritance"])
+
+    def test_a_second_writer_on_main_is_never_overridden(self) -> None:
+        main = main_pages_at(AT_LANDING)
+        for check in main["check_runs"][0]["check_runs"]:
+            if check["name"] == "gitleaks (full history)":
+                check["app"] = {"id": 99, "slug": "impostor"}
+        verdict = selector.grade_candidate(
+            REAL_MAIN, main["check_runs"], main["workflow_runs"], real_inheritance_read(), REPO,
+            export_inheritance=True,
+        )
+        self.assertEqual(verdict["verdict"], selector.DEAD)
+        self.assertIn("claimed by another app", verdict["evidence"]["inheritance"])
+
+    def test_a_cancelled_main_run_is_no_verdict_and_inheritance_stands(self) -> None:
+        main = main_pages_at(AT_LANDING)
+        for run in main["workflow_runs"][0]["workflow_runs"]:
+            if run["path"] == ".github/workflows/ci.yml" and run["event"] == "push":
+                run.update(status="completed", conclusion="cancelled")
+        verdict = selector.grade_candidate(
+            REAL_MAIN, main["check_runs"], main["workflow_runs"], real_inheritance_read(), REPO,
+            export_inheritance=True,
+        )
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        self.assertIn("CI push run 38187338698 concluded cancelled", verdict["evidence"]["main_push"]["dead"])
+
+
+class RealInheritanceDecisionTests(unittest.TestCase):
+    """The decision record names the pull request and the runs it inherited."""
+
+    def landing_snapshot(self) -> dict[str, Any]:
+        document = snapshot(version=RELEASABLE, range=[REAL_MAIN, REAL_BASE])
+        document["grades"] = {REAL_MAIN: {**main_pages_at(AT_LANDING), "inheritance": real_inheritance_read()}}
+        return document
+
+    def test_the_landing_arms_on_inherited_evidence(self) -> None:
+        document = self.landing_snapshot()
+        grades = document["grades"]
+        decision = selector.judge(
+            document,
+            lambda sha: selector.grade_candidate(
+                sha, grades[sha]["check_runs"], grades[sha]["workflow_runs"], grades[sha]["inheritance"], REPO,
+                export_inheritance=True,
+            ),
+        )
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertEqual(decision.candidate, REAL_MAIN)
+        self.assertEqual(decision.move, selector.MOVE_CREATE)
+        for needle in (
+            "inherits CI and Acceptance evidence from export pull request #1848",
+            f"CI run {REAL_CI_RUN}",
+            f"Acceptance run {REAL_ACCEPTANCE_RUN}",
+            f"its tree {REAL_TREE} is the head {REAL_HEAD}'s tree",
+            "CI push run 38187338698 is in_progress",
+        ):
+            self.assertIn(needle, decision.reason)
+        self.assertEqual(decision.details["evidence"]["pull"], 1848)
+
+    def test_the_shipped_selector_inherits_nothing_while_the_switch_is_off(self) -> None:
+        """A pull request head's contexts can be stand-ins now, so the product does not inherit.
+
+        The same real landing that arms with the switch on stands down through
+        the command line, which runs the product default, and the record says
+        main's own push runs are what it waits for.
+        """
+
+        self.assertFalse(selector.EXPORT_INHERITANCE)
+        document = self.landing_snapshot()
+        document["range"] = [REAL_MAIN]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(document, handle)
+            path = handle.name
+        result = subprocess.run(
+            [sys.executable, str(SELECTOR_PATH), "select", "--snapshot", path],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)
+        self.assertEqual(decision["decision"], selector.STAND_DOWN, decision)
+        self.assertIn("still being graded", decision["reason"])
+
+    def test_the_inheritance_command_tells_the_mint_nothing_is_inherited(self) -> None:
+        def run(read: dict[str, Any], sha: str = REAL_MAIN) -> subprocess.CompletedProcess:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+                json.dump(read, handle)
+                path = handle.name
+            return subprocess.run(
+                [sys.executable, str(SELECTOR_PATH), "inheritance", "--sha", sha, "--document", path],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        answered = run(real_inheritance_read())
+        self.assertEqual(answered.returncode, 0, answered.stderr)
+        answer = json.loads(answered.stdout)
+        self.assertFalse(answer["inherited"], answer)
+        self.assertIn("export inheritance is off", answer["reasons"][0])
+        self.assertEqual(run(real_inheritance_read(), sha="abc").returncode, 2)
+
+    def test_the_binding_the_mint_would_read_is_still_exact(self) -> None:
+        """What `inheritance` answers once the switch is back on, from the pure rule."""
+
+        answer = selector.resolve_inheritance(REAL_MAIN, real_inheritance_read(), REPO)
+        self.assertTrue(answer["inherited"], answer)
+        self.assertEqual(
+            {key: answer[key] for key in ("sha", "pull", "head_sha", "head_ref", "base_sha", "tree")},
+            {
+                "sha": REAL_MAIN,
+                "pull": 1848,
+                "head_sha": REAL_HEAD,
+                "head_ref": REAL_REF,
+                "base_sha": REAL_BASE,
+                "tree": REAL_TREE,
+            },
+        )
+
+def git(workspace: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        [
+            "git", "-C", str(workspace),
+            "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+            *arguments,
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+class ReadInheritanceTests(unittest.TestCase):
+    """The live read's git half, against a real repository shaped like an export.
+
+    The origin carries main with a squash on top of the base, and
+    refs/pull/<n>/head carrying the export head, which is how GitHub keeps a
+    merged pull request's head. The workspace is a clone of main alone, like
+    the protected-main checkout the cut and the mint read from.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        root = Path(self.directory.name)
+        self.origin = root / "origin.git"
+        self.author = root / "author"
+        subprocess.run(["git", "init", "--quiet", "--bare", str(self.origin)], check=True)
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(self.author)], check=True)
+        (self.author / "lib.rs").write_text("one\n", encoding="utf-8")
+        git(self.author, "add", "lib.rs")
+        git(self.author, "commit", "--quiet", "-s", "-m", "base")
+        self.base = git(self.author, "rev-parse", "HEAD")
+        (self.author / "lib.rs").write_text("two\n", encoding="utf-8")
+        git(self.author, "commit", "--quiet", "-s", "-am", "export head")
+        self.head = git(self.author, "rev-parse", "HEAD")
+        tree = git(self.author, "rev-parse", "HEAD^{tree}")
+        self.squash = git(self.author, "commit-tree", tree, "-p", self.base, "-m", "Update kin source (#7)")
+        self.lagging_index = False
+        git(self.author, "push", "--quiet", str(self.origin), f"{self.squash}:refs/heads/main",
+            f"{self.head}:refs/pull/7/head")
+        self.workspace = root / "workspace"
+        subprocess.run(["git", "clone", "--quiet", "--branch", "main", str(self.origin), str(self.workspace)], check=True)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def fetch(self, head_sha: str) -> Any:
+        read = real_inheritance_read()
+        for run in read["workflow_runs"][0]["workflow_runs"]:
+            run["head_sha"] = head_sha
+        pull = {
+            "number": 7,
+            "merged": True,
+            "merge_commit_sha": self.squash,
+            "head": {"sha": head_sha, "ref": REAL_REF, "repo": {"full_name": REPO}},
+            "base": {"sha": self.base, "ref": "main", "repo": {"full_name": REPO}},
+        }
+        answers = {
+            selector.commit_pulls_endpoint(REPO, self.squash): (
+                [] if self.lagging_index else [{"number": 7, "merge_commit_sha": self.squash}]
+            ),
+            selector.pull_endpoint(REPO, 7): pull,
+            selector.check_runs_endpoint(REPO, head_sha, 1): read["check_runs"][0],
+            selector.workflow_runs_endpoint(REPO, head_sha, 1): read["workflow_runs"][0],
+        }
+
+        def fetch(endpoint: str) -> Any:
+            if endpoint not in answers:
+                raise AssertionError(f"unexpected endpoint {endpoint}")
+            return copy.deepcopy(answers[endpoint])
+
+        return fetch
+
+    def test_the_read_binds_the_squash_from_git_and_the_head_inherits(self) -> None:
+        read = selector.read_inheritance(self.fetch(self.head), REPO, self.squash, self.workspace)
+        self.assertEqual(read["commit"]["parents"], [self.base])
+        self.assertEqual(read["commit"]["tree"], read["head"]["tree"])
+        self.assertEqual(read["head"]["sha"], self.head)
+        self.assertTrue(read["head"]["base_is_ancestor"])
+        answer = selector.resolve_inheritance(self.squash, read, REPO)
+        self.assertTrue(answer["inherited"], answer)
+        self.assertEqual(answer["pull"], 7)
+
+    def test_the_subject_of_the_squash_in_git_locates_the_pull_request(self) -> None:
+        self.lagging_index = True
+        read = selector.read_inheritance(self.fetch(self.head), REPO, self.squash, self.workspace)
+        self.assertEqual(read["associated_pulls"], [])
+        self.assertEqual(read["subject_pull"], 7)
+        self.assertTrue(selector.resolve_inheritance(self.squash, read, REPO)["inherited"])
+
+    def test_a_head_built_on_another_base_is_read_as_not_descending_from_it(self) -> None:
+        """The head's tree matches, but it was built beside the base rather than on it."""
+
+        git(self.author, "checkout", "--quiet", "--orphan", "elsewhere")
+        (self.author / "lib.rs").write_text("two\n", encoding="utf-8")
+        git(self.author, "add", "lib.rs")
+        git(self.author, "commit", "--quiet", "-s", "-m", "unrelated history, same tree")
+        stray = git(self.author, "rev-parse", "HEAD")
+        git(self.author, "push", "--quiet", "--force", str(self.origin), f"{stray}:refs/pull/7/head")
+        read = selector.read_inheritance(self.fetch(stray), REPO, self.squash, self.workspace)
+        self.assertEqual(read["commit"]["tree"], read["head"]["tree"])
+        self.assertFalse(read["head"]["base_is_ancestor"])
+        answer = selector.resolve_inheritance(self.squash, read, REPO)
+        self.assertFalse(answer["inherited"])
+        self.assertIn("is not an ancestor of its head", answer["reasons"][0])
+
+
+# ---------------------------------------------------------------------------
+# A runner timeout is a retry, not a spent rc-build attempt.
+# ---------------------------------------------------------------------------
+
+
+REAL_TIMEOUTS = REAL["rc_builds"]["timed_out"]
+REAL_CONCURRENCY_CANCEL = REAL["rc_builds"]["concurrency_cancelled"]
+REAL_MANUAL_CANCEL = REAL["rc_builds"]["manually_cancelled"]
+
+
+def real_build(build: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    build = copy.deepcopy(build)
+    build.update(head_sha=REAL_MAIN, artifacts=[])
+    build.update(overrides)
+    return build
+
+
+def cancelled_job(build: dict[str, Any]) -> dict[str, Any]:
+    """The macOS arm64 build leg, cancelled in every real run kept here."""
+
+    jobs = [
+        job for job in build["jobs"]
+        if job["conclusion"] == "cancelled" and job["name"] == "RC Build (kin-macos-aarch64)"
+    ]
+    if len(jobs) != 1:
+        raise AssertionError(f"run {build['id']} has {len(jobs)} cancelled macOS arm64 build legs")
+    return jobs[0]
+
+
+class RcBuildTimeoutTests(unittest.TestCase):
+    def test_both_attempts_spent_on_08d48c27_were_runner_timeouts(self) -> None:
+        for build in REAL_TIMEOUTS:
+            with self.subTest(run=build["id"]):
+                reason = selector.rc_build_timeout(build)
+                self.assertIsNotNone(reason)
+                self.assertIn("RC Build (kin-macos-aarch64) hit its 1h30m0s bound after 1h30m", reason)
+
+    def test_a_concurrency_cancel_and_a_manual_cancel_are_not_timeouts(self) -> None:
+        self.assertIsNone(selector.rc_build_timeout(REAL_CONCURRENCY_CANCEL))
+        self.assertIsNone(selector.rc_build_timeout(REAL_MANUAL_CANCEL))
+
+    def test_a_timeout_text_on_a_job_that_did_not_run_that_long_is_not_a_timeout(self) -> None:
+        build = copy.deepcopy(REAL_TIMEOUTS[0])
+        cancelled_job(build)["completed_at"] = "2026-10-12T02:13:56Z"
+        self.assertIsNone(selector.rc_build_timeout(build))
+
+    def test_a_killed_step_that_ended_before_the_bound_is_not_a_timeout(self) -> None:
+        build = copy.deepcopy(REAL_TIMEOUTS[0])
+        for step in cancelled_job(build)["steps"]:
+            if step["conclusion"] == "cancelled":
+                step["completed_at"] = "2026-10-12T02:13:33Z"
+        self.assertIsNone(selector.rc_build_timeout(build))
+
+    def test_a_timeout_beside_a_manual_cancel_is_not_a_timeout(self) -> None:
+        build = copy.deepcopy(REAL_TIMEOUTS[0])
+        cancelled_job(build)["annotations"].insert(
+            0, {"annotation_level": "failure", "message": "The run was canceled by @someone."}
+        )
+        self.assertIsNone(selector.rc_build_timeout(build))
+
+    def test_a_failed_leg_beside_a_timeout_spends_the_attempt(self) -> None:
+        build = copy.deepcopy(REAL_TIMEOUTS[0])
+        next(job for job in build["jobs"] if job["name"] == "RC Build (kin-linux-x86_64)")["conclusion"] = "failure"
+        self.assertIsNone(selector.rc_build_timeout(build))
+
+    def test_the_older_timeout_text_is_read_too(self) -> None:
+        build = copy.deepcopy(REAL_TIMEOUTS[0])
+        job = cancelled_job(build)
+        job["annotations"][0]["message"] = (
+            "The job running on runner GitHub Actions 2 has exceeded the maximum execution time of 90 minutes."
+        )
+        self.assertIn("hit its 90 minutes bound", selector.rc_build_timeout(build))
+
+    def judge(self, builds: list[dict[str, Any]]) -> Any:
+        grader = Grader({REAL_MAIN: main_pages_at(None)})
+        return selector.judge(
+            snapshot(version=RELEASABLE, range=[REAL_MAIN], candidate=REAL_MAIN, rc_builds=builds),
+            grader,
+        )
+
+    def test_the_candidate_that_died_on_2026_10_12_is_armed_again(self) -> None:
+        builds = [real_build(build) for build in reversed(REAL_TIMEOUTS)]
+        decision = self.judge(builds)
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertEqual(decision.candidate, REAL_MAIN)
+        self.assertEqual(decision.move, selector.MOVE_NONE)
+        self.assertEqual(decision.details["attempts"], [])
+        self.assertEqual(len(decision.details["timeouts"]), 2)
+        self.assertIn("runner timeouts retried rather than spent: 38198979588 (cancelled:", decision.reason)
+
+    def test_timeouts_have_a_budget_of_their_own(self) -> None:
+        third = real_build(REAL_TIMEOUTS[1], id=38_300_000_000, created_at="2026-10-12T05:00:00Z")
+        builds = [third] + [real_build(build) for build in reversed(REAL_TIMEOUTS)]
+        decision = self.judge(builds)
+        self.assertNotEqual(decision.candidate, REAL_MAIN, decision.reason)
+        self.assertTrue(
+            any("rc-build hit its runner timeout 3 times" in note for note in decision.details["notes"]),
+            decision.details,
+        )
+
+    def test_a_failure_still_spends_an_attempt_beside_a_timeout(self) -> None:
+        failed = real_build(REAL_TIMEOUTS[1], id=38_300_000_001, conclusion="failure", created_at="2026-10-12T05:00:00Z")
+        decision = self.judge([failed, real_build(REAL_TIMEOUTS[0])])
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertEqual(decision.details["attempts"], ["38300000001 (failure)"])
+        self.assertEqual(len(decision.details["timeouts"]), 1)
+        second_failure = real_build(REAL_TIMEOUTS[1], id=38_300_000_002, conclusion="failure",
+                                    created_at="2026-10-12T06:00:00Z")
+        dead = self.judge([second_failure, failed, real_build(REAL_TIMEOUTS[0])])
+        self.assertNotEqual(dead.candidate, REAL_MAIN)
+        self.assertTrue(any("rc-build attempts exhausted" in note for note in dead.details["notes"]))
+
+    def test_manual_and_superseding_cancels_still_spend_attempts(self) -> None:
+        builds = [real_build(REAL_MANUAL_CANCEL, created_at="2026-10-12T06:00:00Z"),
+                  real_build(REAL_CONCURRENCY_CANCEL, created_at="2026-10-12T05:00:00Z")]
+        decision = self.judge(builds)
+        self.assertNotEqual(decision.candidate, REAL_MAIN)
+        self.assertTrue(any("rc-build attempts exhausted" in note for note in decision.details["notes"]))
+
+    def test_the_read_carries_a_cancelled_runs_jobs_and_annotations(self) -> None:
+        build = REAL_TIMEOUTS[0]
+        branch = build["head_branch"]
+        run_row = {key: build[key] for key in ("id", "head_sha", "head_branch", "event", "status", "conclusion", "created_at")}
+        answers: dict[str, Any] = {
+            selector.rc_build_runs_endpoint(REPO, branch, 1): {"total_count": 1, "workflow_runs": [run_row]},
+            selector.run_jobs_endpoint(REPO, build["id"], 1): {
+                "total_count": len(build["jobs"]),
+                "jobs": [{key: value for key, value in job.items() if key != "annotations"} for job in build["jobs"]],
+            },
+        }
+        for job in build["jobs"]:
+            if job["conclusion"] == "cancelled":
+                answers[selector.annotations_endpoint(REPO, job["id"])] = job["annotations"]
+
+        def fetch(endpoint: str) -> Any:
+            if endpoint not in answers:
+                raise AssertionError(f"unexpected endpoint {endpoint}")
+            return copy.deepcopy(answers[endpoint])
+
+        builds = selector.read_rc_builds(fetch, REPO, branch)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(
+            [job["name"] for job in builds[0]["jobs"] if job["annotations"]],
+            ["RC Build (kin-macos-aarch64)"],
+        )
+        self.assertIsNotNone(selector.rc_build_timeout(builds[0]))
+
+
+class TimedOutRetryTests(unittest.TestCase):
+    """settled_retry admits a timed-out first attempt, and only a timed-out one."""
+
+    TIMEOUT = REAL_TIMEOUTS[0]
+
+    def annotations(self, message: str) -> list[dict[str, str]]:
+        return [
+            {"annotation_level": "failure", "message": message},
+            {"annotation_level": "failure", "message": "The operation was canceled."},
+        ]
+
+    def grade(self, first: dict[str, Any]) -> dict[str, Any]:
+        checks = [check for check in green_checks() if check["name"] != "Feature permutation tests (macos-latest)"]
+        second = check_run(
+            "Feature permutation tests (macos-latest)",
+            suite=CI_SUITE,
+            started_at="2026-09-28T11:35:00Z",
+            completed_at="2026-09-28T12:50:00Z",
+        )
+        return selector.grade_sha(NEWEST, pages(checks + [first, second], "check_runs"),
+                                  pages(green_workflow_runs(), "workflow_runs"))
+
+    def first(self, message: str, completed_at: str = "2026-09-28T11:30:38Z") -> dict[str, Any]:
+        attempt = check_run(
+            "Feature permutation tests (macos-latest)",
+            suite=CI_SUITE,
+            conclusion="cancelled",
+            started_at="2026-09-28T10:00:00Z",
+            completed_at=completed_at,
+        )
+        attempt["annotations"] = self.annotations(message)
+        return attempt
+
+    def test_a_job_that_hit_its_own_timeout_and_then_passed_is_one_retry(self) -> None:
+        message = cancelled_job(self.TIMEOUT)["annotations"][0]["message"]
+        verdict = self.grade(self.first(message))
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        self.assertEqual(verdict["retried"], ["Feature permutation tests (macos-latest)"])
+
+    def test_a_cancel_that_was_not_a_timeout_stays_ambiguous(self) -> None:
+        for label, message, completed_at in (
+            ("superseded", cancelled_job(REAL_CONCURRENCY_CANCEL)["annotations"][0]["message"], "2026-09-28T11:30:38Z"),
+            ("manual", cancelled_job(REAL_MANUAL_CANCEL)["annotations"][0]["message"], "2026-09-28T11:30:38Z"),
+            ("early", cancelled_job(self.TIMEOUT)["annotations"][0]["message"], "2026-09-28T10:20:00Z"),
+        ):
+            with self.subTest(label=label):
+                verdict = self.grade(self.first(message, completed_at))
+                self.assertEqual(verdict["verdict"], selector.DEAD, verdict)
+                self.assertTrue(any("ambiguous required check" in line for line in verdict["dead"]))
+
+    def test_a_cancel_with_no_annotations_stays_ambiguous(self) -> None:
+        attempt = self.first("unused")
+        attempt["annotations"] = []
+        self.assertEqual(self.grade(attempt)["verdict"], selector.DEAD)
+
+    def test_the_live_grade_reads_annotations_only_for_cancelled_required_checks(self) -> None:
+        cancelled = self.first("unused")
+        del cancelled["annotations"]
+        cancelled["id"] = 77
+        checks = green_checks() + [cancelled, check_run("Code Coverage", suite=CI_SUITE, conclusion="cancelled")]
+        checks[-1]["id"] = 78
+        read: list[str] = []
+
+        def fetch(endpoint: str) -> Any:
+            read.append(endpoint)
+            if endpoint == selector.check_runs_endpoint(REPO, NEWEST, 1):
+                return {"total_count": len(checks), "check_runs": copy.deepcopy(checks)}
+            if endpoint == selector.workflow_runs_endpoint(REPO, NEWEST, 1):
+                return {"total_count": len(green_workflow_runs()), "workflow_runs": green_workflow_runs()}
+            if endpoint == selector.annotations_endpoint(REPO, 77):
+                return self.annotations(cancelled_job(self.TIMEOUT)["annotations"][0]["message"])
+            raise AssertionError(f"unexpected endpoint {endpoint}")
+
+        selector.grade_live(fetch, REPO, NEWEST)
+        self.assertIn(selector.annotations_endpoint(REPO, 77), read)
+        self.assertNotIn(selector.annotations_endpoint(REPO, 78), read)
+
+
+# ---------------------------------------------------------------------------
+# The merge queue: the group commit is the release candidate.
+# ---------------------------------------------------------------------------
+
+
+QUEUE_REF_REAL = f"gh-readonly-queue/main/pr-1848-{REAL_BASE}"
+QUEUE_PRODUCERS = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/acceptance.yml",
+    ".github/workflows/sast.yml",
+    ".github/workflows/secret-scan.yml",
+)
+
+
+def merge_group_pages(moment: str | None = None) -> dict[str, Any]:
+    """08d48c27's real listings as the merge queue's build of it would read.
+
+    The same runs and check-runs, carried by the group commit's queue ref under
+    the merge_group event, and no push build on main: the landing that ships
+    0.8.4 is graded on the queue's build alone.
+    """
+
+    checks, runs = main_listings_at(moment)
+    for run in runs:
+        if run["head_branch"] == "main" and run["event"] == "push" and run["path"] in QUEUE_PRODUCERS:
+            run.update(event="merge_group", head_branch=QUEUE_REF_REAL)
+    return grade_pages(checks, runs)
+
+
+def grade_queued_landing(pages_: dict[str, Any], parents: list[str] | None = None) -> dict[str, Any]:
+    return selector.grade_candidate(
+        REAL_MAIN, pages_["check_runs"], pages_["workflow_runs"], None, REPO, parents or [REAL_BASE]
+    )
+
+
+def queue_runs(pages_: dict[str, Any]) -> list[dict[str, Any]]:
+    return pages_["workflow_runs"][0]["workflow_runs"]
+
+
+def queue_checks(pages_: dict[str, Any]) -> list[dict[str, Any]]:
+    return pages_["check_runs"][0]["check_runs"]
+
+
+def queue_rc_build(**overrides: Any) -> dict[str, Any]:
+    """The real RC Build of 08d48c27, as the queue's build of the group commit."""
+
+    build = real_build(REAL_TIMEOUTS[0], event="merge_group", head_branch=QUEUE_REF_REAL, run_attempt=1)
+    build.update(overrides)
+    return build
+
+
+def usable_queue_rc_build(**overrides: Any) -> dict[str, Any]:
+    return queue_rc_build(conclusion="success", artifacts=sorted(selector.RC_RELEASE_ARTIFACTS), **overrides)
+
+
+class MergeGroupGradeTests(unittest.TestCase):
+    def test_a_queued_landing_is_graded_on_the_queues_build_of_it(self) -> None:
+        verdict = grade_queued_landing(merge_group_pages())
+        self.assertEqual(verdict["verdict"], selector.GREEN, verdict)
+        evidence = verdict["evidence"]
+        self.assertEqual(evidence["source"], selector.EVIDENCE_MERGE_GROUP)
+        self.assertEqual((evidence["queue_ref"], evidence["pull"], evidence["base_sha"]), (QUEUE_REF_REAL, 1848, REAL_BASE))
+        self.assertEqual(evidence["runs"], {"CI": 38_187_338_698, "Acceptance": 38_187_338_482})
+        self.assertIn("no CI push run on main at this sha yet", evidence["main_push"]["pending"])
+
+    def test_a_queue_build_of_another_parent_proved_another_tree(self) -> None:
+        # With no push build at all, main's own grade is dead without a red:
+        # its contexts are missing, which is no verdict, and nothing stands in.
+        verdict = grade_queued_landing(merge_group_pages(), parents=["9" * 40])
+        self.assertEqual(verdict["verdict"], selector.DEAD)
+        self.assertEqual(verdict["evidence"]["source"], selector.EVIDENCE_PUSH)
+        self.assertIn("proved a different tree", verdict["evidence"]["merge_group"])
+
+    def test_two_uncancelled_queue_builds_are_ambiguous(self) -> None:
+        pages_ = merge_group_pages()
+        ci = next(run for run in queue_runs(pages_) if run["path"] == ".github/workflows/ci.yml")
+        queue_runs(pages_).append({**ci, "id": ci["id"] + 1, "check_suite_id": ci["check_suite_id"] + 1})
+        pages_["workflow_runs"][0]["total_count"] += 1
+        verdict = grade_queued_landing(pages_)
+        self.assertNotEqual(verdict["verdict"], selector.GREEN)
+        self.assertIn("ambiguous merge-group evidence", verdict["evidence"]["merge_group"])
+
+    def test_a_branch_that_looks_like_the_queue_is_not_the_queue(self) -> None:
+        pages_ = merge_group_pages()
+        for run in queue_runs(pages_):
+            if run["head_branch"] == QUEUE_REF_REAL:
+                run["head_branch"] = f"chore/gh-readonly-queue/main/pr-1848-{REAL_BASE}"
+        verdict = grade_queued_landing(pages_)
+        self.assertNotEqual(verdict["verdict"], selector.GREEN)
+        self.assertIn("is not on a merge-queue ref of main", verdict["evidence"]["merge_group"])
+
+    def test_a_red_context_in_the_queue_build_is_not_evidence(self) -> None:
+        pages_ = merge_group_pages()
+        for check in queue_checks(pages_):
+            if check["name"] == "Falsify guards":
+                check["conclusion"] = "failure"
+        verdict = grade_queued_landing(pages_)
+        self.assertNotEqual(verdict["verdict"], selector.GREEN)
+        self.assertIn("required check not green: Falsify guards (conclusion=failure)", verdict["evidence"]["merge_group"])
+
+    def test_the_queue_build_must_have_run_acceptance(self) -> None:
+        pages_ = merge_group_pages()
+        for check in queue_checks(pages_):
+            if check["name"] == "Product Acceptance":
+                check["conclusion"] = "skipped"
+        verdict = grade_queued_landing(pages_)
+        self.assertNotEqual(verdict["verdict"], selector.GREEN)
+        self.assertIn("Product Acceptance (conclusion=skipped)", verdict["evidence"]["merge_group"])
+
+    def test_gitleaks_from_a_push_to_the_queue_ref_is_not_the_queue_build(self) -> None:
+        """secret-scan.yml publishes under merge_group in the queue now, like the rest."""
+
+        pages_ = merge_group_pages()
+        for run in queue_runs(pages_):
+            if run["path"] == ".github/workflows/secret-scan.yml" and run["head_branch"] == QUEUE_REF_REAL:
+                run["event"] = "push"
+        verdict = grade_queued_landing(pages_)
+        self.assertNotEqual(verdict["verdict"], selector.GREEN)
+        self.assertIn("missing required check: gitleaks (full history)", verdict["evidence"]["merge_group"])
+
+    def test_a_red_main_push_is_never_overridden_by_the_queue(self) -> None:
+        pages_ = merge_group_pages()
+        sast = next(run for run in queue_runs(pages_) if run["path"] == ".github/workflows/sast.yml")
+        queue_runs(pages_).append(
+            {**sast, "id": sast["id"] + 7, "event": "push", "head_branch": "main", "conclusion": "failure",
+             "check_suite_id": 777_000_001}
+        )
+        queue_checks(pages_).append(
+            check_run("cargo-deny", suite=777_000_001, conclusion="failure")
+        )
+        pages_["workflow_runs"][0]["total_count"] += 1
+        pages_["check_runs"][0]["total_count"] += 1
+        verdict = grade_queued_landing(pages_)
+        self.assertEqual(verdict["verdict"], selector.DEAD)
+        self.assertIn("not considered", verdict["evidence"]["inheritance"])
+
+    def test_a_commit_that_never_went_through_the_queue_is_graded_on_main_alone(self) -> None:
+        verdict = grade_queued_landing(main_pages_at(AT_LANDING))
+        self.assertEqual(verdict["verdict"], selector.PENDING)
+        self.assertNotIn("merge_group", verdict["evidence"])
+
+
+class QueuedLandingDecisionTests(unittest.TestCase):
+    """A queued landing on main: preflight the queue's archives, never rebuild them."""
+
+    def judge(self, builds: list[dict[str, Any]], *, candidate: str | None = None) -> Any:
+        pages_ = merge_group_pages()
+        return selector.judge(
+            snapshot(version=RELEASABLE, range=[REAL_MAIN], candidate=candidate),
+            lambda sha: grade_queued_landing(pages_),
+            lambda sha: [copy.deepcopy(build) for build in builds],
+        )
+
+    def test_a_usable_queue_build_is_preflighted_rather_than_rebuilt(self) -> None:
+        build = usable_queue_rc_build()
+        decision = self.judge([build])
+        self.assertEqual(decision.decision, selector.PROOF, decision.reason)
+        self.assertEqual((decision.candidate, decision.rc_run, decision.move), (REAL_MAIN, build["id"], None))
+        self.assertIn("landed through the merge queue", decision.reason)
+        self.assertIn(f"graded on the merge queue's build of this very commit on {QUEUE_REF_REAL}", decision.reason)
+        self.assertEqual(decision.details["rc_source"], selector.EVIDENCE_MERGE_GROUP)
+
+    def test_a_running_queue_build_is_waited_for(self) -> None:
+        build = queue_rc_build(status="in_progress", conclusion=None)
+        decision = self.judge([build])
+        self.assertEqual(decision.decision, selector.STAND_DOWN, decision.reason)
+        self.assertEqual(decision.rc_run, build["id"])
+
+    def test_a_queue_build_its_runner_timeout_killed_is_re_run(self) -> None:
+        build = queue_rc_build()
+        decision = self.judge([build])
+        self.assertEqual(decision.decision, selector.RETRY, decision.reason)
+        self.assertEqual(decision.rc_run, build["id"])
+        self.assertIn("re-running its failed jobs rather than spending the candidate", decision.reason)
+
+    def test_a_queue_build_that_timed_out_on_every_attempt_falls_back_to_a_dispatch(self) -> None:
+        decision = self.judge([queue_rc_build(run_attempt=selector.RC_BUILD_TIMEOUT_LIMIT)])
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertEqual(decision.move, selector.MOVE_CREATE)
+        self.assertTrue(any("on all 3 attempts" in note for note in decision.details["notes"]), decision.details)
+
+    def test_a_failed_queue_build_falls_back_to_a_dispatch(self) -> None:
+        decision = self.judge([queue_rc_build(conclusion="failure", jobs=[])])
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertTrue(any("concluded failure" in note for note in decision.details["notes"]))
+
+    def test_an_armed_candidate_is_not_built_again_beside_a_usable_queue_build(self) -> None:
+        build = usable_queue_rc_build()
+        decision = self.judge([build], candidate=REAL_MAIN)
+        self.assertEqual(decision.decision, selector.PROOF, decision.reason)
+        self.assertEqual(decision.rc_run, build["id"])
+        running = self.judge([queue_rc_build(status="in_progress", conclusion=None)], candidate=REAL_MAIN)
+        self.assertEqual(running.decision, selector.STAND_DOWN, running.reason)
+
+    def test_a_landing_with_no_queue_build_arms_its_own(self) -> None:
+        decision = self.judge([])
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertEqual(decision.move, selector.MOVE_CREATE)
+
+
+def queue_snapshot(**overrides: Any) -> dict[str, Any]:
+    document = {
+        "mode": "merge-group",
+        "repository": REPO,
+        "sha": REAL_MAIN,
+        "version": RELEASABLE,
+        "binding": {"bound": "merge-group", "ref": QUEUE_REF_REAL, "pull": 1848, "base": REAL_BASE, "stacked": False},
+        "tag_exists": False,
+        "evidence": {},
+        "rc_builds": [usable_queue_rc_build()],
+    }
+    document.update(overrides)
+    return document
+
+
+class QueueWindowTests(unittest.TestCase):
+    """The group is still queued: file its preflight before the queue lands it."""
+
+    def assertQueue(self, document: dict[str, Any], decision: str, state: str | None, needle: str) -> Any:
+        verdict = selector.judge_queue(document)
+        self.assertEqual(verdict.decision, decision, verdict.reason)
+        self.assertEqual(verdict.queue_state, state, verdict.reason)
+        self.assertIn(needle, verdict.reason)
+        return verdict
+
+    def test_a_release_groups_usable_build_is_preflighted_inside_the_queue_window(self) -> None:
+        verdict = self.assertQueue(queue_snapshot(), selector.PROOF, selector.QUEUE_PROOF, "before the queue lands it")
+        self.assertEqual((verdict.candidate, verdict.queue_sha), (REAL_MAIN, REAL_MAIN))
+        self.assertEqual(verdict.rc_run, REAL_TIMEOUTS[0]["id"])
+        self.assertEqual(verdict.branch, f"release/v{RELEASABLE}-candidate")
+
+    def test_the_queue_waits_while_the_build_runs_or_has_not_started(self) -> None:
+        self.assertQueue(queue_snapshot(rc_builds=[queue_rc_build(status="queued", conclusion=None)]),
+                         selector.STAND_DOWN, None, "is queued")
+        self.assertQueue(queue_snapshot(rc_builds=[]), selector.STAND_DOWN, None, "no RC Build has started")
+
+    def test_a_timeout_in_the_queue_fails_the_group_rather_than_outliving_its_window(self) -> None:
+        """A leg that timed out spent its 60-minute bound; a re-run cannot land within 90."""
+
+        self.assertGreater(2 * selector.MERGE_GROUP_LEG_MINUTES, selector.QUEUE_RESPONSE_MINUTES)
+        self.assertLess(selector.MERGE_GROUP_WORST_MINUTES, selector.QUEUE_RESPONSE_MINUTES)
+        self.assertQueue(queue_snapshot(rc_builds=[queue_rc_build()]), selector.REFUSE, selector.QUEUE_FAILURE,
+                         "cannot finish inside the queue's 90-minute window")
+
+    def test_a_build_that_cannot_be_proven_fails_the_group(self) -> None:
+        self.assertQueue(queue_snapshot(rc_builds=[queue_rc_build(run_attempt=3)]),
+                         selector.REFUSE, selector.QUEUE_FAILURE, "on all 3 attempts")
+        self.assertQueue(queue_snapshot(rc_builds=[queue_rc_build(conclusion="failure", jobs=[])]),
+                         selector.REFUSE, selector.QUEUE_FAILURE, "concluded failure")
+        self.assertQueue(queue_snapshot(rc_builds=[queue_rc_build(conclusion="success")]),
+                         selector.REFUSE, selector.QUEUE_FAILURE, "without all six release artifacts")
+
+    def test_a_usable_run_wins_beside_any_other(self) -> None:
+        """The record names the run it judged, so a second run of the commit is not ambiguous."""
+
+        usable = usable_queue_rc_build(id=1)
+        verdict = selector.judge_queue(queue_snapshot(rc_builds=[queue_rc_build(conclusion="failure", jobs=[]), usable]))
+        self.assertEqual((verdict.decision, verdict.rc_run), (selector.PROOF, 1), verdict.reason)
+
+    def test_a_group_that_stages_no_release_is_let_through(self) -> None:
+        self.assertQueue(queue_snapshot(tag_exists=True), selector.STAND_DOWN, selector.QUEUE_SUCCESS, "already tagged")
+        self.assertQueue(queue_snapshot(version="0.8.2"), selector.STAND_DOWN, selector.QUEUE_SUCCESS, "is retired")
+        self.assertQueue(queue_snapshot(evidence={REAL_MAIN: [selector.PREFLIGHT_RECORD]}),
+                         selector.STAND_DOWN, selector.QUEUE_SUCCESS, "already filed")
+
+    def test_a_commit_that_is_not_a_live_group_gets_nothing(self) -> None:
+        verdict = self.assertQueue(
+            queue_snapshot(binding={"bound": None, "reason": "its group left the queue without landing"}),
+            selector.STAND_DOWN, None, "left the queue",
+        )
+        self.assertIsNone(verdict.queue_sha)
+
+    def test_the_command_line_hands_the_queue_its_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot_path = Path(directory) / "queue.json"
+            output_path = Path(directory) / "output"
+            snapshot_path.write_text(json.dumps({**queue_snapshot(), "grades": {}}), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SELECTOR_PATH), "select", "--snapshot", str(snapshot_path)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "GITHUB_OUTPUT": str(output_path)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            written = output_path.read_text(encoding="utf-8")
+        self.assertIn(f"queue_sha={REAL_MAIN}\n", written)
+        self.assertIn("queue_state=proof\n", written)
+        self.assertIn("decision=proof\n", written)
+
+
+class BindMergeGroupTests(unittest.TestCase):
+    REF = f"refs/heads/{QUEUE_REF_REAL}"
+
+    def read(self, **overrides: Any) -> dict[str, Any]:
+        read = {
+            "sha": REAL_MAIN,
+            "landed": False,
+            "refs": [{"ref": self.REF, "sha": REAL_MAIN}],
+            "parents": [REAL_BASE],
+            "base_on_main": True,
+        }
+        read.update(overrides)
+        return read
+
+    def test_a_live_group_on_protected_main_is_bound(self) -> None:
+        binding = selector.bind_merge_group(REAL_MAIN, self.read())
+        self.assertEqual(binding["bound"], "merge-group", binding)
+        self.assertEqual((binding["ref"], binding["pull"], binding["base"]), (QUEUE_REF_REAL, 1848, REAL_BASE))
+
+    def test_a_landed_commit_is_main_history(self) -> None:
+        self.assertEqual(selector.bind_merge_group(REAL_MAIN, self.read(landed=True, refs=[]))["bound"], "main")
+
+    def test_a_group_stacked_behind_another_live_group_is_bound(self) -> None:
+        stacked = selector.bind_merge_group(
+            REAL_MAIN,
+            self.read(base_on_main=False,
+                      refs=[{"ref": self.REF, "sha": REAL_MAIN},
+                            {"ref": f"refs/heads/gh-readonly-queue/main/pr-1847-{'3' * 40}", "sha": REAL_BASE}]),
+        )
+        self.assertEqual((stacked["bound"], stacked["stacked"]), ("merge-group", True))
+
+    def test_everything_else_is_refused(self) -> None:
+        for label, read, needle in (
+            ("left the queue", self.read(refs=[]), "left the queue without landing"),
+            ("two refs", self.read(refs=[{"ref": self.REF, "sha": REAL_MAIN}] * 2), "2 live merge-queue refs"),
+            ("not main's queue", self.read(refs=[{"ref": f"refs/heads/gh-readonly-queue/release/pr-1848-{REAL_BASE}", "sha": REAL_MAIN}]),
+             "is not a merge-queue ref of main"),
+            ("parent differs", self.read(parents=["9" * 40]), "are not the base"),
+            ("merge commit", self.read(parents=[REAL_BASE, REAL_HEAD]), "are not the base"),
+            ("base off main", self.read(base_on_main=False), "neither protected main nor another live group"),
+        ):
+            with self.subTest(label=label):
+                binding = selector.bind_merge_group(REAL_MAIN, read)
+                self.assertIsNone(binding["bound"], binding)
+                self.assertIn(needle, binding["reason"])
+
+
+class GatherQueueTests(unittest.TestCase):
+    """The live queue read against a real repository with a merge-queue ref."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        root = Path(self.directory.name)
+        self.origin = root / "origin.git"
+        author = root / "author"
+        subprocess.run(["git", "init", "--quiet", "--bare", str(self.origin)], check=True)
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(author)], check=True)
+        (author / "Cargo.toml").write_text('[workspace.package]\nversion = "0.8.2"\n', encoding="utf-8")
+        git(author, "add", "Cargo.toml")
+        git(author, "commit", "--quiet", "-s", "-m", "base")
+        self.base = git(author, "rev-parse", "HEAD")
+        (author / "Cargo.toml").write_text('[workspace.package]\nversion = "0.8.4"\n', encoding="utf-8")
+        git(author, "commit", "--quiet", "-s", "-am", "Kin 0.8.4 (#7)")
+        self.group = git(author, "rev-parse", "HEAD")
+        self.queue_ref = f"refs/heads/gh-readonly-queue/main/pr-7-{self.base}"
+        # The origin takes the refs by fetching them, the way the queue writes
+        # its own ref server side; a push would run the author's push hooks.
+        git(self.origin, "fetch", "--quiet", str(author), f"{self.base}:refs/heads/main", f"{self.group}:{self.queue_ref}")
+        self.author = author
+        self.workspace = root / "workspace"
+        subprocess.run(["git", "clone", "--quiet", "--branch", "main", str(self.origin), str(self.workspace)], check=True)
+        git(self.workspace, "fetch", "--quiet", "origin", "main")
+        git(self.workspace, "update-ref", "refs/remotes/origin/main", "FETCH_HEAD")
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def fetch(self) -> Any:
+        build = usable_queue_rc_build(head_sha=self.group, head_branch=self.queue_ref.removeprefix("refs/heads/"))
+        answers = {
+            selector.queue_refs_endpoint(REPO): [{"ref": self.queue_ref, "object": {"sha": self.group}}],
+            selector.evidence_tree_endpoint(REPO): {"tree": [], "truncated": False},
+            selector.merge_group_rc_build_runs_endpoint(REPO, self.group, 1): {
+                "total_count": 1,
+                "workflow_runs": [{key: build[key] for key in ("id", "head_sha", "head_branch", "event", "status",
+                                                              "conclusion", "created_at", "run_attempt")}],
+            },
+            selector.run_artifacts_endpoint(REPO, build["id"], 1): {
+                "total_count": len(selector.RC_RELEASE_ARTIFACTS),
+                "artifacts": [{"name": name, "expired": False} for name in selector.RC_RELEASE_ARTIFACTS],
+            },
+        }
+
+        def fetch(endpoint: str) -> Any:
+            if endpoint == selector.tag_endpoint(REPO, "0.8.4"):
+                raise selector.NotFound("HTTP 404")
+            if endpoint not in answers:
+                raise AssertionError(f"unexpected endpoint {endpoint}")
+            return copy.deepcopy(answers[endpoint])
+
+        return fetch
+
+    def test_a_queued_release_group_is_bound_and_preflighted(self) -> None:
+        document = selector.gather_queue(REPO, self.workspace, self.group, self.fetch())
+        self.assertEqual(document["binding"]["bound"], "merge-group", document["binding"])
+        self.assertEqual(document["binding"]["base"], self.base)
+        self.assertEqual(document["version"], "0.8.4")
+        verdict = selector.judge_queue(document)
+        self.assertEqual(verdict.decision, selector.PROOF, verdict.reason)
+
+    def test_the_group_reads_as_landed_once_main_carries_it(self) -> None:
+        git(self.origin, "update-ref", "refs/heads/main", self.group)
+        git(self.workspace, "fetch", "--quiet", "origin", "main")
+        git(self.workspace, "update-ref", "refs/remotes/origin/main", "FETCH_HEAD")
+        read = selector.read_queue_binding(self.fetch(), REPO, self.group, self.workspace)
+        self.assertTrue(read["landed"])
+        self.assertEqual(selector.bind_merge_group(self.group, read)["bound"], "main")
+
+
+class RetiredVersionTests(unittest.TestCase):
+    def test_a_retired_version_is_never_cut(self) -> None:
+        grader = Grader({})
+        decision = selector.judge(snapshot(version="0.8.2", candidate=MIDDLE, rc_builds=[rc_build(MIDDLE)]), grader)
+        self.assertEqual(decision.decision, selector.STAND_DOWN)
+        self.assertIn("v0.8.2 is retired and will never be tagged", decision.reason)
+        self.assertEqual(grader.calls, [], "a retired version must cost no grading")
+
+    def test_a_leftover_candidates_evidence_outside_the_staged_range_is_never_read(self) -> None:
+        """release/v0.8.2-candidate and its evidence stay behind once main stages 0.8.4."""
+
+        grader = Grader({NEWEST: green_grade(NEWEST)})
+        decision = selector.judge(
+            snapshot(version=RELEASABLE, range=[NEWEST], evidence={FOREIGN: [selector.PREFLIGHT_RECORD]}),
+            grader,
+        )
+        self.assertEqual(decision.decision, selector.ARM, decision.reason)
+        self.assertEqual(decision.candidate, NEWEST)
+        self.assertEqual(decision.branch, f"release/v{RELEASABLE}-candidate")
+
+    def test_the_mint_asks_the_same_rule(self) -> None:
+        for version, code in (("0.8.2", 3), ("v0.8.3", 3), ("0.8.4", 0), ("v0.8.4", 0)):
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    [sys.executable, str(SELECTOR_PATH), "admit-version", "--version", version],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)["admitted"], code == 0)
+
+
+# ---------------------------------------------------------------------------
 # Trigger validation.
 # ---------------------------------------------------------------------------
 
@@ -931,6 +2180,18 @@ def completion_event(**overrides: Any) -> dict[str, Any]:
     }
     run.update(overrides)
     return {"workflow_run": run}
+
+
+def push_event(**overrides: Any) -> dict[str, Any]:
+    event = {
+        "ref": "refs/heads/main",
+        "before": OLDEST,
+        "after": NEWEST,
+        "deleted": False,
+        "repository": {"full_name": REPO},
+    }
+    event.update(overrides)
+    return event
 
 
 class TriggerTests(unittest.TestCase):
@@ -1032,12 +2293,64 @@ class TriggerTests(unittest.TestCase):
             ({"default_branch": "trunk"}, "default branch must be"),
             ({"ref": "refs/heads/chore/lane"}, "workflow ref must be"),
             ({"workflow_sha": "abc"}, "40-character"),
-            ({"event_name": "push"}, "event name must be"),
+            ({"event_name": "pull_request_target"}, "event name must be"),
             ({"event": []}, "event document must be an object"),
         ):
             with self.assertRaises(selector.SelectionError) as caught:
                 selector.validate_trigger(**trigger_context(**overrides))
             self.assertIn(needle, str(caught.exception))
+
+    def test_merge_group_completions_are_occasions(self) -> None:
+        """The queue's RC Build of a group, to preflight it; its CI, to release a group that stages nothing."""
+
+        for path in (".github/workflows/rc-build.yml", ".github/workflows/ci.yml"):
+            with self.subTest(path=path):
+                verdict = selector.validate_trigger(
+                    **trigger_context(
+                        event_name="workflow_run",
+                        event_action="completed",
+                        event=completion_event(path=path, event="merge_group", head_branch=QUEUE_REF_REAL,
+                                               head_sha=REAL_MAIN),
+                    )
+                )
+                self.assertEqual(verdict["trigger"], selector.TRIGGER_MERGE_GROUP)
+                self.assertEqual((verdict["workflow"], verdict["head_sha"]), (path, REAL_MAIN))
+
+    def test_merge_group_completions_off_mains_queue_refuse(self) -> None:
+        for branch in (f"gh-readonly-queue/release/pr-1-{REAL_BASE}", "feature/public-export-kin-x", "main"):
+            with self.subTest(branch=branch):
+                with self.assertRaises(selector.SelectionError) as caught:
+                    selector.validate_trigger(
+                        **trigger_context(
+                            event_name="workflow_run",
+                            event_action="completed",
+                            event=completion_event(path=".github/workflows/rc-build.yml", event="merge_group",
+                                                   head_branch=branch),
+                        )
+                    )
+                self.assertIn("gh-readonly-queue/main/", str(caught.exception))
+
+    def test_a_push_to_main_is_admitted(self) -> None:
+        """The landing push itself, so an inherited grade arms without waiting for CI."""
+
+        verdict = selector.validate_trigger(**trigger_context(event_name="push", event=push_event()))
+        self.assertEqual(verdict, {"trigger": selector.TRIGGER_PUSH, "head_sha": NEWEST})
+
+    def test_pushes_that_are_not_occasions_refuse(self) -> None:
+        for overrides, event, needle in (
+            ({"ref": "refs/heads/feature/public-export-kin-x"}, push_event(), "workflow ref must be"),
+            ({}, push_event(ref="refs/heads/feature/public-export-kin-x"), "only on refs/heads/main"),
+            ({}, push_event(repository={"full_name": "someone/kin"}), "not first-party"),
+            ({}, push_event(after=MIDDLE), "differs from the workflow sha"),
+            ({}, push_event(deleted=True), "differs from the workflow sha"),
+            ({"event_action": "synchronize"}, push_event(), "action must be empty"),
+        ):
+            with self.subTest(needle=needle, overrides=overrides):
+                with self.assertRaises(selector.SelectionError) as caught:
+                    selector.validate_trigger(
+                        **trigger_context(**{"event_name": "push", "event": event, **overrides})
+                    )
+                self.assertIn(needle, str(caught.exception))
 
 
 # ---------------------------------------------------------------------------
@@ -1447,6 +2760,88 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("pull_request", header.group(1))
         for needle in ("workflow_run:", "repository_dispatch:", "schedule:", selector.KICK_ACTION):
             self.assertIn(needle, header.group(1))
+        # The landing push, on main alone: a push run resolves this workflow
+        # from the branch pushed, and validate_trigger refuses any other ref.
+        self.assertRegex(header.group(1), r"(?m)^  push:\n    branches: \[main\]\n  workflow_run:\n")
+
+    def gate_source(self) -> str:
+        source = RELEASE_TAG_PATH.read_text(encoding="utf-8")
+        start = source.index("      - name: Verify required checks are green")
+        step = source[start:source.index("\n      - name:", start + 1)]
+        return step[step.index("python3 - <<'PY'\n"):]
+
+    def test_the_mint_reads_an_export_head_under_the_selectors_events(self) -> None:
+        """The cut and the mint must agree on which build of the head is evidence."""
+
+        table = re.search(r"(?s)export_pull_events = (\{.*?\})\n", self.gate_source())
+        self.assertIsNotNone(table, "release-tag.yml's gate no longer declares export_pull_events")
+        self.assertEqual(ast.literal_eval(table.group(1)), selector.EXPORT_PULL_EVENTS)
+        self.assertIn(f'.startswith("{selector.EXPORT_BRANCH_PREFIX}")', self.gate_source())
+
+    def test_the_mint_tells_a_timeout_from_a_cancel_by_the_selectors_texts(self) -> None:
+        """A retry the selector admits and the mint refuses arms a sha that cannot be tagged."""
+
+        gate = self.gate_source()
+        timeout = re.search(r'(?s)timeout_annotation = re\.compile\(\s*(r".*?")\s*(r".*?")\s*\)', gate)
+        self.assertIsNotNone(timeout, "release-tag.yml's gate no longer declares timeout_annotation")
+        self.assertEqual(
+            ast.literal_eval(timeout.group(1)) + ast.literal_eval(timeout.group(2)),
+            selector.TIMEOUT_ANNOTATION.pattern,
+        )
+        others = re.search(r"(?s)other_cancel_annotations = \((.*?)\n\s*\)\n", gate)
+        self.assertIsNotNone(others, "release-tag.yml's gate no longer declares other_cancel_annotations")
+        self.assertEqual(
+            [ast.literal_eval(literal) for literal in re.findall(r'r"[^"]*"', others.group(1))],
+            [pattern.pattern for pattern in selector.OTHER_CANCEL_ANNOTATIONS],
+        )
+
+    def test_the_cut_tells_the_queue_under_the_selectors_context(self) -> None:
+        """The queue requires a context by name; a renamed one is waited on forever."""
+
+        report = job_block(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"), "report-to-queue")
+        self.assertIn(f'-f context="{selector.QUEUE_STATUS_CONTEXT}"', report)
+        self.assertIn("    permissions:\n      statuses: write\n", report)
+        self.assertIn("if: always() && needs.select.outputs.queue_sha != ''", report)
+
+    def test_the_cut_wakes_on_the_queues_builds(self) -> None:
+        select = job_block(CUT_WORKFLOW_PATH.read_text(encoding="utf-8"), "select")
+        self.assertIn("github.event.workflow_run.event == 'merge_group'", select)
+        self.assertIn("startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/')", select)
+        self.assertIn('queue=(--queue-sha "$QUEUE_SHA")', select)
+
+    def test_the_mint_vetoes_on_the_selectors_acceptance_contexts(self) -> None:
+        table = re.search(r"(?s)acceptance_provenance = (\{.*?\n          \})\n", self.gate_source())
+        self.assertIsNotNone(table, "release-tag.yml's gate no longer declares acceptance_provenance")
+        self.assertEqual(
+            ast.literal_eval(textwrap_dedent(table.group(1))),
+            {name: (workflow_id, path) for name, workflow_id, path in selector.ACCEPTANCE_CONTEXTS},
+        )
+
+    def test_a_usable_run_holds_every_artifact_release_yml_ships(self) -> None:
+        """The selector's usable set is the locator's, or a filed record strands the tag.
+
+        scripts/locate-rc-build.mjs and RC Build's daemon image job land with
+        the build-once change; until they are in this tree only the archive
+        half of the set can be read off the build matrix.
+        """
+
+        build = job_block(RC_BUILD_PATH.read_text(encoding="utf-8"), "build")
+        self.assertLessEqual(set(matrix_artifacts(build)), set(selector.RC_RELEASE_ARTIFACTS))
+        self.assertLessEqual(set(selector.RC_BUILD_ARTIFACTS), set(selector.RC_RELEASE_ARTIFACTS))
+        locator = ROOT / "scripts" / "locate-rc-build.mjs"
+        if not locator.exists():
+            self.skipTest("scripts/locate-rc-build.mjs lands with the build-once change")
+        source = locator.read_text(encoding="utf-8")
+        declared = source.split("export const RC_ARTIFACTS", 1)[0]
+        named = re.findall(r'(?m)^\s*\{?\s*artifact: "([a-z0-9_-]+)"', declared)
+        self.assertIn("kin-daemon-image", named, "the locator no longer names the daemon image artifact")
+        self.assertEqual(sorted(named), sorted(selector.RC_RELEASE_ARTIFACTS))
+
+    def test_the_build_jobs_carry_the_name_the_timeout_rule_reads(self) -> None:
+        """A renamed build job would make every timeout read as a spent attempt again."""
+
+        build = job_block(RC_BUILD_PATH.read_text(encoding="utf-8"), "build")
+        self.assertIn(f"    name: {selector.RC_BUILD_JOB_PREFIX}${{{{ matrix.artifact }}}})\n", build)
 
 
 class CommandLineTests(unittest.TestCase):

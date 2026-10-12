@@ -228,6 +228,56 @@ fn batch_retirement_stays_private_until_successful_adoption() {
 }
 
 #[test]
+fn empty_module_inventory_is_budgeted_before_identity_is_installed() {
+    let root = tempfile::tempdir().unwrap();
+    let blobs = kin_blobs::BlobStore::new_ephemeral(root.path().join("objects")).unwrap();
+    let graph = kin_db::InMemoryGraph::new();
+    let file = FilePathId::new("index.js");
+    let body = b"// An empty local module has no import fragment.\n";
+    let digest = blobs.write(body).unwrap();
+    graph
+        .apply_transaction_delta(&TransactionDelta {
+            tree_deltas: vec![TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(&file.0).unwrap(),
+                    TreeEntry::blob(kin_model::Hash256::from_bytes(digest.0), false),
+                ),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let kin_index::IndexedAny::EntitySource(indexed) = kin_index::IndexPipeline::new()
+        .index_any_content(&file, body, digest)
+        .unwrap()
+    else {
+        panic!("fixture must be entity source");
+    };
+    assert!(indexed.entities.is_empty());
+    assert!(indexed.imports.is_empty());
+    graph.upsert_file_layout(&indexed.file_layout).unwrap();
+    let mut live = LiveCrossFileLinker::new();
+    live.seed_from_graph_checked(&graph).unwrap();
+    live.dependency_cache_budget = Some(1);
+    let before = serde_json::to_vec(&live.linker.to_checkpoint_v1()).unwrap();
+    let error = live.restore_dependencies(&graph, &blobs, None).unwrap_err();
+    assert!(error.to_string().contains("charged bytes"));
+    assert_eq!(
+        serde_json::to_vec(&live.linker.to_checkpoint_v1()).unwrap(),
+        before
+    );
+    assert!(!live.knows_file("index.js"));
+    assert_eq!(live.dependency_cache_bytes, 0);
+    assert!(!live.dependencies_restored);
+    live.dependency_cache_budget = None;
+    live.restore_dependencies(&graph, &blobs, None).unwrap();
+    assert!(live.knows_file("index.js"));
+    assert!(live.dependency_cache_bytes >= 512);
+    assert!(live.pending["index.js"].parse.entities.is_empty());
+    assert!(live.pending["index.js"].parse.relations.is_empty());
+}
+
+#[test]
 fn byte_budget_failure_preserves_the_entire_restore_cache() {
     let mut fixture = Fixture::new();
     fixture.live.dependencies_restored = false;

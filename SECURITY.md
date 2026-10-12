@@ -7,7 +7,7 @@ issue for a suspected vulnerability.**
 
 Use GitHub's private vulnerability reporting on this repository:
 
-1. Go to the **Security** tab of [firelock-ai/kin](https://github.com/firelock-ai/kin/security).
+1. Go to the **Security** tab of [kinlab-ai/kin](https://github.com/kinlab-ai/kin/security).
 2. Click **Report a vulnerability** to open a private security advisory.
 3. Include a description, affected versions, reproduction steps, and the
    impact you observed.

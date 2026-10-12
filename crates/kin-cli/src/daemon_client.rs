@@ -2568,6 +2568,41 @@ impl DaemonClient {
             .ok_or_else(|| anyhow::anyhow!("daemon session registration returned no session_id"))
     }
 
+    /// `GET /agents`: the agents working in this repository, as the daemon
+    /// sees them, with no directory, process or path in it.
+    pub async fn agents(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .send(
+                self.client.get(format!("{}/agents", self.base_url)),
+                "agents",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("agents", resp).await);
+        }
+        resp.json().await.context("parse daemon agents response")
+    }
+
+    /// `GET /session/{session_id}/calls`: one live session's call log, newest
+    /// first, at most `limit` entries.
+    pub async fn session_calls(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value> {
+        let mut url = format!("{}/session/{}/calls", self.base_url, session_id);
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        let resp = self.send(self.client.get(url), "session calls").await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("session calls", resp).await);
+        }
+        resp.json()
+            .await
+            .context("parse daemon session calls response")
+    }
+
     /// Release a session lease registered by [`Self::start_session`].
     pub async fn end_session(&self, session_id: &str) -> Result<()> {
         let resp = self

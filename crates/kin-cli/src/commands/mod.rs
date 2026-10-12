@@ -4,6 +4,7 @@
 pub mod absence_qualifier;
 pub mod admit;
 pub mod agent;
+pub mod agents;
 pub mod allow;
 pub mod approvals;
 pub mod ask;
@@ -126,6 +127,7 @@ pub mod update;
 pub mod upgrade;
 pub mod verify;
 pub mod work;
+mod workspace_agents;
 mod workspace_conflicts;
 mod workspace_explore;
 mod workspace_graph;

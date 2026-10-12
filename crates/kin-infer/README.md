@@ -6,23 +6,22 @@
 GPU acceleration and no external ML framework dependency (no PyTorch, no ONNX,
 no TensorFlow). Custom compute shaders and kernels drive the GPU backends.
 
-It sits in the supporting layer of the open Kin local substrate and depends on
+It sits in the supporting layer of the open Kin local stack and depends on
 no other Kin crate. `kin-db` consumes it to embed source entities on-device.
 Kin runs it with a deterministic pure-Rust CPU path for bit-reproducible
 embedding over local code corpora.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/kinlab-ai/kin)
 
 ## What is Kin?
 
-Kin is a graph-native code repository for AI agents and the people who build with them:
-your code as a graph of entities, relations, and intents, not a pile of files and diffs.
-AI agents and humans navigate it semantically, with provenance, review, and governance
-built in. It coexists with Git and projects graph truth back to a normal filesystem, so
-any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. It stores source, recorded code relationships, and versioned history as
+repository state. The graph is the repository model, not a search index maintained
+beside another repository.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+Start at **[kinlab-ai/kin](https://github.com/kinlab-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 

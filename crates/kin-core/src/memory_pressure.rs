@@ -467,6 +467,51 @@ pub struct TreeFootprint {
     /// overrode is a different fact from one this process measured outright.
     #[serde(default)]
     pub kernel_capped: bool,
+    /// What the daemon's own figure is made of, where the platform can say.
+    ///
+    /// Defaulted on read, so a standing published by an older daemon still
+    /// parses, and absent off macOS, where the reading has no such parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_breakdown: Option<FootprintBreakdown>,
+}
+
+/// What a daemon's own footprint is made of, on a platform that can say.
+///
+/// The footprint is one number, and on a small repository a large one reads
+/// as a defect in the reading. Two parts explain it in practice, and both are
+/// counted on purpose. GPU memory on Apple silicon is ordinary system RAM, so
+/// an embedding model running there holds real memory that the resident set
+/// does not show. Compressed memory counts at its full size even when the
+/// system compressed it or swapped it out, so a daemon on a small Mac under
+/// pressure is charged for pages that are not resident at all. Naming both is
+/// what lets a reader tell a model's working memory from a leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct FootprintBreakdown {
+    /// GPU memory charged to the daemon, resident and compressed together.
+    /// `None` when the kernel does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_bytes: Option<u64>,
+    /// The daemon's pages held compressed or swapped out.
+    pub compressed_bytes: u64,
+}
+
+/// What every footprint figure counts, as a reader would check it.
+///
+/// One phrase per platform, from what `kin_daemon_spawn::process_footprint_bytes`
+/// reads there. The figure is compared against an allowance, and a reader who
+/// sees a number larger than they expected has to know which tool shows the
+/// same number before they can believe it or argue with it.
+pub fn footprint_measure() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "physical footprint (what Activity Monitor shows as Memory, GPU and compressed memory \
+         included)"
+    } else if cfg!(target_os = "linux") {
+        "proportional set size (each shared page split between the processes that map it)"
+    } else if cfg!(windows) {
+        "private commit"
+    } else {
+        "private memory"
+    }
 }
 
 impl TreeFootprint {
@@ -511,6 +556,7 @@ impl TreeFootprint {
             children_bytes: charged.saturating_sub(own_bytes),
             child_count: self.child_count,
             kernel_capped: true,
+            own_breakdown: self.own_breakdown,
         }
     }
 }
@@ -739,21 +785,59 @@ impl BudgetStanding {
     /// its absence is the defect this exists to fix: a reader who cannot see a
     /// child line cannot tell a daemon with no language servers from a reading
     /// that never looked for them.
+    ///
+    /// It opens with what was counted, because "hold 6.9 GiB" on a repository
+    /// of two hundred entities is a figure a reader will otherwise put down to
+    /// a broken reading, and closes the daemon's own share with what it is
+    /// made of when the platform can say.
     pub fn sentence(&self) -> String {
         format!(
-            "this repository's daemon and the {} process(es) it started hold {} of the {} it is \
-             allowed ({}), of which {} is in those child processes{}{}",
+            "by {}, this repository's daemon and the {} process(es) it started hold {} of the {} \
+             it is allowed ({}), of which {} is in those child processes{}{}{}",
+            footprint_measure(),
             self.footprint.child_count,
             human_bytes(self.footprint.total_bytes()),
             human_bytes(self.budget.bytes),
             self.budget.source.describe(),
             human_bytes(self.footprint.children_bytes),
+            self.breakdown_clause(),
             if self.footprint.kernel_capped {
                 ", held at what the kernel charges this container"
             } else {
                 ""
             },
             self.over_allowance_clause(),
+        )
+    }
+
+    /// What the daemon's own figure is made of, or nothing when the platform
+    /// could not say or neither part is present.
+    fn breakdown_clause(&self) -> String {
+        let Some(parts) = self.footprint.own_breakdown else {
+            return String::new();
+        };
+        let gpu = parts.gpu_bytes.filter(|bytes| *bytes > 0);
+        let compressed = (parts.compressed_bytes > 0).then_some(parts.compressed_bytes);
+        let described = match (gpu, compressed) {
+            (None, None) => return String::new(),
+            (Some(gpu), None) => format!(
+                "{} is GPU memory, such as an embedding model's buffers",
+                human_bytes(gpu)
+            ),
+            (None, Some(compressed)) => format!(
+                "{} is compressed or swapped out and still counted",
+                human_bytes(compressed)
+            ),
+            (Some(gpu), Some(compressed)) => format!(
+                "{} is GPU memory, such as an embedding model's buffers, and {} is compressed or \
+                 swapped out and still counted",
+                human_bytes(gpu),
+                human_bytes(compressed)
+            ),
+        };
+        format!(
+            "; of the daemon's own {}, {described}",
+            human_bytes(self.footprint.own_bytes)
         )
     }
 
@@ -2498,6 +2582,7 @@ mod tests {
                 children_bytes: 0,
                 child_count: 0,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget: FootprintBudget {
                 bytes: budget,
@@ -2912,6 +2997,7 @@ mod tests {
             children_bytes: 23 * GIB + GIB / 10,
             child_count: 13,
             kernel_capped: false,
+            own_breakdown: None,
         };
         assert!(
             impossible.total_bytes() > 25 * GIB,
@@ -2942,6 +3028,7 @@ mod tests {
             children_bytes: 54 * 1024 * 1024,
             child_count: 13,
             kernel_capped: false,
+            own_breakdown: None,
         };
         assert_eq!(measured.clamped_to(Some(2 * GIB)), measured);
         assert_eq!(
@@ -2980,6 +3067,7 @@ mod tests {
                 children_bytes: children,
                 child_count,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget: FootprintBudget {
                 bytes: budget,
@@ -3030,6 +3118,78 @@ mod tests {
             Verdict::decide(HeavyWork::LspSweep, &roomy_host, Some(&per_pid_only), &bars),
             Verdict::Proceed,
             "counting only the daemon lets the sweep start, which is how the daemon died"
+        );
+    }
+
+    /// A large figure on a small repository read as a broken reading on a
+    /// fresh 8 GiB Mac. The sentence now opens with what it counted and, when
+    /// the platform could say, closes the daemon's own share with what it was
+    /// made of: there, mostly an embedding model's GPU memory, much of it
+    /// compressed or swapped out and counted all the same.
+    #[test]
+    fn the_sentence_says_what_it_counted_and_what_the_daemons_share_is_made_of() {
+        let mut first_pass = standing(6 * GIB + 922 * MIB, 0, 0, 4 * GIB);
+        first_pass.footprint.own_breakdown = Some(FootprintBreakdown {
+            gpu_bytes: Some(5 * GIB + 870 * MIB),
+            compressed_bytes: 3 * GIB + 517 * MIB,
+        });
+        let sentence = first_pass.sentence();
+        assert!(
+            sentence.starts_with(&format!("by {},", footprint_measure())),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("hold 6.9 GiB of the 4.0 GiB it is allowed"),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains(
+                "of the daemon's own 6.9 GiB, 5.8 GiB is GPU memory, such as an embedding \
+                 model's buffers, and 3.5 GiB is compressed or swapped out and still counted"
+            ),
+            "{sentence}"
+        );
+        assert!(sentence.contains("past the allowance"), "{sentence}");
+        if cfg!(target_os = "macos") {
+            assert!(footprint_measure().contains("Activity Monitor"));
+        }
+
+        // A platform that could not say, or a share with neither part, adds
+        // no clause, so the clause means something when it appears.
+        let unsaid = standing(GIB, 0, 0, 4 * GIB).sentence();
+        assert!(!unsaid.contains("of the daemon's own"), "{unsaid}");
+        let mut plain = standing(GIB, 0, 0, 4 * GIB);
+        plain.footprint.own_breakdown = Some(FootprintBreakdown {
+            gpu_bytes: Some(0),
+            compressed_bytes: 0,
+        });
+        assert!(!plain.sentence().contains("of the daemon's own"));
+
+        // The refusal sentence embeds the standing and still reads as one.
+        let refused = describe_budget(HeavyWork::EmbedBatch, &first_pass, "was held back");
+        assert!(refused.contains("is GPU memory"), "{refused}");
+        assert!(refused.contains(", so "), "{refused}");
+    }
+
+    /// A standing published before the breakdown existed still parses, and a
+    /// new one carries its breakdown through the record.
+    #[test]
+    fn the_breakdown_round_trips_and_an_older_record_still_parses() {
+        let older = r#"{"footprint":{"own_bytes":1,"children_bytes":2,"child_count":1},"budget_bytes":4,"budget_is_derived":true,"level":"nominal","pid":7,"at_unix":9}"#;
+        let parsed: DaemonFootprint = serde_json::from_str(older).expect("an older record parses");
+        assert_eq!(parsed.footprint.own_breakdown, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut published = standing(2 * GIB, 0, 0, 4 * GIB);
+        published.footprint.own_breakdown = Some(FootprintBreakdown {
+            gpu_bytes: Some(GIB),
+            compressed_bytes: 3 * MIB,
+        });
+        DaemonFootprint::record(dir.path(), &published, PressureLevel::Nominal, 7);
+        let read = DaemonFootprint::read(dir.path()).expect("the record reads back");
+        assert_eq!(
+            read.footprint.own_breakdown,
+            published.footprint.own_breakdown
         );
     }
 
@@ -3272,6 +3432,7 @@ mod tests {
                 children_bytes: measured_children,
                 child_count: 1,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget: FootprintBudget {
                 bytes: DERIVED_BUDGET_CEILING_BYTES,
@@ -3319,6 +3480,7 @@ mod tests {
                 children_bytes: budget / 2,
                 child_count: 3,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget: FootprintBudget {
                 bytes: budget,
@@ -3350,6 +3512,7 @@ mod tests {
                 children_bytes: 3 * GIB,
                 child_count: 1,
                 kernel_capped: false,
+                own_breakdown: None,
             },
             budget: FootprintBudget {
                 bytes: FootprintBudget::derived_from(host),

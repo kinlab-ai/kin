@@ -30,7 +30,7 @@ command line.
 
 **Release acquisition.** The npm launcher (`@kinlab/kin`) downloads the matching release
 archive and its checksums from GitHub releases
-(`github.com/firelock-ai/kin/releases/download`) on demand, verifies them, and caches
+(`github.com/kinlab-ai/kin/releases/download`) on demand, verifies them, and caches
 the binaries. `KIN_MCP_RELEASE_BASE_URL` points it at a mirror if you host one, and must
 be https or a loopback address. The request carries nothing but the fetch itself. The
 checksum comes from the same base URL as the archive, which is covered in
@@ -38,7 +38,7 @@ checksum comes from the same base URL as the archive, which is covered in
 what the shell installer writes outside its own prefix.
 
 **The update surface.** `kin update` reads release metadata from
-`api.github.com/repos/firelock-ai/kin` and downloads checksum-verified assets from the
+`api.github.com/repos/kinlab-ai/kin` and downloads checksum-verified assets from the
 same GitHub releases. It runs when you invoke it, and the policy you record with
 `kin update --set-policy` decides whether an available update may interrupt you.
 Requests carry the version ask and nothing else; no repository data is attached.

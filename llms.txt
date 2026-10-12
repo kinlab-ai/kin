@@ -1,8 +1,8 @@
 # Kin
 
-> Kin is a graph-native code repository for AI agents and the people who build with them. It replaces the file-first, diff-first model with a repository and collaboration substrate built on a graph: code becomes entities, relations and intents that AI agents and humans navigate semantically.
+> Kin is a graph-native code repository for AI agents and the people who build with them. It stores source, recorded code relationships, and versioned history as repository state. The graph is the repository model, not a search index maintained beside another repository.
 
-Kin coexists with Git and projects graph-owned truth back to a normal filesystem through a transparent VFS, so any tool or agent works unchanged. The fastest way for an agent to use Kin is the MCP server, which exposes semantic tools (locate, context, trace) backed by the graph rather than filesystem heuristics.
+Kin has its own commits, branches, merges, diffs, and history. Existing Git repositories can be imported, and supported workflows can export a new Git repository. The fastest way for an agent to use Kin is the MCP server, which exposes semantic tools (locate, context, trace) backed by the graph rather than filesystem heuristics.
 
 ## Install
 
@@ -15,8 +15,8 @@ Other ways in, for native Windows, a machine without Node, or a team that prefer
 
 - [Install script for macOS and Linux](https://get.kinlab.dev/install): `curl -fsSL https://get.kinlab.dev/install | sh`
 - [Install script for native Windows x64](https://get.kinlab.dev/install.ps1): `irm https://get.kinlab.dev/install.ps1 | iex`. It installs the CLI and connects no AI clients, since WSL2 remains the recommended path on Windows. No native Windows ARM64 build is published. On ARM64, x64 PowerShell installs the x86_64 build under emulation.
-- [Homebrew](https://github.com/firelock-ai/homebrew-kin): `brew install firelock-ai/kin/kin`
-- [GitHub Releases](https://github.com/firelock-ai/kin/releases): prebuilt binaries + checksums for macOS, Linux, and Windows
+- [Homebrew](https://github.com/kinlab-ai/homebrew-kin): `brew install kinlab-ai/kin/kin`
+- [GitHub Releases](https://github.com/kinlab-ai/kin/releases): prebuilt binaries + checksums for macOS, Linux, and Windows
 
 Native Windows x86_64 support is early. Repository admission works: `kin init` imports a Git repository and publishes graph authority, and graph, lexical, and daemon-backed queries answer natively. The end-to-end install proof also runs agent setup on native Windows and gets graph-backed answers from the installed MCP server. Transparent filesystem projection is not shipped on Windows, and review workflows are not yet tested there, so WSL2 remains the recommended path for the full Kin experience.
 
@@ -39,7 +39,7 @@ Kin ships an MCP server exposing semantic tools that answer from graph-owned tru
 
 ## Source and docs
 
-- [kin: CLI, daemon, MCP](https://github.com/firelock-ai/kin)
-- [kin-vfs: transparent filesystem projection](https://github.com/firelock-ai/kin-vfs)
-- [kin-editor: VS Code extension](https://github.com/firelock-ai/kin-editor)
-- [Quickstart](https://github.com/firelock-ai/kin/blob/main/docs/quickstart.md)
+- [kin: CLI, daemon, MCP](https://github.com/kinlab-ai/kin)
+- [kin-vfs: deprecated filesystem projection, archived for reference](https://github.com/kinlab-ai/kin-vfs)
+- [kin-editor: VS Code extension](https://github.com/kinlab-ai/kin-editor)
+- [Quickstart](https://github.com/kinlab-ai/kin/blob/main/docs/quickstart.md)

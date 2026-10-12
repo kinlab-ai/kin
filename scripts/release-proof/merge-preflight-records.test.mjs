@@ -260,3 +260,27 @@ test('the command line merges files, writes the record and exits 1 on a refusal'
   const programmatic = main(['--candidate', SHA, '--out', path.join(dir, 'main.json'), ...files], { log: () => {} });
   assert.equal(programmatic.legs.length, 3);
 });
+
+test('the RC Build run every leg judged is recorded for the locator to honour', () => {
+  const { merged } = mergeRecords(entries(macos(), arm(), x86()), SHA, { rcRun: 38_192_967_949 });
+  assert.deepEqual(merged.rc_build, { run_id: 38_192_967_949 });
+  // The mint's own judge still accepts the record that names its run.
+  assert.equal(judgePreflight(merged, SHA).archives.length, 3);
+  // Naming no run leaves the record exactly as it was, byte for byte.
+  const unnamed = mergeRecords(entries(macos(), arm(), x86()), SHA).merged;
+  assert.equal(Object.hasOwn(unnamed, 'rc_build'), false);
+  const named = JSON.stringify(merged);
+  assert.equal(named, JSON.stringify(mergeRecords(entries(x86(), arm(), macos()), SHA, { rcRun: 38_192_967_949 }).merged));
+});
+
+test('a run id that is not one is refused, on the command line and in the merge', () => {
+  for (const bad of [0, -1, 1.5, '38192967949']) {
+    assert.throws(() => mergeRecords(entries(macos()), SHA, { rcRun: bad }), /is not an RC Build run id/);
+  }
+  const script = fileURLToPath(new URL('./merge-preflight-records.mjs', import.meta.url));
+  assert.throws(
+    () => execFileSync(process.execPath, [script, '--candidate', SHA, '--out', '/dev/null', '--rc-run', 'abc', 'x.json'], { stdio: 'pipe' }),
+    (error) => error.status === 2 && /--rc-run must be an RC Build run id/.test(String(error.stderr)),
+  );
+  assert.equal(parseArgs(['--candidate', SHA, '--out', 'o', '--rc-run', '42', 'r.json']).rcRun, 42);
+});

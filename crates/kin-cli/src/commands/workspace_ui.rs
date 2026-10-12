@@ -24,6 +24,8 @@ const INDEX: &str = include_str!("../../assets/workspace_ui/index.html");
 const STYLE: &str = include_str!("../../assets/workspace_ui/style.css");
 const APP: &str = include_str!("../../assets/workspace_ui/workspace.js");
 const GRAPH: &str = include_str!("../../assets/workspace_ui/graph.js");
+const AGENTS_APP: &str = include_str!("../../assets/workspace_ui/agents.js");
+const AGENTS_STYLE: &str = include_str!("../../assets/workspace_ui/agents.css");
 const MARK: &str = include_str!("../../assets/review_ui/mark.svg");
 
 #[derive(Clone, Serialize)]
@@ -152,6 +154,14 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
             get(|| async { asset(GRAPH, "application/javascript; charset=utf-8") }),
         )
         .route(
+            "/workspace/agents.js",
+            get(|| async { asset(AGENTS_APP, "application/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/workspace/agents.css",
+            get(|| async { asset(AGENTS_STYLE, "text/css; charset=utf-8") }),
+        )
+        .route(
             "/workspace/mark.svg",
             get(|| async { asset(MARK, "image/svg+xml") }),
         )
@@ -166,6 +176,7 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
         .route("/api/workspace/merge/preview", post(merge_preview))
         .route("/api/workspace/merge/confirm", post(merge_confirm))
         .merge(super::workspace_explore::routes())
+        .merge(super::workspace_agents::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
 }
 

@@ -29,7 +29,26 @@ name: Release Cut
 # branch select the code that runs beside that credential. The typed
 # repository_dispatch cannot: GitHub always runs it from the default branch and
 # only when the workflow exists there. This mirrors release-tag.yml.
+#
+# A push to main is an occasion too, and it is safe for the same reason: a push
+# run resolves this workflow from the branch pushed, and the filter below admits
+# main alone. A commit that landed through the merge queue is graded on the
+# queue's build of that very commit (scripts/select-release-candidate.py,
+# grade_candidate), so nothing waits on main's own push runs to re-grade the
+# same tree. Those runs, where they run, still guard main and still decide the
+# moment they conclude red; they are simply off the release's critical path.
+#
+# Inside the merge queue the candidate is the group commit itself, the exact
+# sha the queue fast-forwards main to. When the queue's RC Build of that commit
+# completes, this workflow preflights its archives and files preflight.json for
+# the commit while the group is still queued, then posts the commit status
+# "Release preflight" on it. A queue that requires that status therefore lands
+# a release only once its record is filed, and release-tag.yml mints on the
+# push that lands it. A CI completion in the queue is an occasion too, so a
+# group that stages no release is told so even if no RC Build runs for it.
 on:
+  push:
+    branches: [main]
   workflow_run:
     workflows: [CI, RC Build]
     types: [completed]
@@ -40,7 +59,7 @@ on:
     # (:07,:22,:37,:52) so a cycle selects, arms and proves between two mint
     # evaluations rather than racing one. GitHub's cron stalled for most of
     # 2026-09-02, so the schedule is the fallback here and never the only path:
-    # CI and RC Build completions (workflow_run) drive the cut between ticks.
+    # main pushes and CI and RC Build completions drive the cut between ticks.
     - cron: "3 * * * *"
 
 permissions:
@@ -60,7 +79,8 @@ jobs:
     # the cheap half: it keeps the job from starting on the CI and RC Build
     # completions that are obviously not occasions. `workflow_run` fires on
     # every completion of both workflows, which on a busy main is most of the
-    # day.
+    # day. A push needs no filter here: `branches: [main]` above admits main
+    # alone, and the selector refuses any other ref again.
     if: >-
       github.event_name != 'workflow_run' ||
       (
@@ -75,15 +95,25 @@ jobs:
             github.event.workflow_run.name == 'RC Build' &&
             github.event.workflow_run.event == 'workflow_dispatch' &&
             startsWith(github.event.workflow_run.head_branch, 'release/v')
+          ) ||
+          (
+            (github.event.workflow_run.name == 'CI' || github.event.workflow_run.name == 'RC Build') &&
+            github.event.workflow_run.event == 'merge_group' &&
+            startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/')
           )
         )
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # pull-requests: read is for the inheritance read alone: which pull request
+    # a main commit was squashed from, and that it merged as this commit. A
+    # rc-build attempt's jobs need actions: read, and the annotations that say
+    # a cancelled job hit its own timeout need checks: read.
     permissions:
       actions: read
       checks: read
       contents: read
+      pull-requests: read
     outputs:
       decision: ${{ steps.select.outputs.decision || 'stand-down' }}
       version: ${{ steps.select.outputs.version }}
@@ -92,6 +122,8 @@ jobs:
       rc_run: ${{ steps.select.outputs.rc_run }}
       move: ${{ steps.select.outputs.move }}
       stranger_state: ${{ steps.select.outputs.stranger_state }}
+      queue_sha: ${{ steps.select.outputs.queue_sha }}
+      queue_state: ${{ steps.select.outputs.queue_state }}
       reason: ${{ steps.select.outputs.reason }}
     steps:
       # The literal trusted context value, as in kin-registry-wave-land.yml.
@@ -134,17 +166,27 @@ jobs:
       # from the checkout this run started with, for the reason release-tag.yml
       # gives: a rerun of an older run carries that run's sha, which resolves
       # the version main carried then rather than the version it carries now.
+      #
+      # A merge_group completion names the group commit it built. The selector
+      # verifies it against the queue's own refs and protected history rather
+      # than trusting it, and judges it as a queued candidate until it lands.
       - name: Select the candidate
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
+          QUEUE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event == 'merge_group' && github.event.workflow_run.head_sha || '' }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
           git update-ref refs/remotes/origin/main FETCH_HEAD
+          queue=()
+          if [ -n "$QUEUE_SHA" ]; then
+            queue=(--queue-sha "$QUEUE_SHA")
+          fi
           python3 scripts/select-release-candidate.py select \
             --repository "$GITHUB_REPOSITORY" \
             --workspace "$GITHUB_WORKSPACE" \
+            "${queue[@]+"${queue[@]}"}" \
             | tee "$RUNNER_TEMP/release-cut-decision.json"
 
       # Uploaded on every path, including the ones that stood down and the ones
@@ -339,6 +381,61 @@ jobs:
             echo "preflight follows without another occasion."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "rc-build run ${run_id} building ${CANDIDATE}"
+
+  # A build whose build job hit its own timeout is a retry, not a spent
+  # attempt. A merge group's RC Build cannot be dispatched again, so its failed
+  # jobs are re-run in place: same run, same commit, and the legs that already
+  # passed keep their archives. The re-run's completion is the next occasion,
+  # which cascades into this workflow only when it was requested on the App
+  # identity, the same precondition the dispatch in `arm` carries.
+  retry:
+    name: Re-run an RC Build its runner timeout killed
+    needs: select
+    if: needs.select.outputs.decision == 'retry'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-tag
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Mint repository-scoped re-run token
+        id: dispatch-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: kinlab-ai
+          repositories: kin
+          permission-actions: write
+
+      - name: Warn when the re-run cannot use the App identity
+        if: steps.dispatch-token.outcome != 'success'
+        run: |
+          echo "::warning::kin-release-bot does not carry Actions: write, so the re-run goes out on github.token and its completion will not wake this workflow again; a queued group then waits for the push that lands it, and a landed commit for the next occasion"
+
+      - name: Re-run the timed-out build's failed jobs
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outcome == 'success' && steps.dispatch-token.outputs.token || github.token }}
+          RC_RUN: ${{ needs.select.outputs.rc_run }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RC_RUN" =~ ^[1-9][0-9]*$ ]] || [[ ! "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact rc-build run and candidate"
+            exit 1
+          fi
+          # Re-read the run rather than trusting the decision: only a finished
+          # RC Build of this very commit is re-run.
+          read -r path head status <<< "$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RC_RUN}" \
+            -q '[.path, .head_sha, .status] | @tsv')"
+          if [ "$path" != .github/workflows/rc-build.yml ] || [ "$head" != "$CANDIDATE" ] || [ "$status" != completed ]; then
+            echo "::error::run ${RC_RUN} is ${path} at ${head} (${status}), not a finished RC Build of ${CANDIDATE}"
+            exit 1
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RC_RUN}/rerun-failed-jobs" >/dev/null
+          echo "re-ran the failed jobs of rc-build run ${RC_RUN} for ${CANDIDATE}"
 
   # The host leg of the proof, on runners that can execute each archive.
   #
@@ -645,6 +742,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # A record may be filed for a commit on protected main, or for the commit
+      # a live merge group of main will fast-forward it to. A group that left
+      # the queue without landing is neither, and gets nothing.
       - name: Re-bind the publish to protected main history
         env:
           GH_TOKEN: ${{ github.token }}
@@ -659,10 +759,12 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --policy-sha "$GITHUB_SHA" \
             --branch main
-          python3 scripts/verify-protected-main-history.py \
+          git fetch --no-tags origin main
+          git update-ref refs/remotes/origin/main FETCH_HEAD
+          python3 scripts/select-release-candidate.py bind-candidate \
             --repository "$GITHUB_REPOSITORY" \
-            --policy-sha "$CANDIDATE" \
-            --branch main
+            --workspace "$GITHUB_WORKSPACE" \
+            --sha "$CANDIDATE"
 
       - name: Collect every leg record
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
@@ -670,11 +772,20 @@ jobs:
           pattern: kin-release-preflight-*
           path: ${{ runner.temp }}/legs
 
+      # The record names the RC Build run every leg judged (rc_build.run_id),
+      # and scripts/locate-rc-build.mjs makes release.yml ship from exactly that
+      # run, so a commit the merge queue and a fallback dispatch both built is
+      # never ambiguous about which bytes were proven.
       - name: Merge the leg records into the candidate's preflight record
         env:
           CANDIDATE: ${{ needs.select.outputs.candidate }}
+          RC_RUN: ${{ needs.select.outputs.rc_run }}
         run: |
           set -euo pipefail
+          if [[ ! "$RC_RUN" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::selection handed over no rc-build run id to record"
+            exit 1
+          fi
           legs=()
           while IFS= read -r record; do
             legs+=("$record")
@@ -687,6 +798,7 @@ jobs:
           node scripts/release-proof/merge-preflight-records.mjs \
             --candidate "$CANDIDATE" \
             --out "$RUNNER_TEMP/preflight.json" \
+            --rc-run "$RC_RUN" \
             "${legs[@]}"
 
       - name: Mint repository-scoped evidence token
@@ -823,6 +935,58 @@ jobs:
             echo "printing the exact local command."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::preflight.json published for ${CANDIDATE}"
+
+  # What the merge queue waits on. Posted on every group commit the cut was
+  # woken for: success when the group stages no release or its record is
+  # filed, failure when its build cannot be proven, and nothing while there is
+  # still a build or a re-run to wait for. Its forgery would only move WHEN a
+  # queue lands, never what is minted: the mint reads the filed record itself.
+  report-to-queue:
+    name: Tell the merge queue whether this group's release is proven
+    needs: [select, preflight, publish]
+    if: always() && needs.select.outputs.queue_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      statuses: write
+    steps:
+      - name: Post the Release preflight status on the group commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_SHA: ${{ needs.select.outputs.queue_sha }}
+          QUEUE_STATE: ${{ needs.select.outputs.queue_state }}
+          REASON: ${{ needs.select.outputs.reason }}
+          PUBLISH: ${{ needs.publish.result }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$QUEUE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::selection handed over no exact group commit"
+            exit 1
+          fi
+          state="$QUEUE_STATE"
+          description="$REASON"
+          if [ "$state" = proof ]; then
+            if [ "$PUBLISH" = success ]; then
+              state=success
+              description="preflight.json is filed for this group commit, so the push that lands it can mint at once"
+            else
+              state=failure
+              description="the preflight of this group's RC Build archives did not file a record (publish ${PUBLISH})"
+            fi
+          fi
+          case "$state" in
+            success|failure) ;;
+            *)
+              echo "nothing to tell the queue yet: ${REASON}"
+              exit 0
+              ;;
+          esac
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${QUEUE_SHA}" \
+            -f state="$state" \
+            -f context="Release preflight" \
+            -f description="${description:0:140}" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          echo "posted Release preflight=${state} on ${QUEUE_SHA}: ${description}"
 
   # The stranger, on a runner the fleet owns.
   #

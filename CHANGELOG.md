@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.2] - 2026-10-10
+## [0.8.4] - 2026-10-12
+
+0.8.4 is the first release after 0.8.1. The 0.8.2 and 0.8.3 versions were
+never published, so everything they would have carried is listed here.
 
 ### Added
+
+- Kin shows which AI agents are working in a repository and what they do
+  through it. Connecting an MCP client opens a daemon session, and its reads,
+  changes and commits carry that agent's attribution. The local workspace
+  page lists connected agents with their recent reads and changes, marks the
+  entities they read or changed on the repository map, and names the agent
+  behind a change in timelines and guided review. Activity keeps tool names,
+  entity ids, result counts, sizes, durations and failures, never query text,
+  arguments, answers or paths, and stays bounded per session and in total.
 
 - `kin update --check-only --json` always prints one JSON object. It now says
   how this Kin was installed (`install_method`: `kin_installer`, `homebrew`,
@@ -308,6 +320,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell instead.
 
 ### Fixed
+
+- On a Linux host with no memory cap, Kin reads the machine's physical memory
+  instead of reporting it as unknown, and a container's cap still wins where
+  one is set.
+- Re-deriving history keeps each same-named declaration, such as a property's
+  getter and setter, on its own identity instead of letting them swap.
+- An edit next to a local module that declares nothing, such as a file of
+  comments or an `index.js` that only re-exports, keeps that module local
+  instead of resolving an unchanged import to an external package. Stores
+  created by earlier releases keep committing and stashing after the upgrade.
+- `kin setup` no longer waits forever on macOS's notification permission
+  request. Over SSH, or anywhere else with no access to the Mac's screen,
+  it does not ask: it says notifications are not decided yet and names the
+  command that asks from the Mac's own screen, `kin notify authorize`. On
+  the Mac's screen it waits at most 45 seconds for the answer, then goes on
+  and says the same if none arrived, leaving the request open to answer.
+  `kin notify authorize` asks again whenever you choose, `--wait` sets how
+  long it waits, and `--json` reports the outcome. `kin notify status` and
+  `kin doctor` no longer wait without a bound on the notifier either.
+- `kin doctor`'s "Daemon memory standing" row says what it counts: on macOS
+  the daemon's physical footprint, the figure Activity Monitor shows as
+  Memory, and of the daemon's own share, how much is GPU memory (such as an
+  embedding model's buffers) and how much is compressed or swapped out but
+  still counted. A reading published by a daemon that has since stopped, as
+  `kin init` stops its own, is reported as that daemon's last reading with
+  its pid and time rather than graded as memory held now, which is what
+  made a fresh 8 GiB Mac report a red row right after `kin init`.
+- On a Mac with less than 48 GiB of memory, the Metal embedding engine's
+  buffer pool holds at most a sixteenth of the machine's memory instead of
+  a fixed 3 GiB, so an embedding pass on an 8 GiB Mac no longer leaves the
+  daemon holding most of its 4 GiB allowance in buffers it keeps for reuse.
+- A review's risk follows what a change asks of the places that rely on it,
+  not how many there are. A comment or a docstring is low risk however many
+  places rely on it and whoever made it, and needs no test coverage. A body
+  that changed under a signature that held rises to medium on its reach and
+  no further unless a finding of its own raises it. A signature change keeps
+  the rules it had. A docstring edit relied on by 16 places used to read as
+  high risk beside a guide that said none of them needed an update.
+- A Python call inside an `isinstance` guard now names the guard's classes as
+  possible targets. `if isinstance(c, AliasPath): c.convert_to_aliases()`
+  links the call to `AliasPath.convert_to_aliases`, or to the method its
+  hierarchy supplies, as a `name_only` candidate carrying the call's exact
+  site and the guard that admitted it. A tuple guard such as
+  `isinstance(alias, (AliasChoices, AliasPath))` names both classes on one
+  site. A subclass passes the same guard, so a guarded candidate is never
+  counted as a proven caller. A guard Kin cannot ground, such as an unknown or
+  rebound class, a replaced `isinstance` or a receiver the branch rebinds,
+  leaves the site a recorded gap instead of a same-named guess.
+- Passing a bound method as a value, as in
+  `Consumer(process_event=self._process_event)`, is now a reference from the
+  registering method to the method its class declares or inherits. When a
+  subclass overrides that method, the reference keeps the dispatch
+  qualification a `self` call to it gets. It is not a call, and Kin does not
+  bind the stored callback to every place that later invokes it.
+- A JavaScript or TypeScript member call such as `object.read()` no longer
+  borrows a same-named `import { read }` as its source, so it is not linked to
+  the imported function. Bare calls keep their import. A JavaScript
+  `import * as ns from './mod'` now binds `ns`, as it already did in
+  TypeScript, so `ns.member()` resolves inside that module.
+- `kin impact` says what its answer measures. Under the count it adds a line
+  stating that the listed dependents are structural graph reach and that
+  argument and branch feasibility is not established. The one-hop heading
+  reads "direct graph dependents" instead of "direct callers" whenever an
+  import or another non-call relation supplies a one-hop dependent, and that
+  row names the relation, such as `(imports, not a call)`. `--json` carries
+  the same reading in an `interpretation` object with counts of dependents
+  reached through call relations and through other relations. The ranked
+  report and every path in it are unchanged.
 
 - Installing Kin works on Ubuntu, Debian and every other distribution whose
   logins get a umask of 0002. The shell installer and the npm launcher create

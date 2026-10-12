@@ -44,7 +44,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = ROOT / "scripts" / "install.sh"
-RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+# RC Build packages the archives a release ships; release.yml verifies and
+# publishes those exact bytes without rebuilding them, so the packaging this
+# guard derives archive contents from lives in rc-build.yml.
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "rc-build.yml"
 
 PROBE_VERSION = "0.0.0-archive-binary-probe"
 

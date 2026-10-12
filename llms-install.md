@@ -87,7 +87,7 @@ npm install -g @kinlab/kin
 From Homebrew:
 
 ```sh
-brew install firelock-ai/kin/kin
+brew install kinlab-ai/kin/kin
 ```
 
 Confirm the install before continuing:

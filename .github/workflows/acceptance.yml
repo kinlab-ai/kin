@@ -25,6 +25,23 @@
 # (FIR-2593). An acceptance suite whose result depends on a profile nobody
 # releases is answering a question nobody asked.
 #
+# The workflow is one release build, five jobs that run the suites against it
+# on runners of their own, and the `Product Acceptance` job that reads every
+# suite's report and alone decides. It used to be one job of 49 to 52 minutes:
+# about 20 building, then thirty suites one after another, the longest of them
+# init-memory, which builds its own guard and never needed the release pair, so
+# it now starts beside the build. Each suite job still runs its suites one at a
+# time on its own host, the gate reads the same reports in the same order, and
+# a job that fails or never runs reaches the gate as missing reports, which it
+# fails by name. Every job reports `skipped` on a pull request, export pull
+# requests included, and runs in full on the merge queue's commit and on every
+# main commit. A job skipped by its `if:` passes a required check, so the
+# skipped `Product Acceptance` is the pull request's one producer of that
+# context, and the queue's run is the real one under the same name. The merge
+# queue waits for it before anything lands, and the release selector refuses a
+# sha whose Acceptance run did not succeed, so what this proves still has to be
+# true before a tag.
+#
 # Whether `Product Acceptance` is a required context is live GitHub
 # configuration that no test in this repository can read, and this comment has
 # now been wrong in BOTH directions, so it names the command rather than the
@@ -96,19 +113,17 @@ env:
   KIN_VFS_DISABLE: "1"
 
 jobs:
-  acceptance:
-    name: Product Acceptance
-    # Measured at 29.0 minutes on a pull request, the single largest required
-    # context, against a ten-minute open-to-merge bar. It reports `skipped` here
-    # and runs in full on the merge queue and on every main commit; the release
-    # mint refuses a sha whose required checks are not green, so what this
-    # proves still has to be true before a tag, only later than it used to be.
-    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
+  # Every grader falsification, then the one release build every suite grades.
+  # The falsifications come first because they need no binary, so a broken
+  # grader is named in seconds rather than after the build.
+  acceptance-build:
+    name: Acceptance release build
+    if: ${{ github.event_name != 'pull_request' }}
     # The heavy-runner switch, matching ci.yml's compile-heavy jobs.
     # `vars.KIN_HEAVY_RUNNER` names the runner; unset or empty resolves to
     # `ubuntu-latest`, so this workflow is always runnable without the variable.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -389,6 +404,7 @@ jobs:
       # that runs with no vector index.
       - name: Falsify the prose-query parity graders
         run: python3 scripts/acceptance/prose_query_parity_repro.py --self-test
+
       # FIR-2964. Written blind to which cheap coverage path is in the tree, so
       # it grades the envelope read and whatever replaces it without being
       # rewritten. The pair is the point: a clean store must read in sync and a
@@ -465,6 +481,50 @@ jobs:
       - name: Build kin + kin-daemon (release)
         run: cargo build --release --locked --bin kin --bin kin-daemon
 
+      # The suites run on other runners and grade exactly these two files. The
+      # artifact belongs to this run and attempt only, so no suite can grade a
+      # binary another commit built.
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-release-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            target/release/kin
+            target/release/kin-daemon
+
+  # Each suite job below grades the build job's binaries on a runner of its
+  # own, in the order the gate reads its reports. The suites in one job still
+  # run one after another, and a suite that measures memory or time now shares
+  # its host with fewer suites than before, not more. Brownfield runs alone: it
+  # is the longest at about six minutes and the only one that needs the pinned
+  # corpora.
+  acceptance-brownfield:
+    name: Acceptance brownfield suite
+    needs: acceptance-build
+    if: ${{ github.event_name != 'pull_request' }}
+    # The heavy-runner switch, matching the build job.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The release pair the build job made. An artifact does not keep the
+      # executable bit, so the step after it restores the mode.
+      - name: Download the release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: acceptance-release-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/release
+
+      - name: Make the release binaries executable
+        run: chmod +x target/release/kin target/release/kin-daemon
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
       # Without a language server on PATH the brownfield suite's enrichment
       # sweep never runs, and its recall checks then report UNREADABLE rather
       # than a verdict. The script warns and exits 0 on a registry failure, so a
@@ -534,33 +594,6 @@ jobs:
       # afterwards, rather than piping into tee. A pipeline's exit status is its
       # last stage's, and `tee` exits 0 on input it never read, so a piped run
       # can report success for a suite that failed.
-      - name: Magic acceptance suite (verdict comes from the gate step)
-        id: magic
-        env:
-          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
-        run: |
-          set -uo pipefail
-          mkdir -p acceptance
-          rc=0
-          python3 scripts/acceptance/magic_repro.py \
-            --kin target/release/kin \
-            --daemon target/release/kin-daemon \
-            --json acceptance/magic.json \
-            --label "$KIN_ACCEPTANCE_LABEL" \
-            --verbose >acceptance/magic.log 2>&1 || rc=$?
-          cat acceptance/magic.log
-          {
-            echo "### Magic acceptance suite (exit $rc)"
-            echo ''
-            echo '```'
-            grep -E '^CHECK ' acceptance/magic.log || echo '(no CHECK line was printed)'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          if [ "$rc" -ne 0 ]; then
-            echo "::warning title=Magic acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
-          fi
-
       - name: Brownfield acceptance suite (verdict comes from the gate step)
         id: brownfield
         if: always()
@@ -588,6 +621,108 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=Brownfield acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
+      # Always, including after a failed suite: the gate reads every report,
+      # and a group that uploads nothing fails it by name.
+      - name: Upload this group's acceptance reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}-brownfield
+          path: acceptance/
+          if-no-files-found: warn
+          retention-days: 14
+
+  acceptance-core-suites:
+    name: Acceptance magic and memory suites
+    needs: acceptance-build
+    if: ${{ github.event_name != 'pull_request' }}
+    # The heavy-runner switch, matching the build job.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The release pair the build job made. An artifact does not keep the
+      # executable bit, so the step after it restores the mode.
+      - name: Download the release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: acceptance-release-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/release
+
+      - name: Make the release binaries executable
+        run: chmod +x target/release/kin target/release/kin-daemon
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      # Without a language server on PATH the brownfield suite's enrichment
+      # sweep never runs, and its recall checks then report UNREADABLE rather
+      # than a verdict. The script warns and exits 0 on a registry failure, so a
+      # bad npm morning does not fail this gate; when that happens the suite
+      # says so per check instead of quietly passing.
+      - name: Install language servers for the enrichment checks
+        run: bash scripts/ci-install-language-servers.sh
+
+      # `kin commit` refuses to invent an author, and a hosted runner carries no
+      # git identity, so without this every magic-suite fixture that commits
+      # through kin fails to build and its checks report UNREADABLE. Run
+      # 32512404014 is what found it: seven of ten checks came back
+      # "kin commit failed ... Set your Git identity". The suites pass an
+      # identity to their own `git` invocations already; this is for the commits
+      # kin itself authors.
+      - name: Give the runner a git identity
+        run: |
+          set -euo pipefail
+          git config --global user.name 'Kin CI'
+          git config --global user.email 'ci@kinlab.ai'
+          git config --global --get user.email
+
+      # The magic suite's virtual-environment check builds a real venv, and
+      # Debian and Ubuntu ship `python3 -m venv` in a separate package. Probe by
+      # creating one rather than by importing the module, because the module
+      # imports fine on an image whose ensurepip was split out and only the
+      # creation fails. A missing venv would otherwise surface as UNREADABLE on
+      # that one check, which is a red job blamed on the diff under review.
+      - name: Ensure python3 can create a virtual environment
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          if ! python3 -m venv "$probe/env" >/dev/null 2>&1; then
+            scripts/ci-apt-install.sh python3-venv
+            python3 -m venv "$probe/env"
+          fi
+          rm -rf "$probe"
+          echo "python3 -m venv works"
+
+      - name: Magic acceptance suite (verdict comes from the gate step)
+        id: magic
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/magic_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/magic.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/magic.log 2>&1 || rc=$?
+          cat acceptance/magic.log
+          {
+            echo "### Magic acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/magic.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Magic acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
       - name: Response budget elision suite (verdict comes from the gate step)
@@ -849,6 +984,50 @@ jobs:
             echo "::warning title=Memory-footprint suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      # Always, including after a failed suite: the gate reads every report,
+      # and a group that uploads nothing fails it by name.
+      - name: Upload this group's acceptance reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}-core
+          path: acceptance/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The init-memory suite builds and runs its own guard with `cargo test
+  # --release` and never touches the release pair, so it does not wait for the
+  # build: it starts with it, on its own runner. It was the longest suite, 12.5
+  # to 12.9 minutes of a 49 to 52 minute job, and it now ends before the build
+  # does.
+  acceptance-init-memory:
+    name: Acceptance init-memory suite
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        # Preserve the tracked config because it carries public Git [patch.kin]
+        # pins for kin-* crates that are not all registry-published yet.
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # The release dependency build the build job saves, restored and never
+      # written from here: one job per entry writes it.
+      - name: Cache cargo registry and the release dependency build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: acceptance-release
+          save-if: false
+
       # FIR-2539. This suite drives the in-tree live-heap guard rather than a
       # binary: the figure that carries the class is what proof 1 adds to the
       # peak, and only the counting allocator can see it. Resident set was tried
@@ -879,6 +1058,81 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=Init-memory acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
+
+      # Always, including after a failed suite: the gate reads every report,
+      # and a group that uploads nothing fails it by name.
+      - name: Upload this group's acceptance reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}-initmemory
+          path: acceptance/
+          if-no-files-found: warn
+          retention-days: 14
+
+  acceptance-lifecycle-suites:
+    name: Acceptance lifecycle suites
+    needs: acceptance-build
+    if: ${{ github.event_name != 'pull_request' }}
+    # The heavy-runner switch, matching the build job.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The release pair the build job made. An artifact does not keep the
+      # executable bit, so the step after it restores the mode.
+      - name: Download the release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: acceptance-release-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/release
+
+      - name: Make the release binaries executable
+        run: chmod +x target/release/kin target/release/kin-daemon
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      # Without a language server on PATH the brownfield suite's enrichment
+      # sweep never runs, and its recall checks then report UNREADABLE rather
+      # than a verdict. The script warns and exits 0 on a registry failure, so a
+      # bad npm morning does not fail this gate; when that happens the suite
+      # says so per check instead of quietly passing.
+      - name: Install language servers for the enrichment checks
+        run: bash scripts/ci-install-language-servers.sh
+
+      # `kin commit` refuses to invent an author, and a hosted runner carries no
+      # git identity, so without this every magic-suite fixture that commits
+      # through kin fails to build and its checks report UNREADABLE. Run
+      # 32512404014 is what found it: seven of ten checks came back
+      # "kin commit failed ... Set your Git identity". The suites pass an
+      # identity to their own `git` invocations already; this is for the commits
+      # kin itself authors.
+      - name: Give the runner a git identity
+        run: |
+          set -euo pipefail
+          git config --global user.name 'Kin CI'
+          git config --global user.email 'ci@kinlab.ai'
+          git config --global --get user.email
+
+      # The magic suite's virtual-environment check builds a real venv, and
+      # Debian and Ubuntu ship `python3 -m venv` in a separate package. Probe by
+      # creating one rather than by importing the module, because the module
+      # imports fine on an image whose ensurepip was split out and only the
+      # creation fails. A missing venv would otherwise surface as UNREADABLE on
+      # that one check, which is a red job blamed on the diff under review.
+      - name: Ensure python3 can create a virtual environment
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          if ! python3 -m venv "$probe/env" >/dev/null 2>&1; then
+            scripts/ci-apt-install.sh python3-venv
+            python3 -m venv "$probe/env"
+          fi
+          rm -rf "$probe"
+          echo "python3 -m venv works"
 
       - name: Registry home isolation suite (verdict comes from the gate step)
         id: registryisolation
@@ -1022,6 +1276,81 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=MCP spawn-admission suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
+
+      # Always, including after a failed suite: the gate reads every report,
+      # and a group that uploads nothing fails it by name.
+      - name: Upload this group's acceptance reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}-lifecycle
+          path: acceptance/
+          if-no-files-found: warn
+          retention-days: 14
+
+  acceptance-surface-suites:
+    name: Acceptance read-surface suites
+    needs: acceptance-build
+    if: ${{ github.event_name != 'pull_request' }}
+    # The heavy-runner switch, matching the build job.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The release pair the build job made. An artifact does not keep the
+      # executable bit, so the step after it restores the mode.
+      - name: Download the release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: acceptance-release-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/release
+
+      - name: Make the release binaries executable
+        run: chmod +x target/release/kin target/release/kin-daemon
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      # Without a language server on PATH the brownfield suite's enrichment
+      # sweep never runs, and its recall checks then report UNREADABLE rather
+      # than a verdict. The script warns and exits 0 on a registry failure, so a
+      # bad npm morning does not fail this gate; when that happens the suite
+      # says so per check instead of quietly passing.
+      - name: Install language servers for the enrichment checks
+        run: bash scripts/ci-install-language-servers.sh
+
+      # `kin commit` refuses to invent an author, and a hosted runner carries no
+      # git identity, so without this every magic-suite fixture that commits
+      # through kin fails to build and its checks report UNREADABLE. Run
+      # 32512404014 is what found it: seven of ten checks came back
+      # "kin commit failed ... Set your Git identity". The suites pass an
+      # identity to their own `git` invocations already; this is for the commits
+      # kin itself authors.
+      - name: Give the runner a git identity
+        run: |
+          set -euo pipefail
+          git config --global user.name 'Kin CI'
+          git config --global user.email 'ci@kinlab.ai'
+          git config --global --get user.email
+
+      # The magic suite's virtual-environment check builds a real venv, and
+      # Debian and Ubuntu ship `python3 -m venv` in a separate package. Probe by
+      # creating one rather than by importing the module, because the module
+      # imports fine on an image whose ensurepip was split out and only the
+      # creation fails. A missing venv would otherwise surface as UNREADABLE on
+      # that one check, which is a red job blamed on the diff under review.
+      - name: Ensure python3 can create a virtual environment
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          if ! python3 -m venv "$probe/env" >/dev/null 2>&1; then
+            scripts/ci-apt-install.sh python3-venv
+            python3 -m venv "$probe/env"
+          fi
+          rm -rf "$probe"
+          echo "python3 -m venv works"
 
       - name: Verdict-limits acceptance suite (verdict comes from the gate step)
         id: verdictlimits
@@ -1384,6 +1713,45 @@ jobs:
             echo "::warning title=Graph viz local render acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      # Always, including after a failed suite: the gate reads every report,
+      # and a group that uploads nothing fails it by name.
+      - name: Upload this group's acceptance reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}-surfaces
+          path: acceptance/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # THE VERDICT. Everything above produced a report or failed to, and this job
+  # alone decides. It runs whenever the run was not cancelled, so a failed or
+  # skipped build or suite job reaches it as missing reports, and gate.py fails
+  # on every missing report by name. It never skips while the suites run, which
+  # is what the landing tool requires of the `Product Acceptance` job.
+  acceptance:
+    name: Product Acceptance
+    needs:
+      - acceptance-build
+      - acceptance-brownfield
+      - acceptance-core-suites
+      - acceptance-init-memory
+      - acceptance-lifecycle-suites
+      - acceptance-surface-suites
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download every group's acceptance reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: acceptance-reports-${{ github.run_id }}-${{ github.run_attempt }}-*
+          merge-multiple: true
+          path: acceptance
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -1419,8 +1787,8 @@ jobs:
         if: always()
         run: |
           python3 scripts/acceptance/gate.py \
-            --report magic=acceptance/magic.json \
             --report brownfield=acceptance/brownfield.json \
+            --report magic=acceptance/magic.json \
             --report response_budget=acceptance/response_budget.json \
             --report trace_spine=acceptance/trace_spine.json \
             --report parsehole=acceptance/parsehole.json \

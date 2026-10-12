@@ -7,6 +7,7 @@
   <title>Kin</title>
   <link rel="icon" href="__KIN_BASE__/workspace/mark.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="__KIN_BASE__/workspace/style.css" />
+  <link rel="stylesheet" href="__KIN_BASE__/workspace/agents.css" />
 </head>
 <body data-api-base="__KIN_BASE__">
   <a class="workspace-skip" href="#workspace-main">Skip to content</a>
@@ -22,6 +23,7 @@
       <div id="workspace-repository-picker"></div>
       <nav class="workspace-nav" id="workspace-nav" aria-label="Primary">
         <a href="#/home" data-route="home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4.5l8 6.7V19a1 1 0 0 1-1 1h-4.5v-5.5h-5V20H5a1 1 0 0 1-1-1z"/></svg><span>Home</span></a>
+        <a href="#/agents" data-route="agents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5c.5 4.3 2.7 6.5 7 7-4.3.5-6.5 2.7-7 7-.5-4.3-2.7-6.5-7-7 4.3-.5 6.5-2.7 7-7z"/><path d="M18.5 15.5c.2 1.6 1 2.4 2.6 2.6-1.6.2-2.4 1-2.6 2.6-.2-1.6-1-2.4-2.6-2.6 1.6-.2 2.4-1 2.6-2.6z"/></svg><span>Agents</span><span class="nav-live" id="workspace-nav-agents" hidden></span></a>
         <a href="#/explore" data-route="explore"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.3-4.3"/></svg><span>Explore</span><kbd>/</kbd></a>
         <a href="#/changes" data-route="changes"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v6m0 6v6"/></svg><span>Changes</span></a>
         <a href="__KIN_BASE__/review/" id="workspace-review-link" data-route="review"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5h10M4 12h7M4 17.5h6"/><path d="m14.5 16 2.2 2.2 4.3-4.7"/></svg><span>Review</span></a>
@@ -49,6 +51,7 @@
   <noscript><p class="workspace-noscript">This page needs JavaScript. The same changes read in a terminal with <code>kin review guide</code>.</p></noscript>
   <script src="__KIN_BASE__/review/highlight.js"></script>
   <script src="__KIN_BASE__/workspace/graph.js"></script>
+  <script src="__KIN_BASE__/workspace/agents.js"></script>
   <script src="__KIN_BASE__/workspace/workspace.js"></script>
 </body>
 </html>

@@ -211,9 +211,14 @@ fn paint_impact(line: &str) -> String {
         );
     }
 
-    // The callers a change breaks first.
-    if line == "  1 hop (direct callers):" {
+    // The dependents nearest the change, whether every one calls it or not.
+    if line == "  1 hop (direct callers):" || line == "  1 hop (direct graph dependents):" {
         return format!("{WARN}{line}{RESET}");
+    }
+
+    // What the count above it measures, with the label dimmed like a note.
+    if let Some(rest) = line.strip_prefix("  Structural graph reach: ") {
+        return format!("  {FAINT}Structural graph reach:{RESET} {rest}");
     }
 
     let hops = compiled(&HOPS, r"^  \d+ hops:$");
@@ -225,15 +230,30 @@ fn paint_impact(line: &str) -> String {
         &ENTITY,
         r"^    - (.+) \(([^)]+)\)(?: @ (\S+(?: \(span stale\))?))?$",
     );
-    if let Some(caps) = entity.captures(line) {
-        let at = caps
-            .get(3)
-            .map(|loc| format!(" {FAINT}@{RESET} {}", loc.as_str()))
-            .unwrap_or_default();
-        return format!(
-            "    - {BOLD}{}{RESET} {FAINT}({}){RESET}{at}",
-            &caps[1], &caps[2]
-        );
+    let paint_row = |row: &str| {
+        entity.captures(row).map(|caps| {
+            let at = caps
+                .get(3)
+                .map(|loc| format!(" {FAINT}@{RESET} {}", loc.as_str()))
+                .unwrap_or_default();
+            format!(
+                "    - {BOLD}{}{RESET} {FAINT}({}){RESET}{at}",
+                &caps[1], &caps[2]
+            )
+        })
+    };
+    // A one-hop row no call reaches names its relations after the location.
+    // Split off first, so the note is not read as the row's kind.
+    if let Some((row, relations)) = line
+        .strip_suffix(", not a call)")
+        .and_then(|rest| rest.rsplit_once(" ("))
+    {
+        if let Some(painted) = paint_row(row) {
+            return format!("{painted} {FAINT}({relations}, not a call){RESET}");
+        }
+    }
+    if let Some(painted) = paint_row(line) {
+        return painted;
     }
 
     let note = compiled(&NOTE, r"^  Note: (.*)$");
@@ -684,6 +704,37 @@ mod tests {
     }
 
     #[test]
+    fn impact_structural_heading_reach_line_and_non_call_rows_are_painted() {
+        let direct = "  1 hop (direct graph dependents):";
+        assert_painted(&paint_impact(direct), direct, WARN);
+
+        let reach = "  Structural graph reach: 3 local graph dependents reach this entity through \
+                     graph edges (2 through call relations alone, 1 through a non-call relation); \
+                     argument and branch feasibility is not established.";
+        assert_painted(
+            &paint_impact(reach),
+            reach,
+            &format!("{FAINT}Structural graph reach:{RESET} 3 local graph dependents"),
+        );
+
+        // The relation note must not be taken for the row's kind.
+        let row = "    - settings.test (Module) @ src/settings.test.ts (imports, not a call)";
+        let painted = paint_impact(row);
+        assert_painted(&painted, row, &format!("{BOLD}settings.test{RESET}"));
+        assert!(
+            painted.contains(&format!("{FAINT}(Module){RESET}")),
+            "{painted:?}"
+        );
+        assert!(
+            painted.ends_with(&format!(
+                "{FAINT}@{RESET} src/settings.test.ts {FAINT}(imports, not a call){RESET}"
+            )),
+            "{painted:?}"
+        );
+        assert_theme_aware(&painted);
+    }
+
+    #[test]
     fn impact_note_dims_only_the_label() {
         let plain = "  Note: 3 matches; showing the deterministic first match.";
         let painted = paint_impact(plain);
@@ -791,8 +842,13 @@ mod tests {
             "Impact analysis for 'h' (Function) @ a.rs:1:",
             "  2 local entities impacted within 2 hops:",
             "  1 hop (direct callers):",
+            "  1 hop (direct graph dependents):",
+            "  Structural graph reach: 2 local graph dependents reach this entity through graph \
+             edges (all through call relations); argument and branch feasibility is not \
+             established.",
             "  2 hops:",
             "    - r (Function) @ a.rs:3",
+            "    - m (Module) @ a.rs (imports, not a call)",
             "  Note: one.",
         ] {
             assert_theme_aware(&paint_impact(line));

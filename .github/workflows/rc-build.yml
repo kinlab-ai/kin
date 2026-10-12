@@ -3,57 +3,67 @@
 
 name: RC Build
 
-# A release-candidate archive build that needs no tag.
+# The only producer of the bytes a Kin release ships.
 #
-# The release proof loop says: preflight the composed build, run the archive
-# stranger on the candidate, then land and tag. The second step could not run
-# before a tag existed. Release-shaped archives were produced only by
-# release.yml, release.yml runs only on a `v*` tag push, and a tag run resolves
-# its workflows from the tag, so nothing landed afterwards can repair it. The
-# archive stranger therefore ran on shipped bytes for v0.5.40, after the cut,
-# and bin/kin-release-preflight skipped its Linux leg with "no Linux archive was
-# given and this host cannot cross-build one" because a macOS host cannot
-# produce a linux-aarch64 archive.
+# This workflow builds the five release archives and the daemon image for one
+# commit, installs every archive, smoke-tests the image, and attests all of
+# them. release.yml compiles nothing. At a tag it locates the run of this
+# workflow for the tagged commit (scripts/locate-rc-build.mjs), checks every
+# binding that script lists, executes each archive again on a runner that can
+# run it, signs and notarizes the two macOS archives, pushes the image, and
+# publishes. The Linux and Windows archives and the image ship byte for byte as
+# they were built here; the macOS archives differ only by their signatures.
 #
-# This workflow closes that gap. It builds the same archive layouts release.yml
-# builds, for the branch or tag it is dispatched on, and uploads them as
-# artifacts. It creates no
-# tag, publishes no release, publishes to no registry, and touches no promotion
-# state. It holds no credential: it declares no environment and reads no secret,
-# which is what keeps a dispatch of branch-controlled workflow code away from the
-# Apple and package-publish credentials release.yml gates behind `environment:
-# release` (see the note above `config` in release.yml).
+# Why that is safe, and safer than what it replaced. The preflight in
+# release-cut.yml has always judged THIS workflow's archives. release.yml used
+# to compile the same commit again at the tag, so the Linux and Windows
+# archives a user installed were a second build no preflight had judged. Now
+# the archive a preflight leg judged is the archive that is published, and
+# release.yml proves it by sha256 before anything ships. It also used to
+# strand a tag whenever a release-only build failed, because a tag freezes
+# release.yml; a build failure now happens here, before any tag exists.
 #
-# SOURCE OF TRUTH: .github/workflows/release.yml, job `build`. Every step below
-# is a byte-identical copy of that job's step of the same name, except where a
-# comment starting DELTA( names the difference and why. Six steps are omitted on
-# purpose: the macOS signing and notarization steps, which need the credentials
-# this workflow deliberately cannot reach.
-# scripts/check-rc-build-drift.mjs holds that relationship and fails the pull
-# request when release.yml moves and this file does not.
+# Two producers run it, and release.yml accepts bytes from no other:
+#   - GitHub's merge queue, on `merge_group` for main. A merge group builds the
+#     exact commit that then lands on main, so the tag minted for that commit
+#     finds this run.
+#   - Release Cut, by `workflow_dispatch` on release/v<version>-candidate, as
+#     the fallback for a commit the queue did not build.
+# A dispatch on any other branch still builds and proves a candidate for
+# whoever asked for it.
 #
-# Neither workflow caches Cargo. This one never did, because it builds whatever
-# ref it is handed and the same step would let a dispatch write a poisoned entry
-# into a cache that CI and release builds later restore from, and would mean the
-# bytes under proof were assembled partly from cache contents no one reviewed.
-# release.yml has now dropped its own for a related reason: its entry was
-# tag-scoped and unreadable from the next tag, so it never restored, and a
-# restore that worked would have put unreviewed objects into published bytes.
-# A candidate compiles cold, and so does a release.
+# What it holds. The build, image and capability jobs declare no environment,
+# read no secret and take no permission beyond `contents: read`. That keeps a
+# dispatch of branch-controlled workflow code away from the Apple and
+# package-publish credentials release.yml gates behind `environment: release`
+# (see the note above `config` in release.yml). The attest job alone holds an
+# OIDC token, to sign build provenance for the bytes the other jobs uploaded,
+# and it checks out nothing and runs no repository code.
+#
+# No job here caches. A restored cache would put objects nobody reviewed into
+# bytes that now ship, and no guard here could tell: "Verify native release
+# build provenance" runs the binary and matches an embedded commit, which a
+# poisoned object still reports correctly. Everything compiles cold.
 #
 # What a candidate archive is NOT:
-#   - not signed and not notarized, so a macOS candidate archive is Gatekeeper
-#     material only after a real tag builds it. The Linux archives carry no
-#     signature in a release either, so they are unaffected.
+#   - not signed and not notarized; release.yml signs the macOS archives.
 #   - not a release, and its provenance manifest carries no release_tag.
 #   - not public delivery proof. Each native archive is installed from this run
-#     and checked against its exact source and component identities. Signing,
-#     notarization, public URLs and the full first-contact contract remain separate.
+#     and checked against its exact source and component identities;
+#     install-proof.yml proves the published release after it is public.
 #
-# Dispatch a held candidate on an ordinary branch. A release/v* branch is the
-# separate Release Cut automation entry point; this workflow changes none of it.
+# scripts/check-rc-build-drift.mjs holds the contract between the two
+# workflows: this one is the only workflow that compiles a release archive or
+# builds the release image, release.yml takes exactly the artifacts this one
+# uploads and compiles nothing, and both run the same native provenance check,
+# scripts/verify-native-release-provenance.mjs.
 
 on:
+  # Every pull request the queue lands on main. The job conditions below keep a
+  # queue for any other base branch out, so nothing but a main landing is built
+  # on this event.
+  merge_group:
+    types: [checks_requested]
   # No ref input. `gh workflow run --ref <branch>` already names the ref, and the
   # run then resolves this workflow, the code it builds, and its cache scope from
   # that ref, the way a tag run resolves everything from its tag. Taking a ref as
@@ -68,7 +78,8 @@ permissions:
   contents: read
 
 # A candidate build is disposable, so a newer dispatch for the same ref
-# supersedes an older one rather than queueing behind it.
+# supersedes an older one rather than queueing behind it. Every merge group has
+# a ref of its own, so no group cancels another.
 concurrency:
   group: kin-rc-build-${{ github.ref }}
   cancel-in-progress: true
@@ -79,14 +90,48 @@ env:
 jobs:
   build:
     name: RC Build (${{ matrix.artifact }})
+    if: ${{ github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main' }}
     runs-on: ${{ matrix.os }}
-    # Same bound as release.yml's build job; see the note there.
-    timeout-minutes: 120
+    # A ceiling on a build that stops making progress, not a queue bound. In a
+    # merge group it is 60: the whole run has to finish inside the merge
+    # queue's 90-minute check window, and the slowest leg, Windows on the
+    # standard runner, measured 31 to 41 minutes (rc-build runs 38238857203 and
+    # 38255291752), with the Depot macOS legs at 13 to 21. 60 for a build leg
+    # plus 15 for the capability or attest job after it is 75 at worst. A
+    # dispatched candidate keeps 120: the macOS arm64 leg reached the old
+    # 90-minute bound on both 0.8.2 candidate attempts on the standard runner,
+    # and a dispatch can still be sent to that pool for a measurement.
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 60 || 120 }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Native rows mirror release.yml, including Intel macOS and Windows.
+          # One row per archive a release ships. scripts/locate-rc-build.mjs
+          # names the same five, and scripts/check-rc-build-drift.mjs holds the
+          # two lists and release.yml's shipping jobs equal. The two macOS
+          # archives build on a Depot Apple Silicon runner. The x86_64 archive
+          # is cross-compiled there and executed under Rosetta 2 by "Verify
+          # native release build provenance", so its provenance is still proved
+          # by running it, and release.yml runs it again natively on Intel.
+          #
+          # Measured on the same source, standard pool (rc-build run
+          # 38238857203) against this runner (38255291752), which reported 9
+          # CPUs and 17 GiB: the build step took 77 minutes there on each macOS
+          # leg, and 20.7 here for arm64 and 12.1 for x86_64, with no swap and
+          # the kernel's memory pressure at normal throughout. The arm64 leg
+          # still links one binary at a time. Linking both at once took 12.4
+          # minutes (38255295674) but compressed 8.3 GB and raised the pressure
+          # level to warning, and the Windows leg sets this workflow's critical
+          # path at over 30 minutes either way.
+          #
+          # This is a paid, third-party pool, and the macOS bytes it builds are
+          # now the macOS bytes that ship once release.yml signs them. It runs
+          # before any tag exists, so a pool that stops assigning runners only
+          # delays a candidate; it can no longer strand a tag, because
+          # release.yml builds nothing. The release workflow authority suite
+          # admits this label for this job only. The capability job below still
+          # installs every archive on the standard pool's native hardware,
+          # Intel included.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: kin-linux-x86_64
@@ -95,11 +140,11 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: kin-linux-aarch64
             cross: false
-          - os: macos-15-intel
+          - os: depot-macos-26
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             cross: false
-          - os: macos-latest
+          - os: depot-macos-26
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
             cross: false
@@ -119,7 +164,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # ADDED: a candidate has no tag to take a version from, and both the macOS
+      # A candidate has no tag to take a version from, and both the macOS
       # notifier bundle and the provenance manifest need one. The workspace
       # package version is what the built binaries stamp into their own static
       # build identity, so it is the only value those identities can agree with.
@@ -158,6 +203,25 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           targets: ${{ matrix.target }}
+
+      # An x86_64 macOS archive built on an Apple Silicon runner is executed by
+      # "Verify native release build provenance", and Rosetta 2 is what lets an
+      # arm64 host run x86_64 code. It is installed and proved here, before the
+      # compile, so a host that cannot run the archive fails in seconds rather
+      # than after the link. On every other leg this step does nothing.
+      - name: Install Rosetta 2 (x86_64 macOS on Apple Silicon)
+        if: ${{ runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.target == 'x86_64-apple-darwin' }}
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "Rosetta 2 is already installed"
+          else
+            sudo -n /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/true
+          echo "x86_64 code runs on this $(uname -m) host under Rosetta 2"
 
       # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
       # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
@@ -418,6 +482,10 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
 
+      # The native provenance check, run on the bytes just linked. release.yml
+      # runs the same script on the archive it publishes, on a runner that can
+      # execute it, so the producer and the consumer judge by one rule.
+      # It writes kin-build-meta.json where the manifest step below reads it.
       - name: Verify native release build provenance
         if: ${{ !matrix.cross }}
         shell: bash
@@ -425,80 +493,16 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          case "$RUNNER_ARCH:$TARGET" in
-            X64:x86_64-*|ARM64:aarch64-*) ;;
-            *)
-              echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
-              exit 0
-              ;;
-          esac
-
           suffix=""
           [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
-          kin_bin="target/$TARGET/release/kin$suffix"
-          daemon_bin="target/$TARGET/release/kin-daemon$suffix"
-          provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
-          mkdir -p "$provenance_dir"
-          "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"
-          "$daemon_bin" --version | tee "$provenance_dir/kin-daemon-version.txt"
-          "$kin_bin" bench-meta --json > "$provenance_dir/kin-build-meta.json"
-          expected_sha="$(git rev-parse HEAD)"
-
-          EXPECTED_SHA="$expected_sha" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
-          const crypto = require("crypto");
-          const fs = require("fs");
-          const expected = process.env.EXPECTED_SHA;
-          const dir = process.env.PROVENANCE_DIR;
-          const lines = ["kin-version.txt", "kin-daemon-version.txt"].map((path) =>
-            fs.readFileSync(`${dir}/${path}`, "utf8").trim()
-          );
-          const shas = lines.map((line) => {
-            const match = line.match(/\(([0-9a-f]{40})(-dirty)?\s/);
-            if (!match) throw new Error(`release version line lacks a full build SHA: ${line}`);
-            if (match[2]) throw new Error(`release binary was built dirty: ${line}`);
-            return match[1];
-          });
-          if (shas.some((sha) => sha !== expected) || shas[0] !== shas[1]) {
-            throw new Error(`release binary SHAs ${shas.join(", ")} do not match checkout ${expected}`);
-          }
-
-          const meta = JSON.parse(fs.readFileSync(`${dir}/kin-build-meta.json`, "utf8"));
-          if (process.env.GITHUB_REF_TYPE === "tag") {
-            const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-            if (meta.kin_version !== expectedVersion) {
-              throw new Error(`kin package version ${meta.kin_version ?? "missing"} does not match release tag ${expectedVersion}`);
-            }
-          }
-          if (meta.kin_commit !== expected || meta.kin_dirty !== false || meta.kin_source_known !== true) {
-            throw new Error("kin bench-meta did not prove a clean, known release source");
-          }
-          const tagLockSha = crypto.createHash("sha256").update(fs.readFileSync("Cargo.lock")).digest("hex");
-          if (meta.dependency_provenance !== tagLockSha) {
-            throw new Error(
-              `embedded Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} ` +
-              `does not match tagged Cargo.lock ${tagLockSha}`
-            );
-          }
-          // Attest the measured default archive profile on every target.
-          for (const feature of ["vector", "external-embeddings"]) {
-            if (!meta.feature_flags.includes(feature)) {
-              throw new Error(`release build for ${process.env.TARGET} did not enable ${feature}`);
-            }
-          }
-          for (const feature of ["embeddings", "metal"]) {
-            if (meta.feature_flags.includes(feature)) {
-              throw new Error(`default release build unexpectedly enabled ${feature}`);
-            }
-          }
-          if (meta.embeddings?.vector_enabled !== true ||
-              meta.embeddings?.embeddings_enabled !== true ||
-              meta.embeddings?.local_inference_enabled !== false ||
-              meta.embeddings?.external_embeddings_enabled !== true ||
-              meta.embeddings?.metal_enabled !== false ||
-              meta.embeddings?.provider !== "none") {
-            throw new Error("release metadata does not attest the engine-free default archive profile");
-          }
-          NODE
+          node scripts/verify-native-release-provenance.mjs \
+            --kin "target/$TARGET/release/kin$suffix" \
+            --daemon "target/$TARGET/release/kin-daemon$suffix" \
+            --target "$TARGET" \
+            --expect-commit "$(git rev-parse HEAD)" \
+            --expect-version "$RC_VERSION" \
+            --cargo-lock Cargo.lock \
+            --out "$RUNNER_TEMP/kin-release-provenance-$TARGET"
 
       - name: Assert release build did not mutate source
         shell: bash
@@ -745,7 +749,7 @@ jobs:
           if (contents.length < 2) {
             throw new Error(`${artifact} does not contain the mandatory kin and kin-daemon binaries`);
           }
-          // DELTA(version): a candidate has no tag, so the version both static
+          // A candidate has no tag, so the version both static
           // build identities must agree on is the workspace package version the
           // job resolved. The cross-check between kin and kin-daemon is intact;
           // what a candidate cannot assert is agreement with a tag name.
@@ -774,7 +778,7 @@ jobs:
 
           const manifest = {
             schema_version: 2,
-            // DELTA(identity): a candidate manifest names the ref and sha it was
+            // A candidate manifest names the ref and sha it was
             // built from. It carries no release_tag, so it can never be mistaken
             // for a published release's provenance.
             release_candidate: {
@@ -806,10 +810,13 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: ${{ matrix.artifact }}
-          # DELTA(retention): a candidate is short-lived scratch, and an empty
-          # upload must fail here rather than surface as a missing archive in
-          # whatever consumes the run.
-          retention-days: 7
+          # These are the bytes a release publishes, so the retention is how long
+          # after this run a tag can still publish or recover them. The
+          # selector and release.yml both refuse a run whose artifacts expired
+          # rather than rebuilding, because a rebuild is not the bytes the
+          # preflight judged. An empty upload fails here rather than surfacing
+          # as a missing archive in whatever consumes the run.
+          retention-days: 30
           if-no-files-found: error
           path: |
             ${{ matrix.artifact }}.tar.gz
@@ -818,7 +825,7 @@ jobs:
             ${{ matrix.artifact }}.zip.sha256
             ${{ matrix.artifact }}.provenance.json
 
-      # ADDED: the run's own answer to "which bytes did this produce". A
+      # The run's own answer to "which bytes did this produce". A
       # consumer downloads by run id, so the run has to name the sha it built
       # and the digest of every archive it uploaded.
       - name: Summarize the candidate archives
@@ -832,6 +839,7 @@ jobs:
             printf '| field | value |\n| --- | --- |\n'
             printf '| built sha | %s |\n' "$RC_REF"
             printf '| version | %s |\n' "$RC_VERSION"
+            printf '| produced by | %s on %s |\n' "$GITHUB_EVENT_NAME" "$GITHUB_REF_NAME"
           } >> "$GITHUB_STEP_SUMMARY"
           found=0
           for archive in "${ARTIFACT}.tar.gz" "${ARTIFACT}.zip"; do
@@ -850,6 +858,149 @@ jobs:
           fi
           printf '\nDownload these archives with: gh run download %s --repo %s\n' \
             "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" >> "$GITHUB_STEP_SUMMARY"
+
+  # The daemon image a release pushes to GHCR, built once and smoke-tested here
+  # before any tag exists. release.yml used to build it at the tag, which put a
+  # 19 to 25 minute compile inside a frozen workflow; it now verifies this
+  # archive and pushes it with its digests preserved.
+  #
+  # The image is exported as an OCI image layout archive rather than loaded
+  # into a registry or the local store, because that keeps every compressed
+  # layer, the config and the manifest as exact blobs: the manifest digest
+  # recorded here is the digest GHCR serves after release.yml's push. The
+  # smokes run on the same archive loaded into Docker, and
+  # scripts/rc-daemon-image.mjs proves the loaded image carries the archive's
+  # layers and runtime config before any smoke counts.
+  #
+  # It needs nothing from the build matrix and runs beside it, so a build leg
+  # that times out leaves it to finish on its own; the jobs that do need the
+  # matrix (capability and attest) end skipped in that case, never cancelled.
+  # Its name is deliberately not "RC Build (...)", which names a build leg.
+  image:
+    name: RC Daemon Image
+    if: ${{ github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    # The release image build took 19 to 25 minutes in release.yml; the smokes
+    # add a few. Inside the merge queue's 90-minute window either way.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Resolve the image source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          # A merge group builds the commit that lands on main, and the image
+          # names the branch it ships from; any other run names its own ref.
+          branch="$GITHUB_REF_NAME"
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            branch=main
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      # Base images resolve through a mirror first, as every Dockerfile build
+      # here does; the Dockerfile pins both bases by digest, so the mirror and
+      # the canonical registry cannot serve different bytes.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      # No --cache-from: see the note at the top of this file. --provenance=false
+      # keeps the layout to one image manifest; this run's attest job signs the
+      # provenance instead, and release.yml attests the pushed digest again.
+      - name: Build the daemon image as an OCI archive
+        shell: bash
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+          BRANCH: ${{ steps.source.outputs.branch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kin-daemon-image"
+          docker buildx build \
+            --file Dockerfile \
+            --platform linux/amd64 \
+            --provenance=false \
+            --build-arg "KIN_BUILD_GIT_SHA=${COMMIT}" \
+            --build-arg KIN_BUILD_DIRTY=false \
+            --build-arg "KIN_BUILD_BRANCH=${BRANCH}" \
+            --output "type=oci,dest=${RUNNER_TEMP}/kin-daemon-image/kin-daemon-image.oci.tar" \
+            .
+
+      - name: Record the image's digests
+        shell: bash
+        env:
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/kin-daemon-image"
+          node scripts/rc-daemon-image.mjs record \
+            --archive "$dir/kin-daemon-image.oci.tar" \
+            --commit "$COMMIT" \
+            --out "$dir/kin-daemon-image.json"
+          ( cd "$dir" && sha256sum kin-daemon-image.oci.tar > kin-daemon-image.oci.tar.sha256 )
+
+      - name: Load the archive for the smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/kin-daemon-image/kin-daemon-image.oci.tar"
+          skopeo copy "oci-archive:${archive}" docker-daemon:kin:ci
+          node scripts/rc-daemon-image.mjs check-loaded --archive "$archive" --image kin:ci
+
+      - name: Verify container build provenance
+        env:
+          EXPECTED_SHA: ${{ steps.source.outputs.commit }}
+        run: bash scripts/verify-container-build-info.sh kin:ci "$EXPECTED_SHA"
+
+      # The same smokes docker.yml runs on the development image every main
+      # commit builds, here on the image a release ships.
+      - name: Entrypoint smoke (local boot + SIGTERM, gcs prep, unwritable fail)
+        run: bash scripts/test-entrypoint-smoke.sh kin:ci
+
+      - name: Entrypoint contract with a volume mounted inside .kin
+        run: bash scripts/test-entrypoint-workspace-mount.sh kin:ci
+
+      - name: Published port reachable from outside the container namespace
+        run: bash scripts/test-compose-published-port.sh kin:ci
+
+      - name: GCS emulator endpoint acceptance
+        run: bash scripts/test-gcs-emulator-endpoint.sh kin:ci
+
+      - name: Upload the image archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: kin-daemon-image
+          # As long as the archives: these are the bytes a release pushes.
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/kin-daemon-image/kin-daemon-image.oci.tar
+            ${{ runner.temp }}/kin-daemon-image/kin-daemon-image.oci.tar.sha256
+            ${{ runner.temp }}/kin-daemon-image/kin-daemon-image.json
+
+      - name: Summarize the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/kin-daemon-image"
+          {
+            printf '### kin-daemon-image\n\n'
+            printf '| field | value |\n| --- | --- |\n'
+            printf '| manifest digest | %s |\n' "$(jq -r .manifest_digest "$dir/kin-daemon-image.json")"
+            printf '| archive sha256 | %s |\n' "$(cut -d' ' -f1 "$dir/kin-daemon-image.oci.tar.sha256")"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # What a candidate build could not say before this job existed: whether the
   # bytes it produced survive a first install. v0.5.41 built cleanly on all five
@@ -878,7 +1029,9 @@ jobs:
     name: RC Capability (${{ matrix.os }})
     needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Measured at 0.2 to 1.4 minutes per leg. Bounded at 15 in a merge group so
+    # a build leg at its 60-minute bound plus this still fits the queue window.
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 15 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1219,3 +1372,60 @@ jobs:
           }
           console.log(`candidate health surface holds on ${process.env.PROBE_OS}`);
           NODE
+
+  # Build provenance for every byte a release takes from this run. release.yml
+  # refuses an archive or image whose attestation does not verify against this
+  # workflow, at the commit it builds, on the ref the run built, signed by the
+  # very run it located (scripts/locate-rc-build.mjs verify-attestation).
+  #
+  # The OIDC token lives in this job alone. It checks out nothing and runs no
+  # repository code: it downloads what the build and image jobs uploaded, checks
+  # each file against its sidecar, and signs. It runs on a GitHub-hosted runner,
+  # which `--deny-self-hosted-runners` in release.yml requires of the signer;
+  # the macOS bytes it signs were built on the Depot pool above, which is what
+  # the run's own job list records.
+  attest:
+    name: RC Attest
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the archives and the image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: kin-*
+          path: ${{ runner.temp }}/rc
+
+      - name: Check every file against its sidecar
+        shell: bash
+        working-directory: ${{ runner.temp }}/rc
+        run: |
+          set -euo pipefail
+          for file in \
+            kin-linux-x86_64/kin-linux-x86_64.tar.gz \
+            kin-linux-aarch64/kin-linux-aarch64.tar.gz \
+            kin-macos-x86_64/kin-macos-x86_64.tar.gz \
+            kin-macos-aarch64/kin-macos-aarch64.tar.gz \
+            kin-windows-x86_64/kin-windows-x86_64.zip \
+            kin-windows-x86_64/kin-windows-x86_64.tar.gz \
+            kin-daemon-image/kin-daemon-image.oci.tar; do
+            ( cd "$(dirname "$file")" && sha256sum -c "$(basename "$file").sha256" )
+          done
+
+      # With no predicate inputs actions/attest emits SLSA build provenance
+      # naming this workflow, this commit, this ref and this run.
+      - name: Attest the archives and the image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/rc/kin-linux-x86_64/kin-linux-x86_64.tar.gz
+            ${{ runner.temp }}/rc/kin-linux-aarch64/kin-linux-aarch64.tar.gz
+            ${{ runner.temp }}/rc/kin-macos-x86_64/kin-macos-x86_64.tar.gz
+            ${{ runner.temp }}/rc/kin-macos-aarch64/kin-macos-aarch64.tar.gz
+            ${{ runner.temp }}/rc/kin-windows-x86_64/kin-windows-x86_64.zip
+            ${{ runner.temp }}/rc/kin-windows-x86_64/kin-windows-x86_64.tar.gz
+            ${{ runner.temp }}/rc/kin-daemon-image/kin-daemon-image.oci.tar

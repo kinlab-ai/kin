@@ -33,7 +33,7 @@ const COMMIT_SHA = /^[0-9a-f]{40}$/;
 function usage(message) {
   process.stderr.write(
     `${message}\n\n` +
-    'usage: merge-preflight-records.mjs --candidate <40-hex sha> --out <file> <leg record>...\n',
+    'usage: merge-preflight-records.mjs --candidate <40-hex sha> --out <file> [--rc-run <run id>] <leg record>...\n',
   );
   process.exit(2);
 }
@@ -45,6 +45,7 @@ export function parseArgs(argv) {
     switch (flag) {
       case '--candidate': args.candidate = argv[i + 1]; i += 1; break;
       case '--out': args.out = argv[i + 1]; i += 1; break;
+      case '--rc-run': args.rcRun = argv[i + 1]; i += 1; break;
       default:
         if (flag.startsWith('--')) usage(`unknown argument: ${flag}`);
         args.records.push(flag);
@@ -54,6 +55,12 @@ export function parseArgs(argv) {
     usage(`--candidate must be a 40-character commit sha, got "${args.candidate ?? ''}"`);
   }
   if (!args.out) usage('--out is required');
+  if (args.rcRun !== undefined) {
+    if (!/^[1-9][0-9]*$/.test(args.rcRun) || !Number.isSafeInteger(Number(args.rcRun))) {
+      usage(`--rc-run must be an RC Build run id, got "${args.rcRun}"`);
+    }
+    args.rcRun = Number(args.rcRun);
+  }
   if (args.records.length === 0) usage('at least one leg record is required');
   return args;
 }
@@ -136,9 +143,16 @@ function mergedTooling(toolings) {
   return { ...first, source: `${sources.size} checkouts @ ${ref}` };
 }
 
-export function mergeRecords(records, candidate) {
+// `rcRun` is the RC Build run whose archives every leg judged. It is recorded as
+// `rc_build.run_id`, which is the run scripts/locate-rc-build.mjs then makes
+// release.yml ship from, so a commit built twice (by the merge queue and by a
+// fallback dispatch) still names exactly the bytes its preflight judged.
+export function mergeRecords(records, candidate, { rcRun } = {}) {
   if (!COMMIT_SHA.test(candidate ?? '')) {
     throw new Error(`"${candidate}" is not a 40-character commit sha`);
+  }
+  if (rcRun !== undefined && (!Number.isSafeInteger(rcRun) || rcRun <= 0)) {
+    throw new Error(`${JSON.stringify(rcRun)} is not an RC Build run id`);
   }
   if (!Array.isArray(records) || records.length === 0) {
     throw new Error('no leg records to merge');
@@ -215,6 +229,7 @@ export function mergeRecords(records, candidate) {
     skipped: admittedByEntry.flatMap(({ record }) => (Array.isArray(record.skipped) ? record.skipped : [])),
     legs,
     merged_from: sources,
+    ...(rcRun === undefined ? {} : { rc_build: { run_id: rcRun } }),
     run_root: null,
     log: null,
   };
@@ -235,7 +250,7 @@ export function main(argv = process.argv.slice(2), { log = console.log } = {}) {
     }
     return { where: file, record };
   });
-  const { merged, archives } = mergeRecords(records, args.candidate);
+  const { merged, archives } = mergeRecords(records, args.candidate, { rcRun: args.rcRun });
   writeFileSync(args.out, `${JSON.stringify(merged, null, 2)}\n`);
   log(
     `merged ${merged.legs.length} leg(s) for ${args.candidate} into ${args.out}: ` +

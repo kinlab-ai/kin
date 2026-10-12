@@ -6,7 +6,7 @@ change might affect, from the same record you inspect with the kin CLI.
 
 ## Install
 
-Add the MCP server by hand. See the [repository README](https://github.com/firelock-ai/kin#use-it-from-claude-code-codex-or-cursor)
+Add the MCP server by hand. See the [repository README](https://github.com/kinlab-ai/kin#use-it-from-claude-code-codex-or-cursor)
 for the surrounding context.
 
 Add this to `~/.cursor/mcp.json`:
@@ -34,7 +34,7 @@ language, or ranks code against a natural-language description using the vector 
 call. `refs` and `neighbors` walk the reference graph. `trace`
 returns the ordered chain a value travels. `impact` answers what a change can
 reach. The full surface is documented in
-[docs/mcp-tools.md](https://github.com/firelock-ai/kin/blob/main/docs/mcp-tools.md).
+[docs/mcp-tools.md](https://github.com/kinlab-ai/kin/blob/main/docs/mcp-tools.md).
 
 Every response names the graph state that produced it, and an empty result says whether the
 absence can be trusted. A graph gap is reported as a gap rather than filled in from raw file
@@ -47,7 +47,7 @@ Kin answers from a graph, so a repository has to be admitted first. Ask the agen
 `kin` on your PATH, so `npx` runs it. Then run `npx -y @kinlab/kin embed` to build the vector
 index that `locate` ranks against. The structural tools work as soon as admission
 finishes.
-[llms-install.md](https://github.com/firelock-ai/kin/blob/main/llms-install.md) is the
+[llms-install.md](https://github.com/kinlab-ai/kin/blob/main/llms-install.md) is the
 step-by-step version, written so an agent can follow it unattended.
 
 ## Requirements

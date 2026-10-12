@@ -3010,3 +3010,36 @@ button.fact-link {
   .main { padding-bottom: 180px; }
   .step { scroll-margin-bottom: 180px; }
 }
+
+/* ── The agent that made a change ───────────────────────────────────────── */
+/* One line under a change's eyebrow, drawn only when an agent session made
+   the change. Nothing else on the page depends on it. */
+
+.agent-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 2px 0 10px;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.agent-line-mark {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+  background: var(--accent);
+  clip-path: polygon(50% 0%, 62% 38%, 100% 50%, 62% 62%, 50% 100%, 38% 62%, 0% 50%, 38% 38%);
+}
+
+.agent-line code {
+  font-family: var(--mono);
+  font-size: 0.93em;
+  font-weight: 600;
+}
+
+.agent-line-entity {
+  color: var(--accent);
+}

@@ -12,6 +12,7 @@ const test = require("node:test");
 const assets = path.resolve(__dirname, "../crates/kin-cli/assets/workspace_ui");
 const source = fs.readFileSync(path.join(assets, "workspace.js"), "utf8");
 const graphSource = fs.readFileSync(path.join(assets, "graph.js"), "utf8");
+const agentsSource = fs.readFileSync(path.join(assets, "agents.js"), "utf8");
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate); };
 const refWire = (name) => ({ bytes_hex: Buffer.from(`refs/heads/${name}`).toString("hex") });
 const hashWire = (byte) => Array(32).fill(byte);
@@ -63,7 +64,36 @@ class Input extends Element {}
 
 const guide = (summary = {}, extra = {}) => ({ schema: "kin.review.guide.v1", change: { base: "change-1" }, summary: { added: 0, modified: 0, removed: 0, recorded_consumers: 0, recorded_tests: 0, consumers_not_updated: 0, ...summary }, chapters: [], working_tree: { differs: false, derived: true, caught_up: true }, ...extra });
 
-function fixture({ merge = true, preview = true, initialFailure = false, tabStorage = new Map(), observedIdentity = true, newServer = true, hash = "#/home", origin = { owner: "pallets", host: "github.com" }, repositories = null } = {}) {
+// An agent as the workspace server describes it: a name, what it did, what it
+// has open and the change it committed. No session id or place on disk.
+const AGENT_KEY = "00000000000000a1";
+const AGENT_CHANGE = "c".repeat(64);
+const secondsAgo = (n) => new Date(Date.now() - n * 1000).toISOString();
+function agentsPayload({ agents = null, earlier = [] } = {}) {
+  return { schema: "kin.workspace.agents.v1", read_at: secondsAgo(0), active_window_secs: 60,
+    agents: agents ?? [{ key: AGENT_KEY, name: "Claude Code", state: "active", busy: false, through: "mcp",
+      started_at: secondsAgo(240), last_activity_at: secondsAgo(5), calls_total: 7,
+      recent_calls: [
+        { seq: 7, at: secondsAgo(5), tool: "impact_analysis", entity_ids: [uuid(2), uuid(3), uuid(9)], result_count: 9, duration_ms: 37, is_error: false },
+        { seq: 6, at: secondsAgo(20), tool: "find_references", entity_ids: [uuid(5)], result_count: 4, duration_ms: 12, is_error: false },
+        { seq: 5, at: secondsAgo(30), tool: "get_entity_source", entity_ids: [uuid(5)], result_count: 2, duration_ms: 8, is_error: false },
+        { seq: 4, at: secondsAgo(31), tool: "get_entity_source", entity_ids: [uuid(5)], result_count: 2, duration_ms: 8, is_error: false },
+        { seq: 3, at: secondsAgo(40), tool: "semantic_locate", entity_ids: [uuid(5), uuid(3)], result_count: 5, duration_ms: 1800, is_error: false }],
+      open_changes: [{ staged_edits: 1, age_secs: 9 }], intents: [], scope_names: {},
+      changes: [{ id: AGENT_CHANGE, title: "Explain how want_bytes treats text", time: secondsAgo(120), entities_changed: 1 }], changes_total: 1 }],
+    earlier,
+    names: { [uuid(5)]: { label: "Signer.verify_signature", kind: "method" }, [uuid(2)]: { label: "want_bytes", kind: "function" }, [uuid(3)]: { label: "Signer", kind: "class" } } };
+}
+
+class FakeEventSource {
+  constructor(url) { this.url = url; this.listeners = {}; FakeEventSource.opened.push(this); }
+  addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+  emit(type, data = {}) { for (const listener of this.listeners[type] || []) listener({ data: JSON.stringify(data) }); }
+  close() { this.closed = true; }
+}
+FakeEventSource.opened = [];
+
+function fixture({ merge = true, preview = true, initialFailure = false, tabStorage = new Map(), observedIdentity = true, newServer = true, hash = "#/home", origin = { owner: "pallets", host: "github.com" }, repositories = null, live = false } = {}) {
   const document = new Element("document", null); document.ownerDocument = document;
   document.createElement = (tag) => new (tag === "input" ? Input : Element)(tag, document);
   document.createElementNS = (_, tag) => document.createElement(tag);
@@ -74,7 +104,8 @@ function fixture({ merge = true, preview = true, initialFailure = false, tabStor
   document.body.dataset.apiBase = "/repositories/fixture";
   const add = (tag, id, parent = document.body) => { const node = document.createElement(tag); node.setAttribute("id", id); parent.append(node); return node; };
   const nav = add("nav", "workspace-nav");
-  for (const route of ["home", "explore", "changes", "branches"]) { const node = add("a", `nav-${route}`, nav); node.dataset.route = route; }
+  for (const route of ["home", "agents", "explore", "changes", "branches"]) { const node = add("a", `nav-${route}`, nav); node.dataset.route = route; }
+  add("span", "workspace-nav-agents", nav);
   for (const id of ["workspace-refresh", "workspace-theme"]) add("button", id);
   add("main", "workspace-main");
   for (const id of ["workspace-status", "workspace-status-text", "workspace-announcer", "repository-name", "repository-branch", "workspace-repository-picker", "workspace-version", "workspace-tip"]) add("div", id);
@@ -109,6 +140,15 @@ function fixture({ merge = true, preview = true, initialFailure = false, tabStor
       { id: uuid(3), name: "Signer", kind: "class", role: "entity", degree: 34, parent: uuid(4), group: uuid(4) }],
       edges: [{ source: uuid(4), target: uuid(1), level: "container", weight: 14 }, { source: uuid(3), target: uuid(2), level: "entity", weight: 1 }],
       totals: { entities: 216, relationships: 602, containers: 15 }, sampled: true },
+    "/api/workspace/agents": agentsPayload(),
+    "/api/workspace/agents/timeline": () => ({ schema: "kin.workspace.agent-timeline.v1", listed: true, kept: 7, earliest_kept_from_start: true,
+      agent: { ...agentsPayload().agents[0], recent_calls: null },
+      calls: [
+        { seq: 7, at: secondsAgo(5), tool: "kin_transaction_commit", entity_ids: [uuid(2)], result_count: 1, duration_ms: 900, is_error: false },
+        { seq: 6, at: secondsAgo(9), tool: "kin_transaction_stage", entity_ids: [uuid(2)], result_count: 1, duration_ms: 20, is_error: false },
+        { seq: 5, at: secondsAgo(10), tool: "kin_transaction_begin", entity_ids: [], result_count: 0, duration_ms: 20, is_error: false },
+        ...agentsPayload().agents[0].recent_calls.slice(0, 4)],
+      names: agentsPayload().names }),
     "/api/workspace/ask": { schema: "kin.workspace.ask.v1", mode: "meaning_and_name", results: [
       { id: uuid(5), name: "Signer.verify_signature", kind: "method", signature: "def verify_signature(self, value, sig) -> bool", container: { id: uuid(3), name: "Signer", kind: "class" }, matched: ["meaning"], why: "Its description and code share words with the question." },
       { id: uuid(2), name: "want_bytes", kind: "function", signature: "def want_bytes(s)", container: { id: uuid(1), name: "encoding", kind: "module" }, matched: ["name", "meaning"], why: "Its name matches." }], total: 2 },
@@ -118,6 +158,8 @@ function fixture({ merge = true, preview = true, initialFailure = false, tabStor
   const maps = [];
   const context = {
     document, location, URL, TextDecoder, Node: Element, HTMLElement: Element, HTMLInputElement: Input, AbortController, setTimeout, clearTimeout, Date, Intl,
+    setInterval: () => 0, clearInterval() {},
+    ...(live ? { EventSource: FakeEventSource } : {}),
     localStorage: { getItem: () => null, setItem() {} },
     sessionStorage: { getItem: (key) => tabStorage.get(key) || null, setItem: (key, value) => tabStorage.set(key, value), removeItem: (key) => tabStorage.delete(key) },
     crypto: { randomUUID: () => `00000000-0000-4000-8000-${String(++operation).padStart(12, "0")}` },
@@ -144,9 +186,10 @@ function fixture({ merge = true, preview = true, initialFailure = false, tabStor
   vm.runInContext(graphSource, context, { filename: "graph.js" });
   const realCreate = context.KinWorkspaceGraph.createMap;
   context.KinWorkspaceGraph.createMap = (host, model, options) => { const controller = realCreate(host, model, options); maps.push({ model, options, controller, disposed: false }); const dispose = controller.dispose; controller.dispose = () => { maps.at(-1).disposed = true; dispose(); }; return controller; };
+  vm.runInContext(agentsSource, context, { filename: "agents.js" });
   vm.runInContext(source, context, { filename: "workspace.js" });
   const api = context.KinWorkspace;
-  return { document, requests, data, failures, expected, held, location, tabStorage, maps, api,
+  return { document, requests, data, failures, expected, held, location, tabStorage, maps, api, agents: context.KinWorkspaceAgents,
     node: (id) => document.getElementById(id), main: () => document.getElementById("workspace-main"), text: () => document.getElementById("workspace-main").textContent,
     links: () => document.getElementById("workspace-main").querySelectorAll("a"),
     buttons: () => document.getElementById("workspace-main").querySelectorAll("button"),
@@ -223,7 +266,8 @@ test("home leads with the repository's numbers, the map, and uncommitted work in
   assert.match(browser.text(), /One function changed\. 16 other places rely on it\. None of them changed\. Two tests reach it\./);
   // Uncommitted work comes before the map, so the first thing to act on is first.
   assert.ok(browser.text().indexOf("Uncommitted work") < browser.text().indexOf("Repository map"));
-  const primary = browser.links().filter((node) => node.className.includes("button-primary"));
+  // The agents panel carries its own Review button for each agent's change; outside it, Home has one primary action.
+  const primary = browser.links().filter((node) => node.className.includes("button-primary") && !node.closest("section.agents-panel"));
   assert.equal(primary.length, 1, "one primary action");
   assert.equal(primary[0].getAttribute("href"), "/repositories/fixture/review/#/w");
   assert.equal(browser.count("/api/workspace/graph"), 0, "the graph sample is not read when the overview and map are offered");
@@ -271,7 +315,7 @@ test("with no uncommitted work the primary action opens the latest change", asyn
   browser2.data["/api/guide"] = guide();
   await flush(); browser2.refresh(); await flush();
   assert.match(browser2.text(), /No uncommitted work\. Your code matches your last commit\./);
-  const primary = browser2.links().filter((node) => node.className.includes("button-primary"));
+  const primary = browser2.links().filter((node) => node.className.includes("button-primary") && !node.closest("section.agents-panel"));
   assert.equal(primary.length, 1);
   assert.equal(primary[0].getAttribute("href"), "/repositories/fixture/review/#/c/change-1");
 });
@@ -306,7 +350,7 @@ test("concurrent refresh clicks share one read cycle", async () => {
   let resolve; browser.held.set("/api/guide", new Promise((done) => { resolve = done; }));
   const before = browser.requests.length;
   browser.refresh(); browser.refresh();
-  assert.equal(browser.requests.length - before, 9);
+  assert.equal(browser.requests.length - before, 10);
   assert.equal(browser.node("workspace-refresh").disabled, true);
   resolve(); await flush();
   assert.equal(browser.node("workspace-refresh").disabled, false);
@@ -827,7 +871,7 @@ test("a branch confirmation cannot reuse a merge preview made before switching",
 // ── Copy ───────────────────────────────────────────────────────────────────
 
 test("the page's own words avoid files, paths, internal terms and em dashes", () => {
-  const files = ["workspace.js", "graph.js", "index.html"].map((name) => fs.readFileSync(path.join(assets, name), "utf8"));
+  const files = ["workspace.js", "graph.js", "agents.js", "index.html"].map((name) => fs.readFileSync(path.join(assets, name), "utf8"));
   // Strings the page shows: quoted literals and template text, not identifiers or comments.
   const shown = files.join("\n").split("\n").filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join("\n");
   const literals = [...shown.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`]*)`/g)].map((match) => (match[1] ?? match[2]).replace(/\$\{[^}]*\}/g, "")).filter((value) => /[A-Za-z]{3,} [A-Za-z]{2,}/.test(value));
@@ -838,6 +882,216 @@ test("the page's own words avoid files, paths, internal terms and em dashes", ()
     assert.doesNotMatch(value, /\b(every|all) (entit|change|relationship|connection|test)/i, value);
   }
   for (const file of files) assert.doesNotMatch(file.replace(/\/\/.*$/gm, ""), /—/);
+});
+
+// ── Agents ─────────────────────────────────────────────────────────────────
+
+test("an agent's calls read as plain sentences about the entities they were about", () => {
+  const browser = fixture();
+  const A = browser.agents;
+  const names = { [uuid(5)]: { label: "Signer.verify_signature" }, [uuid(2)]: { label: "want_bytes" }, [uuid(3)]: { label: "Signer" } };
+  const say = (call) => A.plainText(A.describe(call, names));
+  assert.equal(say({ tool: "semantic_locate", entity_ids: [uuid(5), uuid(3)], result_count: 5 }), "Looked up Signer.verify_signature and 4 related entities");
+  assert.equal(say({ tool: "impact_analysis", entity_ids: [uuid(2)], result_count: 9 }), "Checked what a change to want_bytes would touch");
+  assert.equal(say({ tool: "find_references", entity_ids: [uuid(5)] }), "Checked what uses Signer.verify_signature");
+  assert.equal(say({ tool: "get_entity_source", entity_ids: [uuid(9), uuid(3)] }), "Read Signer");
+  assert.equal(say({ tool: "trace_path", entity_ids: [uuid(5), uuid(2)] }), "Traced how Signer.verify_signature reaches want_bytes");
+  assert.equal(say({ tool: "kin_transaction_commit", entity_ids: [uuid(2), uuid(3), uuid(5)] }), "Committed a change to want_bytes", "entities that only moved with the edit are not claimed as changed");
+  assert.equal(say({ tool: "kin_transaction_begin", entity_ids: [] }), "Started a change");
+  assert.equal(say({ tool: "semantic_locate", entity_ids: [], result_count: 0 }), "Looked something up and found no entity");
+  assert.equal(say({ tool: "find_references", entity_ids: [uuid(9)] }), "Checked what uses an entity");
+  assert.equal(say({ tool: "get_entity_source", entity_ids: [uuid(2)], is_error: true }), "Read want_bytes, but Kin could not answer");
+  assert.equal(say({ tool: "some_new_tool", entity_ids: [uuid(2)] }), "Asked Kin about want_bytes");
+  const groups = A.group([{ tool: "get_entity_source", entity_ids: [uuid(5)] }, { tool: "get_entity_source", entity_ids: [uuid(5)] }, { tool: "find_references", entity_ids: [uuid(5)] }]);
+  assert.deepEqual([...groups.map((entry) => entry.times)], [2, 1]);
+});
+
+test("refused tool names do not become reads in the card, timeline summary or map", async () => {
+  const browser = fixture();
+  const calls = [
+    { seq: 5, at: secondsAgo(2), tool: "kin_transaction_commit", entity_ids: [uuid(2)], is_error: false },
+    { seq: 4, at: secondsAgo(3), tool: "unrecognized_tool", entity_ids: [uuid(9)], result_count: 1, is_error: true },
+    { seq: 3, at: secondsAgo(4), tool: "unknown", entity_ids: [uuid(10)], result_count: 1, is_error: true },
+    { seq: 2, at: secondsAgo(5), tool: "get_entity", entity_ids: [uuid(3)], result_count: 1, is_error: false },
+    { seq: 1, at: secondsAgo(6), tool: "get_entity_source", entity_ids: [uuid(2)], result_count: 1, is_error: false },
+  ];
+  const agent = { ...agentsPayload().agents[0], calls_total: calls.length, recent_calls: calls };
+  const data = agentsPayload({ agents: [agent] });
+  data.names[uuid(9)] = { label: "RefusedTarget", kind: "function" };
+  data.names[uuid(10)] = { label: "UnknownTarget", kind: "function" };
+  browser.data["/api/workspace/agents"] = data;
+  browser.data["/api/workspace/agents/timeline"] = { schema: "kin.workspace.agent-timeline.v1", listed: true,
+    kept: calls.length, earliest_kept_from_start: true, agent: { ...agent, recent_calls: null }, calls, names: data.names };
+  await flush(); await flush();
+  const A = browser.agents;
+  assert.equal(A.family("unrecognized_tool"), "unknown");
+  assert.equal(A.family("unknown"), "unknown");
+  assert.equal(A.family("get_entity"), "other", "registered reads without their own sentence keep the read fallback");
+  assert.equal(A.family("get_entity_source"), "source");
+  assert.deepEqual([...A.marks(data).map((entry) => [...entry])], [[uuid(2), "changing"], [uuid(3), "looked"]]);
+  const chips = browser.main().querySelector(".agent-chips");
+  assert.ok(chips, "actual reads still show the entities the agent looked at");
+  assert.equal(chips.textContent, "Looked atSignerwant_bytes");
+  browser.navigate(`agents/${AGENT_KEY}`); await flush(); await flush(); await flush();
+  assert.equal(browser.main().querySelector(".agent-summary").textContent, "Five calls to Kin, 2 entities looked at, 1 change committed.");
+  assert.ok(browser.main().querySelector(".agent-step-unknown.agent-step-error"), "refused calls remain visible as failed calls");
+});
+
+test("Home shows the connected agent, what it is doing, what it looked at and its change, above the map", async () => {
+  const browser = fixture(); await flush(); await flush();
+  const main = browser.main();
+  const panel = main.querySelector("section.agents-panel");
+  assert.ok(panel, "the agents panel is drawn");
+  const order = main.querySelectorAll("section");
+  assert.ok(order.indexOf(panel) < order.indexOf(main.querySelector("section.map-card")), "the panel sits above the map");
+  assert.ok(browser.text().indexOf("Uncommitted work") < browser.text().indexOf("Claude Code"), "after the reader's own uncommitted work");
+  const text = panel.textContent;
+  assert.match(text, /Claude Code/);
+  assert.match(text, /Active/);
+  assert.match(text, /Connected for 4 minutes/);
+  assert.match(text, /Checked what a change to want_bytes would touch/);
+  assert.match(text, /Checked what uses Signer\.verify_signature/);
+  assert.match(text, /Read Signer\.verify_signature ×2/);
+  assert.match(text, /Looked atwant_bytesSigner\.verify_signatureSigner1 more/);
+  assert.match(text, /Changing the code: 1 edit staged, not committed yet/);
+  assert.match(text, /Explain how want_bytes treats text/);
+  assert.match(text, /One function changed\. 16 other places rely on it\./, "the change reads as its review sentence");
+  const review = panel.querySelectorAll("a").find((node) => node.textContent.startsWith("Review"));
+  assert.equal(review.getAttribute("href"), `/repositories/fixture/review/#/c/${AGENT_CHANGE}`);
+  assert.ok(review.className.includes("button-primary"));
+  const entity = panel.querySelectorAll("a.chip").find((node) => node.textContent === "want_bytes");
+  assert.equal(entity.getAttribute("href"), `#/entity/${uuid(2)}`);
+  assert.equal(browser.node("workspace-nav-agents").textContent, "1");
+  assert.doesNotMatch(text, /session|mcp-agent|\/Users|\.py\b/i);
+});
+
+test("with no agent connected, Home says how agents connect and shows no activity", async () => {
+  const browser = fixture();
+  browser.data["/api/workspace/agents"] = agentsPayload({ agents: [] });
+  await flush(); await flush();
+  const panel = browser.main().querySelector("section.agents-panel");
+  assert.match(panel.textContent, /No agent is working in this repository right now\./);
+  assert.match(panel.textContent, /connect through Kin’s MCP server once you add them in Kin for Mac or with kin setup\./);
+  assert.equal(panel.querySelectorAll("article").length, 0);
+  assert.equal(browser.node("workspace-nav-agents").hidden, true);
+
+  browser.data["/api/workspace/agents"] = agentsPayload({ agents: [], earlier: [{ ...agentsPayload().agents[0], state: "ended", last_activity_at: secondsAgo(720), open_changes: [] }] });
+  browser.refresh(); await flush(); await flush();
+  assert.match(browser.main().querySelector("section.agents-panel").textContent, /Claude Code was here 12 minutes ago\. See what it did\./);
+});
+
+test("the agents read fails on its own and the rest of Home keeps working", async () => {
+  const browser = fixture();
+  browser.failures.set("/api/workspace/agents", "Daemon unavailable");
+  await flush(); await flush();
+  const panel = browser.main().querySelector("section.agents-panel");
+  assert.match(panel.textContent, /Kin couldn't load which agents are connected\./);
+  assert.ok(panel.querySelectorAll("button").some((node) => node.textContent === "Try again"));
+  assert.ok(browser.main().querySelector("section.map-card"));
+  assert.match(browser.text(), /Most relied on/);
+  browser.failures.delete("/api/workspace/agents");
+  panel.querySelectorAll("button").find((node) => node.textContent === "Try again").click(); await flush(); await flush();
+  assert.match(browser.main().querySelector("section.agents-panel").textContent, /Claude Code/);
+});
+
+test("an older server without agents keeps Home as it was", async () => {
+  const browser = fixture({ newServer: false }); await flush(); await flush();
+  assert.equal(browser.main().querySelector("section.agents-panel"), null);
+  browser.navigate("agents"); await flush();
+  assert.match(browser.text(), /This version of Kin does not report agent activity\./);
+});
+
+test("the Agents page lists agents and shows the selected one's calls and changes, newest first", async () => {
+  const browser = fixture({ hash: `#/agents/${AGENT_KEY}` }); await flush(); await flush(); await flush();
+  const timeline = browser.requests.filter((row) => row.name === "/api/workspace/agents/timeline");
+  assert.ok(timeline.length >= 1);
+  assert.match(timeline[0].url, new RegExp(`agent=${AGENT_KEY}`));
+  const text = browser.text();
+  assert.match(text, /One agent is connected and working\./);
+  assert.match(text, /Seven calls to Kin, 4 entities looked at, 1 change committed\./);
+  assert.match(text, /The change it committed/);
+  assert.match(text, /It never keeps the words an agent asks with\./);
+  assert.match(text, /What it did/);
+  assert.match(text, /Committed a change to want_bytes/);
+  assert.match(text, /Staged an edit to want_bytes/);
+  assert.match(text, /Read Signer\.verify_signature/);
+  assert.match(text, /2 times/);
+  assert.match(text, /Its 7 calls since it connected\./);
+  assert.ok(browser.main().querySelectorAll("a.agent-roster-row").some((node) => node.getAttribute("aria-current") === "true"));
+  assert.doesNotMatch(text, /session|mcp-agent|\/Users|\.py\b/i);
+});
+
+test("an agent whose record Kin no longer holds says so instead of failing", async () => {
+  const browser = fixture({ hash: `#/agents/${AGENT_KEY}` });
+  browser.data["/api/workspace/agents/timeline"] = { __status: 404, error: "gone" };
+  await flush(); await flush(); await flush();
+  assert.match(browser.text(), /Kin no longer holds this agent's record\./);
+});
+
+test("Changes marks an agent's change and filters by who made it", async () => {
+  const browser = fixture({ hash: "#/changes" });
+  browser.data["/api/changes"].changes.unshift({ id: AGENT_CHANGE, title: "Explain how want_bytes treats text", author: "Claude Code", agent: { name: "Claude Code", key: AGENT_KEY }, timestamp: secondsAgo(120), entity_deltas: 1 });
+  await flush(); await flush();
+  const marked = browser.main().querySelectorAll("span.author-agent");
+  assert.equal(marked.length, 1);
+  assert.equal(marked[0].textContent, "Claude Code");
+  const filter = browser.node("workspace-author-filter");
+  const buttons = filter.querySelectorAll("button");
+  assert.deepEqual(buttons.map((node) => node.textContent), ["Everyone", "People", "Claude Code1"]);
+  buttons.find((node) => node.textContent === "People").click();
+  assert.doesNotMatch(browser.node("changes-results").textContent, /Explain how want_bytes treats text/);
+  assert.match(browser.node("changes-results").textContent, /Preserved change/);
+  browser.node("workspace-author-filter").querySelectorAll("button").find((node) => node.textContent.startsWith("Claude Code")).click();
+  assert.match(browser.node("changes-results").textContent, /Explain how want_bytes treats text/);
+  assert.doesNotMatch(browser.node("changes-results").textContent, /Preserved change/);
+});
+
+test("a person-only history offers no author filter", async () => {
+  const browser = fixture({ hash: "#/changes" }); await flush(); await flush();
+  assert.equal(browser.node("workspace-author-filter"), null);
+  assert.equal(browser.main().querySelectorAll("span.author-agent").length, 0);
+});
+
+test("the page follows Kin live: an agent's call reads the agents again and a commit is announced", async () => {
+  FakeEventSource.opened.length = 0;
+  const browser = fixture({ live: true }); await flush(); await flush(); await flush();
+  const source = FakeEventSource.opened.at(-1);
+  assert.equal(source.url, "/repositories/fixture/api/workspace/events");
+  source.emit("ready");
+  await new Promise((resolve) => setTimeout(resolve, 600)); await flush();
+  assert.match(browser.main().querySelector("section.agents-panel").textContent, /Live/);
+  const before = browser.count("/api/workspace/agents");
+  source.emit("agent", { agent: AGENT_KEY, tool: "find_references" });
+  source.emit("agent", { agent: AGENT_KEY, tool: "impact_analysis" });
+  await new Promise((resolve) => setTimeout(resolve, 600)); await flush();
+  assert.equal(browser.count("/api/workspace/agents"), before + 1, "pulses close together are read once");
+  const changes = browser.count("/api/changes");
+  source.emit("change", { agent: AGENT_KEY, change: AGENT_CHANGE });
+  assert.equal(browser.node("workspace-announcer").textContent, "Claude Code committed a change.");
+  await new Promise((resolve) => setTimeout(resolve, 600)); await flush();
+  assert.equal(browser.count("/api/changes"), changes + 1);
+  source.onerror();
+  assert.ok(source.closed);
+  assert.match(browser.main().querySelector("section.agents-panel").textContent, /Reconnecting/);
+});
+
+test("the map rings what a connected agent is touching, changes first, and says what the rings mean", async () => {
+  const browser = fixture();
+  browser.data["/api/workspace/agents"] = agentsPayload({ agents: [{ ...agentsPayload().agents[0], recent_calls: [
+    { seq: 9, at: secondsAgo(2), tool: "kin_transaction_stage", entity_ids: [uuid(2), uuid(4)], result_count: 2, is_error: false },
+    { seq: 8, at: secondsAgo(5), tool: "find_references", entity_ids: [uuid(3), uuid(2)], result_count: 4, is_error: false }] }] });
+  await flush(); await flush();
+  const A = browser.agents;
+  assert.deepEqual([...A.marks(browser.data["/api/workspace/agents"]).map((entry) => [...entry])], [[uuid(2), "changing"], [uuid(3), "looked"]]);
+  await new Promise((resolve) => setTimeout(resolve, 50)); await flush();
+  const map = browser.maps.at(-1);
+  assert.ok(map, "the map was drawn");
+  assert.deepEqual([...map.controller.agentMarked].sort(), [uuid(2), uuid(3)].sort(), "the drawn map rings both entities");
+  assert.match(browser.text(), /What Claude Code looked at.*what it is changing/);
+  browser.data["/api/workspace/agents"] = agentsPayload({ agents: [] });
+  browser.refresh(); await flush(); await flush();
+  assert.deepEqual([...map.controller.agentMarked], [], "no ring stays once no agent is connected");
+  assert.doesNotMatch(browser.text(), /What Claude Code looked at/);
 });
 
 // ── One count for what relies on an entity ─────────────────────────────────
@@ -916,4 +1170,14 @@ test("a failure is one plain line, one action, and Kin's own words behind Show d
   assert.match(browser.text(), /Kin is still reading this branch\./);
   assert.ok(browser.button("Try again"));
   assert.match(browser.text(), /Show details.*did not answer within 20 seconds/s);
+});
+
+test("an agent's change carries the same count Changes shows, its own review's", async () => {
+  const browser = fixture({ hash: `#/agents/${AGENT_KEY}` });
+  browser.data["/api/changes"].changes.unshift({ id: AGENT_CHANGE, title: "Explain how want_bytes treats text", author: "Claude Code", agent: { name: "Claude Code", key: AGENT_KEY }, timestamp: secondsAgo(120), entity_deltas: 2 });
+  browser.data["/api/counts"] = (url) => ({ counts: Object.fromEntries(url.searchParams.get("changes").split(",").map((id) => [id, { entities: id === AGENT_CHANGE ? 1 : 3 }])) });
+  await flush(); await flush(); await flush();
+  const row = browser.main().querySelectorAll("a.change-row").find((node) => node.textContent.includes("Explain how want_bytes treats text"));
+  assert.match(row.textContent, /1 entity changed/);
+  assert.doesNotMatch(row.textContent, /2 entities changed/, "not the history's delta count");
 });

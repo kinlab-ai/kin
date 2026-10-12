@@ -337,6 +337,22 @@ pub enum RelationSyntacticRole {
     /// span. Resolve both identities from the admitted lexical spans.
     #[serde(alias = "python_lexical_contains")]
     LexicalContains,
+    /// A member call written inside the true branch of a builtin
+    /// `isinstance(receiver, Class)` or `isinstance(receiver, (A, B))` guard
+    /// whose classes the module binds by a class statement or an import. The
+    /// relation names one guard class's member as `Class.member`, one relation
+    /// per class, all sharing this one call site. The guard admits a subclass
+    /// too, so each destination is a possible target of the call and never a
+    /// proven one, and a linker that cannot ground the class binds nothing
+    /// rather than falling back to a name match.
+    PythonGuardedReceiver,
+    /// A bound member read as a value through a method's own instance
+    /// parameter, as in `Consumer(process_event=self._process_event)`: the
+    /// member is passed or stored, not called here. The relation is a
+    /// `References` edge named `Class.member` for the enclosing class. Whether
+    /// the member is a method the class declares or inherits is the linker's
+    /// question, and a subclass override keeps the destination a candidate.
+    PythonSelfMemberValue,
 }
 
 /// Specifier subset supported by the imported-getter receiver derivation.

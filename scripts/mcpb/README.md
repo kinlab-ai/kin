@@ -50,5 +50,5 @@ embed a verified published release archive instead.
 ## Privacy and support
 
 - https://kinlab.ai/privacy
-- https://github.com/firelock-ai/kin/blob/main/docs/security/what-leaves-the-machine.md
-- https://github.com/firelock-ai/kin/issues
+- https://github.com/kinlab-ai/kin/blob/main/docs/security/what-leaves-the-machine.md
+- https://github.com/kinlab-ai/kin/issues

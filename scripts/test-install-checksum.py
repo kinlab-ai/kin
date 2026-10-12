@@ -145,13 +145,16 @@ def check_product_wiring() -> None:
         'Set-Content -NoNewline -Encoding ascii -Path "$ArchivePath.sha256" -Value $Sidecar',
         'if ((Get-Content -Raw -Encoding ascii "$ArchivePath.sha256") -cne $Sidecar) {',
     )
+    # RC Build packages and writes the sidecars a release ships; release.yml
+    # publishes those exact bytes without repackaging them, so the writer is
+    # pinned in rc-build.yml and the CRLF refusal holds for both workflows.
     rc_workflow = (ROOT / ".github/workflows/rc-build.yml").read_text(encoding="utf-8")
+    for requirement in release_requirements:
+        if requirement not in rc_workflow:
+            raise AssertionError(
+                f"rc-build.yml is missing filename-bound LF checksum output: {requirement}"
+            )
     for name, text in (("release.yml", release_workflow), ("rc-build.yml", rc_workflow)):
-        for requirement in release_requirements:
-            if requirement not in text:
-                raise AssertionError(
-                    f"{name} is missing filename-bound LF checksum output: {requirement}"
-                )
         if re.search(r"\|\s*(?:Set-Content|Out-File|Add-Content)\b[^\n]*\.sha256", text):
             raise AssertionError(
                 f"{name} pipes a checksum line into a cmdlet that ends it in CRLF on Windows"
@@ -170,7 +173,7 @@ def check_product_wiring() -> None:
                 f"release.yml publishes a sidecar it has not held to LF bytes: {requirement}"
             )
 
-    # The PowerShell harness runs the writer it reads out of release.yml on
+    # The PowerShell harness runs the writer it reads out of rc-build.yml on
     # Windows and checks the bytes, so the pins above cannot pass on text alone.
     for requirement in (
         "Invoke-Expression $Writer",

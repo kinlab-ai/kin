@@ -11966,6 +11966,7 @@ mod tests {
             children_bytes: 0,
             child_count: 0,
             kernel_capped: false,
+            own_breakdown: None,
         });
         let repo = tempfile::TempDir::new().unwrap();
         let state = open_test_state(&repo);
@@ -12029,6 +12030,7 @@ mod tests {
             children_bytes: 0,
             child_count: 0,
             kernel_capped: false,
+            own_breakdown: None,
         });
 
         let first_repo = tempfile::TempDir::new().unwrap();

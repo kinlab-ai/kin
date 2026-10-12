@@ -616,6 +616,7 @@ fn recent_changes(report: crate::commands::log::LogReport) -> Map<String, Value>
                 "id": entry.change_id.to_string(),
                 "title": entry.message.lines().next().unwrap_or_default().trim(),
                 "author": author_display(&entry.author.to_string()),
+                "agent": super::workspace_agents::agent_ref(&entry.author.to_string()),
                 "time": entry.timestamp.to_string(),
             })
         })

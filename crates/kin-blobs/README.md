@@ -1,29 +1,28 @@
 # kin-blobs
 
-> Content-addressable blob storage substrate.
+> Content-addressable blob storage for Kin.
 
 `kin-blobs` is a small, dependency-light Rust crate that stores immutable
 content keyed by its SHA-256 digest. Writes are atomic and content is sharded
 Git-style (`{root}/{hash[0..2]}/{hash[2..]}`), so identical content is stored
 once and always addressed by its hash.
 
-It is the storage primitive in the open Kin local substrate. `kin-model` takes
+It is the storage primitive in the open Kin local stack. `kin-model` takes
 its canonical content hash from this crate and `kin` keeps published source
 bodies in a store built by it; Kin's graph, ranking, and provenance policy lives
 above this crate, not inside it.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/kinlab-ai/kin)
 
 ## What is Kin?
 
-Kin is a graph-native code repository for AI agents and the people who build with them:
-your code as a graph of entities, relations, and intents, not a pile of files and diffs.
-AI agents and humans navigate it semantically, with provenance, review, and governance
-built in. It coexists with Git and projects graph truth back to a normal filesystem, so
-any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. It stores source, recorded code relationships, and versioned history as
+repository state. The graph is the repository model, not a search index maintained
+beside another repository.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+Start at **[kinlab-ai/kin](https://github.com/kinlab-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 
