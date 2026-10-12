@@ -2455,8 +2455,17 @@ def execute_locator_step(
         (repo / "check_runs.ndjson").write_text("{}\n", encoding="utf-8")
         mark = root / "located"
         summary = root / "summary"
+        # Never inherit the host runner's command files: one falsification
+        # case strips the step's inert prefix on purpose, so an inherited
+        # GITHUB_ENV would take the fake's PATH poison into the live job.
+        runner_state = {}
+        for name in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_OUTPUT"):
+            state_file = root / name.lower()
+            state_file.write_text("", encoding="utf-8")
+            runner_state[name] = str(state_file)
         environment = {
             **os.environ,
+            **runner_state,
             "SHA": "0" * 40 if detached else sha,
             "TAG": "v0.8.4",
             "REPO": "kinlab-ai/kin",
@@ -2494,9 +2503,13 @@ def assert_no_tag_is_written_that_release_yml_would_refuse(release_tag: str) -> 
     code, log, asked = execute_locator_step(source, locate=1)
     if code == 0 or "release.yml would refuse v0.8.4" not in log:
         raise AssertionError(f"the mint went on to tag a candidate the locator refuses: rc={code} {log}")
+    host_env = os.environ.get("GITHUB_ENV")
+    host_before = Path(host_env).read_bytes() if host_env and Path(host_env).is_file() else None
     code, log, _ = execute_locator_step(source, poison=True)
     if code == 0 or "attempted to change runner state" not in log:
         raise AssertionError(f"the locator reached the runner state of the privileged steps: rc={code} {log}")
+    if host_before is not None and Path(host_env).read_bytes() != host_before:
+        raise AssertionError("the locator test wrote to the host runner GITHUB_ENV")
     code, log, asked = execute_locator_step(source, locates=False)
     if code != 0 or asked or "locates no RC Build bytes" not in log:
         raise AssertionError(f"a release.yml that builds its own bytes must need no locator: rc={code} {log}")
