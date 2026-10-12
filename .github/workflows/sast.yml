@@ -28,9 +28,9 @@ jobs:
   # Mirror of ci.yml's diff classifier: cargo-deny resolves the full
   # dependency graph, which documentation-only and workflow-only changes
   # cannot alter. Fail closed: any classifier failure or non-pull_request
-  # event reports docs_only=false and the gated job runs. An export pull
-  # request never takes the docs-only path, as in ci.yml, because
-  # land_export.py needs cargo-deny green on its exact head.
+  # event reports docs_only=false and the gated job runs, which includes every
+  # merge queue commit, so cargo-deny always runs for real on what lands. The
+  # branch name plays no part, as in ci.yml.
   changes:
     name: Classify diff scope
     runs-on: ubuntu-latest
@@ -46,7 +46,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           docs_only=false
@@ -63,9 +62,6 @@ jobs:
                 esac
               done <<< "$changed"
             fi
-            case "${HEAD_REF:-}" in
-              feature/public-export-*) docs_only=false ;;
-            esac
             printf '%s\n' "$changed"
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"

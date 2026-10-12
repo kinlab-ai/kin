@@ -1,6 +1,6 @@
 {
   "name": "@kin/boundary-contracts",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "private": false,
   "description": "Shared contracts for Kin ecosystem boundaries.",
   "type": "module",
@@ -10,9 +10,9 @@
     "type": "git",
     "url": "git+https://github.com/kinlab-ai/kin.git"
   },
-  "homepage": "https://github.com/firelock-ai/kin/tree/main/packages/boundary-contracts",
+  "homepage": "https://github.com/kinlab-ai/kin/tree/main/packages/boundary-contracts",
   "bugs": {
-    "url": "https://github.com/firelock-ai/kin/issues"
+    "url": "https://github.com/kinlab-ai/kin/issues"
   },
   "exports": {
     ".": {

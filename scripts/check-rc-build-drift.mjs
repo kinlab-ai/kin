@@ -2,160 +2,92 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-// rc-build.yml builds release-candidate archives from release.yml's build job.
-// It is a copy, because the alternative was refactoring the one workflow whose
-// mistakes cannot be repaired after the fact: a tag run resolves its workflows
-// from the tag. A copy that nothing checks is worse than no copy, because it
-// keeps reporting success while the thing it mirrors moves. This is the check
-// that makes the copy hold.
+// RC Build produces every byte a release ships; release.yml only consumes.
 //
-// It does not compare the two files loosely. It rebuilds what rc-build.yml's
-// shared step block MUST be, by taking release.yml's build steps, dropping the
-// step groups rc-build.yml deliberately omits, and applying the exact textual
-// deltas declared below. The result must equal rc-build.yml byte for byte. A
-// step added to release.yml, a step edited in either file, a reordered step, or
-// a delta whose anchor no longer exists all fail here and name what moved.
+// This file used to hold rc-build.yml's build job to a byte-for-byte copy of
+// release.yml's, because both compiled the same archives: the candidate for the
+// preflight to judge, and then the release again at the tag. release.yml no
+// longer compiles. It takes the RC Build archives and image the preflight
+// judged, signs the macOS ones, and publishes, so there is no second build job
+// to mirror. What has to hold instead is the producer and consumer contract,
+// and this checks it on every pull request that touches either workflow:
+//
+//   1. release.yml compiles nothing. No active line runs cargo, cross, rustup
+//      or a Docker build, uses the Rust toolchain action, or reads a Cargo
+//      target directory.
+//   2. rc-build.yml is the producer. Its build matrix is exactly the archive
+//      table scripts/locate-rc-build.mjs locates, its image job builds the
+//      daemon image once as an OCI archive, and its attest job attests every
+//      archive and the image.
+//   3. release.yml ships exactly what rc-build.yml builds. Its shipping
+//      matrices cover every RC Build archive on the same target, macOS only
+//      in the signing job, and its publish inventory names exactly those
+//      archives. Every byte it ships is downloaded from the located RC Build
+//      run and checked there: the artifact and its attestation.
+//   4. Both judge bytes by one rule: each runs
+//      scripts/verify-native-release-provenance.mjs, release.yml with
+//      --require-execution, and neither keeps an inline copy of it.
+//   5. rc-build.yml holds no release credential: no secret, no environment,
+//      and none of the signing steps, which live in release.yml's sign_macos.
+//
+// It does not compare the files loosely; each rule reads the jobs it is about
+// and fails naming what moved.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { RC_ARCHIVES, RC_IMAGE } from "./locate-rc-build.mjs";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const RC_WORKFLOW = ".github/workflows/rc-build.yml";
 
-// The six macOS signing and notarization steps. rc-build.yml declares no
-// environment and reads no secret, on purpose: a workflow_dispatch can target
-// branch-controlled workflow code, which must never reach the Apple or
-// package-publish credentials. Without those credentials these steps have
-// nothing to do, so they are absent rather than inert.
-//
-// A seventh entry, "Cache Cargo registry and build artifacts", used to sit at
-// the head of this list. release.yml no longer carries that step: it never
-// restored, because a tag-scoped cache entry is unreadable from the next tag,
-// and a restore that did work would assemble published bytes partly from cache
-// contents nobody reviewed. Both workflows now compile cold, so the difference
-// this entry described no longer exists and listing it here would report the
-// omission list as stale.
-export const OMITTED_STEPS = [
+// The release.yml jobs that ship RC Build archives, and which archives each
+// may ship. macOS archives are signed; every other one ships unchanged.
+export const SHIPPING_JOBS = Object.freeze({
+  ship_rc_archives: (target) => !target.endsWith("-apple-darwin"),
+  sign_macos: (target) => target.endsWith("-apple-darwin"),
+});
+// The jobs that take bytes from the located RC Build run.
+export const CONSUMING_JOBS = Object.freeze(["ship_rc_archives", "sign_macos", "publish_daemon_image"]);
+export const LOCATED_RUN = "run-id: ${{ needs.locate_rc_build.outputs.run_id }}";
+
+// The signing steps. They exist in release.yml's signing job and nowhere in
+// rc-build.yml, which reads no secret.
+export const SIGNING_STEPS = Object.freeze([
   "Resolve macOS signing credential availability",
   "Import code signing certificate (macOS)",
   "Sign macOS binaries",
   "Stage signed binaries for notarization (macOS)",
   "Notarize macOS binaries (notarytool)",
   "Upload signed binaries for Linux notarization",
-];
-
-// Steps rc-build.yml has and release.yml does not. Both exist because a
-// candidate has no tag: one resolves the version a tag would have supplied, the
-// other reports which bytes the run produced so a consumer can find them.
-export const ADDED_STEPS = [
-  "Resolve the release-candidate identity",
-  "Summarize the candidate archives",
-];
-
-// Every difference inside a shared step, as an exact anchor and its
-// replacement. Each anchor must appear exactly once in release.yml's build
-// steps; an anchor that stops matching is itself drift and fails below.
-export const DELTAS = [
-  {
-    label: "archive-docs-version-windows",
-    from: `          node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" ($env:GITHUB_REF_NAME -replace '^v', '')
-`,
-    to: `          node scripts/write-release-archive-docs.mjs "$env:ARTIFACT" "$env:TARGET" $env:RC_VERSION
-`,
-  },
-  {
-    label: "archive-docs-version",
-    from: `          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "\${GITHUB_REF_NAME#v}"
-`,
-    to: `          node scripts/write-release-archive-docs.mjs "$ARTIFACT" "$TARGET" "$RC_VERSION"
-`,
-  },
-  // An "apt" delta used to sit here. rc-build.yml bounded its musl-tools
-  // install through scripts/ci-apt-install.sh while release.yml still called
-  // apt directly, so the candidate was protected from a mirror stall and the
-  // release was not. release.yml now calls the same helper, the two steps are
-  // byte-identical again, and a delta describing a difference that no longer
-  // exists would fail here as an anchor that matches nothing.
-  {
-    label: "notifier-version",
-    from: `            "\${GITHUB_REF_NAME#v}"
-`,
-    to: `            "$RC_VERSION"
-`,
-  },
-  {
-    label: "provenance-version",
-    from: `
-          const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");`,
-    to: `
-          // DELTA(version): a candidate has no tag, so the version both static
-          // build identities must agree on is the workspace package version the
-          // job resolved. The cross-check between kin and kin-daemon is intact;
-          // what a candidate cannot assert is agreement with a tag name.
-          const expectedVersion = process.env.RC_VERSION;`,
-  },
-  {
-    label: "provenance-tag",
-    from: `            schema_version: 2,
-            release_tag: process.env.GITHUB_REF_NAME,
-            artifact,`,
-    to: `            schema_version: 2,
-            // DELTA(identity): a candidate manifest names the ref and sha it was
-            // built from. It carries no release_tag, so it can never be mistaken
-            // for a published release's provenance.
-            release_candidate: {
-              ref: process.env.RC_REF,
-              version: process.env.RC_VERSION,
-            },
-            artifact,`,
-  },
-  {
-    label: "upload",
-    from: `      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
-        with:
-          name: \${{ matrix.artifact }}
-          path: |`,
-    to: `      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
-        with:
-          name: \${{ matrix.artifact }}
-          # DELTA(retention): a candidate is short-lived scratch, and an empty
-          # upload must fail here rather than surface as a missing archive in
-          # whatever consumes the run.
-          retention-days: 7
-          if-no-files-found: error
-          path: |`,
-  },
-];
-
-// Matrix rows whose runner differs on purpose, by artifact. rc-build.yml builds
-// both macOS archives on a Depot Apple Silicon runner, where each build step
-// takes 12 to 21 minutes against 77 to 79 on release.yml's standard runners. release.yml stays on the standard pool: a tag freezes it, and a pool
-// that stops assigning runners would strand an immutable release. rc-build.yml
-// runs before any tag exists, so the same failure only delays a candidate.
-//
-// Each side must carry exactly the label declared here and the rest of the row
-// must match, so moving either file to a different runner is still drift until
-// this table says so, and a release.yml row that reaches the rc label makes its
-// entry stale rather than silently satisfied.
-export const RUNNER_DELTAS = new Map([
-  ["kin-macos-x86_64", { release: "macos-15-intel", rc: "depot-macos-26" }],
-  ["kin-macos-aarch64", { release: "macos-latest", rc: "depot-macos-26" }],
 ]);
 
-// rc-build.yml declares skip_vfs on every row. Three shared steps read it, and
-// release.yml gets the key from the windows row rc-build.yml does not carry, so
-// without it actionlint rejects those steps against a matrix type with no such
-// property. The value matches what those steps already saw on every row here.
-const RC_ONLY_MATRIX_KEYS = ["skip_vfs"];
+// Anything on an active line of release.yml that compiles. `docker buildx
+// imagetools` reads a registry and is not a build.
+export const COMPILE_PATTERNS = Object.freeze([
+  [/(^|[\s;&|(])cargo\s/, "runs cargo"],
+  [/(^|[\s;&|(])cross\s+build/, "runs cross"],
+  [/(^|[\s;&|(])rustup\s/, "runs rustup"],
+  [/(^|[\s;&|(])rustc\s/, "runs rustc"],
+  [/docker\s+(buildx\s+)?build(\s|$)/, "runs a Docker build"],
+  [/docker\/build-push-action@/, "uses docker/build-push-action"],
+  [/\.\/\.github\/actions\/rust-toolchain/, "installs the Rust toolchain"],
+  [/target\/(\$\{?TARGET\}?|\$\{\{\s*matrix\.target\s*\}\})\/release/, "reads a Cargo target directory"],
+]);
 
-export function buildJobBody(text, workflow) {
+// Text only the native provenance check itself carries. An inline copy in
+// either workflow is a second rule that can drift from the script.
+export const INLINE_PROVENANCE_MARKERS = Object.freeze([
+  "kin bench-meta did not prove a clean, known release source",
+  "release binary SHAs",
+]);
+
+export function jobBody(text, job, workflow) {
   const lines = text.split("\n");
-  const start = lines.findIndex((line) => line === "  build:");
-  if (start === -1) throw new Error(`${workflow}: no build job`);
+  const start = lines.findIndex((line) => line === `  ${job}:`);
+  if (start === -1) throw new Error(`${workflow}: no ${job} job`);
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i += 1) {
     if (/^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(lines[i])) {
@@ -163,42 +95,19 @@ export function buildJobBody(text, workflow) {
       break;
     }
   }
-  // The comment block introducing the next job sits above that job's key and
-  // documents it, not the last step of this one. Without this the release
-  // build job's final step absorbs notarize_linux's header and can never
-  // match a candidate step that has no such neighbour.
+  // The comment block introducing the next job documents that job.
   while (end > start && /^ {2}#/.test(lines[end - 1])) end -= 1;
   return lines.slice(start, end).join("\n");
 }
 
-// A step is its "- name:" line, its body, and the run of comment lines directly
-// above it. Both workflows document a step in the comment block that precedes
-// it, so a comment belongs to the step it describes rather than to the one
-// before. Trailing blank lines are trimmed, so where a blank line falls between
-// steps is not treated as drift.
-export function splitSteps(jobBody, workflow) {
-  const lines = jobBody.split("\n");
-  const starts = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!lines[i].startsWith("      - name: ")) continue;
-    let start = i;
-    while (start > 0 && /^ {6}#/.test(lines[start - 1])) start -= 1;
-    starts.push({ start, nameLine: i });
-  }
-  if (starts.length === 0) throw new Error(`${workflow}: build job has no steps`);
-  return starts.map(({ start, nameLine }, index) => {
-    const end = index + 1 < starts.length ? starts[index + 1].start : lines.length;
-    return {
-      name: lines[nameLine].slice("      - name: ".length),
-      body: lines.slice(start, end).join("\n").replace(/\s+$/, ""),
-    };
-  });
+export function buildJobBody(text, workflow) {
+  return jobBody(text, "build", workflow);
 }
 
-export function matrixRows(jobBody, workflow) {
-  const lines = jobBody.split("\n");
+export function matrixRows(body, workflow) {
+  const lines = body.split("\n");
   const start = lines.findIndex((line) => line === "        include:");
-  if (start === -1) throw new Error(`${workflow}: build job has no matrix include`);
+  if (start === -1) throw new Error(`${workflow}: job has no matrix include`);
   const rows = [];
   let current = null;
   for (let i = start + 1; i < lines.length; i += 1) {
@@ -221,104 +130,175 @@ export function matrixRows(jobBody, workflow) {
       const artifact = row.find((entry) => entry.startsWith("artifact:"));
       if (!artifact) throw new Error(`${workflow}: a matrix row names no artifact`);
       return [artifact.slice("artifact:".length).trim(), row];
-    })
+    }),
   );
+}
+
+const rowValue = (row, key) => row.find((entry) => entry.startsWith(`${key}:`))?.slice(key.length + 1).trim();
+
+export function activeLines(text) {
+  return text.split("\n").filter((line) => !/^\s*#/.test(line));
+}
+
+function stepNames(text) {
+  return [...text.matchAll(/^\s+- name: (.*)$/gm)].map((match) => match[1].trim());
 }
 
 export function check(releaseText, rcText) {
   const problems = [];
-  const releaseJob = buildJobBody(releaseText, RELEASE_WORKFLOW);
-  const rcJob = buildJobBody(rcText, RC_WORKFLOW);
-  const releaseSteps = splitSteps(releaseJob, RELEASE_WORKFLOW);
-  const rcSteps = splitSteps(rcJob, RC_WORKFLOW);
-  const releaseNames = releaseSteps.map((step) => step.name);
-  const rcNames = rcSteps.map((step) => step.name);
+  const guard = (fn) => {
+    try {
+      fn();
+    } catch (error) {
+      problems.push(error.message);
+    }
+  };
 
-  for (const name of OMITTED_STEPS) {
-    if (!releaseNames.includes(name)) {
-      problems.push(`omitted step "${name}" no longer exists in ${RELEASE_WORKFLOW}; the omission list is stale`);
+  // 1. release.yml compiles nothing.
+  activeLines(releaseText).forEach((line) => {
+    for (const [pattern, what] of COMPILE_PATTERNS) {
+      if (pattern.test(line)) {
+        problems.push(`${RELEASE_WORKFLOW} ${what}, but RC Build is the only producer of release bytes: ${line.trim()}`);
+      }
     }
-    if (rcNames.includes(name)) {
-      problems.push(`step "${name}" is listed as omitted but ${RC_WORKFLOW} carries it`);
+  });
+
+  // 2. rc-build.yml produces exactly the located archives and the image.
+  guard(() => {
+    const rows = matrixRows(buildJobBody(rcText, RC_WORKFLOW), RC_WORKFLOW);
+    const built = [...rows.keys()];
+    const located = RC_ARCHIVES.map((entry) => entry.artifact);
+    if (JSON.stringify(built) !== JSON.stringify(located)) {
+      problems.push(`${RC_WORKFLOW} builds ${built.join(", ")}, but scripts/locate-rc-build.mjs locates ${located.join(", ")}`);
     }
+    for (const entry of RC_ARCHIVES) {
+      const row = rows.get(entry.artifact);
+      if (row && rowValue(row, "target") !== entry.target) {
+        problems.push(`${RC_WORKFLOW} builds ${entry.artifact} for ${rowValue(row, "target")}, not ${entry.target}`);
+      }
+    }
+  });
+  guard(() => {
+    const image = jobBody(rcText, "image", RC_WORKFLOW);
+    const builds = activeLines(image).filter((line) => /docker\s+buildx\s+build/.test(line)).length;
+    if (builds !== 1) problems.push(`${RC_WORKFLOW}'s image job must build the daemon image exactly once, found ${builds}`);
+    if (!image.includes("type=oci,dest=") || !image.includes(`${RC_IMAGE.archive}`)) {
+      problems.push(`${RC_WORKFLOW}'s image job must export ${RC_IMAGE.archive} as an OCI archive, so its digests survive the push`);
+    }
+    if (!image.includes(`name: ${RC_IMAGE.artifact}`)) {
+      problems.push(`${RC_WORKFLOW}'s image job must upload the ${RC_IMAGE.artifact} artifact release.yml locates`);
+    }
+  });
+  guard(() => {
+    const attest = jobBody(rcText, "attest", RC_WORKFLOW);
+    const subjects = [...attest.matchAll(/^\s+\$\{\{ runner\.temp \}\}\/rc\/(\S+)$/gm)].map((match) => match[1]).sort();
+    const expected = [
+      ...RC_ARCHIVES.flatMap((entry) => entry.archives.map((name) => `${entry.artifact}/${name}`)),
+      `${RC_IMAGE.artifact}/${RC_IMAGE.archive}`,
+    ].sort();
+    if (JSON.stringify(subjects) !== JSON.stringify(expected)) {
+      problems.push(`${RC_WORKFLOW}'s attest job attests ${subjects.join(", ") || "nothing"}, expected ${expected.join(", ")}`);
+    }
+    if (!/needs: \[build, image\]/.test(attest)) {
+      problems.push(`${RC_WORKFLOW}'s attest job must wait for both the build and image jobs`);
+    }
+  });
+
+  // 3. release.yml ships exactly what rc-build.yml builds, from the located run.
+  guard(() => {
+    const shipped = new Map();
+    for (const [job, admits] of Object.entries(SHIPPING_JOBS)) {
+      for (const [artifact, row] of matrixRows(jobBody(releaseText, job, RELEASE_WORKFLOW), RELEASE_WORKFLOW)) {
+        const target = rowValue(row, "target");
+        if (shipped.has(artifact)) problems.push(`${RELEASE_WORKFLOW} ships ${artifact} from two jobs`);
+        shipped.set(artifact, target);
+        if (!admits(target ?? "")) problems.push(`${RELEASE_WORKFLOW}'s ${job} ships ${artifact} (${target}), which it may not`);
+      }
+    }
+    for (const entry of RC_ARCHIVES) {
+      if (!shipped.has(entry.artifact)) {
+        problems.push(`${RC_WORKFLOW} builds ${entry.artifact}, which ${RELEASE_WORKFLOW} does not ship`);
+      } else if (shipped.get(entry.artifact) !== entry.target) {
+        problems.push(`${RELEASE_WORKFLOW} ships ${entry.artifact} as ${shipped.get(entry.artifact)}, but RC Build builds it for ${entry.target}`);
+      }
+    }
+    for (const artifact of shipped.keys()) {
+      if (!RC_ARCHIVES.some((entry) => entry.artifact === artifact)) {
+        problems.push(`${RELEASE_WORKFLOW} ships ${artifact}, which ${RC_WORKFLOW} does not build`);
+      }
+    }
+  });
+  guard(() => {
+    const publish = jobBody(releaseText, "publish", RELEASE_WORKFLOW);
+    const start = publish.indexOf("          assets=(");
+    const end = publish.indexOf("          )", start);
+    if (start === -1 || end === -1) throw new Error(`${RELEASE_WORKFLOW}'s publish job no longer lists its asset inventory`);
+    const inventory = publish.slice(start, end).split("\n").slice(1).map((line) => line.trim()).filter(Boolean).sort();
+    const expected = RC_ARCHIVES.flatMap((entry) => entry.archives).sort();
+    if (JSON.stringify(inventory) !== JSON.stringify(expected)) {
+      problems.push(`${RELEASE_WORKFLOW} publishes ${inventory.join(", ")}, but RC Build builds ${expected.join(", ")}`);
+    }
+  });
+  for (const job of CONSUMING_JOBS) {
+    guard(() => {
+      const body = jobBody(releaseText, job, RELEASE_WORKFLOW);
+      const downloads = body.split("uses: actions/download-artifact@").slice(1);
+      if (downloads.length !== 1) {
+        problems.push(`${RELEASE_WORKFLOW}'s ${job} must download exactly one artifact from the located RC Build run, found ${downloads.length} downloads`);
+      }
+      for (const download of downloads) {
+        const withBlock = download.split("\n      - ")[0];
+        if (!withBlock.includes(LOCATED_RUN)) {
+          problems.push(`${RELEASE_WORKFLOW}'s ${job} downloads from somewhere other than the located RC Build run`);
+        }
+      }
+      for (const command of ["scripts/locate-rc-build.mjs verify-artifact", "scripts/locate-rc-build.mjs verify-attestation"]) {
+        if (!activeLines(body).some((line) => line.includes(command))) {
+          problems.push(`${RELEASE_WORKFLOW}'s ${job} must run ${command} on the bytes it ships`);
+        }
+      }
+    });
   }
-  for (const name of ADDED_STEPS) {
-    if (!rcNames.includes(name)) {
-      problems.push(`added step "${name}" is missing from ${RC_WORKFLOW}`);
-    }
-    if (releaseNames.includes(name)) {
-      problems.push(`step "${name}" is listed as candidate-only but ${RELEASE_WORKFLOW} carries it too`);
+
+  // 4. One native provenance rule, run by producer and consumer.
+  const PROVENANCE = "node scripts/verify-native-release-provenance.mjs";
+  guard(() => {
+    const producer = activeLines(buildJobBody(rcText, RC_WORKFLOW)).filter((line) => line.includes(PROVENANCE)).length;
+    if (producer !== 1) problems.push(`${RC_WORKFLOW}'s build job must run ${PROVENANCE} once, found ${producer}`);
+  });
+  for (const [job, expected] of [["ship_rc_archives", 1], ["sign_macos", 2]]) {
+    guard(() => {
+      const body = jobBody(releaseText, job, RELEASE_WORKFLOW);
+      const runs = activeLines(body).filter((line) => line.includes(PROVENANCE)).length;
+      const required = activeLines(body).filter((line) => line.includes("--require-execution")).length;
+      if (runs !== expected || required !== expected) {
+        problems.push(`${RELEASE_WORKFLOW}'s ${job} must run ${PROVENANCE} --require-execution ${expected} time(s), found ${runs} run(s) and ${required} --require-execution`);
+      }
+    });
+  }
+  for (const [workflow, text] of [[RELEASE_WORKFLOW, releaseText], [RC_WORKFLOW, rcText]]) {
+    for (const marker of INLINE_PROVENANCE_MARKERS) {
+      if (text.includes(marker)) {
+        problems.push(`${workflow} carries an inline copy of the native provenance check ("${marker}"); call the script instead`);
+      }
     }
   }
 
-  let expected = releaseSteps
-    .filter((step) => !OMITTED_STEPS.includes(step.name))
-    .map((step) => step.body)
-    .join("\n");
-  for (const delta of DELTAS) {
-    const seen = expected.split(delta.from).length - 1;
-    if (seen !== 1) {
-      problems.push(`delta "${delta.label}" matched ${seen} times in ${RELEASE_WORKFLOW}'s shared steps, expected exactly 1`);
-      continue;
+  // 5. rc-build.yml holds no release credential.
+  const rcActive = activeLines(rcText).join("\n");
+  if (/\$\{\{\s*secrets\./.test(rcActive)) problems.push(`${RC_WORKFLOW} reads a secret; it must hold no release credential`);
+  if (/^\s+environment:/m.test(rcActive)) problems.push(`${RC_WORKFLOW} declares an environment; it must hold no release credential`);
+  const rcSteps = stepNames(rcText);
+  const signSteps = (() => {
+    try {
+      return stepNames(jobBody(releaseText, "sign_macos", RELEASE_WORKFLOW));
+    } catch {
+      return [];
     }
-    expected = expected.replace(delta.from, delta.to);
-  }
-  const actual = rcSteps
-    .filter((step) => !ADDED_STEPS.includes(step.name))
-    .map((step) => step.body)
-    .join("\n");
-
-  if (expected !== actual) {
-    const expectedLines = expected.split("\n");
-    const actualLines = actual.split("\n");
-    let i = 0;
-    while (i < expectedLines.length && i < actualLines.length && expectedLines[i] === actualLines[i]) i += 1;
-    let step = "(before any step)";
-    for (let back = i; back >= 0; back -= 1) {
-      const match = /^ {6}- name: (.*)$/.exec(actualLines[back] ?? expectedLines[back] ?? "");
-      if (match) { step = match[1]; break; }
-    }
-    problems.push(
-      `${RC_WORKFLOW} no longer mirrors ${RELEASE_WORKFLOW}'s build steps.\n` +
-        `  first difference in step "${step}"\n` +
-        `  release.yml (with deltas applied): ${JSON.stringify(expectedLines[i] ?? "(end of block)")}\n` +
-        `  rc-build.yml:                      ${JSON.stringify(actualLines[i] ?? "(end of block)")}`
-    );
-  }
-
-  const releaseRows = matrixRows(releaseJob, RELEASE_WORKFLOW);
-  const rcRows = matrixRows(rcJob, RC_WORKFLOW);
-  for (const [artifact, runners] of RUNNER_DELTAS) {
-    if (!rcRows.has(artifact) || !releaseRows.has(artifact)) {
-      problems.push(`runner delta for ${artifact} names a row that ${RC_WORKFLOW} or ${RELEASE_WORKFLOW} does not build; the delta is stale`);
-      continue;
-    }
-    if (!releaseRows.get(artifact).includes(`os: ${runners.release}`)) {
-      problems.push(`runner delta for ${artifact} expects ${RELEASE_WORKFLOW} on ${runners.release}, which it no longer uses; the delta is stale`);
-    }
-    if (!rcRows.get(artifact).includes(`os: ${runners.rc}`)) {
-      problems.push(`runner delta for ${artifact} declares ${RC_WORKFLOW} on ${runners.rc}, which it does not use`);
-    }
-  }
-  for (const [artifact, rcRow] of rcRows) {
-    const releaseRow = releaseRows.get(artifact);
-    if (!releaseRow) {
-      problems.push(`${RC_WORKFLOW} builds ${artifact}, which ${RELEASE_WORKFLOW} does not publish`);
-      continue;
-    }
-    // A declared runner delta swaps exactly that label back before comparing,
-    // so every other key in the row is still held to release.yml's.
-    const runners = RUNNER_DELTAS.get(artifact);
-    const trimmed = rcRow
-      .filter((entry) => !RC_ONLY_MATRIX_KEYS.some((key) => entry.startsWith(`${key}:`)))
-      .map((entry) => (runners && entry === `os: ${runners.rc}` ? `os: ${runners.release}` : entry));
-    if (JSON.stringify(trimmed) !== JSON.stringify(releaseRow)) {
-      problems.push(
-        `${RC_WORKFLOW}'s ${artifact} matrix row differs from ${RELEASE_WORKFLOW}'s.\n` +
-          `  release.yml:  ${JSON.stringify(releaseRow)}\n` +
-          `  rc-build.yml: ${JSON.stringify(trimmed)}`
-      );
-    }
+  })();
+  for (const name of SIGNING_STEPS) {
+    if (rcSteps.includes(name)) problems.push(`${RC_WORKFLOW} carries the signing step "${name}", which belongs to ${RELEASE_WORKFLOW}`);
+    if (!signSteps.includes(name)) problems.push(`${RELEASE_WORKFLOW}'s sign_macos job no longer carries "${name}"`);
   }
   return problems;
 }
@@ -326,7 +306,7 @@ export function check(releaseText, rcText) {
 export function checkFiles(root = ROOT) {
   return check(
     readFileSync(join(root, RELEASE_WORKFLOW), "utf8"),
-    readFileSync(join(root, RC_WORKFLOW), "utf8")
+    readFileSync(join(root, RC_WORKFLOW), "utf8"),
   );
 }
 
@@ -337,14 +317,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       console.error(`::error::${problem}`);
     }
     console.error(
-      `\n${RC_WORKFLOW} mirrors ${RELEASE_WORKFLOW}'s build job so release-candidate archives are built by the release's own steps.\n` +
-        `Re-copy the changed step into ${RC_WORKFLOW}, or record the difference in DELTAS in ${"scripts/check-rc-build-drift.mjs"}.`
+      `\n${RC_WORKFLOW} is the only producer of the bytes a release ships and ${RELEASE_WORKFLOW} only consumes them.\n` +
+        `Change both sides together, and scripts/locate-rc-build.mjs's archive table with them.`,
     );
     process.exit(1);
   }
   console.log(
-    `${RC_WORKFLOW} mirrors ${RELEASE_WORKFLOW}'s build job: ` +
-      `${OMITTED_STEPS.length} steps omitted, ${ADDED_STEPS.length} candidate-only, ${DELTAS.length} deltas applied, ` +
-      `${RUNNER_DELTAS.size} runner deltas declared.`
+    `${RC_WORKFLOW} produces and ${RELEASE_WORKFLOW} consumes: ${RC_ARCHIVES.length} archives and the daemon image, ` +
+      `nothing compiled at the tag, one native provenance rule, signing only in the release.`,
   );
 }

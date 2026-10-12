@@ -35,7 +35,7 @@ GUARD = "scripts/verify-installer-archive-binaries.py"
 COPIED = (
     "scripts/install.sh",
     GUARD,
-    ".github/workflows/release.yml",
+    ".github/workflows/rc-build.yml",
 )
 
 
@@ -137,7 +137,7 @@ PROBES: tuple[tuple[str, str, Callable[[Path], None]], ...] = (
         "unaccounted for",
         lambda tree: poison(
             tree,
-            ".github/workflows/release.yml",
+            ".github/workflows/rc-build.yml",
             'Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop',
             'Copy-Item "target/$env:TARGET/release/kin-daemon" "$env:ARTIFACT/" -ErrorAction Stop',
         ),
@@ -153,11 +153,13 @@ PROBES: tuple[tuple[str, str, Callable[[Path], None]], ...] = (
         ),
     ),
     (
-        "one of the release's mandatory binary records made unreadable",
-        "can be read",
+        # rc-build.yml carries one mandatory-binary record, so making it
+        # unreadable leaves none to read and the guard reports it as not found.
+        "the release's mandatory binary record made unreadable",
+        "authority names not found",
         lambda tree: poison(
             tree,
-            ".github/workflows/release.yml",
+            ".github/workflows/rc-build.yml",
             '            target.includes("-windows-")\n'
             '              ? ["kin.exe", "kin-daemon.exe"]',
             '            target.includes("-windows-")\n'

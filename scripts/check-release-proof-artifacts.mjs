@@ -28,11 +28,13 @@
 // There are two such records and the gate accepts either, because there are two
 // sets of bytes a stranger can honestly run and both belong to this commit. The
 // preflight's legs are the rc-build archives the machine proof judged. The
-// release's own release-provenance.json names the archives release.yml built
-// and published AT THE TAG, which are different bytes by construction: the tag
-// build is a fresh one, so the archive a developer downloads is never a
-// preflight leg. With the preflight link alone, a stranger run on released
-// bytes can never lift that release's own pending notice.
+// release's own release-provenance.json names the archives release.yml
+// published AT THE TAG. Since release.yml stopped compiling, those are the
+// rc-build archives themselves for Linux and Windows, and the macOS ones are
+// the same archives signed, so a signed macOS archive is never a preflight leg.
+// Releases cut before that were a fresh build at the tag, and none of their
+// archives was a preflight leg. With the preflight link alone, a stranger run on
+// released macOS bytes could never lift that release's own pending notice.
 
 import process from 'node:process';
 import { realpathSync } from 'node:fs';

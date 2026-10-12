@@ -38,7 +38,7 @@ repository, and walks the everyday loop end to end. Once Kin is running, the
 ## How Kin works
 
 - **[Architectural thesis](thesis.md)** is the argument for a graph-first
-  repository substrate over a file-first, diff-first one.
+  repository model over a file-first, diff-first one.
 - **[Write-authority model](write-authority-model.md)** describes where the
   source of truth sits during the move from file-first to graph-first, and
   where the graph gets a veto.

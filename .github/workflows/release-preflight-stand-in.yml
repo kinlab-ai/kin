@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# The pull request's producer of `Release preflight`, which the merge queue
+# requires before it lands anything. On the merge queue's commit, Release Cut
+# posts the real context as a commit status after preflighting the release
+# candidate built from that commit. A pull request has no candidate, so this
+# job reports the context at once and says where the proof happens. The tag
+# mint never reads this context, so a pull request's stand-in cannot decide
+# what gets tagged.
+#
+# It is its own workflow, triggered by `pull_request` and nothing else, and
+# that is the point. A job in ci.yml skipped on merge_group would still publish
+# a skipped `Release preflight` check run on every merge queue commit, beside
+# Release Cut's status, and a skipped check passes a required one. Here no
+# merge_group or push event ever starts this workflow, so the queue's commit
+# carries exactly one `Release preflight`, Release Cut's.
+name: Release Preflight Stand-in
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Point at the merge queue
+        run: |
+          echo "::notice title=Release preflight::the merge queue proves the release candidate; Release Cut posts this context on the merge queue's commit"

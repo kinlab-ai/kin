@@ -141,7 +141,7 @@ Public Git history is part of the product, so keep it clean and reviewable:
 
 ## Reporting Issues
 
-File issues on [firelock-ai/kin](https://github.com/firelock-ai/kin/issues)
+File issues on [kinlab-ai/kin](https://github.com/kinlab-ai/kin/issues)
 using the provided templates:
 
 - **Bug reports:** use the bug report template.

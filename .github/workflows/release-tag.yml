@@ -18,6 +18,13 @@ name: Release Tag (bot-mediated)
 # uses the same App-mediated tag write as the break-glass dispatch path.
 
 on:
+  # The push that lands a release is the moment to mint it. Through the merge
+  # queue, every piece of evidence already exists when that push happens: the
+  # queue's build of this exact commit carries the required contexts, and the
+  # release cut filed preflight.json for it while the group was queued. A push
+  # run resolves this workflow from the branch pushed, and main alone is named.
+  push:
+    branches: [main]
   schedule:
     - cron: "11,26,41,56 * * * *"
   workflow_run:
@@ -50,13 +57,16 @@ on:
 
 # The App installation token carries the only write capability (creating the
 # tag ref). The workflow's own GITHUB_TOKEN stays read-only: contents:read for
-# checkout and ref reads, checks:read for check-runs, and actions:read to bind
-# each required check suite to its exact workflow path, event, and head SHA.
+# checkout and ref reads, checks:read for check-runs and their annotations,
+# actions:read to bind each required check suite to its exact workflow path,
+# event, and head SHA, and pull-requests:read to learn which export pull request
+# a main commit was squashed from.
 permissions:
   contents: read
   checks: read
   actions: read
   attestations: read
+  pull-requests: read
 
 # Never run two tag mints at once, and never cancel one mid-flight.
 concurrency:
@@ -126,6 +136,10 @@ jobs:
             kin-release-bot[bot]
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = push ] && [ "$REF" != refs/heads/main ]; then
+            echo "::error::release-tag runs on a push to main alone (got '$REF')"
+            exit 1
+          fi
           if [ "$EVENT_NAME" != repository_dispatch ]; then
             echo "trusted automatic trigger: $EVENT_NAME"
             exit 0
@@ -212,8 +226,8 @@ jobs:
                 sha="$(printf '%s' "$RAW_SHA" | tr '[:upper:]' '[:lower:]')"
               fi
               ;;
-            workflow_run|schedule)
-              # Both automatic arms read the same freshly fetched protected
+            push|workflow_run|schedule)
+              # Every automatic arm reads the same freshly fetched protected
               # main. A trigger decides only when to look, never which commit to
               # release, so the event's own head sha is deliberately not an
               # input here: a rerun of an older CI run carries that run's sha,
@@ -419,6 +433,30 @@ jobs:
           should_tag="$(sed -n 's/^should_tag=//p' "$intent")"
           test -n "$resolved_tag"
           test -n "$should_tag"
+
+          # A cancelled version is never tagged, whatever main stages and
+          # whatever evidence a leftover candidate carries. The rule is the
+          # release cut's own, read from protected main's copy, so the cut and
+          # the mint retire a version together. Exit 3 is a refusal; anything
+          # else that is not 0 is a read that failed, and refuses too.
+          version_policy="$RUNNER_TEMP/select-release-candidate.py"
+          git show "${authority_main}:scripts/select-release-candidate.py" > "$version_policy"
+          test -s "$version_policy"
+          set +e
+          admission="$(env -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE \
+            python3 -I "$version_policy" admit-version --version "$resolved_tag")"
+          admitted=$?
+          set -e
+          if [ "$admitted" -ne 0 ]; then
+            why="$(jq -r '.reason // empty' <<< "$admission" 2>/dev/null || true)"
+            if [ "$automatic" = true ] && [ "$admitted" -eq 3 ]; then
+              echo "::notice::${resolved_tag} may not be released (${why}); release tag reconciliation is a no-op."
+              echo "needed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::${resolved_tag} may not be released (exit ${admitted}: ${why:-the version rule could not be read})"
+            exit 1
+          fi
 
           if [ "$automatic" = true ]; then
             tag="$resolved_tag"
@@ -903,6 +941,63 @@ jobs:
           fi
           echo "::notice::release mint declined (${DECLINE_REASON}); ${consecutive} in a row, escalating at ${DECLINE_LIMIT}"
 
+      # Main's own CI push run re-grades a tree its export pull request already
+      # graded, and took 86 to 93 minutes doing it on 2026-10-12. When this
+      # commit is that pull request's squash, carrying the head's exact tree on
+      # the head's own base, the head's grade may stand in for main's while
+      # main's own build has no verdict yet, and the gate below then judges the
+      # head's required contexts exactly as it judges main's. Whether the commit
+      # qualifies is decided by the function the release cut armed it with,
+      # copied from protected main rather than run from the checkout under
+      # judgment, so the cut and the mint cannot bind a commit to a pull request
+      # by two different rules. A read that fails is not a refusal: the gate
+      # then grades main's own push runs, exactly as before inheritance existed.
+      - name: Resolve evidence inherited from the export pull request
+        id: inherit
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          record="$RUNNER_TEMP/inherited-evidence.json"
+          policy="$RUNNER_TEMP/select-release-candidate.py"
+          fallback() {
+            echo "::warning::could not resolve inherited export evidence for ${SHA} ($1); the gate grades main's own push runs, exactly as before"
+            jq -n --arg sha "$SHA" --arg why "$1" \
+              '{sha: $sha, inherited: false, reasons: [$why]}' > "$record"
+          }
+          if ! git show "refs/remotes/origin/main:scripts/select-release-candidate.py" \
+               > "$policy" 2>/dev/null || [ ! -s "$policy" ]; then
+            fallback "protected main carries no selector to bind the commit with"
+          elif ! python3 -I "$policy" inheritance \
+               --repository "$REPO" \
+               --workspace "$GITHUB_WORKSPACE" \
+               --sha "$SHA" > "$record.read"; then
+            fallback "the inheritance read failed"
+          else
+            mv "$record.read" "$record"
+          fi
+          inherited="$(jq -r 'if .inherited == true then "true" else "false" end' "$record")"
+          head_sha=""
+          if [ "$inherited" = true ]; then
+            head_sha="$(jq -r '.head_sha' "$record")"
+            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$(jq -r '.sha' "$record")" != "$SHA" ]; then
+              echo "::error::the inheritance record for $SHA names no exact head, or names another commit"
+              exit 1
+            fi
+            echo "::notice::$SHA may inherit export pull request #$(jq -r '.pull' "$record") head $head_sha (CI run $(jq -r '.runs.CI' "$record"), Acceptance run $(jq -r '.runs.Acceptance' "$record"))"
+          else
+            echo "$SHA inherits nothing: $(jq -r '.reasons | join("; ")' "$record")"
+          fi
+          {
+            echo "inherited=$inherited"
+            echo "head_sha=$head_sha"
+            echo "record=$record"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Verify required checks are green
         if: >-
           steps.resolve.outputs.needed == 'true' &&
@@ -946,6 +1041,19 @@ jobs:
         # same tree failing a full pass is a verdict, while an unfinished one
         # is never waited for.
         #
+        # An export pull request's head is the third tier, and the authority
+        # only when there is no queue build, the step above bound this commit to
+        # that head, and main's own ci.yml push build has no verdict yet. The
+        # head is judged by the same provenance, uniqueness and conclusion rules
+        # under the event each producer publishes there, and main's own push
+        # build corroborates it the way it corroborates a queue build. Once
+        # main's build has concluded, it is the authority again.
+        #
+        # A required job that hit its own `timeout-minutes` is reported by
+        # GitHub as `cancelled`, so a cancelled required check-run's annotations
+        # are read too: the one retry this gate admits may follow a failure or a
+        # timeout, and only the annotation and the job's timing say which.
+        #
         # The automatic triggers can reach a commit whose release-critical checks
         # are still running, so absent and unfinished evidence is retried. Every
         # other verdict is terminal on the first pass.
@@ -955,6 +1063,8 @@ jobs:
           CURRENT_RUN_ID: ${{ github.run_id }}
           CURRENT_RUN_EVENT: ${{ github.event_name }}
           TRIGGER_SHA: ${{ github.sha }}
+          INHERITED_EVIDENCE: ${{ steps.inherit.outputs.record }}
+          EXPORT_HEAD_SHA: ${{ steps.inherit.outputs.inherited == 'true' && steps.inherit.outputs.head_sha || '' }}
           GITHUB_ACTIONS_APP_ID: "15368"
           GITHUB_ACTIONS_APP_SLUG: github-actions
           REQUIRED_CHECKS: |
@@ -1018,39 +1128,68 @@ jobs:
               check_suite_id: .check_suite_id
             }' \
             > current_run.json || { echo "::error::failed to fetch current release-tag run"; exit 1; }
+          if [ -n "$EXPORT_HEAD_SHA" ] && [[ ! "$EXPORT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::the inherited export head '$EXPORT_HEAD_SHA' is not an exact sha"
+            exit 1
+          fi
+          check_run_fields='.check_runs[] | {
+            name: .name,
+            status: .status,
+            conclusion: .conclusion,
+            id: .id,
+            app_id: (.app.id // 0),
+            app_slug: (.app.slug // ""),
+            check_suite_id: .check_suite.id,
+            head_sha: .head_sha,
+            started_at: .started_at,
+            completed_at: .completed_at
+          }'
+          workflow_run_fields='.workflow_runs[] | {
+            id: .id,
+            workflow_id: .workflow_id,
+            path: .path,
+            event: .event,
+            head_branch: .head_branch,
+            head_sha: .head_sha,
+            status: .status,
+            conclusion: .conclusion,
+            check_suite_id: .check_suite_id
+          }'
           for attempt in $(seq 1 60); do
             # `filter=all` is deliberate: a rerun that claims one required name
             # is ambiguous authority, not evidence to collapse by recency.
             gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100&filter=all" --paginate \
-              -q '.check_runs[] | {
-                name: .name,
-                status: .status,
-                conclusion: .conclusion,
-                id: .id,
-                app_id: (.app.id // 0),
-                app_slug: (.app.slug // ""),
-                check_suite_id: .check_suite.id,
-                head_sha: .head_sha,
-                started_at: .started_at,
-                completed_at: .completed_at
-              }' \
+              -q "$check_run_fields" \
               > check_runs.ndjson || { echo "::error::failed to fetch check-runs for $SHA"; exit 1; }
             gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
-              -q '.workflow_runs[] | {
-                id: .id,
-                workflow_id: .workflow_id,
-                path: .path,
-                event: .event,
-                head_branch: .head_branch,
-                head_sha: .head_sha,
-                status: .status,
-                conclusion: .conclusion,
-                check_suite_id: .check_suite_id
-              }' \
+              -q "$workflow_run_fields" \
               > workflow_runs.ndjson || { echo "::error::failed to fetch workflow runs for $SHA"; exit 1; }
+            # Every record carries its own head sha, so the inherited head's
+            # listings join main's in the same files and the gate tells them
+            # apart by sha, branch and event.
+            if [ -n "$EXPORT_HEAD_SHA" ]; then
+              gh api "repos/$REPO/commits/$EXPORT_HEAD_SHA/check-runs?per_page=100&filter=all" --paginate \
+                -q "$check_run_fields" \
+                >> check_runs.ndjson || { echo "::error::failed to fetch check-runs for inherited head $EXPORT_HEAD_SHA"; exit 1; }
+              gh api "repos/$REPO/actions/runs?head_sha=$EXPORT_HEAD_SHA&per_page=100" --paginate \
+                -q "$workflow_run_fields" \
+                >> workflow_runs.ndjson || { echo "::error::failed to fetch workflow runs for inherited head $EXPORT_HEAD_SHA"; exit 1; }
+            fi
+            : > check_run_annotations.ndjson
+            while IFS= read -r check_run_id; do
+              gh api "repos/$REPO/check-runs/$check_run_id/annotations?per_page=100" \
+                | jq -c --argjson id "$check_run_id" \
+                  '{id: $id, annotations: [.[] | {annotation_level, message}]}' \
+                >> check_run_annotations.ndjson \
+                || { echo "::error::failed to fetch annotations for check-run $check_run_id"; exit 1; }
+            done < <(jq -r --arg required "$REQUIRED_CHECKS" '
+              select(.conclusion == "cancelled")
+              | select(.name | IN($required | split("\n") | .[]))
+              | .id' check_runs.ndjson)
             set +e
             python3 - <<'PY'
           import json, os, re, sys
+          from datetime import datetime
 
           def read_ndjson(path):
               records = []
@@ -1065,6 +1204,25 @@ jobs:
           workflow_runs = read_ndjson("workflow_runs.ndjson")
           with open("current_run.json") as handle:
               current_run = json.load(handle)
+          # What GitHub wrote on each cancelled required check-run, which is
+          # the only place a job that hit its own timeout says so.
+          if os.path.exists("check_run_annotations.ndjson"):
+              annotations_by_run = {
+                  record.get("id"): record.get("annotations") or []
+                  for record in read_ndjson("check_run_annotations.ndjson")
+              }
+              for run in check_runs:
+                  if run.get("id") in annotations_by_run:
+                      run["annotations"] = annotations_by_run[run["id"]]
+          # The export pull request head this commit may inherit from, as the
+          # step above resolved it with scripts/select-release-candidate.py.
+          inherited = None
+          inherited_path = os.environ.get("INHERITED_EVIDENCE") or ""
+          if inherited_path and os.path.exists(inherited_path):
+              with open(inherited_path) as handle:
+                  inherited_record = json.load(handle)
+              if inherited_record.get("inherited") is True:
+                  inherited = inherited_record
 
           runs_by_name = {}
           for run in check_runs:
@@ -1132,6 +1290,21 @@ jobs:
                   ".github/workflows/ci.yml",
               ),
           }
+          # The Acceptance job's own context is a release veto in every tier,
+          # judged by the same rules as the list above but kept apart from it,
+          # because that list is also the reviewed mirror of what the main
+          # ruleset gates. Through the queue the mint is the only grader left
+          # at landing, so it reads Acceptance itself rather than trusting the
+          # cut to have read it. Mirrors ACCEPTANCE_CONTEXTS in
+          # scripts/select-release-candidate.py.
+          acceptance_provenance = {
+              "Product Acceptance": (
+                  339594603,
+                  ".github/workflows/acceptance.yml",
+              ),
+          }
+          release_vetoes = required + list(acceptance_provenance)
+          veto_provenance = {**expected_provenance, **acceptance_provenance}
           # ci.yml is the anchor because it is the workflow the merge queue
           # builds under a merge_group event, and its run is what names the
           # queue ref the rest of the queue's evidence was published on.
@@ -1152,7 +1325,7 @@ jobs:
           # workflow_dispatch path: a human release goes through the
           # release_tag repository_dispatch, which the trigger guard pins to
           # the release captain or the App.
-          release_tag_events = {"schedule", "workflow_run", "repository_dispatch"}
+          release_tag_events = {"push", "schedule", "workflow_run", "repository_dispatch"}
           release_tag_workflow = (318521292, ".github/workflows/release-tag.yml")
           skippable_required = {"DCO Sign-off"}
           non_failing_optional = {"success", "skipped", "neutral"}
@@ -1169,22 +1342,90 @@ jobs:
           corroboration_unwaited = []
           retried = []
 
+          # The event each release producer publishes under on an export pull
+          # request's head, and GitHub's texts for why a job was cancelled.
+          # Both mirror scripts/select-release-candidate.py, and
+          # scripts/test-select-release-candidate.py holds them equal.
+          export_pull_events = {
+              ".github/workflows/ci.yml": "pull_request",
+              ".github/workflows/acceptance.yml": "pull_request",
+              ".github/workflows/sast.yml": "pull_request",
+              ".github/workflows/secret-scan.yml": "push",
+          }
+          timeout_annotation = re.compile(
+              r"^The job (?:running on runner .+ )?has exceeded the maximum execution time of "
+              r"(?P<bound>[0-9hms]+|[0-9]+ minutes?)\.?$"
+          )
+          other_cancel_annotations = (
+              re.compile(r"^The run was canceled by @"),
+              re.compile(r"^Canceling since a higher priority waiting request for "),
+              re.compile(r"^The strategy configuration was canceled because "),
+          )
+
+          def hit_its_own_timeout(run):
+              # A cancelled check-run hit its own `timeout-minutes` when exactly
+              # one failure annotation is GitHub's timeout text, none is its
+              # text for a manual, superseding or fail-fast cancel, and the job
+              # ran at least as long as the bound that text names. Anything
+              # else reads as an ordinary cancel, as every cancel used to.
+              if run.get("status") != "completed" or run.get("conclusion") != "cancelled":
+                  return None
+              failures = [
+                  str(annotation.get("message") or "")
+                  for annotation in run.get("annotations") or []
+                  if annotation.get("annotation_level") == "failure"
+              ]
+              if any(
+                  pattern.search(message)
+                  for message in failures
+                  for pattern in other_cancel_annotations
+              ):
+                  return None
+              bounds = [
+                  match.group("bound")
+                  for match in map(timeout_annotation.fullmatch, failures)
+                  if match
+              ]
+              if len(bounds) != 1:
+                  return None
+              minutes = re.fullmatch(r"([0-9]+) minutes?", bounds[0])
+              parts = re.fullmatch(r"(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?", bounds[0])
+              if minutes:
+                  bound = int(minutes.group(1)) * 60
+              elif parts and any(parts.groups()):
+                  hours, mins, secs = (int(part or 0) for part in parts.groups())
+                  bound = hours * 3600 + mins * 60 + secs
+              else:
+                  return None
+              try:
+                  started = datetime.fromisoformat(str(run.get("started_at")).replace("Z", "+00:00"))
+                  finished = datetime.fromisoformat(str(run.get("completed_at")).replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              if (finished - started).total_seconds() < bound:
+                  return None
+              return bounds[0]
+
           def settled_retry(pairs):
               # A job rerun publishes a second check-run under the same name in
               # the same check suite. Admit it only in its narrowest shape: one
-              # workflow run, the first attempt completed as a failure or a
-              # timeout, and the second started after it and passed. A third
-              # attempt, a pass then a fail, or copies from two runs stay
-              # ambiguous. select-release-candidate.py applies the same rule.
+              # workflow run, the first attempt completed as a failure or as a
+              # job that hit its own timeout, and the second started after it
+              # and passed. A third attempt, a pass then a fail, a first attempt
+              # cancelled any other way, or copies from two runs stay ambiguous.
+              # select-release-candidate.py applies the same rule.
               first, second = sorted(
                   pairs, key=lambda pair: str(pair[0].get("started_at") or "")
               )
               suite = first[0].get("check_suite_id")
               if suite is None or suite != second[0].get("check_suite_id"):
                   return None
-              if (
-                  first[0].get("status") != "completed"
-                  or first[0].get("conclusion") not in ("failure", "timed_out")
+              if first[0].get("status") != "completed" or (
+                  first[0].get("conclusion") not in ("failure", "timed_out")
+                  and not (
+                      first[0].get("conclusion") == "cancelled"
+                      and hit_its_own_timeout(first[0]) is not None
+                  )
               ):
                   return None
               if (
@@ -1313,7 +1554,56 @@ jobs:
                   )
               else:
                   queue_ref = anchor_branch
-          authority_tier = "merge_group" if queue_ref is not None else "push"
+          # Main's own ci.yml push build has a verdict once it has completed
+          # with anything but cancelled. Until then a bound export head may be
+          # the authority; from then on main's own build decides, exactly as it
+          # did before inheritance existed.
+          export_head = export_ref = None
+          if inherited is not None and (
+              inherited.get("sha") != expected_sha
+              or not re.fullmatch(r"[0-9a-f]{40}", str(inherited.get("head_sha") or ""))
+              or not str(inherited.get("head_ref") or "").startswith("feature/public-export-")
+          ):
+              errors.append(
+                  f"the inherited export evidence does not describe {expected_sha}: "
+                  f"sha={inherited.get('sha')} head={inherited.get('head_sha')} "
+                  f"ref={inherited.get('head_ref')}"
+              )
+              inherited = None
+          main_ci_verdict = any(
+              (workflow.get("workflow_id"), workflow.get("path")) == queue_anchor_workflow
+              and workflow.get("event") == "push"
+              and workflow.get("head_branch") == release_branch
+              and workflow.get("head_sha") == expected_sha
+              and workflow.get("status") == "completed"
+              and workflow.get("conclusion") != "cancelled"
+              for workflow in workflow_runs
+          )
+          if inherited is not None and queue_ref is None and not main_ci_verdict:
+              export_head = inherited["head_sha"]
+              export_ref = inherited["head_ref"]
+          elif inherited is not None:
+              # Not the authority, so not evidence of any kind: drop the head's
+              # listings rather than sweep them as somebody else's build.
+              check_runs = [run for run in check_runs if run.get("head_sha") != inherited["head_sha"]]
+              workflow_runs = [run for run in workflow_runs if run.get("head_sha") != inherited["head_sha"]]
+              runs_by_name = {}
+              for run in check_runs:
+                  runs_by_name.setdefault(run["name"], []).append(run)
+              workflows_by_suite = {}
+              for run in workflow_runs:
+                  workflows_by_suite.setdefault(run["check_suite_id"], []).append(run)
+          authority_tier = (
+              "merge_group" if queue_ref is not None
+              else "export_pr" if export_head is not None
+              else "push"
+          )
+          authority_ref = (
+              queue_ref if queue_ref is not None
+              else export_ref if export_head is not None
+              else release_branch
+          )
+          authority_sha = export_head if export_head is not None else expected_sha
           # The refs a release may be proved from. A run sitting on one of
           # these that is still not evidence is an authority conflict rather
           # than an unrelated build, because it claims a required context name
@@ -1321,18 +1611,33 @@ jobs:
           admitted_branches = {release_branch}
           if queue_ref is not None:
               admitted_branches.add(queue_ref)
+          if export_ref is not None:
+              admitted_branches.add(export_ref)
 
           def evidence_tier(workflow):
               if workflow is None:
                   return None
-              if workflow.get("head_sha") != expected_sha:
-                  return None
               if workflow.get("conclusion") == "cancelled":
                   return None
+              if export_head is not None and workflow.get("head_sha") == export_head:
+                  # The inherited head. Each producer is evidence there only
+                  # under the event it publishes on an export branch, so
+                  # secret-scan.yml's skipped pull_request twin of
+                  # `gitleaks (full history)` is not a second copy of it.
+                  if workflow.get("head_branch") == export_ref and workflow.get(
+                      "event"
+                  ) == export_pull_events.get(workflow.get("path"), "pull_request"):
+                      return "export_pr"
+                  return None
+              if workflow.get("head_sha") != expected_sha:
+                  return None
               if queue_ref is not None and workflow.get("head_branch") == queue_ref:
-                  # secret-scan.yml publishes `gitleaks (full history)` from a
-                  # push to the queue ref rather than from a merge_group event,
-                  # so the admitted ref is the tier and the event name is not.
+                  # The admitted ref is the tier and the event name is not.
+                  # secret-scan.yml now publishes `gitleaks (full history)`
+                  # under merge_group like every other producer; it used to
+                  # publish it from the push that creates the queue ref, and a
+                  # queue build of either shape is still one build of this
+                  # commit. Two copies would be two writers, and refuse.
                   if workflow.get("event") in ("merge_group", "push"):
                       return "merge_group"
                   return None
@@ -1355,15 +1660,15 @@ jobs:
                   f"({producer.get('event')} on {producer.get('head_branch')})"
               )
 
-          for name in required:
-              expected_workflow_id, expected_path = expected_provenance[name]
+          for name in release_vetoes:
+              expected_workflow_id, expected_path = veto_provenance[name]
               expected_producer = (expected_workflow_id, expected_path)
               expected_identity = (
                   expected_workflow_id,
                   expected_path,
                   authority_tier,
-                  queue_ref if queue_ref is not None else release_branch,
-                  expected_sha,
+                  authority_ref,
+                  authority_sha,
               )
               named_runs = runs_by_name.get(name, [])
               for run in named_runs:
@@ -1398,9 +1703,20 @@ jobs:
                       workflow.get("head_sha"),
                   )
                   if tier is None:
+                      # The same reviewed producer on the inherited head under
+                      # the event it does not publish there, skipped by its own
+                      # `if:`, gated nothing and claims nothing.
+                      skipped_twin = (
+                          export_ref is not None
+                          and workflow.get("head_branch") == export_ref
+                          and workflow.get("conclusion") == "skipped"
+                          and (workflow.get("workflow_id"), workflow.get("path"))
+                          == expected_producer
+                      )
                       if (
                           workflow.get("head_branch") in admitted_branches
                           and workflow.get("conclusion") != "cancelled"
+                          and not skipped_twin
                       ):
                           # Produced on a ref this release is proved from, but
                           # not by an admitted build. A second writer of a
@@ -1483,7 +1799,7 @@ jobs:
                   if name in skippable_required
                   else {"success"}
               )
-              if run.get("head_sha") != expected_sha:
+              if run.get("head_sha") != authority_sha:
                   errors.append(
                       f"required check has wrong head sha: {name} "
                       f"(head={run.get('head_sha')})"
@@ -1586,7 +1902,7 @@ jobs:
                   evidence_workflows.add(
                       (workflow.get("workflow_id"), workflow.get("path"))
                   )
-          required_names = set(required)
+          required_names = set(release_vetoes)
 
           for run in check_runs:
               name = run["name"]
@@ -1659,7 +1975,16 @@ jobs:
           # nobody was told about. Announcing on the retry passes instead would
           # repeat every line up to sixty times and train the reader to skip it.
           announcements = []
-          if queue_ref is None:
+          if authority_tier == "export_pr":
+              announcements.append(
+                  "admitting on evidence inherited from export pull request "
+                  f"#{inherited.get('pull')}: {expected_sha} is its squash onto "
+                  f"{inherited.get('base_sha')} with the head's tree "
+                  f"{inherited.get('tree')}, so every required context was judged "
+                  f"on head {export_head} ({export_ref}); main's own CI push build "
+                  "has no verdict yet and corroborates rather than decides"
+              )
+          elif queue_ref is None:
               announcements.append(
                   "admitting on landing-push evidence: no merge-group build "
                   f"exists at {expected_sha}, so the queue proved nothing this "
@@ -1712,9 +2037,15 @@ jobs:
               print(f"::notice::{not_waited[-1]}")
 
           verdict = (
-              f"verified {len(required)} required checks against their workflow "
+              f"verified {len(release_vetoes)} required checks against their workflow "
               f"provenance on the {authority_tier} evidence for {expected_sha}"
               + (f" (queue ref {queue_ref})" if queue_ref is not None else "")
+              + (
+                  f" (inherited from export pull request #{inherited.get('pull')} "
+                  f"head {export_head})"
+                  if export_head is not None
+                  else ""
+              )
               + f"; {len(check_runs)} check-runs on the sha, "
               f"{len(corroborated)} corroborated by the other admitted build, "
               f"{len(discounted)} not this release's evidence, "
@@ -1926,6 +2257,65 @@ jobs:
             echo "::notice::first-contact proof complete for $SHA on arms ${stranger_arms}, driven on the ${stranger_driver} endpoint"
           fi
           echo "release proof records verified for $SHA, and the tagged tree is the proven tree"
+
+      # release.yml ships the RC Build bytes the preflight judged, and the first
+      # thing it does at the tag is `scripts/locate-rc-build.mjs select`, which
+      # finds that run. A refusal there would strand a tag no release can
+      # finish, so the mint asks the same question first and writes no tag when
+      # the answer is a refusal. A tag push runs release.yml and its scripts
+      # from the tagged commit, so this runs the locator of the commit being
+      # tagged, read-only, with the runner's state files made inert so that
+      # code cannot reach the privileged steps below. A commit whose release.yml
+      # locates nothing, because it builds its own bytes, has nothing to rule out.
+      - name: Locate the RC Build the release will ship
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+            echo "::error::the checkout is not ${SHA}, the commit being tagged"
+            exit 1
+          fi
+          if ! git cat-file -e "${SHA}:scripts/locate-rc-build.mjs" 2>/dev/null ||
+             ! git show "${SHA}:.github/workflows/release.yml" | grep -q 'scripts/locate-rc-build.mjs select'; then
+            echo "::notice::the release.yml ${TAG} will run locates no RC Build bytes, so there is no locator refusal to rule out"
+            exit 0
+          fi
+          inert="$RUNNER_TEMP/rc-locator-runner-state"
+          mkdir -p "$inert"
+          for file in env path state output; do : > "$inert/$file"; done
+          before="$(git status --porcelain --untracked-files=all)"
+          set +e
+          GITHUB_ENV="$inert/env" GITHUB_PATH="$inert/path" GITHUB_STATE="$inert/state" GITHUB_OUTPUT="$inert/output" \
+            node scripts/locate-rc-build.mjs select \
+              --repo "$REPO" \
+              --sha "$SHA" \
+              --version "${TAG#v}" \
+              --summary "$inert/summary.md"
+          located=$?
+          set -e
+          for file in env path state output; do
+            if [ -s "$inert/$file" ]; then
+              echo "::error::the RC Build locator attempted to change runner state (${file})"
+              exit 1
+            fi
+          done
+          if [ "$(git status --porcelain --untracked-files=all)" != "$before" ] || [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+            echo "::error::the RC Build locator changed the checkout it was asked about"
+            exit 1
+          fi
+          if [ "$located" -ne 0 ]; then
+            echo "::error::release.yml would refuse ${TAG}: scripts/locate-rc-build.mjs select found no RC Build run it may ship for ${SHA}, so the mint writes no tag a release could not finish"
+            exit 1
+          fi
+          if [ -s "$inert/summary.md" ]; then
+            cat "$inert/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "release.yml will find the RC Build bytes it ships for ${TAG}"
 
       - name: Mint kin-release-bot installation token
         id: app-token

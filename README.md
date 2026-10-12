@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache-2.0" /></a>
-  <a href="https://github.com/firelock-ai/kin/releases/latest"><img src="https://img.shields.io/badge/release-latest-6E56CF.svg" alt="Latest release" /></a>
+  <a href="https://github.com/kinlab-ai/kin/releases/latest"><img src="https://img.shields.io/badge/release-latest-6E56CF.svg" alt="Latest release" /></a>
 </p>
 
 **Kin is a graph-native code repository for AI agents and the people who build with them.** It stores source, recorded code relationships, and versioned history as repository state. The graph is the repository model, not a search index maintained beside another repository.
@@ -21,7 +21,7 @@ Functions, types, and the relationships between them are data you commit, branch
   <img src="docs/assets/kin-impact-human-bytes.gif" alt="kin impact human_bytes --file crates/kin-cli/src/commands/cache.rs --kind function --depth 1, showing its direct callers in Kin's own codebase next to a git grep search for the same name" width="100%" />
 </p>
 
-A star helps other people find Kin, and [Discussions](https://github.com/firelock-ai/kin/discussions) is where to bring a question about it.
+A star helps other people find Kin, and [Discussions](https://github.com/kinlab-ai/kin/discussions) is where to bring a question about it.
 
 ## See what connects
 
@@ -36,7 +36,7 @@ Before changing a shared function, what else should you inspect? Kin lets you lo
 For Claude Code:
 
 ```
-/plugin marketplace add firelock-ai/kin
+/plugin marketplace add kinlab-ai/kin
 /plugin install kin@kin
 ```
 
@@ -200,6 +200,6 @@ Troy
 
 ## Learn more and contribute
 
-[CLI reference](docs/cli-reference.md) · [Architecture and detailed limits](docs/readme-reference.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/firelock-ai/kin/issues/new/choose) · [Security](SECURITY.md)
+[CLI reference](docs/cli-reference.md) · [Architecture and detailed limits](docs/readme-reference.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/kinlab-ai/kin/issues/new/choose) · [Security](SECURITY.md)
 
-Kin and its local stack, including [kin-db](https://github.com/firelock-ai/kin-db), are [Apache-2.0](LICENSE). [KinLab](https://kinlab.ai) is the separate proprietary hosted product. Public repository onboarding is still in development.
+Kin and its local stack, including [kin-db](https://github.com/kinlab-ai/kin-db), are [Apache-2.0](LICENSE). [KinLab](https://kinlab.ai) is the separate proprietary hosted product. Public repository onboarding is still in development.

@@ -10,11 +10,11 @@
     "url": "https://kinlab.ai"
   },
   "homepage": "https://kinlab.ai",
-  "documentation": "https://github.com/firelock-ai/kin#readme",
-  "support": "https://github.com/firelock-ai/kin/issues",
+  "documentation": "https://github.com/kinlab-ai/kin#readme",
+  "support": "https://github.com/kinlab-ai/kin/issues",
   "repository": {
     "type": "git",
-    "url": "https://github.com/firelock-ai/kin"
+    "url": "https://github.com/kinlab-ai/kin"
   },
   "license": "Apache-2.0",
   "icon": "icon.png",

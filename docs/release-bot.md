@@ -8,11 +8,14 @@ Kin's release front door is automatic and fail closed:
    and `CHANGELOG.md` together, then uses normal protected-main checks and
    GitHub auto-merge.
 3. `.github/workflows/release-cut.yml` selects the candidate that version will
-   be proven at, arms `release/vX.Y.Z-candidate`, dispatches the archive build,
-   and publishes `preflight.json` for it.
-4. `.github/workflows/release-tag.yml` finds the exact reviewed commit where
-   the coherent untagged version first appeared and creates `vX.Y.Z` with the
-   scoped release App.
+   be proven at and publishes `preflight.json` for it. Through the merge queue
+   the candidate is the group commit itself: the queue's RC Build of it is
+   preflighted while the group is still queued, and the cut tells the queue so
+   with the `Release preflight` commit status. Outside the queue it arms
+   `release/vX.Y.Z-candidate` and dispatches the archive build, as before.
+4. `.github/workflows/release-tag.yml` mints `vX.Y.Z` with the scoped release
+   App on the push that lands the proven commit, from the queue's build of it
+   and the filed record, or on its schedule and CI occasions otherwise.
 5. The existing tag-only `.github/workflows/release.yml` publishes and proves
    the release. `.github/workflows/release-recovery.yml` retries only failed or
    timed-out jobs, at most twice, while preserving the same immutable tag. Its
@@ -122,8 +125,9 @@ it: a stranger that cannot run, because a runner is offline or a weekly limit is
 spent, must not hold a finished release. `release-cut.yml` is what puts a record
 there without a captain.
 
-It runs on a completed CI run for a `main` push, on a completed RC Build for a
-`release/v*-candidate` branch, on the typed `release_cut` repository dispatch
+It runs on a push to `main`, on a completed CI run for a `main` push, on a
+completed CI run or RC Build for a merge group of `main`, on a completed RC
+Build for a `release/v*-candidate` branch, on the typed `release_cut` repository dispatch
 from the same allowlist the mint admits, and on a fifteen-minute sweep offset
 from the mint's and the train's. There is deliberately **no**
 `workflow_dispatch`: a dispatch takes a ref, and the publish job reaches the
@@ -136,12 +140,52 @@ judgments are pure functions over one snapshot:
 3. The current candidate is kept until it is proven or dead. With `preflight.json`
    recorded the mint can already tag it and the cut still runs the stranger,
    because that record is what the release gets to claim; alive with a usable RC
-   Build it is proven; alive with none it is armed again, twice at most.
+   Build it is proven; alive with none it is armed again, twice at most. A
+   build the runner's own job timeout killed is retried without spending one of
+   those two attempts, up to three such timeouts. GitHub reports that timeout as
+   `cancelled`, the word it also uses for a manual or superseding cancel, so the
+   selector tells them apart by GitHub's annotation on the cancelled job, by the
+   job having run for the whole bound, and by its killed step.
 4. A sha carries `preflight.json` alone, so the mint owns it and the cut stands
    down rather than arming a newer sha it would only race.
 5. Otherwise the newest `main` commit in the range whose CI **and** Acceptance
    push runs concluded success, and whose required contexts each appear exactly
    once under push provenance, becomes the candidate.
+
+Only the version `main` stages is ever acted on, and a retired version never
+is: 0.8.2 and 0.8.3 were cancelled, so a `release/v0.8.2-candidate` branch or
+record left behind is never read, and the mint refuses to tag either version
+whatever `main` stages.
+
+**Through the merge queue.** The queue squashes each pull request onto its base
+and fast-forwards `main` to that group commit, so the commit the queue builds is
+the commit that lands. When the queue's RC Build of a group commit completes,
+the cut checks that a live `gh-readonly-queue/main/pr-<n>-<base>` ref points at
+it, that `<base>` is its only parent and is protected `main` (or the head of a
+group queued ahead of it), and that it stages a releasable, untagged version.
+It then preflights that build's archives and files `preflight.json` for the
+group commit before the queue merges it, and posts `Release preflight` on it:
+success once the record is filed, or for a group that stages no release, and
+failure when the build cannot be proven. A queue that requires that status
+lands a release only with its record filed, so the push that lands it can mint
+at once. A build is usable only while it holds every artifact `release.yml`
+ships, the five archives and `kin-daemon-image`, and the record names the run
+its legs judged as `rc_build.run_id`, which is the run `release.yml` then ships
+from. The queue gives a group 90 minutes to report and RC Build bounds a merge
+group's build legs at 60 (75 worst case), so a leg the runner's timeout killed
+has no time left for a re-run: the group is failed at once and a fresh group
+rebuilds. Once a group commit has landed it is an ordinary `main` commit,
+graded on the queue's build of it while `main`'s own push runs have no verdict,
+and preflighted from the queue's archives if the queue did not wait for the
+record; a timed-out build there is re-run in place, up to three timed-out
+attempts. While a usable, running or re-running queue build of a commit exists,
+the cut never dispatches a build of that commit on the candidate branch.
+
+**Outside the queue.** A commit that never went through the queue is graded on
+`main`'s own push runs, as above. Inheriting an export pull request head's grade
+is built and tested but switched off: `ci.yml` publishes the release context
+names on a pull request from stand-in jobs, so a green context there no longer
+proves the suite ran.
 
 A sha still being graded is skipped rather than waited for, because on a busy
 `main` the newest sha is always pending and a selector that waits never
@@ -297,6 +341,20 @@ Before creating any tag, the single job refuses unless **all** hold:
    but it neither refuses nor delays the mint. If an advisory check becomes
    release-critical, add it to this reviewed set so that change is explicit and
    reviewable rather than granting every check writer an implicit veto.
+   The merge queue's build of the landing commit is the authority when one
+   exists: its queue ref must name the commit's own parent as its base, and a
+   finished push-run context that failed still refuses. `Product Acceptance`
+   from `acceptance.yml` is a veto in every tier too, judged by the same rules
+   but kept apart from this list, which mirrors the main ruleset. One retry of
+   a required job is admitted when the first attempt failed or hit its own
+   timeout, which GitHub reports as `cancelled` and the annotation on that
+   check-run names. A retired version is never minted. The mint also runs on
+   every push to `main`, which is what makes a queued release a tag within a
+   minute or two of landing. Before it writes the tag it runs, read-only, the
+   `scripts/locate-rc-build.mjs select` of the commit it is tagging, the same
+   locator `release.yml` runs first at that tag, and writes no tag the locator
+   would refuse, so a release can never be stranded at a tag whose RC Build
+   bytes it cannot find.
    The presence-required set is:
    - `Check & Test (ubuntu-latest)`
    - `Check & Test (macos-latest)`

@@ -1,29 +1,28 @@
 # kin-vector
 
-> Vector / ANN substrate for semantic retrieval.
+> Vector and ANN search for Kin's semantic retrieval.
 
 `kin-vector` implements a Hierarchical Navigable Small World (HNSW) index for
 embedding-based retrieval. It is compiled directly into the binary: no C++
 FFI, no platform-specific build scripts, no external ANN library dependency.
 
-It is the vector retrieval primitive in the open Kin local substrate, and it
+It is the vector retrieval primitive in the open Kin local stack, and it
 depends on nothing else in that stack. `kin-db` composes it for ANN and
 embedding retrieval behind its `vector` feature, and `kin-model` implements
 this crate's `VectorId` trait for the canonical retrieval key. Kin's ranking
 and proof-weighting policy lives above this crate, not inside it.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/kinlab-ai/kin)
 
 ## What is Kin?
 
-Kin is a graph-native code repository for AI agents and the people who build with them:
-your code as a graph of entities, relations, and intents, not a pile of files and diffs.
-AI agents and humans navigate it semantically, with provenance, review, and governance
-built in. It coexists with Git and projects graph truth back to a normal filesystem, so
-any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. It stores source, recorded code relationships, and versioned history as
+repository state. The graph is the repository model, not a search index maintained
+beside another repository.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+Start at **[kinlab-ai/kin](https://github.com/kinlab-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 

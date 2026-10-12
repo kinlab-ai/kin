@@ -3,7 +3,7 @@
 > Canonical types and domain models shared across the Kin stack.
 
 `kin-model` holds the canonical shared types for Kin's semantic repository
-substrate.
+model.
 
 It defines the graph objects that the public Kin stack uses across the local
 engine, CLI, daemon, MCP server, projection layer, and supporting crates:
@@ -15,23 +15,22 @@ engine, CLI, daemon, MCP server, projection layer, and supporting crates:
 - projection, reconciliation, preset, and policy types
 
 This crate is intentionally small and dependency-light. It is the schema and
-domain boundary for the open Kin local substrate, not the hosted KinLab control
+domain boundary for the open Kin local stack, not the hosted KinLab control
 plane. It sits on `kin-blobs` for content-addressable identity and `kin-vector`
 for embedding vectors, and the layers above it, `kin-db` and `kin` included,
 take their types from here instead of redefining them.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/kinlab-ai/kin)
 
 ## What is Kin?
 
-Kin is a graph-native code repository for AI agents and the people who build with them:
-your code as a graph of entities, relations, and intents, not a pile of files and diffs.
-AI agents and humans navigate it semantically, with provenance, review, and governance
-built in. It coexists with Git and projects graph truth back to a normal filesystem, so
-any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. It stores source, recorded code relationships, and versioned history as
+repository state. The graph is the repository model, not a search index maintained
+beside another repository.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+Start at **[kinlab-ai/kin](https://github.com/kinlab-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 

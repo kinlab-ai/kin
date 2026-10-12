@@ -76,7 +76,7 @@ The `kin` CLI is a separate install from this plugin. The plugin's server manage
 cached binaries, which are not added to your PATH. To get `kin` in the terminal too, run
 `npx -y @kinlab/kin setup`, which is the same command on macOS, Linux and WSL2. On a
 machine without Node, use `curl -fsSL https://get.kinlab.dev/install | sh` on macOS or
-Linux, or `brew install firelock-ai/kin/kin`. On native Windows, run
+Linux, or `brew install kinlab-ai/kin/kin`. On native Windows, run
 `irm https://get.kinlab.dev/install.ps1 | iex` in PowerShell; it installs the CLI and
 does not run setup.
 

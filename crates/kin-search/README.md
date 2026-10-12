@@ -1,29 +1,28 @@
 # kin-search
 
-> Lexical search substrate for semantic retrieval.
+> Lexical search for Kin's semantic retrieval.
 
 `kin-search` is a small, in-memory BM25 text index with code-aware
 tokenization and no external search-engine dependency. It splits identifiers
 (camelCase / snake_case) so source symbols are matched the way developers
 write them.
 
-It is a low-level retrieval primitive in the open Kin local substrate. Higher
+It is a low-level retrieval primitive in the open Kin local stack. Higher
 layers, including `kin-db`, compose it with vector retrieval and graph
 structure; Kin's ranking and proof-weighting policy lives above this crate, not
 inside it.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/kinlab-ai/kin)
 
 ## What is Kin?
 
-Kin is a graph-native code repository for AI agents and the people who build with them:
-your code as a graph of entities, relations, and intents, not a pile of files and diffs.
-AI agents and humans navigate it semantically, with provenance, review, and governance
-built in. It coexists with Git and projects graph truth back to a normal filesystem, so
-any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. It stores source, recorded code relationships, and versioned history as
+repository state. The graph is the repository model, not a search index maintained
+beside another repository.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+Start at **[kinlab-ai/kin](https://github.com/kinlab-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 

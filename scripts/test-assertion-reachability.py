@@ -48,6 +48,14 @@ COVERED_SUITES = (
     "scripts/test-assertion-reachability.py",
 )
 
+# A suite that keeps its checks in a package beside it runs as one program: the
+# runner imports every module, so a check defined in one module is reached
+# from the runner or from a sibling. Its modules are analyzed together with the
+# runner, or every check that moved out of the runner would go unpoliced.
+SUITE_PACKAGES = {
+    "scripts/test-release-workflow-authority.py": "scripts/release_authority",
+}
+
 
 def strip_docstrings(tree: ast.AST) -> None:
     """Drop docstrings so a prose mention cannot pass for a call site.
@@ -105,16 +113,35 @@ def orphaned_helpers(source: str, label: str) -> list[str]:
     interpreter runs on import. Everything else is reached, or is not.
     """
 
-    tree = ast.parse(source, filename=label)
-    strip_docstrings(tree)
+    return orphaned_helpers_across([(source, label)])
+
+
+def orphaned_helpers_across(sources: list[tuple[str, str]]) -> list[str]:
+    """Return the covered helpers unreachable across modules that run together.
+
+    Roots are every module's top-level statements, because the runner executes
+    its own and importing a module executes that module's. A check is resolved
+    by name across all of them, so two modules defining the same check would
+    let one keep the other alive; that is refused rather than guessed at.
+    """
 
     functions: dict[str, ast.AST] = {}
+    owners: dict[str, str] = {}
     module_statements: list[ast.AST] = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            functions[node.name] = node
-        else:
-            module_statements.append(node)
+    for source, label in sources:
+        tree = ast.parse(source, filename=label)
+        strip_docstrings(tree)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in owners and node.name.startswith(HELPER_PREFIXES):
+                    raise AssertionError(
+                        f"{label} and {owners[node.name]} both define {node.name}; "
+                        "a check resolved by name cannot say which one runs"
+                    )
+                functions[node.name] = node
+                owners[node.name] = label
+            else:
+                module_statements.append(node)
 
     edges = {name: referenced_names([node]) for name, node in functions.items()}
 
@@ -151,11 +178,29 @@ def invokes(workflow: str, suite: str) -> bool:
     return any(line.strip() in accepted for line in workflow.splitlines())
 
 
-def assert_no_orphaned_helpers(suite: str) -> None:
+def suite_sources(suite: str) -> list[tuple[str, str]]:
+    """The runner's source, plus every module of its package if it has one."""
+
     path = ROOT / suite
     if not path.is_file():
         raise AssertionError(f"covered suite is missing: {suite}")
-    orphans = orphaned_helpers(path.read_text(encoding="utf-8"), suite)
+    sources = [(path.read_text(encoding="utf-8"), suite)]
+    package = SUITE_PACKAGES.get(suite)
+    if package is not None:
+        modules = sorted((ROOT / package).glob("*.py"))
+        if not modules:
+            raise AssertionError(
+                f"{suite} keeps its checks in {package}, which holds no modules"
+            )
+        sources.extend(
+            (module.read_text(encoding="utf-8"), module.relative_to(ROOT).as_posix())
+            for module in modules
+        )
+    return sources
+
+
+def assert_no_orphaned_helpers(suite: str) -> None:
+    orphans = orphaned_helpers_across(suite_sources(suite))
     if orphans:
         raise AssertionError(
             f"{suite} defines checks nothing runs: {', '.join(orphans)}. "
@@ -266,6 +311,47 @@ MUTUAL_ORPHAN_FIXTURE = textwrap.dedent(
     '''
 )
 
+PACKAGE_RUNNER_FIXTURE = textwrap.dedent(
+    '''
+    """A runner whose checks live in a module of its package."""
+
+    from checks import test_release
+
+
+    def main():
+        test_release.check_release("checked")
+
+
+    main()
+    '''
+)
+
+PACKAGE_MODULE_FIXTURE = textwrap.dedent(
+    '''
+    """A package module: one check the runner reaches, one nothing reaches."""
+
+    def assert_reached_from_the_runner(value):
+        raise AssertionError(value)
+
+
+    def assert_stranded_in_the_module(value):
+        raise AssertionError(value)
+
+
+    def check_release(value):
+        assert_reached_from_the_runner(value)
+    '''
+)
+
+DUPLICATE_MODULE_FIXTURE = textwrap.dedent(
+    '''
+    """A second module defining a check its sibling already defines."""
+
+    def assert_reached_from_the_runner(value):
+        raise AssertionError(value)
+    '''
+)
+
 
 def assert_detector_reports_a_stranded_helper() -> None:
     orphans = orphaned_helpers(ORPHAN_FIXTURE, "orphan-fixture")
@@ -315,6 +401,47 @@ def assert_detector_reports_a_mutually_recursive_cluster() -> None:
         )
 
 
+def assert_detector_follows_checks_into_a_package() -> None:
+    """A check that moved into a module is still policed, from the runner."""
+
+    module_alone = orphaned_helpers(PACKAGE_MODULE_FIXTURE, "module-fixture")
+    if module_alone != [
+        "assert_reached_from_the_runner",
+        "assert_stranded_in_the_module",
+    ]:
+        raise AssertionError(
+            "a package module read alone must report every check its runner "
+            f"reaches, reported: {module_alone}"
+        )
+    orphans = orphaned_helpers_across(
+        [
+            (PACKAGE_RUNNER_FIXTURE, "runner-fixture"),
+            (PACKAGE_MODULE_FIXTURE, "module-fixture"),
+        ]
+    )
+    if orphans != ["assert_stranded_in_the_module"]:
+        raise AssertionError(
+            "detector must follow the runner into its package and name the "
+            f"stranded check alone, reported: {orphans}"
+        )
+    try:
+        orphaned_helpers_across(
+            [
+                (PACKAGE_RUNNER_FIXTURE, "runner-fixture"),
+                (PACKAGE_MODULE_FIXTURE, "module-fixture"),
+                (DUPLICATE_MODULE_FIXTURE, "duplicate-fixture"),
+            ]
+        )
+    except AssertionError as error:
+        if "both define assert_reached_from_the_runner" not in str(error):
+            raise
+    else:
+        raise AssertionError(
+            "detector accepted two modules defining the same check, so one "
+            "could keep the other alive"
+        )
+
+
 def main() -> None:
     # Prove the detector still discriminates before trusting it on real files.
     # A gate that reports nothing and a gate that reports everything are both
@@ -322,6 +449,7 @@ def main() -> None:
     assert_detector_reports_a_stranded_helper()
     assert_detector_ignores_indirect_call_sites()
     assert_detector_reports_a_mutually_recursive_cluster()
+    assert_detector_follows_checks_into_a_package()
     assert_wiring_check_rejects_a_disabled_step()
 
     ci_source = CI.read_text(encoding="utf-8")

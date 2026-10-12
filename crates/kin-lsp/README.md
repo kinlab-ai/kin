@@ -11,17 +11,16 @@ reference edges from find-references. Every relation it emits carries
 from a tree-sitter or linker edge once `kin` commits it to the graph through `kin-db`.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/kinlab-ai/kin)
 
 ## What is Kin?
 
-Kin is a graph-native code repository for AI agents and the people who build with them:
-your code as a graph of entities, relations, and intents, not a pile of files and diffs.
-AI agents and humans navigate it semantically, with provenance, review, and governance
-built in. It coexists with Git and projects graph truth back to a normal filesystem, so
-any tool works unchanged.
+Kin is a graph-native code repository for AI agents and the people who build with
+them. It stores source, recorded code relationships, and versioned history as
+repository state. The graph is the repository model, not a search index maintained
+beside another repository.
 
-Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
+Start at **[kinlab-ai/kin](https://github.com/kinlab-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## kin-lsp's role
 
@@ -33,7 +32,7 @@ and translates the results into `kin-model` relation types that the Kin ingest p
 commits to the graph.
 
 `kin` depends on this crate directly via the `kin` Cargo registry. No hosted or
-control-plane logic lives here; this crate belongs to the open local substrate.
+control-plane logic lives here; this crate belongs to the open local stack.
 
 ## Language-server adapters
 
@@ -145,10 +144,10 @@ included, in about three seconds.
 
 | Repo | Role |
 |------|------|
-| [kin](https://github.com/firelock-ai/kin) | Semantic system of record, consumes this crate |
-| [kin-db](https://github.com/firelock-ai/kin-db) | Semantic engine, stores the enriched relations |
-| [kin-model](https://github.com/firelock-ai/kin-model) | Canonical types consumed and produced here |
-| [kinlab](https://kinlab.ai) | Hosted collaboration and control plane |
+| [kin](https://github.com/kinlab-ai/kin) | The repository itself, and the consumer of this crate |
+| [kin-db](https://github.com/kinlab-ai/kin-db) | Graph storage engine, stores the enriched relations |
+| [kin-model](https://github.com/kinlab-ai/kin-model) | Canonical types consumed and produced here |
+| [KinLab](https://kinlab.ai) | Hosted product for teams, in development |
 
 ## License
 

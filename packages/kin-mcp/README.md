@@ -88,7 +88,7 @@ fetches it ahead of time.
 
 A Codex CLI, Grok CLI or Google Antigravity entry also names one repository with
 `--repo`.
-The [Codex plugin README](https://github.com/firelock-ai/kin/blob/main/plugins/kin-codex/README.md#install)
+The [Codex plugin README](https://github.com/kinlab-ai/kin/blob/main/plugins/kin-codex/README.md#install)
 gives the exact TOML.
 
 `kin doctor` recognizes only the exact entries Kin documents. It reports an entry

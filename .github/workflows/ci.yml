@@ -201,7 +201,7 @@ jobs:
 
   windows-authority-tests:
     name: Windows authority tests
-    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
+    if: ${{ github.event_name != 'pull_request' }}
     # Split out of the installer job: the debug test compile and the release
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
@@ -487,13 +487,10 @@ jobs:
             "tests::a_detached_spawn_does_not_hold_the_callers_stdout_open" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-daemon-spawn --lib
-          run_required_filter "daemon shutdown identity" "shutdown" \
-            --locked --target x86_64-pc-windows-msvc \
-            -p kin-daemon --no-default-features --lib
 
   windows-authority-cli-tests:
     name: Windows authority CLI tests
-    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
+    if: ${{ github.event_name != 'pull_request' }}
     # Every leg here is `-p kin-cli --no-default-features --lib`, which is one
     # compilation unit and the single most expensive one in the Windows set.
     # Splitting on that boundary is why the three jobs do not duplicate each
@@ -572,7 +569,7 @@ jobs:
 
   windows-authority-runtime-tests:
     name: Windows authority runtime tests
-    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-') }}
+    if: ${{ github.event_name != 'pull_request' }}
     # The integration-test binaries: real daemons, real process trees, real
     # containment. These are the legs that spend their time running rather than
     # compiling, which is why they belong away from the unit legs instead of
@@ -658,6 +655,14 @@ jobs:
             "full_setup_output_recommends_install_only_when_the_editor_extension_is_missing" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test setup_editor_guidance
+          # The daemon's own library tests, here rather than beside the other
+          # library legs: this job has already built kin-daemon's
+          # no-default-features graph for the sibling binary above, so the
+          # leg costs its own test compile and nothing more, where in the core
+          # job it rebuilt that graph and was the last 7.3 of its 32 minutes.
+          run_required_filter "daemon shutdown identity" "shutdown" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-daemon --no-default-features --lib
 
   windows-installer:
     # Renamed from "Windows installer + vector-free release build" when native
@@ -680,10 +685,12 @@ jobs:
     # the documentation-only path already relies on.
     if: >-
       ${{ !cancelled()
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-'))
+      && github.event_name != 'pull_request'
       && needs.changes.outputs.docs_only != 'true' }}
     runs-on: windows-latest
-    timeout-minutes: 75
+    # A hang guard. The build below is the release profile without LTO, so the
+    # job no longer carries the 55-minute fat-LTO build it used to.
+    timeout-minutes: 60
     steps:
       - name: Preserve tracked bytes on Windows
         shell: bash
@@ -704,11 +711,6 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install sccache
-        uses: taiki-e/install-action@v2
-        with:
-          tool: sccache
-
       # This was a hand-rolled `actions/cache` carrying `target` and the sccache
       # directory under a `hashFiles('Cargo.lock')` key, the only Windows leg in
       # this file that did not use `rust-cache`. A cache key is immutable, so
@@ -728,15 +730,24 @@ jobs:
       # per key. The three sibling Windows legs above already carry exactly this
       # block, so this removes a bespoke shape rather than adding one.
       #
-      # `${{ runner.temp }}/sccache` is deliberately not carried over.
-      # `sccache --show-stats` reported "Compile requests 0" at the end of both
-      # sampled runs (59c2239c2 and 39d3f481a), so what that path archived was a
-      # directory the build never read. The wrapper itself is left alone.
+      # The sccache wrapper that used to sit in front of this build is gone. Its
+      # directory was never restored, so every run started it empty: export pull
+      # request 1851 (run 38249726729) logged 107 compile requests, 107 misses
+      # and 0 hits, and then discarded the 336 MiB it had written. It cost a
+      # process hop per rustc invocation and could not save one.
+      #
+      # `key: lto-off` names what this entry holds. With
+      # `add-rust-environment-hash-key: false` the action drops its Cargo.lock
+      # and toolchain hash too, so the key is fixed and an entry, once written,
+      # is never replaced. The entry under the old key holds fat-LTO release
+      # dependencies, which the LTO-off build below cannot reuse, so it gets an
+      # entry of its own rather than recompiling every dependency forever.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
+          key: lto-off
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
@@ -768,27 +779,39 @@ jobs:
             fi
           done
 
+      # The release profile with its link-time optimization switched off. What
+      # this job proves is a property of the source, the feature graph and the
+      # build: that the default Windows archive resolves vector and
+      # external-embeddings, that its binaries carry a clean, known commit and
+      # the tracked Cargo.lock, and that they refuse what Windows cannot do.
+      # None of that depends on whole-program LTO, and the same build with fat
+      # LTO took 55.3 of this job's 57.2 minutes on export pull request 1851.
+      #
+      # The shipped profile is proven where the shipped bytes are made. RC
+      # Build's Windows leg builds the exact fat-LTO, one-codegen-unit release
+      # archive from the candidate sha and executes it, asserting the version
+      # line's clean commit, `bench-meta`'s commit, clean flag and Cargo.lock
+      # digest, vector and external-embeddings present, embeddings and metal
+      # absent, and the engine-free embeddings profile, and RC Build's
+      # capability leg then installs that archive through the public installer
+      # on windows-latest and runs it. Release Cut publishes the preflight
+      # record the mint requires only after both. So a defect that only fat LTO
+      # exposes on Windows, a link that no longer fits, or an optimization that
+      # changes behaviour, is still caught before a tag; it is caught by RC
+      # Build rather than here.
+      #
+      # Codegen units go to 16, the release default, because the repository's
+      # one-unit setting exists for the shipped binary's size and speed, and
+      # here it only serialised codegen of kin-daemon and kin-cli.
       - name: Build Windows release binaries with vector features
         shell: bash
         env:
-          # Compile cache keyed per crate, so a Cargo.lock change warm-starts
-          # from compiled dependencies instead of a cold tree. The cache lives
-          # OUTSIDE the workspace: an untracked directory inside it reads as a
-          # dirty checkout, and the provenance step then correctly refuses to
-          # certify the build (which is exactly how the first attempt failed).
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: ${{ runner.temp }}/sccache
-          # The sccache server exits after 600 idle seconds by default and then
-          # waits only 10 more for requests in flight. kin-daemon's release
-          # compile alone runs longer than that, so the server died under it
-          # and the crate started again without the wrapper, which pushed the
-          # job past its limit. Zero keeps the server up for the whole build.
-          SCCACHE_IDLE_TIMEOUT: "0"
           CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc \
             -p kin-cli -p kin-daemon
-          sccache --show-stats
 
       - name: Verify Windows build provenance and feature set
         shell: bash
@@ -861,11 +884,9 @@ jobs:
   # satisfy the heavy required checks without a toolchain or registry
   # dependency. Fail closed: any classifier failure or non-pull_request event
   # reports docs_only=false and every gated job runs. ci.yml itself never
-  # qualifies for its own fast path, and neither does an export pull request:
-  # land_export.py lands an export only once the release contexts are green on
-  # its exact head, and the fast-path stand-ins skip export branches, so a
-  # docs-only export could never carry them. The branch name can only add work
-  # here, never skip it.
+  # qualifies for its own fast path. The branch name plays no part: an export
+  # pull request is admitted like any other, and the merge queue grades the
+  # commit that lands.
   changes:
     name: Classify diff scope
     runs-on: ubuntu-latest
@@ -891,7 +912,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           docs_only=false
@@ -944,14 +964,24 @@ jobs:
                 esac
               done <<< "$changed"
             fi
-            case "${HEAD_REF:-}" in
-              feature/public-export-*) docs_only=false ;;
-            esac
             printf '%s\n' "$changed"
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
   # ─── The admission core ─────────────────────────────────────────────────────
+  #
+  # Landing goes through the merge queue, which builds the exact commit that
+  # lands and runs every job in this file on it under `merge_group`. A pull
+  # request, an export one included, gets the light half only: these two jobs,
+  # with every step that compiles skipped, plus DCO, cargo-deny, the secret
+  # scan of its own range and the PR text check, which together finish in a few
+  # minutes. Every required context still reports on the pull request, from
+  # exactly one producer: a job skipped by its `if:` passes a required check,
+  # and the matrix contexts, whose skipped jobs would publish only a bare name,
+  # come from the two `*-pr-fast-path` stand-ins. The queue run publishes the
+  # same names from the real jobs and nothing else, so no event ever carries a
+  # stand-in and a real run under one name. The history below is the earlier
+  # direct-merge shape, kept for the measurements.
   #
   # Two jobs, both running on every event, and between them the whole of what
   # blocks a pull request from landing. FIR-2815, on the founder's ruling that a
@@ -1050,6 +1080,7 @@ jobs:
       # branch that is allowed to write it. Read the cache line in THIS step's
       # log rather than the caches API listing, which is not an inventory.
       - name: Cache cargo registry and build
+        if: github.event_name != 'pull_request'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # FIR-2744. These two jobs share `check`'s cache key, which is exactly
@@ -1252,6 +1283,7 @@ jobs:
       # run on different events now and there is no event on which neither runs,
       # so the workspace is linted exactly once per event rather than twice.
       - name: Clippy
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
@@ -1274,6 +1306,7 @@ jobs:
       # scripts/io-lint/allowed-sites.txt. A raw read added to an answer path
       # fails here. The probe crate runs first and proves the configuration.
       - name: Check the filesystem boundary lint
+        if: github.event_name != 'pull_request'
         run: python3 scripts/check-io-lint.py
 
       # The deployed Firestore client needs a body to retry a query, but a
@@ -1283,6 +1316,7 @@ jobs:
       # contracts in this required context, after its all-features build, with
       # an exact listing assertion so a stale filter cannot grade nothing.
       - name: Test Firestore post-status response semantics
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
@@ -1334,6 +1368,7 @@ jobs:
       # the array itself rather than from a second literal that could disagree
       # with it.
       - name: Test hosted object-store destination composition
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
@@ -1449,7 +1484,7 @@ jobs:
   fast-gate-tests:
     name: Fast gate test shard
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     # A hang guard, not the speed gate. A 0.8.1 shard finished at 29.8 minutes
@@ -1648,7 +1683,7 @@ jobs:
   windows-cross-check:
     name: Windows cross-check
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
@@ -1732,11 +1767,16 @@ jobs:
     steps:
       - name: Require every fast-gate shard to have succeeded
         env:
+          EVENT_NAME: ${{ github.event_name }}
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           SHARDS: ${{ needs.fast-gate-tests.result }}
           WINDOWS: ${{ needs.windows-cross-check.result }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "pull request: the shards and the Windows cross-check run on the merge queue's commit"
+            exit 0
+          fi
           if [ "$DOCS_ONLY" = "true" ]; then
             echo "documentation-only diff: no package changed, so there is nothing to build"
             exit 0
@@ -1758,7 +1798,10 @@ jobs:
           fi
           echo "every fast-gate shard succeeded, and the Windows target compiles"
 
-  # The served MCP surface, graded on the pull request that moves it.
+  # The served MCP surface, graded on the merge queue's commit before it lands.
+  # It used to run on every pull request; with the queue carrying the full
+  # grading it runs there and on main, and the pull request reports it as a
+  # skipped job, which passes the required context.
   #
   # It grades two profiles now: `agent-default`, which is what `kin setup`
   # writes and what the five main-only assertions below read, and `agent-query`,
@@ -1794,7 +1837,8 @@ jobs:
     needs: changes
     if: >-
       ${{ !cancelled()
-      && needs.changes.outputs.docs_only != 'true' }}
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
@@ -1871,10 +1915,9 @@ jobs:
   # exclusive, so no two of them ever publish one expanded name on one event.
   #
   # It used to cover documentation-only diffs alone. It now covers every pull
-  # request, because the ubuntu and macOS suites moved off the pull-request path
-  # entirely: what admits a change is the fast gate below, and the full suite
-  # runs on the merge queue and on every commit that reaches main, where it is
-  # graded per commit and nothing cancels it. `release-tag.yml` still refuses to
+  # request, export pull requests included, because the ubuntu and macOS suites
+  # run on the merge queue's commit and on every commit that reaches main,
+  # where they are graded per commit and nothing cancels them. `release-tag.yml` still refuses to
   # mint a sha whose nine required checks are not green, so the proof did not
   # move, only the moment it is paid for.
   # Every Kin library, graded the way a stranger consumes it.
@@ -1885,10 +1928,9 @@ jobs:
   # packageable shape, and nothing else here would say so until a release tried
   # to publish it.
   #
-  # So each library is tested on its own MINIMAL features and packaged, on every
-  # event. `feature-tests` runs the same minimal-feature legs on macOS, but only
-  # on a push to main, which is a landing too late for a pull request that
-  # breaks one.
+  # So each library is tested on its own MINIMAL features and packaged, on the
+  # merge queue's commit and on main, before anything lands. The feature
+  # workers run the same minimal-feature legs on macOS.
   #
   # `--no-verify` on purpose. `cargo package` rewrites a path dependency to its
   # registry version, so a library whose sibling is at a version nobody has
@@ -1907,7 +1949,7 @@ jobs:
   library-packages:
     name: Library packages
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request' }}
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
@@ -2010,7 +2052,7 @@ jobs:
 
   check-pr-fast-path:
     name: Check & Test
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && !startsWith(github.head_ref, 'feature/public-export-') }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -2021,43 +2063,37 @@ jobs:
           echo "Check & Test runs in the merge queue and on every main commit."
           echo "Admission is the fast gate; see .github/workflows/ci.yml."
 
-  # The ubuntu half of Check & Test, sharded, and the job every source-reading
-  # gate in this repository runs in. The macOS half moved to `check-macos` +
-  # `check-macos-aggregate` below; this one carries the ubuntu-latest evidence
-  # and now splits its test step the same way, because `Test` was 14.98 min of
-  # a 21.8-minute job and was the last unpartitioned suite in the workflow.
+  # The ubuntu half of Check & Test is three jobs. `check-lint` runs every
+  # source-reading gate in this repository, clippy, both musl target checks and
+  # the doctests, once. `check` runs the test suite as nextest partitions, and
+  # each of its shards does nothing but build and run its own partition.
+  # `check-aggregate` publishes the required context and admits only success
+  # from both.
   #
-  # Within that set, shard 1 runs everything and shard 2 runs its own build and
-  # its own partition. The gates on shard 1 read source and cannot answer
-  # differently on a second runner, so running them twice would pay twice for
-  # one answer; the build is the one thing a partition genuinely needs of its
-  # own. Everything a partition consumes stays on both legs: the toolchain, the
-  # registry check, the cache, the build, nextest, and the language servers the
-  # enrichment proof needs, since which shard that test lands in is decided by
-  # the partitioner rather than by anything written here.
+  # The gates used to ride on shard 1 of `check`, in front of that shard's build
+  # and partition. On export pull request 1851 (run 38249726729) that made shard
+  # 1 36.3 minutes against 21.5 for shard 2, and the required context waited on
+  # the long one. Beside the partitions instead of in front of one, the gates
+  # cost what they always cost and stop deciding when the context reports.
   #
-  # The job id stays `check`. Two things read it and neither reads a display
-  # name: `bin/kin-precheck` in the umbrella enumerates this job's gate list out
-  # of this file by that id, and `rust-cache` composes its key from the job id
-  # when no shared key is given, so `feature-tests` reaches this job's warm
-  # dependency graph by asking for `check`. Renaming it would break the lane
-  # inner loop and silently cost the ubuntu permutations their cache, which is
-  # the same defect the macOS leg of that job carried until FIR-2722.
+  # The doctests are here because nextest cannot run them, so no partition can
+  # cover them, and a partition that also ran them would be the long one again.
   #
-  # This job publishes no required context. `check-aggregate` below does, and it
-  # fails unless every shard here succeeded. The `runner.os == 'Linux'`
-  # conditions further down are always true and are kept rather than deleted:
-  # they document which steps are Linux-only by intent.
-  check:
-    name: Check & Test ubuntu shard
+  # `check-lint` restores the dependency cache `check` writes and never writes
+  # one, so the two declare one cargo environment, which
+  # `assert_shared_cache_key_jobs_declare_one_environment` holds. The
+  # `runner.os == 'Linux'` conditions below are always true and are kept: they
+  # document which steps are Linux-only by intent.
+  check-lint:
+    name: Check & Test ubuntu lint
     needs: changes
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 45
     # The all-features clippy/build/test sequence can otherwise retain more
     # than a hosted runner's available disk in incremental objects and debug
     # symbols. Keep validation semantics identical while bounding the target
@@ -2066,14 +2102,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-    strategy:
-      # A shard that dies must not take its sibling with it. With fail-fast on,
-      # one red shard cancels the other, the aggregate reads `cancelled` for a
-      # partition that was passing, and the run reports one cause where there
-      # may be two.
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
     steps:
       - uses: actions/checkout@v7
 
@@ -2085,7 +2113,6 @@ jobs:
       # crates/ is never classified documentation-only, so it never takes the
       # inert fast path.
       - name: Check the README language count against the adapter registry
-        if: matrix.shard == 1
         shell: bash
         run: |
           set -euo pipefail
@@ -2168,7 +2195,6 @@ jobs:
           echo "$reference and the adapter registry agree on $derived languages."
 
       - name: Install runtime guard tools
-        if: matrix.shard == 1
         shell: bash
         run: |
           if ! command -v rg >/dev/null 2>&1; then
@@ -2207,7 +2233,6 @@ jobs:
           command -v rg
 
       - name: Validate installer checksum fixtures
-        if: matrix.shard == 1
         run: python3 scripts/test-install-checksum.py
 
       # A gate whose assertion lost its call site still exits 0, so passing the
@@ -2220,11 +2245,9 @@ jobs:
       # scripts/test-release-workflow-authority.py asserts this step exists, so
       # the pair cannot be half-removed.
       - name: Validate that every release gate assertion still runs
-        if: matrix.shard == 1
         run: python3 scripts/test-assertion-reachability.py
 
       - name: Validate mandatory Homebrew release outcome gate
-        if: matrix.shard == 1
         run: python3 scripts/test-homebrew-release-gate.py
 
       # Every validator below polices a repo-global invariant, so a break in one
@@ -2237,7 +2260,7 @@ jobs:
       # the gate because the assertion-reachability gate reads this file to
       # prove each suite still runs on pull requests.
       - name: Validate automatic release policy
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         env:
           GH_TOKEN: ${{ github.token }}
           KIN_POLICY_EVENT: ${{ github.event_name }}
@@ -2278,16 +2301,17 @@ jobs:
       # success while the original moves, and release.yml is the one workflow
       # whose mistakes a later commit cannot repair.
       - name: Check the RC build mirrors the release build
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         run: node scripts/check-rc-build-drift.mjs
+
       # This check is duplicated with fast-gate-lint so both the pull-request
       # and push paths verify the same branch-protection documentation.
       - name: Falsify required-contexts doc check
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         run: python3 scripts/check-required-contexts.py --self-test
 
       - name: Check required-contexts doc matches branch protection
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/check-required-contexts.py
@@ -2306,18 +2330,17 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
-      # Same trusted-ref scoping as the Windows authority job: restore always,
-      # save only from main. This is the pull-request critical path, so a warm
-      # dependency graph here is what a round actually costs.
+      # Restore-only, from the entry `check` writes on main. The two declare one
+      # cargo environment, which the shared cache-key guard holds.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          # FIR-2744, and see the note on the first cache step in this file.
+          # See the note on the first cache step in this file.
           add-rust-environment-hash-key: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: check
+          save-if: false
 
       - name: Check formatting
-        if: matrix.shard == 1
         run: cargo fmt -- --check
 
       # Two guards, two jobs. The Python checker walks every crate and carries
@@ -2326,15 +2349,12 @@ jobs:
       # kin-cli unit test drives. Both run, and the third step falsifies them,
       # because a guard that has never been shown to fail proves nothing.
       - name: Check Zero File-Search Invariant
-        if: matrix.shard == 1
         run: python3 scripts/verify-zero-file-search.py
 
       - name: Check Zero File-Search Invariant (answer modules)
-        if: matrix.shard == 1
         run: bash scripts/zero_file_search_guard.sh
 
       - name: Test the filesystem boundary lint
-        if: matrix.shard == 1
         run: python3 scripts/test-io-lint.py
 
       # Two gates that ROUTE a failure rather than merely reporting one: the
@@ -2346,7 +2366,7 @@ jobs:
       # deciding. Both run after the toolchain step because the leg helpers
       # resolve a compilation unit through cargo.
       - name: Falsify the release policy and Windows leg gates
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         run: |
           bash scripts/test-release-policy-gate.sh
           bash scripts/test-windows-authority-legs.sh
@@ -2357,7 +2377,6 @@ jobs:
       # list would drift, and the drift would be invisible until the platform
       # whose copy lost an allow went red for a lint nobody meant to enforce.
       - name: Clippy
-        if: matrix.shard == 1
         shell: bash
         run: |
           set -euo pipefail
@@ -2380,29 +2399,19 @@ jobs:
       # scripts/io-lint/allowed-sites.txt. A raw read added to an answer path
       # fails here. The probe crate runs first and proves the configuration.
       - name: Check the filesystem boundary lint
-        if: matrix.shard == 1
         run: python3 scripts/check-io-lint.py
 
       - name: Check Runtime Boundaries
-        if: matrix.shard == 1
         run: bash scripts/check_runtime_boundaries.sh
 
       - name: Check Private Repo Coupling
-        if: matrix.shard == 1
         run: bash scripts/check_private_repo_coupling.sh
 
       # The guard above is invoked from the repository root here and nowhere
       # else, which is the one working directory that hid a broken exclusion.
       # These tests run it from a foreign directory in both directions.
       - name: Test Private Repo Coupling Guard
-        if: matrix.shard == 1
         run: python3 scripts/test-private-repo-coupling.py
-
-      # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
-      # to public source until every crate is registry-published.
-      # Additional opt-in local-engine coverage, separate from default archive proofs.
-      - name: Build
-        run: cargo build --all-targets --locked --features kin-cli/embeddings,kin-daemon/embeddings
 
       # Kin's Linux release binaries link against musl so a single archive runs
       # on every distribution, and nothing else in CI compiles for that target.
@@ -2416,7 +2425,7 @@ jobs:
       # One deliberate bound: it checks rather than builds, so it proves
       # compilation and name resolution and not linking.
       - name: Check the Linux release target (musl)
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           rustup target add x86_64-unknown-linux-musl
@@ -2447,7 +2456,7 @@ jobs:
       # leg proves that natively on ubuntu-24.04-arm, where musl-tools does
       # supply an aarch64 musl-gcc, which is why nothing here is a cross build.
       - name: Check the aarch64 Linux release target (musl)
-        if: runner.os == 'Linux' && matrix.shard == 1
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           rustup target add aarch64-unknown-linux-musl
@@ -2460,6 +2469,81 @@ jobs:
           AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar \
             cargo check --locked --target aarch64-unknown-linux-musl \
               -p kin-cli -p kin-daemon
+
+      # nextest does not run doctests, so no partition covers them and they run
+      # here, beside the partitions rather than in front of one.
+      - name: Doc tests
+        run: cargo test --doc --locked --features kin-cli/embeddings,kin-daemon/embeddings
+
+  # The test partitions. `--partition count:N/M` splits the suite by test,
+  # deterministically, so the shards together run exactly the set one
+  # unpartitioned run ran, and the shard matrix and the denominator are one
+  # fact in two places that the release-authority suite holds equal.
+  #
+  # The job id stays `check`. `rust-cache` composes its key from the job id when
+  # no shared key is given, so `check-lint`, the fast gate and the ubuntu
+  # feature workers all reach this job's warm dependency graph by asking for
+  # `check`. Renaming it would silently cost all of them their cache, which is
+  # the defect the macOS feature leg carried until it asked for `check-macos`.
+  #
+  # This job publishes no required context. `check-aggregate` below does, and it
+  # fails unless every shard here succeeded.
+  check:
+    name: Check & Test ubuntu shard
+    needs: changes
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    # The all-features clippy/build/test sequence can otherwise retain more
+    # than a hosted runner's available disk in incremental objects and debug
+    # symbols. Keep validation semantics identical while bounding the target
+    # directory so tests still have space for their temporary fixtures.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      # A shard that dies must not take its siblings with it. With fail-fast on,
+      # one red shard cancels the others, the aggregate reads `cancelled` for a
+      # partition that was passing, and the run reports one cause where there
+      # may be two.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        # kin-* crates resolve from the Kin sparse registry ([registries.kin]).
+        # The temporary git [patch.kin] pins were dropped once all kin-* crates
+        # were published to the registry; CI asserts they stay gone.
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # Same trusted-ref scoping as the Windows authority job: restore always,
+      # save only from main. This is the pull-request critical path, so a warm
+      # dependency graph here is what a round actually costs.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # See the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
+      # to public source until every crate is registry-published.
+      # Additional opt-in local-engine coverage, separate from default archive proofs.
+      - name: Build
+        run: cargo build --all-targets --locked --features kin-cli/embeddings,kin-daemon/embeddings
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -2484,7 +2568,7 @@ jobs:
         run: bash scripts/ci-install-go-language-server.sh
 
       # `--partition count:N/M` splits the suite by test, deterministically,
-      # so the two shards together run exactly the set one unpartitioned run
+      # so the three shards together run exactly the set one unpartitioned run
       # ran. `check-aggregate` below is what makes "together" enforceable: a
       # shard that never reported cannot leave its partition silently unrun.
       #
@@ -2493,12 +2577,7 @@ jobs:
       # failure hid every later one, so each export cycle found one failure
       # and the next cycle found the next.
       - name: Test
-        run: cargo nextest run --locked --no-fail-fast --features kin-cli/embeddings,kin-daemon/embeddings --partition count:${{ matrix.shard }}/2
-
-      - name: Doc tests
-        if: matrix.shard == 1
-        # nextest does not run doctests; keep them covered explicitly.
-        run: cargo test --doc --locked --features kin-cli/embeddings,kin-daemon/embeddings
+        run: cargo nextest run --locked --no-fail-fast --features kin-cli/embeddings,kin-daemon/embeddings --partition count:${{ matrix.shard }}/3
 
   # The required context for ubuntu. Its display name plus its one matrix value
   # compose to `Check & Test (ubuntu-latest)`, byte for byte what ruleset
@@ -2515,11 +2594,11 @@ jobs:
   # name is the ambiguity the release mint refuses on.
   check-aggregate:
     name: Check & Test
-    needs: [changes, check]
+    needs: [changes, check-lint, check]
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -2527,16 +2606,25 @@ jobs:
         os: [ubuntu-latest]
     steps:
       # `needs.<job>.result` for a matrix job is the roll-up of every leg, so
-      # this is `success` only when both shards succeeded. Requiring exactly
-      # `success` is what makes a SKIPPED or CANCELLED shard fail this check
-      # rather than pass it: a shard that never ran left half the ubuntu suite
-      # unexecuted, and a required context that goes green on that is worse than
-      # no context at all.
+      # SHARDS is `success` only when every shard succeeded. Requiring exactly
+      # `success` from the shards and from the lint job is what makes a SKIPPED
+      # or CANCELLED one fail this check rather than pass it: a shard that never
+      # ran left a third of the ubuntu suite unexecuted, a lint job that never ran
+      # left every source-reading gate unrun, and a required context that goes
+      # green on either is worse than no context at all.
       - name: Require every ubuntu shard to have succeeded
         env:
+          LINT: ${{ needs.check-lint.result }}
           SHARDS: ${{ needs.check.result }}
         run: |
           set -euo pipefail
+          if [ "$LINT" != "success" ]; then
+            echo "::error title=ubuntu lint did not pass::the ubuntu Check & Test lint job reported '$LINT'"
+            echo "Every source-reading gate, clippy, the musl checks and the doctests" >&2
+            echo "run there and nowhere else in this context. 'skipped' and" >&2
+            echo "'cancelled' mean they did not run at all." >&2
+            exit 1
+          fi
           if [ "$SHARDS" != "success" ]; then
             echo "::error title=ubuntu shards did not pass::the sharded ubuntu Check & Test legs reported '$SHARDS'"
             echo "Every partition of the ubuntu suite has to report success for this" >&2
@@ -2544,55 +2632,49 @@ jobs:
             echo "mean a partition did not run at all." >&2
             exit 1
           fi
-          echo "every ubuntu Check & Test shard succeeded"
+          echo "the ubuntu lint job and every ubuntu Check & Test shard succeeded"
 
-  # The macOS half of Check & Test, sharded.
+  # The macOS half of Check & Test, as a lint job and two test partitions.
   #
-  # `Check & Test (macos-latest)` was the last required check to report on 83%
-  # of merge_group runs and 73% of pull-request runs, at ~21.9 min. Of that,
-  # 14.2 min is the `Test` step alone: 6454 tests in 801.6s, against 7.5 min for
-  # the identical suite on ubuntu-latest, because macos-latest is a three-core
-  # arm64 runner and nextest ran the suite as a single partition. Splitting the
-  # partition is the whole point of this job.
+  # What it carries is what macOS can answer differently from ubuntu: clippy
+  # over macOS-gated code, the boundary lint, the build, the tests and the
+  # doctests, all with the Metal features. The source-reading gates whose
+  # result cannot depend on the runner run once, in `check-lint`, which the
+  # ubuntu required context already requires.
   #
-  # What this job carries is what macOS can answer differently from ubuntu:
-  # clippy over macOS-gated code, the build, the tests, and the doctests. The
-  # steps it does not carry are the source-reading gates whose result cannot
-  # depend on the runner at all, from the README language count through the
-  # zero-file-search guards. `Check & Test (ubuntu-latest)` is a
-  # required context and runs every one of them, so none is lost; running them a
-  # second time bought nothing but macOS minutes at ten times the billing rate.
+  # The build is the floor of every shard. On export pull request 1851 (run
+  # 38249726729) and the five runs before it, a shard's `Build` took 21.3 to
+  # 28.1 minutes, median about 23, and the whole suite's `Test` took about 34
+  # minutes of runner time split two ways. Two shards left each one at 47 to 55
+  # minutes. Five, measured on 2026-10-12, built in 21.3 to 25.5 minutes and
+  # left the slowest shard at 35.7, past the merge queue's whole budget, and
+  # eight still left the build as the floor. That floor is the standard
+  # runner's three cores and 7 GB, so the shards run on Depot's eight-core
+  # runner instead (see the job), in two partitions. The clippy pass and
+  # doctests that shard 1 used to run in front of its build run beside the
+  # shards in `check-macos-lint`, on the standard runner, where they finish
+  # well inside the shards' time. Each shard pays its own build, which
+  # is the wall-clock trade the fast gate makes too: building once and fanning
+  # out an archive of 374 test binaries would put an upload and a download on
+  # the critical path in exchange for runner minutes.
   #
-  # Within that set, shard 1 runs everything and shard 2 runs its own build and
-  # its own partition. Nothing before `Test` can differ between the shards, so
-  # repeating it would only pay twice for one answer, and the build is the one
-  # thing a partition genuinely needs of its own.
-  #
-  # This job publishes no required context. `check-macos-aggregate` below does,
-  # and it fails unless every shard here succeeded.
-  check-macos:
-    name: Check & Test macOS shard
+  # `check-macos-lint` restores the dependency cache `check-macos` writes and
+  # never writes one, so the two declare one cargo environment. Neither job
+  # publishes a required context. `check-macos-aggregate` below does, and it
+  # fails unless the lint job and every shard succeeded.
+  check-macos-lint:
+    name: Check & Test macOS lint
     needs: changes
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: macos-latest
-    # Shard 1 also runs lint, boundary checks and doctests. Leave room for
-    # those gates after compilation; shard 2 keeps its existing limit.
-    timeout-minutes: ${{ matrix.shard == 1 && 75 || 60 }}
+    timeout-minutes: 50
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-    strategy:
-      # A shard that dies must not take its sibling with it. With fail-fast on,
-      # one red shard cancels the other, the aggregate reads `cancelled` for a
-      # partition that was passing, and the run reports one cause where there
-      # may be two.
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
     steps:
       - uses: actions/checkout@v7
 
@@ -2607,21 +2689,20 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
-      # Same trusted-ref scoping as every other cached job: restore always, save
-      # only from main. Both shards restore the same main entry, so the second
-      # one is not paying for the first one's warmth.
+      # Restore-only, from the entry `check-macos` writes on main. The two
+      # declare one cargo environment, which the shared cache-key guard holds.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          # FIR-2744, and see the note on the first cache step in this file.
+          # See the note on the first cache step in this file.
           add-rust-environment-hash-key: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: check-macos
+          save-if: false
 
       # See .github/clippy-allowed-lints.txt. This is the only clippy pass over
       # macOS-gated code, which is why it stays on the macOS side rather than
       # being left to the ubuntu leg.
       - name: Clippy
-        if: matrix.shard == 1
         shell: bash
         run: |
           set -euo pipefail
@@ -2644,8 +2725,62 @@ jobs:
       # scripts/io-lint/allowed-sites.txt. A raw read added to an answer path
       # fails here. The probe crate runs first and proves the configuration.
       - name: Check the filesystem boundary lint
-        if: matrix.shard == 1
         run: python3 scripts/check-io-lint.py
+
+      # nextest does not run doctests, so no partition covers them and they run
+      # here, beside the partitions rather than in front of one. A shard that
+      # also ran them would be the long shard again.
+      - name: Doc tests
+        run: cargo test --doc --locked --features kin-cli/metal,kin-daemon/metal
+
+  check-macos:
+    name: Check & Test macOS shard
+    needs: changes
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
+    # Depot's eight-core Apple Silicon runner, admitted here and nowhere else in
+    # this file. This job runs only on the merge queue's commit and on main,
+    # never on a pull request, so no fork's code reaches a paid runner. Setting
+    # `vars.KIN_MACOS_HEAVY_RUNNER` to `macos-latest` puts it back on the
+    # standard pool during a Depot outage: the queue keeps grading, at the
+    # standard runner's pace.
+    runs-on: ${{ vars.KIN_MACOS_HEAVY_RUNNER || 'depot-macos-26' }}
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      # A shard that dies must not take its siblings with it. With fail-fast on,
+      # one red shard cancels the others, the aggregate reads `cancelled` for a
+      # partition that was passing, and the run reports one cause where there
+      # may be several.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      # Same trusted-ref scoping as every other cached job: restore always, save
+      # only from main. Every shard restores the same main entry, so no shard is
+      # paying for another one's warmth.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # See the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Additional opt-in Metal coverage, separate from default archive proofs.
       - name: Build
@@ -2666,13 +2801,6 @@ jobs:
       - name: Test
         run: cargo nextest run --locked --no-fail-fast --features kin-cli/metal,kin-daemon/metal --partition count:${{ matrix.shard }}/2
 
-      # nextest does not run doctests, so partitioning cannot cover them and one
-      # shard has to. They are a 0.9 min step and splitting them would cost more
-      # in a second cold `cargo test --doc` than it could save.
-      - name: Doc tests
-        if: matrix.shard == 1
-        run: cargo test --doc --locked --features kin-cli/metal,kin-daemon/metal
-
   # The required context for macOS. Its display name plus its one matrix value
   # compose to `Check & Test (macos-latest)`, byte for byte what ruleset
   # 19746451, release-tag.yml's REQUIRED_CHECKS and expected_provenance tables,
@@ -2692,11 +2820,11 @@ jobs:
   # platform this context speaks for, not the platform it runs on.
   check-macos-aggregate:
     name: Check & Test
-    needs: [changes, check-macos]
+    needs: [changes, check-macos-lint, check-macos]
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -2704,16 +2832,26 @@ jobs:
         os: [macos-latest]
     steps:
       # `needs.<job>.result` for a matrix job is the roll-up of every leg, so
-      # this is `success` only when both shards succeeded. Requiring exactly
-      # `success` is what makes a SKIPPED or CANCELLED shard fail this check
-      # rather than pass it: a shard that never ran left half the macOS suite
-      # unexecuted, and a required context that goes green on that is worse than
-      # no context at all.
+      # SHARDS is `success` only when every shard succeeded. Requiring exactly
+      # `success` from the shards and from the lint job is what makes a SKIPPED
+      # or CANCELLED one fail this check rather than pass it: a shard that never
+      # ran left half of the macOS suite unexecuted, a lint job that never
+      # ran left clippy, the boundary lint and the doctests unrun, and a
+      # required context that goes green on either is worse than no context at
+      # all.
       - name: Require every macOS shard to have succeeded
         env:
+          LINT: ${{ needs.check-macos-lint.result }}
           SHARDS: ${{ needs.check-macos.result }}
         run: |
           set -euo pipefail
+          if [ "$LINT" != "success" ]; then
+            echo "::error title=macOS lint did not pass::the macOS Check & Test lint job reported '$LINT'"
+            echo "Clippy over macOS-gated code, the boundary lint and the doctests" >&2
+            echo "run there and nowhere else in this context. 'skipped' and" >&2
+            echo "'cancelled' mean they did not run at all." >&2
+            exit 1
+          fi
           if [ "$SHARDS" != "success" ]; then
             echo "::error title=macOS shards did not pass::the sharded macOS Check & Test legs reported '$SHARDS'"
             echo "Every partition of the macOS suite has to report success for this" >&2
@@ -2721,7 +2859,7 @@ jobs:
             echo "mean a partition did not run at all." >&2
             exit 1
           fi
-          echo "every macOS Check & Test shard succeeded"
+          echo "the macOS lint job and every macOS Check & Test shard succeeded"
 
   # Two sets of steps used to run inside Check & Test and gate nothing that
   # needed them to be there. Both sat on the merge queue's critical path: five
@@ -2739,14 +2877,21 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
-    # "Falsify Zero File-Search guards" grew from about 14 minutes to about 26
-    # on 2026-10-11 and crossed the old 30-minute bound on an export pull
-    # request the next day. GitHub records a job timeout as cancelled, which
-    # the release selector does not admit as a retryable failure, so a bound
-    # this close to the job's own length can kill a release candidate.
-    timeout-minutes: 45
+    # "Falsify Zero File-Search guards" did not grow on 2026-10-11; the runners
+    # under it differ. It is about thirty sequential walks of the tree by a
+    # guard that lexes one character at a time, so its length is the host's
+    # single-core speed: 13.8 minutes on export pull request 1851 and 29.1 on
+    # the export an hour before it, whose guard scripts were identical and whose
+    # crates differed by fifteen lines, and the same 13 to 25 minute spread runs
+    # back through September. The step now splits those walks across the
+    # runner's four cores, which took a local run from 10.3 minutes to 3.0.
+    #
+    # GitHub records a job timeout as cancelled, which the release selector
+    # does not admit as a retryable failure, so this stays well clear of the
+    # slowest host's time rather than near the typical one.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -2802,7 +2947,8 @@ jobs:
         run: |
           set -euo pipefail
           poisoned="$(mktemp -d)"
-          trap 'rm -rf "$poisoned"' EXIT
+          shard_root="$(mktemp -d)"
+          trap 'rm -rf "$poisoned" "$shard_root"' EXIT
           cp -a crates scripts "$poisoned/"
 
           fail_expected() {
@@ -2833,8 +2979,57 @@ jobs:
           # file, and a counted pin paid for by a rename in test code the guard
           # never reads. Both are the same failure as [2/3] reached through the
           # exemption mechanism instead of a stale pin.
-          echo "[1/3] every answer module, every probe site, both guards"
-          python3 scripts/falsify-zero-file-search.py "$poisoned"
+          #
+          # The harness rewrites the tree it is given, so each shard gets its
+          # own copy, and the shards run at once, one per core. Every probe unit
+          # belongs to exactly one shard and each shard prints a receipt of how
+          # many it ran out of how many exist. The receipts are summed below, so
+          # a shard that ran nothing, or a total one shard disagrees on, fails
+          # this step rather than shrinking what it proved.
+          shards=4
+          echo "[1/3] every answer module, every probe site, both guards, in $shards shards"
+          pids=()
+          for shard in $(seq 1 "$shards"); do
+            mkdir "$shard_root/$shard"
+            cp -a crates scripts "$shard_root/$shard/"
+            python3 scripts/falsify-zero-file-search.py --shard "$shard/$shards" "$shard_root/$shard" \
+              > "$shard_root/$shard.log" 2>&1 &
+            pids+=("$!")
+          done
+          failed=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || failed=1
+          done
+          ran_sum=0
+          total_seen=""
+          for shard in $(seq 1 "$shards"); do
+            echo "::group::falsification shard $shard of $shards"
+            cat "$shard_root/$shard.log"
+            echo "::endgroup::"
+            receipt="$(grep -E "^FALSIFY_SHARD $shard/$shards ran=[0-9]+ total=[0-9]+$" "$shard_root/$shard.log" || true)"
+            if [[ -z "$receipt" ]]; then
+              echo "::error::falsification shard $shard/$shards printed no receipt, so what it ran is unknown"
+              failed=1
+              continue
+            fi
+            ran="${receipt#*ran=}"
+            ran="${ran%% *}"
+            total="${receipt##*total=}"
+            if [[ -n "$total_seen" && "$total" != "$total_seen" ]]; then
+              echo "::error::falsification shard $shard/$shards counted $total probe units where another counted $total_seen"
+              failed=1
+            fi
+            total_seen="$total"
+            ran_sum=$((ran_sum + ran))
+          done
+          if [[ -z "$total_seen" || "$total_seen" -eq 0 || "$ran_sum" -ne "$total_seen" ]]; then
+            echo "::error::falsification shards ran $ran_sum probe units of ${total_seen:-an unknown number}; every unit must run exactly once"
+            failed=1
+          fi
+          if [[ $failed -ne 0 ]]; then
+            exit 1
+          fi
+          echo "  ok: $shards shards ran all $total_seen probe units"
 
           # [2/3] A broken pin must not hide the scan. Allowlist validation used
           # to exit before the walk, so a stale pin reported itself and nothing
@@ -2914,20 +3109,13 @@ jobs:
   # Read this before trusting a green `Feature permutation tests` on a pull
   # request. On a pull request this job runs NO tests: it exists only to publish
   # the two context names, and the real feature workers and aggregates are skipped.
-  # The permutations execute on push to `main` and nowhere earlier, because this
-  # repository lands through direct merges rather than a merge queue, so there is
-  # no pre-merge event that runs them. The trade is deliberate: the permutations
-  # carry a 60 minute timeout and a per-pull-request gate is held to minutes, so
-  # they are kept off the pull-request path on purpose.
-  #
-  # The consequence is real and is the reason this is written down. A break that
-  # appears only under a non-default feature permutation reaches `main` first and
-  # is caught by the push run afterwards, not by the pull request that introduced
-  # it. Anything that must refuse a change BEFORE it lands belongs in the fast
-  # gate instead, where the required contexts are.
+  # The permutations execute in the merge queue, on the exact commit that lands,
+  # and again on the push to `main`. The queue is what refuses a change that
+  # breaks a feature permutation before it lands, so a pull request does not
+  # pay for them.
   feature-tests-pr-fast-path:
     name: Feature permutation tests
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && !startsWith(github.head_ref, 'feature/public-export-') }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -2939,31 +3127,46 @@ jobs:
           echo "main, after the merge, and not on this pull request."
           echo "Admission before the merge is the fast gate."
 
-  # Keep the hosted feature combinations together, and the two featureless
-  # packages together, so each group reuses its related compilation work. The
-  # minimal-library pass balances the hosted group without dropping its macOS
-  # NEON coverage. Both groups retain the same commands and warning policy.
+  # One worker per feature phase, so each phase's compile and run overlap with
+  # every other phase's instead of following it. On export pull request 1851
+  # (run 38249726729) the macOS job ran its phases in a row: gcs 19.7 minutes,
+  # hosted production 15.3, minimal libraries 7.8, featureless kin-cli 30.7 and
+  # featureless kin-daemon 21, which was 96.4 minutes, and the two-group split
+  # after it still put both groups near 50. A phase is now one job, and the two
+  # featureless suites, the longest, are each split into two nextest
+  # partitions. Every command is the one that ran before, with two changes the
+  # partitions need: the featureless suites run under nextest instead of
+  # `cargo test`, as the gcs and hosted phases and Check & Test already do, and
+  # each runs half of its tests. `--lib --tests` still selects the same targets,
+  # doctests stay out of it as before, and nextest's setup script and flake
+  # quarantine now apply to them exactly as they apply to every other suite.
+  #
+  # Each worker compiles its own feature set, so the phases pay for overlapping
+  # compilation: the two partitions of a featureless suite build the same test
+  # binaries, and the hosted phase rebuilds kin-daemon with `firestore` where
+  # it used to follow the gcs build. That is the trade for wall clock, and on
+  # ubuntu it is minutes of free runner time.
   #
   # Each platform has its own worker matrix: a matrix result covers every leg
-  # of that job, so one shared OS-by-group matrix could not tell the Ubuntu
+  # of that job, so one shared OS-by-phase matrix could not tell the ubuntu
   # aggregate from the macOS aggregate. The two small aggregates keep the
-  # existing platform check names and accept only a successful full group set.
-  # fail-fast:false preserves the other group's evidence after a failure;
-  # successful runs change elapsed time through overlap, not fewer tests.
+  # existing platform check names and accept only a successful full set of
+  # legs. fail-fast:false preserves the other legs' evidence after a failure.
+  # The partition matrix and the `/2` denominator are one fact in two places,
+  # and the release-authority suite holds them equal.
   #
-  # Both groups only read Check & Test's dependency cache. The shared key stays
-  # check on Ubuntu and check-macos on Darwin, with the same bounded Cargo
-  # environment and save-if:false. Workspace feature builds stay local to the
-  # job, and native release archive workflows continue to compile cold.
+  # Every worker only reads Check & Test's dependency cache. The shared key
+  # stays check on ubuntu and check-macos on Darwin, with the same bounded Cargo
+  # environment and save-if:false.
   feature-tests-ubuntu-shards:
     name: Feature permutation shard
     needs: changes
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -2972,7 +3175,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        group: [hosted-minimal, featureless]
+        phase: [gcs, hosted, libraries, featureless-cli, featureless-daemon]
+        partition: [1, 2]
+        exclude:
+          - phase: gcs
+            partition: 2
+          - phase: hosted
+            partition: 2
+          - phase: libraries
+            partition: 2
     steps:
       - uses: actions/checkout@v7
 
@@ -2998,33 +3209,33 @@ jobs:
           tool: nextest
 
       - name: Test gcs feature
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'gcs'
         run: cargo nextest run -p kin-daemon --features gcs --locked
 
       - name: Test hosted gcs spine cursor hold
-        if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'
+        if: matrix.phase == 'gcs' && matrix.os == 'ubuntu-latest'
         run: >-
           cargo test -p kin-daemon --features gcs --locked
           state::tests::hosted_spine_refuses_persistence_without_cursor_cas
           -- --exact --nocapture --test-threads=1
 
       - name: Test kin-spine durable publication paths
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'hosted'
         run: cargo nextest run -p kin-spine --features firestore --locked
 
       - name: Test hosted production features
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'hosted'
         run: cargo nextest run -p kin-daemon --features gcs,firestore --locked
 
       - name: Test hosted production durable spine selection
-        if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'
+        if: matrix.phase == 'hosted' && matrix.os == 'ubuntu-latest'
         run: >-
           cargo test -p kin-daemon --features gcs,firestore --locked
           state::tests::hosted_production_feature_pair_selects_durable_backend
           -- --exact --nocapture --test-threads=1
 
       - name: Test each Kin library on its own minimal features
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'libraries'
         run: |
           set -euo pipefail
           python3 - <<'LIBS' > "$RUNNER_TEMP/libraries.txt"
@@ -3047,12 +3258,12 @@ jobs:
           done < "$RUNNER_TEMP/libraries.txt"
 
       - name: Test featureless kin-cli
-        if: matrix.group == 'featureless'
-        run: cargo test -p kin-cli --no-default-features --lib --tests --locked
+        if: matrix.phase == 'featureless-cli'
+        run: cargo nextest run -p kin-cli --no-default-features --lib --tests --locked --partition count:${{ matrix.partition }}/2
 
       - name: Test featureless kin-daemon
-        if: matrix.group == 'featureless'
-        run: cargo test -p kin-daemon --no-default-features --lib --tests --locked
+        if: matrix.phase == 'featureless-daemon'
+        run: cargo nextest run -p kin-daemon --no-default-features --lib --tests --locked --partition count:${{ matrix.partition }}/2
 
   feature-tests-macos-shards:
     name: Feature permutation shard
@@ -3060,9 +3271,9 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -3071,7 +3282,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest]
-        group: [hosted-minimal, featureless]
+        phase: [gcs, hosted, libraries, featureless-cli, featureless-daemon]
+        partition: [1, 2]
+        exclude:
+          - phase: gcs
+            partition: 2
+          - phase: hosted
+            partition: 2
+          - phase: libraries
+            partition: 2
     steps:
       - uses: actions/checkout@v7
 
@@ -3097,33 +3316,33 @@ jobs:
           tool: nextest
 
       - name: Test gcs feature
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'gcs'
         run: cargo nextest run -p kin-daemon --features gcs --locked
 
       - name: Test hosted gcs spine cursor hold
-        if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'
+        if: matrix.phase == 'gcs' && matrix.os == 'ubuntu-latest'
         run: >-
           cargo test -p kin-daemon --features gcs --locked
           state::tests::hosted_spine_refuses_persistence_without_cursor_cas
           -- --exact --nocapture --test-threads=1
 
       - name: Test kin-spine durable publication paths
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'hosted'
         run: cargo nextest run -p kin-spine --features firestore --locked
 
       - name: Test hosted production features
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'hosted'
         run: cargo nextest run -p kin-daemon --features gcs,firestore --locked
 
       - name: Test hosted production durable spine selection
-        if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'
+        if: matrix.phase == 'hosted' && matrix.os == 'ubuntu-latest'
         run: >-
           cargo test -p kin-daemon --features gcs,firestore --locked
           state::tests::hosted_production_feature_pair_selects_durable_backend
           -- --exact --nocapture --test-threads=1
 
       - name: Test each Kin library on its own minimal features
-        if: matrix.group == 'hosted-minimal'
+        if: matrix.phase == 'libraries'
         run: |
           set -euo pipefail
           python3 - <<'LIBS' > "$RUNNER_TEMP/libraries.txt"
@@ -3146,12 +3365,12 @@ jobs:
           done < "$RUNNER_TEMP/libraries.txt"
 
       - name: Test featureless kin-cli
-        if: matrix.group == 'featureless'
-        run: cargo test -p kin-cli --no-default-features --lib --tests --locked
+        if: matrix.phase == 'featureless-cli'
+        run: cargo nextest run -p kin-cli --no-default-features --lib --tests --locked --partition count:${{ matrix.partition }}/2
 
       - name: Test featureless kin-daemon
-        if: matrix.group == 'featureless'
-        run: cargo test -p kin-daemon --no-default-features --lib --tests --locked
+        if: matrix.phase == 'featureless-daemon'
+        run: cargo nextest run -p kin-daemon --no-default-features --lib --tests --locked --partition count:${{ matrix.partition }}/2
 
   feature-tests:
     name: Feature permutation tests
@@ -3159,7 +3378,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -3183,7 +3402,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -3203,153 +3422,15 @@ jobs:
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
-  coverage:
-    name: Code Coverage
-    # Not the critical path (the Windows jobs are longer), so gating this off
-    # PRs costs no wall clock and reclaims ~23 min of billed compute per PR.
-    # Coverage still runs on every push to main, so it still gates what lands.
-    #
-    # Off the merge queue for a stronger reason than cost. This is not a
-    # required context, so the queue never waits for it: across seven sampled
-    # landings the merge completed a median 34s after the last required check
-    # while this job was still running, finishing up to 7.1 min PAST the merge.
-    # A merge_group check-run that concludes after the merge lands on the exact
-    # sha release-tag.yml sweeps, where a non-required failure is terminal even
-    # though nothing gated on it. A job that never starts cannot conclude.
-    if: ${{ (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) && github.event_name != 'merge_group' }}
-    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
-    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 45
-    # The coverage step below already treats a tarpaulin failure as a warning.
-    # What it cannot absorb is the runner dying under the instrumented test
-    # binaries, which ends the job with no step verdict and no log; on
-    # 2026-09-16 that alone read as a failed CI run and refused the 0.7.20 cut
-    # twice. Coverage is a diagnostic, not a release gate, so its job never
-    # decides the run.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-
-      # The runner is not small; the build is enormous, and the margin was
-      # under half a gigabyte. Measured on main's push run 33711619735, the
-      # first to carry this step: 145G of disk with 86.1 GiB free before the
-      # reclaim, 30.4 GiB free after tarpaulin finished, so the instrumented
-      # build of the whole workspace consumes about 85.7 GiB. Without the
-      # reclaim it was landing inside 0.4 GiB of the wall, which is why eleven
-      # consecutive main pushes on 2026-09-03 failed in two shapes rather than
-      # one, and why some of them squeaked through. Whether a run crossed the
-      # line came down to how much the image already held.
-      #
-      # Both shapes are that one cause. `rust-lld` mmaps its output, so a write
-      # with no blocks behind it arrives as `ld terminated with signal 7 [Bus
-      # error]` and reads as a compiler crash; or the runner's own worker hits
-      # `No space left on device` writing its diagnostic log and takes the job
-      # down with no failed step in it.
-      #
-      # Reclaiming the toolchains no kin build touches buys 30 GiB, which is
-      # about 35% headroom over the build. That is a margin, not a fix in
-      # perpetuity: it erodes as the workspace grows, and the `df` lines on both
-      # sides are what let the next reader see the next near miss coming instead
-      # of inferring it from a linker signal.
-      #
-      # `continue-on-error` because a reclaim that does not apply on some future
-      # runner image is not a reason to stop a build. The script already exits 0
-      # on every path it can reach; this covers the paths it cannot.
-      - name: Free runner disk
-        continue-on-error: true
-        run: bash scripts/ci-free-disk.sh
-
-      - name: Install Rust toolchain
-        uses: ./.github/actions/rust-toolchain
-
-      - name: Verify kin cargo registry config
-        # Same tracked config the check job verifies.
-        run: |
-          test -f .cargo/config.toml
-          grep -q '^\[registries\.kin\]' .cargo/config.toml
-          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
-
-      - name: Cache cargo registry
-        # Registry only, deliberately: tarpaulin's instrumented builds use their
-        # own flags, so a cached target never fingerprint-matches. Measured on
-        # main: a 4.62 GB target cache HIT left coverage at 24.2 min vs 23.5
-        # cold. That is zero benefit, and its size (47% of the repo's 10 GB budget)
-        # evicted the Windows release-build cache that does pay for itself.
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-tarpaulin-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-tarpaulin-
-
-      - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
-
-      # The exit-0 contract here is unchanged from main. Tarpaulin is
-      # non-blocking for the public beta and this change neither hardens nor
-      # softens that; hardening it belongs after a run proves tarpaulin can
-      # finish, which none of the 39 sampled runs did. What is new is that a
-      # failure now says WHICH failure it was. A tarpaulin nonzero next to a
-      # near-empty disk is a runner infrastructure failure and says so by name,
-      # rc=124 is the 30m bound rather than a defect, and anything else keeps
-      # the non-blocking warning.
-      #
-      # This can only speak when the step itself survives. When the disk kills
-      # the runner's worker process instead, no step-level line is ever written,
-      # which is why freeing the disk above is the fix and this is the report.
-      - name: Run coverage
-        run: |
-          # Two GiB. Below this the next link or report write is what fails, so
-          # a tarpaulin nonzero here is the disk and not the code.
-          disk_floor_kb=2097152
-          rc=0
-          timeout 30m cargo tarpaulin --out xml --out stdout || rc=$?
-          free_kb="$(df -Pk . | awk 'NR == 2 { print $4 }')"
-          if [ -z "$free_kb" ]; then
-            echo "::warning::could not read free disk after the coverage run"
-            free_kb=-1
-          else
-            awk -v k="$free_kb" 'BEGIN { printf "coverage: %.1f GiB free after the run\n", k / 1048576 }'
-          fi
-          if [ "$rc" -ne 0 ]; then
-            if [ "$free_kb" -ge 0 ] && [ "$free_kb" -lt "$disk_floor_kb" ]; then
-              echo "::error::runner out of disk: tarpaulin exited $rc with under 2 GiB free. This is a runner infrastructure failure, not a coverage regression."
-            elif [ "$rc" -eq 124 ]; then
-              echo "::warning::Tarpaulin exceeded its 30m bound (rc=124) with disk to spare, so the bound is what stopped it."
-            else
-              echo "::warning::Tarpaulin is currently non-blocking in CI for the public beta (rc=$rc)."
-            fi
-          fi
-
-      # `continue-on-error` here so an upload that fails concludes with a named
-      # cause rather than leaving a null step behind a dead job.
-      #
-      # `disable_search` because without it this step is not merely useless when
-      # tarpaulin wrote nothing, it is wrong. Read on the green run at
-      # c99d9065a: `not_found_files: ["cobertura.xml"]`, and then the action
-      # walked the tree, decided eleven paths whose names happen to contain
-      # "coverage" were coverage files, and uploaded those. Two were fingerprint
-      # JSON out of target/debug and three were Rust sources. The setting
-      # confines this step to the file it was pointed at.
-      #
-      # Bounded because nothing else bounds it: on the 0.8.2 export pull
-      # request this upload started at 06:05:56Z and was still running when the
-      # job's cap cancelled the whole job 35 minutes later. A timed-out upload
-      # is a soft step failure under `continue-on-error`, not a lost job.
-      - name: Upload coverage reports to Codecov
-        continue-on-error: true
-        timeout-minutes: 5
-        uses: codecov/codecov-action@v7
-        with:
-          files: cobertura.xml
-          disable_search: true
-          token: ${{ secrets.CODECOV_TOKEN }}
-          slug: kinlab-ai/kin
-          fail_ci_if_error: false
+  # Code Coverage was deleted on 2026-10-12. It was continue-on-error, no
+  # ruleset or release gate read it, and it never produced a report: tarpaulin's
+  # instrumented build of the whole workspace outgrew the hosted runner's disk
+  # even after the 30 GiB reclaim. All five runs sampled on 2026-10-12 ran out
+  # of disk, four of them inside the runner's own worker ("No space left on
+  # device" with no step verdict at all) and the fifth inside tarpaulin, so
+  # Codecov had nothing to receive. Each run still cost a median 17 and up to
+  # 55 runner minutes and a red mark every release mint had to announce. Coverage worth reading needs a different design, such
+  # as a scoped `cargo llvm-cov` on a schedule, and that is its own decision.
 
   # The public install proof is what caught v0.5.38, and it caught it on the
   # tag, after the version was cut and the archives were built and published,
@@ -3362,7 +3443,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      && github.event_name != 'pull_request' }}
     # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
     runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
@@ -3466,7 +3547,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
-      && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-'))
+      && github.event_name != 'pull_request'
       && needs.install-proof-pr-build.result == 'success' }}
     uses: ./.github/workflows/install-proof.yml
     with:
@@ -3491,20 +3572,14 @@ jobs:
       - name: Require the pull request install proof
         env:
           EVENT_NAME: ${{ github.event_name }}
-          HEAD_REF: ${{ github.head_ref }}
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           BUILD_RESULT: ${{ needs.install-proof-pr-build.result }}
           PROOF_RESULT: ${{ needs.install-proof-pr.result }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            case "$HEAD_REF" in
-              feature/public-export-*) ;;
-              *)
-                echo "ordinary pull request: the install proof runs before the tag on main"
-                exit 0
-                ;;
-            esac
+            echo "pull request: the install proof runs on the merge queue's commit and on main"
+            exit 0
           fi
           if [ "$DOCS_ONLY" = "true" ]; then
             echo "documentation-only diff: no binaries changed, so the install proof has nothing to install"

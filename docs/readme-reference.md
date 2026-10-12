@@ -37,7 +37,7 @@ Once it finishes, reload your shell with this separate command:
 exec "$SHELL" -l
 ```
 
-The installer resolves the [latest stable release](https://github.com/firelock-ai/kin/releases/latest),
+The installer resolves the [latest stable release](https://github.com/kinlab-ai/kin/releases/latest),
 verifies its published SHA-256 checksum, installs the managed binaries under
 `~/.kin`, and launches setup. Running the explicit `agent` intent, which
 [step 5](#5-wire-your-agent) does once the graph exists, configures the built-in
@@ -50,11 +50,11 @@ channel. None of them is needed when the primary command above works:
 
 ```sh
 npm install -g @kinlab/kin@latest
-brew install firelock-ai/kin/kin
+brew install kinlab-ai/kin/kin
 ```
 
 Each archive and its `.sha256` file is published under
-`https://github.com/firelock-ai/kin/releases/latest/download/`, and the release
+`https://github.com/kinlab-ai/kin/releases/latest/download/`, and the release
 page lists the asset names.
 
 Confirm what you installed with `kin --version`, whichever path you took.
@@ -286,11 +286,11 @@ Kin is one system with a few clear public surfaces:
 
 | Surface | What it does |
 | --- | --- |
-| **[kin](https://github.com/firelock-ai/kin)** | Semantic system of record: CLI, daemon, graph lifecycle, MCP, review, provenance, and Git coexistence. |
-| **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** | Deprecated. Projected graph-owned files through normal filesystem calls; defocused 2026-09-11 in favor of `kin run -- <cmd>` sandboxes, kept public for reference. |
-| **[kin-editor](https://github.com/firelock-ai/kin-editor)** | VS Code access to the entity explorer, semantic search, trace, review, and rename surfaces. |
+| **[kin](https://github.com/kinlab-ai/kin)** | The repository itself: CLI, daemon, graph lifecycle, MCP, review, provenance, and Git coexistence. |
+| **[kin-vfs](https://github.com/kinlab-ai/kin-vfs)** | Deprecated. Projected graph-owned files through normal filesystem calls; defocused 2026-09-11 in favor of `kin run -- <cmd>` sandboxes, kept public for reference. |
+| **[kin-editor](https://github.com/kinlab-ai/kin-editor)** | VS Code access to the entity explorer, semantic search, trace, review, and rename surfaces. |
 | **[Kin MCP](mcp-tools.md)** | Typed graph tools for AI agents, bundled into `kin` and launched with `kin mcp start`. |
-| **[KinLab](https://kinlab.ai)** | Hosted collaboration and control plane. Public repository connection is not a first-run flow yet. |
+| **[KinLab](https://kinlab.ai)** | Our hosted product for teams, in development. Public repository connection is not a first-run flow yet. |
 
 ## How the pieces fit
 
@@ -343,22 +343,22 @@ Underneath those surfaces are the layers the system is built from:
 
 | Layer | Role |
 | --- | --- |
-| **[kin-db](https://github.com/firelock-ai/kin-db)** | Graph storage, snapshots, indexing, text search, and vector search. |
-| **[kin-model](https://github.com/firelock-ai/kin-model)** | Canonical types and domain models shared across the stack. |
-| **[kin-blobs](https://github.com/firelock-ai/kin-blobs)** | Content-addressable blob storage. |
-| **[kin-search](https://github.com/firelock-ai/kin-search)** | Lexical search primitives and staged retrieval. |
-| **[kin-vector](https://github.com/firelock-ai/kin-vector)** | Vector and nearest-neighbor substrate. |
-| **[kin-infer](https://github.com/firelock-ai/kin-infer)** | Inference and embedding substrate. |
-| **[kin-lsp](https://github.com/firelock-ai/kin-lsp)** | Language-server enrichment feeding the semantic layer. |
+| **[kin-db](https://github.com/kinlab-ai/kin-db)** | Graph storage, snapshots, indexing, text search, and vector search. |
+| **[kin-model](https://github.com/kinlab-ai/kin-model)** | Canonical types and domain models shared across the stack. |
+| **[kin-blobs](https://github.com/kinlab-ai/kin-blobs)** | Content-addressable blob storage. |
+| **[kin-search](https://github.com/kinlab-ai/kin-search)** | Lexical search primitives and staged retrieval. |
+| **[kin-vector](https://github.com/kinlab-ai/kin-vector)** | Vector and nearest-neighbor search. |
+| **[kin-infer](https://github.com/kinlab-ai/kin-infer)** | Model inference and embeddings. |
+| **[kin-lsp](https://github.com/kinlab-ai/kin-lsp)** | Language-server enrichment feeding the semantic layer. |
 
 These are implementation layers of one system, not separate products a new user
 needs to assemble. None of them is installed separately.
 
 ## Open source and the Kin ecosystem
 
-The core of Kin is open source under Apache-2.0: [kin](https://github.com/firelock-ai/kin),
-[kin-db](https://github.com/firelock-ai/kin-db), [kin-vfs](https://github.com/firelock-ai/kin-vfs)
-(deprecated, kept public for reference), and [kin-editor](https://github.com/firelock-ai/kin-editor),
+The core of Kin is open source under Apache-2.0: [kin](https://github.com/kinlab-ai/kin),
+[kin-db](https://github.com/kinlab-ai/kin-db), [kin-vfs](https://github.com/kinlab-ai/kin-vfs)
+(deprecated, kept public for reference), and [kin-editor](https://github.com/kinlab-ai/kin-editor),
 plus the supporting libraries kin-model, kin-blobs, kin-search, kin-vector, kin-infer, kin-lsp, and
 kin-actions.
 
@@ -366,7 +366,7 @@ kin-actions.
 hosted collaboration and control-plane layer described above.
 
 The same boundary applies to how benchmark work is shared. The [benchmark
-specification and a standalone, dependency-free bundle verifier](https://github.com/firelock-ai/kin-bench-spec)
+specification and a standalone, dependency-free bundle verifier](https://github.com/kinlab-ai/kin-bench-spec)
 are public, so a merge-trust benchmark claim can be checked without access to the
 runner that produced it. The runner and proof infrastructure that produce sealed evidence bundles (the
 orchestration, the pinned-release proof gate, and the hosted measurement
@@ -604,21 +604,21 @@ directory it ran in, and tells you to run `kin init` there and re-run setup.
 Claude Code, from inside a session:
 
 ```
-/plugin marketplace add firelock-ai/kin
+/plugin marketplace add kinlab-ai/kin
 /plugin install kin@kin
 ```
 
 Codex:
 
 ```sh
-codex plugin marketplace add firelock-ai/kin
+codex plugin marketplace add kinlab-ai/kin
 codex plugin add kin@kin
 ```
 
 Gemini CLI:
 
 ```sh
-gemini extensions install https://github.com/firelock-ai/kin
+gemini extensions install https://github.com/kinlab-ai/kin
 ```
 
 Cursor takes a one-click install link. Paste this into Cursor or into your
@@ -736,13 +736,13 @@ supported Unix host, use `kin vfs status`, which probes each projection mode and
 prints what is actually in force, then `kin setup status` and a real
 `kin-vfs exec --workspace . -- <command>` launch. The VFS launcher includes an
 interposition canary and reports when the operating system strips the shim.
-The [kin-vfs README](https://github.com/firelock-ai/kin-vfs#current-platform-and-package-boundaries)
+The [kin-vfs README](https://github.com/kinlab-ai/kin-vfs#current-platform-and-package-boundaries)
 contains the full boundary.
 
 Release assets are checksum-published and the release workflow runs anonymous
 installation, daemon/MCP, embedding, and real graph-backed VFS projection checks
 across its supported runner matrix. The workflow itself is public:
-[Install Proof](https://github.com/firelock-ai/kin/actions/workflows/install-proof.yml).
+[Install Proof](https://github.com/kinlab-ai/kin/actions/workflows/install-proof.yml).
 A green release establishes those exact artifacts and environments; it is not a
 claim that every distribution, tool, or repository shape is already covered.
 

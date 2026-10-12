@@ -45,13 +45,16 @@ class ExpectedSuite:
     report_path: str
 
 
+# In the order acceptance.yml declares the suites and the gate reads them.
+# Brownfield leads because it runs on a runner of its own; see the job comments
+# in acceptance.yml.
 EXPECTED_SUITES = (
-    ExpectedSuite("scripts/acceptance/magic_repro.py", "magic", "acceptance/magic.json"),
     ExpectedSuite(
         "scripts/acceptance/brownfield_repro.py",
         "brownfield",
         "acceptance/brownfield.json",
     ),
+    ExpectedSuite("scripts/acceptance/magic_repro.py", "magic", "acceptance/magic.json"),
     ExpectedSuite(
         "scripts/acceptance/response_budget_elisions.py",
         "response_budget",

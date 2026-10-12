@@ -15,3 +15,9 @@ c6792e701a0c7b548bad102ec109c8475e99da89:crates/kin-db/src/admission.rs:generic-
 4de560cf55965eea334659a6f2ce35cd53d47839:scripts/review-ui.test.cjs:generic-api-key:1010
 4de560cf55965eea334659a6f2ce35cd53d47839:scripts/review-ui.test.cjs:generic-api-key:1011
 4de560cf55965eea334659a6f2ce35cd53d47839:scripts/workspace-ui.test.cjs:generic-api-key:69
+# The same three findings under the reproducible export id of that
+# integration (each exported commit takes its source commit's date and the
+# kin-public-export committer identity).
+fd8f254db0de1a973afe853ff8c58e7995ff98d0:scripts/review-ui.test.cjs:generic-api-key:1010
+fd8f254db0de1a973afe853ff8c58e7995ff98d0:scripts/review-ui.test.cjs:generic-api-key:1011
+fd8f254db0de1a973afe853ff8c58e7995ff98d0:scripts/workspace-ui.test.cjs:generic-api-key:69
