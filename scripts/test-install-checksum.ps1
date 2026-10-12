@@ -398,9 +398,10 @@ if ($null -eq $X86Failure -or -not $X86Failure.Contains("32-bit PowerShell is no
 # Run the release workflow's own sidecar writer against stand-in archives and
 # read back the bytes it wrote. Set-Content ends a line with CRLF on Windows,
 # and a sidecar ending in CRLF names a file that sha256sum -c on Linux or macOS
-# cannot find. The statement is read from release.yml, so this proves the
+# cannot find. The statement is read from rc-build.yml, which packages the
+# archives a release ships, so this proves the
 # shipped writer rather than a copy of it.
-$ReleaseWorkflowPath = Join-Path (Split-Path -Parent $ScriptsDir) ".github/workflows/release.yml"
+$ReleaseWorkflowPath = Join-Path (Split-Path -Parent $ScriptsDir) ".github/workflows/rc-build.yml"
 $WorkflowLines = @(Get-Content -LiteralPath $ReleaseWorkflowPath)
 $WriterStart = -1
 for ($Index = 0; $Index -lt $WorkflowLines.Count; $Index++) {
@@ -411,7 +412,7 @@ for ($Index = 0; $Index -lt $WorkflowLines.Count; $Index++) {
     }
 }
 if ($WriterStart -lt 0) {
-    throw "release.yml no longer carries the Windows sidecar writer this harness proves"
+    throw "rc-build.yml no longer carries the Windows sidecar writer this harness proves"
 }
 $WriterEnd = -1
 for ($Index = $WriterStart + 1; $Index -lt $WorkflowLines.Count; $Index++) {
@@ -421,7 +422,7 @@ for ($Index = $WriterStart + 1; $Index -lt $WorkflowLines.Count; $Index++) {
     }
 }
 if ($WriterEnd -lt 0) {
-    throw "release.yml's Windows sidecar writer never closes"
+    throw "rc-build.yml's Windows sidecar writer never closes"
 }
 $Writer = ($WorkflowLines[$WriterStart..$WriterEnd] |
     ForEach-Object { $_.Substring([Math]::Min($WriterIndent.Length, $_.Length)) }) -join "`n"
