@@ -7,3 +7,11 @@ c6792e701a0c7b548bad102ec109c8475e99da89:crates/kin-db/src/admission.rs:generic-
 99d0db72d0a50ea7a9d6ff87adf576fff83b1d9d:crates/kin-db/src/admission.rs:generic-api-key:986
 99d0db72d0a50ea7a9d6ff87adf576fff83b1d9d:crates/kin-db/src/admission.rs:generic-api-key:987
 
+# Workspace and review UI test fixtures once used the made-up agent key
+# a1b2c3d4e5f60718, which reads as a generic API key. The fixtures now use
+# 00000000000000a1. The commit below is the 0.8.3 export's migration of the
+# integration that introduced it, exported with a fixed committer date so its
+# id is reproducible.
+4de560cf55965eea334659a6f2ce35cd53d47839:scripts/review-ui.test.cjs:generic-api-key:1010
+4de560cf55965eea334659a6f2ce35cd53d47839:scripts/review-ui.test.cjs:generic-api-key:1011
+4de560cf55965eea334659a6f2ce35cd53d47839:scripts/workspace-ui.test.cjs:generic-api-key:69
