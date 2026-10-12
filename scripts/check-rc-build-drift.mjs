@@ -131,6 +131,21 @@ export const DELTAS = [
   },
 ];
 
+// Matrix rows whose runner differs on purpose, by artifact. rc-build.yml builds
+// both macOS archives on a Depot Apple Silicon runner, where each build step
+// takes 12 to 21 minutes against 77 to 79 on release.yml's standard runners. release.yml stays on the standard pool: a tag freezes it, and a pool
+// that stops assigning runners would strand an immutable release. rc-build.yml
+// runs before any tag exists, so the same failure only delays a candidate.
+//
+// Each side must carry exactly the label declared here and the rest of the row
+// must match, so moving either file to a different runner is still drift until
+// this table says so, and a release.yml row that reaches the rc label makes its
+// entry stale rather than silently satisfied.
+export const RUNNER_DELTAS = new Map([
+  ["kin-macos-x86_64", { release: "macos-15-intel", rc: "depot-macos-26" }],
+  ["kin-macos-aarch64", { release: "macos-latest", rc: "depot-macos-26" }],
+]);
+
 // rc-build.yml declares skip_vfs on every row. Three shared steps read it, and
 // release.yml gets the key from the windows row rc-build.yml does not carry, so
 // without it actionlint rejects those steps against a matrix type with no such
@@ -273,13 +288,30 @@ export function check(releaseText, rcText) {
 
   const releaseRows = matrixRows(releaseJob, RELEASE_WORKFLOW);
   const rcRows = matrixRows(rcJob, RC_WORKFLOW);
+  for (const [artifact, runners] of RUNNER_DELTAS) {
+    if (!rcRows.has(artifact) || !releaseRows.has(artifact)) {
+      problems.push(`runner delta for ${artifact} names a row that ${RC_WORKFLOW} or ${RELEASE_WORKFLOW} does not build; the delta is stale`);
+      continue;
+    }
+    if (!releaseRows.get(artifact).includes(`os: ${runners.release}`)) {
+      problems.push(`runner delta for ${artifact} expects ${RELEASE_WORKFLOW} on ${runners.release}, which it no longer uses; the delta is stale`);
+    }
+    if (!rcRows.get(artifact).includes(`os: ${runners.rc}`)) {
+      problems.push(`runner delta for ${artifact} declares ${RC_WORKFLOW} on ${runners.rc}, which it does not use`);
+    }
+  }
   for (const [artifact, rcRow] of rcRows) {
     const releaseRow = releaseRows.get(artifact);
     if (!releaseRow) {
       problems.push(`${RC_WORKFLOW} builds ${artifact}, which ${RELEASE_WORKFLOW} does not publish`);
       continue;
     }
-    const trimmed = rcRow.filter((entry) => !RC_ONLY_MATRIX_KEYS.some((key) => entry.startsWith(`${key}:`)));
+    // A declared runner delta swaps exactly that label back before comparing,
+    // so every other key in the row is still held to release.yml's.
+    const runners = RUNNER_DELTAS.get(artifact);
+    const trimmed = rcRow
+      .filter((entry) => !RC_ONLY_MATRIX_KEYS.some((key) => entry.startsWith(`${key}:`)))
+      .map((entry) => (runners && entry === `os: ${runners.rc}` ? `os: ${runners.release}` : entry));
     if (JSON.stringify(trimmed) !== JSON.stringify(releaseRow)) {
       problems.push(
         `${RC_WORKFLOW}'s ${artifact} matrix row differs from ${RELEASE_WORKFLOW}'s.\n` +
@@ -312,6 +344,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }
   console.log(
     `${RC_WORKFLOW} mirrors ${RELEASE_WORKFLOW}'s build job: ` +
-      `${OMITTED_STEPS.length} steps omitted, ${ADDED_STEPS.length} candidate-only, ${DELTAS.length} deltas applied.`
+      `${OMITTED_STEPS.length} steps omitted, ${ADDED_STEPS.length} candidate-only, ${DELTAS.length} deltas applied, ` +
+      `${RUNNER_DELTAS.size} runner deltas declared.`
   );
 }

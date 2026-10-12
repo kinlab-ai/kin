@@ -65,11 +65,12 @@ PORTED_PROOF_FLOW = (
 )
 
 # A release tag freezes the workflow that its run will execute. Keep every
-# runner selected by the pretag build, tag mint, tagged release, recovery and
-# public install proof on the standard hosted pool, so a paid or custom pool
-# exhausting its budget cannot strand an immutable release. A deliberate new
-# label has to change this reviewed allowlist, which is the explicit gate for
-# expanding runner authority.
+# runner selected by the tag mint, tagged release, recovery and public install
+# proof, and by the pretag build apart from the one exception below, on the
+# standard hosted pool, so a paid or custom pool exhausting its budget cannot
+# strand an immutable release. A deliberate new label has to change this
+# reviewed allowlist, which is the explicit gate for expanding runner
+# authority.
 RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
     {
         "ubuntu-latest",
@@ -79,6 +80,18 @@ RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
         "windows-latest",
     }
 )
+# The one exception, and why it is safe. RC Build's build job runs before any
+# tag exists and only produces a candidate, so a paid pool that stops
+# assigning runners there delays a candidate and cannot strand a release.
+# Its two macOS rows build on this Depot Apple Silicon label, where each build
+# step takes 12 to 21 minutes against 77 to 79 on the standard runners. The label is
+# admitted for that one job and nowhere else: RC Build's capability job, the
+# tag mint, the tagged release, recovery and the public install proof stay on
+# the standard pool. scripts/check-rc-build-drift.mjs declares the same two
+# rows as its runner deltas.
+PRETAG_PAID_RUNNERS = {
+    (RC_BUILD, "build"): frozenset({"depot-macos-26"}),
+}
 RELEASE_CRITICAL_MATRIX_JOBS = frozenset(
     {
         (RC_BUILD, "build"),
@@ -1186,7 +1199,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/rc-build.yml",
         "build",
-    ): "3752b53d0a5a3297c2cca3c529999836d93e5502bcee2da04c592861ff7cdcce",
+    ): "22d9e7389fc4053a37e86b1eabf0b2da6e18ad3968c96b8e1f21eece4407f5b8",
     (
         ".github/workflows/rc-build.yml",
         "capability",
@@ -4112,10 +4125,11 @@ def assert_release_critical_runner_policy(
                         "release-critical runner policy cannot resolve the runner "
                         f"matrix at {workflow.name}:{job_id}"
                     )
+                admitted = RELEASE_CRITICAL_STANDARD_RUNNERS | PRETAG_PAID_RUNNERS.get(
+                    matrix_key, frozenset()
+                )
                 rejected = [
-                    label
-                    for label in matrix_runners
-                    if label not in RELEASE_CRITICAL_STANDARD_RUNNERS
+                    label for label in matrix_runners if label not in admitted
                 ]
                 if rejected:
                     raise AssertionError(
@@ -11942,6 +11956,12 @@ def main() -> None:
             "    runs-on: kin-16core\n",
         ),
         (
+            "tag mint moves onto the pretag Depot runner",
+            RELEASE_TAG,
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: depot-macos-26\n",
+        ),
+        (
             "tagged release returns to a paid runner",
             RELEASE,
             "          - os: macos-15-intel\n",
@@ -12006,6 +12026,38 @@ def main() -> None:
             "install-proof",
             '{"os":"macos-15-intel","setup-shell":"zsh"}',
             '{"os":"macos-15-large","setup-shell":"zsh"}',
+        ),
+        # The pretag Depot label is admitted for RC Build's build job alone.
+        # Each of these moves it somewhere a tag depends on, or widens the
+        # exception to a second paid label, and each must still be refused
+        # after its matrix contract is deliberately repinned.
+        (
+            "a repinned tagged-release matrix still rejects the pretag Depot runner",
+            RELEASE,
+            "build",
+            "          - os: macos-latest\n",
+            "          - os: depot-macos-26\n",
+        ),
+        (
+            "a repinned RC capability matrix still rejects the pretag Depot runner",
+            RC_BUILD,
+            "capability",
+            "          - os: macos-15-intel\n",
+            "          - os: depot-macos-26\n",
+        ),
+        (
+            "a repinned install-proof matrix still rejects the pretag Depot runner",
+            INSTALL_PROOF,
+            "install-proof",
+            '{"os":"macos-15-intel","setup-shell":"zsh"}',
+            '{"os":"depot-macos-26","setup-shell":"zsh"}',
+        ),
+        (
+            "a repinned RC build matrix still rejects a second Depot label",
+            RC_BUILD,
+            "build",
+            "          - os: depot-macos-26\n            target: aarch64-apple-darwin\n",
+            "          - os: depot-macos-15\n            target: aarch64-apple-darwin\n",
         ),
     ):
         repinned_spoof = dict(workflow_sources)
