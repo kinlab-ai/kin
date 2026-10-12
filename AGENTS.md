@@ -90,9 +90,13 @@ docs-only change needs no version bump.
 
 ## Landing
 
-kin is a classic direct-merge repository. Its merge-queue ruleset was disabled on 2026-08-27 and
-kept only for a one-step rollback. Seven required contexts on main, read from
-`/repos/firelock-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, `cargo-deny`,
-`gitleaks (full history)`, `Fast gate lint and policy`, `Fast gate build and tests` and
-`MCP surface contract`. Commit with `git commit -s`, and keep assistant-session traces out of the
+kin lands through a squash merge queue. Pull requests, export pull requests included, run a
+light admission set, and the queue runs the full CI, Acceptance, SAST, secret scan and RC Build on
+the exact commit that lands. Fourteen required contexts on main, read from
+`/repos/kinlab-ai/kin/rules/branches/main`: `DCO Sign-off`, `PR text hygiene`, `cargo-deny`,
+`gitleaks (full history)`, `Fast gate lint and policy`, `Fast gate build and tests`,
+`MCP surface contract`, `Check & Test (ubuntu-latest)`, `Check & Test (macos-latest)`,
+`Falsify guards`, `Feature permutation tests (ubuntu-latest)`,
+`Feature permutation tests (macos-latest)`, `Windows installer + vector release build` and
+`Product Acceptance`. Commit with `git commit -s`, and keep assistant-session traces out of the
 PR title and body, which `PR text hygiene` refuses.
