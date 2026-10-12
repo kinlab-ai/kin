@@ -240,12 +240,18 @@ impl LanguageAdapter for JavaScriptAdapter {
             })
             .collect();
 
-        // Annotate Calls/References relations with import_source
+        // Annotate Calls/References relations with import_source. Only a
+        // receiver-free name is the binding an import introduces. A member call
+        // such as `object.read()` names a property of whatever `object` holds,
+        // so a same-named `import { read }` is not its source, and pinning it
+        // there would bind the call to the imported function.
         for rel in &mut relations {
-            if matches!(
-                rel.kind,
-                kin_model::RelationKind::Calls | kin_model::RelationKind::References
-            ) {
+            if rel.receiver.is_none()
+                && matches!(
+                    rel.kind,
+                    kin_model::RelationKind::Calls | kin_model::RelationKind::References
+                )
+            {
                 if let Some(&module) = import_map.get(rel.dst_name.as_str()) {
                     rel.import_source = Some(module.to_string());
                 }
@@ -2750,6 +2756,20 @@ fn extract_js_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
                         "named_imports" => {
                             extract_js_named_imports(&clause_child, source, &mut specifiers);
                         }
+                        // `import * as ns from './mod'` binds the module's
+                        // namespace object, recorded exactly as the TypeScript
+                        // adapter records it, so `ns.member(...)` resolves
+                        // inside that module instead of by its bare name.
+                        "namespace_import" => {
+                            if let Some(namespace) =
+                                super::typescript::extract_namespace_import_name(
+                                    &clause_child,
+                                    source,
+                                )
+                            {
+                                specifiers.push(namespace);
+                            }
+                        }
                         "import_specifier" => {
                             if let Some(import_name) =
                                 extract_single_import_name(&clause_child, source)
@@ -5137,6 +5157,40 @@ exports.static = require('serve-static');
         assert_eq!(star.module_path, "./shared");
         assert_eq!(star.specifiers.len(), 1);
         assert_eq!(star.specifiers[0].local_name, "*");
+    }
+
+    #[test]
+    fn parse_js_namespace_import_binds_its_local_name() {
+        let adapter = JavaScriptAdapter;
+        let source = b"import * as util from './util';\nutil.finalize();\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("test.js"))
+            .unwrap();
+        assert_eq!(output.imports.len(), 1);
+        let namespace = &output.imports[0];
+        assert_eq!(namespace.module_path, "./util");
+        assert_eq!(namespace.specifiers.len(), 1);
+        assert_eq!(namespace.specifiers[0].local_name, "util");
+        assert_eq!(namespace.specifiers[0].original_name.as_deref(), Some("*"));
+        assert!(namespace.specifiers[0].site.is_some());
+    }
+
+    #[test]
+    fn parse_js_member_call_does_not_take_a_same_named_import() {
+        let adapter = JavaScriptAdapter;
+        let source = b"import { read } from './provider';\nexport function f(object) {\n  object.read();\n  return read();\n}\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("test.js"))
+            .unwrap();
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::Calls && rel.dst_name == "read")
+            .map(|rel| (rel.receiver.as_deref(), rel.import_source.as_deref()))
+            .collect();
+        assert_eq!(calls, [(Some("object"), None), (None, Some("./provider"))]);
     }
 
     #[test]

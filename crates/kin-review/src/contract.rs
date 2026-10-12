@@ -91,6 +91,17 @@ impl ContractChange {
         matches!(self, Self::Signature | Self::VisibilityReduced)
     }
 
+    /// How far this reading reaches what relies on the entity.
+    pub fn reach(self) -> ConsumerReach {
+        if self.consumers_unaffected() {
+            ConsumerReach::Unaffected
+        } else if self.breaks_consumers() {
+            ConsumerReach::Breaks
+        } else {
+            ConsumerReach::MayNeedReview
+        }
+    }
+
     /// The machine-readable name of this reading.
     pub fn label(self) -> &'static str {
         match self {
@@ -101,6 +112,39 @@ impl ContractChange {
             Self::Body => "body_changed",
             Self::VisibilityReduced => "visibility_reduced",
             Self::Signature => "signature_changed",
+        }
+    }
+}
+
+/// How far a change reaches the entities that rely on what it changed.
+///
+/// Ordered by how much it asks of them, so a range of changes reaches as far
+/// as the one of them that reaches furthest. How many entities rely on a
+/// change measures how much a break would cost, which matters only as far as
+/// the change can break them: a docstring edit relied on by a thousand callers
+/// asks nothing of any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConsumerReach {
+    /// Nothing a consumer relies on moved: its signature held and its code
+    /// reads or behaves as it did.
+    Unaffected,
+    /// What a consumer runs may have moved, and nothing it binds to did: a
+    /// body that changed under a signature that held, a move, or a new entity.
+    MayNeedReview,
+    /// What a consumer binds to moved or is gone: a signature change, a lost
+    /// public visibility or a removal.
+    Breaks,
+}
+
+impl ConsumerReach {
+    /// How far one entity change reaches.
+    pub fn of(change: &crate::diff::EntityChangeKind) -> Self {
+        match change {
+            crate::diff::EntityChangeKind::Added(_) => Self::MayNeedReview,
+            crate::diff::EntityChangeKind::Modified { old, new } => {
+                ContractChange::of(old, new).reach()
+            }
+            crate::diff::EntityChangeKind::Removed { .. } => Self::Breaks,
         }
     }
 }
@@ -211,6 +255,28 @@ mod tests {
             ContractChange::CommentsOrLayout
         );
         assert!(ContractChange::of(&old, &new).consumers_unaffected());
+    }
+
+    #[test]
+    fn a_reading_reaches_as_far_as_what_it_asks_of_consumers() {
+        let old = entity("def want_bytes(s)", 1);
+        let commented = entity("def want_bytes(# a comment s)", 1);
+        let body = entity("def want_bytes(s)", 2);
+        let widened = entity("def want_bytes(s, encoding)", 3);
+        assert_eq!(
+            ContractChange::of(&old, &commented).reach(),
+            ConsumerReach::Unaffected
+        );
+        assert_eq!(
+            ContractChange::of(&old, &body).reach(),
+            ConsumerReach::MayNeedReview
+        );
+        assert_eq!(
+            ContractChange::of(&old, &widened).reach(),
+            ConsumerReach::Breaks
+        );
+        assert!(ConsumerReach::Unaffected < ConsumerReach::MayNeedReview);
+        assert!(ConsumerReach::MayNeedReview < ConsumerReach::Breaks);
     }
 
     /// Falsify by trusting a zero hash: two records nothing measured would

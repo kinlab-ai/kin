@@ -409,7 +409,6 @@ crates/kin-cli/src/commands/setup.rs	record_setup_ledger	std::fs::read_to_string
 crates/kin-cli/src/commands/setup.rs	recorded_config_recovery_path	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	remove_full_install_root	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	remove_full_install_root_with_hooks	std::fs::symlink_metadata
-crates/kin-cli/src/commands/setup.rs	request_notification_authorization	std::process::Command::new
 crates/kin-cli/src/commands/setup.rs	require_windows_path_absent	std::fs::symlink_metadata
 crates/kin-cli/src/commands/setup.rs	resolve_mcp_launcher	std::fs::canonicalize
 crates/kin-cli/src/commands/setup.rs	resolve_terminal_kin	std::path::Path::canonicalize
@@ -1773,6 +1772,10 @@ crates/kin-migrate/src/scanner.rs	scan_repo	std::path::Path::canonicalize
 crates/kin-migrate/src/scanner.rs	scan_repo	std::path::Path::exists
 crates/kin-notifier-macos/src/macos.rs	run_action	std::path::Path::is_file
 crates/kin-notifier-macos/src/macos.rs	run_action	std::process::Command::new
+crates/kin-notify/src/authorization.rs	authorization_state	std::process::Command::new
+crates/kin-notify/src/authorization.rs	request	std::process::Command::new
+crates/kin-notify/src/authorization.rs	requester_stderr	std::fs::OpenOptions::open
+crates/kin-notify/src/authorization.rs	requester_stderr	std::fs::create_dir_all
 crates/kin-notify/src/lib.rs	bundle_candidates	std::fs::canonicalize
 crates/kin-notify/src/lib.rs	clear	std::fs::remove_file
 crates/kin-notify/src/lib.rs	clear	std::path::Path::exists

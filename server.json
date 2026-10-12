@@ -8,12 +8,12 @@
     "url": "https://github.com/firelock-ai/kin",
     "source": "github"
   },
-  "version": "0.8.2",
+  "version": "0.8.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@kinlab/kin",
-      "version": "0.8.2",
+      "version": "0.8.3",
       "packageArguments": [
         {
           "type": "positional",

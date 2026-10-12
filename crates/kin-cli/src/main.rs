@@ -126,7 +126,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Coordinate work",
         &[
-            "work", "feature", "todo", "spec", "note", "intent", "traffic", "notify",
+            "work", "feature", "todo", "spec", "note", "intent", "traffic", "agents", "notify",
         ],
     ),
     (
@@ -1549,6 +1549,12 @@ enum Command {
         #[command(subcommand)]
         action: TrafficAction,
     },
+    /// Show the AI agents working in this repository and what they do through Kin
+    Agents {
+        /// Print the daemon's agents payload as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage assistant adapters
     Assistant {
         #[command(subcommand)]
@@ -2122,6 +2128,24 @@ enum NotifyAction {
     /// Report which backend would deliver and what is currently held back
     Status {
         /// Emit the report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Ask macOS whether Kin may send you notifications
+    ///
+    /// Run it in Terminal on the Mac's own screen: macOS shows the request
+    /// there, so from an SSH session it asks nothing and says so. A decision
+    /// macOS already holds is reported, never asked again.
+    Authorize {
+        /// Seconds to wait for the answer; an unanswered request stays open
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            default_value_t = kin_notify::authorization::DEFAULT_WAIT.as_secs(),
+            value_parser = clap::value_parser!(u64).range(1..=600)
+        )]
+        wait: u64,
+        /// Emit the outcome as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -5334,6 +5358,7 @@ fn run() -> Result<()> {
                     TrafficAction::Show { scope } => commands::traffic::run(scope).await,
                     TrafficAction::Sessions => commands::traffic::sessions().await,
                 },
+                Command::Agents { json } => commands::agents::run(json).await,
                 Command::Assistant { action } => match action {
                     AssistantAction::Install { assistant } => {
                         commands::assistant::install(assistant).await
@@ -5586,6 +5611,9 @@ fn run() -> Result<()> {
                             commands::notify::clear(&key, json)
                         }
                         Some(NotifyAction::Status { json }) => commands::notify::status(json),
+                        Some(NotifyAction::Authorize { wait, json }) => {
+                            commands::notify::authorize(std::time::Duration::from_secs(wait), json)
+                        }
                         None => {
                             // clap cannot express "required unless a subcommand
                             // was given", so the pairing is checked here.

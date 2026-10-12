@@ -115,6 +115,7 @@
 //!   stream ineligible rather than reporting a misleading success.
 
 pub(crate) mod accepted_enrichment;
+pub mod agent_activity;
 pub mod api;
 mod artifact_commit;
 pub mod auth_rotation;

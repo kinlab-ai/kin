@@ -1175,7 +1175,12 @@ fn collect_modified_comments(
     // No test coverage. Keyed on THIS entity's covering tests and suppressed
     // when the diff-wide impact signal is absent — that deficit is already
     // reported as an `impact_signal_absent` evidence gap.
-    if new.role != EntityRole::Test && !impact.is_empty() && entity_covering_tests == 0 {
+    // A comment or a docstring changes nothing a test could catch.
+    if new.role != EntityRole::Test
+        && !impact.is_empty()
+        && entity_covering_tests == 0
+        && !crate::contract::ContractChange::of(old, new).consumers_unaffected()
+    {
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,

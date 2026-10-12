@@ -4666,6 +4666,101 @@ mod tests {
         }
     }
 
+    /// A guide's risk follows what the change asks of the places that rely
+    /// on it, not how many there are. Twelve callers and no test reach one
+    /// function: a comment inside its parameter list and a docstring are low,
+    /// a body change under a signature that held is medium, and a signature
+    /// change is high, on the step and in the summary alike.
+    ///
+    /// Falsify by reading the review's blast radius without how far the
+    /// change reaches: the body change then reads high, beside a verdict that
+    /// says its callers only may need review.
+    #[test]
+    fn risk_follows_the_verdict_however_many_places_rely_on_it() {
+        let hash = |byte: u8| kin_model::Hash256::from_bytes([byte; 32]);
+        let graph = kin_db::InMemoryGraph::new();
+        let mut want_bytes = function("wantBytes", "src/encoding.ts", 1);
+        want_bytes.fingerprint.equivalence_hash = hash(11);
+        let callers: Vec<Entity> = (0..12)
+            .map(|index| function(&format!("caller{index}"), "src/callers.ts", 20 + index))
+            .collect();
+        let mut everything: Vec<&Entity> = vec![&want_bytes];
+        everything.extend(callers.iter());
+        let root = commit(
+            &graph,
+            vec![],
+            "Add wantBytes and its callers",
+            added(&everything),
+            callers
+                .iter()
+                .map(|caller| calls(caller, &want_bytes))
+                .collect(),
+        );
+
+        let mut commented = want_bytes.clone();
+        commented.signature =
+            "function wantBytes(// Bytes pass through unchanged. projectId: string)".to_string();
+        let mut documented = want_bytes.clone();
+        documented.doc_summary = Some("Return bytes, encoding a string first.".to_string());
+        documented.fingerprint.behavior_hash = hash(21);
+        documented.fingerprint.ast_hash = hash(21);
+        let mut body = want_bytes.clone();
+        body.fingerprint.behavior_hash = hash(22);
+        body.fingerprint.ast_hash = hash(22);
+        body.fingerprint.equivalence_hash = hash(23);
+        let mut signature = want_bytes.clone();
+        signature.signature = "function wantBytes(projectId: string, team: string)".to_string();
+        signature.fingerprint.behavior_hash = hash(24);
+        signature.fingerprint.ast_hash = hash(24);
+        signature.fingerprint.signature_hash = hash(24);
+        signature.fingerprint.equivalence_hash = hash(25);
+
+        for (new, message, verdict, risk) in [
+            (
+                commented,
+                "Say that bytes pass through",
+                "needs_no_update",
+                "low",
+            ),
+            (documented, "Describe wantBytes", "needs_no_update", "low"),
+            (
+                body,
+                "Fall back to strict errors",
+                "may_need_review",
+                "medium",
+            ),
+            (signature, "Scope wantBytes by team", "not_updated", "high"),
+        ] {
+            let head = commit(
+                &graph,
+                vec![root],
+                message,
+                vec![EntityDelta::Modified {
+                    old: want_bytes.clone(),
+                    new,
+                }],
+                vec![],
+            );
+            let guide = guide_of(&graph, head);
+            let text = guide_text(&guide);
+            assert_eq!(guide.summary.recorded_consumers, 12, "{text}");
+            let step = &guide.chapters[0].steps[0];
+            assert_eq!(
+                step.consumer_verdict
+                    .as_ref()
+                    .map(|found| found.verdict.as_str()),
+                Some(verdict),
+                "{message}: {text}"
+            );
+            assert_eq!(step.risk, risk, "{message}: the step's risk: {text}");
+            assert_eq!(
+                guide.summary.risk, risk,
+                "{message}: the summary's risk: {text}"
+            );
+            assert_eq!(guide.chapters[0].risk, risk, "{message}: {text}");
+        }
+    }
+
     /// Entities that changed together and call each other are one chapter,
     /// read callee first. What nothing connects or reaches is grouped apart.
     #[test]

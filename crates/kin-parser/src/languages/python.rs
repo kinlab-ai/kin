@@ -21,6 +21,10 @@ use crate::nested::{
 
 #[path = "python_fields.rs"]
 mod fields;
+#[path = "python_guards.rs"]
+mod guards;
+#[path = "python_member_values.rs"]
+mod member_values;
 
 /// Every public name CPython's `builtins` module binds, sorted so
 /// [`is_python_builtin_name`] can binary-search it.
@@ -311,6 +315,7 @@ impl LanguageAdapter for PythonAdapter {
         let mut guarded_imports: Vec<FileImport> = Vec::new();
         let mut out = PyExtraction::default();
         let root = tree.root_node();
+        out.module_names = guards::ModuleNames::of(root, source);
         let mut cursor = root.walk();
 
         // In Python, each `.py` file IS a module (PEP 328); `__init__.py`
@@ -427,6 +432,7 @@ impl LanguageAdapter for PythonAdapter {
                     receiver_types: &PythonReceiverTypes::new(),
                     frames: &[],
                     skip: &walked,
+                    module_names: &out.module_names,
                 },
                 &mut swept,
                 &mut swept_audit,
@@ -626,6 +632,10 @@ struct PyExtraction {
     ambiguous_definitions: std::collections::HashSet<usize>,
     ambiguous_names: std::collections::HashSet<String>,
     ambiguous_class_bindings: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// How the module binds its names, read once before the walk.
+    module_names: guards::ModuleNames,
+    /// The names each class binds as data, by class node, read once per class.
+    class_data: std::collections::HashMap<usize, std::collections::HashSet<String>>,
 }
 
 /// Where in the file's lexical structure a node sits.
@@ -871,6 +881,9 @@ struct PyCallScope<'a> {
     frames: &'a [std::rc::Rc<PyFrame>],
     /// Nested definitions whose calls belong to their own entities.
     skip: &'a std::collections::HashSet<usize>,
+    /// How the module binds its names, which decides whether an
+    /// `isinstance` guard is the builtin and whether its classes are grounded.
+    module_names: &'a guards::ModuleNames,
 }
 
 /// The name a `def` or `class` statement binds, looking through a decorator
@@ -1445,10 +1458,24 @@ fn extract_py_node(
                     receiver_types: &frame.receiver_types,
                     frames: &body_scope.frames,
                     skip: &nested,
+                    module_names: &out.module_names,
                 },
                 &mut out.relations,
                 &mut out.call_audit,
             );
+            if kind == EntityKind::Method {
+                if let Some(class) = scope.class_ctx.as_deref() {
+                    member_values::push_self_member_values(
+                        node,
+                        source,
+                        &name,
+                        class,
+                        &nested,
+                        &mut out.class_data,
+                        &mut out.relations,
+                    );
+                }
+            }
             extract_value_refs_from_definition(
                 node,
                 source,
@@ -1645,6 +1672,7 @@ fn extract_py_node(
                                     .map_or(&no_types, |frame| &frame.receiver_types),
                                 frames: &scope.frames,
                                 skip: &nested,
+                                module_names: &out.module_names,
                             },
                             &mut out.relations,
                             &mut out.call_audit,
@@ -3585,29 +3613,31 @@ fn extract_calls_from_context(
                     Some(callee.name.clone()),
                 ));
             } else if let Some(callee) = callee {
-                let site = RelationSite {
-                    syntactic_role: python_call_is_raise_target(&child)
-                        .then_some(crate::extract::RelationSyntacticRole::RaiseTarget),
-                    ..site_from_node(&child)
-                };
-                relations.push(ExtractedRelation {
-                    // The call expression itself, so a reference row can report the
-                    // line the call is written on rather than the line the caller's
-                    // definition starts on.
-                    site: Some(site),
-                    receiver: callee.receiver,
-                    call_shape: Some(extract_call_arg_shape(&child, source)),
-                    kind: kin_model::RelationKind::Calls,
-                    src_name: context_name.to_string(),
-                    dst_name: callee.name.clone(),
-                    import_source: callee.import_source,
-                });
-                if !callee.resolution_proven {
-                    relations.push(scoped_call_extraction_incomplete_marker(
-                        context_name.into(),
-                        site_from_node(&child),
-                        Some(callee.name),
-                    ));
+                match python_call_receiver_guard(&child, &callee, source, scope.module_names) {
+                    guards::ReceiverGuard::Classes { guard, classes } => {
+                        push_python_guarded_calls(
+                            &child,
+                            &guard,
+                            &classes,
+                            callee,
+                            context_name,
+                            source,
+                            relations,
+                        );
+                    }
+                    // The guard says the receiver is something this file
+                    // cannot name, so no same-named member anywhere is
+                    // evidence of the destination. The site stays a gap.
+                    guards::ReceiverGuard::Ungrounded => {
+                        relations.push(scoped_call_extraction_incomplete_marker(
+                            context_name.into(),
+                            site_from_node(&child),
+                            Some(callee.name),
+                        ));
+                    }
+                    guards::ReceiverGuard::Unguarded => {
+                        push_python_named_call(&child, callee, context_name, source, relations);
+                    }
                 }
             } else {
                 relations.push(scoped_call_extraction_incomplete_marker(
@@ -3636,6 +3666,104 @@ fn extract_calls_from_context(
         // Recurse into child nodes. Positive extraction is unchanged; a nested
         // execution scope above cannot provide caller-specific negative evidence.
         extract_calls_from_context(&child, source, scope, relations, call_audit);
+    }
+}
+
+/// The `isinstance` guard on the receiver of a member call, for a call whose
+/// receiver nothing else typed. A call the parser already pinned to an owner,
+/// a `raise` operand and a call through anything but a plain name are left
+/// as they were.
+fn python_call_receiver_guard<'tree>(
+    call: &tree_sitter::Node<'tree>,
+    callee: &PythonNamedCallee,
+    source: &[u8],
+    module_names: &guards::ModuleNames,
+) -> guards::ReceiverGuard<'tree> {
+    if callee.name.contains('.') || callee.receiver.is_none() || python_call_is_raise_target(call) {
+        return guards::ReceiverGuard::Unguarded;
+    }
+    let Some(receiver) = call
+        .child_by_field_name("function")
+        .filter(|function| function.kind() == "attribute")
+        .and_then(|function| function.child_by_field_name("object"))
+    else {
+        return guards::ReceiverGuard::Unguarded;
+    };
+    guards::receiver_guard(*call, receiver, source, module_names)
+}
+
+/// One possible-target relation per guard class, all on the call's one site,
+/// plus the record naming the guard and the gap the guard cannot close: a
+/// subclass passes the same guard, so no one body is certified to run.
+fn push_python_guarded_calls(
+    call: &tree_sitter::Node,
+    guard: &tree_sitter::Node,
+    classes: &[String],
+    callee: PythonNamedCallee,
+    context_name: &str,
+    source: &[u8],
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let site = RelationSite {
+        syntactic_role: Some(crate::extract::RelationSyntacticRole::PythonGuardedReceiver),
+        ..site_from_node(call)
+    };
+    let shape = extract_call_arg_shape(call, source);
+    for class in classes {
+        relations.push(ExtractedRelation {
+            site: Some(site.clone()),
+            receiver: callee.receiver.clone(),
+            call_shape: Some(shape.clone()),
+            kind: kin_model::RelationKind::Calls,
+            src_name: context_name.to_string(),
+            dst_name: format!("{class}.{}", callee.name),
+            import_source: None,
+        });
+    }
+    relations.push(crate::file_evidence::receiver_guard_record(
+        &site_from_node(call),
+        site_from_node(guard),
+        guard.utf8_text(source).unwrap_or_default(),
+    ));
+    relations.push(scoped_call_extraction_incomplete_marker(
+        context_name.into(),
+        site_from_node(call),
+        Some(callee.name),
+    ));
+}
+
+/// The relation for a call whose callee the parser named, with the gap marker
+/// when that name does not prove the destination.
+fn push_python_named_call(
+    call: &tree_sitter::Node,
+    callee: PythonNamedCallee,
+    context_name: &str,
+    source: &[u8],
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let site = RelationSite {
+        syntactic_role: python_call_is_raise_target(call)
+            .then_some(crate::extract::RelationSyntacticRole::RaiseTarget),
+        ..site_from_node(call)
+    };
+    relations.push(ExtractedRelation {
+        // The call expression itself, so a reference row can report the line
+        // the call is written on rather than the line the caller's definition
+        // starts on.
+        site: Some(site),
+        receiver: callee.receiver,
+        call_shape: Some(extract_call_arg_shape(call, source)),
+        kind: kin_model::RelationKind::Calls,
+        src_name: context_name.to_string(),
+        dst_name: callee.name.clone(),
+        import_source: callee.import_source,
+    });
+    if !callee.resolution_proven {
+        relations.push(scoped_call_extraction_incomplete_marker(
+            context_name.into(),
+            site_from_node(call),
+            Some(callee.name),
+        ));
     }
 }
 

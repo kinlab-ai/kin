@@ -293,6 +293,7 @@ function browserFixture({ initial = "ancestor", history = ["head", "ancestor"], 
           else if (name === "working") body = guide("working", "WORKSPACE");
           else if (name === "guide") body = guide(parsed.searchParams.has("base") ? "range" : "change", parsed.searchParams.get("change") || "head");
           else if (name === "reviews") body = { reviews: [], reviews_total: 0 };
+          else if (name === "change-agent") body = network.changeAgent || { agent: null };
           else throw new Error(`Unexpected request: ${url}`);
         }
         if ((withSteps || withSource) && (name === "guide" || name === "working")) {
@@ -1001,6 +1002,28 @@ test("a guide counts relations that changed apart from ones that only moved, and
   const author = mainOf(browser).querySelector(".eyebrow").querySelectorAll("span").find((span) => span.textContent === "Armin Ronacher");
   assert.ok(author, "the author reads as a person");
   assert.match(author.getAttribute("title"), /armin@example.invalid/, "the recorded signature stays one hover away");
+});
+
+test("an agent's change names the agent and what it looked at first, and a person's change has no such line", async () => {
+  const id = "c".repeat(64);
+  const [first, second, third] = ["5a1c7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10", "9e2b7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10", "0c3d7a4e-8d55-4d0b-a7a4-0b1f1b8f6d10"];
+  const browser = browserFixture({ initial: id, history: [id], shapeGuide: (body) => body.kind === "change" ? { ...body, change: { ...body.change, author: "Claude Code", author_recorded: null, agent: { name: "Claude Code", key: "a1b2c3d4e5f60718" } } } : body });
+  browser.network.changeAgent = { agent: { name: "Claude Code", key: "a1b2c3d4e5f60718", state: "idle" },
+    looked_at: { count: 6, complete: true, entity_ids: [first, second, third] },
+    names: { [first]: { label: "Signer.verify_signature" }, [second]: { label: "want_bytes" }, [third]: { label: "Signer" } } };
+  await browser.start();
+  await browser.clock.advance(10);
+  const line = browser.document.getElementById("main").querySelectorAll("p").find((node) => node.className === "agent-line");
+  assert.ok(line, "the agent line is drawn under the eyebrow");
+  assert.equal(line.textContent, "Claude Code made this change after looking at 6 entities: Signer.verify_signature, want_bytes, Signer and 3 others.");
+  assert.equal(browser.network.count("change-agent"), 1);
+  assert.doesNotMatch(line.textContent, /a1b2c3d4|mcp-agent|session/);
+
+  const person = browserFixture({ initial: id, history: [id] });
+  await person.start();
+  await person.clock.advance(10);
+  assert.equal(person.document.getElementById("main").querySelectorAll("p").find((node) => node.className === "agent-line"), undefined);
+  assert.equal(person.network.count("change-agent"), 0);
 });
 
 // ── Plain words: what the page says, and what it never says ───────────────

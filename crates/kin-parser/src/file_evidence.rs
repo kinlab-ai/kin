@@ -264,6 +264,78 @@ pub fn call_extraction_gaps_of(relations: &[ExtractedRelation]) -> Vec<CallExtra
         .collect()
 }
 
+/// The guard that narrows the receiver of one call site. Payload
+/// `call_start_byte<US>call_end_byte<US>guard_text`; the site is the guard
+/// expression. The call's own relations carry
+/// [`crate::RelationSyntacticRole::PythonGuardedReceiver`], and this record is
+/// how a reader of the linked edge can say which guard admitted its target.
+pub const RECEIVER_GUARD_RECORD: &str = "kin-internal://file-evidence/v1/receiver-guard";
+
+/// How much of a guard's source text a record keeps. A guard is one short
+/// expression; the bound only stops a pathological one from riding along.
+const RECEIVER_GUARD_TEXT_CAP: usize = 160;
+
+/// The guard admitting the possible receiver classes of one call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiverGuard {
+    pub call_start_byte: usize,
+    pub call_end_byte: usize,
+    /// The guard expression as written, whitespace collapsed and bounded.
+    pub text: String,
+    pub site: RelationSite,
+}
+
+/// Record the guard expression that narrows the receiver of the call at
+/// `call`.
+pub fn receiver_guard_record(
+    call: &RelationSite,
+    guard: RelationSite,
+    text: &str,
+) -> ExtractedRelation {
+    let text: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(SEPARATOR, " ")
+        .chars()
+        .take(RECEIVER_GUARD_TEXT_CAP)
+        .collect();
+    record(
+        RECEIVER_GUARD_RECORD,
+        Some(format!(
+            "{}{SEPARATOR}{}{SEPARATOR}{text}",
+            call.start_byte, call.end_byte
+        )),
+        Some(RelationSite {
+            syntactic_role: None,
+            ..guard
+        }),
+    )
+}
+
+/// The receiver guards a file's raw relations list, keyed by the byte range of
+/// the call each one narrows.
+pub fn receiver_guards_of(
+    relations: &[ExtractedRelation],
+) -> std::collections::HashMap<(usize, usize), ReceiverGuard> {
+    relations
+        .iter()
+        .filter_map(|relation| {
+            let fields = fields(relation, RECEIVER_GUARD_RECORD)?;
+            let [start, end, text] = fields.as_slice() else {
+                return None;
+            };
+            let guard = ReceiverGuard {
+                call_start_byte: start.parse().ok()?,
+                call_end_byte: end.parse().ok()?,
+                text: text.clone(),
+                site: relation.site.clone()?,
+            };
+            Some(((guard.call_start_byte, guard.call_end_byte), guard))
+        })
+        .collect()
+}
+
 /// Attach the file evidence an adapter-independent pass can take from a parse:
 /// the declaration census when the adapter takes one, and the parse's error
 /// regions. Called by every ingest path right after extraction, before the
@@ -343,6 +415,25 @@ mod tests {
                 owner: Some("outer".into()),
                 site: site(40),
             }]
+        );
+    }
+
+    #[test]
+    fn a_receiver_guard_round_trips_by_its_call_range_and_is_reserved() {
+        let guard = receiver_guard_record(&site(50), site(40), "isinstance(c,\n  AliasPath)");
+        assert!(is_reserved_parser_record(&guard));
+        assert!(!crate::extract::is_call_extraction_incomplete_marker(
+            &guard
+        ));
+        let guards = receiver_guards_of(&[guard]);
+        assert_eq!(
+            guards.get(&(50, 53)),
+            Some(&ReceiverGuard {
+                call_start_byte: 50,
+                call_end_byte: 53,
+                text: "isinstance(c, AliasPath)".into(),
+                site: site(40),
+            })
         );
     }
 

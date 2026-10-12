@@ -12,9 +12,11 @@
   const rawBase = document.body.dataset.apiBase || "";
   const apiBase = rawBase === "__KIN_BASE__" ? "" : rawBase.replace(/\/$/, "");
   const graphApi = () => globalThis.KinWorkspaceGraph || null;
+  const agentsApi = () => globalThis.KinWorkspaceAgents || null;
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  const ROUTES = ["home", "explore", "entity", "changes", "branches"];
-  const TITLES = { home: "Home", explore: "Explore", entity: "Entity", changes: "Changes", branches: "Branches" };
+  const ROUTES = ["home", "agents", "explore", "entity", "changes", "branches"];
+  const TITLES = { home: "Home", agents: "Agents", explore: "Explore", entity: "Entity", changes: "Changes", branches: "Branches" };
+  const AGENT_KEY = /^[0-9a-f]{16}$/;
 
   // Reads shared by every view. Optional reads are newer endpoints: when the
   // server does not offer one, the page uses the older read it replaces.
@@ -29,8 +31,9 @@
     graph: "/api/workspace/graph?query=&offset=0",
     overview: "/api/workspace/overview",
     map: "/api/workspace/map",
+    agents: "/api/workspace/agents",
   };
-  const OPTIONAL = new Set(["overview", "map"]);
+  const OPTIONAL = new Set(["overview", "map", "agents"]);
   // The graph sample is the older server's stand-in for the overview and the
   // map. It is read only when one of those is not offered.
   const needsGraph = () => read("overview").missing || read("map").missing;
@@ -46,6 +49,7 @@
     graph: "Kin couldn't load this code's entities.",
     overview: "Kin couldn't load the summary.",
     map: "Kin couldn't load the map.",
+    agents: "Kin couldn't load which agents are connected.",
   };
   /** Whether a failure only means Kin took too long, so trying again later may work. */
   const isSlow = (detail) => /did not answer within|took longer than|timed out|timeout/i.test(String(detail || ""));
@@ -60,6 +64,7 @@
     disposers: [],
     reviewQuery: "",
     reviewFilter: "all",
+    authorFilter: "all",
     rangeBase: null,
     rangeHead: "HEAD",
     explore: { query: "", results: null, error: null, busy: false, request: 0, offset: 0, active: -1 },
@@ -325,6 +330,7 @@
       if (key === "graph") graphApi()?.graphData?.(data);
       if (key === "map" && (!Array.isArray(data.nodes) || (data.schema && data.schema !== "kin.workspace.map.v1"))) throw new Error("The repository map was not returned in a readable form.");
       if (key === "overview" && (data.schema && data.schema !== "kin.workspace.overview.v1")) throw new Error("The repository summary was not returned in a readable form.");
+      if (key === "agents" && (!Array.isArray(data.agents) || data.schema !== "kin.workspace.agents.v1")) throw new Error("The agents were not returned in a readable form.");
       const sig = JSON.stringify(data);
       resource.changed = sig !== resource.sig;
       resource.sig = sig;
@@ -398,7 +404,7 @@
       } finally {
         batch.forEach((id) => state.countsAsked.delete(id));
       }
-      for (const id of ["home-changes", "changes-results"]) paint(id);
+      for (const id of ["home-changes", "changes-results", "home-agents", "agents-detail"]) paint(id);
     }
   }
 
@@ -410,6 +416,23 @@
       const host = byId(id);
       if (host && !(typing && host.contains?.(typing))) host.replaceChildren(...[panel()].filter(Boolean));
     }
+  }
+
+  // A live pulse reads again only what it names, outside the full refresh,
+  // and pulses that arrive close together are read once.
+  const pulsing = { keys: new Set(), timer: null };
+  function pulse(keys, delay = 500) {
+    for (const key of keys) if (key in READS && !(key === "graph" && !needsGraph())) pulsing.keys.add(key);
+    if (pulsing.timer || !pulsing.keys.size) return;
+    pulsing.timer = setTimeout(async () => {
+      pulsing.timer = null;
+      if (!session() || state.destroyed) { pulsing.keys.clear(); return; }
+      const ready = [...pulsing.keys].filter((key) => !read(key).busy);
+      pulsing.keys = new Set([...pulsing.keys].filter((key) => read(key).busy));
+      await Promise.all(ready.map(async (key) => { await load(key); syncAll([key]); }));
+      if (ready.some((key) => ["changes", "branches"].includes(key))) updateChrome();
+      if (pulsing.keys.size) pulse([], 800);
+    }, delay);
   }
 
   function setRefreshDisabled(disabled) {
@@ -451,6 +474,7 @@
     // Uncommitted work is ringed on the map, in place as it changes.
     if (changed.includes("working") && state.homeMap?.mark) state.homeMap.mark(workIds());
     for (const key of changed) read(key).changed = false;
+    if (changed.includes("agents")) { updateAgentsNav(); state.homeMap?.agentMark?.(agentsApi()?.marks(read("agents").data) || []); }
     for (const [id, entry] of [...state.sections]) if (state.sections.get(id) === entry && entry.reads.some((key) => changed.includes(key))) paint(id);
   }
   function clearSections() {
@@ -550,6 +574,22 @@
     };
   }
 
+  // ── Agents ───────────────────────────────────────────────────────────────
+  // The agents panel and page live in agents.js; this is what they draw with.
+
+  const agentsCtx = {
+    h, icon, ago, clock, kindWord, entityHref, changeURL, button, link, moreLink, pill, skeleton, skeletonLines, failed, workSentence, fetchJSON, announce, apiBase,
+    read: () => read("agents"),
+    refresh: (keys) => refresh(keys),
+    pulse: (keys, delay) => pulse(keys, delay),
+    paint: (id) => paint(id),
+    section: (id, reads, build, attrs) => section(id, reads, build, attrs),
+    params: () => state.params,
+    // The one count a change is shown with: its own review's, as Changes shows it.
+    changedCount: (id) => changedCount({ id }),
+    repaintAgents: () => { for (const id of ["home-agents", "agents-lede", "agents-list", "agents-detail"]) paint(id); },
+  };
+
   // ── Home ─────────────────────────────────────────────────────────────────
 
   function home() {
@@ -566,6 +606,8 @@
           return skeleton("skeleton-lede");
         }))),
       section("home-work", ["working", "changes"], workCard),
+      // The agents sit right above the map whose rings show what they touch.
+      section("home-agents", ["agents"], () => agentsApi()?.panel(agentsCtx) || null),
       h("section", { class: "map-card", "aria-labelledby": "home-map-title" },
         section("home-map", ["map", "graph"], (onCleanup) => {
           const title = h("h2", { class: "map-title", id: "home-map-title" }, "Repository map");
@@ -598,12 +640,15 @@
                 describe: (node) => node.container ? kindWord(node.kind) : [kindWord(node.kind), relyWords(relied.get(node.id)), workIds().includes(node.id) ? "Changed in your uncommitted work" : ""].filter(Boolean).join(" · "),
               });
               state.homeMap = controller;
+              controller.agentMark?.(agentsApi()?.marks(read("agents").data) || []);
+              paint("home-map-agents");
               onCleanup(() => { if (state.homeMap === controller) state.homeMap = null; controller.dispose(); });
             } catch (_) { stage.replaceChildren(h("div", { class: "map-empty" }, h("p", { class: "gap" }, "The map could not be drawn in this browser."))); }
           };
           if (globalThis.requestAnimationFrame) requestAnimationFrame(mount); else mount();
           return [title, stage, h("p", { class: "map-caption" }, caption)];
-        })),
+        }),
+        section("home-map-agents", ["agents", "map"], () => agentsApi()?.legend(agentsCtx, read("agents").data, state.homeMap?.agentMarked?.length || 0) || null)),
       h("div", { class: "home-grid" },
         h("section", { class: "section", "aria-labelledby": "home-top-title" },
           h("div", { class: "section-head" }, h("h2", { id: "home-top-title" }, "Most relied on"), moreLink("Explore", "#/explore")),
@@ -748,7 +793,7 @@
     const quiet = kin || n === 0;
     return h("li", {}, h("a", { class: `change-row${quiet ? " change-row-quiet" : ""}`, href: changeURL(change.id) },
       h("div", {}, h("span", { class: "change-title" }, change.title || "Untitled change"),
-        h("span", { class: "change-meta" }, author ? h("span", {}, author) : null, when ? h("time", { datetime: change.timestamp || undefined }, when) : null, entities ? h("span", {}, entities) : null)),
+        h("span", { class: "change-meta" }, agentsApi() ? agentsApi().author(agentsCtx, change, author) : author ? h("span", {}, author) : null, when ? h("time", { datetime: change.timestamp || undefined }, when) : null, entities ? h("span", {}, entities) : null)),
       h("span", { class: "change-side" }, kin ? pill("Kin update", "quiet") : decisionPill(change))));
   }
 
@@ -772,7 +817,9 @@
   function filteredChanges() {
     const query = state.reviewQuery.toLowerCase().trim();
     return array(read("changes").data?.changes).filter((change) => {
-      if (query && !`${change.title} ${change.id} ${authorOf(change)}`.toLowerCase().includes(query)) return false;
+      if (query && !`${change.title} ${change.id} ${authorOf(change)} ${change.agent?.name || ""}`.toLowerCase().includes(query)) return false;
+      if (state.authorFilter === "people" && (change.agent || isKinUpdate(change))) return false;
+      if (state.authorFilter.startsWith("agent:") && change.agent?.name !== state.authorFilter.slice(6)) return false;
       if (state.reviewFilter === "all") return true;
       const value = decisionOf(change);
       if (!value) return false;
@@ -813,6 +860,19 @@
 
   function updateReviewResults() { paint("changes-results"); }
 
+  /** Who made the loaded changes: everyone, people, or one agent. Offered once an agent made one. */
+  function authorFilter() {
+    const changes = array(read("changes").data?.changes);
+    const agents = [...new Set(changes.map((change) => text(change.agent?.name)).filter(Boolean))].slice(0, 6);
+    if (!agents.length) { state.authorFilter = "all"; return null; }
+    if (state.authorFilter.startsWith("agent:") && !agents.includes(state.authorFilter.slice(6))) state.authorFilter = "all";
+    const madeBy = (name) => changes.filter((change) => change.agent?.name === name).length;
+    const options = [["all", "Everyone", null], ["people", "People", null], ...agents.map((name) => [`agent:${name}`, name, madeBy(name)])];
+    return h("div", { class: "segmented segmented-authors", role: "group", "aria-label": "Show by who made the change", id: "workspace-author-filter" },
+      options.map(([value, label, made]) => h("button", { type: "button", "aria-pressed": String(state.authorFilter === value), on: { click: () => { state.authorFilter = value; paint("changes-authors"); updateReviewResults(); } } },
+        value.startsWith("agent:") && agentsApi() ? agentsApi().mark(12) : null, label, made ? h("span", { class: "segmented-count" }, count(made)) : null)));
+  }
+
   function changes() {
     const query = h("input", { id: "workspace-review-search", type: "search", placeholder: "Title, author or ID", value: state.reviewQuery, autocomplete: "off", on: { input: (event) => { state.reviewQuery = event.target.value; updateReviewResults(); } } });
     const FILTERS = [["all", "All"], ["pending", "To review"], ["needswork", "Needs work"], ["approved", "Approved"]];
@@ -837,6 +897,7 @@
             return h("div", { class: "segmented", role: "group", "aria-label": "Show by review decision", id: "workspace-review-filter" },
               FILTERS.map(([value, label]) => h("button", { type: "button", "aria-pressed": String(state.reviewFilter === value), disabled: value !== "all" && !read("standing").data, on: { click: () => { state.reviewFilter = value; paint("changes-filter"); updateReviewResults(); } } }, label)));
           })),
+        section("changes-authors", ["changes"], authorFilter),
         section("changes-compare", ["branches"], () => state.compareOpen ? compareForm() : null, { class: "compare-host" }),
         section("changes-results", ["changes", "standing"], () => changeList(filteredChanges()), { "aria-live": "polite" }))];
   }
@@ -2040,6 +2101,16 @@
     }
   }
 
+  /** The Agents nav item counts the agents working now. */
+  function updateAgentsNav() {
+    const badge = byId("workspace-nav-agents");
+    if (!badge) return;
+    const working = array(read("agents").data?.agents).filter((agent) => agent.state === "active").length;
+    badge.hidden = !working;
+    badge.textContent = working ? String(working) : "";
+    badge.setAttribute("aria-label", working ? `${working} working now` : "");
+  }
+
   /** On a narrow window, status, refresh, version, theme and the repository picker sit in one menu. */
   function setMenu(open) {
     state.menuOpen = Boolean(open);
@@ -2059,7 +2130,7 @@
         : h("div", { "aria-busy": "true" }, skeleton("skeleton-lede"), skeleton("skeleton-line")));
       return;
     }
-    const views = { home, explore, entity, changes, branches };
+    const views = { home, agents: () => agentsApi() ? agentsApi().view(agentsCtx) : [h("h1", {}, "Agents"), h("p", { class: "gap" }, "This page could not load its agents view.")], explore, entity, changes, branches };
     main.replaceChildren(...views[state.route]().filter(Boolean));
   }
 
@@ -2090,13 +2161,14 @@
       return UUID.test(id) ? { name: "entity", id } : { name: "explore", q: "" };
     }
     if (name === "explore") return { name, q: params.q || "" };
+    if (name === "agents") return AGENT_KEY.test(parts[1] || "") ? { name, agent: parts[1] } : { name };
     return ROUTES.includes(name) ? { name } : { name: "home" };
   }
 
   function routeChanged(initial = false) {
     const next = parseRoute(location.hash);
     const nav = next.name === "entity" ? "explore" : next.name;
-    if (!initial && next.name === state.route && (next.name !== "entity" || next.id === state.params.id) && next.name !== "explore") return;
+    if (!initial && next.name === state.route && (next.name !== "entity" || next.id === state.params.id) && (next.name !== "agents" || next.agent === state.params.agent) && next.name !== "explore") return;
     if (!initial && next.name === "explore" && state.route === "explore") {
       if ((next.q || "") !== state.explore.query) { state.explore.query = next.q || ""; const input = byId("explore-input"); if (input) input.value = state.explore.query; runAsk(state.explore.query, true); }
       return;
@@ -2152,7 +2224,12 @@
     if (state.route === "entity" && session()) loadEntity(state.params.id);
     if (state.route === "explore" && state.explore.query.trim() && session()) runAsk(state.explore.query, true);
     await refresh(readKeys().filter((key) => key !== "session"));
+    if (!read("agents").missing && agentsApi()) {
+      state.disposeLive = agentsApi().follow(agentsCtx);
+      // Times like "connected for 4 minutes" are read from the clock; draw them again now and then.
+      setInterval(() => { if (!document.hidden && ["home", "agents"].includes(state.route)) agentsCtx.repaintAgents(); }, 30_000);
+    }
   })();
 
-  globalThis.KinWorkspace = { workSentence, repositorySentence, personName, parseRoute, bodyLines, askGroups, isTest, relyWords, started };
+  globalThis.KinWorkspace = { workSentence, repositorySentence, personName, parseRoute, bodyLines, askGroups, isTest, relyWords, started, pulse };
 })();

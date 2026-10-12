@@ -22,6 +22,8 @@ files = [
     "src/kind.rs",
     "src/lib.rs",
     "src/linker.rs",
+    "src/linker/guarded_receiver.rs",
+    "src/linker/member_value.rs",
     "src/occurrence.rs",
     "src/overlay.rs",
     "src/pipeline.rs",

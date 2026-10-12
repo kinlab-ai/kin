@@ -14658,7 +14658,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     provision_language_servers_in_wizard(&opts, interactive, &language_scope).await;
     record_language_tool_dirs_in_wizard();
 
-    let _ = report_notification_identity(interactive);
+    let _ = report_notification_identity(interactive, || {});
 
     // The two always-asked items come last, after every intent-specific one, so
     // a `local`-intent run still gets told about the one thing it skipped. They
@@ -14855,6 +14855,16 @@ fn record_language_tool_dirs_in_wizard() {
     }
 }
 
+/// What the notification step came to, for a caller that prints its own
+/// summary.
+#[derive(Default)]
+struct NotificationStep {
+    /// The bundle or registration gap, when there is one.
+    issue: Option<String>,
+    /// What asking for permission came to, when this run reached that step.
+    authorization: Option<kin_notify::authorization::AuthorizationReport>,
+}
+
 /// Get the notification identity working, and say so when it cannot be.
 ///
 /// Three things have to be true for a notification to arrive as Kin: the bundle
@@ -14862,17 +14872,23 @@ fn record_language_tool_dirs_in_wizard() {
 /// it. Setup is where all three are settled, because it is the one moment a
 /// person is present. When the first is not true, the remaining two cannot be
 /// fixed here, so the gap is reported instead of silently skipped.
-fn report_notification_identity(interactive: bool) -> Option<String> {
+///
+/// `on_ask` runs just before macOS's request goes up, for a caller whose own
+/// display has to say what setup is waiting on.
+fn report_notification_identity(interactive: bool, on_ask: impl FnOnce()) -> NotificationStep {
     if !cfg!(target_os = "macos") {
-        return None;
+        return NotificationStep::default();
     }
     let Ok(notifier) = kin_notify::Notifier::new() else {
-        return None;
+        return NotificationStep::default();
     };
     if let Some(degradation) = notifier.status().degradation() {
         say!();
         say!("  {} {degradation}", style("!").yellow());
-        return Some(degradation.to_string());
+        return NotificationStep {
+            issue: Some(degradation.to_string()),
+            authorization: None,
+        };
     }
     // The managed installer registers what it writes; a channel that installs
     // into its own prefix, such as a Homebrew formula, cannot, so setup does it
@@ -14886,8 +14902,10 @@ fn report_notification_identity(interactive: bool) -> Option<String> {
             Some(format!("{error:#}"))
         }
     };
-    request_notification_authorization(interactive);
-    issue
+    NotificationStep {
+        issue,
+        authorization: request_notification_authorization(interactive, on_ask),
+    }
 }
 
 /// Ask macOS for permission to post notifications, once, from the one place a
@@ -14898,53 +14916,48 @@ fn report_notification_identity(interactive: bool) -> Option<String> {
 /// way is not listed in System Settings, so there is no supported way to undo
 /// it. A prompt raised by a background job at 3am would therefore burn the
 /// bundle identity with nobody there to answer, which is why nothing else in
-/// Kin ever requests authorization.
+/// Kin ever requests authorization unasked.
+///
+/// A terminal is not a screen. Over SSH the request would go up on the Mac's
+/// own display, where nobody at the terminal can answer, so it is not raised
+/// and the step says notifications are not decided yet and how to be asked.
+/// With a screen the wait for an answer is bounded, and setup goes on when it
+/// runs out. `kin_notify::authorization` holds every one of those decisions.
 ///
 /// Never fails setup: an unavailable or declined notifier only costs the nicer
 /// sender identity, and the router still delivers through its fallback.
-fn request_notification_authorization(interactive: bool) {
+fn request_notification_authorization(
+    interactive: bool,
+    on_ask: impl FnOnce(),
+) -> Option<kin_notify::authorization::AuthorizationReport> {
     if !cfg!(target_os = "macos") || !interactive {
-        return;
+        return None;
     }
-    let Ok(notifier) = kin_notify::Notifier::new() else {
-        return;
-    };
-    // Resolved rather than assumed: a channel that cannot write to the home
-    // directory installs its bundle beside the binary, and that copy holds the
-    // same identity the authorization decision is recorded against.
-    let Some(executable) = notifier.resolve_notifier() else {
-        return;
-    };
-
-    // Only ask when the decision has not already been made; re-running setup
-    // must not nag, and macOS answers from the stored decision anyway.
-    let already_decided = std::process::Command::new(&executable)
-        .arg("--status")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| !String::from_utf8_lossy(&out.stdout).contains("not_determined"))
-        .unwrap_or(true);
-    if already_decided {
-        return;
-    }
-
-    say!();
-    say!("  macOS will ask whether Kin may send you notifications.");
-    say!("  These are update and health alerts; Kin posts nothing else.");
-    let granted = std::process::Command::new(&executable)
-        .arg("--request-authorization")
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if granted {
-        say!("  {} Notifications will arrive as Kin", style("✓").green());
-    } else {
+    let notifier = kin_notify::Notifier::new().ok()?;
+    let wait = kin_notify::authorization::DEFAULT_WAIT;
+    let report = notifier.request_authorization(wait, || {
+        say!();
+        say!("  macOS is asking whether Kin may send you notifications.");
+        say!("  These are update and health alerts; Kin posts nothing else.");
         say!(
-            "  {} Notifications declined; Kin will stay quiet",
-            style("·").dim()
+            "  Answer it on screen. Setup goes on after {} seconds either way.",
+            wait.as_secs()
         );
+        on_ask();
+    });
+    use kin_notify::authorization::AuthorizationReport;
+    match &report {
+        // Nothing to say: the bundle's absence is reported above, and a
+        // decision already held is not news on a second run.
+        AuthorizationReport::NoBundle | AuthorizationReport::AlreadyDecided(_) => {}
+        AuthorizationReport::Granted => say!("  {} {report}", style("✓").green()),
+        AuthorizationReport::Declined => say!("  {} {report}", style("·").dim()),
+        AuthorizationReport::Undecided(_) => {
+            say!();
+            say!("  {} {report}", style("!").yellow());
+        }
     }
+    Some(report)
 }
 
 /// Decide the first-run intent: explicit flag, else interactive menu, else the
@@ -15099,8 +15112,9 @@ fn build_plan(
         skipped.push(SkippedDecision {
             decision: "macOS notifications",
             value: "not requested".to_string(),
-            give_back: "run `kin setup` interactively; macOS records a dismissed prompt as a \
-                        permanent denial, so nothing may ask unattended"
+            give_back: "run `kin notify authorize` in Terminal on the Mac's own screen; macOS \
+                        records a dismissed prompt as a permanent denial, so nothing may ask \
+                        unattended"
                 .to_string(),
         });
     }

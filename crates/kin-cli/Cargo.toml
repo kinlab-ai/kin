@@ -60,6 +60,7 @@ kin-lsp = { workspace = true }
 kin-remote = { workspace = true, features = ["http"] }
 kin-vfs-core = { workspace = true }
 axum = { workspace = true }
+futures-util = "0.3"
 clap = { workspace = true }
 clap_complete = "4"
 open = "5"
@@ -101,7 +102,7 @@ toml_edit = "0.25"
 tempfile = { workspace = true }
 unicode-normalization = "0.1"
 unicode-ident = "1"
-kin-spine = { version = "0.8.2", path = "../kin-spine" }
+kin-spine = { version = "0.8.3", path = "../kin-spine" }
 
 [dev-dependencies]
 kin-mcp = { workspace = true, features = ["test-support"] }

@@ -4391,6 +4391,7 @@ pub(crate) fn tree_footprint_and_descendants(
             children_bytes,
             child_count: descendants.len(),
             kernel_capped: false,
+            own_breakdown: None,
         },
         descendants,
     )
@@ -4482,7 +4483,11 @@ fn walk_process_table_with_descendants(
     {
         return None;
     }
-    let (folded, descendants) = tree_footprint_and_descendants(me, &rows);
+    let (mut folded, descendants) = tree_footprint_and_descendants(me, &rows);
+    // What the daemon's own figure is made of, where the platform can say, so
+    // the published standing names GPU and compressed memory instead of
+    // leaving a large figure on a small repository to read as a broken one.
+    folded.own_breakdown = own_footprint_breakdown(kin_daemon_spawn::own_footprint_parts());
     // Held to what the kernel says this container is charged, so the figure a
     // reader sees beside a cap can never exceed it. Off a cgroup there is no
     // such ceiling and the reading stands as measured.
@@ -4490,6 +4495,20 @@ fn walk_process_table_with_descendants(
         folded.clamped_to(kin_daemon_spawn::cgroup_memory().current_bytes),
         descendants,
     ))
+}
+
+/// The published breakdown of this daemon's own footprint, from what the
+/// platform read about this process.
+///
+/// Read from this process's own task, never another's, which is why it covers
+/// the daemon alone and not the children it started.
+fn own_footprint_breakdown(
+    parts: Option<kin_daemon_spawn::OwnFootprintParts>,
+) -> Option<kin_core::memory_pressure::FootprintBreakdown> {
+    parts.map(|parts| kin_core::memory_pressure::FootprintBreakdown {
+        gpu_bytes: parts.gpu_bytes,
+        compressed_bytes: parts.compressed_bytes,
+    })
 }
 
 /// This process's pid and the host's process table as rows the fold can take.
@@ -22262,6 +22281,7 @@ mod memory_pressure_tests {
             children_bytes: summed_resident,
             child_count: 13,
             kernel_capped: false,
+            own_breakdown: None,
         };
         assert!(
             kin_core::memory_pressure::Verdict::decide(
@@ -22431,6 +22451,7 @@ mod memory_pressure_tests {
             children_bytes: pre_fix_bytes - daemon_bytes,
             child_count: usize::try_from(THREADS).expect("fixture thread count fits") + 2,
             kernel_capped: false,
+            own_breakdown: None,
         };
         assert!(
             kin_core::memory_pressure::Verdict::decide(
@@ -22685,6 +22706,33 @@ mod memory_pressure_tests {
             row.abs_diff(footprint) <= row.abs_diff(resident),
             "the row carries {row} for this process, which is closer to its resident set of \
              {resident} than to its footprint of {footprint}"
+        );
+    }
+
+    /// The published walk carries what the daemon's own figure is made of on
+    /// macOS, read from this process's own task, and nothing elsewhere.
+    #[test]
+    fn the_walk_names_what_the_daemons_own_footprint_is_made_of() {
+        let walked = super::walk_process_table().expect("this host's process table reads");
+        if cfg!(target_os = "macos") {
+            let parts = walked
+                .own_breakdown
+                .expect("macOS reports the daemon's own GPU and compressed memory");
+            assert!(parts.gpu_bytes.is_some(), "{parts:?}");
+        } else {
+            assert_eq!(walked.own_breakdown, None);
+        }
+        assert_eq!(super::own_footprint_breakdown(None), None);
+        assert_eq!(
+            super::own_footprint_breakdown(Some(kin_daemon_spawn::OwnFootprintParts {
+                phys_footprint_bytes: 10,
+                gpu_bytes: Some(6),
+                compressed_bytes: 3,
+            })),
+            Some(kin_core::memory_pressure::FootprintBreakdown {
+                gpu_bytes: Some(6),
+                compressed_bytes: 3,
+            })
         );
     }
 

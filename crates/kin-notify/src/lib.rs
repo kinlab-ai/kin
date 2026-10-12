@@ -48,6 +48,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+pub mod authorization;
+
+use authorization::AuthorizationReport;
+
 /// Alert urgency. Determines whether a notification makes a sound and whether
 /// the platform may let it break through Do Not Disturb.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +435,21 @@ impl Notifier {
         Ok(())
     }
 
+    /// Settle whether macOS lets Kin post notifications, asking only when the
+    /// question is open and a person at this session can answer it, and never
+    /// waiting longer than `wait` for the answer.
+    ///
+    /// `on_ask` runs just before the request goes up. See
+    /// [`authorization::request_with`] for every decision this makes.
+    pub fn request_authorization(
+        &self,
+        wait: Duration,
+        on_ask: impl FnOnce(),
+    ) -> AuthorizationReport {
+        let host = authorization::SystemHost::new(Some(self.log_path()));
+        authorization::request_with(&host, self.resolve_notifier().as_deref(), wait, on_ask)
+    }
+
     /// Which channel installed the running binary.
     pub fn install_channel(&self) -> InstallChannel {
         let Some(executable) = self.executable.as_deref() else {
@@ -775,11 +794,12 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// The bundle's own `--status` line, bounded so `kin doctor` and `kin notify
+/// status` cannot hang on a notifier that never answers.
 fn query_identity(notifier: &Path) -> Option<String> {
-    let output = std::process::Command::new(notifier)
-        .arg("--status")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(notifier);
+    command.arg("--status");
+    let output = authorization::output_within(command, authorization::STATUS_WAIT)?;
     output
         .status
         .success()
@@ -805,7 +825,10 @@ fn post_via_bundle(notifier: &Path, notification: &Notification) -> Result<(), S
         Ok(status) => Err(match status.code() {
             Some(3) => "no bundle identity".to_string(),
             Some(4) => "authorization denied".to_string(),
-            Some(7) => "authorization never requested; run `kin setup` interactively".to_string(),
+            Some(7) => format!(
+                "notifications not decided yet; run `{}` in Terminal on the Mac's own screen",
+                authorization::ASK_AGAIN_COMMAND
+            ),
             Some(code) => format!("exit {code}"),
             None => "terminated by signal".to_string(),
         }),

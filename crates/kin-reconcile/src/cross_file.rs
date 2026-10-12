@@ -530,6 +530,26 @@ pub struct CrossFilePass {
     pub files_resolved: usize,
 }
 
+/// What a dependency restore needs before it installs an admitted module that
+/// declares nothing as a local module, which keeps an import of it local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyModuleEvidence {
+    /// The restore runs over the graph a daemon serves, whose canonical startup
+    /// repair derived a layout for every admitted source. The module's held
+    /// layout must match a fresh parse of its bytes, and a missing one is a gap.
+    HeldLayout,
+    /// The restore runs inside a reconcile, over whatever graph that reconcile
+    /// runs in. That graph is usually a private candidate that carries no
+    /// derived layouts at all: an admission prepares its batch in a semantic
+    /// observation of the live graph, and an MCP write plans in a graph built
+    /// from repository authority, which stores none. A layout the graph does
+    /// hold must still match a fresh parse. Without one, the module rests on
+    /// its checked parse: the admitted bytes match the tree's digest, parse
+    /// completely, and declare nothing, which is what the canonical census
+    /// accepts for any source whose layout is not held.
+    HeldLayoutOrCheckedParse,
+}
+
 /// Live cross-file resolver: the incremental linker plus the waiting-name index
 /// that makes backward binding bounded.
 #[derive(Debug, Default)]
@@ -1202,16 +1222,47 @@ impl LiveCrossFileLinker {
         )
     }
 
-    /// Restore dependency nominations from admitted CAS, once per checked seed.
-    /// The file currently being edited supplies its fresh observation separately.
+    /// Restore dependency nominations from admitted CAS, once per checked seed,
+    /// over a graph that holds a derived layout for every admitted source. The
+    /// source currently being edited supplies its fresh observation separately.
     pub(crate) fn restore_dependencies<G: GraphStore>(
         &mut self,
         graph: &G,
         blobs: &kin_blobs::BlobStore,
         editing: Option<&str>,
     ) -> crate::error::Result<()> {
-        self.restore_dependencies_inner(graph, blobs, editing, None, None, false)
-            .map(|_| ())
+        self.restore_dependencies_inner(
+            graph,
+            blobs,
+            editing,
+            None,
+            None,
+            false,
+            EmptyModuleEvidence::HeldLayout,
+        )
+        .map(|_| ())
+    }
+
+    /// The same restore from inside a reconcile of `editing`, over whatever
+    /// graph that reconcile runs in. See
+    /// [`EmptyModuleEvidence::HeldLayoutOrCheckedParse`] for what a module with
+    /// no declarations needs there.
+    pub(crate) fn restore_dependencies_for_edit<G: GraphStore>(
+        &mut self,
+        graph: &G,
+        blobs: &kin_blobs::BlobStore,
+        editing: &str,
+    ) -> crate::error::Result<()> {
+        self.restore_dependencies_inner(
+            graph,
+            blobs,
+            Some(editing),
+            None,
+            None,
+            false,
+            EmptyModuleEvidence::HeldLayoutOrCheckedParse,
+        )
+        .map(|_| ())
     }
 
     /// The caller owns this private linker fork. The explicit exact-tree source
@@ -1238,9 +1289,20 @@ impl LiveCrossFileLinker {
             ));
         }
         self.seed_from_graph_checked(graph)?;
-        self.restore_dependencies_inner(graph, blobs, None, Some(paths), stale, install_rest)
+        // The explicit census installs no module from inventory alone, so the
+        // evidence an empty module needs never arises here.
+        self.restore_dependencies_inner(
+            graph,
+            blobs,
+            None,
+            Some(paths),
+            stale,
+            install_rest,
+            EmptyModuleEvidence::HeldLayout,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn restore_dependencies_inner<G: GraphStore>(
         &mut self,
         graph: &G,
@@ -1249,20 +1311,44 @@ impl LiveCrossFileLinker {
         source_paths: Option<Vec<String>>,
         mut stale: Option<&mut Vec<crate::reconciler::StaleCanonicalSource>>,
         install_rest: bool,
+        empty_module_evidence: EmptyModuleEvidence,
     ) -> crate::error::Result<Vec<crate::admitted_source::AdmittedSource>> {
         let retain_sources = source_paths.is_some();
         if (self.dependencies_restored && !retain_sources) || !self.seeded {
             return Ok(Vec::new());
         }
-        let paths = source_paths.unwrap_or_else(|| {
+        let mut paths = source_paths.unwrap_or_else(|| {
             self.artifact_id_by_file
                 .keys()
                 .filter(|path| editing != Some(path.as_str()) && !self.is_withheld(path))
                 .cloned()
                 .collect()
         });
+        // Declaration-only seeding cannot see an empty module. Its admitted
+        // path still prevents an unresolved local import becoming external.
+        // Inventory nominates a checked CAS read; it supplies no source facts.
+        if !retain_sources {
+            if let Some(tree) = graph
+                .resolved_tree_snapshot()
+                .map_err(|error| crate::error::ReconcileError::Graph(error.to_string()))?
+            {
+                paths.extend(
+                    tree.artifacts_by_path()
+                        .filter(|artifact| {
+                            matches!(artifact.entry, kin_model::TreeEntry::Blob { .. })
+                        })
+                        .filter(|artifact| !self.withheld.contains_key(&artifact.artifact_id))
+                        .filter_map(|artifact| artifact.path.as_utf8())
+                        .filter(|path| {
+                            editing != Some(*path) && kin_model::is_entity_source_path(path)
+                        })
+                        .map(str::to_owned),
+                );
+            }
+        }
         let (paths, absent) = self.partition_admitted_sources(graph, paths)?;
         let mut sources = Vec::new();
+        let mut empty_modules = Vec::new();
         let mut observations = Vec::new();
         let mut witnesses = Vec::new();
         let mut cache_bytes = self.dependency_cache_bytes;
@@ -1281,18 +1367,83 @@ impl LiveCrossFileLinker {
             if let Some(source) = reading.into_complete(&file)? {
                 let indexed = &source.indexed;
                 let file_path = &indexed.file_id.0;
+                let empty_module =
+                    !retain_sources && !self.artifact_id_by_file.contains_key(file_path);
+                if empty_module {
+                    if !indexed.entities.is_empty() {
+                        return Err(crate::error::ReconcileError::InvalidTransaction(
+                            format!("admitted module {file_path} has declarations missing from the seeded universe"),
+                        ));
+                    }
+                    let layout = graph
+                        .get_file_layout(&indexed.file_id)
+                        .map_err(|error| crate::error::ReconcileError::Graph(error.to_string()))?;
+                    match (layout, empty_module_evidence) {
+                        (Some(layout), _) => {
+                            let held = serde_json::to_value(&layout).map_err(|error| {
+                                crate::error::ReconcileError::Graph(error.to_string())
+                            })?;
+                            let fresh =
+                                serde_json::to_value(&indexed.file_layout).map_err(|error| {
+                                    crate::error::ReconcileError::Graph(error.to_string())
+                                })?;
+                            if held != fresh {
+                                return Err(crate::error::ReconcileError::InvalidTransaction(
+                                    format!(
+                                        "admitted empty module {file_path} layout differs from \
+                                         its source"
+                                    ),
+                                ));
+                            }
+                        }
+                        (None, EmptyModuleEvidence::HeldLayout) => {
+                            return Err(crate::error::ReconcileError::InvalidTransaction(format!(
+                                "admitted empty module {file_path} has no derived source layout"
+                            )));
+                        }
+                        (None, EmptyModuleEvidence::HeldLayoutOrCheckedParse) => {}
+                    }
+                    let artifact = admitted_artifact_id(graph, file_path).ok_or_else(|| {
+                        crate::error::ReconcileError::InvalidTransaction(
+                            "empty module lost admitted artifact identity".into(),
+                        )
+                    })?;
+                    empty_modules.push((file_path.clone(), artifact));
+                }
                 let witness = kin_index::linker::bind_import_witness(
                     file_path,
                     &indexed.entities,
                     &indexed.extracted_relations,
                 );
-                let fragment = self.dependency_fragment(
-                    file_path,
-                    ParseCompleteness::Full,
-                    &indexed.extracted_relations,
-                    &indexed.imports,
-                    &indexed.entities,
-                );
+                let mut fragment = self
+                    .dependency_fragment(
+                        file_path,
+                        ParseCompleteness::Full,
+                        &indexed.extracted_relations,
+                        &indexed.imports,
+                        &indexed.entities,
+                    )
+                    .or_else(|| {
+                        empty_module.then(|| PendingFile {
+                            parse: FileParseData {
+                                file_path: file_path.clone(),
+                                entities: Vec::new(),
+                                relations: Vec::new(),
+                                imports: Vec::new(),
+                            },
+                            completeness: ParseCompleteness::Full,
+                            source_blob_hash: Some(indexed.blob_hash.to_string()),
+                            retained_bytes: file_path.len().saturating_mul(4).saturating_add(512),
+                            waiting_on: BTreeSet::new(),
+                            waiting_on_paths: BTreeSet::new(),
+                            go_receiver_owners: BTreeSet::new(),
+                        })
+                    });
+                if empty_module {
+                    if let Some(fragment) = &mut fragment {
+                        fragment.source_blob_hash = Some(indexed.blob_hash.to_string());
+                    }
+                }
                 cache_bytes = self.replacement_cache_bytes(
                     cache_bytes,
                     file_path,
@@ -1318,6 +1469,9 @@ impl LiveCrossFileLinker {
         // bodies for the separately staged projection cache.
         for path in absent {
             self.forget_file(&path);
+        }
+        for (file, artifact) in empty_modules {
+            self.install_file(&file, artifact, &[]);
         }
         // Rebuild full observations only for the explicit canonical restore.
         // Ordinary edit-time dependency restoration retains its compact cache.
@@ -1365,7 +1519,7 @@ impl LiveCrossFileLinker {
         completeness: ParseCompleteness,
         dependents: Dependents,
     ) -> crate::error::Result<CrossFilePass> {
-        self.restore_dependencies(graph, blobs, Some(file_path))?;
+        self.restore_dependencies_for_edit(graph, blobs, file_path)?;
         let mut sources = Vec::new();
         let nominated = match dependents {
             Dependents::Rebind => self.files_waiting_on_names_of(file_path, entities),

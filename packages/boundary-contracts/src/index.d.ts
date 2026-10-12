@@ -1228,7 +1228,85 @@ export type GraphEvent =
       nodes_removed: number;
       relations_added: number;
       relations_removed: number;
-    };
+    }
+  /**
+   * An agent session's tool call finished. Delivered only to a subscriber
+   * whose `types` filter names `ToolCall`. At most one per session per 250 ms
+   * and 16 per second overall; `coalesced` counts the earlier calls of the
+   * session this event stands for. The full list is `GET /session/{id}/calls`.
+   */
+  | ({ type: "ToolCall"; seq: number; session_id: string; call_seq: number; coalesced: number } & Omit<
+      AgentToolCall,
+      "seq"
+    >);
+
+/** One entry of an agent session's call log. Never carries query text, arguments, answers or paths. */
+export interface AgentToolCall {
+  /** 1-based position of the call in its session. */
+  seq: number;
+  at: string;
+  /** The registered tool the daemon ran. */
+  tool: string;
+  /** Up to 16 graph entities the call was about, each present in the graph. */
+  entity_ids: string[];
+  /** Distinct graph entities the answer named. */
+  result_count: number;
+  bytes: number;
+  duration_ms: number;
+  is_error: boolean;
+  /** The repository a repo-scoped call named; absent for the daemon's own. */
+  repo_id?: string;
+}
+
+/** `GET /agents`: the live agent sessions of one repository, path-free. */
+export interface AgentsResponse {
+  schema: "kin.agents.v1";
+  generated_at: string;
+  active_window_secs: number;
+  agents: AgentView[];
+}
+
+export interface AgentView {
+  session_id: string;
+  client: string;
+  vendor: string;
+  transport: "mcp" | "cli" | "wrapper" | "ui";
+  started_at: string;
+  last_activity_at: string;
+  state: "active" | "idle";
+  calls_in_flight: number;
+  calls_total: number;
+  /** Newest first, at most 5. */
+  recent_calls: AgentToolCall[];
+  open_transactions: {
+    transaction_id: string;
+    state: string;
+    staged_operations: number;
+    opened_at: string | null;
+    age_secs: number | null;
+  }[];
+  intents: {
+    intent_id: string;
+    lock_type: "soft" | "hard";
+    scopes: { kind: "entity" | "contract"; id: string; name?: string }[];
+    /** File-shaped scopes, which are never shown. */
+    withheld_scopes: number;
+    task: string;
+    registered_at: string;
+    expires_at: string | null;
+  }[];
+  /** Changes this session committed, newest first, at most 16. */
+  recent_change_ids: string[];
+}
+
+/** `GET /session/{id}/calls`: one live session's call log, newest first. */
+export interface AgentCallsResponse {
+  schema: "kin.agent-calls.v1";
+  session_id: string;
+  calls_total: number;
+  retained: number;
+  calls: AgentToolCall[];
+}
 
 export interface EntitySourceBaseV1 {
   schema: "kin.entity.source_base.v1";

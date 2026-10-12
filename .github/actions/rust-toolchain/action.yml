@@ -154,7 +154,7 @@ runs:
         if [ "$TOOLCHAIN" = "nightly" ] && [ -n "$COMPONENTS" ]; then
           downgrade=" --allow-downgrade"
         fi
-        rustup toolchain install "$TOOLCHAIN" $target_flags $component_flags \
+        bash "$GITHUB_ACTION_PATH/install-toolchain.sh" "$TOOLCHAIN" $target_flags $component_flags \
           --profile minimal$downgrade --no-self-update
 
     # Non-fatal for the same reason it is upstream: on a runner whose rustup

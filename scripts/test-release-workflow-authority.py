@@ -569,7 +569,7 @@ PULL_REQUEST_CHECK_STUB = textwrap.dedent(
 # `check-ubuntu` for two reasons neither of which is visible from this file:
 # `bin/kin-precheck` in the umbrella enumerates this job's gate list by that id,
 # and `rust-cache` composes its key from the job id when no shared key is given,
-# so `feature-tests` reaches this job's warm dependency graph by asking for
+# so the feature workers reach this job's warm dependency graph by asking for
 # `check`. Renaming it would cost the ubuntu permutations their cache exactly
 # the way the macOS leg lost its own.
 REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
@@ -710,6 +710,175 @@ MACOS_SHARD_PARTITION = (
 )
 MACOS_SHARD_DOCTESTS = "      run: cargo test --doc --locked --features kin-cli/metal,kin-daemon/metal"
 MACOS_SHARD_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
+# Each worker resolves its own feature set. The required contexts belong to
+# per-platform aggregates, whose one-value OS matrices preserve the existing
+# names without creating a second expanded check when the real path is skipped.
+FEATURE_PERMUTATION_WORKERS = {
+    "feature-tests-ubuntu-shards": ("ubuntu-latest", "feature-tests"),
+    "feature-tests-macos-shards": ("macos-latest", "feature-tests-macos-aggregate"),
+}
+FEATURE_PERMUTATION_WORKER_AUTHORITY = textwrap.dedent(r"""
+    @JOB@:
+      name: Feature permutation shard
+      needs: changes
+      if: >-
+        ${{ !cancelled()
+        && needs.changes.outputs.docs_only != 'true'
+        && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      runs-on: ${{ matrix.os }}
+      timeout-minutes: 120
+      env:
+        CARGO_INCREMENTAL: "0"
+        CARGO_PROFILE_DEV_DEBUG: "0"
+        CARGO_PROFILE_TEST_DEBUG: "0"
+      strategy:
+        fail-fast: false
+        matrix:
+          os: [@OS@]
+          group: [hosted-minimal, featureless]
+      steps:
+""").strip()
+FEATURE_PERMUTATION_AGGREGATE_AUTHORITY = textwrap.dedent(r"""
+    @JOB@:
+      name: Feature permutation tests
+      needs: [changes, @WORKER@]
+      if: >-
+        ${{ !cancelled()
+        && needs.changes.outputs.docs_only != 'true'
+        && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'feature/public-export-')) }}
+      runs-on: ubuntu-latest
+      timeout-minutes: 5
+      strategy:
+        matrix:
+          os: [@OS@]
+      steps:
+""").strip()
+FEATURE_PERMUTATION_PR_STUB = textwrap.dedent(r"""
+    feature-tests-pr-fast-path:
+      name: Feature permutation tests
+      if: ${{ !cancelled() && github.event_name == 'pull_request' && !startsWith(github.head_ref, 'feature/public-export-') }}
+      runs-on: ubuntu-latest
+      strategy:
+        matrix:
+          os: [ubuntu-latest, macos-latest]
+      steps:
+        - name: Report the pull-request fast path
+          run: |
+            echo "This job runs no tests. The feature permutations run on push to"
+            echo "main, after the merge, and not on this pull request."
+            echo "Admission before the merge is the fast gate."
+""").strip()
+# Pin executable step boundaries, ordering and conditions, rather than searching
+# for commands which could survive in comments or on the wrong matrix group.
+FEATURE_PERMUTATION_STEPS = (
+    textwrap.dedent(r"""
+        - uses: actions/checkout@v7
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Install Rust toolchain
+          uses: ./.github/actions/rust-toolchain
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Verify kin cargo registry config
+          run: |
+            test -f .cargo/config.toml
+            grep -q '^\[registries\.kin\]' .cargo/config.toml
+            if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Cache cargo registry and build
+          uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+          with:
+            add-rust-environment-hash-key: false
+            shared-key: ${{ matrix.os == 'macos-latest' && 'check-macos' || 'check' }}
+            save-if: false
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Install nextest
+          uses: taiki-e/install-action@v2
+          with:
+            tool: nextest
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test gcs feature
+          if: matrix.group == 'hosted-minimal'
+          run: cargo nextest run -p kin-daemon --features gcs --locked
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test hosted gcs spine cursor hold
+          if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'
+          run: >-
+            cargo test -p kin-daemon --features gcs --locked
+            state::tests::hosted_spine_refuses_persistence_without_cursor_cas
+            -- --exact --nocapture --test-threads=1
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test kin-spine durable publication paths
+          if: matrix.group == 'hosted-minimal'
+          run: cargo nextest run -p kin-spine --features firestore --locked
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test hosted production features
+          if: matrix.group == 'hosted-minimal'
+          run: cargo nextest run -p kin-daemon --features gcs,firestore --locked
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test hosted production durable spine selection
+          if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'
+          run: >-
+            cargo test -p kin-daemon --features gcs,firestore --locked
+            state::tests::hosted_production_feature_pair_selects_durable_backend
+            -- --exact --nocapture --test-threads=1
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test each Kin library on its own minimal features
+          if: matrix.group == 'hosted-minimal'
+          run: |
+            set -euo pipefail
+            python3 - <<'LIBS' > "$RUNNER_TEMP/libraries.txt"
+            import tomllib
+            root = tomllib.load(open("Cargo.toml", "rb"))
+            deps = root["workspace"]["dependencies"]
+            for name, spec in sorted(deps.items()):
+                if isinstance(spec, dict) and "path" in spec and "registry" in spec:
+                    print(name)
+            LIBS
+            count="$(wc -l < "$RUNNER_TEMP/libraries.txt" | tr -d ' ')"
+            if [ "$count" -lt 7 ]; then
+              echo "::error title=No Kin libraries resolved::read $count from the root manifest"
+              exit 1
+            fi
+            while IFS= read -r crate; do
+              echo "::group::cargo test -p $crate --no-default-features"
+              cargo test -p "$crate" --no-default-features --lib --tests --locked
+              echo "::endgroup::"
+            done < "$RUNNER_TEMP/libraries.txt"
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test featureless kin-cli
+          if: matrix.group == 'featureless'
+          run: cargo test -p kin-cli --no-default-features --lib --tests --locked
+    """).strip(),
+    textwrap.dedent(r"""
+        - name: Test featureless kin-daemon
+          if: matrix.group == 'featureless'
+          run: cargo test -p kin-daemon --no-default-features --lib --tests --locked
+    """).strip(),
+)
+FEATURE_PERMUTATION_AGGREGATE_STEP = textwrap.dedent(r"""
+    - name: Require every feature group to have succeeded
+      env:
+        SHARDS: ${{ needs.@WORKER@.result }}
+      run: |
+        set -euo pipefail
+        if [ "$SHARDS" != "success" ]; then
+          echo "::error title=Feature groups did not pass::the feature permutation groups reported '$SHARDS'"
+          exit 1
+        fi
+        echo "every feature permutation group succeeded"
+""").strip()
+
+
 CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
     "release-version": "Release version gate",
@@ -746,8 +915,8 @@ CI_JOB_DISPLAY_NAMES = {
     "mcp-surface-contract": "MCP surface contract",
     # Every Kin library tested on its own minimal features and packaged, on
     # every event. A workspace unifies features, so a library can be healthy
-    # here and broken for the consumer who depends on it alone; `feature-tests`
-    # runs the same minimal-feature legs on macOS but only on a push to main,
+    # here and broken for the consumer who depends on it alone; feature workers
+    # run the same minimal-feature legs on macOS on main and export pull requests,
     # which is a landing too late. Like `mcp-surface-contract` it publishes no
     # required context and claims none: `bin/kin-lane merge land` refuses on any
     # check that is not green by name, and a ruleset is what would make it
@@ -774,13 +943,15 @@ CI_JOB_DISPLAY_NAMES = {
     # `Check & Test (macos-latest)` and is what the ruleset names.
     "check-macos": "Check & Test macOS shard",
     "check-macos-aggregate": "Check & Test",
-    # Both were steps inside `check` and are jobs so they stop sitting on the
-    # merge queue's critical path. Neither is a required context until the
-    # branch ruleset names it, so each is listed here to be reviewed as a
-    # producer, and the ruleset is what makes it block.
+    # Falsification and feature permutations run beside Check & Test. Feature
+    # workers publish their OS/group outcomes; only the PR stub and two exact
+    # per-platform aggregates own the release-required feature context names.
     "falsify-guards": "Falsify guards",
     "feature-tests-pr-fast-path": "Feature permutation tests",
     "feature-tests": "Feature permutation tests",
+    "feature-tests-macos-aggregate": "Feature permutation tests",
+    "feature-tests-ubuntu-shards": "Feature permutation shard",
+    "feature-tests-macos-shards": "Feature permutation shard",
     "coverage": "Code Coverage",
     "install-proof-pr-build": "Install Proof (PR) Build",
     "install-proof-pr": "Install Proof (PR)",
@@ -1070,9 +1241,12 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
     "Fast gate test shard": {
         (".github/workflows/ci.yml", "fast-gate-tests"),
     },
+    # One inert PR producer plus one fail-closed aggregate for each OS. Worker
+    # names never claim either required expanded feature context.
     "Feature permutation tests": {
         (".github/workflows/ci.yml", "feature-tests-pr-fast-path"),
         (".github/workflows/ci.yml", "feature-tests"),
+        (".github/workflows/ci.yml", "feature-tests-macos-aggregate"),
     },
     "DCO Sign-off": {
         (".github/workflows/ci.yml", "dco"),
@@ -6437,6 +6611,160 @@ def assert_check_consumer_authority(workflow: str) -> None:
             "Check & Test consumer authority requires the exact real check admission "
             "and matrix contract"
         )
+
+
+def feature_permutation_steps(job: str) -> list[str]:
+    """Return complete canonical step contracts, preserving duplicate steps."""
+
+    rendered = classifier_active_job_source(job)
+    marker = "\n  steps:\n"
+    if rendered.count(marker) != 1:
+        raise AssertionError("feature permutation authority requires one steps mapping")
+    source = rendered.split(marker, 1)[1]
+    starts = [match.start() for match in re.finditer(r"(?m)^    - ", source)]
+    if not starts or starts[0] != 0:
+        raise AssertionError("feature permutation authority requires canonical steps")
+    return [
+        textwrap.dedent(source[start:end]).strip()
+        for start, end in zip(starts, starts[1:] + [len(source)])
+    ]
+
+
+def assert_feature_permutation_authority(workflow: str) -> None:
+    """Keep every reviewed feature command behind one fail-closed OS context.
+
+    A matrix worker can succeed while every test step is skipped, so an aggregate
+    result alone cannot prove coverage. Pin the two groups, command inventory and
+    routing together. Separate OS workers keep one OS failure from deciding the
+    other OS's aggregate; fail-fast is off so each group records its own outcome.
+    """
+
+    blocks = workflow_job_blocks(workflow)
+    stub = blocks.get("feature-tests-pr-fast-path")
+    if stub is None or classifier_active_job_source(stub) != FEATURE_PERMUTATION_PR_STUB:
+        raise AssertionError("feature permutation authority requires the exact PR stub")
+    for worker, (os_name, aggregate) in FEATURE_PERMUTATION_WORKERS.items():
+        job = blocks.get(worker)
+        if job is None:
+            raise AssertionError(f"feature permutation authority lost worker {worker}")
+        expected_header = FEATURE_PERMUTATION_WORKER_AUTHORITY.replace("@JOB@", worker).replace("@OS@", os_name)
+        if real_check_job_authority_source(job) != expected_header:
+            raise AssertionError(f"feature permutation authority changed worker admission, environment or matrix: {worker}")
+        if feature_permutation_steps(job) != list(FEATURE_PERMUTATION_STEPS):
+            raise AssertionError(f"feature permutation authority changed ordered commands, setup or group routing: {worker}")
+        gate = blocks.get(aggregate)
+        if gate is None:
+            raise AssertionError(f"feature permutation authority lost aggregate {aggregate}")
+        expected_header = FEATURE_PERMUTATION_AGGREGATE_AUTHORITY.replace("@JOB@", aggregate).replace("@OS@", os_name).replace("@WORKER@", worker)
+        if real_check_job_authority_source(gate) != expected_header:
+            raise AssertionError(f"feature permutation authority changed aggregate admission, dependencies or matrix: {aggregate}")
+        expected_step = FEATURE_PERMUTATION_AGGREGATE_STEP.replace("@WORKER@", worker)
+        if feature_permutation_steps(gate) != [expected_step]:
+            raise AssertionError(f"feature permutation authority requires an exact success-only aggregate: {aggregate}")
+
+
+def assert_feature_permutation_aggregate_results(workflow: str) -> None:
+    """Exercise the actual aggregate shell with successful and absent work."""
+
+    blocks = workflow_job_blocks(workflow)
+    for _, aggregate in FEATURE_PERMUTATION_WORKERS.values():
+        shell = workflow_step_shell(blocks[aggregate], "Require every feature group to have succeeded")
+        for outcome in ("success", "failure", "skipped", "cancelled", "", "neutral", "timed_out"):
+            expected = 0 if outcome == "success" else 1
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", shell],
+                env={"PATH": os.defpath, "SHARDS": outcome},
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != expected:
+                raise AssertionError(
+                    f"feature permutation aggregate {aggregate} admitted {outcome!r} incorrectly: "
+                    f"expected exit {expected}, got {result.returncode}: {result.stdout}{result.stderr}"
+                )
+
+
+def assert_feature_permutation_falsification(workflow: str) -> None:
+    """Prove omitted, duplicated, misrouted and incomplete work is refused."""
+
+    blocks = workflow_job_blocks(workflow)
+    for worker, (os_name, aggregate) in FEATURE_PERMUTATION_WORKERS.items():
+        job = blocks[worker]
+        mutations = [
+            ("the worker leaves its OS", f"os: [{os_name}]", "os: [windows-latest]"),
+            ("the worker mixes both OS outcomes", f"os: [{os_name}]", "os: [ubuntu-latest, macos-latest]"),
+            ("one group disappears", "group: [hosted-minimal, featureless]", "group: [hosted-minimal]"),
+            ("a group is duplicated", "group: [hosted-minimal, featureless]", "group: [hosted-minimal, featureless, featureless]"),
+            ("one failure cancels its sibling", "fail-fast: false", "fail-fast: true"),
+            ("a worker masks all of its failures", "    timeout-minutes: 120\n", "    timeout-minutes: 120\n    continue-on-error: true\n"),
+            ("a worker weakens warnings", '      CARGO_INCREMENTAL: "0"', '      CARGO_INCREMENTAL: "0"\n      RUSTFLAGS: ""'),
+            ("a cache sharer changes build environment", 'CARGO_PROFILE_TEST_DEBUG: "0"', 'CARGO_PROFILE_TEST_DEBUG: "2"'),
+            ("a feature worker writes its owner's cache", "save-if: false", "save-if: ${{ github.ref == 'refs/heads/main' }}"),
+            ("the image toolchains split the cache key", "add-rust-environment-hash-key: false", "add-rust-environment-hash-key: true"),
+            ("the cache action moves to an unreviewed ref", "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4", "Swatinem/rust-cache@v2"),
+            ("the macOS cache loses its owner", "shared-key: ${{ matrix.os == 'macos-latest' && 'check-macos' || 'check' }}", "shared-key: check"),
+            ("the toolchain setup is conditional", "- name: Install Rust toolchain\n", "- name: Install Rust toolchain\n        if: matrix.group == 'hosted-minimal'\n"),
+            ("a test is routed to the wrong group", "if: matrix.group == 'featureless'", "if: matrix.group == 'hosted-minimal'"),
+            ("a hosted command runs in both groups", "        if: matrix.group == 'hosted-minimal'\n", ""),
+            ("a test overrides the warnings gate", "- name: Test gcs feature\n", "- name: Test gcs feature\n        env:\n          RUSTFLAGS: \"\"\n"),
+            ("a test failure becomes advisory", "- name: Test gcs feature\n", "- name: Test gcs feature\n        continue-on-error: true\n"),
+            ("Ubuntu exact assertions lose their platform guard", "if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'", "if: matrix.group == 'hosted-minimal'"),
+            ("Ubuntu exact assertions become unreachable", "if: matrix.group == 'hosted-minimal' && matrix.os == 'ubuntu-latest'", "if: matrix.group == 'featureless' && matrix.os == 'macos-latest'"),
+            ("minimal libraries are hardcoded", 'for name, spec in sorted(deps.items()):', 'for name, spec in []:'),
+            ("a package loses its integration targets", "--no-default-features --lib --tests --locked", "--no-default-features --lib --locked"),
+            ("a test failure is masked", "run: cargo nextest run -p kin-daemon --features gcs --locked", "run: cargo nextest run -p kin-daemon --features gcs --locked || true"),
+        ]
+        # Remove and duplicate every test STEP, including both exact Ubuntu
+        # assertions. The list comparison also rejects reordered commands.
+        matches = list(re.finditer(r"(?m)^      - name: Test .+$", job))
+        for index, match in enumerate(matches):
+            start = match.start()
+            following = re.search(r"(?m)^      - ", job[match.end():])
+            end = match.end() + following.start() if following else len(job)
+            step = job[start:end]
+            name = match.group().strip().removeprefix("- name: ")
+            mutations.extend(((f"{name} is omitted", step, ""), (f"{name} is duplicated", step, step + "\n" + step)))
+        first = job.index("      - name: Test gcs feature\n")
+        second = job.index("      - name: Test hosted gcs spine cursor hold\n")
+        third = job.index("      - name: Test kin-spine durable publication paths\n")
+        first_two = job[first:third]
+        mutations.append(("hosted command order changes", first_two, job[second:third] + job[first:second]))
+        for label, old, new in mutations:
+            if old not in job:
+                raise AssertionError(f"feature permutation falsification could not identify {worker}: {label}")
+            mutant = workflow.replace(job, job.replace(old, new, 1), 1)
+            expect_assertion(label, "feature permutation authority", lambda mutant=mutant: assert_feature_permutation_authority(mutant))
+
+        gate = blocks[aggregate]
+        for label, old, new in (
+            ("the aggregate no longer waits on its worker", f"needs: [changes, {worker}]", "needs: changes"),
+            ("the aggregate reads the other OS result", f"needs.{worker}.result", "needs.check.result"),
+            ("the aggregate accepts skipped work", 'if [ "$SHARDS" != "success" ]; then', 'if [ "$SHARDS" = "failure" ]; then'),
+            ("the aggregate loses its required suffix", f"os: [{os_name}]", "os: []"),
+            ("the aggregate accepts cancellation", "!cancelled()", "always()"),
+            ("a failed worker suppresses the aggregate", "!cancelled()", "success()"),
+            ("the aggregate can emit a second expanded check", f"os: [{os_name}]", "os: [ubuntu-latest, macos-latest]"),
+            ("the aggregate masks its failure", "exit 1", "exit 0"),
+        ):
+            if old not in gate:
+                raise AssertionError(f"feature permutation falsification could not identify {aggregate}: {label}")
+            mutant = workflow.replace(gate, gate.replace(old, new, 1), 1)
+            expect_assertion(label, "feature permutation authority", lambda mutant=mutant: assert_feature_permutation_authority(mutant))
+        mutant = workflow.replace(gate, gate.replace('if [ "$SHARDS" != "success" ]; then', 'if [ "$SHARDS" = "failure" ]; then', 1), 1)
+        expect_assertion("runtime aggregate admits skipped groups", "feature permutation aggregate", lambda mutant=mutant: assert_feature_permutation_aggregate_results(mutant))
+    stub = blocks["feature-tests-pr-fast-path"]
+    for label, old, new in (
+        ("the PR stub also runs on main", "github.event_name == 'pull_request'", "github.event_name != 'merge_group'"),
+        ("the PR stub steals export PR contexts", " && !startsWith(github.head_ref, 'feature/public-export-')", ""),
+        ("the PR stub expands the wrong context", "os: [ubuntu-latest, macos-latest]", "os: [ubuntu-latest]"),
+        ("the PR stub ignores cancellation", "!cancelled()", "always()"),
+    ):
+        if old not in stub:
+            raise AssertionError(f"feature permutation falsification could not identify PR stub: {label}")
+        mutant = workflow.replace(stub, stub.replace(old, new, 1), 1)
+        expect_assertion(label, "feature permutation authority", lambda mutant=mutant: assert_feature_permutation_authority(mutant))
 
 
 def assert_macos_shard_authority(workflow: str) -> None:
@@ -16394,6 +16722,9 @@ def main() -> None:
         ),
     )
     assert_check_consumer_authority(ci_workflow)
+    assert_feature_permutation_authority(ci_workflow)
+    assert_feature_permutation_aggregate_results(ci_workflow)
+    assert_feature_permutation_falsification(ci_workflow)
     assert_macos_shard_authority(ci_workflow)
     assert_ubuntu_shard_authority(ci_workflow)
     assert_fast_gate_authority(ci_workflow)
@@ -16729,24 +17060,23 @@ def main() -> None:
 
     # The one that matters most, because it is the collision the guard exists
     # for and the only one nothing else in this repository would notice.
-    feature_tests = consumer_blocks["feature-tests"]
-    diverged_env = feature_tests.replace(
-        '      CARGO_PROFILE_TEST_DEBUG: "0"',
-        '      CARGO_PROFILE_TEST_DEBUG: "2"',
-        1,
-    )
-    if diverged_env == feature_tests:
-        raise AssertionError(
-            "shared cache-key falsification could not diverge a sharing job's "
-            "environment"
+    for worker in FEATURE_PERMUTATION_WORKERS:
+        feature_tests = consumer_blocks[worker]
+        diverged_env = feature_tests.replace(
+            '      CARGO_PROFILE_TEST_DEBUG: "0"',
+            '      CARGO_PROFILE_TEST_DEBUG: "2"',
+            1,
         )
-    expect_assertion(
-        "a job sharing the cargo cache key declares a different environment",
-        "shared cache-key authority",
-        lambda mutant=ci_workflow.replace(
-            feature_tests, diverged_env, 1
-        ): assert_shared_cache_key_jobs_declare_one_environment(mutant),
-    )
+        if diverged_env == feature_tests:
+            raise AssertionError(
+                f"shared cache-key falsification could not diverge {worker}'s environment"
+            )
+        expect_assertion(
+            "a job sharing the cargo cache key declares a different environment",
+            "shared cache-key authority",
+            lambda mutant=ci_workflow.replace(feature_tests, diverged_env, 1):
+            assert_shared_cache_key_jobs_declare_one_environment(mutant),
+        )
 
     stub_condition = (
         "    if: ${{ !cancelled() && github.event_name == 'pull_request' "
@@ -18567,7 +18897,7 @@ def main() -> None:
     ci_path = WORKFLOWS / "ci.yml"
     check_start = ci_workflow.index("\n  check:")
     # The slice has to stop at the very next job. `check-macos` follows `check`
-    # and caches too, and `falsify-guards` and `feature-tests` follow that, so
+    # and caches too, and `falsify-guards` and the feature workers follow that, so
     # slicing to any of them would hand this falsification several jobs and count
     # save lines that are not the check job's.
     check_end = ci_workflow.index("\n  check-macos:", check_start)

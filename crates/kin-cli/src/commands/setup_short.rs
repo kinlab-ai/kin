@@ -260,7 +260,12 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
         }
     }
     record_language_tool_dirs_in_wizard();
-    let notifier_issue = report_notification_identity(interactive);
+    // macOS's request waits for an answer, so the live line says what setup
+    // is waiting on for as long as it waits.
+    let notifications = report_notification_identity(interactive, || match &live {
+        Some(live) => live.note(ASKING_ABOUT_NOTIFICATIONS),
+        None => println!("{INDENT}Setup is waiting: {ASKING_ABOUT_NOTIFICATIONS}."),
+    });
     note("checking which kin a new terminal runs");
     let terminal = match applied.shell_integration {
         ShellIntegration::Installed => terminal_kin(shell_name),
@@ -284,7 +289,8 @@ pub(super) async fn run(opts: WizardOptions, interactive: bool) -> Result<()> {
         terminal: &terminal,
         installed_servers: &installed_servers,
         server_issues: &server_issues,
-        notifier_issue: notifier_issue.as_deref(),
+        notifier_issue: notifications.issue.as_deref(),
+        notifications: notifications.authorization.as_ref(),
         report: &report,
         in_repo,
         defaults_taken: if interactive { 0 } else { skipped.len() },
@@ -741,6 +747,59 @@ fn terminal_attention(
     }
 }
 
+/// What the live line says while macOS's notification request waits.
+const ASKING_ABOUT_NOTIFICATIONS: &str = "answer macOS's notification request";
+
+/// What asking macOS about notifications came to, when it needs the person.
+///
+/// Only a question still open needs them. A decision this run or an earlier
+/// one settled is not attention, and a missing bundle is the notifier item.
+fn notification_attention(
+    report: &kin_notify::authorization::AuthorizationReport,
+) -> Option<Attention> {
+    use kin_notify::authorization::{AuthorizationReport, PromptReach, Undecided};
+    let AuthorizationReport::Undecided(undecided) = report else {
+        return None;
+    };
+    let from_the_screen = format!(
+        "In Terminal on the Mac's own screen, run:\n{}",
+        kin_notify::authorization::ASK_AGAIN_COMMAND
+    );
+    let (what, fix) = match undecided {
+        Undecided::NotAsked(PromptReach::Ssh) => (
+            "Notifications aren't decided yet. macOS asks on the Mac's own screen, so setup \
+             didn't ask over SSH."
+                .to_string(),
+            from_the_screen,
+        ),
+        Undecided::NotAsked(_) => (
+            "Notifications aren't decided yet. This session can't reach the Mac's screen, \
+             where macOS asks."
+                .to_string(),
+            from_the_screen,
+        ),
+        Undecided::StillOpen { waited } => (
+            format!(
+                "Notifications aren't decided yet. macOS's request had no answer in {} seconds.",
+                waited.as_secs()
+            ),
+            format!(
+                "Answer it on screen, or later run:\n{}",
+                kin_notify::authorization::ASK_AGAIN_COMMAND
+            ),
+        ),
+        Undecided::RequestFailed(reason) => (
+            format!("Notifications aren't decided yet. macOS's request failed: {reason}"),
+            from_the_screen,
+        ),
+    };
+    Some(Attention {
+        status: Status::Warn,
+        what,
+        fix: Some(fix),
+    })
+}
+
 /// The notifier finding as one line and its one fix.
 ///
 /// The notifier module's sentence names the path it looked in and why, which
@@ -784,6 +843,9 @@ struct Observed<'a> {
     installed_servers: &'a [String],
     server_issues: &'a [String],
     notifier_issue: Option<&'a str>,
+    /// What asking macOS about notifications came to, when this run asked or
+    /// decided not to.
+    notifications: Option<&'a kin_notify::authorization::AuthorizationReport>,
     report: &'a crate::commands::health::HealthReport,
     in_repo: bool,
     /// Decisions a run without a terminal took without asking, which the
@@ -909,6 +971,9 @@ fn summarize(observed: Observed<'_>) -> Summary {
     }
     if let Some(issue) = observed.notifier_issue {
         attention.push(notifier_attention(issue));
+    }
+    if let Some(item) = observed.notifications.and_then(notification_attention) {
+        attention.push(item);
     }
     let needs: Vec<&crate::commands::health::HealthCheck> = observed
         .report
@@ -1369,6 +1434,7 @@ mod tests {
                 installed_servers: &[],
                 server_issues: &[],
                 notifier_issue: None,
+                notifications: None,
                 report: &report,
                 in_repo: false,
                 defaults_taken: 0,
@@ -1591,6 +1657,7 @@ mod tests {
                 installed_servers: &[],
                 server_issues: &[],
                 notifier_issue: None,
+                notifications: None,
                 report: &report,
                 in_repo: false,
                 defaults_taken: 0,
@@ -1636,6 +1703,7 @@ mod tests {
             installed_servers: &[],
             server_issues: &[],
             notifier_issue: None,
+            notifications: None,
             report: &report,
             in_repo: false,
             defaults_taken: 0,
@@ -1647,6 +1715,87 @@ mod tests {
         );
         assert!(text.contains("1 thing needs you"), "{text}");
         assert!(!text.contains("Connected  Cursor"), "{text}");
+    }
+
+    /// The first `kin setup` on a fresh Mac over SSH waited forever on a
+    /// notification request nobody could see. The short form now finishes and
+    /// counts the open question, with the command that asks from the Mac's
+    /// screen on a line of its own so it copies whole.
+    #[test]
+    fn an_undecided_notification_question_is_counted_with_the_command_that_asks() {
+        use crate::commands::health::HealthReport;
+        use kin_notify::authorization::{AuthorizationReport, PromptReach, Undecided};
+        let report = HealthReport::from_checks("test".to_string(), Vec::new());
+        let applied = AppliedSetup {
+            configured_assistants: Vec::new(),
+            deferred_clients: Vec::new(),
+            failed_clients: Vec::new(),
+            shell_integration: ShellIntegration::NotPlanned,
+            proofs: Vec::new(),
+        };
+        let completion = |notifications: &AuthorizationReport| {
+            let summary = summarize(Observed {
+                machine: "this Mac",
+                shell_name: "zsh",
+                path_planned: false,
+                path_asked: false,
+                connect: false,
+                assistants: &[],
+                applied: &applied,
+                terminal: &TerminalKin::Unknown,
+                installed_servers: &[],
+                server_issues: &[],
+                notifier_issue: None,
+                notifications: Some(notifications),
+                report: &report,
+                in_repo: false,
+                defaults_taken: 0,
+            });
+            completion_lines(Style::plain(), &summary, 80).join("\n")
+        };
+
+        let over_ssh = completion(&AuthorizationReport::Undecided(Undecided::NotAsked(
+            PromptReach::Ssh,
+        )));
+        assert!(over_ssh.contains("1 thing needs you"), "{over_ssh}");
+        assert!(
+            over_ssh.contains("Notifications aren't decided yet"),
+            "{over_ssh}"
+        );
+        assert!(over_ssh.contains("over SSH"), "{over_ssh}");
+        assert!(
+            over_ssh
+                .lines()
+                .any(|line| line.trim() == "kin notify authorize"),
+            "the command must stand alone on its line: {over_ssh}"
+        );
+
+        let unanswered = completion(&AuthorizationReport::Undecided(Undecided::StillOpen {
+            waited: kin_notify::authorization::DEFAULT_WAIT,
+        }));
+        assert!(unanswered.contains("had no answer in 45"), "{unanswered}");
+        assert!(
+            unanswered
+                .lines()
+                .any(|line| line.trim() == "kin notify authorize"),
+            "{unanswered}"
+        );
+
+        // A settled question is not attention, whichever way it went.
+        for settled in [
+            AuthorizationReport::Granted,
+            AuthorizationReport::Declined,
+            AuthorizationReport::AlreadyDecided(
+                kin_notify::authorization::AuthorizationState::Authorized,
+            ),
+        ] {
+            let text = completion(&settled);
+            assert!(!text.contains("needs you"), "{settled:?}: {text}");
+            assert!(
+                !text.contains("Notifications aren't"),
+                "{settled:?}: {text}"
+            );
+        }
     }
 
     /// A new terminal that could not be checked is attention and is counted,

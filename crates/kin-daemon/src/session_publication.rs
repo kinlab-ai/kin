@@ -48,14 +48,19 @@ fn core_error(error: impl std::fmt::Display) -> kin_core::KinError {
 pub(crate) async fn execute(
     state: Arc<DaemonState>,
     request: ReconcileRequest,
+    session_id: Option<kin_model::SessionId>,
 ) -> Result<Response, HttpError> {
     // Disconnecting a client must not cancel a publication or drop its guards.
-    tokio::task::spawn_blocking(move || execute_blocking(&state, request))
+    tokio::task::spawn_blocking(move || execute_blocking(&state, request, session_id))
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
 }
 
-fn execute_blocking(state: &DaemonState, request: ReconcileRequest) -> Result<Response, HttpError> {
+fn execute_blocking(
+    state: &DaemonState,
+    request: ReconcileRequest,
+    session_id: Option<kin_model::SessionId>,
+) -> Result<Response, HttpError> {
     // Whole-process crash controls register their engine observers here,
     // on the actual blocking publication thread, and nowhere else. Test-only:
     // a released binary carries no observer, no environment trigger and no
@@ -256,7 +261,14 @@ fn execute_blocking(state: &DaemonState, request: ReconcileRequest) -> Result<Re
                     observation.desired_tree(),
                 )
                 .map_err(core_error)?;
-            adopt_sources(state, armed.custody_mut(), sources, nonsemantic, freeze)?;
+            adopt_sources(
+                state,
+                armed.custody_mut(),
+                sources,
+                nonsemantic,
+                freeze,
+                session_id.as_ref(),
+            )?;
             state.bump_version();
             state.emit_event(DaemonEvent::GraphRootChanged {
                 old_root_hash: Some(summary.previous_tree_hash.to_string()),
@@ -343,6 +355,7 @@ fn adopt_sources(
     sources: crate::session_publication_plan::PreparedSessionSourceState,
     facets: Vec<kin_index::IndexedAny>,
     freeze: &LocalRepositoryAuthorityFreeze,
+    session_id: Option<&kin_model::SessionId>,
 ) -> kin_core::Result<()> {
     let adopted = sources.adopt(&mut custody.reconciler);
     // Clear old derived keys only. The prepared semantic transition has already
@@ -459,7 +472,9 @@ fn adopt_sources(
             node,
             change_type,
             file_path: entity.file_origin.as_ref().map(|file| file.0.clone()),
-            session_id: None,
+            // The session whose workspace this publication admitted, when the
+            // request named one.
+            session_id: session_id.map(ToString::to_string),
         });
     }
     for event in crate::state::relation_change_events(&adopted.live_delta, None) {

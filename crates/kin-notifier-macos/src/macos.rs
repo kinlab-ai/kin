@@ -20,6 +20,8 @@
 //! * `4` authorization denied by the user
 //! * `5` delivery failed or the completion handler never fired
 //! * `7` authorization never requested; needs an interactive run first
+//! * `8` `--request-authorization` found no screen to ask on and raised nothing
+//! * `9` `--request-authorization` had no answer within `--timeout`
 //!
 //! Posting deliberately never prompts. A process that exits while an
 //! authorization prompt is on screen has that dismissal recorded as a permanent
@@ -27,6 +29,14 @@
 //! there is no way back. An unattended launchd job that prompted at 3am would
 //! burn the bundle identity with nobody present to answer. Prompting is
 //! confined to `--request-authorization`, which waits indefinitely by default.
+//!
+//! Waiting indefinitely is this process's business, never its caller's. A
+//! caller bounds its own wait and leaves this process running when the bound
+//! passes, so the request stays answerable after the caller has moved on; `kin
+//! setup` and `kin notify authorize` do exactly that. And the request is never
+//! raised from a session with no access to the screen, such as an SSH login:
+//! macOS would show it on a display nobody at that session can see, and the
+//! wait for an answer would have no end.
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -55,6 +65,8 @@ const EXIT_NO_BUNDLE: u8 = 3;
 const EXIT_DENIED: u8 = 4;
 const EXIT_UNDELIVERED: u8 = 5;
 const EXIT_NOT_REQUESTED: u8 = 7;
+const EXIT_NO_SCREEN: u8 = 8;
+const EXIT_UNANSWERED: u8 = 9;
 
 /// How long a post waits for its delivery callback. Bounded, because an
 /// unattended caller must not hang.
@@ -246,11 +258,15 @@ OPTIONS:
     --timeout <SECONDS>   Override the wait. Posting defaults to 10 seconds;
                           --request-authorization waits indefinitely, because a
                           prompt abandoned by a dying process is recorded as a
-                          permanent denial.
+                          permanent denial. A caller that cannot wait that long
+                          bounds its own wait and leaves this process running.
 
 MODES:
     --request-authorization   Prompt for permission, post nothing. Only ever
-                              call this interactively. Posting never prompts.
+                              call this from the Mac's own screen; from a
+                              session with no screen, such as SSH, it exits 8
+                              without asking. Posting never prompts.
+                              `kin notify authorize` is the supported way in.
     --status                  Print bundle id and authorization status as JSON.
 ";
 
@@ -391,11 +407,40 @@ fn authorization_status(
     Some(UNAuthorizationStatus(raw as _))
 }
 
-/// Prompt for permission. Returns whether it was granted.
+/// Whether this process's security session can reach the window server.
+///
+/// An SSH login and a launchd job lack `sessionHasGraphicAccess`, and a
+/// request raised from either appears, if anywhere, on a screen nobody at that
+/// session can see. `None` when the session could not be read.
+fn session_has_graphic_access() -> Option<bool> {
+    /// `callerSecuritySession` in `AuthSession.h`.
+    const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+    /// `sessionHasGraphicAccess` in `AuthSession.h`.
+    const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+    }
+
+    let mut session_id = 0u32;
+    let mut attributes = 0u32;
+    // SAFETY: both out-pointers are valid for the call, and the framework
+    // writes nothing else.
+    let status =
+        unsafe { SessionGetInfo(CALLER_SECURITY_SESSION, &mut session_id, &mut attributes) };
+    (status == 0).then_some(attributes & SESSION_HAS_GRAPHIC_ACCESS != 0)
+}
+
+/// Prompt for permission. Returns whether it was granted, or `None` when no
+/// answer arrived within `timeout`.
 ///
 /// Only meaningful when the current status is `NotDetermined`; macOS answers
 /// from the stored decision every time after that without showing a prompt.
-fn request_authorization(center: &UNUserNotificationCenter, timeout: Option<Duration>) -> bool {
+fn request_authorization(
+    center: &UNUserNotificationCenter,
+    timeout: Option<Duration>,
+) -> Option<bool> {
     let done = Arc::new(AtomicBool::new(false));
     let granted = Arc::new(AtomicBool::new(false));
 
@@ -415,7 +460,7 @@ fn request_authorization(center: &UNUserNotificationCenter, timeout: Option<Dura
         &handler,
     );
 
-    pump_until(&done, timeout) && granted.load(Ordering::SeqCst)
+    pump_until(&done, timeout).then(|| granted.load(Ordering::SeqCst))
 }
 
 /// Post one notification and wait for the delivery callback.
@@ -673,7 +718,21 @@ pub fn run() -> ExitCode {
     }
 
     if args.request_authorization {
-        let granted = request_authorization(&center, args.timeout);
+        if session_has_graphic_access() != Some(true) {
+            eprintln!(
+                "KinNotifier: this session has no access to the Mac's screen (an SSH login or a \
+                 background job), so nobody here could answer a notification request. Run `kin \
+                 notify authorize` in Terminal on the Mac's own screen."
+            );
+            return ExitCode::from(EXIT_NO_SCREEN);
+        }
+        let Some(granted) = request_authorization(&center, args.timeout) else {
+            eprintln!(
+                "KinNotifier: no answer to the notification request within the timeout; it was \
+                 not decided"
+            );
+            return ExitCode::from(EXIT_UNANSWERED);
+        };
         println!(r#"{{"bundle_id":"{bundle_id}","granted":{granted}}}"#);
         return if granted {
             ExitCode::SUCCESS
@@ -696,7 +755,7 @@ pub fn run() -> ExitCode {
         Some(UNAuthorizationStatus::NotDetermined) => {
             eprintln!(
                 "KinNotifier: {bundle_id} has never requested notification authorization. \
-                 Run `KinNotifier --request-authorization` interactively first."
+                 Run `kin notify authorize` in Terminal on the Mac's own screen first."
             );
             return ExitCode::from(EXIT_NOT_REQUESTED);
         }

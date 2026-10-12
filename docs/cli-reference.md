@@ -3875,6 +3875,21 @@ kin notify status [options]
 | --- | --- | --- |
 | `--json` |  | Emit the report as JSON |
 
+#### `kin notify authorize`
+
+Ask macOS whether Kin may send you notifications
+
+Run it in Terminal on the Mac's own screen: macOS shows the request there, so from an SSH session it asks nothing and says so. A decision macOS already holds is reported, never asked again. It waits at most `--wait` seconds for the answer, and a request still unanswered then stays open on screen. Exits 0 when notifications are allowed, 4 when they are declined or turned off, 7 when they are not decided yet, and 3 when there is no KinNotifier.app to ask about.
+
+```
+kin notify authorize [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--wait <SECONDS>` | `45` | Seconds to wait for the answer; an unanswered request stays open |
+| `--json` |  | Emit the outcome as JSON |
+
 ### `kin bench`
 
 Run benchmarks (delegates to kin-bench binary)

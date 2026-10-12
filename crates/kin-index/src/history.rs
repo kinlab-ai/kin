@@ -286,11 +286,9 @@ const HELD_IDENTITIES_ONLY: &str = "\0held entity identities";
 
 /// How many times a derivation re-offers its own identities before refusing.
 ///
-/// Identity assignment within a file takes the held entities of one name and
-/// kind in identity order. A declaration that is new to this build mints an
-/// identity that can sort before one it matched, so the first derivation is
-/// not always the one a second derivation over its own output reproduces; the
-/// second always is, and the third proves it.
+/// A newly minted identity is offered back with the declaration it names, then
+/// one more pass checks that both declarations and relations reproduce it.
+/// A derivation that does not settle within these passes returns an error.
 const IDENTITY_PASSES: usize = 3;
 
 /// Derive the complete entity and relation state `tree` holds under this
@@ -346,9 +344,10 @@ pub fn rederive_tree_semantics<'held>(
             }
             Some(_) => {}
             None => {
-                // Every file-owned identity came from `held`, so a derivation
-                // over this output offers the same identities in the same order
-                // and reproduces it without being asked to.
+                // Every file-owned identity came from `held`, and matching
+                // follows declaration evidence rather than the order those
+                // identities are offered in, so no new identity needs a pass
+                // to settle.
                 let held_ids: HashSet<EntityId> = held.iter().map(|entity| entity.id).collect();
                 if derived
                     .entities
@@ -480,9 +479,9 @@ fn derive_tree_semantics_once(
     }
     let mut prior = SemanticTreeState::default();
     for (artifact_id, (entry, mut entities)) in held_by_artifact {
-        // Offered in identity order, which is the order a replayed parent
-        // holds its entities in, so a file whose declarations share a name and
-        // kind pairs with them exactly as the replay of a later commit would.
+        // Offer identities in the order a replayed parent holds them. Matching
+        // uses each declaration's body, signature and position, so this order
+        // cannot swap two declarations that share a name and kind.
         entities.sort_by_key(|entity| entity.id);
         prior.files.insert(
             artifact_id,
@@ -1125,33 +1124,18 @@ fn stabilize_historical_entities(
     old_entities: Vec<&Entity>,
     parsed_entities: &[Entity],
 ) -> Vec<Entity> {
-    let mut matched = HashSet::<EntityId>::new();
     let mut in_use = HashSet::<EntityId>::new();
     let mut unmatched = Vec::new();
     let mut current = Vec::with_capacity(parsed_entities.len());
 
-    for parsed in parsed_entities {
-        let existing = old_entities
-            .iter()
-            .filter(|candidate| !matched.contains(&candidate.id))
-            .copied()
-            .find(|candidate| candidate.name == parsed.name && candidate.kind == parsed.kind)
-            .or_else(|| {
-                old_entities
-                    .iter()
-                    .filter(|candidate| !matched.contains(&candidate.id))
-                    .copied()
-                    .find(|candidate| {
-                        candidate.name == parsed.name && candidate.file_origin == parsed.file_origin
-                    })
-            });
+    let matches = match_historical_declarations(artifact_id, &old_entities, parsed_entities);
+    for (parsed, existing) in parsed_entities.iter().zip(matches) {
         let mut stabilized = parsed.clone();
         if let Some(old) = existing {
             stabilized.id = old.id;
             stabilized.lineage_parent = old.lineage_parent;
             stabilized.created_in = old.created_in;
             stabilized.superseded_by = old.superseded_by;
-            matched.insert(old.id);
             in_use.insert(old.id);
         } else {
             unmatched.push(current.len());
@@ -1179,6 +1163,132 @@ fn stabilize_historical_entities(
 
     current.sort_by_key(|entity| entity.id);
     current
+}
+
+/// Reserve the strongest declaration continuity across the whole file before
+/// an edited namesake can consume an unchanged declaration's identity. UUID
+/// order is not declaration order: property getters and setters, overloads and
+/// conditional definitions all share a name and kind.
+fn match_historical_declarations<'old>(
+    artifact_id: ArtifactId,
+    old_entities: &[&'old Entity],
+    parsed_entities: &[Entity],
+) -> Vec<Option<&'old Entity>> {
+    let mut matches = vec![None; parsed_entities.len()];
+    let mut reserved = HashSet::new();
+    let mut old_by_name = BTreeMap::<&str, Vec<&Entity>>::new();
+    for &old in old_entities {
+        old_by_name.entry(old.name.as_str()).or_default().push(old);
+    }
+    reserve_historical_matches(
+        &old_by_name,
+        parsed_entities,
+        &mut matches,
+        &mut reserved,
+        |old, parsed| {
+            old.kind == parsed.kind
+                && old.signature == parsed.signature
+                && old.language == parsed.language
+                && old.fingerprint.algorithm == parsed.fingerprint.algorithm
+                && old.fingerprint.behavior_hash != Hash256::from_bytes([0; 32])
+                && old.fingerprint.behavior_hash == parsed.fingerprint.behavior_hash
+        },
+    );
+    reserve_historical_matches(
+        &old_by_name,
+        parsed_entities,
+        &mut matches,
+        &mut reserved,
+        |old, parsed| old.kind == parsed.kind && old.signature == parsed.signature,
+    );
+    let historical_ids: BTreeMap<_, _> = parsed_entities
+        .iter()
+        .zip(&matches)
+        .filter(|(_, matched)| matched.is_none())
+        .map(|(parsed, _)| (parsed.id, historical_entity_id(artifact_id, parsed.id)))
+        .collect();
+    reserve_historical_matches(
+        &old_by_name,
+        parsed_entities,
+        &mut matches,
+        &mut reserved,
+        |old, parsed| {
+            old.kind == parsed.kind
+                && (old.id == parsed.id || historical_ids.get(&parsed.id) == Some(&old.id))
+        },
+    );
+    reserve_historical_matches(
+        &old_by_name,
+        parsed_entities,
+        &mut matches,
+        &mut reserved,
+        |old, parsed| old.kind == parsed.kind,
+    );
+    // Retain the historical same-file fallback when a declaration's kind
+    // changes. Artifact identity still admits same-kind continuity on a move.
+    reserve_historical_matches(
+        &old_by_name,
+        parsed_entities,
+        &mut matches,
+        &mut reserved,
+        |old, parsed| old.file_origin == parsed.file_origin,
+    );
+    matches
+}
+
+fn reserve_historical_matches<'old>(
+    old_by_name: &BTreeMap<&str, Vec<&'old Entity>>,
+    parsed_entities: &[Entity],
+    matches: &mut [Option<&'old Entity>],
+    reserved: &mut HashSet<EntityId>,
+    accept: impl Fn(&Entity, &Entity) -> bool,
+) {
+    // An edit can make one declaration's body identical to an unchanged
+    // namesake. Reserve the unchanged declaration at its exact position before
+    // assigning that same evidence to a declaration at another position.
+    for exact_position in [true, false] {
+        for (parsed, slot) in parsed_entities.iter().zip(matches.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            let existing = old_by_name
+                .get(parsed.name.as_str())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|old| {
+                    !reserved.contains(&old.id)
+                        && accept(old, parsed)
+                        && (!exact_position
+                            || old.span.as_ref().zip(parsed.span.as_ref()).is_some_and(
+                                |(was, now)| {
+                                    (was.start_byte, was.start_line, was.start_col)
+                                        == (now.start_byte, now.start_line, now.start_col)
+                                },
+                            ))
+                })
+                .min_by_key(|old| {
+                    let distance = old
+                        .span
+                        .as_ref()
+                        .zip(parsed.span.as_ref())
+                        .map(|(was, now)| {
+                            (
+                                was.start_line.abs_diff(now.start_line),
+                                was.start_byte.abs_diff(now.start_byte),
+                            )
+                        });
+                    // Candidates without a usable span distance sort last.
+                    // Equal versions of one ID retain parent order, so merge
+                    // ancestry remains deterministic.
+                    (distance.is_none(), distance, old.id)
+                });
+            if let Some(old) = existing {
+                reserved.insert(old.id);
+                *slot = Some(old);
+            }
+        }
+    }
 }
 
 fn historical_entity_id(artifact_id: ArtifactId, parser_id: EntityId) -> EntityId {
@@ -1779,6 +1889,145 @@ mod tests {
             .unwrap()
     }
 
+    fn parsed_python_declarations(path: &str, source: &[u8]) -> Vec<Entity> {
+        IndexPipeline::new()
+            .index_file_content_with_tests(
+                &FilePathId::new(path),
+                source,
+                kin_blobs::digest(source),
+            )
+            .unwrap()
+            .indexed_file
+            .entities
+    }
+
+    #[test]
+    fn historical_matching_reserves_unchanged_namesakes_before_edits() {
+        let artifact = ArtifactId(uuid::Uuid::from_u128(4));
+        let before = parsed_python_declarations(
+            "module.py",
+            b"def render():\n    return 1\n\n\ndef render():\n    return 2\n",
+        );
+        let before = stabilize_historical_entities(artifact, vec![], &before);
+        let after = parsed_python_declarations(
+            "module.py",
+            b"\n\n\n\ndef render():\n    return 3\n\n\ndef render():\n    return 2\n",
+        );
+        let id_for_body = |entities: &[Entity], body: &str| {
+            entities
+                .iter()
+                .find(|entity| {
+                    entity.name == "render"
+                        && entity.metadata.extra[kin_parser::extract::EMBEDDING_BODY_PREVIEW_KEY]
+                            .as_str()
+                            .is_some_and(|preview| preview.contains(body))
+                })
+                .unwrap()
+                .id
+        };
+        // The edited first declaration now occupies the unchanged second
+        // declaration's old position. Reserve the unchanged body globally.
+        for old in [before.iter().collect(), before.iter().rev().collect()] {
+            let current = stabilize_historical_entities(artifact, old, &after);
+            assert_eq!(
+                id_for_body(&current, "return 3"),
+                id_for_body(&before, "return 1")
+            );
+            assert_eq!(
+                id_for_body(&current, "return 2"),
+                id_for_body(&before, "return 2")
+            );
+        }
+    }
+
+    #[test]
+    fn historical_matching_reserves_same_position_namesakes_when_bodies_converge() {
+        let artifact = ArtifactId(uuid::Uuid::from_u128(4));
+        let before = parsed_python_declarations(
+            "module.py",
+            b"def render():\n    return 1\n\n\ndef render():\n    return 2\n",
+        );
+        let before = stabilize_historical_entities(artifact, vec![], &before);
+        let after = parsed_python_declarations(
+            "module.py",
+            b"def render():\n    return 2\n\n\ndef render():\n    return 2\n",
+        );
+        let current = stabilize_historical_entities(artifact, before.iter().collect(), &after);
+        for old in before.iter().filter(|entity| entity.name == "render") {
+            let new = current.iter().find(|entity| entity.id == old.id).unwrap();
+            assert_eq!(
+                new.span, old.span,
+                "the unchanged namesake must keep its identity"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_matching_can_select_a_secondary_parents_version_of_an_identity() {
+        let artifact = ArtifactId(uuid::Uuid::from_u128(4));
+        let primary = parsed_python_declarations(
+            "module.py",
+            b"def render():\n    return 1\n\n\ndef render():\n    return 2\n",
+        );
+        let primary = stabilize_historical_entities(artifact, vec![], &primary);
+        let parsed = parsed_python_declarations(
+            "module.py",
+            b"def render():\n    return 2\n\n\ndef render():\n    return 1\n",
+        );
+        let mut secondary = parsed.clone();
+        for entity in &mut secondary {
+            entity.id = primary
+                .iter()
+                .find(|old| old.name == entity.name && old.span == entity.span)
+                .unwrap()
+                .id;
+        }
+        let current = stabilize_historical_entities(
+            artifact,
+            primary.iter().chain(&secondary).collect(),
+            &parsed,
+        );
+        assert_eq!(current.len(), secondary.len());
+        for expected in &secondary {
+            assert_eq!(
+                current.iter().find(|entity| entity.id == expected.id),
+                Some(expected),
+                "same-ID parent versions must remain available to the evidence tiers"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_matching_retains_artifact_moves_and_same_file_kind_changes() {
+        let artifact = ArtifactId(uuid::Uuid::from_u128(4));
+        for (old_path, old_body, new_path, new_body, name) in [
+            (
+                "old.py",
+                b"def value():\n    return 1\n".as_slice(),
+                "new.py",
+                b"def value(multiplier):\n    return 2 * multiplier\n".as_slice(),
+                "value",
+            ),
+            (
+                "module.py",
+                b"VALUE = 1\n".as_slice(),
+                "module.py",
+                b"def VALUE():\n    return 1\n".as_slice(),
+                "VALUE",
+            ),
+        ] {
+            let before = parsed_python_declarations(old_path, old_body);
+            let before = stabilize_historical_entities(artifact, vec![], &before);
+            let after = parsed_python_declarations(new_path, new_body);
+            let current = stabilize_historical_entities(artifact, before.iter().collect(), &after);
+            let old = before.iter().find(|entity| entity.name == name).unwrap();
+            let new = current.iter().find(|entity| entity.name == name).unwrap();
+            assert_eq!(new.id, old.id);
+            assert_eq!(new.file_origin, Some(FilePathId::new(new_path)));
+            assert_eq!(new.kind, EntityKind::Function);
+        }
+    }
+
     #[test]
     fn fails_closed_when_history_is_not_parent_first() {
         let root = tempdir().unwrap();
@@ -2292,6 +2541,84 @@ mod tests {
         tree: ResolvedTree,
         entities: BTreeMap<EntityId, Entity>,
         relations: BTreeMap<RelationId, Relation>,
+    }
+
+    /// Property accessors share a name and kind but are different declarations.
+    /// Their history identities need not sort in declaration order, so a fresh
+    /// derivation must keep each identity on its own getter or setter.
+    #[test]
+    fn rederiving_property_accessors_preserves_the_replayed_identities() {
+        let root = tempdir().unwrap();
+        let blobs = BlobStore::new(root.path().join("cas")).unwrap();
+        let source = b"class Request:\n\
+            \x20   @property\n\
+            \x20   def max_content_length(self) -> int | None:\n\
+            \x20       return self._max_content_length\n\n\
+            \x20   @max_content_length.setter\n\
+            \x20   def max_content_length(self, value: int | None) -> None:\n\
+            \x20       self._max_content_length = value\n\n\
+            \x20   @property\n\
+            \x20   def max_form_memory_size(self) -> int | None:\n\
+            \x20       return self._max_form_memory_size\n\n\
+            \x20   @max_form_memory_size.setter\n\
+            \x20   def max_form_memory_size(self, value: int | None) -> None:\n\
+            \x20       self._max_form_memory_size = value\n";
+        let digest = blobs.write(source).unwrap();
+        let tree = ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
+            ArtifactId(uuid::Uuid::from_u128(4)),
+            kin_model::RepoPath::from_utf8("src/flask/wrappers.py").unwrap(),
+            TreeEntry::blob(digest, false),
+        )])
+        .unwrap();
+        // A root history commit has no prior declarations and derives each
+        // identity from its artifact and parser key, exactly as this pass does.
+        let replayed = derive_tree_semantics_once(&tree, &[], &blobs).unwrap();
+        for name in ["Request.max_content_length", "Request.max_form_memory_size"] {
+            let accessors: Vec<_> = replayed
+                .entities
+                .values()
+                .filter(|entity| entity.name == name)
+                .collect();
+            assert_eq!(accessors.len(), 2);
+            assert!(
+                accessors[0].signature.starts_with("@setter"),
+                "the fixture must offer each setter identity before its getter"
+            );
+        }
+        let derived = rederive_tree_semantics(&tree, replayed.entities.values(), &blobs).unwrap();
+        assert_eq!(derived.entities, replayed.entities);
+        assert_eq!(derived.relations, replayed.relations);
+        let repeated = rederive_tree_semantics(&tree, derived.entities.values(), &blobs).unwrap();
+        assert_eq!(repeated.entities, derived.entities);
+        assert_eq!(repeated.relations, derived.relations);
+    }
+
+    #[test]
+    fn rederiving_same_line_twins_preserves_each_declaration_position() {
+        let root = tempdir().unwrap();
+        let blobs = BlobStore::new(root.path().join("cas")).unwrap();
+        let digest = blobs
+            .write(b"function value() { return 1; } function value() { return 1; }\n")
+            .unwrap();
+        let tree = ResolvedTree::from_artifacts([kin_model::ResolvedArtifact::new(
+            ArtifactId(uuid::Uuid::from_u128(2)),
+            kin_model::RepoPath::from_utf8("twins.js").unwrap(),
+            TreeEntry::blob(digest, false),
+        )])
+        .unwrap();
+        let replayed = derive_tree_semantics_once(&tree, &[], &blobs).unwrap();
+        let twins: Vec<_> = replayed
+            .entities
+            .values()
+            .filter(|entity| entity.name == "value")
+            .collect();
+        assert_eq!(twins.len(), 2);
+        assert!(
+            twins[0].span.as_ref().unwrap().start_byte > twins[1].span.as_ref().unwrap().start_byte
+        );
+        let derived = rederive_tree_semantics(&tree, replayed.entities.values(), &blobs).unwrap();
+        assert_eq!(derived.entities, replayed.entities);
+        assert_eq!(derived.relations, replayed.relations);
     }
 
     fn replayed_head() -> ReplayedHead {
