@@ -77,6 +77,25 @@ test('the lock shim keeps the acquire, holder and release contract the preflight
   assert.notEqual(run('frobnicate').status, 0);
 });
 
+test('a staged acceptance suite carries the sibling modules it imports', (t) => {
+  const python = spawnSync('python3', ['--version'], { encoding: 'utf8' });
+  if (python.error) return t.skip('python3 unavailable');
+  const root = path.join(HERE, '..', '..');
+  const staged = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-suite-'));
+  const dest = path.join(staged, 'kin-magic-repro');
+  // The resolver exit also carries its drift tripwire verdict, which is not
+  // what this test grades; the staging writes land before that verdict.
+  spawnSync('python3', [path.join(HERE, 'bin', 'kin-acceptance-suite'), 'magic',
+    '--checkout', root, '--dest', dest, '--no-fetch'], { encoding: 'utf8' });
+  assert.ok(fs.existsSync(dest), 'the suite was not staged');
+  const sibling = path.join(staged, 'trace_pages.py');
+  assert.ok(fs.existsSync(sibling), 'trace_pages.py was not staged beside the suite');
+  assert.equal(sha256(sibling), sha256(path.join(root, 'scripts', 'acceptance', 'trace_pages.py')));
+  const help = spawnSync('python3', [dest, '--help'], { encoding: 'utf8' });
+  assert.equal(help.status, 0, help.stderr);
+  assert.doesNotMatch(help.stderr, /ModuleNotFoundError/);
+});
+
 test('the preflight resolves the shim beside itself rather than the fleet tool', () => {
   const preflight = fs.readFileSync(path.join(HERE, 'bin', 'kin-release-preflight'), 'utf8');
   assert.match(preflight, /KIN_LANE="\$BIN_DIR\/kin-lane"/);

@@ -110,6 +110,14 @@ SUITES = {
     "brownfield": "scripts/acceptance/brownfield_repro.py",
 }
 
+# Sibling modules a suite imports by bare name. Python resolves those from
+# the script's own directory, so a suite staged alone at --dest dies on
+# import; the siblings travel beside it, from the same tree and ref.
+SUITE_SIBLINGS = {
+    "magic": ("scripts/acceptance/trace_pages.py",),
+    "brownfield": ("scripts/acceptance/trace_pages.py",),
+}
+
 BASELINE_REF = "origin/main"
 ALLOW_ENV = "KIN_ACCEPTANCE_ALLOW_DRIFT"
 
@@ -206,6 +214,26 @@ def write_executable(dest, data):
     return None
 
 
+def stage_siblings(opts, read_bytes):
+    """Write the suite's sibling modules beside --dest; error or None.
+
+    `read_bytes(rel)` returns the sibling's bytes from the same tree or ref
+    the suite itself came from, or None when that source has no such path,
+    which refuses: a staged suite whose imports cannot resolve is worse
+    than no suite, because it fails later and somewhere else.
+    """
+    dest_dir = os.path.dirname(os.path.abspath(opts.dest))
+    for rel in SUITE_SIBLINGS.get(opts.suite, ()):
+        data = read_bytes(rel)
+        if data is None:
+            return "the %s suite imports %s but its source tree carries no %s" % (
+                opts.suite, os.path.basename(rel), rel)
+        target = os.path.join(dest_dir, os.path.basename(rel))
+        with open(target, "wb") as handle:
+            handle.write(data)
+    return None
+
+
 def resolve(opts):
     """(path, repo, ref, error). `ref` is None when the working tree answered."""
     rel = SUITES[opts.suite]
@@ -239,6 +267,17 @@ def resolve(opts):
                 problem = write_executable(opts.dest, handle.read())
             if problem:
                 return None, None, None, problem
+
+            def from_checkout(sibling):
+                sibling_path = os.path.join(checkout, sibling)
+                if not os.path.isfile(sibling_path):
+                    return None
+                with open(sibling_path, "rb") as handle:
+                    return handle.read()
+
+            problem = stage_siblings(opts, from_checkout)
+            if problem:
+                return None, None, None, problem
             return os.path.abspath(opts.dest), checkout, None, None
         return path, checkout, None, None
 
@@ -266,6 +305,15 @@ def resolve(opts):
                                   % (opts.ref, rel, repo,
                                      proc.stderr.decode("utf-8", "replace").strip()))
     problem = write_executable(opts.dest, proc.stdout)
+    if problem:
+        return None, None, None, problem
+
+    def from_ref(sibling):
+        shown = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (opts.ref, sibling)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return shown.stdout if shown.returncode == 0 else None
+
+    problem = stage_siblings(opts, from_ref)
     if problem:
         return None, None, None, problem
     return os.path.abspath(opts.dest), repo, opts.ref, None
