@@ -14,7 +14,7 @@ use crate::error::KinDbError;
 use crate::search::{resolve_roles, ScoredHit};
 use crate::types::EntityId;
 use kin_model::{EntityRole, RetrievalKey};
-use kin_vector::IndexDescriptor;
+use kin_vector::{IndexDescriptor, PersistTopology};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
@@ -787,7 +787,7 @@ fn append_vector_index_producer_trailer(
                 path.display()
             ))
         })?;
-    file.sync_all().map_err(|error| {
+    kin_blobs::durable::sync_all(&file).map_err(|error| {
         KinDbError::StorageError(format!(
             "failed to sync complete staged vector index {}: {error}",
             path.display()
@@ -914,7 +914,7 @@ fn stage_verified_vector_base(
                 .to_string(),
         ));
     }
-    if let Err(error) = staged.sync_all() {
+    if let Err(error) = kin_blobs::durable::sync_all(&staged) {
         drop(staged);
         return Err(KinDbError::StorageError(format!(
             "failed to sync verified vector base {}: {error}",
@@ -950,9 +950,13 @@ pub struct VectorIndex {
     /// Conservative lineage for every producer that has contributed to this
     /// handle. Removal deliberately does not subtract from the set.
     actual_producers: RwLock<EmbeddingProducerSet>,
-    /// Serializes vector mutation plus provenance union against persistence, so
-    /// no saved index can contain a vector whose producer has not yet landed.
+    /// Serializes vector mutation plus provenance union against the copy a
+    /// save takes, so no saved index can contain a vector whose producer has
+    /// not yet landed. A save holds it only while it copies, never across the
+    /// rebuild and write that follow.
     mutation_guard: RwLock<()>,
+    /// Serializes saves against each other, and nothing else.
+    persist_serial: parking_lot::Mutex<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,6 +1034,7 @@ impl VectorIndex {
             generation: AtomicU64::new(0),
             actual_producers: RwLock::new(actual_producers),
             mutation_guard: RwLock::new(()),
+            persist_serial: parking_lot::Mutex::new(()),
         }
     }
 
@@ -1422,18 +1427,62 @@ impl VectorIndex {
     where
         F: FnOnce(&VectorIndexPersistenceInfo) -> Result<(), KinDbError>,
     {
+        self.save_with_provenance_as(
+            path,
+            descriptor,
+            PersistTopology::Canonical,
+            before_index_promote,
+        )
+    }
+
+    /// [`Self::save_with_provenance`] writing the HNSW topology `topology`
+    /// asks for. [`PersistTopology::AsIs`] writes a changed graph without its
+    /// canonical rebuild, for a checkpoint taken while the index is filling.
+    pub(crate) fn save_with_provenance_as<F>(
+        &self,
+        path: &Path,
+        descriptor: Option<IndexDescriptor>,
+        topology: PersistTopology,
+        before_index_promote: F,
+    ) -> Result<VectorIndexPersistenceInfo, KinDbError>
+    where
+        F: FnOnce(&VectorIndexPersistenceInfo) -> Result<(), KinDbError>,
+    {
         let _span = tracing::info_span!(
             "kindb.vector_index.save",
-            path = %path.display()
+            path = %path.display(),
+            topology = ?topology
         )
         .entered();
-        let _guard = self.mutation_guard.write();
-        if let Some(descriptor) = descriptor {
-            self.inner.set_descriptor(descriptor);
-        }
-        let producers = self.actual_producers.read().clone();
-        let dimensions = self.inner.dimensions();
-        let indexed = self.inner.len();
+        // One save at a time, as before: two saves promoting their metadata and
+        // their index in an interleaved order would leave a mixed pair behind.
+        let _serial = self.persist_serial.lock();
+        // Mutation is fenced only while the copy is taken. The producer set and
+        // the vectors are read under the same guard every mutation takes, so
+        // the saved index can hold no vector whose producer has not landed,
+        // and the rebuild and IO below then run with every writer free to
+        // proceed. Holding the guard across them made a full canonical rebuild,
+        // which on a large index is tens of seconds of one core, a wall that
+        // every relation write invalidating an embedding had to wait behind.
+        let (snapshot, producers) = {
+            let _guard = self.mutation_guard.write();
+            if let Some(descriptor) = descriptor {
+                self.inner.set_descriptor(descriptor);
+            }
+            let producers = self.actual_producers.read().clone();
+            let snapshot = self
+                .inner
+                .persist_snapshot_with(topology)
+                .map_err(|e| KinDbError::IndexError(e.to_string()))?;
+            (snapshot, producers)
+        };
+        tracing::debug!(
+            vectors = snapshot.len(),
+            rebuilds = snapshot.rebuilds(),
+            "kindb.vector_index.save: snapshot taken"
+        );
+        let dimensions = snapshot.dimensions();
+        let indexed = snapshot.len();
         if indexed > 0 && producers.is_empty() {
             return Err(KinDbError::StorageError(
                 "non-empty vector index has no actual-producer evidence".to_string(),
@@ -1453,7 +1502,11 @@ impl VectorIndex {
         ));
         let outcome = (|| {
             self.inner
-                .save(&staged)
+                .write_persist_snapshot(
+                    snapshot,
+                    &staged,
+                    kin_vector::KvecQuantizeOptions::default(),
+                )
                 .map_err(|e| KinDbError::IndexError(e.to_string()))?;
             let index_binding_sha256 = append_vector_index_producer_trailer(&staged, &producers)?;
             let info = VectorIndexPersistenceInfo {
@@ -1671,6 +1724,61 @@ mod tests {
         bytes[24..32].copy_from_slice(&slots.to_le_bytes());
         bytes[32..40].copy_from_slice(&dimensions.to_le_bytes());
         bytes
+    }
+
+    /// A checkpoint of a filling index writes its vectors and their producer
+    /// binding without the canonical rebuild, leaves that rebuild owed on the
+    /// live index, and does not change what the completing canonical save
+    /// writes.
+    #[test]
+    fn an_as_is_checkpoint_skips_the_rebuild_and_leaves_it_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("checkpoint.kvec");
+        let completed = dir.path().join("completed.kvec");
+        let reference = dir.path().join("reference.kvec");
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        let items: Vec<(RetrievalKey, Vec<f32>)> = (0..120u32)
+            .map(|i| {
+                let f = i as f32;
+                (
+                    RetrievalKey::from(EntityId(uuid::Uuid::from_u128(u128::from(i) + 11))),
+                    vec![f.sin(), f.cos(), (i % 3) as f32, (i % 4) as f32],
+                )
+            })
+            .collect();
+
+        let filling = VectorIndex::new(4).unwrap();
+        for batch in items.chunks(30) {
+            filling
+                .upsert_retrievable_batch_with_producers(batch.to_vec(), &producers)
+                .unwrap();
+            let info = filling
+                .save_with_provenance_as(&checkpoint, None, PersistTopology::AsIs, |_| Ok(()))
+                .unwrap();
+            assert_eq!(info.actual_producers, producers);
+            assert!(
+                filling.inner.persist_snapshot().unwrap().rebuilds(),
+                "the canonical rebuild stays owed after an as-is checkpoint"
+            );
+        }
+        let reloaded = VectorIndex::load_from_disk(&checkpoint).unwrap();
+        assert_eq!(reloaded.len(), items.len());
+        assert_eq!(reloaded.actual_producers(), producers);
+
+        filling.save(&completed).unwrap();
+        assert!(!filling.inner.persist_snapshot().unwrap().rebuilds());
+        let direct = VectorIndex::new(4).unwrap();
+        for (key, vector) in items.iter().rev() {
+            direct
+                .upsert_retrievable_with_producers(*key, vector, &producers)
+                .unwrap();
+        }
+        direct.save(&reference).unwrap();
+        assert_eq!(
+            std::fs::read(&completed).unwrap(),
+            std::fs::read(&reference).unwrap(),
+            "the completing save writes the canonical index"
+        );
     }
 
     fn every_producer() -> EmbeddingProducerSet {
@@ -2689,6 +2797,18 @@ mod tests {
         assert!(stranded.is_empty(), "stranded vector stages: {stranded:?}");
     }
 
+    /// A save fences writers only while it copies, and what it writes is that
+    /// copy and its producers.
+    ///
+    /// The save is paused inside its promote callback, after the rebuild and
+    /// the write, which is exactly where it used to still hold the mutation
+    /// guard. Holding it there made every writer wait out a full canonical
+    /// rebuild: measured on a React store, a relation write that invalidates an
+    /// embedding waited 30 to 90 s behind each embed batch's save, so the
+    /// language-server sweep advanced one file per batch. The writer must now
+    /// finish while the save is still paused, and the saved index must still
+    /// hold exactly the vector and producer it copied, never the one the writer
+    /// added after.
     #[test]
     fn save_and_produced_upsert_share_one_mutation_frontier() {
         let dir = tempfile::tempdir().unwrap();
@@ -2732,20 +2852,19 @@ mod tests {
             );
             writer_tx.send(result).unwrap();
         });
-        assert!(
-            writer_rx
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err(),
-            "produced upsert must wait while the exact save frontier is held"
+        writer_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a produced upsert must not wait for a save that has already copied")
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            index.len(),
+            2,
+            "the writer landed while the save was still paused"
         );
 
         release.wait();
         let saved_receipt = saver.join().unwrap().unwrap();
-        writer_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
-        writer.join().unwrap();
         assert_eq!(receipt, saved_receipt);
         assert_eq!(saved_receipt.indexed, 1);
         assert_eq!(saved_receipt.actual_producers, cpu);

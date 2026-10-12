@@ -110,7 +110,7 @@ test('artifactName is honest about windows-aarch64 having no artifact', () => {
 test('releaseDownloadUrl pins the tag and file', () => {
   assert.equal(
     releaseDownloadUrl('1.2.3', 'kin-macos-aarch64.tar.gz'),
-    'https://github.com/firelock-ai/kin/releases/download/v1.2.3/kin-macos-aarch64.tar.gz',
+    'https://github.com/kinlab-ai/kin/releases/download/v1.2.3/kin-macos-aarch64.tar.gz',
   );
 });
 
@@ -228,11 +228,12 @@ function makeFixture({
   streamArchive = false,
   notifier = 'complete',
   notifierBody = 'notifier-v1',
+  kinScript = '#!/bin/sh\necho "kin 9.9.9 (test)"\n',
 } = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-fixture-'));
   const stage = path.join(work, 'kin-macos-aarch64');
   fs.mkdirSync(stage, { recursive: true });
-  fs.writeFileSync(path.join(stage, 'kin'), '#!/bin/sh\necho "kin 9.9.9 (test)"\n');
+  fs.writeFileSync(path.join(stage, 'kin'), kinScript);
   if (withDaemon) {
     fs.writeFileSync(path.join(stage, 'kin-daemon'), '#!/bin/sh\necho daemon\n');
   }
@@ -614,6 +615,110 @@ test('provision installs no bundle on a platform that has no notification bundle
     !lines.some((line) => line.includes('KinNotifier.app')),
     'a platform with no bundle concept has nothing to warn about',
   );
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+// A stand-in for the release kin that keeps the one rule this lane depends on:
+// `registry authority --initialize` refuses a Kin home its group or others can
+// write, exactly as the real binary's registry check does. It records every
+// registry call so a test can see the installer made it.
+const REGISTRY_CHECKING_KIN = `#!/bin/sh
+if [ "$1" = registry ]; then
+  printf '%s\\n' "$*" >> "$KIN_HOME/../registry-calls.log"
+  if [ -n "$(find "$KIN_HOME" -prune \\( -perm -020 -o -perm -002 \\) -print)" ]; then
+    echo "Error: registry parent $KIN_HOME must not be group/world writable" >&2
+    exit 1
+  fi
+  exit 0
+fi
+echo "kin 9.9.9 (test)"
+`;
+
+function directoryMode(target) {
+  return fs.statSync(target).mode & 0o777;
+}
+
+// Ubuntu, Debian and every distribution with USERGROUPS_ENAB give a login a
+// umask of 0002. mkdirSync's default 0777 then made KIN_HOME group writable,
+// the release kin refused its own registry directory, and the npm lane ended
+// with a registry nothing had initialized.
+macArchiveModeTest('provision creates Kin directories at 0755 and initializes the registry under umask 0002', async () => {
+  const { work, fetchImpl } = makeFixture({ kinScript: REGISTRY_CHECKING_KIN });
+  const home = path.join(work, 'fresh', 'kin-home');
+  const previous = process.umask(0o002);
+  try {
+    await provision('9.9.9', {
+      env: { KIN_HOME: home },
+      platform: 'darwin',
+      arch: 'arm64',
+      fetchImpl,
+      log: () => {},
+    });
+  } finally {
+    process.umask(previous);
+  }
+  for (const directory of [
+    path.join(work, 'fresh'),
+    home,
+    path.join(home, 'bin'),
+    path.join(home, 'lib'),
+    path.join(home, 'lib', 'KinNotifier.app'),
+    path.join(home, 'lib', 'KinNotifier.app', 'Contents'),
+  ]) {
+    assert.equal(directoryMode(directory), 0o755, `${directory} under umask 0002`);
+  }
+  assert.equal(
+    fs.readFileSync(path.join(work, 'fresh', 'registry-calls.log'), 'utf8'),
+    'registry authority --initialize\n',
+    'the npm lane initializes the registry the way the shell installer does',
+  );
+  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+// A Kin home an earlier install left group writable is not repaired silently.
+// The refusal names the directory and the command that repairs it, and the
+// installed binaries stay as they were.
+macArchiveModeTest('provision names the exact repair for a group-writable Kin home and replaces nothing', async () => {
+  const { work, fetchImpl } = makeFixture({ kinScript: REGISTRY_CHECKING_KIN });
+  const home = path.join(work, 'kin home');
+  fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'bin', 'kin'), 'old kin');
+  fs.chmodSync(home, 0o775);
+  await assert.rejects(
+    provision('9.9.9', {
+      env: { KIN_HOME: home },
+      platform: 'darwin',
+      arch: 'arm64',
+      fetchImpl,
+      log: () => {},
+    }),
+    (error) => {
+      assert.match(error.message, /must not be group\/world writable/);
+      assert.ok(
+        error.message.includes(`chmod go-w '${home}'`),
+        `the refusal carries a remedy that can be pasted: ${error.message}`,
+      );
+      assert.match(error.message, /mode 0775/);
+      assert.match(error.message, /KIN_REGISTRY_REPAIR=1/);
+      return true;
+    },
+  );
+  assert.equal(fs.readFileSync(path.join(home, 'bin', 'kin'), 'utf8'), 'old kin');
+  assert.equal(directoryMode(home), 0o775, 'a refusal never repairs');
+
+  // Consent is what turns the refusal into a repair request.
+  const calls = path.join(work, 'registry-calls.log');
+  fs.rmSync(calls, { force: true });
+  fs.chmodSync(home, 0o755);
+  await provision('9.9.9', {
+    env: { KIN_HOME: home, KIN_REGISTRY_REPAIR: '1' },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+  });
+  assert.equal(fs.readFileSync(calls, 'utf8'), 'registry authority --fix --initialize\n');
   fs.rmSync(work, { recursive: true, force: true });
 });
 

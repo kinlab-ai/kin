@@ -297,12 +297,48 @@ jobs:
               echo "::error title=Kin dependency wave blocked::$reason"
               exit 3
               ;;
+            4)
+              # kin-actions' updater exits 4 only when the Kin registry kept
+              # answering HTTP 5xx after its own retries: an outage, not a fact
+              # about the pins. Warn and end the run cleanly; the next hourly
+              # schedule reconciles the full set. The marker line is required,
+              # so any other exit-4 path still fails loudly.
+              reason="$(printf '%s\n' "$output" \
+                | sed -n 's/^dependency wave skipped: registry unavailable: //p' | head -1)"
+              if [ -z "$reason" ]; then
+                echo "::error::dependency updater exited 4 without a registry-unavailable reason"
+                exit 4
+              fi
+              echo "::warning title=Kin registry unavailable::$reason; dependency wave skipped, next scheduled run retries"
+              {
+                echo "### Kin registry unavailable"
+                echo
+                echo "> $reason"
+                echo
+                echo "Dependency wave skipped; no pull request was written. The next hourly run retries."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "changed=unavailable" >> "$GITHUB_OUTPUT"
+              mkdir -p "$RUNNER_TEMP/kin-registry-unavailable"
+              printf '%s\n' "$reason" > "$RUNNER_TEMP/kin-registry-unavailable/reason.txt"
+              exit 0
+              ;;
             *)
               echo "::error::dependency updater failed with exit code $code"
               exit "$code"
               ;;
           esac
           echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      # Tells the post-completion attester this successful run wrote no result
+      # on purpose: the registry was unavailable and mutate-wave was skipped.
+      - name: Record the registry-unavailable skip
+        if: steps.update.outputs.changed == 'unavailable'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kin-registry-unavailable-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kin-registry-unavailable/reason.txt
+          if-no-files-found: error
+          retention-days: 30
 
       # fuzz/Cargo.toml declares its own empty [workspace] table (see the
       # comment there), so it carries a separate fuzz/Cargo.lock that the
@@ -406,6 +442,8 @@ jobs:
   mutate-wave:
     name: Update the fixed Kin registry PR
     needs: [validate-dispatch, prepare-wave]
+    # A registry outage (updater exit 4) produced no candidate; nothing to write.
+    if: needs.prepare-wave.outputs.changed != 'unavailable'
     concurrency:
       group: kin-registry-release-mutate-${{ github.repository }}
       cancel-in-progress: false

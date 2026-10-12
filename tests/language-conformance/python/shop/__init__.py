@@ -1,0 +1,1 @@
+"""The shop package."""

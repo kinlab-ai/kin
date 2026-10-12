@@ -184,7 +184,14 @@ pub enum NameReach {
     /// No entity's whole name is the query; these owners' members carry it as
     /// their member name.
     Members(Vec<Entity>),
-    /// Neither tier reaches anything.
+    /// Neither tier reaches the query as written, and it is a module-qualified
+    /// name: a module qualifier (`flask.app`, `Scheduler`) before a name the
+    /// exact or member tier reaches (`_make_timedelta`, `advanceTimers`). These
+    /// are the entities that name reaches whose modules the qualifier names
+    /// ([`crate::module_qualifier`]). The qualifier is matched against Module
+    /// entities, never against a file path.
+    Qualified(Vec<Entity>),
+    /// No tier reaches anything.
     Neither,
 }
 
@@ -241,7 +248,92 @@ pub fn reach_among(entities: impl IntoIterator<Item = Entity>, query: &str) -> N
 /// hid `Request.blueprint` behind the two `Blueprint` classes.
 ///
 /// A query carrying `*` is a glob, not a name, and reaches nothing here.
+///
+/// A query neither tier reaches that carries a separator is tried last as a
+/// module-qualified name ([`NameReach::Qualified`]), so `flask.app._make_timedelta`
+/// and `Scheduler.advanceTimers` pin one of several same-named definitions
+/// without a file path.
 pub fn reach_by_name<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<NameReach, <G as GraphStore>::Error> {
+    let reach = reach_whole_or_member_name(store, query)?;
+    if !matches!(reach, NameReach::Neither) {
+        return Ok(reach);
+    }
+    reach_by_module_qualifier(store, query)
+}
+
+/// The owners' members that carry `query` as their member name, whatever the
+/// exact tier holds: `Flask.url_for` for `url_for` beside a function named
+/// `url_for`. [`reach_by_name`] never pools these with an exact match; this is
+/// for an answer that names them beside the entity it answered for, so a
+/// reader who meant the member can ask for it.
+pub fn members_named<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<Vec<Entity>, <G as GraphStore>::Error> {
+    if query.is_empty() || query.contains('*') || query.contains('.') || query.contains("::") {
+        return Ok(Vec::new());
+    }
+    let mut members = Vec::new();
+    for pattern in [format!("*.{query}"), format!("*::{query}")] {
+        members.extend(
+            store
+                .query_entities(&kin_model::graph::EntityFilter {
+                    name_pattern: Some(pattern),
+                    ..Default::default()
+                })?
+                .into_iter()
+                .filter(|entity| {
+                    addressable_by_name(entity) && is_member_name_match(entity, query)
+                }),
+        );
+    }
+    sort_name_candidates(&mut members);
+    Ok(members)
+}
+
+/// The module-qualified tier of [`reach_by_name`]: each way the query splits
+/// into a qualifier and a name, longest name first, until a name the exact or
+/// member tier reaches has candidates in modules the qualifier names.
+fn reach_by_module_qualifier<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<NameReach, <G as GraphStore>::Error> {
+    if query.is_empty() || query.contains('*') {
+        return Ok(NameReach::Neither);
+    }
+    let splits = crate::module_qualifier::qualifier_splits(query);
+    if splits.is_empty() {
+        return Ok(NameReach::Neither);
+    }
+    let mut modules: Option<crate::module_qualifier::ModuleIndex> = None;
+    for (qualifier, tail) in splits {
+        let reached = match reach_whole_or_member_name(store, &tail)? {
+            NameReach::Exact(found) | NameReach::Members(found) => found,
+            NameReach::Qualified(_) | NameReach::Neither => continue,
+        };
+        if modules.is_none() {
+            modules = Some(crate::module_qualifier::ModuleIndex::load(store)?);
+        }
+        let index = modules.as_ref().expect("loaded above");
+        let mut pinned: Vec<Entity> = reached
+            .into_iter()
+            .filter(|entity| {
+                crate::module_qualifier::qualifier_matches_chain(&qualifier, &index.chain(entity))
+            })
+            .collect();
+        if !pinned.is_empty() {
+            sort_name_candidates(&mut pinned);
+            return Ok(NameReach::Qualified(pinned));
+        }
+    }
+    Ok(NameReach::Neither)
+}
+
+/// The exact and member tiers of [`reach_by_name`], without the qualified one.
+fn reach_whole_or_member_name<G: GraphStore>(
     store: &G,
     query: &str,
 ) -> std::result::Result<NameReach, <G as GraphStore>::Error> {
@@ -281,6 +373,13 @@ pub enum NameResolution {
     /// it as their member name, so the name does not say which one is meant and
     /// none was chosen. Listed in [`sort_name_candidates`] order.
     SharedMemberName(Vec<Entity>),
+    /// Several distinct entities carry the query as their whole name, or a
+    /// module-qualified query reaches several, once the twins of one
+    /// declaration are folded together ([`fold_same_name_twins`]). The name
+    /// does not say which one is meant and none was chosen. Listed in
+    /// [`sort_name_candidates`] order; [`same_name_reason`] says which of the
+    /// two it was.
+    SameName(Vec<Entity>),
     /// Nothing the repository holds matches the name.
     Missing,
 }
@@ -288,26 +387,239 @@ pub enum NameResolution {
 /// Resolve `query` for a surface that answers about exactly one entity.
 ///
 /// The exact tier comes first and is never pooled with members. Members are a
-/// fallback that runs only when no entity's whole name is the query: one
-/// member answers, several are returned whole as
-/// [`NameResolution::SharedMemberName`] for the surface to list, never ranked
-/// down to one. Every other name goes to [`select_best_entity`], whose own tier
-/// key keeps a whole-name match first; a surface that returns an editable body
-/// uses [`resolve_name_strictly`] instead, which never ranks.
+/// fallback that runs only when no entity's whole name is the query, and a
+/// module-qualified name is tried after both. Whatever a tier reaches is folded
+/// first ([`fold_same_name_twins`]), so a C prototype and its definition, a
+/// TypeScript overload signature and its implementation, and a Python
+/// `@overload` stub or a Rust `cfg` arm beside its twin in one file count once.
+/// One entity left answers. Several are returned whole, as
+/// [`NameResolution::SharedMemberName`] for members of different owners and
+/// [`NameResolution::SameName`] for same-named entities, for the surface to
+/// list or section, never ranked down to one. A name no tier reaches goes to
+/// [`select_best_entity`]; a surface that returns an editable body uses
+/// [`resolve_name_strictly`] instead, which never ranks.
 pub fn resolve_name<G: GraphStore>(
     store: &G,
     query: &str,
 ) -> std::result::Result<NameResolution, <G as GraphStore>::Error> {
-    match reach_by_name(store, query)? {
-        NameReach::Members(mut members) if members.len() == 1 => {
-            Ok(NameResolution::One(members.remove(0)))
-        }
-        NameReach::Members(members) => Ok(NameResolution::SharedMemberName(members)),
-        NameReach::Exact(_) | NameReach::Neither => Ok(match select_best_entity(store, query)? {
+    match resolve_name_exact(store, query)? {
+        NameResolution::Missing => Ok(match select_best_entity(store, query)? {
             Some(entity) => NameResolution::One(entity),
             None => NameResolution::Missing,
         }),
+        resolved => Ok(resolved),
     }
+}
+
+/// Resolve an exact name, member name or module-qualified name without a
+/// substring fallback. Declaration twins are folded and distinct candidates
+/// remain ambiguous, as in [`resolve_name`]. A name no tier reaches is missing:
+/// a reference lookup for `_app_ctx` must not answer for a test whose name
+/// merely contains it. Unlike [`resolve_name_strictly`], this read-only
+/// resolution may choose one representative of a declaration's twins.
+pub fn resolve_name_exact<G: GraphStore>(
+    store: &G,
+    query: &str,
+) -> std::result::Result<NameResolution, <G as GraphStore>::Error> {
+    let reached = match reach_by_name(store, query)? {
+        NameReach::Exact(found) | NameReach::Members(found) | NameReach::Qualified(found) => found,
+        NameReach::Neither => return Ok(NameResolution::Missing),
+    };
+    let mut distinct = fold_same_name_twins(store, reached)?.distinct;
+    Ok(if distinct.len() == 1 {
+        NameResolution::One(distinct.remove(0))
+    } else if distinct
+        .iter()
+        .all(|entity| entity.name == distinct[0].name)
+    {
+        NameResolution::SameName(distinct)
+    } else {
+        NameResolution::SharedMemberName(distinct)
+    })
+}
+
+/// Why a [`NameResolution::SameName`] answer listed several entities: the query
+/// is their whole name, or a module-qualified name whose qualifier names more
+/// than one of them.
+pub fn same_name_reason(query: &str, candidates: &[Entity]) -> CandidateReason {
+    if candidates.iter().all(|entity| entity.name == query.trim()) {
+        CandidateReason::SameName
+    } else {
+        CandidateReason::SameQualifiedName
+    }
+}
+
+/// Whether an entity's own record shows it carries a body, rather than only
+/// declaring one.
+///
+/// The parser writes `signature` by clamping the declaration where its body
+/// begins: `kin_parser::adapter::declaration_signature` stops at the `body`
+/// field, at a `function_body` or `class_body` child, and at the first comment,
+/// then trims a trailing `{` or `:`. A definition therefore stores a signature
+/// that ends where its body starts, while a declaration stores its whole
+/// statement, terminator included. The terminator is the tell: a signature that
+/// still ends in `;` is the entire declaration, because the language closed the
+/// statement instead of opening a body.
+///
+/// This holds wherever a language spells a declaration as a terminated
+/// statement, which is every language Kin parses that has the distinction at
+/// all: a C prototype, a Rust trait method without a default, a TypeScript
+/// `declare` or interface member or overload signature. A definition's
+/// signature ends at its parameter list or return type and never at a
+/// terminator.
+///
+/// Read off the entity alone, so it answers the same way for a store built
+/// today and one built from the same tree six commits ago, and nothing here
+/// consults the filesystem. `kin_core::carries_body` is this function.
+pub fn carries_body(entity: &Entity) -> bool {
+    !entity.signature.trim_end().ends_with(';')
+}
+
+/// Same-named entities split into the distinct ones a name could mean and the
+/// twins folded into them.
+#[derive(Debug, Clone, Default)]
+pub struct FoldedNames {
+    /// One entity per distinct declaration, in [`sort_name_candidates`] order.
+    pub distinct: Vec<Entity>,
+    /// Every entity folded into one of `distinct`: a declaration beside a
+    /// definition, or a second arm of one declaration in the same file.
+    pub folded: Vec<Entity>,
+}
+
+/// Fold the twins of one declaration so a name that reaches them counts it
+/// once.
+///
+/// Two rules, both read off the entity records alone and neither naming a
+/// language:
+///
+/// 1. A declaration ([`carries_body`] false) folds away when the same name
+///    reaches an entity of the same kind that carries a body, with a function
+///    and a method counted as one kind ([`fold_kind`]). That is a C or C++
+///    prototype beside its definition, a C++ member declared in its class and
+///    defined outside it, a TypeScript overload signature or `declare` beside
+///    its implementation, and a trait method without a default beside an
+///    implementation of the same name.
+/// 2. Entities with one name, one kind and one file are arms of one
+///    declaration: a Python `@overload` stub beside its implementation, two
+///    Rust `cfg` arms, a conditional definition in each branch of an `if`, a C++
+///    overload set. One answers for them all: the one other entities call,
+///    import or reference most, then the earliest in the file.
+///
+/// Entities in different files, or of different kinds, stay distinct: those
+/// are the renderer implementations and the mock beside the real scheduler
+/// that a same-name answer has to keep apart. Every folded entity is kept in
+/// [`FoldedNames::folded`], so an answer can still name the twins it stands for.
+pub fn fold_same_name_twins<G: GraphStore>(
+    store: &G,
+    candidates: Vec<Entity>,
+) -> std::result::Result<FoldedNames, <G as GraphStore>::Error> {
+    if candidates.len() < 2 {
+        return Ok(FoldedNames {
+            distinct: candidates,
+            folded: Vec::new(),
+        });
+    }
+    fold_same_name_twins_by(candidates, |entity| incoming_dependents(store, &entity.id))
+}
+
+/// The kind a declaration folds by. A function and a method are one kind here:
+/// C++ declares a member function as a method inside its class and defines it
+/// as a qualified function outside it, and the two are one declaration.
+fn fold_kind(kind: EntityKind) -> EntityKind {
+    match kind {
+        EntityKind::Method => EntityKind::Function,
+        other => other,
+    }
+}
+
+/// [`fold_same_name_twins`] with the count of an entity's dependents supplied
+/// by the caller, for a candidate set that lives outside a store.
+pub fn fold_same_name_twins_by<E>(
+    candidates: Vec<Entity>,
+    mut dependents: impl FnMut(&Entity) -> std::result::Result<usize, E>,
+) -> std::result::Result<FoldedNames, E> {
+    let defined: std::collections::HashSet<(String, EntityKind)> = candidates
+        .iter()
+        .filter(|entity| carries_body(entity))
+        .map(|entity| (entity.name.clone(), fold_kind(entity.kind)))
+        .collect();
+    let (mut folded, kept): (Vec<Entity>, Vec<Entity>) =
+        candidates.into_iter().partition(|entity| {
+            !carries_body(entity)
+                && defined.contains(&(entity.name.clone(), fold_kind(entity.kind)))
+        });
+
+    type ArmKey = (String, EntityKind, Option<String>);
+    let mut groups: Vec<(ArmKey, Vec<Entity>)> = Vec::new();
+    for entity in kept {
+        let key = (
+            entity.name.clone(),
+            entity.kind,
+            entity.file_origin.as_ref().map(|path| path.0.clone()),
+        );
+        match groups
+            .iter_mut()
+            .find(|(existing, _)| *existing == key && key.2.is_some())
+        {
+            Some((_, arms)) => arms.push(entity),
+            None => groups.push((key, vec![entity])),
+        }
+    }
+    let mut distinct = Vec::with_capacity(groups.len());
+    for (_, mut arms) in groups {
+        if arms.len() == 1 {
+            distinct.push(arms.remove(0));
+            continue;
+        }
+        let mut keyed = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let count = dependents(&arm)?;
+            let line = arm.span.as_ref().map(|span| span.start_line).unwrap_or(0);
+            keyed.push(((std::cmp::Reverse(count), line, arm.id), arm));
+        }
+        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut arms = keyed.into_iter().map(|(_, arm)| arm);
+        distinct.extend(arms.next());
+        folded.extend(arms);
+    }
+    sort_name_candidates(&mut distinct);
+    sort_name_candidates(&mut folded);
+    Ok(FoldedNames { distinct, folded })
+}
+
+/// How many other entities call, import or reference `id`.
+fn incoming_dependents<G: GraphStore>(
+    store: &G,
+    id: &EntityId,
+) -> std::result::Result<usize, <G as GraphStore>::Error> {
+    Ok(store
+        .get_all_relations_for_entity(id)?
+        .iter()
+        .filter(|rel| {
+            rel.dst == GraphNodeId::Entity(*id)
+                && rel.src != GraphNodeId::Entity(*id)
+                && matches!(
+                    rel.kind,
+                    RelationKind::Calls | RelationKind::Imports | RelationKind::References
+                )
+        })
+        .count())
+}
+
+/// The spelling a caller can paste back to name each candidate alone, keyed by
+/// entity id ([`crate::module_qualifier::distinguishing_names`]). A candidate
+/// with none is absent, and its entity id is its only address.
+pub fn distinguishing_names<G: GraphStore>(
+    store: &G,
+    candidates: &[Entity],
+) -> std::result::Result<std::collections::HashMap<EntityId, String>, <G as GraphStore>::Error> {
+    if candidates.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let index = crate::module_qualifier::ModuleIndex::load(store)?;
+    Ok(crate::module_qualifier::distinguishing_names(
+        candidates, &index,
+    ))
 }
 
 /// Why a name answered with candidates instead of an entity.
@@ -315,6 +627,9 @@ pub fn resolve_name<G: GraphStore>(
 pub enum CandidateReason {
     /// Several entities have the name as their whole name.
     SameName,
+    /// A module-qualified name whose qualifier names several modules holding
+    /// an entity of that name.
+    SameQualifiedName,
     /// No entity has it as its whole name, and several owners' members have it
     /// as their member name.
     SharedMemberName,
@@ -330,6 +645,7 @@ impl CandidateReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SameName => "same_name",
+            Self::SameQualifiedName => "same_qualified_name",
             Self::SharedMemberName => "shared_member_name",
             Self::SameLeafName => "same_leaf_name",
             Self::PartialName => "partial_name",
@@ -373,6 +689,20 @@ pub fn resolve_name_strictly<G: GraphStore>(
         }
         NameReach::Members(members) => {
             StrictNameResolution::Candidates(CandidateReason::SharedMemberName, members)
+        }
+        NameReach::Qualified(mut qualified) if qualified.len() == 1 => {
+            StrictNameResolution::One(qualified.remove(0))
+        }
+        NameReach::Qualified(qualified) => {
+            let reason = if qualified
+                .iter()
+                .all(|entity| entity.name == qualified[0].name)
+            {
+                CandidateReason::SameQualifiedName
+            } else {
+                CandidateReason::SharedMemberName
+            };
+            StrictNameResolution::Candidates(reason, qualified)
         }
         NameReach::Neither => {
             if query.trim().is_empty() {
@@ -2014,11 +2344,275 @@ mod tests {
     fn candidate_reasons_have_stable_wire_names() {
         for (reason, wire) in [
             (CandidateReason::SameName, "same_name"),
+            (CandidateReason::SameQualifiedName, "same_qualified_name"),
             (CandidateReason::SharedMemberName, "shared_member_name"),
             (CandidateReason::SameLeafName, "same_leaf_name"),
             (CandidateReason::PartialName, "partial_name"),
         ] {
             assert_eq!(reason.as_str(), wire);
         }
+    }
+
+    fn arm(name: &str, kind: EntityKind, file: &str, signature: &str, line: u32) -> Entity {
+        let mut entity = member(name, kind, file);
+        entity.signature = signature.to_string();
+        entity.span = Some(kin_model::entity::SourceSpan {
+            file: kin_model::ids::FilePathId::new(file),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: line,
+            start_col: 0,
+            end_line: line,
+            end_col: 0,
+        });
+        entity
+    }
+
+    fn fold(candidates: Vec<Entity>, dependents: &[(EntityId, usize)]) -> FoldedNames {
+        fold_same_name_twins_by::<()>(candidates, |entity| {
+            Ok(dependents
+                .iter()
+                .find(|(id, _)| *id == entity.id)
+                .map_or(0, |(_, count)| *count))
+        })
+        .unwrap()
+    }
+
+    fn names_and_files(entities: &[Entity]) -> Vec<(String, String)> {
+        entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.name.clone(),
+                    entity.file_origin.as_ref().unwrap().0.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_terminated_export_and_a_same_named_module_are_distinct() {
+        for name in ["Router", "Route"] {
+            let export = arm(
+                name,
+                EntityKind::Constant,
+                "lib/express.js",
+                &format!("exports.{name} = Router;"),
+                70,
+            );
+            let module = arm(
+                name,
+                EntityKind::Module,
+                &format!("test/{name}.js"),
+                &format!("module test/{name}.js"),
+                0,
+            );
+            assert!(!carries_body(&export));
+            assert!(carries_body(&module));
+            for candidates in [
+                vec![export.clone(), module.clone()],
+                vec![module.clone(), export.clone()],
+            ] {
+                let result = fold(candidates, &[(module.id, 20)]);
+                assert_eq!(result.distinct.len(), 2);
+                assert!(result.distinct.iter().any(|e| e.id == export.id));
+                assert!(result.distinct.iter().any(|e| e.id == module.id));
+                assert!(result.folded.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn an_in_class_member_declaration_folds_into_its_out_of_line_definition() {
+        for (name, declared, defined) in [
+            ("Widget::Widget", "Widget();", "Widget::Widget()"),
+            ("Widget::~Widget", "~Widget();", "Widget::~Widget()"),
+            (
+                "Widget::resize",
+                "void resize(int n);",
+                "void Widget::resize(int n)",
+            ),
+        ] {
+            let declaration = arm(name, EntityKind::Method, "include/widget.h", declared, 5);
+            let definition = arm(name, EntityKind::Function, "src/widget.cpp", defined, 12);
+            assert!(!carries_body(&declaration));
+            assert!(carries_body(&definition));
+            for candidates in [
+                vec![declaration.clone(), definition.clone()],
+                vec![definition.clone(), declaration.clone()],
+            ] {
+                let result = fold(candidates, &[]);
+                assert_eq!(result.distinct.len(), 1, "{name}");
+                assert_eq!(result.distinct[0].id, definition.id, "{name}");
+                assert_eq!(result.folded.len(), 1, "{name}");
+                assert_eq!(result.folded[0].id, declaration.id, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_prototype_folds_into_its_definition_and_another_definition_stays_distinct() {
+        let prototype = arm(
+            "buffer_grow",
+            EntityKind::Function,
+            "src/buffer.h",
+            "int buffer_grow(buffer *b);",
+            4,
+        );
+        let definition = arm(
+            "buffer_grow",
+            EntityKind::Function,
+            "src/buffer.c",
+            "int buffer_grow(buffer *b)",
+            20,
+        );
+        let other = arm(
+            "buffer_grow",
+            EntityKind::Function,
+            "tests/fake_buffer.c",
+            "static int buffer_grow(buffer *b)",
+            3,
+        );
+        let folded = fold(
+            vec![prototype.clone(), definition.clone(), other.clone()],
+            &[],
+        );
+        assert_eq!(
+            names_and_files(&folded.distinct),
+            vec![
+                ("buffer_grow".to_string(), "src/buffer.c".to_string()),
+                ("buffer_grow".to_string(), "tests/fake_buffer.c".to_string()),
+            ]
+        );
+        assert_eq!(folded.folded.len(), 1);
+        assert_eq!(folded.folded[0].id, prototype.id);
+    }
+
+    #[test]
+    fn overload_signatures_fold_into_the_implementation() {
+        let first = arm(
+            "parse",
+            EntityKind::Function,
+            "src/parse.ts",
+            "export function parse(input: string): Node;",
+            1,
+        );
+        let second = arm(
+            "parse",
+            EntityKind::Function,
+            "src/parse.ts",
+            "export function parse(input: Buffer): Node;",
+            2,
+        );
+        let implementation = arm(
+            "parse",
+            EntityKind::Function,
+            "src/parse.ts",
+            "export function parse(input: string | Buffer): Node",
+            3,
+        );
+        let folded = fold(vec![first, second, implementation.clone()], &[]);
+        assert_eq!(folded.distinct.len(), 1);
+        assert_eq!(folded.distinct[0].id, implementation.id);
+        assert_eq!(folded.folded.len(), 2);
+    }
+
+    #[test]
+    fn arms_of_one_declaration_in_one_file_fold_to_the_one_others_depend_on() {
+        // Python `@overload` stubs carry a body (`...`) like the implementation
+        // does, and Rust `cfg` arms both carry bodies; what makes them one
+        // declaration is one name, one kind and one file.
+        let stub = arm(
+            "get",
+            EntityKind::Function,
+            "src/api.py",
+            "@overload def get(key: int) -> int",
+            10,
+        );
+        let other_stub = arm(
+            "get",
+            EntityKind::Function,
+            "src/api.py",
+            "@overload def get(key: str) -> str",
+            12,
+        );
+        let implementation = arm(
+            "get",
+            EntityKind::Function,
+            "src/api.py",
+            "def get(key)",
+            14,
+        );
+        let folded = fold(
+            vec![stub.clone(), other_stub, implementation.clone()],
+            &[(implementation.id, 3)],
+        );
+        assert_eq!(folded.distinct.len(), 1);
+        assert_eq!(folded.distinct[0].id, implementation.id);
+
+        let unix = arm(
+            "page_size",
+            EntityKind::Function,
+            "src/sys.rs",
+            "#[cfg(unix)] fn page_size() -> usize",
+            5,
+        );
+        let windows = arm(
+            "page_size",
+            EntityKind::Function,
+            "src/sys.rs",
+            "#[cfg(windows)] fn page_size() -> usize",
+            9,
+        );
+        let folded = fold(vec![windows, unix.clone()], &[]);
+        assert_eq!(folded.distinct.len(), 1);
+        assert_eq!(
+            folded.distinct[0].id, unix.id,
+            "no dependents: the earliest arm answers"
+        );
+    }
+
+    #[test]
+    fn same_named_definitions_in_different_files_or_kinds_stay_distinct() {
+        // The renderer host configs and the scheduler beside its mock: one
+        // name, several real definitions a caller has to choose between.
+        let dom = arm(
+            "commitTextUpdate",
+            EntityKind::Function,
+            "packages/react-dom-bindings/src/client/ReactFiberConfigDOM.js",
+            "export function commitTextUpdate(textInstance, oldText, newText)",
+            1018,
+        );
+        let art = arm(
+            "commitTextUpdate",
+            EntityKind::Function,
+            "packages/react-art/src/ReactFiberConfigART.js",
+            "export function commitTextUpdate(textInstance, oldText, newText)",
+            457,
+        );
+        let shim = arm(
+            "commitTextUpdate",
+            EntityKind::Constant,
+            "packages/react-art/src/ReactFiberConfigART.js",
+            "export const commitTextUpdate = shim",
+            20,
+        );
+        let folded = fold(vec![dom, art, shim], &[]);
+        assert_eq!(folded.distinct.len(), 3);
+        assert!(folded.folded.is_empty());
+    }
+
+    #[test]
+    fn a_same_name_reason_says_whether_the_query_was_the_name_or_a_qualified_one() {
+        let one = member("advanceTimers", EntityKind::Function, "a/Scheduler.js");
+        let two = member("advanceTimers", EntityKind::Function, "b/Scheduler.js");
+        assert_eq!(
+            same_name_reason("advanceTimers", &[one.clone(), two.clone()]),
+            CandidateReason::SameName
+        );
+        assert_eq!(
+            same_name_reason("Scheduler.advanceTimers", &[one, two]),
+            CandidateReason::SameQualifiedName
+        );
     }
 }

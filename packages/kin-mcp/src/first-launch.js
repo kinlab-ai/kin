@@ -33,11 +33,35 @@ import cp from 'node:child_process';
 import fs from 'node:fs';
 
 /**
- * The protocol version `kin mcp start` answers with. This module answers
- * `initialize` before that server exists and then hands the session to it, so
- * the two must agree; a test reads the server's constant from its Rust source.
+ * Every protocol version `kin mcp start` speaks, newest first. This module
+ * answers `initialize` before that server exists and then hands the session to
+ * it, so the two must negotiate alike; a test reads the server's list from its
+ * Rust source.
+ */
+export const MCP_PROTOCOL_VERSIONS = Object.freeze(['2025-11-25', '2025-06-18', '2024-11-05']);
+
+/**
+ * The version a client that names none, or an older one the server does not
+ * speak, is answered with.
  */
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
+
+/**
+ * The version `kin mcp start` answers an `initialize` asking for `requested`
+ * with: the client's own when the server speaks it, the newest the server
+ * speaks when the client asked for a newer one, and otherwise
+ * `MCP_PROTOCOL_VERSION`.
+ */
+export function negotiateProtocolVersion(requested) {
+  if (typeof requested !== 'string') {
+    return MCP_PROTOCOL_VERSION;
+  }
+  if (MCP_PROTOCOL_VERSIONS.includes(requested)) {
+    return requested;
+  }
+  // Revisions are dates, so they order as strings.
+  return requested > MCP_PROTOCOL_VERSIONS[0] ? MCP_PROTOCOL_VERSIONS[0] : MCP_PROTOCOL_VERSION;
+}
 
 /**
  * What `kin mcp start` answers `initialize` with, from `server-instructions.json`
@@ -299,19 +323,20 @@ export function startFirstLaunchSession({
   }
 
   function initializeResult(params) {
+    const requested = params?.protocolVersion;
+    const negotiated = negotiateProtocolVersion(requested);
     const result = {
-      protocolVersion: MCP_PROTOCOL_VERSION,
+      protocolVersion: negotiated,
       capabilities: { tools: { listChanged: true } },
       serverInfo: { name: 'kin-mcp', version, kinVersion: version },
       instructions
     };
-    const requested = params?.protocolVersion;
-    if (typeof requested === 'string' && requested !== MCP_PROTOCOL_VERSION) {
+    if (typeof requested === 'string' && requested !== negotiated) {
       // The same fallback note `kin mcp start` adds, so the answer does not
       // change with who gave it.
       result._warning =
         `client requested protocol version '${requested}', server supports ` +
-        `'${MCP_PROTOCOL_VERSION}'; falling back to server version`;
+        `'${negotiated}'; falling back to server version`;
     }
     return result;
   }

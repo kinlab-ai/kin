@@ -382,7 +382,25 @@ struct Fixture {
 /// session. Everything here happens before any child exists; the parent then
 /// releases the repository entirely so the child owns it.
 async fn fixture(label: &str, evidence: Evidence) -> Fixture {
+    fixture_with_completion(label, evidence, false).await
+}
+
+async fn fixture_with_completion(label: &str, evidence: Evidence, complete: bool) -> Fixture {
     let (repo, state) = lsp_publication_fixture().await;
+    if complete {
+        let files = ["caller.py", "first.py", "second.py", "target.py"];
+        stage_lsp_publication_completion(&state, &files);
+        assert!(matches!(
+            state.save_snapshot_reporting_enrichment().unwrap(),
+            crate::state::EnrichmentFlush::Proceeded
+        ));
+        assert_lsp_publication_native_completion(&state, &files);
+        crate::daemon::mark_files_enriched(
+            &state,
+            &files.map(String::from),
+            crate::daemon::current_marker_epoch(&state),
+        );
+    }
     let singleton = session_runtime_lock(&state);
     let runtime = state
         .prepared_publication
@@ -1164,23 +1182,12 @@ async fn crash_prefix_authority_negative_control_has_no_wal_left() {
 /// finalization is what retires them, and a kill at these prefixes means it
 /// never ran, so recovery has to.
 async fn assert_recovery_retires_changed_completion_markers(label: &str, point: CrashPoint) {
-    // Unknown evidence leaves one accepted language-server relation in the
-    // graph after restart. A graph holding none makes a starting daemon ignore
-    // the whole marker, and the skip this grades could not happen at all.
-    let fixture = fixture(label, Evidence::Unknown).await;
-    std::fs::write(
-        fixture.layout.root().join("lsp-enriched-files.json"),
-        crate::daemon::encode_enriched_marker(
-            &["caller.py", "first.py", "second.py", "target.py"].map(String::from),
-        ),
-    )
-    .unwrap();
+    // Native publication, rather than a surviving unrelated edge, earns the
+    // completion. The controlled empty answers need no LSP relation at all.
+    let fixture = fixture_with_completion(label, Evidence::Checked, true).await;
     stop_child_at(&fixture, point).await;
     let restarted = restart(&fixture).expect("a recoverable prefix must open");
-    assert!(
-        restarted.lead_present,
-        "the control needs a surviving language-server relation for the marker to be honored"
-    );
+    assert_lsp_publication_native_completion(&restarted.state, &["caller.py", "target.py"]);
     crate::daemon::load_lsp_enriched_marker(&restarted.state);
     for changed in ["first.py", "second.py"] {
         assert!(

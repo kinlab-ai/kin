@@ -176,7 +176,14 @@ mod tests {
     #[test]
     fn a_removal_hides_the_assignment_it_names_and_no_later_one() {
         let first = Timestamp::now();
-        let later = Timestamp::now();
+        // Two reads of the clock can land in the same microsecond, which would
+        // make the re-assignment the same pair as the removed one.
+        let later = loop {
+            let now = Timestamp::now();
+            if now.0 > first.0 {
+                break now;
+            }
+        };
         let removed = assignment("bob", first);
         let again = assignment("bob", later);
         let kept = assignment("alice", Timestamp::now());

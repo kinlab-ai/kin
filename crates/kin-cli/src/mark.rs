@@ -50,6 +50,20 @@ const UNICODE_ROWS: [&str; 4] = [
 /// The same shape where the locale cannot carry the block characters.
 const ASCII_ROWS: [&str; 4] = ["  /", "/", " \\", "   \\"];
 
+/// The mark at whole-cell resolution, for a terminal that draws block glyphs
+/// from its font: `A` is the arm, `L` the leg, `.` a blank cell.
+///
+/// Terminal.app draws a block glyph one em tall in a line taller than that, so
+/// the half-block rows print there as loose dots. A cell painted with a
+/// background fills edge to edge, so this drawing paints cells instead, two
+/// columns a row so each stroke stays joined at 45 degrees. The leg starts a
+/// column clear of where the arm ends, which keeps the split.
+const CELL_ROWS: [&str; 4] = ["..AA", "AA", "...LL", ".....LL"];
+
+/// The column text starts at beside the cell drawing, which is two columns
+/// wider than the half-block one.
+const CELL_TEXT_COLUMN: usize = 9;
+
 /// Columns reserved for the mark itself, wide enough for the longest row.
 const MARK_COLUMNS: usize = 5;
 
@@ -117,12 +131,38 @@ pub enum Paint {
 pub struct MarkStyle {
     glyphs: Glyphs,
     paint: Paint,
+    /// Painted cells rather than half blocks; see [`CELL_ROWS`].
+    cells: bool,
 }
 
 impl MarkStyle {
     /// A style named outright, for tests and for a caller that already knows.
     pub fn new(glyphs: Glyphs, paint: Paint) -> Self {
-        Self { glyphs, paint }
+        Self {
+            glyphs,
+            paint,
+            cells: false,
+        }
+    }
+
+    /// The style a terminal that draws block glyphs from its font gets: the
+    /// cells of [`CELL_ROWS`], painted. Without colour there is nothing to
+    /// paint a cell with, so it falls back to `glyphs`.
+    pub fn in_cells(glyphs: Glyphs, paint: Paint) -> Self {
+        Self {
+            glyphs,
+            paint,
+            cells: paint != Paint::None,
+        }
+    }
+
+    /// The column the text beside the mark starts at.
+    pub fn text_column(&self) -> usize {
+        if self.cells {
+            CELL_TEXT_COLUMN
+        } else {
+            TEXT_COLUMN
+        }
     }
 
     /// How the mark should be drawn on this process's stdout, or `None` when it
@@ -139,13 +179,19 @@ impl MarkStyle {
         if terminal_columns().is_some_and(|columns| columns < MIN_TERMINAL_COLUMNS) {
             return None;
         }
+        let paint = detect_paint();
+        let term_program = std::env::var("TERM_PROGRAM").ok();
         Some(Self {
             glyphs: detect_glyphs(),
-            paint: detect_paint(),
+            paint,
+            cells: cells_for(paint, term_program.as_deref()),
         })
     }
 
     fn rows(&self) -> [&'static str; 4] {
+        if self.cells {
+            return CELL_ROWS;
+        }
         match self.glyphs {
             Glyphs::Unicode => UNICODE_ROWS,
             Glyphs::Ascii => ASCII_ROWS,
@@ -156,6 +202,9 @@ impl MarkStyle {
     fn paint_row(&self, index: usize, row: &str) -> String {
         if row.is_empty() {
             return String::new();
+        }
+        if self.cells {
+            return self.paint_cells(index, row);
         }
         match self.paint {
             Paint::None => row.to_string(),
@@ -175,6 +224,56 @@ impl MarkStyle {
     }
 }
 
+impl MarkStyle {
+    /// One row of the cell drawing: each inked cell a space on the ink's
+    /// background, each blank cell a plain space.
+    fn paint_cells(&self, index: usize, row: &str) -> String {
+        let escape = match self.paint {
+            Paint::Truecolor => {
+                let (r, g, b) = TRUECOLOR_STOPS[index.min(TRUECOLOR_STOPS.len() - 1)];
+                format!("\u{1b}[48;2;{r};{g};{b}m")
+            }
+            Paint::Indexed => {
+                let code = INDEXED_STOPS[index.min(INDEXED_STOPS.len() - 1)];
+                format!("\u{1b}[48;5;{code}m")
+            }
+            Paint::Basic => if index < 2 {
+                BASIC_ARM_BACKGROUND
+            } else {
+                BASIC_LEG_BACKGROUND
+            }
+            .to_string(),
+            Paint::None => return row.replace(['A', 'L', '.'], " "),
+        };
+        let mut out = String::new();
+        let mut open = false;
+        for cell in row.chars() {
+            let inked = cell != '.';
+            if inked && !open {
+                out.push_str(&escape);
+            } else if !inked && open {
+                out.push_str("\u{1b}[0m");
+            }
+            open = inked;
+            out.push(' ');
+        }
+        if open {
+            out.push_str("\u{1b}[0m");
+        }
+        out
+    }
+}
+
+/// The sixteen-colour arm and leg as backgrounds, for the cell drawing.
+const BASIC_ARM_BACKGROUND: &str = "\u{1b}[45m";
+const BASIC_LEG_BACKGROUND: &str = "\u{1b}[104m";
+
+/// Whether this terminal gets the painted cells: Terminal.app, the terminal
+/// a new Mac opens, while it has colour to paint them with.
+pub(crate) fn cells_for(paint: Paint, term_program: Option<&str>) -> bool {
+    paint != Paint::None && term_program == Some("Apple_Terminal")
+}
+
 /// The mark with `text` set beside it, one text line per mark row.
 ///
 /// Index-aligned on purpose: the caller decides which row a line sits on by
@@ -187,7 +286,7 @@ impl MarkStyle {
 /// every snapshot, and every terminal that highlights them.
 pub fn beside(style: MarkStyle, text: &[&str]) -> Vec<String> {
     let rows = style.rows();
-    let indent = TEXT_COLUMN;
+    let indent = style.text_column();
     let height = rows.len().max(text.len());
     let mut out = Vec::with_capacity(height);
     for index in 0..height {
@@ -435,6 +534,64 @@ mod tests {
         );
     }
 
+    /// Terminal.app gets the painted cells while it has colour, and nothing
+    /// else does.
+    #[test]
+    fn only_terminal_app_with_colour_gets_painted_cells() {
+        for paint in [Paint::Truecolor, Paint::Indexed, Paint::Basic] {
+            assert!(cells_for(paint, Some("Apple_Terminal")), "{paint:?}");
+            for other in ["iTerm.app", "vscode", "WezTerm", "tmux"] {
+                assert!(!cells_for(paint, Some(other)), "{paint:?} {other}");
+            }
+            assert!(!cells_for(paint, None), "{paint:?} with no TERM_PROGRAM");
+        }
+        assert!(!cells_for(Paint::None, Some("Apple_Terminal")));
+        assert_eq!(
+            MarkStyle::in_cells(Glyphs::Unicode, Paint::None),
+            MarkStyle::new(Glyphs::Unicode, Paint::None),
+            "without colour the cells fall back to the half blocks"
+        );
+    }
+
+    /// The cell drawing paints whole cells, draws no block glyph, keeps the
+    /// split as a blank cell between the arm and the leg, and sets the text
+    /// two columns further out.
+    #[test]
+    fn the_cell_mark_paints_whole_cells_beside_its_text() {
+        let style = MarkStyle::in_cells(Glyphs::Unicode, Paint::Indexed);
+        let drawn = beside(style, &["", "kin 0.8.2"]);
+        assert_eq!(
+            drawn,
+            vec![
+                "  \u{1b}[48;5;141m  \u{1b}[0m".to_string(),
+                "\u{1b}[48;5;99m  \u{1b}[0m       kin 0.8.2".to_string(),
+                "   \u{1b}[48;5;63m  \u{1b}[0m".to_string(),
+                "     \u{1b}[48;5;69m  \u{1b}[0m".to_string(),
+            ]
+        );
+        for line in &drawn {
+            assert!(
+                !line.contains(['\u{2580}', '\u{2584}', '\u{2588}']),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            console::measure_text_width(&drawn[1]),
+            CELL_TEXT_COLUMN + "kin 0.8.2".len()
+        );
+        // The arm's last cell and the leg's first never touch, even at a corner.
+        let arm_end = CELL_ROWS[1].rfind('A').unwrap();
+        let leg_start = CELL_ROWS[2].find('L').unwrap();
+        assert!(leg_start > arm_end + 1, "the split closed");
+        let basic = beside(MarkStyle::in_cells(Glyphs::Unicode, Paint::Basic), &[]);
+        assert!(basic[0].contains(BASIC_ARM_BACKGROUND) && basic[3].contains(BASIC_LEG_BACKGROUND));
+        let truecolor = beside(MarkStyle::in_cells(Glyphs::Unicode, Paint::Truecolor), &[]);
+        assert!(
+            truecolor[0].starts_with("  \u{1b}[48;2;174;90;255m"),
+            "{truecolor:?}"
+        );
+    }
+
     /// Each colour depth is reached by the terminal that advertises it.
     #[test]
     fn colour_depth_follows_what_the_terminal_advertises() {
@@ -538,8 +695,8 @@ mod tests {
         let text = [
             "",
             "kin 0.7.2",
-            "A graph-native code repository for people and AI agents.",
-            "",
+            "A graph-native code repository for AI agents",
+            "and the people who build with them.",
         ];
         for style in [
             MarkStyle::new(Glyphs::Unicode, Paint::None),

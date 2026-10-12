@@ -7,12 +7,13 @@
 //! evidence that each unsettled caller reaches the changed entities. Paths
 //! label projections of entity identities; no file bytes are read here.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use kin_model::call_site_reading as reading;
 use kin_model::{
-    read_caller_sites, CallSiteFacts, CallSiteLedger, CallSiteTally, ContextValidationState,
-    Entity, EntityId, GraphStore, LanguageId, ResolutionRecord, ResolutionRecordId,
-    SemanticChangeId,
+    read_caller_sites, CallSiteFacts, CallSiteLedger, CallSiteTally, CallerSites,
+    ContextValidationState, Entity, EntityId, GraphStore, LanguageId, NoResolver, ResolutionRecord,
+    ResolutionRecordId, SemanticChangeId, SiteStateKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,24 @@ pub type EscapeEvidence<'a> =
 pub struct EscapeEvidenceBatch {
     pub selected_change: Option<SemanticChangeId>,
     pub readings: Vec<kin_model::FocalEscape>,
+}
+
+/// Why no resolver can prove a language's call sites on the host serving the
+/// selected graph now, the way every other call-site surface reads it (see
+/// [`CallSiteFacts::no_resolver`]). `None` for a language one can still prove,
+/// or one the source cannot speak for, which leaves a caller with no ledger
+/// owed. Only a live view consults it: a historical view answers from its
+/// selected revision, not from this host.
+pub type NoResolverSource<'a> = dyn Fn(LanguageId) -> Option<NoResolver> + 'a;
+
+/// The host observations one impact observation may consult beside the
+/// selected graph. Each is optional, and a missing one never certifies
+/// anything: no containment evidence keeps value escapes possible, and no
+/// resolver source leaves a caller with no ledger owed.
+#[derive(Clone, Copy, Default)]
+pub struct ObservationSources<'s> {
+    pub escape_evidence: Option<&'s EscapeEvidence<'s>>,
+    pub no_resolver: Option<&'s NoResolverSource<'s>>,
 }
 
 fn contained_targets(
@@ -80,10 +99,29 @@ pub struct EnrichmentObservation {
     /// that reference, type or other enrichment has completed.
     pub status: String,
     pub basis: String,
+    /// Every clause in [`Self::clauses`], joined by `"; "`. It begins with
+    /// `enrichment_incomplete:` only when [`Self::owed_entities`] is not zero.
     pub limitation: Option<String>,
     pub total_pending_entities: usize,
     pub pending_entities: Vec<PendingEnrichmentEntity>,
     pub entities_withheld: usize,
+    /// Of the pending entities, how many have call sites the graph has not
+    /// settled yet because their derivation or enrichment is still owed, which
+    /// is what `callers_owed` counts on the store-wide status. The rest hold
+    /// sites a resolver already answered without settling them (unresolved, a
+    /// binding, a server failure, a file no build compiles, no resolver on this
+    /// host) or proofs under a context the selected graph does not hold current.
+    #[serde(default)]
+    pub owed_entities: usize,
+    /// Pending entities by the verdict code their unsettled sites call for, an
+    /// entity counted once under each code it holds. Owed entities are counted
+    /// under `enrichment_incomplete`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_by_code: BTreeMap<String, usize>,
+    /// One `<code>: <why>` clause per code in [`Self::pending_by_code`], owed
+    /// work first, none holding the `"; "` that separates verdict clauses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clauses: Vec<String>,
 }
 
 impl EnrichmentObservation {
@@ -92,11 +130,23 @@ impl EnrichmentObservation {
     }
 }
 
-struct StoreLedgers<'a, G: ?Sized>(&'a G);
+struct StoreLedgers<'a, G: ?Sized> {
+    store: &'a G,
+    no_resolver: Option<&'a NoResolverSource<'a>>,
+}
+
+impl<'a, G: ?Sized> StoreLedgers<'a, G> {
+    fn new(store: &'a G) -> Self {
+        Self {
+            store,
+            no_resolver: None,
+        }
+    }
+}
 
 impl<G: GraphStore + ?Sized> CallSiteFacts for StoreLedgers<'_, G> {
     fn ledger(&self, caller: EntityId) -> Option<CallSiteLedger> {
-        self.0
+        self.store
             .lookup_resolution_record(&ResolutionRecordId::call_sites(caller))
             .ok()
             .flatten()
@@ -104,7 +154,7 @@ impl<G: GraphStore + ?Sized> CallSiteFacts for StoreLedgers<'_, G> {
     }
 
     fn current_context(&self, language: LanguageId) -> Option<ResolutionRecordId> {
-        self.0
+        self.store
             .lookup_resolution_record(&ResolutionRecordId::context_validation(language))
             .ok()
             .flatten()
@@ -117,12 +167,16 @@ impl<G: GraphStore + ?Sized> CallSiteFacts for StoreLedgers<'_, G> {
 
     fn context_unverified_reason(&self, language: LanguageId) -> String {
         match self
-            .0
+            .store
             .lookup_resolution_record(&ResolutionRecordId::context_validation(language))
         {
             Ok(record) => validation_reason(record.as_ref()),
             Err(_) => "the selected graph's proof-context validation could not be read".into(),
         }
+    }
+
+    fn no_resolver(&self, language: LanguageId) -> Option<NoResolver> {
+        self.no_resolver.and_then(|source| source(language))
     }
 }
 
@@ -166,7 +220,7 @@ pub fn observe_selected_graph<G: GraphStore + ?Sized>(
     store: &G,
 ) -> Result<EnrichmentObservation, ReviewError> {
     let entities = store.list_all_entities().map_err(ReviewError::graph)?;
-    Ok(observe(&entities, &StoreLedgers(store), None, None))
+    Ok(observe(&entities, &StoreLedgers::new(store), None, None))
 }
 
 /// Read the same replayed entities and ledgers as a committed review's impact.
@@ -199,16 +253,39 @@ pub fn observe_selected_impact_with_source<G: GraphStore + ?Sized>(
     unknown_target: bool,
     escape_evidence: Option<&EscapeEvidence<'_>>,
 ) -> Result<EnrichmentObservation, ReviewError> {
+    observe_selected_impact_with_sources(
+        store,
+        targets,
+        unknown_target,
+        ObservationSources {
+            escape_evidence,
+            no_resolver: None,
+        },
+    )
+}
+
+/// [`observe_selected_impact_with_source`] that also reads a caller with no
+/// ledger whose language no resolver can prove on this host now as unproven
+/// for that reason rather than owed, the way the store-wide status reads it.
+pub fn observe_selected_impact_with_sources<G: GraphStore + ?Sized>(
+    store: &G,
+    targets: &[Entity],
+    unknown_target: bool,
+    sources: ObservationSources<'_>,
+) -> Result<EnrichmentObservation, ReviewError> {
     let entities = store.list_all_entities().map_err(ReviewError::graph)?;
     // Missing References edges do not prove value containment. A definitions
     // pass may leave a non-call occurrence unanswered, while its call ledger
     // still has a complete zero-site census. Until the selected graph supplies
     // positive containment evidence, retain possible callers through aliases.
-    let (selected_change, contained) = contained_targets(targets, None, escape_evidence);
+    let (selected_change, contained) = contained_targets(targets, None, sources.escape_evidence);
     let scope = ImpactScope::new(targets, &contained, unknown_target);
     Ok(observe(
         &entities,
-        &StoreLedgers(store),
+        &StoreLedgers {
+            store,
+            no_resolver: sources.no_resolver,
+        },
         selected_change,
         Some(&scope),
     ))
@@ -294,12 +371,111 @@ impl ImpactScope {
             .filter(|(names, escapes)| {
                 *escapes
                     || names.is_empty()
-                    || body.is_none_or(|body| names.iter().any(|name| body.contains(name)))
+                    || body.is_none_or(|body| {
+                        names
+                            .iter()
+                            .any(|name| kin_model::spells_identifier(body, name))
+                    })
             })
             .map(|(names, escapes)| {
                 kin_model::call_site_reading::scope_caller_sites(reading, names, body, *escapes)
             })
             .collect()
+    }
+}
+
+/// The verdict code an observation leads with while any pending entity is
+/// owed its derivation or enrichment, which a sweep will still reach.
+pub const ENRICHMENT_INCOMPLETE: &str = "enrichment_incomplete";
+
+/// The codes an observation reports pending entities under when nothing about
+/// them is owed: a resolver answered without settling where their calls go,
+/// no resolver serves their language on this host, or their proofs were taken
+/// under a context the selected graph does not hold current.
+pub const ANSWERED_UNSETTLED_CODES: [&str; 7] = [
+    reading::BINDING_UNPROVEN,
+    reading::CALL_SITES_NOT_IN_BUILD,
+    reading::CALL_SITES_SERVER_FAILED,
+    reading::CALL_SITES_UNRESOLVED,
+    reading::CALL_SITES_UNPROVEN_NO_RESOLVER,
+    reading::PROOF_CONTEXT_STALE,
+    reading::PROOF_CONTEXT_UNVERIFIED,
+];
+
+/// Whether a caller read as `kind` is still owed work a sweep will reach: its
+/// derivation or its enrichment, exactly what the store-wide status counts as
+/// `callers_owed`. Every other unsettled kind was already answered by a
+/// resolver, or by its absence, without settling where the call goes.
+fn is_owed(kind: SiteStateKind) -> bool {
+    matches!(
+        kind,
+        SiteStateKind::OwedDerivation | SiteStateKind::OwedEnrichment
+    )
+}
+
+/// The kind a whole caller reading stands for when none of its sites in scope
+/// is unsettled on its own: no ledger, or a ledger whose context is not the
+/// selected graph's current one.
+fn reading_kind(reading: &CallerSites) -> SiteStateKind {
+    match reading {
+        CallerSites::OwedDerivation => SiteStateKind::OwedDerivation,
+        CallerSites::NoResolver { .. } => SiteStateKind::UnprovenNoResolver,
+        CallerSites::Stale(_) => SiteStateKind::ProofContextStale,
+        CallerSites::Unverified { .. } => SiteStateKind::ProofContextUnverified,
+        // A settled reading never reaches here. Should one, it is read as not
+        // known rather than as settled, so nothing unmeasured is certified.
+        CallerSites::OwedEnrichment | CallerSites::NoSites | CallerSites::Current(_) => {
+            SiteStateKind::OwedEnrichment
+        }
+    }
+}
+
+/// What a pending entity holds under `code`, as a clause fragment: its verb
+/// for one entity and for several, and the rest of the fragment.
+fn pending_why(code: &str) -> (&'static str, &'static str, &'static str) {
+    match code {
+        ENRICHMENT_INCOMPLETE => (
+            "has",
+            "have",
+            "call-site evidence the graph has not settled yet because derivation or enrichment \
+             is still owed, and a sweep will still reach it",
+        ),
+        reading::BINDING_UNPROVEN => (
+            "holds",
+            "hold",
+            "call sites that call through a value binding, which proves no target",
+        ),
+        reading::CALL_SITES_NOT_IN_BUILD => (
+            "holds",
+            "hold",
+            "call sites in files no build of the repository compiles",
+        ),
+        reading::CALL_SITES_SERVER_FAILED => (
+            "holds",
+            "hold",
+            "call sites the resolver timed out on, crashed on or broke protocol on",
+        ),
+        reading::CALL_SITES_UNRESOLVED => (
+            "holds",
+            "hold",
+            "call sites the resolver answered without proving a target",
+        ),
+        reading::CALL_SITES_UNPROVEN_NO_RESOLVER => (
+            "has",
+            "have",
+            "call sites no resolver can prove on this host now",
+        ),
+        reading::PROOF_CONTEXT_STALE => (
+            "holds",
+            "hold",
+            "call sites proven under a proof context the resolver no longer runs under",
+        ),
+        reading::PROOF_CONTEXT_UNVERIFIED => (
+            "holds",
+            "hold",
+            "call-site evidence whose proof context the selected graph has not validated",
+        ),
+        _ => ("has", "have", "unsettled call-site evidence"),
     }
 }
 
@@ -309,33 +485,57 @@ fn observe<'a, F: CallSiteFacts>(
     selected_change: Option<SemanticChangeId>,
     scope: Option<&ImpactScope>,
 ) -> EnrichmentObservation {
+    // Every unsettled entity is counted, so nothing unmeasured is certified.
+    // What each one holds decides the code it is reported under: only owed
+    // work is `enrichment_incomplete`, and a site a resolver already answered
+    // without settling keeps the code every other surface gives it.
     let mut pending = Vec::new();
+    let mut owed_entities = 0usize;
+    let mut pending_by_code: BTreeMap<String, usize> = BTreeMap::new();
     for entity in entities {
         let reading = read_caller_sites(facts, entity);
         let readings = scope.map_or_else(
             || vec![reading.clone()],
             |scope| scope.readings(entity, &reading),
         );
-        let mut states = BTreeSet::new();
+        let mut kinds: BTreeSet<SiteStateKind> = BTreeSet::new();
         for scoped in readings {
             let mut tally = CallSiteTally::default();
             tally.add(&scoped);
             if tally.is_settled() {
                 continue;
             }
-            let mut site_states: BTreeSet<String> = tally
+            let site_kinds: BTreeSet<SiteStateKind> = tally
                 .by_state
                 .iter()
                 .filter(|(kind, count)| !kind.is_settled() && **count > 0)
-                .map(|(kind, _)| kind.wire().to_string())
+                .map(|(kind, _)| *kind)
                 .collect();
-            if site_states.is_empty() {
-                site_states.insert(scoped.wire().to_string());
+            if site_kinds.is_empty() {
+                kinds.insert(reading_kind(&scoped));
+            } else {
+                kinds.extend(site_kinds);
             }
-            states.extend(site_states);
         }
-        if states.is_empty() {
+        if kinds.is_empty() {
             continue;
+        }
+        let codes: BTreeSet<&'static str> = kinds
+            .iter()
+            .map(|kind| {
+                if is_owed(*kind) {
+                    ENRICHMENT_INCOMPLETE
+                } else {
+                    kind.verdict_code()
+                        .expect("an unsettled kind calls for a verdict code")
+                }
+            })
+            .collect();
+        if codes.contains(ENRICHMENT_INCOMPLETE) {
+            owed_entities += 1;
+        }
+        for code in codes {
+            *pending_by_code.entry(code.to_string()).or_insert(0) += 1;
         }
         pending.push(PendingEnrichmentEntity {
             entity_id: entity.id,
@@ -347,9 +547,9 @@ fn observe<'a, F: CallSiteFacts>(
                     .map(|span| span.file.to_string())
                     .or_else(|| entity.file_origin.as_ref().map(ToString::to_string)),
             },
-            states: states.into_iter().collect(),
+            states: kinds.iter().map(|kind| kind.wire().to_string()).collect(),
             validation_reason: match &reading {
-                kin_model::CallerSites::Unverified { reason, .. } => Some(reason.clone()),
+                CallerSites::Unverified { reason, .. } => Some(reason.clone()),
                 _ => None,
             },
         });
@@ -364,6 +564,37 @@ fn observe<'a, F: CallSiteFacts>(
     let total_pending_entities = pending.len();
     pending.truncate(PENDING_ENTITIES_MAX);
     let bounded = total_pending_entities > 0;
+    let reach = if scope.is_some() {
+        "in this impact's reach or among its possible inbound callers across the selected graph"
+    } else {
+        "in the selected repository graph"
+    };
+    let clause = |code: &str, count: usize| {
+        let (one, several, why) = pending_why(code);
+        let (noun, verb) = if count == 1 {
+            ("entity", one)
+        } else {
+            ("entities", several)
+        };
+        format!(
+            "{code}: {count} {noun} {reach} {verb} {why}. Impact counts are a lower bound and \
+             review risk may change. This conservatively bounds the answer. It does not prove \
+             that every listed entity reaches the changed code."
+        )
+    };
+    // Owed work leads, because it is the one gap waiting can close. The
+    // answered-but-unsettled codes follow in code order.
+    let clauses: Vec<String> = pending_by_code
+        .get(ENRICHMENT_INCOMPLETE)
+        .map(|count| clause(ENRICHMENT_INCOMPLETE, *count))
+        .into_iter()
+        .chain(
+            pending_by_code
+                .iter()
+                .filter(|(code, _)| code.as_str() != ENRICHMENT_INCOMPLETE)
+                .map(|(code, count)| clause(code, *count)),
+        )
+        .collect();
     EnrichmentObservation {
         scope: if selected_change.is_some() { "committed_graph" } else if scope.is_some() { "selected_graph_impact" } else { "selected_graph_repository" }.into(),
         selected_change,
@@ -373,13 +604,13 @@ fn observe<'a, F: CallSiteFacts>(
         } else {
             "persisted_call_site_ledgers_and_context_validation; other relation enrichment is not established by this observation"
         }.into(),
-        limitation: bounded.then(|| format!(
-            "enrichment_incomplete: {total_pending_entities} entities {} have unsettled call-site evidence. Impact counts are a lower bound and review risk may change. This conservatively bounds the answer. It does not prove that every listed entity reaches the changed code.",
-            if scope.is_some() { "in this impact's reach or among its possible inbound callers across the selected graph" } else { "in the selected repository graph" }
-        )),
+        limitation: bounded.then(|| clauses.join("; ")),
         total_pending_entities,
         entities_withheld: total_pending_entities.saturating_sub(pending.len()),
         pending_entities: pending,
+        owed_entities,
+        pending_by_code,
+        clauses,
     }
 }
 
@@ -496,7 +727,24 @@ mod tests {
         assert!(json["pending_entities"][1]["projection"]
             .get("line")
             .is_none());
-        assert!(observation.limitation.unwrap().contains("does not prove"));
+        // Owed work and a server failure are two different gaps, each under
+        // its own code, and only the owed one is `enrichment_incomplete`.
+        assert_eq!(observation.owed_entities, 1);
+        assert_eq!(
+            observation.pending_by_code,
+            BTreeMap::from([
+                ("call_sites_server_failed".to_string(), 1),
+                ("enrichment_incomplete".to_string(), 1),
+            ])
+        );
+        let limitation = observation.limitation.unwrap();
+        assert!(limitation.starts_with("enrichment_incomplete: 1 entity "));
+        assert!(limitation.contains("; call_sites_server_failed: 1 entity "));
+        assert!(limitation.contains("does not prove"));
+        assert!(observation
+            .clauses
+            .iter()
+            .all(|clause| !clause.contains("; ")));
 
         let records = entities
             .into_iter()
@@ -511,6 +759,117 @@ mod tests {
         assert!(settled
             .basis
             .contains("other relation enrichment is not established"));
+    }
+
+    /// A resolver that already answered without settling a site is not owed
+    /// work, so the observation names what it is under its own code and never
+    /// says enrichment is unfinished while nothing is owed.
+    #[test]
+    fn owed_and_answered_unsettled_entities_carry_distinct_codes() {
+        let unresolved = entity("unresolved_caller", "docs/conf.py");
+        let binding = entity("binding_caller", "examples/app.py");
+        let ledgerless = entity("ledgerless", "src/no_ledger.py");
+        let records = records_with_validation(vec![
+            record(
+                &unresolved,
+                CallSiteState::Unresolved {
+                    reason: kin_model::UnresolvedReason::NoAnswer,
+                },
+            ),
+            record(&binding, CallSiteState::Binding { may_call: None }),
+        ]);
+        let answered = observe(
+            [&unresolved, &binding],
+            &CommittedLedgers(&records),
+            None,
+            None,
+        );
+        // Still bounded: nothing unmeasured is certified.
+        assert!(answered.bounds_answer());
+        assert_eq!(answered.total_pending_entities, 2);
+        assert_eq!(answered.owed_entities, 0);
+        let limitation = answered.limitation.as_deref().unwrap();
+        assert!(!limitation.contains(ENRICHMENT_INCOMPLETE), "{limitation}");
+        assert!(!limitation.contains("still owed"), "{limitation}");
+        assert_eq!(
+            answered
+                .clauses
+                .iter()
+                .map(|clause| clause.split(':').next().unwrap())
+                .collect::<Vec<_>>(),
+            ["binding_unproven", "call_sites_unresolved"]
+        );
+        assert!(limitation.starts_with("binding_unproven: 1 entity "));
+
+        // A caller no ledger describes is owed, and leads, unless the host
+        // says no resolver can prove its language now.
+        let with_owed = observe(
+            [&unresolved, &ledgerless],
+            &CommittedLedgers(&records),
+            None,
+            None,
+        );
+        assert_eq!(with_owed.owed_entities, 1);
+        assert!(with_owed
+            .limitation
+            .as_deref()
+            .unwrap()
+            .starts_with("enrichment_incomplete: 1 entity "));
+        assert_eq!(with_owed.clauses.len(), 2);
+
+        let graph = kin_db::InMemoryGraph::new();
+        {
+            use kin_model::{EntityStore, ResolutionRecordDelta, TransactionDelta};
+            for entity in [&unresolved, &binding, &ledgerless] {
+                graph.upsert_entity(entity).unwrap();
+            }
+            let validated = validation();
+            let ContextValidationState::Validated { context } =
+                &validated.as_context_validation().unwrap().state
+            else {
+                unreachable!()
+            };
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    resolution_record_deltas: std::iter::once(ResolutionRecord::ProofContext(
+                        context.clone(),
+                    ))
+                    .chain(records.values().cloned())
+                    .map(|new| ResolutionRecordDelta::Added { new })
+                    .collect(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let owed = observe_selected_impact(&graph, &[], true).unwrap();
+        assert_eq!(owed.owed_entities, 1);
+        let no_resolver = |_: LanguageId| Some(NoResolver::NoLanguageServer);
+        let unproven = observe_selected_impact_with_sources(
+            &graph,
+            &[],
+            true,
+            ObservationSources {
+                escape_evidence: None,
+                no_resolver: Some(&no_resolver),
+            },
+        )
+        .unwrap();
+        assert!(unproven.bounds_answer());
+        assert_eq!(unproven.owed_entities, 0);
+        assert_eq!(
+            unproven.pending_by_code,
+            BTreeMap::from([
+                ("binding_unproven".to_string(), 1),
+                ("call_sites_unproven_no_resolver".to_string(), 1),
+                ("call_sites_unresolved".to_string(), 1),
+            ])
+        );
+        let held = unproven
+            .pending_entities
+            .iter()
+            .find(|row| row.entity_id == ledgerless.id)
+            .unwrap();
+        assert_eq!(held.states, ["unproven_no_resolver"]);
     }
 
     #[test]
@@ -596,6 +955,188 @@ mod tests {
             .chain(std::iter::once(validation()))
             .map(|record| (record.id(), record))
             .collect()
+    }
+
+    /// Caller-level debt survives site filtering, so a different identifier
+    /// must be ruled out before an outside caller's reading enters the impact.
+    fn assert_outside_caller_identifier_debt(unverified: bool) {
+        use kin_model::{EntityStore, ResolutionRecordDelta, TransactionDelta};
+
+        let mut target = with_body(
+            entity("refresh", "src/refresh.py"),
+            "def refresh(): return 1",
+        );
+        // The parser's zero-call census settles this call-free focal even when
+        // the outside callers' proof context has not been validated.
+        target.metadata.extra.insert(
+            kin_model::call_site_reading::FILE_PARSED_CALL_SITES_KEY.into(),
+            serde_json::json!(0),
+        );
+        let longer = with_body(entity("cache_user", "src/cache.py"), "refresh_cache()");
+        let exact = with_body(entity("direct_user", "src/direct.py"), "refresh()");
+        let graph = kin_db::InMemoryGraph::new();
+        for entity in [&target, &longer, &exact] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        if unverified {
+            let validated = validation();
+            let ContextValidationState::Validated { context } =
+                &validated.as_context_validation().unwrap().state
+            else {
+                unreachable!()
+            };
+            graph
+                .apply_transaction_delta(&TransactionDelta {
+                    resolution_record_deltas: vec![
+                        ResolutionRecord::ProofContext(context.clone()),
+                        ResolutionRecord::ContextValidation(kin_model::ContextValidation {
+                            language: LanguageId::Python,
+                            state: ContextValidationState::Unverified {
+                                reason: "fixture context has not been validated".into(),
+                            },
+                        }),
+                        unresolved(&longer, "refresh_cache"),
+                        unresolved(&exact, "refresh"),
+                    ]
+                    .into_iter()
+                    .map(|new| ResolutionRecordDelta::Added { new })
+                    .collect(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let containment = |targets: &[Entity], at| {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].id, target.id);
+            EscapeEvidenceBatch {
+                selected_change: at,
+                readings: vec![kin_model::FocalEscape::contained(
+                    graph.list_all_entities().unwrap().len(),
+                )],
+            }
+        };
+        let diff = crate::diff::SemanticDiff {
+            entity_changes: vec![crate::diff::EntityChange {
+                entity_id: target.id,
+                kind: crate::diff::EntityChangeKind::Added(target.clone()),
+            }],
+            ..Default::default()
+        };
+        let report =
+            crate::impact::analyze_impact_with_source(&graph, &diff, Some(&containment)).unwrap();
+        assert!(report.affected_callers.is_empty());
+        let observation = report.enrichment.unwrap();
+        assert!(observation.bounds_answer());
+        assert!(!observation
+            .pending_entities
+            .iter()
+            .any(|entity| entity.entity_id == longer.id));
+        assert!(!observation
+            .pending_entities
+            .iter()
+            .any(|entity| entity.entity_id == target.id));
+        let direct = observation
+            .pending_entities
+            .iter()
+            .find(|entity| entity.entity_id == exact.id)
+            .expect("the exact spelling must retain the outside caller's debt");
+        assert_eq!(
+            direct.states,
+            [if unverified {
+                "proof_context_unverified"
+            } else {
+                "owed_enrichment"
+            }]
+        );
+        if unverified {
+            assert_eq!(
+                direct.validation_reason.as_deref(),
+                Some("fixture context has not been validated")
+            );
+        }
+
+        // Removing the real spelling leaves no relevant caller debt, even
+        // though the unrelated longer-name caller is still owed or unverified.
+        graph.remove_entity(&exact.id).unwrap();
+        let collision_only =
+            crate::impact::analyze_impact_with_source(&graph, &diff, Some(&containment))
+                .unwrap()
+                .enrichment
+                .unwrap();
+        assert!(!collision_only.bounds_answer());
+        assert!(collision_only.pending_entities.is_empty());
+    }
+
+    #[test]
+    fn impact_scope_owed_callers_require_whole_identifiers() {
+        assert_outside_caller_identifier_debt(false);
+    }
+
+    #[test]
+    fn impact_scope_unverified_callers_require_whole_identifiers() {
+        assert_outside_caller_identifier_debt(true);
+    }
+
+    #[test]
+    fn impact_scope_identifier_boundaries_preserve_unknown_bodies_and_escape() {
+        use kin_model::EntityStore;
+
+        let mut target = with_body(
+            entity("refresh", "src/refresh.py"),
+            "def refresh(): return 1",
+        );
+        target.metadata.extra.insert(
+            kin_model::call_site_reading::FILE_PARSED_CALL_SITES_KEY.into(),
+            serde_json::json!(0),
+        );
+        let longer = with_body(entity("cache_user", "src/cache.py"), "refresh_cache()");
+        let missing = entity("missing_preview", "src/missing.py");
+        let abbreviated = with_body(
+            entity("abbreviated_preview", "src/abbreviated.py"),
+            &format!("{}refresh_cache()", " ".repeat(8001)),
+        );
+        let graph = kin_db::InMemoryGraph::new();
+        for entity in [&target, &longer, &missing, &abbreviated] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let containment = |targets: &[Entity], at| EscapeEvidenceBatch {
+            selected_change: at,
+            readings: targets
+                .iter()
+                .map(|_| kin_model::FocalEscape::contained(4))
+                .collect(),
+        };
+        let contained = observe_selected_impact_with_source(
+            &graph,
+            std::slice::from_ref(&target),
+            false,
+            Some(&containment),
+        )
+        .unwrap();
+        for caller in [&missing, &abbreviated] {
+            let pending = contained
+                .pending_entities
+                .iter()
+                .find(|entity| entity.entity_id == caller.id)
+                .expect("an unknown or abbreviated body cannot exclude an owed caller");
+            assert_eq!(pending.states, ["owed_enrichment"]);
+        }
+        assert!(!contained
+            .pending_entities
+            .iter()
+            .any(|entity| entity.entity_id == longer.id || entity.entity_id == target.id));
+
+        // Without a source census proving containment, a call through an
+        // alias could still reach refresh despite the different identifier.
+        let unknown_escape =
+            observe_selected_impact(&graph, std::slice::from_ref(&target), false).unwrap();
+        let pending = unknown_escape
+            .pending_entities
+            .iter()
+            .find(|entity| entity.entity_id == longer.id)
+            .expect("unknown value escape must keep the outside caller conservative");
+        assert_eq!(pending.states, ["owed_enrichment"]);
+        assert!(unknown_escape.bounds_answer());
     }
 
     #[test]
@@ -926,9 +1467,7 @@ mod tests {
             assert_eq!(targets[0].id, target.id);
             EscapeEvidenceBatch {
                 selected_change: at,
-                readings: vec![FocalEscape::Contained {
-                    entities_checked: 2,
-                }],
+                readings: vec![FocalEscape::contained(2)],
             }
         };
         let settled = observe_committed_impact_with_source(
@@ -945,9 +1484,7 @@ mod tests {
 
         let wrong_revision = |_: &[Entity], _| EscapeEvidenceBatch {
             selected_change: None,
-            readings: vec![FocalEscape::Contained {
-                entities_checked: 2,
-            }],
+            readings: vec![FocalEscape::contained(2)],
         };
         let bounded = observe_committed_impact_with_source(
             &entities,
@@ -980,9 +1517,7 @@ mod tests {
         let mixed = |_: &[Entity], at| EscapeEvidenceBatch {
             selected_change: at,
             readings: vec![
-                FocalEscape::Contained {
-                    entities_checked: 2,
-                },
+                FocalEscape::contained(2),
                 FocalEscape::Unknown {
                     reason: "old spelling unavailable",
                 },

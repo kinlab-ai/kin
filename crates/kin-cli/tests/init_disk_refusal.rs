@@ -82,13 +82,26 @@ impl Run {
     }
 }
 
+fn kin_command(home: &Path) -> Command<'static> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kin"));
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("KIN_HOME", home.join("kin-home"))
+        .env("KIN_REGISTRY_PATH", home.join("registry.toml"))
+        .env_remove("KIN_STORE")
+        .env_remove("KIN_STORE_LAYOUT")
+        .env_remove("KIN_DIR")
+        .env_remove("KIN_DAEMON_URL")
+        .env_remove("KIN_MCP_REPO");
+    command
+}
+
 fn kin_init(repo: &Path, home: &Path, free: &str) -> Run {
-    let output = Command::new(env!("CARGO_BIN_EXE_kin"))
+    let output = kin_command(home)
         .arg("init")
         .arg(repo)
-        .arg("--no-enrich")
-        .env("HOME", home)
-        .env("KIN_HOME", home.join("kin-home"))
+        .arg("--defer-enrich")
         .env("KIN_INIT_MEMORY_CEILING_BYTES", ROOMY_MEMORY)
         .env(FREE_ENV, free)
         .output()
@@ -98,6 +111,60 @@ fn kin_init(repo: &Path, home: &Path, free: &str) -> Run {
     Run {
         code: output.status.code(),
         text,
+    }
+}
+
+fn assert_admitted_store(repo: &Path, home: &Path) {
+    let layout = common::repository_layout(kin_command(home), repo);
+    assert!(
+        layout.is_external(),
+        "conversion uses default central storage"
+    );
+    assert!(
+        layout
+            .root()
+            .starts_with(home.join("stores").canonicalize().unwrap()),
+        "the store belongs to this fixture's private registry"
+    );
+    kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+        .expect("the conversion published a repository authority binding");
+}
+
+fn assert_no_admitted_store(repo: &Path, home: &Path) {
+    let output = kin_command(home)
+        .args(["store", "path", "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("inspect refused conversion's store binding");
+    assert!(
+        !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("not a Kin repository"),
+        "a refused conversion must have no admitted store: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !repo.join(".kin").exists(),
+        "no in-tree store was left behind"
+    );
+    let stores = home.join("stores");
+    match fs::read_dir(&stores) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.expect("inspect central store entry");
+                // Reserving the parent may install its empty Spotlight marker;
+                // no repository store or capture staging is permitted.
+                assert!(
+                    entry.file_name() == ".metadata_never_index"
+                        && entry.file_type().unwrap().is_file()
+                        && entry.metadata().unwrap().len() == 0,
+                    "a refused conversion left a central store or staging behind: {}",
+                    entry.path().display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("inspect private central stores: {error}"),
     }
 }
 
@@ -141,10 +208,7 @@ fn a_conversion_the_disk_cannot_hold_refuses_before_it_writes_anything() {
             run.text
         );
     }
-    assert!(
-        !repo.join(".kin").exists(),
-        "a refused conversion left a store behind"
-    );
+    assert_no_admitted_store(&repo, home.path());
     let stranded = stranded_staging(workspace.path());
     assert!(
         stranded.is_empty(),
@@ -173,11 +237,7 @@ fn a_tight_disk_is_named_and_the_conversion_still_runs() {
         "a disk with room for the floor was refused: {}",
         run.text
     );
-    assert!(
-        repo.join(".kin").exists(),
-        "a warned conversion must still convert: {}",
-        run.text
-    );
+    assert_admitted_store(&repo, home.path());
 }
 
 /// A conversion with room converts and says nothing about disk.
@@ -190,11 +250,7 @@ fn a_conversion_with_room_converts_and_says_nothing_about_disk() {
 
     let run = kin_init(&repo, home.path(), ROOMY_DISK);
 
-    assert!(
-        repo.join(".kin").exists(),
-        "no store was written: {}",
-        run.text
-    );
+    assert_admitted_store(&repo, home.path());
     for phrase in ["needs more free disk", "may not fit on disk"] {
         assert!(
             !run.contains(phrase),
@@ -225,8 +281,5 @@ fn an_unreadable_free_space_override_is_refused_rather_than_ignored() {
         "the refusal does not name the variable and what is wrong with it: {}",
         run.text
     );
-    assert!(
-        !repo.join(".kin").exists(),
-        "a refused conversion left a store behind"
-    );
+    assert_no_admitted_store(&repo, home.path());
 }

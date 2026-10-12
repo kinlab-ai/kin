@@ -2,19 +2,52 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod c_lang;
+mod cpp_declarations;
+pub(crate) mod cpp_escape;
 pub mod cpp_lang;
+mod cpp_nested;
+mod csharp_declarations;
+mod ecmascript_declarations;
+mod ecmascript_edit;
+mod ecmascript_extent;
 pub mod go;
+mod go_declarations;
+mod go_edit;
+pub(crate) mod go_escape;
+pub(crate) mod go_unit;
 pub mod hcl;
 pub mod java;
+mod java_declarations;
+pub(crate) mod java_escape;
 pub mod javascript;
 mod javascript_dynamic;
+pub(crate) mod javascript_escape;
 mod javascript_imported_receiver;
+mod javascript_key_facts;
+mod javascript_nested;
 pub mod kotlin;
+mod kotlin_declarations;
+pub(crate) mod kotlin_escape;
 pub mod php;
+mod php_declarations;
+pub(crate) mod php_escape;
 pub mod python;
+mod python_declarations;
+mod python_edit;
+pub(crate) mod python_escape;
+mod python_layout;
+mod ruby_declarations;
+pub mod rust_crates;
+mod rust_declarations;
+mod rust_edit;
+pub(crate) mod rust_escape;
 pub mod rust_lang;
+pub(crate) mod rust_nested;
 pub mod shallow_backed;
 pub mod swift;
+mod swift_declarations;
+pub(crate) mod swift_escape;
+mod swift_nested;
 pub mod typescript;
 
 pub use c_lang::CAdapter;
@@ -187,6 +220,23 @@ impl AdapterRegistry {
             .iter()
             .map(|adapter| (adapter.language_id(), adapter.file_extensions()))
             .collect()
+    }
+
+    /// Every manifest a registered adapter names, once each, in root
+    /// precedence order. The manifest's name breaks a tie.
+    pub fn project_manifests(&self) -> Vec<crate::project_manifest::ProjectManifest> {
+        let mut manifests: Vec<crate::project_manifest::ProjectManifest> = Vec::new();
+        for manifest in self
+            .adapters
+            .iter()
+            .filter_map(|adapter| adapter.project_manifest())
+        {
+            if !manifests.iter().any(|held| held.name == manifest.name) {
+                manifests.push(manifest);
+            }
+        }
+        manifests.sort_by_key(|manifest| (manifest.root_precedence, manifest.name));
+        manifests
     }
 }
 

@@ -62,6 +62,11 @@ import tempfile
 import time
 import urllib.request
 
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
+
 from trace_pages import mcp_references
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -186,8 +191,13 @@ class Suite(object):
         self._comment_only_evidence = None
         self.run_id = "r%d" % os.getpid()
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
@@ -472,7 +482,7 @@ class Suite(object):
     def _build_graphsection(self, repo):
         """A committed Git base whose first daemon reopen must be prepared.
 
-        `--no-enrich` is load-bearing: no daemon may open the store before the
+        `--defer-enrich` is load-bearing: no daemon may open the store before the
         check asks the explicit materialize verb whether init already wrote the
         section.
         """
@@ -487,10 +497,10 @@ class Suite(object):
             ["commit", "-q", "-m", "graph section fixture"], repo)
         if rc != 0:
             raise RuntimeError("git commit failed: %s" % failure_excerpt(err or out))
-        rc, out, err = self.kin_run(["init", ".", "--no-enrich"], repo)
+        rc, out, err = self.kin_run(["init", ".", "--defer-enrich"], repo)
         if rc != 0:
             raise RuntimeError(
-                "kin init --no-enrich failed in %s: %s"
+                "kin init --defer-enrich failed in %s: %s"
                 % (repo, failure_excerpt(err or out)))
 
     def _build_threestate(self, repo):
@@ -845,51 +855,49 @@ class Suite(object):
         evidence["after_send"] = self.references(
             repo, MIXIN_FOCAL_SEND, relation_kinds=["calls"])
         evidence["after_adapter"] = self.references(repo, MIXIN_FOCAL_ADAPTER_SEND)
-        evidence["after_caller_starts"] = self.caller_span_starts(
+        evidence["after_caller_bodies"] = self.caller_bodies(
             repo, (evidence["after_send"], evidence["after_adapter"]))
         with open(source) as handle:
             evidence["source_lines"] = handle.read().splitlines()
         self._comment_only_evidence = evidence
         return evidence
 
-    def caller_span_starts(self, repo, payloads):
-        """Read each counted caller's start and body through `get_entity_source`.
+    def caller_bodies(self, repo, payloads):
+        """Read each counted caller's body through `get_entity_source`.
 
-        A reference row addresses each site inside its caller, as `line_in_entity`
-        counted from 0 at the caller's first line, and never by a file line. A check
-        that grades a site against the file on disk crosses a materialization
-        boundary, and needs the caller's own first line to do it: the site's file
-        line is the response's 1-based `start_line` plus its `line_in_entity`.
-        The entity-only body independently proves the offset carries the call.
-        Read straight after the rows, over the same store, so the
-        two describe one graph.
+        A reference row places its caller by module and addresses each site
+        inside that caller, as `line_in_entity` counted from 0 at the caller's
+        first line. Kin serves no line of a file for either. A check that grades
+        a site against the source this suite wrote crosses a materialization
+        boundary, and crosses it here, through the caller's own body: where that
+        exact body sits in the written source is where the caller starts, and
+        the body independently proves the offset carries the call. Read straight
+        after the rows, over the same store, so the two describe one graph.
 
-        Returns `{entity_id: {"start_line": int, "body": str}}`, or
-        `{"error": reason}` for a caller whose record could not be read, so a
-        check reports that caller as ungraded rather than guessing where it starts.
+        Returns `{entity_id: {"body": str}}`, or `{"error": reason}` for a caller
+        whose record could not be read, so a check reports that caller as
+        ungraded rather than guessing where it starts.
         """
-        starts = {}
+        bodies = {}
         for payload in payloads:
             for row in (payload or {}).get("references") or []:
                 entity_id = row.get("entity_id") if isinstance(row, dict) else None
-                if not isinstance(entity_id, str) or not entity_id or entity_id in starts:
+                if not isinstance(entity_id, str) or not entity_id or entity_id in bodies:
                     continue
                 if str(row.get("kind", "")).lower() in ("module", "file"):
-                    starts[entity_id] = {"error": "whole-file caller bodies are not requested"}
+                    bodies[entity_id] = {"error": "whole-module caller bodies are not requested"}
                     continue
                 try:
                     record, _ = self.mcp(repo, "get_entity_source", {"entity_id": entity_id})
                 except McpError as exc:
-                    starts[entity_id] = {"error": "get_entity_source unreadable: %s" % exc}
+                    bodies[entity_id] = {"error": "get_entity_source unreadable: %s" % exc}
                     continue
-                start = record.get("start_line") if isinstance(record, dict) else None
                 body = record.get("body") if isinstance(record, dict) else None
-                if type(start) is int and start >= 1 and isinstance(body, str):
-                    starts[entity_id] = {"start_line": start, "body": body}
+                if isinstance(body, str):
+                    bodies[entity_id] = {"body": body}
                 else:
-                    starts[entity_id] = {
-                        "error": "get_entity_source carries no positive start_line and body"}
-        return starts
+                    bodies[entity_id] = {"error": "get_entity_source carries no body"}
+        return bodies
 
 
 # ----------------------------------------------------------------- fixture code
@@ -1130,28 +1138,42 @@ def resolution_miss(payload, query):
         query, negative.get("kind") or negative.get("subject") or "no reason given")
 
 
-def projection_path(row):
-    """The file a reference row's caller is projected into, or None.
+def row_module(row):
+    """The dotted module a reference row's caller, or a focal, is placed in, or None.
 
-    A row names its caller by `entity_id` and serves the caller's file only as
-    `projection.path`. A check that asks which file a caller lives in reads it
-    here, and a row that carries no readable path answers None rather than an
-    empty string, so no check can mistake a missing projection for a file.
+    A row names its caller by `entity_id` and places it by `module`, the dotted
+    module that contains it as the graph's own module records name it:
+    `pkg.storage` for a method of a class declared there. A reply's focal is
+    placed the same way. A check that asks where an entity lives reads it here,
+    and a row that carries no readable module answers None rather than an empty
+    string, so no check can mistake a missing placement for a module.
     """
-    projection = row.get("projection") if isinstance(row, dict) else None
-    path = projection.get("path") if isinstance(projection, dict) else None
-    return path if isinstance(path, str) and path else None
+    module = row.get("module") if isinstance(row, dict) else None
+    return module if isinstance(module, str) and module else None
+
+
+def is_test_caller(row):
+    """Whether a reference row's caller is test code, by the role the graph gives it.
+
+    The graph classifies every caller (`source`, `test`, `vendored`, ...) and the
+    row serves that as `role`. None when the row carries no readable role, so a
+    check can tell an unclassified caller from a production one.
+    """
+    role = row.get("role") if isinstance(row, dict) else None
+    if not isinstance(role, str) or not role:
+        return None
+    return role == "test"
 
 
 def is_relimport_live_focal(focal):
-    """Whether a `find_references` focal is check 23's live `connect` in pkg/store.py.
+    """Whether a `find_references` focal is check 23's live `connect` in `pkg.store`.
 
-    The focal is addressed by id like every row, with its file only as
-    `projection.path`, so that is where its file is read.
+    The focal is addressed by id like every row and placed by its module, so
+    that is where its place is read.
     """
     return (isinstance(focal, dict)
             and focal.get("name") == RELIMPORT_LIVE_FUNCTION
-            and (projection_path(focal) or "").endswith("pkg/store.py"))
+            and row_module(focal) == RELIMPORT_LIVE_MODULE)
 
 
 def trend_of(status, prior):
@@ -1281,6 +1303,9 @@ class Session(SessionRedirectMixin):
 # failure text cannot drift apart.
 MIXIN_FOCAL_SEND = "Session.send"
 MIXIN_FOCAL_ADAPTER_SEND = "HTTPAdapter.send"
+# The module every caller of both symbols is declared in, and the one the
+# comment-only commit edited.
+MIXIN_CALLER_MODULE = "pkg.sessions"
 
 # The fixture behind check 12. `src/prelude.rs` is the whole point: a file that
 # declares nothing and that no adapter failed on. Measured on kin 0.5.48, the
@@ -1346,6 +1371,12 @@ certify an enumeration of it.
 # them while the one row it could resolve carried a careful one.
 RELIMPORT_LIVE_FUNCTION = "connect"
 RELIMPORT_DEAD_FUNCTION = "orphaned_helper"
+# Where the graph places the two ends of that call, by the dotted module that
+# contains each: `connect` in the store module, its caller `main` in the
+# command-line module. A check names a place by its module, never by where the
+# module's source is stored.
+RELIMPORT_LIVE_MODULE = "pkg.store"
+RELIMPORT_CALLER_MODULE = "pkg.cli"
 
 REEXPORT_BENIGN_FILE = "src/prelude.rs"
 REEXPORT_DEAD_FUNCTION = "legacy_shim"
@@ -1517,6 +1548,13 @@ def check_0(suite):
     return res
 
 
+# Where the incremental fixture's modules are placed. `parse_note` and
+# `normalize_title` are declared in `pkg.parsing`; the storage and link-graph
+# modules call them.
+INCREMENTAL_STORAGE_MODULE = "pkg.storage"
+INCREMENTAL_CALLER_MODULES = ("pkg.parsing", "pkg.storage", "pkg.linkgraph")
+
+
 def check_1(suite):
     """FIR-2354: the incremental path must produce cross-file edges."""
     res = Result("1", "FIR-2354", "cross-file edges on the incremental commit path")
@@ -1543,14 +1581,17 @@ def check_1(suite):
     if miss:
         res.unknown(miss)
         return res
-    files = sorted({projection_path(r) or "<no projection>"
-                    for r in payload.get("references") or []})
-    if any(f.endswith("storage.py") for f in files):
-        res.ok("find_references(parse_note) crosses into storage.py")
+    # Each caller is placed by the module that contains it. `parse_note` is
+    # declared in `pkg.parsing`, so a caller placed in the storage module is a
+    # cross-module reference the incremental path had to produce.
+    modules = sorted({row_module(r) or "<no module>"
+                      for r in payload.get("references") or []})
+    if INCREMENTAL_STORAGE_MODULE in modules:
+        res.ok("find_references(parse_note) crosses into %s" % INCREMENTAL_STORAGE_MODULE)
     else:
-        res.bad("find_references(parse_note) returned %d reference(s) %s; "
-                "storage.py imports and calls it"
-                % (len(payload.get("references") or []), files))
+        res.bad("find_references(parse_note) returned %d reference(s) placed in %s; "
+                "%s imports and calls it"
+                % (len(payload.get("references") or []), modules, INCREMENTAL_STORAGE_MODULE))
     return res
 
 
@@ -1600,7 +1641,7 @@ def check_2(suite):
 def check_3(suite):
     """FIR-2357: a partial answer must say it is partial.
 
-    normalize_title has five call sites across three files in the fixture:
+    normalize_title has five call sites across three modules in the fixture:
     extract_links (parsing), ingest_note twice (storage), from_db twice
     (linkgraph).
     """
@@ -1616,10 +1657,9 @@ def check_3(suite):
         res.unknown(miss)
         return res
     refs = payload.get("references") or []
-    files = sorted({projection_path(r) for r in refs if projection_path(r)})
-    expected_files = {"pkg/parsing.py", "pkg/storage.py", "pkg/linkgraph.py"}
-    if expected_files.issubset(set(files)):
-        res.ok("all three calling files returned: %s" % files)
+    modules = sorted({row_module(r) for r in refs if row_module(r)})
+    if set(INCREMENTAL_CALLER_MODULES).issubset(set(modules)):
+        res.ok("all three calling modules returned: %s" % modules)
         return res
     signal = None
     for key in ("completeness", "edge_coverage"):
@@ -1629,8 +1669,8 @@ def check_3(suite):
     if signal is None and isinstance(payload.get("negative"), dict):
         signal = "negative"
     if signal is None:
-        res.bad("partial answer (%d ref(s) from %s, ground truth 5 sites in 3 files) "
-                "carries no completeness signal" % (len(refs), files))
+        res.bad("partial answer (%d ref(s) from %s, ground truth 5 sites in 3 modules) "
+                "carries no completeness signal" % (len(refs), modules))
         return res
     res.ok("partial answer carries a %r signal" % signal)
     marked = json.dumps(payload.get(signal))
@@ -1760,18 +1800,21 @@ def check_5(suite):
         res.unknown(miss)
         return res
     rows = payload.get("references") or []
-    test_callers = [r for r in rows if (projection_path(r) or "").startswith("tests/")]
-    # A caller whose projection cannot be read cannot be shown not to be a test,
-    # so the no-test-caller arm is not graded over one.
-    unplaced = [r.get("name", "?") for r in rows if projection_path(r) is None]
+    # Whether a caller is test code is the graph's classification of it, served
+    # on every local row as `role`.
+    test_callers = [r for r in rows if is_test_caller(r)]
+    # A caller whose role cannot be read cannot be shown not to be a test, so
+    # the no-test-caller arm is not graded over one.
+    unclassified = [r.get("name", "?") for r in rows if is_test_caller(r) is None]
     if test_callers:
         res.bad("Adapter.send claims caller(s) %s; the test calls Session.send"
                 % ", ".join(r.get("name", "?") for r in test_callers))
-    elif unplaced:
-        res.unknown("Adapter.send caller(s) %s carry no projection.path, so whether one "
-                    "is a test caller cannot be read" % ", ".join(unplaced))
+    elif unclassified:
+        res.unknown("Adapter.send caller(s) %s carry no role, so whether one is a test "
+                    "caller cannot be read" % ", ".join(unclassified))
     else:
-        res.ok("Adapter.send claims no test caller")
+        res.ok("Adapter.send claims no test caller (roles %s)"
+               % sorted({r.get("role") for r in rows}))
     drain = suite.inspect(repo, "Session.drain")
     if drain is None:
         res.unknown("kin graph inspect Session.drain did not resolve")
@@ -1792,8 +1835,16 @@ def check_5(suite):
     return res
 
 
+# The served name of the call-chain walk, and the name it replaced, which a
+# listing that does not speak verbs still serves.
+TRACE_TOOL_NAMES = ("trace", "trace_data_flow")
+
+# The served name of the graph status tool, and the name it replaced.
+STATUS_TOOL_NAMES = ("status", "kin_graph_status")
+
+
 def trace_shape_knob(tools):
-    """The shape knob check 6 reads off the served `trace_data_flow`.
+    """The shape knob check 6 reads off the served `trace` (`trace_data_flow`).
 
     Module level and pure so `scripts/acceptance/mcp_surface_contract.py` can
     assert the same property per pull request through this exact reader. Both
@@ -1807,7 +1858,7 @@ def trace_shape_knob(tools):
     """
     schema = None
     for tool in tools.get("tools") or []:
-        if tool.get("name") == "trace_data_flow":
+        if tool.get("name") in TRACE_TOOL_NAMES:
             schema = (tool.get("inputSchema") or {}).get("properties") or {}
     if schema is None:
         return None, None
@@ -1825,7 +1876,7 @@ def graph_status_description(tools):
     reports as unreadable rather than as a trimmed sentence.
     """
     for tool in tools.get("tools") or []:
-        if tool.get("name") == "kin_graph_status":
+        if tool.get("name") in STATUS_TOOL_NAMES:
             return tool.get("description") or ""
     return ""
 
@@ -1841,7 +1892,7 @@ def check_6(suite):
         return res
     knob, schema_keys = trace_shape_knob(tools)
     if schema_keys is None:
-        res.unknown("trace_data_flow absent from tools/list")
+        res.unknown("trace (trace_data_flow) absent from tools/list")
         return res
     if knob is None:
         res.bad("trace_data_flow declares no compact/include_body parameter: %s"
@@ -2253,6 +2304,32 @@ def check_10(suite):
     return res
 
 
+def grade_doctor_census(report, expected):
+    """Grade the stable machine check id, independent of its display label."""
+    checks = report.get("checks") if isinstance(report, dict) else None
+    if not isinstance(checks, list):
+        return UNREADABLE, "kin doctor returned no checks array"
+    matches = [row for row in checks
+               if isinstance(row, dict) and row.get("id") == "relation_census"]
+    if len(matches) != 1:
+        return UNREADABLE, "kin doctor returned %d relation_census checks, expected one" % len(matches)
+    row = matches[0]
+    status, detail = row.get("status"), row.get("detail")
+    if status not in ("healthy", "missing", "stale", "misconfigured", "pending", "degraded", "unsupported"):
+        return UNREADABLE, "kin doctor returned an unknown relation_census status: %r" % status
+    if not isinstance(detail, str):
+        return UNREADABLE, "kin doctor returned no relation_census detail"
+    if status != "stale":
+        return FAIL, "kin doctor reports relation_census=%s over a forced loss: %s" % (status, detail)
+    if "no relation kind has lost ground" in detail:
+        return FAIL, "kin doctor claims no loss beside a forced census loss: %s" % detail
+    if expected not in detail:
+        return FAIL, "kin doctor does not name the exact lost count %r: %s" % (expected, detail)
+    if "entity count held" not in detail:
+        return FAIL, "kin doctor names the loss without its unchanged entity count: %s" % detail
+    return PASS, "kin doctor relation_census names the kind and unchanged entity count: %s" % detail
+
+
 def check_11(suite):
     """FIR-2598: the census must be able to see a loss a commit introduced.
 
@@ -2320,30 +2397,22 @@ def check_11(suite):
         res.bad("graph status did not name the lost kind. Expected %r, census row read: %s"
                 % (expected, line or "(no census row printed)"))
 
-    rc, out, err = suite.kin_run(["doctor"], repo)
-    doctor = strip_ansi(out + "\n" + err)
-    # The row, not the summary. `kin doctor` closes with a line naming every
-    # check that needs attention, and on a runner where several do, that line
-    # contains the words "Relation census" too. A substring search picked it and
-    # reported the check red over a product that had answered correctly. The row
-    # carries its status marker and then the label; the summary carries a count
-    # between the two.
-    row = ""
-    for candidate in doctor.splitlines():
-        if re.match(r"^\s*\S?\s+Relation census\b", candidate):
-            row = candidate.strip()
-    if not row:
-        res.unknown("kin doctor rc=%d printed no relation-census row" % rc)
-    elif "no relation kind has lost ground" in doctor:
-        res.bad("kin doctor reports the census green over a kind that lost ground: %s" % row)
-    elif expected not in doctor:
-        res.bad("kin doctor does not name the kind that lost ground. Expected %r, census row "
-                "read: %s" % (expected, row))
-    elif "entity count held" not in doctor:
-        res.bad("kin doctor names the loss without the entity count that makes it a "
-                "regression rather than a deletion: %s" % row)
+    rc, out, err = suite.kin_run(["doctor", "--json"], repo)
+    try:
+        report = json.loads(out)
+    except ValueError as exc:
+        res.unknown("kin doctor rc=%d returned unreadable JSON: %s" % (rc, exc))
     else:
-        res.ok("kin doctor names the kind and the entity count: %s" % row)
+        status, detail = grade_doctor_census(report, expected)
+        if rc != 0:
+            res.unknown("kin doctor JSON was readable but exited rc=%d: %s"
+                        % (rc, failure_excerpt(err)))
+        elif status == UNREADABLE:
+            res.unknown(detail)
+        elif status == FAIL:
+            res.bad(detail)
+        else:
+            res.ok(detail)
 
     # The second half of the defect. A commit taken while the graph is below
     # its baseline must not install its own census as the new comparison point,
@@ -2800,7 +2869,7 @@ def check_14(suite):
         return res
     description = graph_status_description(tools)
     if not description:
-        res.unknown("tools/list carries no kin_graph_status description")
+        res.unknown("tools/list carries no status (kin_graph_status) description")
         return res
     if AS_OF_EARLIER_SAMPLING not in description:
         res.bad("the kin_graph_status description does not tell a caller a reading as of an "
@@ -3528,21 +3597,51 @@ def check_18(suite):
     return res
 
 
-def grade_sites_on_disk(focal, payload, starts, lines, path):
-    """Place every site a caller in `path` reports into the file on disk.
+def locate_body(lines, body):
+    """Where an entity's served body starts in `lines`, as a 1-based line.
+
+    Returns `(line, None)` for the one place the body sits, `(None, "absent")`
+    when it sits nowhere, and `(None, "ambiguous")` when it sits in more than
+    one place. The body's first line is matched as the end of a source line
+    with only indentation before it, because a declaration's span starts at its
+    keyword and not at the indentation before it; every later line must match
+    exactly.
+    """
+    body_lines = body.splitlines()
+    if not body_lines or not body_lines[0].strip():
+        return None, "absent"
+    head, rest = body_lines[0], body_lines[1:]
+    found = []
+    for index in range(len(lines) - len(body_lines) + 1):
+        line = lines[index]
+        if (line.endswith(head) and not line[:len(line) - len(head)].strip()
+                and lines[index + 1:index + len(body_lines)] == rest):
+            found.append(index + 1)
+    if len(found) == 1:
+        return found[0], None
+    return None, ("ambiguous" if found else "absent")
+
+
+def grade_sites_on_disk(focal, payload, bodies, lines, module):
+    """Place every site a caller placed in `module` reports into the fixture source.
 
     Returns `(graded, stale, ungraded)`: how many sites were read against the
     file, one message per site that no longer carries the call, and one per
     caller whose sites could not be placed at all.
 
-    A row addresses a site inside its caller, so the file line is computed at
-    this boundary and nowhere else: the caller's 1-based `start_line` from
-    `get_entity_source` (in `starts`) plus the site's `line_in_entity`.
-    Both that entity-body line and the file line must carry `<method>(`, which
-    is the check the old absolute `reference_lines` were read against. On top of it, a
-    site's `callee`, cut from the caller's own body, must name the method when
-    it is present, and a site whose text Kin says lies outside its caller is
-    stale by Kin's own account.
+    A row places its caller by the module that contains it and addresses a site
+    inside that caller. `lines` is that module's source as this suite wrote it,
+    so the line in it is computed at this boundary and nowhere else: the caller
+    starts where the exact body `get_entity_source` served for it (in `bodies`)
+    sits in `lines`, and the site is its `line_in_entity` below that. A body
+    that sits nowhere in the written source is a caller Kin remembers rather
+    than reads, so its sites are stale; a body that sits in two places cannot
+    be placed and is ungraded. Both the entity-body line and the source line
+    must carry `<method>(`, which is the check the old absolute
+    `reference_lines` were read against. On top of it, a site's `callee`, cut
+    from the caller's own body, must name the method when it is present, and a
+    site whose text Kin says lies outside its caller is stale by Kin's own
+    account.
 
     A site with no `line_in_entity` is failed, not skipped. The defect this
     check guards was a remembered site that did not move with its file; once
@@ -3558,21 +3657,24 @@ def grade_sites_on_disk(focal, payload, starts, lines, path):
     stale = []
     ungraded = []
     for name, row in sorted(reference_rows(payload).items()):
-        if projection_path(row) != path:
+        if row_module(row) != module:
             continue
         sites = row.get("sites")
         if sites is None or sites == []:
             # No site at all is a different answer from a wrong one, and the
             # row's `sites_absent_reason` already says which absence it is.
             continue
-        source = starts.get(row.get("entity_id")) or {}
-        start, body = source.get("start_line"), source.get("body")
-        if (not isinstance(sites, list) or type(start) is not int or start < 1
-                or not isinstance(body, str)):
+        source = bodies.get(row.get("entity_id")) or {}
+        body = source.get("body")
+        if not isinstance(sites, list) or not isinstance(body, str):
             ungraded.append("%s (%s)" % (
                 name, "sites is not a list" if not isinstance(sites, list) else
-                (starts.get(row.get("entity_id")) or {}).get("error")
-                or "no caller record was read"))
+                source.get("error") or "no caller record was read"))
+            continue
+        start, unplaced = locate_body(lines, body)
+        if unplaced == "ambiguous":
+            ungraded.append("%s (its body sits in more than one place in the written source)"
+                            % name)
             continue
         body_lines = body.splitlines()
         for site in sites:
@@ -3589,10 +3691,14 @@ def grade_sites_on_disk(focal, payload, starts, lines, path):
                 stale.append("%s -> %s site +%d is outside its entity body or does not carry %r"
                              % (name, focal, offset, token))
                 continue
+            if start is None:
+                stale.append("%s -> %s site +%d: the body Kin serves for the caller is not "
+                             "in the edited source" % (name, focal, offset))
+                continue
             line_no = start + offset
-            text = lines[line_no - 1] if 0 < line_no <= len(lines) else "<past end of file>"
+            text = lines[line_no - 1] if 0 < line_no <= len(lines) else "<past end of source>"
             if token not in text:
-                stale.append("%s -> %s site +%d is file line %d, which reads %r"
+                stale.append("%s -> %s site +%d is source line %d, which reads %r"
                              % (name, focal, offset, line_no, text.strip()))
             elif callee is None and site.get("callee_unavailable") == "site_outside_caller":
                 stale.append("%s -> %s site +%d: Kin says its text lies outside the caller"
@@ -3613,11 +3719,12 @@ def check_19(suite):
     line is not a call any more; on the run that produced this ticket it read
     `kwargs.setdefault("cert", self.cert)`.
 
-    Graded against the file on disk after the commit, because that is the only
-    thing that can tell a re-anchored site from a remembered one. A row names
-    each site inside its caller, so `grade_sites_on_disk` places it in the file
-    through the caller's entity source, read by `get_entity_source` over the
-    same store, and reads the call there. A row that reports no site at all is not failed
+    Graded against the source on disk after the commit, because that is the only
+    thing that can tell a re-anchored site from a remembered one. A row places
+    its caller by module and names each site inside it, so `grade_sites_on_disk`
+    places the site in the written source through the caller's entity body, read
+    by `get_entity_source` over the same store, and reads the call there. A row
+    that reports no site at all is not failed
     here: an absent site is a different answer from a wrong one, and the payload
     already distinguishes them.
     """
@@ -3630,7 +3737,7 @@ def check_19(suite):
     if not lines:
         res.unknown("the edited fixture source could not be read back")
         return res
-    starts = evidence.get("after_caller_starts") or {}
+    bodies = evidence.get("after_caller_bodies") or {}
 
     graded = 0
     stale = []
@@ -3642,7 +3749,7 @@ def check_19(suite):
             res.unknown(unresolved)
             return res
         counted, wrong, unplaced = grade_sites_on_disk(
-            focal, payload, starts, lines, "pkg/sessions.py")
+            focal, payload, bodies, lines, MIXIN_CALLER_MODULE)
         graded += counted
         stale.extend(wrong)
         ungraded.extend(unplaced)
@@ -3650,11 +3757,11 @@ def check_19(suite):
         res.bad("%d of %d reported reference site(s) no longer carry the call: %s"
                 % (len(stale), graded, "; ".join(stale)))
     elif ungraded:
-        res.unknown("the sites of %d caller(s) could not be placed in the file, so not every "
-                    "reported site was graded: %s" % (len(ungraded), "; ".join(ungraded)))
+        res.unknown("the sites of %d caller(s) could not be placed in the written source, so "
+                    "not every reported site was graded: %s" % (len(ungraded), "; ".join(ungraded)))
     elif graded == 0:
-        res.unknown("no caller reported a reference site in pkg/sessions.py after the commit, "
-                    "so there is nothing to grade")
+        res.unknown("no caller placed in %s reported a reference site after the commit, "
+                    "so there is nothing to grade" % MIXIN_CALLER_MODULE)
     else:
         res.ok("all %d reported reference site(s) still carry the call they name" % graded)
     return res
@@ -4069,16 +4176,17 @@ def check_23(suite):
     expected_callers = [
         row for row in live_refs.get("references") or []
         if row.get("name") == "main"
-        and (projection_path(row) or "").endswith("pkg/cli.py")
+        and row_module(row) == RELIMPORT_CALLER_MODULE
         and "calls" in (row.get("relation_kinds") or [])
     ]
     if not expected_callers:
-        res.bad("find_references(%s, calls) did not return main projected into pkg/cli.py; "
+        res.bad("find_references(%s, calls) did not return main placed in %s; "
                 "the live edge precondition is absent. Rows: %r"
-                % (RELIMPORT_LIVE_FUNCTION, live_refs.get("references") or []))
+                % (RELIMPORT_LIVE_FUNCTION, RELIMPORT_CALLER_MODULE,
+                   live_refs.get("references") or []))
         return res
-    res.ok("graph truth contains %s and its incoming Calls edge from main, projected into pkg/cli.py"
-           % RELIMPORT_LIVE_FUNCTION)
+    res.ok("graph truth contains %s in %s and its incoming Calls edge from main in %s"
+           % (RELIMPORT_LIVE_FUNCTION, RELIMPORT_LIVE_MODULE, RELIMPORT_CALLER_MODULE))
 
     clean, listed = listed_rows(repo)
     if clean["rc"] != 0:
@@ -4304,7 +4412,7 @@ def check_24(suite):
     elif any("[named match]" in line for line in off_rows):
         res.unknown("the off-topic control named a symbol this fixture holds, so it is not "
                     "off-topic here: %s" % off[:300])
-    elif "answer floor" not in off_notes:
+    elif "answer floor" not in off_notes and "confirmed match" not in off_notes:
         res.bad("six confident-looking rows and nothing saying nothing matched: rows=%s "
                 "notes=%s" % (off[:300], off_notes[:200]))
     else:
@@ -4344,7 +4452,7 @@ def check_25(suite):
                       for name in ("daemon.pid", "daemon.port")]
     present = [path for path in endpoint_files if os.path.exists(path)]
     if present:
-        res.bad("init --no-enrich left a daemon endpoint before the offline retry: %s" %
+        res.bad("init --defer-enrich left a daemon endpoint before the offline retry: %s" %
                 ", ".join(present))
         return res
 

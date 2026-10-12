@@ -91,6 +91,61 @@ pub enum ReviewRequest {
     Show {
         review_id: String,
     },
+    /// A walkthrough: chapters of connected entities, each step with its text
+    /// before and after and what reaches it. Read-only.
+    ///
+    /// Of one recorded change by default. With `working`, of what the working
+    /// tree holds beyond the last recorded change. With `base`, of everything
+    /// `change` reaches that `base` does not.
+    Guide {
+        /// Any ref the history commands take. The workspace's current change
+        /// when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change: Option<String>,
+        #[serde(default)]
+        json: bool,
+        /// `#[serde(default)]` because this crosses the daemon wire and an
+        /// older peer sends none; it then walks a recorded change, as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        working: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+    },
+    /// One entity's own text at one recorded change, as JSON, for a reader of
+    /// a guide who opens something that reaches a step. Read-only.
+    GuideSource {
+        entity: String,
+        change: String,
+    },
+    /// The stored reviews of one change with their decisions and notes, as
+    /// JSON, for a reader of a guide after something was recorded. Read-only.
+    GuideReviews {
+        change: String,
+        /// Set for a range: the change it reads "before" at. Only reviews
+        /// whose base lands there are listed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range_base: Option<String>,
+    },
+    /// The changes that changed one entity, as JSON, for a reader of a guide
+    /// who asks how a step's entity got here. Read-only.
+    GuideHistory {
+        entity: String,
+        /// The change whose line of history is read. The current one when
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
+        /// A range's base, to mark which revisions belong to the range.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+    },
+    /// Where each reviewed change stands, as JSON, for a list of changes.
+    /// Read-only.
+    GuideStanding {},
+    /// How many entities the guide of each named change walks, as JSON, for
+    /// a list of changes that should say what each walk will. Read-only.
+    GuideCounts {
+        changes: Vec<String>,
+    },
 }
 
 /// A review id the store holds no review under.
@@ -259,6 +314,35 @@ pub async fn execute_review_request_with_source(
     repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
 ) -> Result<ReviewExecution> {
+    execute_review_request_with_authority(
+        &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+        request,
+        repository_authority,
+        source_scope,
+        None,
+    )
+    .await
+}
+
+/// [`execute_review_request_with_source`] for a server that already holds the
+/// repository's authority open at the publication the request reads.
+///
+/// `refs` is where every ref a read names is resolved. A daemon passes the
+/// authority it keeps for the current publication, so a guide, a history or a
+/// reviews read resolves `HEAD` or a branch without opening the store; a
+/// terminal command passes one pinned to its binding, which opens as it always
+/// did. `open_authority` is the open a guide of uncommitted work reads its diff
+/// from. Without one that request opens the authority for itself, as a
+/// terminal command does.
+pub async fn execute_review_request_with_authority(
+    refs: &super::repository_authority::RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    open_authority: Option<&super::repository_authority::ActiveRepositoryAuthority>,
+) -> Result<ReviewExecution> {
     let source = kin_mcp::handlers::review::AnalysisEscapeEvidence::new(
         graph,
         repository_authority,
@@ -276,7 +360,7 @@ pub async fn execute_review_request_with_source(
             details,
         } => Ok(ReviewExecution {
             response: build_review_run_response_with_source(
-                binding,
+                refs,
                 graph,
                 change,
                 entities,
@@ -298,7 +382,7 @@ pub async fn execute_review_request_with_source(
             json,
         } => Ok(ReviewExecution {
             response: build_shadow_run_response(
-                binding, graph, base, head, title, source_url, author, json,
+                refs, graph, base, head, title, source_url, author, json,
             )?,
             mutated: false,
         }),
@@ -314,6 +398,115 @@ pub async fn execute_review_request_with_source(
         ),
         ReviewRequest::List { state } => list_reviews_with_graph(graph, state),
         ReviewRequest::Show { review_id } => show_review_with_graph(graph, review_id),
+        ReviewRequest::Guide {
+            change,
+            json,
+            working,
+            base,
+        } => {
+            let guide = if working {
+                super::review_guide::build_working_guide(
+                    refs,
+                    graph,
+                    repository_authority,
+                    Some(&escape_evidence),
+                    open_authority,
+                )?
+            } else if let Some(base) = base.as_deref() {
+                super::review_guide::build_range_guide(
+                    refs,
+                    graph,
+                    base,
+                    change.as_deref(),
+                    repository_authority,
+                    Some(&escape_evidence),
+                )?
+            } else {
+                super::review_guide::build_guide(
+                    refs,
+                    graph,
+                    change.as_deref(),
+                    repository_authority,
+                    Some(&escape_evidence),
+                )?
+            };
+            let response = if json {
+                ReviewResponse {
+                    text: String::new(),
+                    json: Some(serde_json::to_string(&guide)?),
+                }
+            } else {
+                ReviewResponse {
+                    text: super::review_guide::guide_text(&guide),
+                    json: None,
+                }
+            };
+            Ok(ReviewExecution {
+                response,
+                mutated: false,
+            })
+        }
+        ReviewRequest::GuideStanding {} => Ok(ReviewExecution {
+            response: ReviewResponse {
+                text: String::new(),
+                json: Some(serde_json::to_string(
+                    &super::review_guide::standing_index(refs, graph)?,
+                )?),
+            },
+            mutated: false,
+        }),
+        ReviewRequest::GuideCounts { changes } => Ok(ReviewExecution {
+            response: ReviewResponse {
+                text: String::new(),
+                json: Some(serde_json::to_string(&super::review_guide::change_counts(
+                    graph,
+                    &changes,
+                    repository_authority,
+                )?)?),
+            },
+            mutated: false,
+        }),
+        ReviewRequest::GuideHistory { entity, at, since } => Ok(ReviewExecution {
+            response: ReviewResponse {
+                text: String::new(),
+                json: Some(serde_json::to_string(
+                    &super::review_guide::entity_history(
+                        refs,
+                        graph,
+                        &entity,
+                        at.as_deref(),
+                        since.as_deref(),
+                    )?,
+                )?),
+            },
+            mutated: false,
+        }),
+        ReviewRequest::GuideReviews { change, range_base } => {
+            let reviews =
+                super::review_guide::reviews_of_ref(refs, graph, &change, range_base.as_deref())?;
+            Ok(ReviewExecution {
+                response: ReviewResponse {
+                    text: String::new(),
+                    json: Some(serde_json::to_string(&reviews)?),
+                },
+                mutated: false,
+            })
+        }
+        ReviewRequest::GuideSource { entity, change } => {
+            let source = super::review_guide::entity_source_at(
+                graph,
+                &entity,
+                &change,
+                repository_authority,
+            )?;
+            Ok(ReviewExecution {
+                response: ReviewResponse {
+                    text: String::new(),
+                    json: Some(serde_json::to_string(&source)?),
+                },
+                mutated: false,
+            })
+        }
     }
 }
 
@@ -331,13 +524,22 @@ fn build_review_run_response(
     details: bool,
 ) -> Result<ReviewResponse> {
     build_review_run_response_with_source(
-        binding, graph, change, entities, files, changes, json, relations, details, None,
+        &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+        change,
+        entities,
+        files,
+        changes,
+        json,
+        relations,
+        details,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_review_run_response_with_source(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    refs: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     change: Option<String>,
     entities: Option<String>,
@@ -350,7 +552,7 @@ fn build_review_run_response_with_source(
 ) -> Result<ReviewResponse> {
     let mut detail_command = review_detail_command(&change, &entities, &files, &changes);
     let (review, file_hint, text_prefix, change_context) = compute_review_with_source(
-        binding,
+        refs,
         graph,
         change,
         entities,
@@ -670,7 +872,7 @@ struct ShadowReviewResponseJson<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_shadow_run_response(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    refs: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     base: String,
     head: String,
@@ -683,10 +885,12 @@ fn build_shadow_run_response(
     // already be present in graph authority through an explicit import, clone,
     // fetch, or native change transaction.
     let resolved_head =
-        crate::commands::ref_lookup::resolve_ref(graph, binding, Some(head.as_str()))
+        crate::commands::ref_lookup::resolve_ref_through(graph, refs, Some(head.as_str()))
+            .map(|resolved| resolved.change_id)
             .with_context(|| format!("resolve shadow head ref '{}'", head))?;
     let resolved_base =
-        crate::commands::ref_lookup::resolve_ref(graph, binding, Some(base.as_str()))
+        crate::commands::ref_lookup::resolve_ref_through(graph, refs, Some(base.as_str()))
+            .map(|resolved| resolved.change_id)
             .with_context(|| format!("resolve shadow base ref '{}'", base))?;
 
     let request = kin_review::ShadowRequest {
@@ -737,11 +941,19 @@ fn compute_review(
     String,
     Option<(kin_model::SemanticChangeId, kin_model::SemanticChange)>,
 )> {
-    compute_review_with_source(binding, graph, change, entities, files, changes, None)
+    compute_review_with_source(
+        &super::repository_authority::RequestRepositoryAuthority::pinned(binding.clone()),
+        graph,
+        change,
+        entities,
+        files,
+        changes,
+        None,
+    )
 }
 
 fn compute_review_with_source(
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
+    refs: &super::repository_authority::RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     change: Option<String>,
     entities: Option<String>,
@@ -836,18 +1048,18 @@ fn compute_review_with_source(
         ));
     }
 
+    // Any ref the history commands take: a whole change id, a prefix of one,
+    // a branch, a Git commit the import recorded, or its short form.
     let change_id = match change {
-        Some(h) => kin_model::SemanticChangeId::from_hash(
-            kin_model::Hash256::from_hex(&h).map_err(|e| anyhow::anyhow!("invalid hash: {}", e))?,
-        ),
-        None => crate::commands::repository_authority::ActiveRepositoryAuthority::open(binding)?
-            .current_change_id()?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "this workspace has no commits yet, so there is nothing to review; make one \
+        Some(reference) => {
+            super::review_guide::resolve_change(refs, graph, Some(reference.trim()))?
+        }
+        None => refs.open()?.current_change_id()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "this workspace has no commits yet, so there is nothing to review; make one \
                      with `kin commit`"
-                )
-            })?,
+            )
+        })?,
     };
 
     let semantic_change = graph
@@ -857,7 +1069,7 @@ fn compute_review_with_source(
     let mut text = String::new();
     writeln!(text, "Reviewing semantic change: {}", change_id)?;
     writeln!(text, "  Message: {}", semantic_change.message)?;
-    writeln!(text, "  Author: {}", semantic_change.author)?;
+    writeln!(text, "  Author: {}", semantic_change.author.name())?;
     writeln!(text)?;
 
     let review = if let Some(parent_id) = semantic_change.parents.first() {
@@ -929,7 +1141,7 @@ fn append_review_provenance(
         writeln!(
             text,
             "Author: {} {}",
-            semantic_change.author,
+            semantic_change.author.name(),
             if is_agent_change {
                 "(agent)"
             } else {
@@ -946,21 +1158,27 @@ fn append_review_provenance(
                         writeln!(
                             text,
                             "  + {} ({:?}) by {}",
-                            e.name, e.kind, semantic_change.author
+                            e.name,
+                            e.kind,
+                            semantic_change.author.name()
                         )?;
                     }
                     kin_model::EntityDelta::Modified { new, .. } => {
                         writeln!(
                             text,
                             "  ~ {} ({:?}) by {}",
-                            new.name, new.kind, semantic_change.author
+                            new.name,
+                            new.kind,
+                            semantic_change.author.name()
                         )?;
                     }
                     kin_model::EntityDelta::Removed { old } => {
                         writeln!(
                             text,
                             "  - {} ({:?}) by {}",
-                            old.name, old.kind, semantic_change.author
+                            old.name,
+                            old.kind,
+                            semantic_change.author.name()
                         )?;
                     }
                 }
@@ -973,7 +1191,8 @@ fn append_review_provenance(
             writeln!(
                 text,
                 "  Change {} by {} has NO human approval.",
-                change_id, semantic_change.author
+                change_id,
+                semantic_change.author.name()
             )?;
             for a in &approvals {
                 writeln!(
@@ -1552,7 +1771,13 @@ pub fn plan_review_mutation(
         ReviewRequest::Run { .. }
         | ReviewRequest::Shadow { .. }
         | ReviewRequest::List { .. }
-        | ReviewRequest::Show { .. } => {
+        | ReviewRequest::Show { .. }
+        | ReviewRequest::Guide { .. }
+        | ReviewRequest::GuideSource { .. }
+        | ReviewRequest::GuideReviews { .. }
+        | ReviewRequest::GuideHistory { .. }
+        | ReviewRequest::GuideStanding {}
+        | ReviewRequest::GuideCounts { .. } => {
             anyhow::bail!("this review request reads review state and writes nothing")
         }
     }
@@ -1695,6 +1920,114 @@ pub async fn show_review(review_id: String) -> Result<()> {
     Ok(())
 }
 
+/// What `kin review guide` and `kin review open` were asked to walk.
+///
+/// One spelling for both commands: a change, `--working`, or a range given
+/// either as `<base>..<head>` or as `--base` beside the head.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuideTarget {
+    pub change: Option<String>,
+    pub working: bool,
+    pub base: Option<String>,
+}
+
+impl GuideTarget {
+    /// Read the positional and the two flags into one target.
+    ///
+    /// Clap keeps `--working` apart from the other two. What it cannot check
+    /// is the shape of a range, or a range given twice.
+    pub fn parse(change: Option<String>, working: bool, base: Option<String>) -> Result<Self> {
+        let Some((range_base, range_head)) = change.as_deref().and_then(|c| c.split_once(".."))
+        else {
+            return Ok(Self {
+                change,
+                working,
+                base,
+            });
+        };
+        if base.is_some() {
+            anyhow::bail!("give the range as <base>..<head> or with --base, not both");
+        }
+        if range_base.is_empty() {
+            anyhow::bail!("a range is <base>..<head>, and the base is missing");
+        }
+        Ok(Self {
+            change: (!range_head.is_empty()).then(|| range_head.to_string()),
+            working,
+            base: Some(range_base.to_string()),
+        })
+    }
+}
+
+/// `kin review guide`: walk a change, uncommitted work or a range, as text or
+/// as its JSON.
+pub async fn guide(target: GuideTarget, json: bool) -> Result<()> {
+    // Uncommitted work is admitted before it is read, as `kin diff` admits it,
+    // so an edit made a moment ago is in the answer and not waiting on the
+    // watcher. A pass that cannot run is said, never silent.
+    let unmeasured = if target.working {
+        let layout = crate::commands::require_repository_layout()?;
+        admit_working_copy(&layout).await
+    } else {
+        None
+    };
+    let waiting = crate::screen::LiveLine::start_after(
+        crate::screen::Style::for_stdout(),
+        "Reading",
+        crate::commands::init::LIVE_LINE_DELAY,
+    );
+    if let Some(live) = &waiting {
+        crate::first_run::quiet_daemon_start();
+        live.note("walking the selected change");
+    }
+    let response = run_daemon_review(&ReviewRequest::Guide {
+        change: target.change,
+        json,
+        working: target.working,
+        base: target.base,
+    })
+    .await;
+    drop(waiting);
+    let mut response = response?;
+    if let Some(why) = unmeasured {
+        mark_unmeasured(&mut response, &why)?;
+    }
+    print_review_response(response);
+    Ok(())
+}
+
+/// Admit the working copy before a guide of uncommitted work reads it, and
+/// return why it could not be when it could not.
+pub(crate) async fn admit_working_copy(layout: &kin_core::KinLayout) -> Option<String> {
+    match crate::commands::status::admit_before_reading(layout).await {
+        crate::commands::status::StatusAdmission::Took(_) => None,
+        crate::commands::status::StatusAdmission::Skipped(why) => Some(why),
+    }
+}
+
+/// Say on a guide's answer that the working copy was not measured before it
+/// was read: in the JSON's `working_tree`, or as the text's second line.
+pub(crate) fn mark_unmeasured(response: &mut ReviewResponse, why: &str) -> Result<()> {
+    if let Some(json) = response.json.as_mut() {
+        let mut guide: serde_json::Value = serde_json::from_str(json)?;
+        if let Some(tree) = guide
+            .get_mut("working_tree")
+            .and_then(|tree| tree.as_object_mut())
+        {
+            tree.insert("unmeasured".to_string(), why.into());
+        }
+        *json = serde_json::to_string(&guide)?;
+    } else {
+        let line = format!(
+            "Not measured before this was read ({why}), so it may be a moment behind the \
+             working tree.\n"
+        );
+        let at = response.text.find('\n').map_or(0, |end| end + 1);
+        response.text.insert_str(at, &line);
+    }
+    Ok(())
+}
+
 fn show_review_with_graph(
     graph: &kin_db::InMemoryGraph,
     review_id: String,
@@ -1784,7 +2117,7 @@ fn show_review_with_graph(
     })
 }
 
-fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str {
+pub(super) fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str {
     use kin_review::InlineCommentKind;
 
     match kind {
@@ -1819,6 +2152,34 @@ mod tests {
             WorkspaceId::new(),
             Arc::new(LocalFileBackend::new(layout.kindb_dir())),
         )
+    }
+
+    #[test]
+    fn a_guide_target_reads_a_range_from_either_spelling() {
+        let parse = |change: Option<&str>, working, base: Option<&str>| {
+            GuideTarget::parse(
+                change.map(str::to_string),
+                working,
+                base.map(str::to_string),
+            )
+        };
+        assert_eq!(parse(None, false, None).unwrap(), GuideTarget::default());
+        assert_eq!(
+            parse(Some("main..feature"), false, None).unwrap(),
+            GuideTarget {
+                change: Some("feature".to_string()),
+                working: false,
+                base: Some("main".to_string()),
+            }
+        );
+        // No head after the dots means the current change, as `--base` alone does.
+        assert_eq!(
+            parse(Some("main.."), false, None).unwrap(),
+            parse(None, false, Some("main")).unwrap()
+        );
+        assert!(parse(None, true, None).unwrap().working);
+        assert!(parse(Some("..feature"), false, None).is_err());
+        assert!(parse(Some("main..feature"), false, Some("other")).is_err());
     }
 
     #[test]
@@ -2076,7 +2437,9 @@ mod tests {
         let binding = absent_binding(&layout);
 
         let error = build_shadow_run_response(
-            &binding,
+            &super::super::repository_authority::RequestRepositoryAuthority::pinned(
+                binding.clone(),
+            ),
             &graph,
             branch_a.clone(),
             branch_b.clone(),
@@ -2153,7 +2516,9 @@ mod tests {
         let binding = absent_binding(&layout);
 
         let response = build_shadow_run_response(
-            &binding,
+            &super::super::repository_authority::RequestRepositoryAuthority::pinned(
+                binding.clone(),
+            ),
             &graph,
             format!("kin:{base_id}"),
             format!("kin:{head_id}"),
@@ -2336,6 +2701,8 @@ mod tests {
         let old = spanned_entity("load_dotenv", "src/flask/cli.py");
         let mut new = old.clone();
         new.signature = "def load_dotenv(use_defaults=True)".into();
+        // A changed declaration is changed tokens, as a parse of it records.
+        new.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([2; 32]);
         let caller = spanned_entity("run", "src/flask/app.py");
         let others: Vec<kin_model::Entity> = (0..60)
             .map(|i| spanned_entity(&format!("view_{i}"), "src/flask/views.py"))

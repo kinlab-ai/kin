@@ -12,12 +12,24 @@ use crate::extract::{
     CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport,
     ImportedName, ParseOutput,
 };
+use crate::nested::{
+    local_scope_name, LocalScopeNames, NestedDefinitionCensus, UnadmittedNestedDefinition,
+};
+use crate::value_origins::cpp::{CppFileTypes, CppScopeReader};
 
 pub struct CppAdapter;
 
 impl LanguageAdapter for CppAdapter {
     fn language_id(&self) -> LanguageId {
         LanguageId::Cpp
+    }
+
+    /// A prototype: `declaration_signature` cuts a definition off at its
+    /// body, so a definition's stored signature ends at its parameter list
+    /// while a prototype keeps the `;` that ended its statement.
+    fn declares_only(&self, kind: EntityKind, signature: &str) -> bool {
+        matches!(kind, EntityKind::Function | EntityKind::Method)
+            && signature.trim_end().ends_with(';')
     }
 
     fn file_extensions(&self) -> &[&str] {
@@ -35,6 +47,14 @@ impl LanguageAdapter for CppAdapter {
             })
     }
 
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::cpp_declarations::census(tree, source, true))
+    }
+
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         let preprocessed = preprocess_cpp_source(source);
         let source = &preprocessed;
@@ -49,6 +69,8 @@ impl LanguageAdapter for CppAdapter {
         let mut relations = Vec::new();
         let mut imports = Vec::new();
         let root = tree.root_node();
+        let types = CppFileTypes::read(root, source);
+        let mut nested = CppNestedState::default();
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
@@ -56,11 +78,32 @@ impl LanguageAdapter for CppAdapter {
                 &child,
                 source,
                 file_id,
+                &types,
                 None,
                 Visibility::Public, // file-scope default
                 &mut entities,
                 &mut relations,
+                &mut nested,
             );
+        }
+
+        // Calls no callable's walk reached go to the innermost entity holding
+        // each one, such as a class whose member initializer calls. C++ has
+        // no file module entity, so a call at namespace scope that no
+        // declaration holds (a registration macro, most often) stays out.
+        {
+            let accounted = crate::call_owner::accounted_call_sites(&relations);
+            let mut swept = Vec::new();
+            let scope = receiver_scope(&root, source, "", None, &types);
+            collect_scoped_calls(
+                &root,
+                source,
+                "",
+                &scope,
+                &NestedCalls::default(),
+                &mut swept,
+            );
+            crate::call_owner::adopt_unowned_calls(&entities, &accounted, swept, &mut relations);
         }
 
         // Recursively extract all includes and ALL_CAPS macro usages across the whole file
@@ -100,6 +143,7 @@ impl LanguageAdapter for CppAdapter {
             tests,
             parse_state,
             parsed_call_sites: None,
+            nested_definitions: Some(nested.census),
         })
     }
 }
@@ -108,14 +152,17 @@ impl LanguageAdapter for CppAdapter {
 ///
 /// `class_ctx` carries the enclosing class/struct name when recursing into class bodies.
 /// `default_vis` carries the current access specifier context within a class body.
+#[allow(clippy::too_many_arguments)]
 fn extract_cpp_node(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
+    types: &CppFileTypes,
     class_ctx: Option<&str>,
     default_vis: Visibility,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    nested: &mut CppNestedState,
 ) {
     match node.kind() {
         "function_definition" => {
@@ -157,7 +204,10 @@ fn extract_cpp_node(
                     });
                 }
 
-                extract_calls_from_body(node, source, &qualified, relations);
+                extract_callable_body(
+                    node, source, file_id, types, &qualified, class_ctx, entities, relations,
+                    nested,
+                );
             }
         }
         "declaration" => {
@@ -202,14 +252,20 @@ fn extract_cpp_node(
             }
         }
         "class_specifier" => {
-            extract_class_or_struct(node, source, file_id, false, entities, relations);
+            extract_class_or_struct(
+                node, source, file_id, types, false, class_ctx, entities, relations, nested,
+            );
         }
         "struct_specifier" => {
-            extract_class_or_struct(node, source, file_id, true, entities, relations);
+            extract_class_or_struct(
+                node, source, file_id, types, true, class_ctx, entities, relations, nested,
+            );
         }
         // A union is modeled as a Class; its members default to public like a struct.
         "union_specifier" => {
-            extract_class_or_struct(node, source, file_id, true, entities, relations);
+            extract_class_or_struct(
+                node, source, file_id, types, true, class_ctx, entities, relations, nested,
+            );
         }
         "enum_specifier" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -256,10 +312,12 @@ fn extract_cpp_node(
                         &member,
                         source,
                         file_id,
+                        types,
                         None,
                         Visibility::Public,
                         entities,
                         relations,
+                        nested,
                     );
                 }
             }
@@ -329,10 +387,12 @@ fn extract_cpp_node(
                             &child,
                             source,
                             file_id,
+                            types,
                             class_ctx,
                             default_vis,
                             entities,
                             relations,
+                            nested,
                         );
                     }
                     _ => {}
@@ -361,10 +421,12 @@ fn extract_cpp_node(
                     &child,
                     source,
                     file_id,
+                    types,
                     class_ctx,
                     default_vis,
                     entities,
                     relations,
+                    nested,
                 );
             }
         }
@@ -428,13 +490,20 @@ fn extract_cpp_node(
 }
 
 /// Extract a class or struct specifier.
+///
+/// A class declared inside a class (`owner`) is named under it,
+/// `Point::Inner`, as its members are.
+#[allow(clippy::too_many_arguments)]
 fn extract_class_or_struct(
     node: &tree_sitter::Node,
     source: &[u8],
     file_id: &FilePathId,
+    types: &CppFileTypes,
     is_struct: bool,
+    owner: Option<&str>,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
+    nested: &mut CppNestedState,
 ) {
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
@@ -444,6 +513,10 @@ fn extract_class_or_struct(
     if name.is_empty() {
         return;
     }
+    let name = match owner {
+        Some(owner) => format!("{owner}::{name}"),
+        None => name,
+    };
 
     entities.push(ExtractedEntity {
         kind: EntityKind::Class,
@@ -487,8 +560,55 @@ fn extract_class_or_struct(
                         &member,
                         source,
                         file_id,
+                        types,
                         Some(&name),
                         current_vis,
+                        entities,
+                        relations,
+                        nested,
+                    );
+                }
+                "field_declaration" => {
+                    // A class, struct or union defined in the body is a
+                    // nested type of this one.
+                    if let Some(inner) = member.child_by_field_name("type").filter(|inner| {
+                        matches!(
+                            inner.kind(),
+                            "class_specifier" | "struct_specifier" | "union_specifier"
+                        ) && inner.child_by_field_name("body").is_some()
+                            && inner.child_by_field_name("name").is_some()
+                    }) {
+                        extract_class_or_struct(
+                            &inner,
+                            source,
+                            file_id,
+                            types,
+                            inner.kind() != "class_specifier",
+                            Some(&name),
+                            entities,
+                            relations,
+                            nested,
+                        );
+                        relations.push(ExtractedRelation {
+                            site: None,
+                            receiver: None,
+                            call_shape: None,
+                            kind: kin_model::RelationKind::Contains,
+                            src_name: name.clone(),
+                            dst_name: inner
+                                .child_by_field_name("name")
+                                .and_then(|inner_name| inner_name.utf8_text(source).ok())
+                                .map(|inner_name| format!("{name}::{inner_name}"))
+                                .unwrap_or_default(),
+                            import_source: None,
+                        });
+                    }
+                    extract_cpp_data_members(
+                        &member,
+                        &name,
+                        current_vis,
+                        source,
+                        file_id,
                         entities,
                         relations,
                     );
@@ -496,6 +616,81 @@ fn extract_class_or_struct(
                 _ => {}
             }
         }
+    }
+}
+
+/// The name a data member's declarator introduces: the field at the bottom
+/// of its pointer, reference and array declarators. `None` for a member
+/// function's declaration, whose chain holds a function declarator.
+fn cpp_data_member_name(declarator: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut current = *declarator;
+    for _ in 0..16 {
+        match current.kind() {
+            "function_declarator" => return None,
+            "field_identifier" | "identifier" => {
+                let text = current.utf8_text(source).ok()?.trim();
+                return (!text.is_empty()).then(|| text.to_string());
+            }
+            _ => {}
+        }
+        current = current
+            .child_by_field_name("declarator")
+            .or_else(|| current.named_child(0))?;
+    }
+    None
+}
+
+/// Every data member a `field_declaration` in a class body declares, as a
+/// field entity `Class::member` with the access the body gives it, contained
+/// by its class. A member function declared without a body and a nested
+/// type are not data members and stay out here.
+#[allow(clippy::too_many_arguments)]
+fn extract_cpp_data_members(
+    declaration: &tree_sitter::Node,
+    class: &str,
+    visibility: Visibility,
+    source: &[u8],
+    file_id: &FilePathId,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let declarators: Vec<tree_sitter::Node> = (0..declaration.child_count())
+        .filter_map(|index| {
+            let index = index.try_into().ok()?;
+            (declaration.field_name_for_child(index) == Some("declarator"))
+                .then(|| declaration.child(index))
+                .flatten()
+        })
+        .collect();
+    for declarator in &declarators {
+        let Some(member) = cpp_data_member_name(declarator, source) else {
+            continue;
+        };
+        let qualified = format!("{class}::{member}");
+        let spanned = if declarators.len() == 1 {
+            *declaration
+        } else {
+            *declarator
+        };
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Field,
+            name: qualified.clone(),
+            signature: node_signature(declaration, source),
+            visibility,
+            doc_summary: extract_preceding_comment(declaration, source),
+            fingerprint: compute_fingerprint(&spanned, source),
+            span: span_from_node(&spanned, file_id),
+            declaration_line: None,
+        });
+        relations.push(ExtractedRelation {
+            site: None,
+            receiver: None,
+            call_shape: None,
+            kind: kin_model::RelationKind::Contains,
+            src_name: class.to_string(),
+            dst_name: qualified,
+            import_source: None,
+        });
     }
 }
 
@@ -595,9 +790,15 @@ fn extract_name_from_declarator(node: &tree_sitter::Node, source: &[u8]) -> Opti
             }
             None
         }
-        "pointer_declarator" | "reference_declarator" => {
-            // Unwrap pointer/reference wrappers.
-            if let Some(inner) = node.child_by_field_name("declarator") {
+        "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => {
+            // Unwrap pointer/reference wrappers. A reference declarator and a
+            // parenthesized one hold their inner declarator as an unnamed
+            // child, so `Store& Registry::get()` and `void (*handler())(int)`
+            // name their functions too.
+            if let Some(inner) = node
+                .child_by_field_name("declarator")
+                .or_else(|| node.named_child(0))
+            {
                 return extract_name_from_declarator(&inner, source);
             }
             None
@@ -649,7 +850,7 @@ const MAX_DECLARATOR_DEPTH: usize = 16;
 /// function-pointer typedef is stored as `Handler` and not as the text of its
 /// declarator, which no query can reach.
 ///
-/// Deliberately separate from [`declarator_name`], which serves receiver-type
+/// Deliberately separate from the declarator reading in [`CppScopeReader`], which serves receiver-type
 /// mapping: that one stops at an `identifier` and skips function declarators, while a
 /// typedef's leaf is a `type_identifier` and its function-pointer form is exactly a
 /// function declarator. Widening the shared helper would change what
@@ -946,59 +1147,94 @@ fn strip_callee_template_args(raw: &str) -> String {
     out
 }
 
-/// Static receiver types visible inside one function/method body: local
-/// variables and parameters (`var_types`), the enclosing class name for a
-/// `this` receiver (`enclosing_class`), and the enclosing class's data members
-/// (`member_types`). A `recv.method()` / `recv->method()` whose receiver type
-/// resolves here is emitted as `Type::method`, so the linker binds it to that
-/// class instead of fanning the call out to every same-named method.
-#[derive(Default)]
-struct ReceiverScope {
+/// What a call written in one callable body can say about its receivers: the
+/// class `this` points at, and every name the body reads to one declared
+/// origin ([`CppScopeReader`]). A `recv.method()` / `recv->method()` whose
+/// receiver the file alone settles is emitted as `Type::method`, so the linker
+/// binds it to that class instead of fanning the call out to every same-named
+/// method. Every other call keeps the bare rightmost name, and the linker's
+/// ambiguous-fanout tier weighs those (see [`crate::value_origins::cpp`] for
+/// why a receiver only another file settles is not handed to the linker's
+/// value-origin tier).
+struct ReceiverScope<'a> {
     enclosing_class: Option<String>,
-    var_types: std::collections::HashMap<String, String>,
-    member_types: std::collections::HashMap<String, String>,
+    reader: CppScopeReader,
+    types: &'a CppFileTypes,
 }
 
-impl ReceiverScope {
-    fn owner_of(&self, receiver: &str) -> Option<&str> {
-        self.var_types
-            .get(receiver)
-            .or_else(|| self.member_types.get(receiver))
-            .map(String::as_str)
+/// The definitions admitted inside one callable body: the byte ranges whose
+/// calls belong to them rather than to the callable, and the local names a
+/// call reaches an admitted lambda through.
+#[derive(Default)]
+struct NestedCalls {
+    /// Bodies whose calls another entity owns.
+    skip: Vec<(usize, usize)>,
+    /// (name, visible from, visible until, entity name) of each admitted
+    /// lambda binding.
+    lambdas: Vec<(String, usize, usize, String)>,
+    /// The same for each admitted local class, which a receiver typed by
+    /// the class's plain name and a construction of it reach.
+    classes: Vec<(String, usize, usize, String)>,
+}
+
+impl NestedCalls {
+    fn skips(&self, node: &tree_sitter::Node) -> bool {
+        self.skip
+            .iter()
+            .any(|&(start, end)| node.start_byte() == start && node.end_byte() == end)
+    }
+
+    /// The admitted lambda a bare call spelling `name` at `at` reaches.
+    fn lambda_at(&self, name: &str, at: usize) -> Option<&str> {
+        visible(&self.lambdas, name, at)
+    }
+
+    /// The admitted local class a type spelled `name` at `at` names.
+    fn class_at(&self, name: &str, at: usize) -> Option<&str> {
+        visible(&self.classes, name, at)
     }
 }
 
-/// Walk a function/method body and emit its `call_expression` edges. A method
-/// call's receiver static type is resolved through the body's [`ReceiverScope`]
-/// so a typed receiver binds to `Type::method`; an unresolvable receiver keeps
-/// the bare rightmost name (the linker's ambiguous-fanout tier weighs those).
-fn extract_calls_from_body(
+fn visible<'a>(
+    bindings: &'a [(String, usize, usize, String)],
+    name: &str,
+    at: usize,
+) -> Option<&'a str> {
+    bindings
+        .iter()
+        .find(|(bound, from, until, _)| bound == name && *from <= at && at < *until)
+        .map(|(_, _, _, entity)| entity.as_str())
+}
+
+fn receiver_scope<'a>(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
-    relations: &mut Vec<ExtractedRelation>,
-) {
-    let mut scope = ReceiverScope {
+    class_ctx: Option<&str>,
+    types: &'a CppFileTypes,
+) -> ReceiverScope<'a> {
+    ReceiverScope {
         enclosing_class: context_name
             .rsplit_once("::")
             .map(|(owner, _)| owner.to_string()),
-        ..ReceiverScope::default()
-    };
-    collect_param_types(node, source, &mut scope.var_types);
-    collect_local_var_types(node, source, &mut scope.var_types);
-    collect_member_field_types(node, source, &mut scope.member_types);
-    collect_scoped_calls(node, source, context_name, &scope, relations);
+        reader: CppScopeReader::for_function(*node, source, class_ctx, context_name, types),
+        types,
+    }
 }
 
 fn collect_scoped_calls(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
-    scope: &ReceiverScope,
+    scope: &ReceiverScope<'_>,
+    nested: &NestedCalls,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if nested.skips(&child) {
+            continue;
+        }
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
                 let dst_name = if function.kind() == "field_expression" {
@@ -1009,11 +1245,29 @@ fn collect_scoped_calls(
                             .unwrap_or_default(),
                     );
                     match receiver_owner(&function, source, scope) {
-                        Some(owner) if is_valid_callee(&method) => format!("{owner}::{method}"),
+                        Some(owner) if is_valid_callee(&method) => {
+                            let owner = nested
+                                .class_at(&owner, function.start_byte())
+                                .map(str::to_string)
+                                .unwrap_or(owner);
+                            format!("{owner}::{method}")
+                        }
                         _ => method,
                     }
                 } else {
-                    strip_callee_template_args(function.utf8_text(source).unwrap_or(""))
+                    let spelled = function.utf8_text(source).unwrap_or("");
+                    let at = function.start_byte();
+                    match (function.kind() == "identifier")
+                        .then(|| {
+                            nested
+                                .lambda_at(spelled, at)
+                                .or_else(|| nested.class_at(spelled, at))
+                        })
+                        .flatten()
+                    {
+                        Some(entity) => entity.to_string(),
+                        None => strip_callee_template_args(spelled),
+                    }
                 };
                 if is_valid_callee(&dst_name) {
                     relations.push(ExtractedRelation {
@@ -1032,7 +1286,329 @@ fn collect_scoped_calls(
                 }
             }
         }
-        collect_scoped_calls(&child, source, context_name, scope, relations);
+        collect_scoped_calls(&child, source, context_name, scope, nested, relations);
+    }
+}
+
+/// Admit what a callable body defines, record what it declines, and extract
+/// the callable's own calls with the admitted bodies' calls moved onto them.
+///
+/// A class declared in the body becomes `F.<locals>.Local` with its member
+/// functions `F.<locals>.Local::m`, and a lambda bound once to a local
+/// becomes the function `F.<locals>.name`, which a bare call of that name
+/// inside its scope reaches (see [`crate::nested`]).
+#[allow(clippy::too_many_arguments)]
+fn extract_callable_body(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    types: &CppFileTypes,
+    context_name: &str,
+    class_ctx: Option<&str>,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    nested: &mut CppNestedState,
+) {
+    let plan = super::cpp_nested::plan(*node, source);
+    let mut calls = NestedCalls::default();
+    let mut lambdas = Vec::new();
+    for (lambda, expression) in &plan.lambdas {
+        let entity = local_scope_name(context_name, &lambda.name);
+        if !nested.names.claim(&entity) {
+            nested.decline(
+                &entity,
+                EntityKind::Function,
+                lambda.line,
+                context_name,
+                Vec::new(),
+            );
+            continue;
+        }
+        calls
+            .skip
+            .push((expression.start_byte(), expression.end_byte()));
+        calls.lambdas.push((
+            lambda.name.clone(),
+            lambda.visible_from,
+            lambda.end,
+            entity.clone(),
+        ));
+        lambdas.push((entity, lambda.clone(), *expression));
+    }
+    let mut classes = Vec::new();
+    for class in &plan.classes {
+        let Some(name) = class
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+        else {
+            continue;
+        };
+        let entity = local_scope_name(context_name, name);
+        let line = class.start_position().row as u32;
+        if !nested.names.claim(&entity) {
+            nested.decline(
+                &entity,
+                EntityKind::Class,
+                line,
+                context_name,
+                base_names(class, source),
+            );
+            continue;
+        }
+        calls.skip.push((class.start_byte(), class.end_byte()));
+        // A class is visible from its name to the end of its block.
+        let mut block = class.parent();
+        while let Some(holder) = block {
+            if holder.kind() == "compound_statement" {
+                break;
+            }
+            block = holder.parent();
+        }
+        let block_end = block.map_or(node.end_byte(), |block| block.end_byte());
+        calls.classes.push((
+            name.to_string(),
+            class.start_byte(),
+            block_end,
+            entity.clone(),
+        ));
+        classes.push((entity, name.to_string(), *class));
+    }
+    for (name, kind, line) in &plan.declined {
+        let entity = local_scope_name(context_name, name);
+        nested.decline(&entity, *kind, *line, context_name, Vec::new());
+    }
+
+    let scope = receiver_scope(node, source, context_name, class_ctx, types);
+    collect_scoped_calls(node, source, context_name, &scope, &calls, relations);
+
+    for (entity, lambda, expression) in lambdas {
+        let declaration = expression
+            .parent()
+            .and_then(|declarator| declarator.parent())
+            .filter(|declaration| {
+                (declaration.start_byte(), declaration.end_byte()) == lambda.declaration
+            })
+            .unwrap_or(expression);
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Function,
+            name: entity.clone(),
+            signature: node_signature(&declaration, source),
+            visibility: Visibility::Private,
+            doc_summary: extract_preceding_comment(&declaration, source),
+            fingerprint: compute_fingerprint(&declaration, source),
+            span: span_from_node(&declaration, file_id),
+            declaration_line: None,
+        });
+        // The lambda's own calls, typed by the enclosing callable's
+        // declarations: its parameters and captures are among them.
+        let mut own = NestedCalls {
+            skip: calls
+                .skip
+                .iter()
+                .copied()
+                .filter(|&range| range != (expression.start_byte(), expression.end_byte()))
+                .collect(),
+            lambdas: calls.lambdas.clone(),
+            classes: calls.classes.clone(),
+        };
+        own.skip.retain(|&(start, end)| {
+            start >= expression.start_byte() && end <= expression.end_byte()
+        });
+        collect_scoped_calls(&expression, source, &entity, &scope, &own, relations);
+    }
+
+    for (entity, plain, class) in classes {
+        entities.push(ExtractedEntity {
+            kind: EntityKind::Class,
+            name: entity.clone(),
+            signature: node_signature(&class, source),
+            visibility: Visibility::Private,
+            doc_summary: extract_preceding_comment(&class, source),
+            fingerprint: compute_fingerprint(&class, source),
+            span: span_from_node(&class, file_id),
+            declaration_line: None,
+        });
+        let mut cursor = class.walk();
+        for child in class.children(&mut cursor) {
+            if child.kind() == "base_class_clause" {
+                extract_base_classes(&child, source, &entity, relations);
+            }
+        }
+        let Some(body) = class.child_by_field_name("body") else {
+            continue;
+        };
+        let mut current_vis = if class.kind() == "class_specifier" {
+            Visibility::Private
+        } else {
+            Visibility::Public
+        };
+        let mut members = body.walk();
+        for member in body.children(&mut members) {
+            match member.kind() {
+                "access_specifier" => current_vis = parse_access_specifier(&member, source),
+                "function_definition" | "declaration" | "template_declaration" => {
+                    extract_local_member(
+                        &member,
+                        source,
+                        file_id,
+                        types,
+                        &entity,
+                        &plain,
+                        current_vis,
+                        entities,
+                        relations,
+                        nested,
+                    );
+                }
+                "field_declaration" => {
+                    // A class nested in the local class is declined.
+                    if let Some(inner) = member.child_by_field_name("type").filter(|ty| {
+                        matches!(
+                            ty.kind(),
+                            "class_specifier" | "struct_specifier" | "union_specifier"
+                        ) && ty.child_by_field_name("body").is_some()
+                    }) {
+                        if let Some(name) = inner
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(source).ok())
+                        {
+                            nested.decline(
+                                &format!("{entity}::{name}"),
+                                EntityKind::Class,
+                                inner.start_position().row as u32,
+                                &entity,
+                                base_names(&inner, source),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One member of an admitted local class. Its methods are named on the
+/// class's local-scope name and read their receivers against the class's
+/// plain name, which is how the file's type table knows it.
+#[allow(clippy::too_many_arguments)]
+fn extract_local_member(
+    member: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    types: &CppFileTypes,
+    class_entity: &str,
+    class_plain: &str,
+    visibility: Visibility,
+    entities: &mut Vec<ExtractedEntity>,
+    relations: &mut Vec<ExtractedRelation>,
+    nested: &mut CppNestedState,
+) {
+    match member.kind() {
+        "template_declaration" => {
+            let mut cursor = member.walk();
+            for child in member.children(&mut cursor) {
+                if matches!(child.kind(), "function_definition" | "declaration") {
+                    extract_local_member(
+                        &child,
+                        source,
+                        file_id,
+                        types,
+                        class_entity,
+                        class_plain,
+                        visibility,
+                        entities,
+                        relations,
+                        nested,
+                    );
+                }
+            }
+        }
+        "function_definition" | "declaration" => {
+            let name = if member.kind() == "function_definition" {
+                extract_function_name(member, source)
+            } else {
+                extract_declaration_function_name(member, source)
+            };
+            let Some(name) = name else {
+                return;
+            };
+            let qualified = format!("{class_entity}::{name}");
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Method,
+                name: qualified.clone(),
+                signature: node_signature(member, source),
+                visibility,
+                doc_summary: extract_preceding_comment(member, source),
+                fingerprint: compute_fingerprint(member, source),
+                span: span_from_node(member, file_id),
+                declaration_line: None,
+            });
+            relations.push(ExtractedRelation {
+                site: None,
+                receiver: None,
+                call_shape: None,
+                kind: kin_model::RelationKind::Contains,
+                src_name: class_entity.to_string(),
+                dst_name: qualified.clone(),
+                import_source: None,
+            });
+            if member.kind() == "function_definition" {
+                extract_callable_body(
+                    member,
+                    source,
+                    file_id,
+                    types,
+                    &qualified,
+                    Some(class_plain),
+                    entities,
+                    relations,
+                    nested,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The base classes a class specifier names, as written.
+fn base_names(class: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut relations = Vec::new();
+    let mut cursor = class.walk();
+    for child in class.children(&mut cursor) {
+        if child.kind() == "base_class_clause" {
+            extract_base_classes(&child, source, "", &mut relations);
+        }
+    }
+    relations
+        .into_iter()
+        .map(|relation| relation.dst_name)
+        .collect()
+}
+
+/// What the walk accumulates about definitions nested in callable bodies.
+#[derive(Default)]
+struct CppNestedState {
+    census: NestedDefinitionCensus,
+    names: LocalScopeNames,
+}
+
+impl CppNestedState {
+    fn decline(
+        &mut self,
+        name: &str,
+        kind: EntityKind,
+        line: u32,
+        enclosing: &str,
+        bases: Vec<String>,
+    ) {
+        self.census.record(UnadmittedNestedDefinition {
+            name: name.to_string(),
+            kind,
+            start_line: line,
+            enclosing: Some(enclosing.to_string()),
+            bases,
+        });
     }
 }
 
@@ -1080,158 +1656,22 @@ fn argument_is_pack_expansion(arg: &tree_sitter::Node, source: &[u8]) -> bool {
 }
 
 /// Resolve a `field_expression` receiver to a class name: `this` binds to the
-/// enclosing class; a bare identifier binds to its local/parameter type, then to
-/// an enclosing-class member's type. Any other receiver shape (chained access,
-/// call result, subscript) is left unresolved so the call keeps its bare name.
+/// enclosing class; a bare identifier binds to the class its declarations
+/// settle in this file (a parameter, a local, a field of the enclosing class).
+/// Any other receiver shape (chained access, call result, subscript) is left
+/// unresolved so the call keeps its bare name.
 fn receiver_owner(
     field_expr: &tree_sitter::Node,
     source: &[u8],
-    scope: &ReceiverScope,
+    scope: &ReceiverScope<'_>,
 ) -> Option<String> {
     let receiver = field_expr.child_by_field_name("argument")?;
     match receiver.kind() {
         "this" => scope.enclosing_class.clone(),
         "identifier" => scope
-            .owner_of(receiver.utf8_text(source).ok()?)
-            .map(str::to_string),
+            .reader
+            .class_of(receiver.utf8_text(source).ok()?, scope.types),
         _ => None,
-    }
-}
-
-/// Collect `name -> class type` for the parameters under a function declarator.
-fn collect_param_types(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    out: &mut std::collections::HashMap<String, String>,
-) {
-    if node.kind() == "parameter_list" {
-        let mut cursor = node.walk();
-        for param in node.children(&mut cursor) {
-            if matches!(
-                param.kind(),
-                "parameter_declaration" | "optional_parameter_declaration"
-            ) {
-                record_typed_declarators(&param, source, out);
-            }
-        }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_param_types(&child, source, out);
-    }
-}
-
-/// Collect `name -> class type` for every local `declaration` in a body.
-fn collect_local_var_types(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    out: &mut std::collections::HashMap<String, String>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "declaration" {
-            record_typed_declarators(&child, source, out);
-        }
-        collect_local_var_types(&child, source, out);
-    }
-}
-
-/// Collect `member -> class type` for the enclosing class's data members, found
-/// by walking up to the nearest class/struct/union and reading its field list.
-fn collect_member_field_types(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    out: &mut std::collections::HashMap<String, String>,
-) {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if matches!(
-            ancestor.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
-        ) {
-            if let Some(body) = ancestor.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for member in body.children(&mut cursor) {
-                    if member.kind() == "field_declaration" {
-                        record_typed_declarators(&member, source, out);
-                    }
-                }
-            }
-            return;
-        }
-        current = ancestor.parent();
-    }
-}
-
-/// Map each of a declaration's named declarators to its class type. Function
-/// declarators (method prototypes) carry no receiver type and are skipped, as
-/// are non-class types (`int`, `auto`, ...).
-fn record_typed_declarators(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    out: &mut std::collections::HashMap<String, String>,
-) {
-    let Some(class_type) = node
-        .child_by_field_name("type")
-        .and_then(|t| type_class_name(&t, source))
-    else {
-        return;
-    };
-    let mut cursor = node.walk();
-    for declarator in node.children_by_field_name("declarator", &mut cursor) {
-        if declarator_is_function(&declarator) {
-            continue;
-        }
-        if let Some(name) = declarator_name(&declarator, source) {
-            out.entry(name).or_insert_with(|| class_type.clone());
-        }
-    }
-}
-
-/// Reduce a `type` node to the bare class name usable as an entity key: a plain
-/// or template type yields its identifier, a qualified type its leaf; primitive
-/// and inferred (`auto`) types yield nothing.
-fn type_class_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "type_identifier" | "identifier" => node.utf8_text(source).ok().map(str::to_string),
-        "template_type" | "qualified_identifier" => node
-            .child_by_field_name("name")
-            .and_then(|n| type_class_name(&n, source)),
-        _ => None,
-    }
-}
-
-/// Descend a declarator through pointer/reference/array/init wrappers to the
-/// declared identifier.
-fn declarator_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" | "field_identifier" => node.utf8_text(source).ok().map(str::to_string),
-        "pointer_declarator" | "array_declarator" | "init_declarator" => node
-            .child_by_field_name("declarator")
-            .and_then(|c| declarator_name(&c, source)),
-        "reference_declarator" | "parenthesized_declarator" => node
-            .named_child(0)
-            .and_then(|c| declarator_name(&c, source)),
-        _ => None,
-    }
-}
-
-/// Whether a declarator declares a function (a method prototype), which has no
-/// receiver type to record.
-fn declarator_is_function(node: &tree_sitter::Node) -> bool {
-    match node.kind() {
-        "function_declarator" => true,
-        "pointer_declarator"
-        | "reference_declarator"
-        | "init_declarator"
-        | "array_declarator"
-        | "parenthesized_declarator" => node
-            .child_by_field_name("declarator")
-            .or_else(|| node.named_child(0))
-            .map(|c| declarator_is_function(&c))
-            .unwrap_or(false),
-        _ => false,
     }
 }
 
@@ -2412,7 +2852,7 @@ static void onCleanup(void *p) { (void)p; }
 /// macro's definition/invocation sites, not as first-class entities. Only
 /// namespace-shaping macros are rewritten below, because they otherwise
 /// break the surrounding — real — declarations' extraction.
-fn preprocess_cpp_source(source: &[u8]) -> Vec<u8> {
+pub(crate) fn preprocess_cpp_source(source: &[u8]) -> Vec<u8> {
     let mut s = source.to_vec();
     replace_namespace_macros(&mut s);
     s

@@ -24,6 +24,8 @@ def wire(page):
 
 
 def pages():
+    # Each partial page carries the answer's own verdict and says it is partial
+    # in its page-scoped completeness.
     shell = {
         "references": [], "next_cursor": None,
         "negative": {"safe_to_conclude_absent": False},
@@ -31,7 +33,9 @@ def pages():
             "page": {"version": 1, "kind": "references", "complete": False,
                      "total_references": 2},
             "verdict": {"state": "inconclusive", "safe_to_conclude_absent": False,
-                        "limiting_factor": "reference_page_partial"},
+                        "limiting_factor": "call_sites_owed"},
+            "completeness": {"status": "partial", "bound": "at_least",
+                             "limits": ["reference_page_partial"]},
         },
     }
     first, last = copy.deepcopy(shell), copy.deepcopy(shell)
@@ -75,13 +79,25 @@ class PagedVerdictLimits(unittest.TestCase):
         result = grade(answer)
         self.assertEqual(result.status, verdict_limits.PASS, result.detail)
 
-    def test_each_page_must_name_its_partial_reason_and_refuse_absence(self):
+    def test_each_page_must_carry_the_answers_verdict_say_it_is_partial_and_refuse_absence(self):
         for index in (0, 1):
-            for factor in (None, "", "call_sites_owed", "reference_page_partial; call_sites_owed"):
+            for factor in (None, "", "reference_page_partial",
+                           "reference_page_partial; call_sites_owed", "other_gap"):
                 with self.subTest(index=index, factor=factor):
                     sequence = pages()
                     sequence[index]["_kin"]["verdict"]["limiting_factor"] = factor
                     self.assertEqual(grade(assemble(sequence)).status, verdict_limits.FAIL)
+            with self.subTest(index=index, state="certified"):
+                sequence = pages()
+                sequence[index]["_kin"]["verdict"]["state"] = "certified"
+                self.assertEqual(grade(assemble(sequence)).status, verdict_limits.FAIL)
+            for completeness in ({"status": "partial", "limits": []},
+                                 {"status": "complete", "limits": ["reference_page_partial"]}):
+                with self.subTest(index=index, completeness=completeness):
+                    sequence = pages()
+                    sequence[index]["_kin"]["completeness"] = completeness
+                    with self.assertRaisesRegex(ValueError, "does not say it is partial"):
+                        assemble(sequence)
             for section in ("negative", "verdict"):
                 sequence = pages()
                 target = sequence[index] if section == "negative" else sequence[index]["_kin"]

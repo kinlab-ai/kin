@@ -16,7 +16,7 @@
 //! for it.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serial_test::serial;
@@ -96,6 +96,28 @@ fn kin_command(runtime: &common::IsolatedDaemonRuntime) -> Command<'_> {
     command
 }
 
+fn initialize_deferred_store(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> PathBuf {
+    let init = kin_command(runtime)
+        .args(["init", ".", "--json"])
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .current_dir(repo)
+        .output()
+        .expect("run kin init");
+    assert!(
+        init.status.success(),
+        "kin init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&init.stdout).expect("kin init reports JSON");
+    PathBuf::from(
+        report["kin_dir"]
+            .as_str()
+            .expect("init reports its control directory"),
+    )
+}
+
 /// Daemon logs carry ANSI colour, and an escape sequence can sit between a field
 /// name and its value, so a raw byte search for a phrase can miss text that is
 /// plainly there.
@@ -148,18 +170,7 @@ fn a_cli_spawned_daemon_honours_the_background_embed_opt_out() {
 
     // Every command in this flow carries the opt-out, so whichever one ends up
     // starting the daemon delivers it.
-    let init = kin_command(&runtime)
-        .args(["init", "."])
-        .env("KIN_DAEMON_AUTO_EMBED", "0")
-        .current_dir(repo.path())
-        .output()
-        .expect("run kin init");
-    assert!(
-        init.status.success(),
-        "kin init failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&init.stdout),
-        String::from_utf8_lossy(&init.stderr)
-    );
+    let kin_root = initialize_deferred_store(&runtime, repo.path());
 
     let status = kin_command(&runtime)
         .args(["graph", "status"])
@@ -174,7 +185,7 @@ fn a_cli_spawned_daemon_honours_the_background_embed_opt_out() {
         String::from_utf8_lossy(&status.stderr)
     );
 
-    let log = wait_for_embedding_decision(&repo.path().join(".kin"));
+    let log = wait_for_embedding_decision(&kin_root);
     assert!(
         log.contains(WORKER_REACHED_THE_DECISION),
         "the embedding worker never reached its decision, so nothing below is about the \
@@ -210,22 +221,19 @@ fn attaching_to_a_daemon_that_fixed_this_lever_first_says_so() {
     let runtime = common::IsolatedDaemonRuntime::new(repo.path());
     seed_repository(repo.path());
 
-    for arguments in [["init", "."], ["graph", "status"]] {
-        let output = kin_command(&runtime)
-            .args(arguments)
-            .env("KIN_DAEMON_AUTO_EMBED", "0")
-            .current_dir(repo.path())
-            .output()
-            .unwrap_or_else(|error| panic!("run kin {arguments:?}: {error}"));
-        assert!(
-            output.status.success(),
-            "kin {arguments:?} failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let kin_root = repo.path().join(".kin");
+    let kin_root = initialize_deferred_store(&runtime, repo.path());
+    let output = kin_command(&runtime)
+        .args(["graph", "status"])
+        .env("KIN_DAEMON_AUTO_EMBED", "0")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin graph status");
+    assert!(
+        output.status.success(),
+        "kin graph status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let log = wait_for_embedding_decision(&kin_root);
     assert!(
         log.contains(DEFERRED),

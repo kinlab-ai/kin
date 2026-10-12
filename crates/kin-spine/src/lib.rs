@@ -14,6 +14,7 @@
 pub mod backend;
 pub mod federation;
 pub mod firestore;
+pub mod graph_facts;
 pub mod index;
 pub mod publication;
 pub mod query;
@@ -39,6 +40,7 @@ pub use federation::{federated_impact, FederatedEdge, FederatedImpact, Federated
 #[cfg(feature = "firestore")]
 pub use firestore::FirestoreStore;
 pub use firestore::{FirestoreEndpoint, FirestoreSpineBackend, TransientRetryGate};
+pub use graph_facts::{language_can_reference, RepoGraphFacts, DERIVED_MEMBER_EDGE_CONFIDENCE};
 pub use index::{
     AuthorityRootState, CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex,
     SpineXrefAuthorityAnchor, SpineXrefDecodeError, SpineXrefResponse,

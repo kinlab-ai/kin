@@ -54,11 +54,23 @@ pub const VERDICT_KEY: &str = "verdict";
 const CERTIFIED: &str = "certified";
 const INCONCLUSIVE: &str = "inconclusive";
 const NOT_APPLICABLE: &str = "not_applicable";
+/// The state of an answer that is complete except a residue it lists or
+/// counts in full: every clause that refused is one of
+/// [`kin_model::call_site_reading::RESIDUE_CODES`]. Its rows are proven, and
+/// the only sites that could add to them are the ones the answer names, so a
+/// reader checks those rather than distrusting the whole answer. It never
+/// licenses an absence: `safe_to_conclude_absent` stays false.
+pub const CERTIFIED_EXCEPT: &str = "certified_except";
 
 /// Machine-stable label recorded in `_kin.completeness.limits` when the single
 /// verdict, rather than this answer's own substrate reading, is what stopped the
 /// counts being called whole.
 const VERDICT_LIMIT: &str = "verdict_inconclusive";
+
+/// The label recorded in `_kin.completeness.limits` when the counts are not
+/// whole only because of a residue the answer lists: a floor with a known,
+/// named remainder rather than an unknown one.
+const VERDICT_EXCEPT_LIMIT: &str = "verdict_certified_except";
 
 /// What separates two clauses when the factor is rendered as one sentence.
 ///
@@ -118,8 +130,12 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "A call site in the answer's scope calls through a value binding, which proves no target, so where that call goes is not known.",
     },
     ClauseCode {
+        code: "body_unverified",
+        meaning: "This entity records no source digest, so the served span could not be checked against the bytes it was cut from.",
+    },
+    ClauseCode {
         code: "call_sites_not_in_build",
-        meaning: "A call site in the answer's scope sits in a file no build of the repository compiles, so no resolver proved where that call goes.",
+        meaning: "A call site in the answer's scope sits in a source unit no build of the repository compiles, so no resolver proved where that call goes.",
     },
     ClauseCode {
         code: "call_sites_owed",
@@ -143,11 +159,15 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "caller_arrival_unmeasured",
-        meaning: "The set of files that can reach the focal could not be established, because the language links no imports across files in this graph.",
+        meaning: "The set of modules that can reach the focal could not be established, because the language links no imports between modules in this graph.",
     },
     ClauseCode {
         code: "caller_arrival_unresolved",
-        meaning: "Some files that can reach the focal have callers the graph did not resolve, so the reference list is a floor.",
+        meaning: "Some modules that can reach the focal have callers the graph did not resolve, so the reference list is a floor.",
+    },
+    ClauseCode {
+        code: "constructor_dispatch_unlisted",
+        meaning: "Every call that spells the constructor's call names is proven or listed, and a constructor also runs when code constructs a subclass that defines no constructor of its own, or constructs through `cls`, `type(self)` or `self.__class__`, none of which spells those names, so such constructions are not in the answer.",
     },
     ClauseCode {
         code: "counts_are_a_floor",
@@ -175,7 +195,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "cross_file_edges_absent",
-        meaning: "The graph was not observed to hold cross-file edges of a requested class for the language, so a use reaching the target through that class could not have been found; the gap is in extraction or enrichment rather than in the code, and the classes that are present do not stand in for it.",
+        meaning: "The graph was not observed to hold edges of a requested class between modules for the language, so a use reaching the target through that class could not have been found; the gap is in extraction or enrichment rather than in the code, and the classes that are present do not stand in for it.",
     },
     ClauseCode {
         code: "cross_file_edges_unproduced",
@@ -206,6 +226,22 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "A configured cross-repo spine could not answer and named no condition.",
     },
     ClauseCode {
+        code: "declaration_census_unmeasured",
+        meaning: "Some source unit the name search covers carries no current declaration census, so a declaration the extractor did not admit there could match the query and is not listed.",
+    },
+    ClauseCode {
+        code: "declarations_unadmitted_listed",
+        meaning: "Declarations the grammar shows that extraction did not admit could match the name search, and each is listed, so the rows are complete except those.",
+    },
+    ClauseCode {
+        code: "declarations_unparsed_files_listed",
+        meaning: "Source units the name search covers are held as bytes and were never parsed, and each is listed, so the rows are complete except what those units declare.",
+    },
+    ClauseCode {
+        code: "decorator_dispatch_listed",
+        meaning: "The method could run without a call that spells its name only through the decorators it is declared under, each of which receives it and returns what a call spelling its name runs; the answer lists every one in `call_sites.dispatch_decorators`, so it is complete except what those decorators do with it.",
+    },
+    ClauseCode {
         code: "degraded",
         meaning: "The daemon reported a degraded signal; `_kin.degraded` names which.",
     },
@@ -233,11 +269,11 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "edge_coverage_unknown",
-        meaning: "Whether the graph holds cross-file edges of a requested class for the language could not be established.",
+        meaning: "Whether the graph holds edges of a requested class between modules for the language could not be established.",
     },
     ClauseCode {
         code: "edge_coverage_unreported",
-        meaning: "The answer did not report whether the graph holds the cross-file edges it depends on.",
+        meaning: "The answer did not report whether the graph holds the edges between modules it depends on.",
     },
     ClauseCode {
         code: "enrichment_incomplete",
@@ -245,7 +281,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "enrichment_metadata_unavailable",
-        meaning: "Selected graph enrichment detail exceeded its bounded metadata scan. Aggregate counters remain observations, but the unavailable file inventory cannot attest dependency completion or absence.",
+        meaning: "Selected graph enrichment detail exceeded its bounded metadata scan. Aggregate counters remain observations, but the unavailable source inventory cannot attest dependency completion or absence.",
     },
     ClauseCode {
         code: "entity_index_unresolved",
@@ -253,27 +289,31 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "enumeration_shifted",
-        meaning: "The file gained or lost entities between pages, so the pages do not assemble into one state; walk again from the start.",
+        meaning: "The source unit gained or lost entities between pages, so the pages do not assemble into one state; walk again from the start.",
+    },
+    ClauseCode {
+        code: "escape_residue_listed",
+        meaning: "The focal can be reached without a call that spells its call names through sites the escape census lists: uses that hold it as a value, implicit calls, lookups whose recorded key or text could spell its name, protocol dispatch or unparsed regions, so the answer is complete except those listed sites.",
     },
     ClauseCode {
         code: "file_bytes_unadmitted",
-        meaning: "The working copy holds content at this path that graph truth does not carry, so the spans describe earlier bytes; `kin admit` takes the working tree.",
+        meaning: "The working copy holds content for this source unit that graph truth does not carry, so the spans describe earlier bytes; `kin admit` takes the working tree.",
     },
     ClauseCode {
         code: "file_bytes_unchecked",
-        meaning: "This repository has a working copy the graph is supposed to be level with and nothing is comparing them, so whether the answer describes the file as it is now is not known.",
+        meaning: "This repository has a working copy the graph is supposed to be level with and nothing is comparing them, so whether the answer describes the source unit as it is now is not known.",
     },
     ClauseCode {
         code: "file_coverage_unreported",
-        meaning: "The answer did not report whether a language adapter parsed the file.",
+        meaning: "The answer did not report whether a language adapter parsed the source unit.",
     },
     ClauseCode {
         code: "file_not_parsed",
-        meaning: "No language adapter produced a layout for the file, so an empty enumeration is a fact about extraction coverage, not the file.",
+        meaning: "No language adapter produced a layout for the source unit, so an empty enumeration is a fact about extraction coverage, not about the code.",
     },
     ClauseCode {
         code: "file_parse_failed",
-        meaning: "The adapter could not parse the file, so the entities the graph still carries for it describe an earlier state.",
+        meaning: "The adapter could not parse the source unit, so the entities the graph still carries for it describe an earlier state.",
     },
     ClauseCode {
         code: "file_parse_state_unknown",
@@ -281,15 +321,15 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "file_parse_unrecorded",
-        meaning: "The graph holds entities for the file and no record of how completely they were extracted, so the rows are real and their being the whole set is unestablished.",
+        meaning: "The graph holds entities for the source unit and no record of how completely they were extracted, so the rows are real and their being the whole set is unestablished.",
     },
     ClauseCode {
         code: "file_parsed_partially",
-        meaning: "The adapter hit parse errors in the file, so its entities are a floor.",
+        meaning: "The adapter hit parse errors in the source unit, so its entities are a floor.",
     },
     ClauseCode {
         code: "file_spans_stale",
-        meaning: "Some entity spans in the file were derived from bytes the repository tree no longer holds at this path.",
+        meaning: "Some entity spans in the source unit were derived from bytes the repository tree no longer holds for it.",
     },
     ClauseCode {
         code: "focal_not_in_graph",
@@ -302,6 +342,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     ClauseCode {
         code: "focal_resolution_unreported",
         meaning: "The answer did not report how many entities the focal could have resolved to, so it may describe a same-named sibling.",
+    },
+    ClauseCode {
+        code: "generator_source_unavailable",
+        meaning: "This derived member's generator source could not be read, so what it was generated from is not shown.",
     },
     ClauseCode {
         code: "graph_admission_unrecorded",
@@ -324,8 +368,16 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "The daemon has not confirmed its first reconciliation or snapshot load.",
     },
     ClauseCode {
+        code: "history_partial",
+        meaning: "The store admitted only its checked-out commit, so an answer that reads its history is missing every earlier revision; `_kin.partial_history` says how far the history derivation got.",
+    },
+    ClauseCode {
         code: "history_predates_upgrade",
         meaning: "The answer reads the store's history, and history recorded before its last `kin upgrade` keeps the replay version that authored it and carries no checked binding history.",
+    },
+    ClauseCode {
+        code: "impact_page_partial",
+        meaning: "This page contains only part of an impact answer; reconstruct every page and retain the original safety readings before assessing the complete result.",
     },
     ClauseCode {
         code: "lexical_fallback_matched_nothing",
@@ -344,12 +396,40 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "Prior-local binding evidence could not be validated for the checked scope; complete dependency knowledge is unproven.",
     },
     ClauseCode {
+        code: "local_binding_unrelated",
+        meaning: "Outstanding local-name bindings in the answer's scope sit outside every entity it lists and spell none of their names; they are counted beside the answer, which is complete except them and never an absence.",
+    },
+    ClauseCode {
+        code: "locate_page_partial",
+        meaning: "This page contains only part of a ranking page; reconstruct every page and retain the original safety readings before assessing the complete result, then follow the ranking's own next_cursor for the rows after it.",
+    },
+    ClauseCode {
+        code: MATCHED_BY_NAME,
+        meaning: "These rows name the entity in their text, and Kin has not resolved what they use it for; a name built while code runs, or a pattern, is not followed.",
+    },
+    ClauseCode {
         code: "method_call_resolution_incomplete",
         meaning: "Receiver-method calls are linked by bare name and may be unresolved, so an empty result is not authoritative for a method.",
     },
     ClauseCode {
+        code: "model_filtered",
+        meaning: "A model stage withheld graph candidates; its scores cannot certify repository absence.",
+    },
+    ClauseCode {
+        code: "model_observation_invalid",
+        meaning: "The answer supplied invalid model-stage evidence, so repository absence is not certified.",
+    },
+    ClauseCode {
         code: "name_filter_narrowed_to_zero",
         meaning: "The name pattern selects declarations and the query's other filters removed every one of them.",
+    },
+    ClauseCode {
+        code: "named_leftovers",
+        meaning: "Call sites whose callee or caller body spells the focal's call name are not proven, and the answer lists every one by caller and line beside its rows, so it is complete except those sites.",
+    },
+    ClauseCode {
+        code: "none_of_these",
+        meaning: "The candidate scorer rated no candidate at or above its calibrated threshold and the query named none of them, so the rows are leads rather than an answer.",
     },
     ClauseCode {
         code: "offline_fallback",
@@ -357,7 +437,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "page_bounded",
-        meaning: "The response holds one page of the file; follow `next_cursor` to the end before reading the set as whole.",
+        meaning: "The response holds one page of the enumeration; follow `next_cursor` to the end before reading the set as whole.",
     },
     ClauseCode {
         code: "proof_context_stale",
@@ -372,6 +452,10 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
         meaning: "A ranking is a bounded candidate set, so a name absent from it may belong to an entity the query never ranked.",
     },
     ClauseCode {
+        code: "reference_completion_unmeasured",
+        meaning: "Completion of requested non-call relations is unmeasured: the escape census took no reading of the focal's non-call uses, or took it over records that predate it or regions no record covers, so the Call census cannot certify this set.",
+    },
+    ClauseCode {
         code: "reference_enrichment_no_language_server",
         meaning: "An adapter is wired for the language but no language server for it is installed on this host.",
     },
@@ -381,15 +465,27 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "reference_enrichment_unsupported",
-        meaning: "This build cannot link cross-file references for the language, so an unused symbol cannot be told from an unlinked one.",
+        meaning: "This build cannot link references between modules for the language, so an unused symbol cannot be told from an unlinked one.",
     },
     ClauseCode {
         code: "reference_enrichment_unusable",
-        meaning: "A language server for the selected language failed to initialize, so reference-enrichment capability is unavailable.",
+        meaning: "A language server for the selected language could not start, so reference-enrichment capability is unavailable. The clause names why, as does `edge_coverage.reference_enrichment_reason`.",
+    },
+    ClauseCode {
+        code: "reference_mentions_unmatched",
+        meaning: "Non-call reads of the focal's name that could read it have no stored row of a requested kind, and the answer lists every one in `focal_escape.residue.mentions.unmatched`, so it is complete except those reads.",
     },
     ClauseCode {
         code: "reference_page_partial",
         meaning: "This page contains only part of a reference answer; reconstruct every page and retain the original safety readings before assessing the complete result.",
+    },
+    ClauseCode {
+        code: "reference_sites_undecided",
+        meaning: "Reference sites a language server left undecided on repeated passes over unchanged code are served as references that nothing proves, and the answer counts them in `undecided_reference_sites` without listing every one, so usages there may be missing.",
+    },
+    ClauseCode {
+        code: "reference_sites_undecided_listed",
+        meaning: "Reference sites a language server left undecided on repeated passes over unchanged code are served as references that nothing proves, and the answer lists every one with its caller and line in `undecided_reference_sites.sites`, so it is complete except those sites.",
     },
     ClauseCode {
         code: "relevance_floor_unmeasured",
@@ -466,15 +562,23 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "tracked_changes_unadmitted",
-        meaning: "Tracked files changed or removed while no daemon was watching are not admitted yet, so the answer may describe bytes the working copy no longer holds; the daemon's catch-up takes them on its own, and `kin admit` takes them now.",
+        meaning: "Tracked source changed or removed while no daemon was watching is not admitted yet, so the answer may describe bytes the working copy no longer holds; the daemon's catch-up takes it on its own, and `kin admit` takes it now.",
     },
     ClauseCode {
         code: "tracked_changes_unchecked",
-        meaning: "The daemon could not check whether tracked files changed while no daemon was watching, so the answer may describe bytes the working copy no longer holds; `kin admit` settles it.",
+        meaning: "The daemon could not check whether tracked source changed while no daemon was watching, so the answer may describe bytes the working copy no longer holds; `kin admit` settles it.",
+    },
+    ClauseCode {
+        code: "unkeyed_lookups_counted",
+        meaning: "Lookups by a name computed at run time could reach the focal only as they could reach anything their receiver holds: no record says anything about the name they look up and none spells a call name, which every reader that does not run the program shares as a blind spot, so the answer counts them in `focal_escape.residue.unkeyed_lookups` rather than listing them as sites to check. It never licenses an absence.",
     },
     ClauseCode {
         code: "unlisted_clause",
         meaning: "A reason this build carries no code for. The blocks the verdict's `inputs` name hold its facts. Seeing it is a Kin defect.",
+    },
+    ClauseCode {
+        code: "value_calls_unmeasured",
+        meaning: "Unsettled call sites that never spell the focal's call name could reach it only if it is held as a value or looked up by a computed name, and the escape census could not rule that out, so the answer counts them once with the census reason.",
     },
     ClauseCode {
         code: "walk_bounded",
@@ -486,7 +590,7 @@ pub const CLAUSE_CODES: &[ClauseCode] = &[
     },
     ClauseCode {
         code: "watcher_events_lost",
-        meaning: "The filesystem watcher lost events no admission has covered; a running daemon retries a full admission, and `kin admit` runs it now.",
+        meaning: "The working-copy watcher lost change events no admission has covered; a running daemon retries a full admission, and `kin admit` runs it now.",
     },
     ClauseCode {
         code: "watcher_loss_unreadable",
@@ -539,6 +643,35 @@ fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
         }
     }
     (!codes.is_empty()).then(|| codes.join(CLAUSE_SEPARATOR))
+}
+
+/// Codes for gaps an answer counts beside itself rather than lists: kinds of
+/// place that never held an answer unit, so they are not part of the answer's
+/// uncertainty. Like a listed residue they leave the answer complete except
+/// them and never license an absence.
+pub(crate) const FOLDED_CODES: [&str; 1] = [LOCAL_BINDING_UNRELATED];
+
+/// The code [`crate::source_derivation`] writes when every outstanding
+/// binding obligation in scope is shown unrelated to the answer.
+pub(crate) const LOCAL_BINDING_UNRELATED: &str = "local_binding_unrelated";
+
+/// Whether `code` names a residue the answer lists or a gap it counts beside
+/// itself: either leaves the answer complete except that residue.
+pub(crate) fn is_residue_code(code: &str) -> bool {
+    kin_model::call_site_reading::RESIDUE_CODES.contains(&code)
+        || crate::declaration_coverage::RESIDUE_CODES.contains(&code)
+        || FOLDED_CODES.contains(&code)
+}
+
+/// Whether every code a composed factor carries names a listed residue, so the
+/// answer is complete except that residue ([`CERTIFIED_EXCEPT`]).
+fn factor_is_residue_only(factor: &str) -> bool {
+    let mut codes = factor
+        .split(CLAUSE_SEPARATOR)
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .peekable();
+    codes.peek().is_some() && codes.all(is_residue_code)
 }
 
 /// The closed-list code for a clause label, or [`UNLISTED_CLAUSE_CODE`].
@@ -697,7 +830,13 @@ impl Reading {
 
 /// The single verdict for one response, plus the inputs it was computed from.
 pub struct Verdict {
+    /// The candidate scorer's report, lifted from the payload's top-level
+    /// `scorer` block unchanged, when a retrieval arm ran one.
+    scorer: Option<Value>,
     certified: bool,
+    /// Not certified, and every clause that refused names a listed residue
+    /// ([`CERTIFIED_EXCEPT`]).
+    except_residue: bool,
     absence_claim: AbsenceClaim,
     limiting_factor: Option<String>,
     inputs: Map<String, Value>,
@@ -755,22 +894,45 @@ impl Verdict {
             // site whose call no resolver settled bounds the rows an answer did
             // return as much as the absence it did not.
             ("call_sites", call_sites_reading(payload)),
+            (
+                "reference_completion",
+                if tool == "find_references" {
+                    reference_completion_reading(payload)
+                } else {
+                    Reading::Silent
+                },
+            ),
+            (
+                "undecided_reference_sites",
+                match undecided_reference_sites_gap(payload) {
+                    Some(gap) => Reading::Inconclusive(vec![gap]),
+                    None => Reading::Silent,
+                },
+            ),
+            (
+                "impact_consumer_absence",
+                match impact_consumer_absence_gaps(payload) {
+                    gaps if gaps.is_empty() => Reading::Silent,
+                    gaps => Reading::Inconclusive(gaps),
+                },
+            ),
             ("enrichment", enrichment_reading(payload)),
             ("edge_coverage", edge_coverage_reading(tool, payload)),
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
+            ("scorer", scorer_reading(payload)),
             ("cross_repo", cross_repo_reading(tool, payload)),
             ("outside_graph", outside_graph_reading(payload)),
+            ("source_body", source_body_reading(tool, payload)),
+            ("named_in", named_in_reading(tool, payload)),
             ("completeness", completeness_reading(envelope)),
             ("graph_freshness", graph_freshness_reading(envelope)),
             (
                 "source_derivation",
-                match envelope.source_derivation.as_ref().and_then(|observation| {
-                    observation.limiting_factor(if tool == "entity_history" {
-                        crate::envelope::AbsenceSubstrate::History
-                    } else {
-                        crate::envelope::AbsenceSubstrate::Relations
-                    })
+                match envelope.source_limiting_factor(if tool == "entity_history" {
+                    crate::envelope::AbsenceSubstrate::History
+                } else {
+                    crate::envelope::AbsenceSubstrate::Relations
                 }) {
                     Some(reason) => Reading::Inconclusive(vec![reason.into()]),
                     None => Reading::Silent,
@@ -792,13 +954,30 @@ impl Verdict {
 
         let limiting_factor = compose_limiting_factor(&readings);
         let certified = limiting_factor.is_none();
+        let except_residue = limiting_factor
+            .as_deref()
+            .is_some_and(factor_is_residue_only);
         let inputs = readings
             .iter()
+            // The scorer input exists only on a retrieval arm that runs one, so
+            // every other answer's verdict lists exactly the inputs it did before.
+            .filter(|(name, reading)| {
+                !matches!(
+                    *name,
+                    "scorer"
+                        | "reference_completion"
+                        | "undecided_reference_sites"
+                        | "impact_consumer_absence"
+                        | "named_in"
+                ) || !matches!(reading, Reading::Silent)
+            })
             .map(|(name, reading)| ((*name).to_string(), json!(reading.state())))
             .collect();
 
         Some(Verdict {
+            scorer: scorer_block(payload),
             certified,
+            except_residue,
             absence_claim: match (makes_absence_claim, certified) {
                 (false, _) => AbsenceClaim::NotApplicable,
                 (true, true) => AbsenceClaim::Authoritative,
@@ -824,6 +1003,23 @@ impl Verdict {
     /// reason twice.
     pub fn pre_negative_gaps(payload: &Value) -> Vec<String> {
         let mut gaps = Vec::new();
+        // An unsettled call-site block's clauses are pushed below; a reference
+        // gap under one of their labels (the unkeyed lookups both count) is
+        // the same gap, said once.
+        let call_site_labels: Vec<String> = payload
+            .get(crate::call_sites::CALL_SITES_KEY)
+            .filter(|block| block.get("settled").and_then(Value::as_bool) == Some(false))
+            .map(call_sites_clauses)
+            .unwrap_or_default()
+            .iter()
+            .map(|clause| clause_label(clause))
+            .collect();
+        if let Some(gap) = reference_completion_gap(payload)
+            .filter(|gap| !call_site_labels.contains(&clause_label(gap)))
+        {
+            gaps.push(gap);
+        }
+        gaps.extend(impact_consumer_absence_gaps(payload));
         if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
             gaps.push(
                 "answer_truncated: this answer stopped early and returned part of what it \
@@ -945,25 +1141,136 @@ impl Verdict {
         if let Some(counted) = completeness.counted.as_mut().and_then(Value::as_object_mut) {
             counted.insert("exact".to_string(), json!(false));
         }
-        if !completeness
-            .limits
-            .iter()
-            .any(|limit| limit == VERDICT_LIMIT)
-        {
-            completeness.limits.push(VERDICT_LIMIT.to_string());
+        let limit = if self.except_residue {
+            VERDICT_EXCEPT_LIMIT
+        } else {
+            VERDICT_LIMIT
+        };
+        if !completeness.limits.iter().any(|existing| existing == limit) {
+            completeness.limits.push(limit.to_string());
         }
+    }
+
+    /// The state this verdict serializes as.
+    fn state(&self) -> &'static str {
+        if self.certified {
+            CERTIFIED
+        } else if self.except_residue {
+            CERTIFIED_EXCEPT
+        } else {
+            INCONCLUSIVE
+        }
+    }
+
+    /// One verdict for an answer made of sections, each a whole answer about
+    /// its own focal: a name several entities carry, answered for every one of
+    /// them under `candidates_by_owner`.
+    ///
+    /// The top level of such an answer carries no rows, no coverage and no
+    /// ledger of its own, so it is never graded as a single-focal answer: that
+    /// would read an absent `edge_coverage` block as a gap in a reference list
+    /// it never had. What it does report about itself is its `degradations`,
+    /// which name a candidate the section cap left unanswered, and that is the
+    /// one reading taken from it. Every section's verdict is composed with it
+    /// the way readings are composed within one answer: certified only when
+    /// every one of them is, the limiting factor carrying each code once in the
+    /// order they were named, and each input at the most pessimistic state any
+    /// of them read. The whole makes no absence claim of its own, because each
+    /// section claims or declines its own absence under its own verdict, which
+    /// is where a reader looking at one candidate reads it.
+    pub fn compose_sections(payload: &Value, sections: Vec<Self>) -> Option<Self> {
+        if sections.is_empty() {
+            return None;
+        }
+        let rank = |state: Option<&str>| match state {
+            Some(INCONCLUSIVE) => 2,
+            Some(CERTIFIED) => 1,
+            _ => 0,
+        };
+        let own = [("degradations", degradations_reading(payload))];
+        let mut certified = !matches!(own[0].1, Reading::Inconclusive(_));
+        let mut codes: Vec<String> = compose_limiting_factor(&own)
+            .map(|factor| factor.split(CLAUSE_SEPARATOR).map(str::to_string).collect())
+            .unwrap_or_default();
+        let mut inputs: Map<String, Value> = Map::new();
+        inputs.insert("degradations".to_string(), json!(own[0].1.state()));
+        for verdict in &sections {
+            certified &= verdict.certified;
+            for code in verdict
+                .limiting_factor
+                .iter()
+                .flat_map(|factor| factor.split(CLAUSE_SEPARATOR))
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+            {
+                if !codes.iter().any(|known| known == code) {
+                    codes.push(code.to_string());
+                }
+            }
+            for (name, state) in &verdict.inputs {
+                if !inputs.contains_key(name)
+                    || rank(state.as_str()) > rank(inputs.get(name).and_then(Value::as_str))
+                {
+                    inputs.insert(name.clone(), state.clone());
+                }
+            }
+        }
+        let limiting_factor = (!codes.is_empty()).then(|| codes.join(CLAUSE_SEPARATOR));
+        Some(Verdict {
+            scorer: None,
+            certified: certified && codes.is_empty(),
+            except_residue: limiting_factor
+                .as_deref()
+                .is_some_and(factor_is_residue_only),
+            absence_claim: AbsenceClaim::NotApplicable,
+            limiting_factor,
+            inputs,
+        })
     }
 
     /// Serialize for embedding under `_kin.verdict`.
     pub fn to_value(&self) -> Value {
-        json!({
-            "state": if self.certified { CERTIFIED } else { INCONCLUSIVE },
+        let mut value = json!({
+            "state": self.state(),
             "absence_claim": self.absence_claim.as_str(),
             "safe_to_conclude_absent": self.absence_claim.legacy_bool(),
             "limiting_factor": self.limiting_factor.clone().map(Value::String).unwrap_or(Value::Null),
             "inputs": Value::Object(self.inputs.clone()),
-        })
+        });
+        if let Some(remedy) = remedy_for(self.limiting_factor.as_deref()) {
+            value["remedy"] = Value::String(remedy);
+        }
+        if let Some(scorer) = &self.scorer {
+            value["scorer"] = scorer.clone();
+        }
+        value
     }
+}
+
+/// The one step that lifts a store-wide limit, when a limiting factor names
+/// one, as a sentence an agent can pass to the user.
+///
+/// Only the store-level codes carry one. Every other clause is about this
+/// answer, and the codes themselves already say what it rests on.
+fn remedy_for(limiting_factor: Option<&str>) -> Option<String> {
+    let codes: Vec<&str> = limiting_factor?.split(CLAUSE_SEPARATOR).collect();
+    if codes.contains(&"store_semantics_behind") {
+        return Some(format!(
+            "Run `kin upgrade` in this repository (`{}` through npm): an older version of Kin \
+             built this repository's records, and no answer from them can be complete until \
+             they are rebuilt.",
+            kin_core::hydration_semantics::npm_upgrade_command()
+        ));
+    }
+    if codes.contains(&"store_semantics_unknown") {
+        return Some(format!(
+            "Upgrade Kin to the newest version, then run `kin upgrade` in this repository (`{}` \
+             through npm): the note of how this repository's records were built is missing or \
+             unreadable.",
+            kin_core::hydration_semantics::NPM_LATEST_UPGRADE_COMMAND
+        ));
+    }
+    None
 }
 
 /// The absence gate's reading: the composed verdict
@@ -1088,22 +1395,95 @@ fn caller_arrival_reading(tool: &str, payload: &Value, makes_absence_claim: bool
 /// evidence.
 /// The report observes the selected graph's persisted ledgers. A settled
 /// call-site observation is deliberately silent about all other relation types.
+///
+/// Every clause the observation names, joined the way `trust_reason` joins
+/// gaps, or `None` while it records no call-site debt.
 pub(crate) fn enrichment_gap(payload: &Value) -> Option<String> {
-    let observation = payload
+    let clauses = enrichment_gaps(payload);
+    (!clauses.is_empty()).then(|| clauses.join(CLAUSE_SEPARATOR))
+}
+
+/// The clauses a bounded enrichment observation names, one per code, each
+/// under the code its pending entities call for. Only owed work is
+/// `enrichment_incomplete`: an observation that counts no owed entity never
+/// reads as unfinished, because waiting would not change it.
+fn enrichment_gaps(payload: &Value) -> Vec<String> {
+    let Some(observation) = payload
         .get("enrichment")
-        .or_else(|| payload.pointer("/impact/enrichment"))?;
+        .or_else(|| payload.pointer("/impact/enrichment"))
+    else {
+        return Vec::new();
+    };
     if observation.get("status").and_then(Value::as_str) != Some("bounded") {
-        return None;
+        return Vec::new();
     }
-    Some(observation.get("limitation").and_then(Value::as_str)
-        .unwrap_or("enrichment_incomplete: recorded call-site evidence is unsettled, so impact counts are a lower bound and review risk may change")
-        .to_string())
+    let clauses: Vec<String> = observation
+        .get("clauses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !clauses.is_empty() {
+        return clauses;
+    }
+    if let Some(limitation) = observation
+        .get("limitation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|limitation| !limitation.is_empty())
+    {
+        return limitation
+            .split(CLAUSE_SEPARATOR)
+            .map(str::trim)
+            .filter(|clause| !clause.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    let owed = observation
+        .get("owed_entities")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if owed > 0 {
+        return vec![format!(
+            "enrichment_incomplete: {owed} entities have call-site evidence the graph has not \
+             settled yet because their derivation or enrichment is still owed, so impact counts \
+             are a lower bound and review risk may change"
+        )];
+    }
+    let codes: Vec<String> = observation
+        .get("pending_by_code")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(code, count)| {
+            format!(
+                "{code}: {} entities hold call-site evidence no resolver settled, so impact \
+                 counts are a lower bound and review risk may change",
+                count.as_u64().unwrap_or(0)
+            )
+        })
+        .collect();
+    if !codes.is_empty() {
+        return codes;
+    }
+    // Bounded, and nothing says by what. Not owed work, which it never
+    // claimed, and still never a certification.
+    vec![format!(
+        "{UNLISTED_CLAUSE_CODE}: the enrichment observation bounds this answer and names no \
+         clause"
+    )]
 }
 
 fn enrichment_reading(payload: &Value) -> Reading {
-    match enrichment_gap(payload) {
-        Some(gap) => Reading::Inconclusive(vec![gap]),
-        None => Reading::Silent,
+    let clauses = enrichment_gaps(payload);
+    if clauses.is_empty() {
+        Reading::Silent
+    } else {
+        Reading::Inconclusive(clauses)
     }
 }
 
@@ -1116,6 +1496,286 @@ fn call_sites_reading(payload: &Value) -> Reading {
         Some(false) => Reading::Inconclusive(call_sites_clauses(block)),
         None => Reading::Silent,
     }
+}
+
+/// The non-call relation kinds a reference answer asked for, or `None` when
+/// it is no reference answer or asked for calls alone.
+fn requested_non_call_kinds(payload: &Value) -> Option<Vec<&str>> {
+    payload.get("references")?.as_array()?;
+    let kinds: Vec<&str> = payload
+        .get("relation_kinds")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    kinds
+        .iter()
+        .any(|kind| !kind.eq_ignore_ascii_case("calls"))
+        .then_some(kinds)
+}
+
+/// Undecided sites a `reference_sites_undecided_listed` clause names before it
+/// points at the block for the rest.
+const UNDECIDED_SITES_NAMED: usize = 5;
+
+/// The gap the answer's `undecided_reference_sites` block names, or `None`
+/// when it carries none (see [`crate::undecided_sites`]).
+///
+/// A site no pass could decide over unchanged code is served as a reference
+/// that nothing proves, so an answer that holds one is never complete because
+/// of it. Listed whole, the clause is a residue: the answer is complete except
+/// those sites. Counted beyond its list, or unreadable, it is partial.
+fn undecided_reference_sites_gap(payload: &Value) -> Option<String> {
+    use kin_model::call_site_reading::{
+        REFERENCE_SITES_UNDECIDED, REFERENCE_SITES_UNDECIDED_LISTED, UNDECIDED_REFERENCE_SITES_KEY,
+    };
+    let block = payload.get(UNDECIDED_REFERENCE_SITES_KEY)?;
+    let sites = block
+        .get("sites")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let Some(count) = block.get("count").and_then(Value::as_u64) else {
+        return Some(format!(
+            "{REFERENCE_SITES_UNDECIDED}: the reference sites no pass could decide could not \
+             be read, so usages there may be missing"
+        ));
+    };
+    if count == 0 {
+        return None;
+    }
+    if sites.len() as u64 >= count {
+        let named: Vec<String> = sites
+            .iter()
+            .take(UNDECIDED_SITES_NAMED)
+            .map(|site| {
+                let caller = site
+                    .get("caller_name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| site.get("caller").and_then(Value::as_str))
+                    .unwrap_or("an unnamed caller");
+                match site.get("line_in_entity").and_then(Value::as_u64) {
+                    Some(line) => format!("{caller} +{line}"),
+                    None => caller.to_string(),
+                }
+            })
+            .collect();
+        let rest = count.saturating_sub(named.len() as u64);
+        let mut at = named.join(", ");
+        if rest > 0 {
+            at.push_str(&format!(" and {rest} more"));
+        }
+        return Some(
+            format!(
+                "{REFERENCE_SITES_UNDECIDED_LISTED}: {count} reference sites stayed undecided \
+                 after repeated sweeps of unchanged code, at {at}, each listed in \
+                 {UNDECIDED_REFERENCE_SITES_KEY}"
+            )
+            .replace(CLAUSE_SEPARATOR, ", "),
+        );
+    }
+    Some(format!(
+        "{REFERENCE_SITES_UNDECIDED}: {count} reference sites stayed undecided after repeated \
+         sweeps of unchanged code and {} are listed, so usages there may be missing",
+        sites.len()
+    ))
+}
+
+/// The `reference_completion` input: silent unless the answer asked for a
+/// non-call relation, inconclusive while [`reference_completion_gap`] names
+/// a gap, and certified when the census measured every non-call read that
+/// could read the focal and a stored row of a requested kind carries each.
+fn reference_completion_reading(payload: &Value) -> Reading {
+    if requested_non_call_kinds(payload).is_none() {
+        return Reading::Silent;
+    }
+    match reference_completion_gap(payload) {
+        Some(gap) => Reading::Inconclusive(vec![gap]),
+        None => Reading::Certified,
+    }
+}
+
+/// A zero consumer count covers calls, imports and references. Certifying the
+/// direct call-site section alone cannot certify that broader absence. Read
+/// each zero against its own mention census; another changed entity's complete
+/// census never licenses it. Positive consumer rows do not claim absence.
+fn impact_consumer_absence_gaps(payload: &Value) -> Vec<String> {
+    let Some(impacts) = payload.get("entity_impacts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let call_sites = payload.get(crate::call_sites::CALL_SITES_KEY);
+    let mut gaps = Vec::new();
+    for row in impacts
+        .iter()
+        .filter(|row| row.get("consumer_count").and_then(Value::as_u64) == Some(0))
+    {
+        let target = row.get("entity_id").and_then(Value::as_str);
+        let matches_target = |block: &&Value| {
+            target.is_some() && block.get("entity_id").and_then(Value::as_str) == target
+        };
+        let census = call_sites.filter(matches_target).or_else(|| {
+            call_sites?
+                .get("focals")?
+                .as_array()?
+                .iter()
+                .find(matches_target)
+        });
+        let reference_view = json!({
+            "references": [],
+            "relation_kinds": ["calls", "imports", "references"],
+            "call_sites": census,
+        });
+        if let Some(gap) = reference_completion_gap(&reference_view) {
+            let target = target.unwrap_or("an unidentified changed entity");
+            gaps.push(format!("{gap} for the zero consumer count of {target}"));
+        }
+    }
+    gaps
+}
+
+/// Sites a `reference_mentions_unmatched` clause names before it points at
+/// the residue for the rest.
+const UNMATCHED_SITES_NAMED: usize = 5;
+
+/// Whether the requested non-call relations are complete, read from the
+/// escape census's mention reading (`call_sites.focal_escape.residue.mentions`,
+/// see [`kin_model::MentionResidue`]), or the gap that stops them being.
+///
+/// A Call census settles calls alone, and an edge class being present says
+/// nothing about any one read. Completion of `imports` and `references` holds
+/// only when the census matched every recorded non-call read that could read
+/// the focal (a mention, a value use, an alias or import site) against the
+/// stored rows:
+///
+/// - no mention reading was taken, or it was taken over records that predate
+///   it or regions no record covers: `reference_completion_unmeasured`, with
+///   the census's own reason;
+/// - a lookup by a name computed at run time could reach the focal: the same
+///   residue the call census counts, `unkeyed_lookups_counted`, bounds the
+///   non-call reads too;
+/// - a read no stored row of a requested kind carries: a
+///   `reference_mentions_unmatched` clause naming each by file and line, all
+///   of them listed in `residue.mentions.unmatched`.
+///
+/// Reads that hold the focal as a value, keyed reflective sites, implicit
+/// calls and protocol dispatch are listed by the call census and refuse
+/// through its own clause.
+fn reference_completion_gap(payload: &Value) -> Option<String> {
+    use kin_model::call_site_reading::{
+        REFERENCE_COMPLETION_UNMEASURED, REFERENCE_MENTIONS_UNMATCHED, UNKEYED_LOOKUPS_COUNTED,
+    };
+    let requested = requested_non_call_kinds(payload)?;
+    // Word for word what every reference answer carried before the census
+    // took a mention reading, so a store whose records predate it answers
+    // exactly as it did. Why it was not measured is the census's own
+    // `residue.mentions.reason`.
+    let unmeasured = || {
+        Some(format!(
+            "{REFERENCE_COMPLETION_UNMEASURED}: non-call completion is unmeasured"
+        ))
+    };
+    let Some(census) = payload
+        .get(crate::call_sites::CALL_SITES_KEY)
+        .and_then(|block| block.get("focal_escape"))
+    else {
+        return unmeasured();
+    };
+    let residue = census.get("residue");
+    let Some(mentions) =
+        residue.and_then(|residue| residue.get(kin_model::call_site_reading::MENTIONS_KEY))
+    else {
+        return unmeasured();
+    };
+    if mentions.get("measured").and_then(Value::as_bool) != Some(true) {
+        return unmeasured();
+    }
+    // A focal that holds members is referenced through them without its name
+    // being spelled, which the reading cannot see; an import of it is still
+    // measured.
+    if mentions.get("references_unmeasured").is_some()
+        && requested
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case("references"))
+    {
+        return unmeasured();
+    }
+    let unkeyed = residue
+        .and_then(|residue| residue.pointer("/unkeyed_lookups/count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if unkeyed > 0 {
+        return Some(format!(
+            "{UNKEYED_LOOKUPS_COUNTED}: {unkeyed} lookups by a name computed at run time could \
+             reach the focal as they could reach anything their receiver holds, so a non-call \
+             read through one is counted in focal_escape.residue.unkeyed_lookups rather than \
+             matched against a stored row"
+        ));
+    }
+    let unmatched = mentions.get("unmatched");
+    let listed = unmatched
+        .and_then(|list| list.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let requested_kind = |kind: &str| {
+        requested
+            .iter()
+            .any(|asked| asked.eq_ignore_ascii_case(kind))
+    };
+    let mut unrequested: Vec<(String, u64)> = mentions
+        .get("matched")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(kind, _)| !requested_kind(kind))
+        .filter_map(|(kind, count)| Some((kind.clone(), count.as_u64()?)))
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    unrequested.sort();
+    let carried_elsewhere: u64 = unrequested.iter().map(|(_, count)| count).sum();
+    if listed == 0 && carried_elsewhere == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if listed > 0 {
+        let named: Vec<String> = unmatched
+            .and_then(|list| list.get("sites"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(UNMATCHED_SITES_NAMED)
+            .filter_map(|site| {
+                Some(format!(
+                    "{}:{} ({})",
+                    site.get("file")?.as_str()?,
+                    site.get("line")?.as_u64()?,
+                    site.get("kind").and_then(Value::as_str).unwrap_or("read"),
+                ))
+            })
+            .collect();
+        let rest = listed.saturating_sub(named.len() as u64);
+        let mut at = named.join(", ");
+        if rest > 0 {
+            at.push_str(&format!(" and {rest} more"));
+        }
+        parts.push(format!(
+            "{listed} non-call reads that could read the focal have no stored row, at {at}"
+        ));
+    }
+    if carried_elsewhere > 0 {
+        let kinds: Vec<&str> = unrequested.iter().map(|(kind, _)| kind.as_str()).collect();
+        parts.push(format!(
+            "{carried_elsewhere} are carried only by {} rows this query did not request",
+            kinds.join(" and ")
+        ));
+    }
+    Some(
+        format!(
+            "{REFERENCE_MENTIONS_UNMATCHED}: {}, each listed in focal_escape.residue.mentions",
+            parts.join(", and ")
+        )
+        .replace(CLAUSE_SEPARATOR, ", "),
+    )
 }
 
 /// The clauses an unsettled `call_sites` block names, never none.
@@ -1163,8 +1823,25 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         .filter(|language| !language.trim().is_empty())
         .unwrap_or("an unreported language");
 
-    if let Some(gap) = crate::negative::reference_readiness_gap(coverage) {
-        return Reading::Inconclusive(vec![gap]);
+    let requested = crate::negative::absence_cross_unit_classes(tool, payload);
+    // An entity-index answer carrying a declaration census is decided by it:
+    // the census measured what the extractor admitted in every file the answer
+    // covers, which is what the language-server gates below stand in for.
+    let declarations = requested
+        .is_empty()
+        .then(|| crate::declaration_coverage::clauses(coverage))
+        .flatten();
+    let census_measured = declarations.is_some()
+        && crate::declaration_coverage::class_state(coverage)
+            != Some(crate::declaration_coverage::STATE_UNMEASURED);
+
+    // A reference answer whose own censuses measured every kind it asked for
+    // has nothing a pending readiness observation could stand in for (see
+    // `crate::negative::reference_census_measured`).
+    if !census_measured && !crate::negative::reference_census_measured(tool, payload) {
+        if let Some(gap) = crate::negative::reference_readiness_gap(coverage) {
+            return Reading::Inconclusive(vec![gap]);
+        }
     }
 
     // The same reading [`crate::negative::absence_coverage_gap`] takes, on
@@ -1177,12 +1854,13 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
     {
+        _ if census_measured => {}
         "available" => {}
         "unsupported" => {
             return Reading::Inconclusive(vec![format!(
                 "reference_enrichment_unsupported: this build wires no language-server adapter \
-                 for {language}, so cross-file reference and override edges cannot exist for it \
-                 at all"
+                 for {language}, so reference and override edges between its modules cannot exist \
+                 for it at all"
             )])
         }
         "no_language_server" => {
@@ -1206,8 +1884,14 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         )]);
     }
 
-    let requested = crate::negative::absence_cross_file_classes(tool, payload);
     let states = coverage.get("classes").and_then(Value::as_object);
+    if let Some(clauses) = declarations {
+        return if clauses.is_empty() {
+            Reading::Certified
+        } else {
+            Reading::Inconclusive(clauses)
+        };
+    }
     if requested.is_empty() {
         // FIR-2496. This input used to answer `certified` for any observation
         // that named no class to check, which is every observation a tool
@@ -1295,8 +1979,8 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     if !absent.is_empty() {
         let missing = absent.join(", ");
         return Reading::Inconclusive(vec![format!(
-            "cross_file_edges_absent: the graph was not observed to hold cross-file \
-             {missing} edges for {language}, so a use that reaches the target through {missing} \
+            "cross_file_edges_absent: the graph was not observed to hold {missing} edges \
+             between modules for {language}, so a use that reaches the target through {missing} \
              could not have been found"
         )]);
     }
@@ -1310,8 +1994,8 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     } else {
         let missing = unhealthy.join(", ");
         Reading::Inconclusive(vec![format!(
-            "edge_coverage_unknown: whether the graph holds cross-file {missing} edges for \
-             {language} could not be established, so a use that reaches the target through \
+            "edge_coverage_unknown: whether the graph holds {missing} edges between modules \
+             for {language} could not be established, so a use that reaches the target through \
              {missing} may not have been found"
         )])
     }
@@ -1428,8 +2112,154 @@ fn outside_graph_reading(payload: &Value) -> Reading {
     }
 }
 
+/// Whether a source read served the entity's recorded source.
+///
+/// A body read is an answer like any other, and without this every other
+/// input stays silent on it, so it went out with no verdict at all while the
+/// tool beside it carried one. It certifies when the span was checked against
+/// the bytes it was cut from, by the entity's recorded digest or by reading
+/// span and bytes from one committed state, and when a container was served as
+/// its shape from those same bytes. A span nothing could check is served and
+/// says so. A reply that served no source (a list of name candidates) leaves
+/// the verdict to the inputs that read it.
+fn source_body_reading(tool: &str, payload: &Value) -> Reading {
+    if !matches!(tool, "get_entity_source" | "get_entity_body") {
+        return Reading::Silent;
+    }
+    // An entity Kin holds without parsing it is served as its text, or, held
+    // as bytes, as its description, read from its exact content.
+    let served = payload.get("body").is_some_and(Value::is_string)
+        || payload.get("members").is_some_and(Value::is_array)
+        || payload.get("generator_source").is_some()
+        || payload
+            .as_object()
+            .is_some_and(crate::artifact_entity::is_artifact_reply);
+    if !served {
+        return Reading::Silent;
+    }
+    if payload.get("generator_source_unavailable").is_some() {
+        return Reading::Inconclusive(vec![
+            "generator_source_unavailable: this derived member's generator source could not be read, so what it was generated from is not shown"
+                .to_string(),
+        ]);
+    }
+    match payload.get("span_coherence").and_then(Value::as_str) {
+        Some("unverified") => Reading::Inconclusive(vec![
+            "body_unverified: this entity records no source digest, so the served span could not be checked against the bytes it was cut from"
+                .to_string(),
+        ]),
+        _ => Reading::Certified,
+    }
+}
+
+/// The code a `refs` answer about an unparsed entity carries: its rows are
+/// the places whose text names the entity, matched by name.
+pub(crate) const MATCHED_BY_NAME: &str = "matched_by_name";
+
+/// A `refs` answer about an unparsed entity lists the places whose text names
+/// it. A match by name is not a resolved use: Kin has not proved what any of
+/// those places uses it for, and a name built while code runs, or a pattern,
+/// is not followed. So the answer is never complete, whether it lists places
+/// or none.
+fn named_in_reading(tool: &str, payload: &Value) -> Reading {
+    if tool != "find_references" {
+        return Reading::Silent;
+    }
+    match payload.as_object() {
+        Some(reply) if crate::artifact_entity::mentions::is_named_in_reply(reply) => {
+            Reading::Inconclusive(vec![
+                "matched_by_name: these rows name the entity in their text, and Kin has not resolved what they use it for; a name built while code runs, or a pattern, is not followed"
+                    .to_string(),
+            ])
+        }
+        _ => Reading::Silent,
+    }
+}
+
+/// A module inventory whose graph recorded no member coverage cannot establish
+/// an empty module. Read the same gap in single, batch and context projections.
+fn module_members_reading(payload: &Value) -> Reading {
+    fn has_gap(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.get("semantic_gap").and_then(Value::as_str)
+                    == Some(crate::container_shape::MODULE_MEMBER_GAP)
+                    || object.values().any(has_gap)
+            }
+            Value::Array(values) => values.iter().any(has_gap),
+            _ => false,
+        }
+    }
+    if has_gap(payload) {
+        Reading::Inconclusive(vec![format!(
+            "{}: the graph could not establish member coverage for a module in this answer; \
+             this inventory does not establish that its source has no declarations",
+            crate::container_shape::MODULE_MEMBER_GAP
+        )])
+    } else {
+        Reading::Silent
+    }
+}
+
+/// The payload's candidate-scorer block, when a retrieval arm ran a scorer.
+fn scorer_block(payload: &Value) -> Option<Value> {
+    payload
+        .get("scorer")
+        .filter(|block| block.is_object())
+        .cloned()
+}
+
+/// What the candidate scorer said about this answer's rows.
+///
+/// An abstention refuses: the scorer read the leading rows and rated none of
+/// them the answer, so an agent must not act on rank one as if it were. A
+/// scorer that rated a row over its threshold certifies nothing more than that.
+/// A scorer that could not run is silent here, because the ledger already
+/// carries it under `degradations`, and an answer with no scorer is silent too.
+fn scorer_reading(payload: &Value) -> Reading {
+    let Some(scorer) = payload.get("scorer").and_then(Value::as_object) else {
+        return Reading::Silent;
+    };
+    if scorer
+        .get("unavailable")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Reading::Silent;
+    }
+    if scorer.get("abstained").and_then(Value::as_bool) != Some(true) {
+        return Reading::Certified;
+    }
+    let name = scorer
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("candidate");
+    let threshold = scorer
+        .get("threshold")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let best = match scorer.get("top_probability").and_then(Value::as_f64) {
+        Some(best) => format!("the best row scored {best:.2}"),
+        None => "no row was scored".to_string(),
+    };
+    Reading::Inconclusive(vec![format!(
+        "none_of_these: the {name} scorer rated no candidate at or above its calibrated threshold \
+         {threshold:.2} ({best}) and the query named none of them, so these rows are leads rather \
+         than an answer"
+    )])
+}
+
 /// This query's own reported degradations.
+///
+/// Refuses on every entry that reports the run lost a capability or cut its
+/// answer. An entry marked `severity: "note"` records a policy the run applied
+/// by design, such as a filter the caller chose, and is read past rather than
+/// refused on: it stays in `degradations[]` for the caller, and a ledger holding
+/// only notes certifies. The split is the producer's, read off each entry by
+/// [`crate::negative::payload_degradation_labels`], so no label list lives here.
 fn degradations_reading(payload: &Value) -> Reading {
+    if let reading @ Reading::Inconclusive(_) = module_members_reading(payload) {
+        return reading;
+    }
     if payload.get("degradations").is_none() {
         return Reading::Silent;
     }
@@ -1728,8 +2558,22 @@ pub(crate) fn qualify_source_observation(payload: &mut Value, reason: &'static s
         .cloned()
         .unwrap_or_default();
     inputs.insert("source_derivation".into(), json!(INCONCLUSIVE));
+    let limiting_factor = lead_with_code(
+        previous.get("limiting_factor").and_then(Value::as_str),
+        reason
+            .split(':')
+            .next()
+            .unwrap_or("derived_source_unproven"),
+    );
+    // A folded gap downgrades a certified answer only to complete except it,
+    // and leaves an answer some other input refused exactly as refused.
+    let previous_state = previous.get("state").and_then(Value::as_str);
+    let except_residue = matches!(previous_state, Some(CERTIFIED) | Some(CERTIFIED_EXCEPT))
+        && factor_is_residue_only(&limiting_factor);
     let verdict = Verdict {
+        scorer: previous.get("scorer").cloned(),
         certified: false,
+        except_residue,
         absence_claim: if previous.get("absence_claim").and_then(Value::as_str)
             == Some("not_applicable")
         {
@@ -1737,13 +2581,7 @@ pub(crate) fn qualify_source_observation(payload: &mut Value, reason: &'static s
         } else {
             AbsenceClaim::NotAuthoritative
         },
-        limiting_factor: Some(lead_with_code(
-            previous.get("limiting_factor").and_then(Value::as_str),
-            reason
-                .split(':')
-                .next()
-                .unwrap_or("derived_source_unproven"),
-        )),
+        limiting_factor: Some(limiting_factor),
         inputs,
     };
     if let Some(value) = envelope.get_mut("completeness") {
@@ -1844,6 +2682,13 @@ pub fn disagreements(response: &Value) -> Vec<String> {
         }
     }
 
+    // A partial page of a paged answer carries the ANSWER's verdict and its own
+    // page-scoped completeness: the rows it holds are a floor of the answer by
+    // construction, and the rest arrive on later pages. Its `at_least` bound and
+    // its share of the rows describe the page, not a second verdict on the
+    // answer, so they are checked on the reassembled answer instead.
+    let partial_page = response.pointer("/_kin/page/complete") == Some(&Value::Bool(false));
+
     // The five arms above all read one direction: a surface claiming
     // certification under an inconclusive verdict. Nothing read the other way,
     // which is why a shipped envelope could carry a CERTIFIED verdict over a
@@ -1855,7 +2700,7 @@ pub fn disagreements(response: &Value) -> Vec<String> {
             .and_then(|envelope| envelope.get("completeness"))
         {
             let bound = completeness.get("bound").and_then(Value::as_str);
-            if matches!(bound, Some("at_least")) {
+            if matches!(bound, Some("at_least")) && !partial_page {
                 found.push(
                     "_kin.completeness.bound reads at_least under a certified _kin.verdict"
                         .to_string(),
@@ -1878,7 +2723,9 @@ pub fn disagreements(response: &Value) -> Vec<String> {
         }
     }
 
-    found.extend(headline_count_disagreements(response));
+    if !partial_page {
+        found.extend(headline_count_disagreements(response));
+    }
     found
 }
 
@@ -2011,6 +2858,73 @@ mod clause_codes_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `refs` answer that lists what names an unparsed entity in its text
+    /// is matched by name, so it is never complete, with places or with none.
+    /// A source reply that lists the same rows beside the entity's
+    /// description answers another question and is not qualified by them.
+    #[test]
+    fn what_names_an_unparsed_entity_by_name_is_never_a_complete_answer() {
+        let named = |rows: Value| {
+            json!({
+                "entity": {"entity_id": "artifact", "name": "schema.sql", "kind": "SQL"},
+                "named_in": rows,
+                "matched_by": "name",
+                "named_in_total": rows.as_array().map_or(0, Vec::len),
+            })
+        };
+        for payload in [
+            named(
+                json!([{"entity_id": "init_db", "name": "init_db", "line": "open(\"schema.sql\")"}]),
+            ),
+            named(json!([])),
+        ] {
+            let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+                .expect("a refs answer about an unparsed entity carries a verdict");
+            assert!(!verdict.certified, "{payload}");
+            let factor = verdict.limiting_factor.unwrap_or_default();
+            assert!(
+                factor
+                    .split(CLAUSE_SEPARATOR)
+                    .any(|code| code == MATCHED_BY_NAME),
+                "{factor}"
+            );
+            assert_eq!(verdict.inputs["named_in"], json!(INCONCLUSIVE));
+        }
+        assert!(matches!(
+            named_in_reading("get_entity_source", &named(json!([]))),
+            Reading::Silent
+        ));
+        // Every other answer's inputs stay as they were.
+        let other = json!({"references": [], "focal_entity": {"id": "f", "name": "f"}});
+        if let Some(verdict) =
+            Verdict::compute("find_references", &other, &Envelope::daemon(), None)
+        {
+            assert!(
+                verdict.inputs.get("named_in").is_none(),
+                "{:?}",
+                verdict.inputs
+            );
+        }
+    }
+
+    /// A store-level limit carries the one step that lifts it, and an
+    /// answer-level one carries none.
+    #[test]
+    fn a_store_written_by_an_older_build_names_kin_upgrade_on_the_verdict() {
+        let behind = remedy_for(Some("store_semantics_behind; call_sites_owed")).unwrap();
+        assert!(
+            behind.starts_with("Run `kin upgrade` in this repository"),
+            "{behind}"
+        );
+        let unknown = remedy_for(Some("call_sites_owed; store_semantics_unknown")).unwrap();
+        assert!(unknown.contains("then run `kin upgrade`"), "{unknown}");
+        assert_eq!(
+            remedy_for(Some("call_sites_owed; local_binding_unproven")),
+            None
+        );
+        assert_eq!(remedy_for(None), None);
+    }
 
     #[test]
     fn enrichment_bounds_populated_and_empty_answers_without_certifying_other_relations() {
@@ -2224,7 +3138,7 @@ mod tests {
 
             let verdict = Verdict::compute(
                 "find_references",
-                &populated_reference_payload("present"),
+                &call_only_reference_payload(),
                 &envelope,
                 None,
             )
@@ -2335,7 +3249,7 @@ mod tests {
             );
             let verdict = Verdict::compute(
                 "find_references",
-                &populated_reference_payload("present"),
+                &call_only_reference_payload(),
                 &envelope,
                 None,
             )
@@ -2389,7 +3303,7 @@ mod tests {
             ));
             let verdict = Verdict::compute(
                 "find_references",
-                &populated_reference_payload("present"),
+                &call_only_reference_payload(),
                 &envelope,
                 None,
             )
@@ -2643,7 +3557,7 @@ mod tests {
 
             let verdict = Verdict::compute(
                 "find_references",
-                &populated_reference_payload("present"),
+                &call_only_reference_payload(),
                 &envelope,
                 None,
             )
@@ -2684,7 +3598,7 @@ mod tests {
             // the earlier spelling raised a high-severity alert on this test.
             let live_sample = Verdict::compute(
                 "find_references",
-                &populated_reference_payload("present"),
+                &call_only_reference_payload(),
                 &live,
                 None,
             )
@@ -2734,7 +3648,9 @@ mod tests {
                 inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
                 inputs.insert(name.clone(), json!(INCONCLUSIVE));
                 let refusing = Verdict {
+                    scorer: None,
                     certified: false,
+                    except_residue: false,
                     absence_claim: AbsenceClaim::NotAuthoritative,
                     limiting_factor: Some(format!("{name}: refusing")),
                     inputs,
@@ -2796,9 +3712,324 @@ mod tests {
     /// beside it promised that an absence in the answer was authoritative. A
     /// consumer branching on the bool got the opposite of the verdict, and the
     /// one object said both things at once.
+    /// A reference answer whose call-site block names only a listed residue.
+    fn residue_payload(clauses: &[&str]) -> Value {
+        let mut payload = call_only_reference_payload();
+        payload["call_sites"] = json!({ "settled": clauses.is_empty(), "clauses": clauses });
+        payload
+    }
+
+    const NAMED_RESIDUE: &str = "named_leftovers: 13 call site(s) whose callee or caller body \
+                                 spells pop are not proven: 13 are listed by caller and line";
+    const VALUE_RESIDUE: &str = "value_calls_unmeasured: 1256 unsettled call site(s) in 400 \
+                                 caller(s) never spell a call name of the focal";
+
+    #[test]
+    fn reference_query_certainty_does_not_borrow_completion_from_a_call_census() {
+        // Class presence and resolver availability do not attest completion of
+        // non-call references. Even a settled Call ledger says nothing about
+        // retained Reference sites whose enrichment could not settle.
+        for kinds in [
+            json!(["references"]),
+            json!(["calls", "references"]),
+            json!(["References"]),
+            json!(["Calls", "Imports", "References"]),
+        ] {
+            for clauses in [
+                Vec::new(),
+                vec!["unkeyed_lookups_counted: 2 lookups counted"],
+            ] {
+                let mut payload = residue_payload(&clauses);
+                payload["relation_kinds"] = kinds.clone();
+                payload["edge_coverage"]["requested_classes"] = kinds.clone();
+                let result = crate::finalize_with_envelope(
+                    crate::types::ToolCallResult::text(payload.to_string()),
+                    Envelope::daemon().with_health(&json!({
+                        "initialized": true, "graph_loaded": true, "graph_generation": 12,
+                    })),
+                    "find_references",
+                );
+                let crate::types::ContentBlock::Text { text } = &result.content[0];
+                let response: Value = serde_json::from_str(text).unwrap();
+                let verdict = &response["_kin"]["verdict"];
+                assert_eq!(verdict["state"], INCONCLUSIVE, "{response}");
+                assert!(
+                    !verdict["limiting_factor"]
+                        .as_str()
+                        .is_some_and(|factor| factor.contains(UNLISTED_CLAUSE_CODE)),
+                    "{response}"
+                );
+                assert!(
+                    verdict["limiting_factor"]
+                        .as_str()
+                        .is_some_and(|factor| factor.contains("reference_completion_unmeasured")),
+                    "{response}"
+                );
+                assert_eq!(verdict["safe_to_conclude_absent"], false, "{response}");
+                assert_eq!(response["negative"]["trust"], INCONCLUSIVE, "{response}");
+                assert!(
+                    response["negative"]["trust_reason"]
+                        .as_str()
+                        .is_some_and(|factor| factor.contains("reference_completion_unmeasured")),
+                    "{response}"
+                );
+                assert!(response["_kin"].get("self_check").is_none(), "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn reference_query_certainty_keeps_call_only_certification() {
+        for kind in ["calls", "Calls", "CALLS"] {
+            for (clauses, expected) in [
+                (Vec::new(), CERTIFIED),
+                (
+                    vec!["unkeyed_lookups_counted: 2 lookups counted"],
+                    CERTIFIED_EXCEPT,
+                ),
+            ] {
+                let mut payload = residue_payload(&clauses);
+                payload["relation_kinds"] = json!([kind]);
+                payload["edge_coverage"]["requested_classes"] = json!(["calls"]);
+                let verdict =
+                    Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+                        .unwrap()
+                        .to_value();
+                assert_eq!(verdict["state"], expected, "{verdict}");
+                assert!(
+                    !verdict["limiting_factor"]
+                        .as_str()
+                        .is_some_and(|factor| factor.contains("reference_completion_unmeasured")),
+                    "{verdict}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_whose_only_refusals_are_a_listed_residue_is_certified_except() {
+        let payload = residue_payload(&[NAMED_RESIDUE, VALUE_RESIDUE]);
+        let negative = json!({
+            "interpretation": "qualified_answer",
+            "trust": "inconclusive",
+            "trust_reason": format!("{NAMED_RESIDUE}; {VALUE_RESIDUE}"),
+        });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict");
+        let value = verdict.to_value();
+        assert_eq!(value["state"], json!(CERTIFIED_EXCEPT), "{value}");
+        assert_eq!(
+            value["limiting_factor"],
+            json!("named_leftovers; value_calls_unmeasured"),
+            "{value}"
+        );
+        assert_eq!(value["safe_to_conclude_absent"], json!(false), "{value}");
+        assert_eq!(
+            value["inputs"]["call_sites"],
+            json!(INCONCLUSIVE),
+            "{value}"
+        );
+        // The counts are a floor with a named remainder, and say so.
+        let mut completeness = Some(crate::envelope::Completeness {
+            status: "complete".to_string(),
+            bound: "exact".to_string(),
+            substrate: "edges".to_string(),
+            classes: Map::new(),
+            decided_by: Vec::new(),
+            counted: None,
+            reference_resolution: None,
+            limits: Vec::new(),
+        });
+        verdict.project_onto_completeness(&mut completeness);
+        let completeness = completeness.unwrap();
+        assert_eq!(completeness.bound, "at_least");
+        assert_eq!(completeness.limits, vec![VERDICT_EXCEPT_LIMIT.to_string()]);
+    }
+
+    /// A folded binding gap downgrades a certified answer only to complete
+    /// except it, never past a refusal another input made, and never licenses
+    /// an absence.
+    #[test]
+    fn a_folded_binding_gap_is_complete_except_and_never_an_absence() {
+        const FOLDED: &str = "local_binding_unrelated: the bindings sit outside the answer";
+        assert!(is_residue_code(LOCAL_BINDING_UNRELATED));
+        assert!(factor_is_residue_only(
+            "local_binding_unrelated; named_leftovers"
+        ));
+        assert!(!factor_is_residue_only(
+            "local_binding_unrelated; local_binding_outstanding"
+        ));
+        assert!(CLAUSE_CODES
+            .iter()
+            .any(|entry| entry.code == LOCAL_BINDING_UNRELATED));
+        for (state, factor, claim, expected) in [
+            (CERTIFIED, Value::Null, "authoritative", CERTIFIED_EXCEPT),
+            (
+                CERTIFIED_EXCEPT,
+                json!("named_leftovers"),
+                "not_applicable",
+                CERTIFIED_EXCEPT,
+            ),
+            (
+                INCONCLUSIVE,
+                json!("method_call_resolution_incomplete"),
+                "not_authoritative",
+                INCONCLUSIVE,
+            ),
+        ] {
+            let mut payload = json!({"_kin": {"verdict": {
+                "state": state, "limiting_factor": factor, "absence_claim": claim,
+                "safe_to_conclude_absent": claim == "authoritative", "inputs": {},
+            }}});
+            qualify_source_observation(&mut payload, FOLDED);
+            let verdict = &payload["_kin"]["verdict"];
+            assert_eq!(verdict["state"], json!(expected), "{state}: {verdict}");
+            assert_eq!(
+                verdict["safe_to_conclude_absent"],
+                json!(false),
+                "{verdict}"
+            );
+            assert!(
+                verdict["limiting_factor"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(LOCAL_BINDING_UNRELATED),
+                "{verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_residue_beside_any_other_refusal_stays_inconclusive() {
+        let owed = "call_sites_owed: 1 of the 9 callers in the store's callers that could call \
+                    the focal have call sites the graph has not settled yet";
+        let payload = residue_payload(&[owed, NAMED_RESIDUE]);
+        let negative = json!({
+            "interpretation": "qualified_answer",
+            "trust": "inconclusive",
+            "trust_reason": format!("{owed}; {NAMED_RESIDUE}"),
+        });
+        let value = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+        assert_eq!(value["state"], json!(INCONCLUSIVE), "{value}");
+    }
+
+    #[test]
+    fn an_empty_answer_with_a_residue_never_licenses_its_absence() {
+        let mut payload = residue_payload(&[VALUE_RESIDUE]);
+        payload["references"] = json!([]);
+        payload["total_upstream"] = json!(0);
+        let negative = json!({
+            "interpretation": "absence_claimed",
+            "trust": "inconclusive",
+            "trust_reason": VALUE_RESIDUE,
+        });
+        let value = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+        assert_eq!(value["state"], json!(CERTIFIED_EXCEPT), "{value}");
+        assert_eq!(
+            value["absence_claim"],
+            json!("not_authoritative"),
+            "{value}"
+        );
+        assert_eq!(value["safe_to_conclude_absent"], json!(false), "{value}");
+    }
+
+    /// Unkeyed lookups are counted, not listed, and the answer reads complete
+    /// except that count. They are still lookups that could reach the focal,
+    /// so an empty answer beside them never licenses its absence.
+    #[test]
+    fn an_empty_answer_beside_unkeyed_lookups_never_licenses_its_absence() {
+        const UNKEYED: &str = "unkeyed_lookups_counted: 14 lookups by a name computed at run \
+                               time could reach the focal as they could reach anything their \
+                               receiver holds, and none spells a call name";
+        let mut payload = residue_payload(&[UNKEYED]);
+        payload["references"] = json!([]);
+        payload["total_upstream"] = json!(0);
+        let negative = json!({
+            "interpretation": "absence_claimed",
+            "trust": "inconclusive",
+            "trust_reason": UNKEYED,
+        });
+        let value = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+        assert_eq!(value["state"], json!(CERTIFIED_EXCEPT), "{value}");
+        assert_eq!(
+            value["limiting_factor"],
+            json!("unkeyed_lookups_counted"),
+            "{value}"
+        );
+        assert_eq!(value["safe_to_conclude_absent"], json!(false), "{value}");
+    }
+
+    #[test]
+    fn a_certified_except_response_reads_as_one_verdict() {
+        let mut response = agreeing_response();
+        response[crate::envelope::ENVELOPE_KEY][VERDICT_KEY]["state"] = json!(CERTIFIED_EXCEPT);
+        response[crate::envelope::ENVELOPE_KEY][VERDICT_KEY]["safe_to_conclude_absent"] =
+            json!(false);
+        response[crate::envelope::ENVELOPE_KEY][VERDICT_KEY]["limiting_factor"] =
+            json!("named_leftovers");
+        if let Some(negative) = response.get_mut(crate::negative::NEGATIVE_KEY) {
+            negative["trust"] = json!("inconclusive");
+            negative["safe_to_conclude_absent"] = json!(false);
+            negative["advice"] = json!("Check the listed call sites.");
+        }
+        if let Some(completeness) = response[crate::envelope::ENVELOPE_KEY].get_mut("completeness")
+        {
+            completeness["bound"] = json!("at_least");
+            completeness["counted"]["exact"] = json!(false);
+        }
+        assert_eq!(disagreements(&response), Vec::<String>::new(), "{response}");
+        // And it can never sit under a completeness that claims whole counts.
+        response[crate::envelope::ENVELOPE_KEY]["completeness"]["bound"] = json!("exact");
+        assert!(!disagreements(&response).is_empty(), "{response}");
+    }
+
+    #[test]
+    fn a_budget_cut_turns_certified_except_inconclusive() {
+        let mut annotated = json!({
+            "_kin": {"verdict": {
+                "state": CERTIFIED_EXCEPT,
+                "safe_to_conclude_absent": false,
+                "limiting_factor": "named_leftovers",
+                "inputs": {},
+            }},
+        });
+        mark_response_bounded(&mut annotated);
+        assert_eq!(annotated["_kin"]["verdict"]["state"], json!(INCONCLUSIVE));
+        assert_eq!(
+            annotated["_kin"]["verdict"]["limiting_factor"],
+            json!("response_bounded; named_leftovers")
+        );
+    }
+
     #[test]
     fn a_populated_certified_answer_claims_no_absence_and_promises_none() {
-        let payload = populated_reference_payload("present");
+        let payload = call_only_reference_payload();
         let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
         let verdict = Verdict::compute(
             "find_references",
@@ -2838,7 +4069,7 @@ mod tests {
     /// pass the check above and say nothing.
     #[test]
     fn an_empty_certified_answer_still_certifies_its_absence() {
-        let mut payload = populated_reference_payload("present");
+        let mut payload = call_only_reference_payload();
         payload["references"] = json!([]);
         payload["total_upstream"] = json!(0);
         let negative = json!({ "interpretation": "absence_claimed", "trust": "authoritative" });
@@ -3183,7 +4414,7 @@ mod tests {
             "negative": {
                 "safe_to_conclude_absent": true,
                 "trust": "authoritative",
-                "advice": "Absence is authoritative: safe to treat the target as genuinely absent/unused.",
+                "advice": "Absence is authoritative: safe to treat the target as genuinely absent or unused.",
             },
         })
     }
@@ -3449,6 +4680,87 @@ mod tests {
     /// `safe_to_conclude_absent` is `false` on any answer that claims no
     /// absence, whatever its quality. Without it the assertion below would read
     /// false in every arm and prove nothing about the mismatch.
+    /// A retrieval arm's scorer that abstained withdraws the verdict and names
+    /// the gap, and its report rides under `_kin.verdict.scorer` either way, so
+    /// a caller finds the calibrated probability where it reads the verdict.
+    #[test]
+    fn a_scorer_abstention_is_a_listed_gap_and_its_report_rides_the_verdict() {
+        let answer = |scorer: Value| {
+            json!({
+                "entities": [{"id": "e1", "name": "refill"}],
+                "degradations": [],
+                "scorer": scorer,
+            })
+        };
+        let compute = |payload: &Value| {
+            Verdict::compute("semantic_locate", payload, &Envelope::daemon(), None)
+                .expect("a retrieval payload carries a verdict")
+                .to_value()
+        };
+
+        let confident = compute(&answer(json!({
+            "name": "cross-encoder",
+            "scored": 40,
+            "threshold": 0.5,
+            "top_probability": 0.91,
+            "abstained": false,
+        })));
+        assert_ne!(
+            confident["limiting_factor"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("none_of_these"),
+            true,
+            "{confident}"
+        );
+        assert_eq!(
+            confident["inputs"]["scorer"],
+            json!(CERTIFIED),
+            "{confident}"
+        );
+        assert_eq!(confident["scorer"]["top_probability"], json!(0.91));
+
+        let abstained = compute(&answer(json!({
+            "name": "cross-encoder",
+            "scored": 40,
+            "threshold": 0.5,
+            "top_probability": 0.12,
+            "abstained": true,
+        })));
+        assert_eq!(abstained["state"], json!(INCONCLUSIVE), "{abstained}");
+        let factor = abstained["limiting_factor"].as_str().unwrap_or_default();
+        assert!(factor.contains("none_of_these"), "{abstained}");
+        assert_eq!(abstained["inputs"]["scorer"], json!(INCONCLUSIVE));
+        assert_eq!(abstained["scorer"]["abstained"], json!(true));
+        assert!(
+            CLAUSE_CODES
+                .iter()
+                .any(|entry| entry.code == "none_of_these"),
+            "the code is listed where the docs table is checked against"
+        );
+
+        // A scorer that could not run is the ledger's to report, not a second
+        // clause here.
+        let unavailable = compute(&answer(json!({
+            "name": "decision-engine",
+            "scored": 40,
+            "threshold": 0.5,
+            "abstained": false,
+            "unavailable": "not_in_build",
+        })));
+        assert!(
+            unavailable["inputs"].get("scorer").is_none(),
+            "a scorer that could not run is the ledger's to report: {unavailable}"
+        );
+
+        let no_scorer = compute(&json!({"entities": [], "degradations": []}));
+        assert!(no_scorer.get("scorer").is_none(), "{no_scorer}");
+        assert!(
+            no_scorer["inputs"].get("scorer").is_none(),
+            "an answer with no scorer lists the inputs it always did: {no_scorer}"
+        );
+    }
+
     #[test]
     fn a_query_producer_mismatch_leaves_the_answer_uncertified() {
         let clean = || {
@@ -3542,6 +4854,78 @@ mod tests {
         let scaled = compute(&corpus);
         assert_eq!(scaled["state"], json!(CERTIFIED), "{scaled}");
         assert_eq!(scaled["safe_to_conclude_absent"], json!(true), "{scaled}");
+    }
+
+    /// A policy note is disclosed and never refuses; a real degradation beside
+    /// it still does, and an entry that does not say it is a note refuses.
+    ///
+    /// Measured on a Python web framework: every `semantic_locate` reply read
+    /// inconclusive on `retrieval_degraded`, and the only entries behind it were
+    /// the surface omitting non-entity rows by design, the artifact admit limit,
+    /// and the caller's own `include_tests: false` filter. The labels here are
+    /// arbitrary on purpose: the reader decides by the entry's `severity`, not
+    /// by a list of names.
+    #[test]
+    fn a_policy_note_is_disclosed_without_refusing_the_verdict() {
+        let compute = |degradations: Value| {
+            let payload = json!({
+                "entities": [{"name": "handler"}],
+                "degradations": degradations,
+            });
+            Verdict::compute("semantic_locate", &payload, &Envelope::daemon(), None)
+                .expect("a retrieval payload carries a verdict")
+                .to_value()
+        };
+        let note = |component: &str, reason: &str| json!({"component": component, "reason": reason, "severity": "note"});
+
+        let notes_only = compute(json!([
+            note("entity_coverage", "non_entity_candidates_omitted"),
+            note("artifact_candidates", "over_admit_limit"),
+            note("graph_role_filter", "tests_withheld"),
+            note("any_surface", "any_policy"),
+        ]));
+        assert_eq!(
+            notes_only["inputs"]["degradations"],
+            json!(CERTIFIED),
+            "{notes_only}"
+        );
+
+        let mixed = compute(json!([
+            note("entity_coverage", "non_entity_candidates_omitted"),
+            {"component": "vector_index", "reason": "query_failed"},
+        ]));
+        assert_eq!(
+            mixed["inputs"]["degradations"],
+            json!(INCONCLUSIVE),
+            "{mixed}"
+        );
+        assert_eq!(
+            mixed["limiting_factor"],
+            json!("retrieval_degraded"),
+            "{mixed}"
+        );
+        assert_eq!(
+            crate::negative::payload_degradation_labels(&json!({"degradations": [
+                note("entity_coverage", "non_entity_candidates_omitted"),
+                {"component": "vector_index", "reason": "query_failed"},
+            ]})),
+            vec!["vector_index:query_failed".to_string()],
+            "a note must not be named as a degradation"
+        );
+
+        // Old payloads carry no severity, and an unknown word is not a note.
+        for severity in [None, Some("warning"), Some("NOTE")] {
+            let mut entry = json!({"component": "graph_role_filter", "reason": "tests_withheld"});
+            if let Some(severity) = severity {
+                entry["severity"] = json!(severity);
+            }
+            let refused = compute(json!([entry]));
+            assert_eq!(
+                refused["inputs"]["degradations"],
+                json!(INCONCLUSIVE),
+                "{severity:?}: {refused}"
+            );
+        }
     }
 
     /// FIR-2496. The `edge_coverage` input used to answer `certified` for an
@@ -3672,6 +5056,13 @@ mod tests {
         })
     }
 
+    fn call_only_reference_payload() -> Value {
+        let mut payload = populated_reference_payload("present");
+        payload["relation_kinds"] = json!(["calls"]);
+        payload["edge_coverage"]["requested_classes"] = json!(["calls"]);
+        payload
+    }
+
     /// FIR-2764. A populated answer whose configured spine answered incompletely
     /// is a lower bound, and the verdict has to say so.
     ///
@@ -3770,7 +5161,7 @@ mod tests {
                 }),
             ),
         ] {
-            let mut payload = populated_reference_payload("present");
+            let mut payload = call_only_reference_payload();
             payload["cross_repo"] = cross_repo;
             let negative =
                 json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
@@ -3813,7 +5204,7 @@ mod tests {
     /// contributes agreement on the healthy path instead of merely not refusing.
     #[test]
     fn a_complete_spine_certifies_as_its_own_named_input() {
-        let payload = populated_reference_payload("present");
+        let payload = call_only_reference_payload();
         let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
         let verdict = Verdict::compute(
             "find_references",
@@ -3975,11 +5366,10 @@ mod tests {
         }
     }
 
-    /// The inverse of the case above, and the half that keeps the fix from
-    /// trading a false certification for a false refusal: the same answer with
-    /// every requested class present certifies, with no limiting factor.
+    /// A present class proves that edges exist, not that every requested
+    /// non-call site was settled. Keep that gap distinct from class presence.
     #[test]
-    fn the_same_answer_with_every_class_present_still_certifies() {
+    fn present_edge_classes_do_not_establish_non_call_completion() {
         let verdict = Verdict::compute(
             "find_references",
             &populated_reference_payload("present"),
@@ -3988,10 +5378,291 @@ mod tests {
         )
         .expect("a retrieval payload carries a verdict")
         .to_value();
-        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
-        assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
+        assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+        assert_eq!(
+            verdict["limiting_factor"], "reference_completion_unmeasured",
+            "{verdict}"
+        );
         assert_eq!(verdict["inputs"]["edge_coverage"], json!(CERTIFIED));
         assert_eq!(verdict["inputs"]["absence_gate"], json!(CERTIFIED));
+    }
+
+    /// A reference payload over an escape census that took the mention
+    /// reading `mentions`, with `unkeyed` lookups counted beside it.
+    fn mention_census_payload(kinds: Value, mentions: Value, unkeyed: u64) -> Value {
+        let mut payload = populated_reference_payload("present");
+        payload["relation_kinds"] = kinds.clone();
+        payload["edge_coverage"]["requested_classes"] = kinds;
+        let mut residue = json!({ "mentions": mentions });
+        let mut clauses = Vec::new();
+        if unkeyed > 0 {
+            residue["unkeyed_lookups"] = json!({"count": unkeyed, "sites": []});
+            clauses.push(format!(
+                "unkeyed_lookups_counted: {unkeyed} lookups by a name computed at run time"
+            ));
+        }
+        payload["call_sites"] = json!({
+            "settled": clauses.is_empty(),
+            "clauses": clauses,
+            "focal_escape": {"escape": "contained", "entities_checked": 1767, "residue": residue},
+        });
+        payload
+    }
+
+    fn default_kinds() -> Value {
+        json!(["calls", "imports", "references"])
+    }
+
+    #[test]
+    fn impact_zero_consumers_need_their_own_non_call_census() {
+        let measured = mention_census_payload(
+            default_kinds(),
+            json!({"measured": true, "count": 0, "matched": {}}),
+            0,
+        );
+        let mut first = measured["call_sites"].clone();
+        first["entity_id"] = json!("first");
+        let mut impact = json!({
+            "entity_impacts": [{"entity_id": "first", "consumer_count": 0}],
+            "call_sites": first,
+        });
+        assert!(impact_consumer_absence_gaps(&impact).is_empty());
+
+        impact["call_sites"]["focal_escape"]["residue"]["mentions"]["measured"] = json!(false);
+        let gaps = impact_consumer_absence_gaps(&impact);
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].starts_with("reference_completion_unmeasured:"));
+        assert!(gaps[0].contains("first"));
+        assert!(Verdict::pre_negative_gaps(&impact).contains(&gaps[0]));
+        let verdict = Verdict::compute("impact_analysis", &impact, &Envelope::daemon(), None)
+            .unwrap()
+            .to_value();
+        assert_eq!(verdict["state"], INCONCLUSIVE);
+        assert_eq!(verdict["safe_to_conclude_absent"], false);
+        assert_eq!(verdict["inputs"]["impact_consumer_absence"], INCONCLUSIVE);
+
+        // A complete first focal must not certify an unmeasured second zero.
+        impact["call_sites"] = json!({"settled": true, "clauses": [], "focals": [first]});
+        impact["entity_impacts"] = json!([
+            {"entity_id": "first", "consumer_count": 0},
+            {"entity_id": "second", "consumer_count": 0},
+        ]);
+        let gaps = impact_consumer_absence_gaps(&impact);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("second"));
+
+        // Positive direct callers remain independently gradeable.
+        impact["entity_impacts"] = json!([{"entity_id": "second", "consumer_count": 1}]);
+        assert!(impact_consumer_absence_gaps(&impact).is_empty());
+    }
+
+    #[test]
+    fn impact_zero_with_unmatched_mentions_remains_qualified() {
+        let mut census = mention_census_payload(
+            default_kinds(),
+            json!({"measured": true, "count": 1, "matched": {},
+            "unmatched": {"count": 1, "sites": [
+                {"file": "consumer.py", "line": 4, "kind": "annotation"}
+            ]}}),
+            0,
+        )["call_sites"]
+            .clone();
+        census["entity_id"] = json!("target");
+        let impact = json!({
+            "entity_impacts": [{"entity_id": "target", "consumer_count": 0}],
+            "call_sites": census,
+        });
+        let gaps = impact_consumer_absence_gaps(&impact);
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].starts_with("reference_mentions_unmatched:"));
+        assert!(gaps[0].contains("consumer.py:4"));
+        let verdict = Verdict::compute("impact_analysis", &impact, &Envelope::daemon(), None)
+            .unwrap()
+            .to_value();
+        assert_eq!(verdict["safe_to_conclude_absent"], false);
+    }
+
+    /// The census matched every non-call read that could read the focal
+    /// against a stored row of a requested kind: non-call completion holds,
+    /// and an absence over it is authoritative.
+    #[test]
+    fn a_measured_mention_reading_with_nothing_unmatched_certifies_non_call_completion() {
+        let mentions =
+            json!({"measured": true, "count": 2, "matched": {"references": 1, "imports": 1}});
+        let payload = mention_census_payload(default_kinds(), mentions, 0);
+        assert!(Verdict::pre_negative_gaps(&payload).is_empty());
+        let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["inputs"]["reference_completion"],
+            json!(CERTIFIED),
+            "{verdict}"
+        );
+
+        // `_make_timedelta`: nothing reads it, so the empty answer is an
+        // authoritative absence.
+        let mut empty = mention_census_payload(
+            default_kinds(),
+            json!({"measured": true, "count": 0, "matched": {}}),
+            0,
+        );
+        empty["references"] = json!([]);
+        empty["total_upstream"] = json!(0);
+        let result = crate::finalize_with_envelope(
+            crate::types::ToolCallResult::text(empty.to_string()),
+            Envelope::daemon().with_health(&json!({
+                "initialized": true, "graph_loaded": true, "graph_generation": 12,
+            })),
+            "find_references",
+        );
+        let crate::types::ContentBlock::Text { text } = &result.content[0];
+        let response: Value = serde_json::from_str(text).unwrap();
+        let verdict = &response["_kin"]["verdict"];
+        assert!(
+            !verdict["limiting_factor"].as_str().is_some_and(|factor| {
+                factor.contains("reference_completion_unmeasured")
+                    || factor.contains("reference_mentions_unmatched")
+            }),
+            "{response}"
+        );
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{response}");
+        assert_eq!(verdict["safe_to_conclude_absent"], true, "{response}");
+    }
+
+    /// A focal with members is referenced through them without its name
+    /// being spelled, so a measured reading still certifies its imports and
+    /// never its references.
+    #[test]
+    fn a_reading_over_a_focal_with_members_certifies_imports_and_not_references() {
+        let mentions = json!({"measured": true, "count": 1, "matched": {"imports": 1},
+            "references_unmeasured": "the focal holds members"});
+        let imports = mention_census_payload(json!(["imports"]), mentions.clone(), 0);
+        assert!(reference_completion_gap(&imports).is_none());
+        for kinds in [json!(["references"]), json!(["imports", "references"])] {
+            let payload = mention_census_payload(kinds, mentions.clone(), 0);
+            assert!(reference_completion_gap(&payload)
+                .is_some_and(|gap| gap.starts_with("reference_completion_unmeasured")));
+        }
+    }
+
+    /// A read no stored row carries keeps a gap of its own, which names the
+    /// file and line rather than calling all of non-call completion
+    /// unmeasured, and is a listed residue.
+    #[test]
+    fn an_unmatched_mention_keeps_a_gap_that_names_its_file_and_line() {
+        let mentions = json!({
+            "measured": true,
+            "count": 3,
+            "matched": {"references": 2},
+            "unmatched": {"count": 1, "sites": [
+                {"file": "src/flask/cli.py", "line": 42, "kind": "comparison", "name": "find_best_app"},
+            ]},
+        });
+        let payload = mention_census_payload(default_kinds(), mentions, 0);
+        let gaps = Verdict::pre_negative_gaps(&payload);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].starts_with("reference_mentions_unmatched: 1 non-call reads"),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps[0].contains("src/flask/cli.py:42 (comparison)"),
+            "{gaps:?}"
+        );
+        assert!(!gaps[0].contains(CLAUSE_SEPARATOR), "{gaps:?}");
+        let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+            .unwrap()
+            .to_value();
+        assert_eq!(
+            verdict["limiting_factor"], "reference_mentions_unmatched",
+            "{verdict}"
+        );
+        assert_eq!(verdict["state"], json!(CERTIFIED_EXCEPT), "{verdict}");
+        assert_eq!(verdict["safe_to_conclude_absent"], false, "{verdict}");
+    }
+
+    /// Rows of a kind the query did not ask for are not in its answer.
+    #[test]
+    fn a_read_carried_only_by_an_unrequested_kind_is_unmatched_for_that_query() {
+        let mentions =
+            json!({"measured": true, "count": 2, "matched": {"references": 1, "imports": 1}});
+        let payload = mention_census_payload(json!(["references"]), mentions.clone(), 0);
+        let gaps = Verdict::pre_negative_gaps(&payload);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].starts_with("reference_mentions_unmatched:"),
+            "{gaps:?}"
+        );
+        assert!(gaps[0].contains("carried only by imports rows"), "{gaps:?}");
+        let both = mention_census_payload(json!(["imports", "References"]), mentions, 0);
+        assert!(Verdict::pre_negative_gaps(&both).is_empty());
+    }
+
+    /// A store whose records predate the mention reading, or a census that
+    /// took none, keeps `reference_completion_unmeasured`, as before.
+    #[test]
+    fn records_that_predate_mentions_keep_reference_completion_unmeasured() {
+        let unlisted = mention_census_payload(
+            default_kinds(),
+            json!({"measured": false, "reason": "a source unit of the domain has a value-occurrence record that lists no mentions"}),
+            0,
+        );
+        let mut unknown = populated_reference_payload("present");
+        unknown["call_sites"] = json!({
+            "settled": true,
+            "clauses": [],
+            "focal_escape": {"escape": "unknown", "reason": "the selected tree could not be read"},
+        });
+        let mut untaken = mention_census_payload(default_kinds(), json!({}), 0);
+        untaken["call_sites"]["focal_escape"]["residue"] = json!({});
+        for payload in [unlisted, unknown, untaken] {
+            let gaps = Verdict::pre_negative_gaps(&payload);
+            assert_eq!(gaps.len(), 1, "{gaps:?}");
+            assert_eq!(
+                gaps,
+                vec!["reference_completion_unmeasured: non-call completion is unmeasured"],
+                "word for word what it was"
+            );
+            let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+                .unwrap()
+                .to_value();
+            assert_eq!(
+                verdict["limiting_factor"], "reference_completion_unmeasured",
+                "{verdict}"
+            );
+            assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+        }
+    }
+
+    /// `SessionInterface.open_session`: lookups by a computed name could
+    /// reach it, which bounds its non-call reads exactly as it bounds its
+    /// calls, under the call census's own code.
+    #[test]
+    fn an_unkeyed_lookup_bounds_non_call_completion_under_its_own_code() {
+        let mentions = json!({"measured": true, "count": 2, "matched": {"references": 2}});
+        let payload = mention_census_payload(default_kinds(), mentions, 14);
+        let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+            .unwrap()
+            .to_value();
+        assert_eq!(
+            verdict["limiting_factor"], "unkeyed_lookups_counted",
+            "{verdict}"
+        );
+        assert_eq!(verdict["state"], json!(CERTIFIED_EXCEPT), "{verdict}");
+        assert_eq!(
+            verdict["inputs"]["reference_completion"],
+            json!(INCONCLUSIVE)
+        );
+        let gaps = Verdict::pre_negative_gaps(&payload);
+        assert_eq!(
+            gaps.iter()
+                .filter(|gap| gap.starts_with("unkeyed_lookups_counted"))
+                .count(),
+            1,
+            "the call census and the reference reading name one gap once: {gaps:?}"
+        );
     }
 
     /// The budget path downgrades every verdict surface together. Leaving
@@ -4022,7 +5693,9 @@ mod tests {
             inputs.insert("completeness".to_string(), json!(CERTIFIED));
             inputs.insert("graph_freshness".to_string(), json!(unknown_state));
             Verdict {
+                scorer: None,
                 certified: false,
+                except_residue: false,
                 absence_claim: AbsenceClaim::NotAuthoritative,
                 limiting_factor: Some("graph_freshness: the store is stale".to_string()),
                 inputs,
@@ -4053,7 +5726,9 @@ mod tests {
         inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
         inputs.insert("completeness".to_string(), json!(INCONCLUSIVE));
         let verdict = Verdict {
+            scorer: None,
             certified: false,
+            except_residue: false,
             absence_claim: AbsenceClaim::NotAuthoritative,
             limiting_factor: Some("completeness: unknown".to_string()),
             inputs,
@@ -4395,7 +6070,7 @@ mod tests {
         }
 
         fn verdict_over(block: Option<Value>) -> Value {
-            let mut payload = populated_reference_payload("present");
+            let mut payload = call_only_reference_payload();
             if let Some(block) = block {
                 payload[crate::call_sites::CALL_SITES_KEY] = block;
             }
@@ -4459,8 +6134,7 @@ mod tests {
                 },
             ]);
             tally.add(&CallerSites::OwedEnrichment);
-            let block =
-                crate::call_sites::block_json(&tally, "the files that import the focal's file");
+            let block = crate::call_sites::block_json(&tally, crate::call_sites::FAMILY_SCOPE);
             for clause in block["clauses"].as_array().expect("clauses") {
                 let clause = clause.as_str().expect("a clause is a string");
                 assert!(

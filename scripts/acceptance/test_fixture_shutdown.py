@@ -57,6 +57,14 @@ class FixtureShutdownTests(unittest.TestCase):
             suite.responses = []
         else:
             suite.payloads = {}
+            # These controls grade stop replies. Store discovery has separate
+            # controls for central, in-tree, malformed and foreign bindings.
+            def discovered(repo):
+                store = Path(repo) / ".kin"
+                if not (store / "manifest.json").is_file():
+                    raise module.ProbeError("fixture manifest missing")
+                return str(store)
+            suite.store_path = mock.Mock(side_effect=discovered)
         return suite
 
     def test_foreign_or_reused_pid_never_authorizes_a_signal(self):

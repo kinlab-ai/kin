@@ -321,6 +321,8 @@ jobs:
             sampler=$!
           fi
           rc=0
+          # Default archives include graph/vector and optional HTTP support.
+          # Local inference is available in explicitly enabled source builds.
           cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon || rc=$?
           if [ -n "$sampler" ]; then
             kill "$sampler" 2>/dev/null || true
@@ -418,25 +420,24 @@ jobs:
               `does not match tagged Cargo.lock ${tagLockSha}`
             );
           }
-          // Every published archive now carries semantic search. This used to
-          // run only for the one leg that stripped the features, which meant no
-          // leg ever asserted they were PRESENT; a silent feature regression on
-          // any platform would have shipped green. Assert it everywhere.
-          //
-          // `metal` reports the compiled backend rather than the marker cargo
-          // feature (bench_meta.rs `metal_active()` is
-          // `cfg!(target_os = "macos")`), so it is expected on macOS and is a
-          // defect anywhere else.
-          for (const feature of ["vector", "embeddings"]) {
+          // Attest the measured default archive profile on every target.
+          for (const feature of ["vector", "external-embeddings"]) {
             if (!meta.feature_flags.includes(feature)) {
               throw new Error(`release build for ${process.env.TARGET} did not enable ${feature}`);
             }
           }
-          const expectMetal = process.env.TARGET.includes("apple-darwin");
-          if (meta.feature_flags.includes("metal") !== expectMetal) {
-            throw new Error(
-              `release build for ${process.env.TARGET} reported metal=${meta.feature_flags.includes("metal")}, expected ${expectMetal}`
-            );
+          for (const feature of ["embeddings", "metal"]) {
+            if (meta.feature_flags.includes(feature)) {
+              throw new Error(`default release build unexpectedly enabled ${feature}`);
+            }
+          }
+          if (meta.embeddings?.vector_enabled !== true ||
+              meta.embeddings?.embeddings_enabled !== true ||
+              meta.embeddings?.local_inference_enabled !== false ||
+              meta.embeddings?.external_embeddings_enabled !== true ||
+              meta.embeddings?.metal_enabled !== false ||
+              meta.embeddings?.provider !== "none") {
+            throw new Error("release metadata does not attest the engine-free default archive profile");
           }
           NODE
 

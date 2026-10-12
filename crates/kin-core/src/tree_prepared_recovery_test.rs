@@ -18,6 +18,7 @@ enum SealFault {
 
 struct Fixture {
     root: tempfile::TempDir,
+    layout: crate::layout::KinLayout,
     authority: RepositoryAuthorityManager<LocalFileBackend>,
     observed: kin_db::GraphSnapshot,
     target: ResolvedTree,
@@ -60,6 +61,7 @@ impl Fixture {
         let transaction = Self::transaction(&authority, &target);
         Self {
             root,
+            layout: initialized.layout,
             authority,
             observed,
             target,
@@ -111,11 +113,13 @@ impl Fixture {
             merge_transaction_delta: None,
             sealed_observation: None,
             collaboration_delta: None,
+            git_snapshot_proofs: Vec::new(),
         }
     }
     fn reopen(self) -> Self {
         let Self {
             root,
+            layout,
             authority,
             observed,
             target,
@@ -123,7 +127,6 @@ impl Fixture {
         } = self;
         let repository_id = transaction.repository_id.clone();
         drop(authority);
-        let layout = crate::layout::KinLayout::new(root.path().join(".kin"));
         let authority = RepositoryAuthorityManager::open(
             repository_id,
             Arc::new(LocalFileBackend::new(layout.kindb_dir())),
@@ -131,6 +134,7 @@ impl Fixture {
         .unwrap();
         Self {
             root,
+            layout,
             authority,
             observed,
             target,
@@ -265,11 +269,18 @@ impl Fixture {
         assert_eq!(self.source("second.yaml").unwrap(), b"second: true\n");
     }
 }
+fn reconciliation_dir(root: &Path) -> PathBuf {
+    crate::layout::locate_store(root)
+        .expect("initialized fixture store remains discoverable")
+        .root()
+        .join("reconciliation")
+}
+
 fn assert_locked(root: &Path) {
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(root.join(".kin/reconciliation/projection.lock"))
+        .open(reconciliation_dir(root).join("projection.lock"))
         .unwrap();
     assert!(
         fs2::FileExt::try_lock_exclusive(&f).is_err(),
@@ -277,7 +288,7 @@ fn assert_locked(root: &Path) {
     );
 }
 fn assert_no_wal(root: &Path) {
-    assert!(!std::fs::read_dir(root.join(".kin/reconciliation"))
+    assert!(!std::fs::read_dir(reconciliation_dir(root))
         .unwrap()
         .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("tx-")));
 }
@@ -477,9 +488,8 @@ fn prepared_recovery_startup_session_callback_keeps_custody_without_lock_recursi
                 assert!(wal.exists(), "cleanup preceded session finalization");
                 assert_locked(f.root.path());
                 let backend_lock = std::fs::File::open(
-                    f.root
-                        .path()
-                        .join(".kin/kindb")
+                    f.layout
+                        .kindb_dir()
                         .join(f.transaction.repository_id.as_str()),
                 )
                 .unwrap();
@@ -652,9 +662,8 @@ fn prepared_recovery_startup_missing_required_session_payload_preserves_wal() {
         .unwrap();
     drop(freeze);
     let directory = f
-        .root
-        .path()
-        .join(".kin/kindb")
+        .layout
+        .kindb_dir()
         .join(f.transaction.repository_id.as_str())
         .join("session-publications");
     let records = std::fs::read_dir(&directory)
@@ -786,9 +795,9 @@ fn prepared_recovery_competing_eject_refuses_before_any_wal_mutation() {
     let wal = f.wal(f.marker(), 1);
     let before = f.source("first.yaml");
     let eject = f
-        .root
-        .path()
-        .join(".kin/reconciliation")
+        .layout
+        .root()
+        .join("reconciliation")
         .join(EXACT_EJECT_JOURNAL_FILE);
     std::fs::write(&eject, b"invalid competing eject evidence").unwrap();
     assert!(recover_prepared_session_workspace(
@@ -850,9 +859,8 @@ fn prepared_recovery_finalizer_error_and_unwind_drop_custody_before_authority_an
                     root: f.root.path(),
                     dropped: &dropped,
                     authority_lock: Some(
-                        f.root
-                            .path()
-                            .join(".kin/kindb")
+                        f.layout
+                            .kindb_dir()
                             .join(f.transaction.repository_id.as_str()),
                     ),
                 },
@@ -868,7 +876,7 @@ fn prepared_recovery_finalizer_error_and_unwind_drop_custody_before_authority_an
         assert!(dropped.get());
         assert!(result.is_err() || result.unwrap().is_err());
         f.assert_target();
-        assert!(std::fs::read_dir(f.root.path().join(".kin/reconciliation"))
+        assert!(std::fs::read_dir(f.layout.root().join("reconciliation"))
             .unwrap()
             .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("tx-")));
     }
@@ -976,9 +984,9 @@ fn prepared_recovery_post_lock_open_refusal_drops_custody_while_lock_is_held() {
     let f = Fixture::new();
     let prepared = f.prepare();
     let key = f
-        .root
-        .path()
-        .join(".kin/reconciliation")
+        .layout
+        .root()
+        .join("reconciliation")
         .join(RECONCILIATION_AUTHORITY_FILE);
     std::fs::write(&key, b"invalid authority key").unwrap();
     let dropped = Cell::new(false);
@@ -1601,4 +1609,321 @@ fn watermark_generic_projection_open_refuses_truncated_pending_log() {
     assert!(wal.exists());
     assert_eq!(f.source("first.yaml").unwrap(), b"first: true\n");
     assert_eq!(f.source("second.yaml").unwrap(), b"second: true\n");
+}
+
+/// Move the admitted store out of its discoverable position without adding
+/// an index entry. Only the caller's explicit layout can find this authority.
+fn relocate_recovery_store(mut f: Fixture) -> (Fixture, tempfile::TempDir) {
+    let destination = tempfile::tempdir().unwrap();
+    let store = destination.path().join("selected-store");
+    std::fs::rename(f.layout.root(), &store).unwrap();
+    crate::layout::write_working_tree_record(&store, f.root.path()).unwrap();
+    f.layout = crate::KinLayout::new(store);
+    f.authority = RepositoryAuthorityManager::open(
+        f.transaction.repository_id.clone(),
+        Arc::new(LocalFileBackend::new(f.layout.kindb_dir())),
+    )
+    .unwrap();
+    (f, destination)
+}
+
+#[test]
+fn selected_authority_recovers_ordinary_wal_without_store_discovery() {
+    let f = Fixture::new();
+    let wal_name = f.wal(f.marker(), 1).file_name().unwrap().to_owned();
+    let (f, _store_owner) = relocate_recovery_store(f);
+    let wal = f
+        .layout
+        .root()
+        .join(RECONCILIATION_CONTROL_DIRECTORY)
+        .join(wal_name);
+    assert!(ExactProjectionFreeze::acquire_existing(f.root.path()).is_err());
+    recover_repository_projection_before_hydration(f.root.path(), &f.authority).unwrap();
+    assert!(!wal.exists());
+    assert!(f.source("first.yaml").is_none());
+    assert_eq!(
+        f.authority.read_authority().roots(),
+        &f.transaction.expected_roots
+    );
+    assert!(!f.root.path().join(".kin").exists());
+}
+
+#[test]
+fn selected_authority_recovers_prepared_wal_without_store_discovery() {
+    let f = Fixture::new();
+    let prepared = f.prepare();
+    let wal_name = f.wal(f.marker(), 1).file_name().unwrap().to_owned();
+    let (f, _store_owner) = relocate_recovery_store(f);
+    let recovered = recover_prepared_session_workspace(
+        f.root.path(),
+        &f.authority,
+        prepared,
+        (),
+        |freeze, _| freeze.revalidate_namespace(),
+        |_, receipt, frozen, _| {
+            assert_eq!(frozen.roots(), &receipt.roots_after);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let (_, _, frozen, disposition) = recovered.into_parts();
+    drop(frozen);
+    assert_eq!(disposition, PreparedRecoveryDisposition::ActivePublished);
+    f.assert_target();
+    assert!(!f
+        .layout
+        .root()
+        .join(RECONCILIATION_CONTROL_DIRECTORY)
+        .join(wal_name)
+        .exists());
+    assert!(!f.root.path().join(".kin").exists());
+}
+
+#[test]
+fn selected_authority_refuses_another_working_tree_before_wal_recovery() {
+    let f = Fixture::new();
+    let wal_name = f.wal(f.marker(), 1).file_name().unwrap().to_owned();
+    let (f, _store_owner) = relocate_recovery_store(f);
+    let other_tree = tempfile::tempdir().unwrap();
+    let error = recover_repository_projection_before_hydration(other_tree.path(), &f.authority)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("selected projection store"),
+        "{error}"
+    );
+    assert!(f
+        .layout
+        .root()
+        .join(RECONCILIATION_CONTROL_DIRECTORY)
+        .join(wal_name)
+        .exists());
+    assert_eq!(f.source("first.yaml").unwrap(), b"first: true\n");
+    assert_eq!(
+        f.authority.read_authority().roots(),
+        &f.transaction.expected_roots
+    );
+}
+
+#[test]
+fn selected_authority_retains_store_identity_during_projection_recovery() {
+    let (f, _store_owner) = relocate_recovery_store(Fixture::new());
+    let freeze =
+        ExactProjectionFreeze::acquire_existing_for_authority(f.layout.working_dir(), &f.authority)
+            .unwrap();
+    let displaced = f.layout.root().with_extension("displaced");
+    std::fs::rename(f.layout.root(), &displaced).unwrap();
+    copy_recovery_store(&displaced, f.layout.root());
+    let error = freeze.revalidate_namespace().unwrap_err();
+    assert!(error.to_string().contains("replaced while"), "{error}");
+    assert!(displaced.join(RECONCILIATION_CONTROL_DIRECTORY).is_dir());
+    assert!(!f.root.path().join(".kin").exists());
+}
+
+#[test]
+fn selected_authority_publishes_source_changes_without_store_discovery() {
+    for mode in ["reconcile", "authored", "observed"] {
+        let (f, _store_owner) = relocate_recovery_store(Fixture::new());
+        let owned =
+            load_repository_projection_entries(&f.authority, &f.target, "selected store").unwrap();
+        let entries = || {
+            owned
+                .iter()
+                .map(|e| (&e.path, e.kind, e.content.as_slice()))
+        };
+        if mode != "reconcile" {
+            for entry in &owned {
+                std::fs::write(f.root.path().join(entry.path.to_string()), &entry.content).unwrap();
+            }
+        }
+        let result = match mode {
+            "reconcile" => reconcile_source_tree_and_commit_repository_transaction(
+                f.root.path(),
+                &f.observed.resolved_tree,
+                &f.target,
+                std::iter::empty(),
+                entries(),
+                &f.authority,
+                f.transaction.clone(),
+                None,
+            ),
+            "authored" => reconcile_source_tree_and_commit_authored_repository_transaction(
+                f.root.path(),
+                &f.observed.resolved_tree,
+                &f.target,
+                std::iter::empty(),
+                entries(),
+                &f.authority,
+                f.transaction.clone(),
+                &owned.iter().map(|entry| entry.path.clone()).collect(),
+                None,
+            ),
+            "observed" => verify_observed_target_tree_and_commit_repository_transaction(
+                f.root.path(),
+                &f.observed.resolved_tree,
+                &f.target,
+                std::iter::empty(),
+                entries(),
+                &f.authority,
+                f.transaction.clone(),
+                None,
+            ),
+            _ => unreachable!(),
+        };
+        result.unwrap_or_else(|error| panic!("{mode}: {error}"));
+        f.assert_target();
+        // Publish a real metadata transition while the source tree stays
+        // unchanged. Repeating the same tree with no other change is a no-op
+        // transaction and cannot exercise the unchanged-projection seam.
+        let mut unchanged = Fixture::transaction(&f.authority, &f.target);
+        let expected_head = kin_model::WorkspaceHead::Symbolic {
+            target: kin_model::RefName::branch(b"selected-store-proof").unwrap(),
+        };
+        let mutation = unchanged.workspace_mutation.as_mut().unwrap();
+        let workspace_id = mutation.workspace_id;
+        mutation.new_head = expected_head.clone();
+        unchanged.validate().unwrap();
+        let expected_generation = unchanged.expected_generation + 1;
+        let (_, receipt) = verify_unchanged_source_tree_and_commit_repository_transaction(
+            f.root.path(),
+            &f.target,
+            entries(),
+            &f.authority,
+            unchanged,
+            None,
+        )
+        .unwrap();
+        assert_eq!(receipt.generation, expected_generation);
+        let f = f.reopen();
+        recover_repository_projection_before_hydration(f.root.path(), &f.authority).unwrap();
+        f.assert_target();
+        let selected = f.authority.read_authority();
+        let workspace = selected
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+        assert_eq!(workspace.head, expected_head);
+        assert!(!f.root.path().join(".kin").exists());
+    }
+}
+
+fn copy_recovery_store(source: &Path, destination: &Path) {
+    std::fs::create_dir(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_recovery_store(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn selected_authority_without_binding_cannot_use_another_in_tree_control() {
+    let f = Fixture::new();
+    let selected_store = f.root.path().join("unbound-store");
+    copy_recovery_store(f.layout.root(), &selected_store);
+    crate::layout::remove_working_tree_record(&selected_store).unwrap();
+    let decoy = f.root.path().join(".kin");
+    if !decoy.exists() {
+        copy_recovery_store(f.layout.root(), &decoy);
+    }
+    let selected = RepositoryAuthorityManager::open(
+        f.transaction.repository_id.clone(),
+        Arc::new(LocalFileBackend::new(selected_store.join("kindb"))),
+    )
+    .unwrap();
+    let error = ExactProjectionFreeze::acquire_existing_for_authority(f.root.path(), &selected)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("has no working-tree record"),
+        "{error}"
+    );
+    assert!(decoy.join(RECONCILIATION_CONTROL_DIRECTORY).is_dir());
+    assert_eq!(
+        f.authority.read_authority().roots(),
+        &f.transaction.expected_roots
+    );
+}
+
+#[test]
+fn selected_authority_refuses_copied_store_before_recovering_wal() {
+    for replace_with_copy in [false, true] {
+        let f = Fixture::new();
+        let wal_name = f.wal(f.marker(), 1).file_name().unwrap().to_owned();
+        let (f, _store_owner) = relocate_recovery_store(f);
+        let wal = f
+            .layout
+            .root()
+            .join(RECONCILIATION_CONTROL_DIRECTORY)
+            .join(&wal_name);
+        if !replace_with_copy {
+            // Moving the original directories preserves the WAL identities.
+            // Prove that this setup recovers before testing bytewise replacement.
+            recover_repository_projection_before_hydration(f.root.path(), &f.authority).unwrap();
+            assert!(!wal.exists());
+            assert!(f.source("first.yaml").is_none());
+        } else {
+            let descriptor = Path::new(RECONCILIATION_CONTROL_DIRECTORY)
+                .join(&wal_name)
+                .join(RECONCILIATION_MANIFEST_FILE);
+            let descriptor_before = std::fs::read(f.layout.root().join(&descriptor)).unwrap();
+            let displaced = f.layout.root().with_extension("original");
+            std::fs::rename(f.layout.root(), &displaced).unwrap();
+            copy_recovery_store(&displaced, f.layout.root());
+            let error = recover_repository_projection_before_hydration(f.root.path(), &f.authority)
+                .unwrap_err();
+            // The copied WAL is authenticated, but its retained directory
+            // identities name the original store, before the backend freeze.
+            assert!(
+                error
+                    .to_string()
+                    .contains("WAL descriptor does not name this exact projection"),
+                "{error}"
+            );
+            for store in [f.layout.root(), displaced.as_path()] {
+                assert!(store
+                    .join(RECONCILIATION_CONTROL_DIRECTORY)
+                    .join(&wal_name)
+                    .exists());
+                assert_eq!(
+                    std::fs::read(store.join(&descriptor)).unwrap(),
+                    descriptor_before
+                );
+            }
+            assert_eq!(f.source("first.yaml").unwrap(), b"first: true\n");
+        }
+        assert!(f.source("second.yaml").is_none());
+        assert_eq!(
+            f.authority.read_authority().roots(),
+            &f.transaction.expected_roots
+        );
+    }
+}
+
+#[test]
+fn selected_authority_refuses_a_noncanonical_backend_inside_the_store() {
+    let f = Fixture::new();
+    let alternate = f.layout.root().join("other-db");
+    copy_recovery_store(&f.layout.kindb_dir(), &alternate);
+    let selected = RepositoryAuthorityManager::open(
+        f.transaction.repository_id.clone(),
+        Arc::new(LocalFileBackend::new(&alternate)),
+    )
+    .unwrap();
+    let error = ExactProjectionFreeze::acquire_existing_for_authority(f.root.path(), &selected)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not in a store's kindb directory"),
+        "{error}"
+    );
+    assert_eq!(
+        f.authority.read_authority().roots(),
+        &f.transaction.expected_roots
+    );
 }

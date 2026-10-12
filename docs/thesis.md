@@ -55,7 +55,7 @@ NFS is a secondary exploration, not a day-one dependency.
 ### 3. Agent integration (MCP)
 Kin's built-in MCP server exposes semantic primitives directly to AI agents. Instead of
 giving an assistant raw directory reads and grep loops, it calls semantic endpoints
-(`get_context_pack`, `trace_data_flow`, `semantic_locate`) to interact directly with code
+(`context`, `trace`, `locate`) to interact directly with code
 structure.
 
 ---

@@ -13,6 +13,11 @@ use std::hash::BuildHasherDefault;
 
 use crate::capability::{CapabilityDetection, LocateProfile};
 
+mod cards;
+mod evidence;
+pub mod scorer;
+pub use cards::warm_entity_cards;
+
 /// Deterministic-iteration map for transient locate accumulators. Fixed-seed
 /// hashing keeps fusion/resolution iteration order stable across processes so
 /// float score accumulation and tie-breaks are bit-reproducible.
@@ -100,6 +105,16 @@ pub struct LocateResult {
     /// only; never serialized.
     #[serde(skip)]
     pub score_composition: Option<ScoreComposition>,
+    /// The retrieval arm that produced this answer ([`crate::retrieval_arm`]),
+    /// when it is not the default. Absent on the default arm, so its answers
+    /// serialize exactly as they did before the switch existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_arm: Option<String>,
+    /// What the candidate scorer did, on an arm that runs one: which scorer,
+    /// how many rows it read, the best calibrated probability, the threshold,
+    /// and whether it abstained. `kin-mcp` lifts it into `_kin.verdict.scorer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<scorer::ScorerReport>,
 }
 
 /// Score-composition regime of a locate ranking (see
@@ -108,13 +123,25 @@ pub struct LocateResult {
 pub enum ScoreComposition {
     DirectEntityOrdered,
     RrfComposed,
+    /// The entity ranking is the description's own evidence ranking
+    /// ([`rank_description_entities_first`]), not a projection of the file
+    /// ranking. It already weighs every identifier the description spells, so
+    /// the automatic identifier variant has nothing to add to it.
+    EntityFirst,
 }
 
 /// One retrieval capability that did not fully run for a query, with the
 /// reason and the operator remediation. Serialized on `LocateResult` and on
 /// the agent-facing `semantic_locate` payload; also logged at WARN by the
 /// daemon so degraded serving is visible on both sides of the boundary.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+///
+/// The ledger also carries policy notes: entries that record a filter or a
+/// by-design omission this run applied, not a capability it lost. Which entries
+/// are notes is decided by [`RetrievalPolicyNote`] and published on the wire as
+/// `severity: "note"`; every other entry serializes without the field, and a
+/// reader treats an entry without it as refusing. See
+/// [`RetrievalDegradation::severity`].
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct RetrievalDegradation {
     /// Which capability degraded: `vector_index`, `cross_encoder`, ….
     pub component: String,
@@ -122,11 +149,192 @@ pub struct RetrievalDegradation {
     /// `model_not_cached`, `init_failed`, `latency_budget_exceeded`, …).
     pub reason: String,
     /// Human-readable specifics (counts, elapsed times, model ids).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub detail: String,
     /// What restores full capability (`run 'kin embed'`, …).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub remediation: String,
+}
+
+/// Whether a degradation entry bounds how far the answer can be trusted.
+///
+/// `Refusing` is the default and the only reading an entry without a
+/// `severity` field gets, so a payload minted before this field existed, or by
+/// a producer that does not know it, keeps refusing exactly as it did.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationSeverity {
+    /// The run lost a capability or cut its answer short. A verdict reader
+    /// refuses to certify on it.
+    #[default]
+    Refusing,
+    /// The run applied a policy or a filter by design and records it so the
+    /// caller can see it. It stays in `degradations[]` and never refuses.
+    Note,
+}
+
+impl DegradationSeverity {
+    /// Serde predicate: the default is never written.
+    pub fn is_refusing(&self) -> bool {
+        *self == Self::Refusing
+    }
+}
+
+/// Every ledger entry that records a policy rather than a lost capability.
+///
+/// This list is the whole of what a note is. An entry is a note because its
+/// `component` and `reason` name one of these, and for no other reason, so the
+/// set is reviewed in one place and a recording site cannot mark a real
+/// degradation as a note by accident. Each producer builds its entry through
+/// [`Self::degradation`], which keeps the name it writes and the name this
+/// list reads the same string.
+///
+/// What belongs here is a fact about how this run was ASKED or SCOPED: a filter
+/// the caller chose, a limit the surface applies to every query, a kind of row
+/// the surface withholds by design. What never belongs here is a fact about
+/// how the run WENT: a vector index that failed, a budget that cut the answer,
+/// an ambiguous name or receiver-name candidates. Those bound the answer and
+/// keep refusing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetrievalPolicyNote {
+    /// `include_tests: false` kept test-role source paths out of ranking. The
+    /// caller chose the filter and can lift it.
+    TestsWithheldByFilter,
+    /// More tracked artifacts matched the query's text than the ranking admits.
+    /// The admit limit is the same for every query.
+    ArtifactCandidatesOverAdmitLimit,
+    /// The semantic surface omitted ranked candidates that carry no semantic
+    /// entity. It serves entities only, by design, for every query.
+    NonEntityCandidatesOmitted,
+    /// No returned entity was literally named by a description-shaped query.
+    /// Guidance about reading the ranking, not a lost signal.
+    DescriptionQueryShape,
+    /// The configured retrieval arm ranks without embeddings by design
+    /// ([`crate::retrieval_arm`]). The answer lost no signal it was asked for.
+    EmbeddingsNotUsedByArm,
+    /// The description asked about test code, so test code was ranked without
+    /// the caller passing `include_tests` ([`description_asks_for_tests`]).
+    TestsRankedForQuestion,
+    /// The caller confined the rows to a module path with `scope`, and the
+    /// ranked rows outside it were left out.
+    RowsConfinedToScope,
+    /// The caller asked for `sort`, and the most relevant rows were re-ordered
+    /// by where each sits in the call graph.
+    LeadingRowsSorted,
+}
+
+impl RetrievalPolicyNote {
+    /// Every note, for lookup.
+    pub const ALL: [Self; 8] = [
+        Self::TestsWithheldByFilter,
+        Self::ArtifactCandidatesOverAdmitLimit,
+        Self::NonEntityCandidatesOmitted,
+        Self::DescriptionQueryShape,
+        Self::EmbeddingsNotUsedByArm,
+        Self::TestsRankedForQuestion,
+        Self::RowsConfinedToScope,
+        Self::LeadingRowsSorted,
+    ];
+
+    /// The `component` the entry is recorded under.
+    pub fn component(self) -> &'static str {
+        match self {
+            Self::TestsWithheldByFilter => "graph_role_filter",
+            Self::ArtifactCandidatesOverAdmitLimit => "artifact_candidates",
+            Self::NonEntityCandidatesOmitted => "entity_coverage",
+            Self::DescriptionQueryShape => kin_mcp::negative::QUERY_SHAPE_COMPONENT,
+            Self::EmbeddingsNotUsedByArm => "retrieval_arm",
+            Self::TestsRankedForQuestion => kin_mcp::negative::QUESTION_SCOPE_COMPONENT,
+            Self::RowsConfinedToScope | Self::LeadingRowsSorted => "caller_order",
+        }
+    }
+
+    /// The `reason` the entry is recorded under.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TestsWithheldByFilter => "tests_withheld",
+            Self::ArtifactCandidatesOverAdmitLimit => "over_admit_limit",
+            Self::NonEntityCandidatesOmitted => "non_entity_candidates_omitted",
+            Self::DescriptionQueryShape => kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON,
+            Self::EmbeddingsNotUsedByArm => "embeddings_not_used",
+            Self::TestsRankedForQuestion => kin_mcp::negative::TESTS_RANKED_FOR_QUESTION_REASON,
+            Self::RowsConfinedToScope => "rows_in_scope",
+            Self::LeadingRowsSorted => "leading_rows_sorted",
+        }
+    }
+
+    /// The note an entry with this identity records, if it records one.
+    pub fn of(component: &str, reason: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|note| note.component() == component && note.reason() == reason)
+    }
+
+    /// The ledger entry for this note.
+    pub fn degradation(
+        self,
+        detail: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> RetrievalDegradation {
+        RetrievalDegradation {
+            component: self.component().to_string(),
+            reason: self.reason().to_string(),
+            detail: detail.into(),
+            remediation: remediation.into(),
+        }
+    }
+}
+
+impl RetrievalDegradation {
+    /// Whether this entry refuses or only notes, read off its identity against
+    /// [`RetrievalPolicyNote`].
+    pub fn severity(&self) -> DegradationSeverity {
+        if RetrievalPolicyNote::of(&self.component, &self.reason).is_some() {
+            DegradationSeverity::Note
+        } else {
+            DegradationSeverity::Refusing
+        }
+    }
+}
+
+/// Written by hand so the wire carries [`RetrievalDegradation::severity`]
+/// beside the four stored fields, in the order the derived form always wrote
+/// them, with `severity` omitted for a refusing entry. A reader that has never
+/// heard of the field sees exactly the payload it always did for every entry
+/// that refuses.
+///
+/// Deserialization ignores an incoming `severity`: the note list is the one
+/// authority, so an entry read back and written again is classified the same
+/// way it was the first time, and an entry this build does not list as a note
+/// is written back refusing.
+impl Serialize for RetrievalDegradation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let severity = self.severity();
+        let fields = 2
+            + usize::from(!self.detail.is_empty())
+            + usize::from(!self.remediation.is_empty())
+            + usize::from(!severity.is_refusing());
+        let mut out = serializer.serialize_struct("RetrievalDegradation", fields)?;
+        out.serialize_field("component", &self.component)?;
+        out.serialize_field("reason", &self.reason)?;
+        if self.detail.is_empty() {
+            out.skip_field("detail")?;
+        } else {
+            out.serialize_field("detail", &self.detail)?;
+        }
+        if self.remediation.is_empty() {
+            out.skip_field("remediation")?;
+        } else {
+            out.serialize_field("remediation", &self.remediation)?;
+        }
+        if severity.is_refusing() {
+            out.skip_field("severity")?;
+        } else {
+            out.serialize_field("severity", &severity)?;
+        }
+        out.end()
+    }
 }
 
 /// What the embedding substrate itself was observed to be for one query.
@@ -160,6 +368,13 @@ pub enum EmbeddingState {
     /// Nobody could say: no vector backend in this build, or no index attached
     /// to take a reading from.
     Unknown,
+    /// This answer ranked without search vectors: entity cards and the graph
+    /// ranked it, which is what a setup with no usable vectors runs. Missing
+    /// vectors are not a gap in such an answer, so the state says the substrate
+    /// was not used rather than reporting it short. Never produced by
+    /// [`Self::observe`], which reads the store; set by
+    /// [`SemanticCoverage::ranked_without_vectors`] on an answer's own report.
+    NotUsed,
 }
 
 impl EmbeddingState {
@@ -171,6 +386,7 @@ impl EmbeddingState {
             Self::Partial => "partial",
             Self::Absent => "absent",
             Self::Unknown => "unknown",
+            Self::NotUsed => "not_used",
         }
     }
 
@@ -328,10 +544,22 @@ pub struct SemanticCoverage {
 pub struct GraphBodyCoverage {
     /// Source paths the graph owns as retrieval authority for this query.
     pub source_paths: usize,
-    /// Of those, the ones carrying a non-empty graph-owned body.
+    /// Of those, the ones whose body the graph knows: a non-empty graph-owned
+    /// body, or admitted bytes that are empty.
+    ///
+    /// An empty file counts. Its body is the empty string and the graph's tree
+    /// knows that exactly, so there is nothing missing to rank on, and counting
+    /// it as a gap reported every empty package marker in a repository as a
+    /// hole in the index. [`Self::empty_paths`] says how many of these are
+    /// empty.
     pub with_body: usize,
-    /// Of those, the ones the graph holds no body for. `source_paths -
-    /// with_body`, stated rather than left to the caller's arithmetic.
+    /// Of `with_body`, the paths whose admitted bytes are empty. Zero is
+    /// serialized away.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub empty_paths: usize,
+    /// Of `source_paths`, the ones the graph holds no body for although their
+    /// bytes are not empty. `source_paths - with_body`, stated rather than left
+    /// to the caller's arithmetic.
     pub gap_paths: usize,
     /// A bounded sample of gap paths, so an operator can act without turning on
     /// daemon logging. Capped at [`GRAPH_BODY_GAP_SAMPLE`].
@@ -362,20 +590,28 @@ fn is_zero(value: &usize) -> bool {
 const GRAPH_BODY_GAP_SAMPLE: usize = 8;
 
 impl GraphBodyCoverage {
-    /// Assemble from the two sets locate already holds: the graph's source-path
-    /// authority, and the subset it resolved a body for.
+    /// Assemble from the sets locate already holds: the graph's source-path
+    /// authority, the subset it resolved a text body for, and the paths whose
+    /// admitted bytes are empty.
+    ///
+    /// `has_text_body` is consulted first, so a path is never counted twice.
     fn observe<'a>(
         source_paths: impl IntoIterator<Item = &'a String>,
         withheld_test_paths: usize,
-        has_body: impl Fn(&str) -> bool,
+        has_text_body: impl Fn(&str) -> bool,
+        is_empty_file: impl Fn(&str) -> bool,
     ) -> Self {
         let mut total = 0usize;
         let mut with_body = 0usize;
+        let mut empty_paths = 0usize;
         let mut gaps: Vec<String> = Vec::new();
         for path in source_paths {
             total += 1;
-            if has_body(path) {
+            if has_text_body(path) {
                 with_body += 1;
+            } else if is_empty_file(path) {
+                with_body += 1;
+                empty_paths += 1;
             } else {
                 gaps.push(path.clone());
             }
@@ -389,6 +625,7 @@ impl GraphBodyCoverage {
         Self {
             source_paths: total,
             with_body,
+            empty_paths,
             gap_paths,
             sample: gaps,
             withheld_test_paths,
@@ -1920,6 +2157,19 @@ pub struct LocateEntity {
     /// query text alone ([`locate_exact_name_tier`]).
     #[serde(skip)]
     pub name_tier: Option<u8>,
+    /// The calibrated probability the candidate scorer gave this row, on an
+    /// arm that runs one ([`crate::retrieval_arm`]). Absent on every other
+    /// arm, and on rows past the scorer's window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer_probability: Option<f32>,
+    /// On a row a `sort: callers` re-ordered, how many non-test entities are
+    /// proven to call it: a floor, since call resolution is partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proven_callers: Option<u64>,
+    /// On a row a `sort: hops` re-ordered, the fewest resolved calls from a
+    /// root (a callable nothing non-test is proven to call) to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hops_from_root: Option<u64>,
 }
 
 impl LocateEntity {
@@ -2955,6 +3205,30 @@ fn evaluate_embedding_coverage(
     ))
 }
 
+/// Whether a query has search vectors it can use: this build embeds queries,
+/// and the index backing the query is attached and holds at least one vector.
+///
+/// A store never embedded, a build without embeddings, and an index the model
+/// identity check reset all answer no, and a description query with nothing
+/// naming its arm then ranks on entity cards and the graph rather than fusing
+/// an embedding signal that cannot exist. A partial index answers yes: it is
+/// filling, and the fused arm already reports that as the gap it is.
+fn vectors_usable(coverage: &SemanticCoverage, index_attached: bool) -> bool {
+    cfg!(feature = "embeddings") && coverage.supported && index_attached && coverage.indexed > 0
+}
+
+/// The arm a description query on `graph` runs now: the one the environment
+/// names, or the automatic choice for the vectors this graph holds. A daemon
+/// reads it to decide whether to build entity cards before the first query.
+pub fn description_query_arm(graph: &kin_db::InMemoryGraph) -> crate::retrieval_arm::RetrievalArm {
+    let effective = effective_embedding(graph, None);
+    let coverage = coverage_from_status(&effective.status, effective.index_attached);
+    crate::retrieval_arm::RetrievalArm::for_query(vectors_usable(
+        &coverage,
+        effective.index_attached,
+    ))
+}
+
 /// Build the non-gating [`SemanticCoverage`] report from an embedding status.
 /// This is the default (non-strict) coverage `evaluate_embedding_coverage`
 /// returns, factored out so post-retrieval surfaces can re-report coverage
@@ -3049,6 +3323,25 @@ fn coverage_from_status(
 }
 
 impl SemanticCoverage {
+    /// Restate this report for an answer that ranked without search vectors.
+    ///
+    /// The counters stay, as the store observation they are. What changes is
+    /// what they qualify: no vector was read, so a store with none, a build
+    /// without vector support or an index still filling limits nothing about
+    /// this answer, and reporting them as a shortfall is what made a
+    /// no-embeddings setup read as a partial index. Only the limits that narrow
+    /// the population ranked remain, and [`Self::with_graph_bodies`] adds those
+    /// afterwards.
+    pub fn ranked_without_vectors(mut self) -> Self {
+        self.embedding_state = EmbeddingState::NotUsed;
+        self.limited_by.retain(|limit| {
+            limit == COVERAGE_LIMIT_GRAPH_ROLE_FILTER || limit == COVERAGE_LIMIT_GRAPH_BODY_GAP
+        });
+        self.complete = self.limited_by.is_empty();
+        self.note = None;
+        self
+    }
+
     /// Fold an observed graph-body coverage into this report.
     ///
     /// `complete` becomes the conjunction it always claimed to be: a body gap
@@ -3076,12 +3369,9 @@ impl SemanticCoverage {
             // tell a repository whose every path was covered from one where
             // half the paths were removed from the question.
             self.complete = false;
-            let withheld_note = format!(
-                "role filter: {} test-role source path(s) were withheld from ranking and from \
-                 the counters beside this note, so completeness is claimed over source paths \
-                 only; pass include_tests to rank them.",
-                bodies.withheld_test_paths
-            );
+            let withheld_note = "The include_tests: false filter excluded test-role code from \
+                                 this ranking and its coverage. Pass include_tests: true to include it."
+                .to_string();
             self.note = Some(match self.note.take() {
                 Some(existing) => format!("{existing} {withheld_note}"),
                 None => withheld_note,
@@ -3120,7 +3410,7 @@ pub fn local_semantic_coverage(
 
 /// What a caller can do about a text index that refuses reads.
 const TEXT_INDEX_UNAVAILABLE_REMEDIATION: &str =
-    "retry the query: the next read maps the index's image again once its files are readable; \
+    "retry the query: the next read maps the index's image again once its storage is readable; \
      if it stays refused, restart the repository daemon, which rebuilds the text index from the \
      graph when it opens the store";
 
@@ -3324,6 +3614,38 @@ pub fn record_query_producer_verdict(
     verdict
 }
 
+/// Whether this query's vector ranking must be left out, because its query
+/// vector came from a runtime the store's vectors were not built by, and the
+/// ledger entry rewritten to say so in words.
+///
+/// A mismatched ranking used to go into the answer anyway, beside an entry
+/// calling its numerics unproven, so a description query on a store embedded on
+/// Metal, asked from a process that embeds on the CPU, answered with a ranking
+/// the answer itself would not stand behind. The rows now rank on lexical and
+/// graph signals only, and the entry says exactly that and how to lift it.
+#[cfg(feature = "vector")]
+fn exclude_mismatched_query_vectors(
+    verdict: &kin_core::vector_producer_policy::QueryProducerVerdict,
+    sink: &mut [RetrievalDegradation],
+) -> bool {
+    let kin_core::vector_producer_policy::QueryProducerVerdict::Mismatched { query, index } =
+        verdict
+    else {
+        return false;
+    };
+    if let Some(entry) = sink.iter_mut().rev().find(|entry| {
+        entry.component == "vector_index" && Some(entry.reason.as_str()) == verdict.reason()
+    }) {
+        entry.detail = format!(
+            "this store's vectors were produced by {index} and this process embeds queries on \
+             {query}, and those numerics are not proved rank-stable against each other, so the \
+             store's vectors are unusable for this query and were left out: these rows rank on \
+             lexical and graph signals only"
+        );
+    }
+    true
+}
+
 /// Record the vector-index state for this query as a structured degradation
 /// when it is absent, empty or partial. The `SemanticCoverage` object already
 /// carries the numbers; this adds the machine-readable
@@ -3482,6 +3804,35 @@ fn record_vector_index_degradation(
     );
 }
 
+/// What undoes a cards-arm note: selecting an arm that reads embeddings.
+const CARDS_ARM_REMEDIATION: &str =
+    "set KIN_LOCATE_ARM=fused, or [retrieval] arm = \"fused\", to rank with embeddings";
+
+/// The note a cards-arm answer carries: which arm, what it ranked, and that no
+/// embedding was read or computed.
+fn cards_arm_note(
+    arm: &crate::retrieval_arm::RetrievalArm,
+    run: Option<&cards::CardRun>,
+) -> String {
+    let mut note = format!(
+        "the {} retrieval arm ranks entity cards and the graph, so no embedding was read or \
+         computed for this query",
+        arm.name()
+    );
+    if let Some(run) = run {
+        note.push_str(&format!(
+            "; {} card hits and {} graph neighbours fused into {} candidates from {} cards",
+            run.card_hits, run.graph_hits, run.pooled, run.cards
+        ));
+        if let Some(built_ms) = run.built_ms {
+            note.push_str(&format!(
+                ", and this query built the card index in {built_ms} ms"
+            ));
+        }
+    }
+    note
+}
+
 /// Explain a description-shaped entity ranking that named no returned symbol.
 ///
 /// This guidance follows the response fact that makes its advice useful instead
@@ -3492,26 +3843,21 @@ fn record_vector_index_degradation(
 /// a full entity ranking with no name hit is.
 ///
 /// This is an advisory about how to read the result, not a claim that a signal
-/// failed. It therefore remains excluded from the run-quality verdict under its
-/// own stable label. A row marked `semantic` still used vector evidence;
-/// `all_fallback` means only that the query did not literally name a returned
-/// entity.
+/// failed. It is therefore a [`RetrievalPolicyNote`], published with
+/// `severity: "note"`, and kept out of the run-quality verdict. A row marked
+/// `semantic` still used vector evidence; `all_fallback` means only that the
+/// query did not literally name a returned entity.
 pub fn record_description_query_guidance(sink: &mut Vec<RetrievalDegradation>) {
     record_degradation(
         sink,
-        RetrievalDegradation {
-            component: kin_mcp::negative::QUERY_SHAPE_COMPONENT.to_string(),
-            reason: kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON.to_string(),
-            detail: "not one ranked entity was literally named by this query. That does not \
+        RetrievalPolicyNote::DescriptionQueryShape.degradation(
+            "not one ranked entity was literally named by this query. That does not \
                  mean embeddings were unused: rows marked `semantic` carry vector evidence. It \
                  does mean the entity list cannot prove it found the intended symbol from a \
-                 description alone"
-                .to_string(),
-            remediation: "read the existing files[] rollup; semantic_locate callers can request \
-                 granularity: \"file\"; then name the returned entity or file in a narrower \
-                 follow-up query"
-                .to_string(),
-        },
+                 description alone",
+            "name the intended symbol, or a distinctive word from its signature, in a \
+                 narrower follow-up query, then read the returned entity by its id",
+        ),
     );
 }
 
@@ -3633,6 +3979,32 @@ fn source_file_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
         }
     }
     paths
+}
+
+/// Whether the graph's own tree admits `path` as a file whose bytes are empty.
+///
+/// Read from tree truth by blob identity, never from disk: the tree records
+/// every admitted file's content digest, and `empty_blob` is the digest of zero
+/// bytes. A path the tree does not hold, or holds as anything other than a
+/// plain blob, is not known to be empty, so it stays whatever the caller would
+/// otherwise call it. Nothing here depends on the file's language.
+fn graph_admits_empty_file(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+    empty_blob: &kin_model::Hash256,
+) -> bool {
+    let Ok(repo_path) = RepoPath::from_utf8(path) else {
+        return false;
+    };
+    graph
+        .artifact_id_at_path(&repo_path)
+        .and_then(|id| graph.resolved_artifact(&id))
+        .is_some_and(|artifact| {
+            matches!(
+                artifact.entry,
+                kin_model::TreeEntry::Blob { hash, .. } if hash == *empty_blob
+            )
+        })
 }
 
 /// Graph-owned source-path authority set: entity-bearing and entity-origin
@@ -3764,6 +4136,211 @@ impl LocateScope {
     pub fn with_tests(include_tests: bool) -> Self {
         Self { include_tests }
     }
+
+    /// The scope a description is ranked in, and whether the description
+    /// itself is why test code is in it.
+    ///
+    /// What the caller said about tests stands, either way. When it said
+    /// nothing, test code is ranked for a description that asks about tests
+    /// ([`description_asks_for_tests`]) and left out for any other.
+    pub fn for_description(
+        asked: Option<bool>,
+        query: &str,
+        holders: impl Fn(&str) -> NameHolders,
+    ) -> (Self, bool) {
+        match asked {
+            Some(include_tests) => (Self::with_tests(include_tests), false),
+            None => {
+                let asks = description_asks_for_tests(query, holders);
+                (Self::with_tests(asks), asks)
+            }
+        }
+    }
+}
+
+/// What kinds of code declare a name, as far as a description's scope needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NameHolders {
+    /// Code outside the tests declares it.
+    pub library: bool,
+    /// A function or method of the tests declares it.
+    pub test_callable: bool,
+}
+
+/// What declares `name` in `graph`, by the last segment of an entity's name.
+pub fn name_holders(graph: &kin_db::InMemoryGraph, name: &str) -> NameHolders {
+    let mut holders = NameHolders::default();
+    let named = graph
+        .query_entities(&EntityFilter {
+            name_pattern: Some(name.to_string()),
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    for entity in named {
+        if qualified_name_tail(&entity.name) != name {
+            continue;
+        }
+        if entity.role == EntityRole::Test {
+            holders.test_callable |=
+                matches!(entity.kind, EntityKind::Function | EntityKind::Method);
+        } else {
+            holders.library = true;
+        }
+    }
+    holders
+}
+
+/// Words that, as the subject of a description, say it is about test code.
+const TEST_SUBJECT_WORDS: [&str; 5] = ["test", "tests", "testing", "spec", "specs"];
+
+/// Words a description opens with before it names its subject.
+const DESCRIPTION_LEAD_INS: [&str; 20] = [
+    "find",
+    "show",
+    "list",
+    "locate",
+    "where",
+    "is",
+    "are",
+    "the",
+    "a",
+    "an",
+    "any",
+    "all",
+    "which",
+    "what",
+    "existing",
+    "unit",
+    "integration",
+    "regression",
+    "failing",
+    "me",
+];
+
+/// Whether a description asks about test code, so that its ranking includes
+/// test code without the caller saying so.
+///
+/// Measured in a task run: a model fixing session handling asked four times
+/// for the tests of that behaviour ("test session cleared vary cookie
+/// header", "tests session_interface vary cookie", "test that session access
+/// sets vary cookie on response") and was shown no test, because a
+/// description leaves tests out by default. With tests ranked the test it
+/// wanted was row 1, 2 and 1. It ran the whole suite to learn the name.
+///
+/// The default stays: over 260 descriptions of library behaviour, ranking
+/// tests beside library code cost 12 points at the top five. So this reads
+/// the description's subject, not any mention of the word. A description asks
+/// about tests when:
+///
+/// - its first word, past a lead-in such as "find the", is `test`, `tests`,
+///   `testing`, `spec` or `specs`, unless that word and the next one name
+///   library code together, as `test_client` does: "test client drops the
+///   session cookie" is about the client;
+/// - or it spells an identifier that only test code declares: a test
+///   function or method holds the name and no library code does.
+///
+/// Which code is test code is the language adapters' to say, through the
+/// test role each entity carries; nothing here reads a naming convention of a
+/// language. An identifier is a word written with an underscore or with a
+/// capital after its first letter, the shapes the shared identifier tokenizer
+/// splits, so a plain English word costs no lookup.
+///
+/// A sentence that mentions tests in passing ("the test client", "added
+/// tests") asks nothing about them.
+pub fn description_asks_for_tests(query: &str, holders: impl Fn(&str) -> NameHolders) -> bool {
+    let words: Vec<&str> = query
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let subject = words
+        .iter()
+        .position(|word| !DESCRIPTION_LEAD_INS.contains(&word.to_ascii_lowercase().as_str()));
+    if let Some(at) = subject {
+        let word = words[at].to_ascii_lowercase();
+        if TEST_SUBJECT_WORDS.contains(&word.as_str()) {
+            let names_library_code = words.get(at + 1).is_some_and(|next| {
+                joined_spellings(&word, next)
+                    .iter()
+                    .any(|name| holders(name).library)
+            });
+            if !names_library_code {
+                return true;
+            }
+        }
+    }
+    words.iter().any(|word| {
+        is_identifier_shaped(word) && {
+            let held = holders(word);
+            held.test_callable && !held.library
+        }
+    })
+}
+
+/// Whether `word` is written as an identifier rather than a word of prose:
+/// with an underscore between letters, or a capital after its first letter.
+fn is_identifier_shaped(word: &str) -> bool {
+    let trimmed = word.trim_matches('_');
+    trimmed.len() > 2
+        && (trimmed.contains('_') || trimmed.chars().skip(1).any(|c| c.is_ascii_uppercase()))
+}
+
+/// The ways an identifier spells two words joined: `test_client`,
+/// `testClient`, `TestClient`.
+fn joined_spellings(first: &str, second: &str) -> [String; 3] {
+    let capital = |word: &str| {
+        let mut letters = word.chars();
+        letters
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string() + &letters.as_str().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let first = first.to_ascii_lowercase();
+    [
+        format!("{first}_{}", second.to_ascii_lowercase()),
+        format!("{first}{}", capital(second)),
+        format!("{}{}", capital(&first), capital(second)),
+    ]
+}
+
+/// Record that the rows were confined to `module`, leaving `outside` ranked
+/// rows out. The caller's choice, never a lost capability.
+pub fn record_rows_confined_to_scope(
+    sink: &mut Vec<RetrievalDegradation>,
+    module: &str,
+    outside: usize,
+) {
+    record_degradation(
+        sink,
+        RetrievalPolicyNote::RowsConfinedToScope.degradation(
+            format!("rows confined to {module}; {outside} ranked rows outside it were left out"),
+            "omit scope to rank every module",
+        ),
+    );
+}
+
+/// Record that the leading `rows` of the ranking were re-sorted by `key`.
+pub fn record_leading_rows_sorted(sink: &mut Vec<RetrievalDegradation>, key: &str, rows: usize) {
+    record_degradation(
+        sink,
+        RetrievalPolicyNote::LeadingRowsSorted.degradation(
+            format!(
+                "the {rows} most relevant rows were re-sorted by {key}; the rest keep relevance order"
+            ),
+            "omit sort for relevance order, which finds described code best",
+        ),
+    );
+}
+
+/// Record that test code was ranked because the description asked about
+/// tests. A note about how the run was scoped, never a lost capability.
+pub fn record_tests_ranked_for_question(sink: &mut Vec<RetrievalDegradation>) {
+    record_degradation(
+        sink,
+        RetrievalPolicyNote::TestsRankedForQuestion.degradation(
+            "the question asks about tests, so test code is ranked beside source code",
+            "pass include_tests false to rank source code only",
+        ),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4285,12 +4862,32 @@ fn run_with_graph_capture_budgeted(
     ensure_lexical_index_queryable(graph, &mut degradations);
     let (semantic_coverage, vector_index_attached) =
         evaluate_embedding_coverage(graph, vector_source)?;
-    record_vector_index_degradation(
+    // Which candidates this description query runs on, and whether a scorer
+    // reads them ([`crate::retrieval_arm`]): the arm an operator named, or the
+    // one the vectors this query can use choose. The fused arm runs every line
+    // below exactly as it did before the switch existed.
+    let arm = crate::retrieval_arm::RetrievalArm::for_query(vectors_usable(
         &semantic_coverage,
         vector_index_attached,
-        || crate::embed_model::declined_and_absent().is_some(),
-        &mut degradations,
-    );
+    ));
+    // The counters still report the store's embedding state, because that is an
+    // observation of the store. An arm that reads no embedding restates what
+    // they qualify, and says so as a note below instead of a gap: it lost no
+    // signal it was asked for.
+    let semantic_coverage = if arm.uses_embeddings() {
+        semantic_coverage
+    } else {
+        semantic_coverage.ranked_without_vectors()
+    };
+    if arm.uses_embeddings() {
+        record_vector_index_degradation(
+            &semantic_coverage,
+            vector_index_attached,
+            || crate::embed_model::declined_and_absent().is_some(),
+            &mut degradations,
+        );
+    }
+    let mut card_run: Option<cards::CardRun> = None;
     // Per-stage prune attribution, recorded only under --explain.
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
 
@@ -4379,6 +4976,13 @@ fn run_with_graph_capture_budgeted(
                 });
             }
             HashMap::new()
+        } else if !arm.uses_embeddings() {
+            // The cards arm fills the pool the embedding seeds fill on the
+            // fused arm, so every stage after this one runs unchanged and the
+            // two arms differ in their candidates alone.
+            let (seeds, run) = cards::card_entity_seeds(text, graph, test_query)?;
+            card_run = Some(run);
+            seeds
         } else {
             extract_embedding_signals(
                 text,
@@ -4405,6 +5009,16 @@ fn run_with_graph_capture_budgeted(
         }
         (search, embedding)
     };
+
+    if !arm.uses_embeddings() {
+        record_degradation(
+            &mut degradations,
+            RetrievalPolicyNote::EmbeddingsNotUsedByArm.degradation(
+                cards_arm_note(&arm, card_run.as_ref()),
+                CARDS_ARM_REMEDIATION,
+            ),
+        );
+    }
 
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
@@ -4492,7 +5106,17 @@ fn run_with_graph_capture_budgeted(
             _embed_signal_scores,
             embed_symbols,
             embed_candidate_stages,
-        ) = resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector", scope)?;
+        ) = resolve_entities_to_files(
+            &embedding_entity_seeds,
+            graph,
+            explain,
+            if arm.uses_embeddings() {
+                "vector"
+            } else {
+                "cards"
+            },
+            scope,
+        )?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -4571,28 +5195,26 @@ fn run_with_graph_capture_budgeted(
         source_text
     };
     // Fold the observation into the coverage report the caller reads, and record
-    // the gap on the degradation ledger beside it. Two channels because they
-    // answer different questions: the coverage object says how much of the store
-    // ranking could see, the degradation says this query ran degraded and names
-    // the remediation.
+    // it on the degradation ledger beside it. Two channels because they answer
+    // different questions: the coverage object says how much of the store
+    // ranking could see, the ledger says what shaped this query and names the
+    // remediation.
+    //
+    // The two entries differ in kind. Withheld tests are the caller's own
+    // `include_tests: false` filter, so that entry is a policy note naming the
+    // filter and how to lift it. A body gap is a path the graph admits as source
+    // and cannot rank, which is a real shortfall and keeps refusing.
     let semantic_coverage = match graph_body_coverage {
         Some(bodies) => {
             if bodies.withholds_tests() {
                 record_degradation(
                     &mut degradations,
-                    RetrievalDegradation {
-                        component: "graph_role_filter".to_string(),
-                        reason: "tests_withheld".to_string(),
-                        detail: format!(
-                            "{} test-role source path(s) were kept out of ranking and out of \
-                             the graph_bodies counters; an entity defined only in one of them \
-                             could not be returned by this query",
-                            bodies.withheld_test_paths
-                        ),
-                        remediation: "pass include_tests to rank test-role entities alongside \
-                                      source, or name the entity in the query"
-                            .to_string(),
-                    },
+                    RetrievalPolicyNote::TestsWithheldByFilter.degradation(
+                        "The include_tests: false filter excluded test-role code from this \
+                         ranking and its coverage. Pass include_tests: true to include it.",
+                        "pass include_tests: true to rank test-role entities alongside source, \
+                         or name the entity in the query",
+                    ),
                 );
             }
             if bodies.has_gap() {
@@ -4606,9 +5228,9 @@ fn run_with_graph_capture_budgeted(
                              rank on text fallback only",
                             bodies.gap_paths, bodies.source_paths
                         ),
-                        remediation: "graph_bodies.sample names the paths; a change the daemon \
-                                      admits to one re-derives its entities with bodies, while a \
-                                      binary or empty source-like file has no text to admit"
+                        remediation: "a change the daemon admits to one of those source units \
+                                      re-derives its entities with bodies, while a binary \
+                                      source-like unit has no text to admit"
                             .to_string(),
                     },
                 );
@@ -4798,6 +5420,9 @@ fn run_with_graph_capture_budgeted(
             );
         }
         early.degradations = degradations;
+        if !arm.is_default() {
+            early.retrieval_arm = Some(arm.name());
+        }
         return Ok(early);
     }
 
@@ -4848,7 +5473,11 @@ fn run_with_graph_capture_budgeted(
         "cochange",
         "entity_resolve",
         "source_text",
-        "embedding",
+        if arm.uses_embeddings() {
+            "embedding"
+        } else {
+            "cards"
+        },
     ];
     let mut per_file_signals: HashMap<String, HashMap<String, f32>> = HashMap::new();
     if explain {
@@ -6501,7 +7130,185 @@ fn run_with_graph_capture_budgeted(
         text,
         test_query,
     )?;
+    if !arm.uses_embeddings() {
+        rank_description_entities_first(
+            &mut result,
+            &held_authority,
+            &snippet_opts,
+            source_scope,
+            text,
+            scope,
+        )?;
+    }
+    finish_arm(&mut result, &arm, graph, text);
     Ok(result)
+}
+
+/// Rank a description's entities directly, on an arm that reads no embedding.
+///
+/// The entity surface used to be a projection of the FILE ranking: ten file
+/// signals fused, each ranked file's symbols carried over with the score a
+/// name seed gave them, the classes of the leading files added as anchors, and
+/// every row a query word happened to spell lifted above the rest. Measured on
+/// 256 Flask commit descriptions that never name the function they changed,
+/// that put the function in the top five for 28 percent. The words it needed
+/// were in its body, where a hit was worth one point against the forty-five a
+/// partial name match earned.
+///
+/// A description is about entities, so it is ranked over entities: every one
+/// the graph holds is scored against the whole description on its name, its
+/// owner, its signature, its doc summary, its body, its place and its
+/// neighbours' names ([`evidence::EvidenceIndex`]), and that order is the
+/// answer. The file an entity lives in is one of its fields. On the same
+/// queries this ranks the function in the top five for 52 percent.
+///
+/// Below the rows the words found come the graph's own candidates, the owner,
+/// callees and callers of the leading rows ([`evidence::graph_tail`]), and a
+/// ranked artifact keeps its place beside the entities.
+///
+/// What it leaves alone: a query that is a name ([`NameQuery::is_name_shaped`])
+/// keeps the name tier and everything else about a lookup; an arm that reads
+/// embeddings keeps its own ranking; and `files` is the file ranking it was.
+/// Test code is ranked only when the caller asks for it. The keyword reading
+/// of the description ([`is_test_query`]) does not ask: a bug report that says
+/// "the test client" is about the client, and with tests ranked beside library
+/// code the same queries fall from 51 percent to 37.
+///
+/// `KIN_LOCATE_ENTITY_FIRST=0` restores the projection.
+fn rank_description_entities_first(
+    result: &mut LocateResult,
+    held_authority: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
+    opts: &SnippetOptions,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    query: &str,
+    scope: LocateScope,
+) -> Result<()> {
+    if !opts.enabled
+        || !locate_env_bool("KIN_LOCATE_ENTITY_FIRST", true)
+        || query_is_name_shaped(query)
+    {
+        return Ok(());
+    }
+    let terms = evidence::description_terms(query);
+    if terms.is_empty() {
+        return Ok(());
+    }
+    let graph = held_authority.store();
+    let index = evidence::evidence_index_for(graph)?;
+    let limit = locate_env_usize("KIN_LOCATE_CARD_LIMIT", 100);
+    let mut ranked = index.rank(&terms, scope.include_tests, limit);
+    // Nothing in the graph carries any word of the description. The projection
+    // stands, with whatever the other signals found.
+    if ranked.is_empty() {
+        return Ok(());
+    }
+    let room = limit.saturating_sub(ranked.len());
+    let tail = evidence::graph_tail(graph, &ranked, scope.include_tests, room)?;
+    ranked.extend(tail);
+    let mut entities = Vec::with_capacity(ranked.len());
+    for hit in ranked {
+        let Some(entity) = graph.get_entity(&hit.id)? else {
+            continue;
+        };
+        let body = if opts.bodies {
+            bounded_entity_body_with_note(
+                held_authority,
+                &entity,
+                opts.max_lines,
+                opts.max_chars,
+                source_scope,
+                &mut result.degradations,
+            )
+        } else {
+            None
+        };
+        entities.push(LocateEntity {
+            entity_id: entity.id.to_string(),
+            id_space: LocateIdSpace::Entity,
+            artifact_path: None,
+            kind: format!("{:?}", entity.kind).to_lowercase(),
+            name: entity.name.clone(),
+            signature: entity.signature.clone(),
+            score: hit.score,
+            definition: true,
+            span: entity_span_pair(&entity).into_iter().next(),
+            body,
+            // Still a fact about the row: the description spelled its name.
+            match_kind: Some(classify_locate_match(query, &entity.name, "", None)),
+            provenance: LocateProvenance {
+                file: entity.file_origin.as_ref().map(|origin| origin.0.clone()),
+                origin: String::new(),
+                cosine: None,
+            },
+            matched_queries: Vec::new(),
+            collapsed_rows: 0,
+            // No row holds a tier: in a description a name is evidence like
+            // any other, and a fused ranking must not re-read one from the
+            // query text.
+            name_tier: Some(0),
+            scorer_probability: None,
+            proven_callers: None,
+            hops_from_root: None,
+        });
+    }
+    if entities.is_empty() {
+        return Ok(());
+    }
+    // A ranked file the graph holds no entity for is still an answer, and on a
+    // docs-and-config repository it is the answer. The projection ranked those
+    // rows on its own scale, so each keeps its share of the projection's best
+    // row, taken of this ranking's best, and sorts in beside the entities.
+    let projection_best = result
+        .entities
+        .iter()
+        .map(|entity| entity.score)
+        .fold(0.0f32, f32::max);
+    let evidence_best = entities.first().map_or(0.0, |entity| entity.score);
+    for mut artifact in std::mem::take(&mut result.entities) {
+        if artifact.id_space == LocateIdSpace::Entity {
+            continue;
+        }
+        if projection_best > 0.0 {
+            artifact.score = artifact.score / projection_best * evidence_best;
+        }
+        artifact.name_tier = Some(0);
+        entities.push(artifact);
+    }
+    // Stable, so rows of equal score keep the order they were ranked in.
+    entities.sort_by(|a, b| b.score.total_cmp(&a.score));
+    result.entities = entities;
+    collapse_package_module_rows(&mut result.entities);
+    result.total_ranked = result.entities.len();
+    result.all_fallback = locate_entities_are_all_fallback(&result.entities);
+    result.score_composition = Some(ScoreComposition::EntityFirst);
+    Ok(())
+}
+
+/// The arm's own last steps: the file signal slot named for what filled it,
+/// the scorer over the entity ranking the answer carries, and the arm's name
+/// on every answer it shaped. The default arm does none of them.
+fn finish_arm(
+    result: &mut LocateResult,
+    arm: &crate::retrieval_arm::RetrievalArm,
+    graph: &kin_db::InMemoryGraph,
+    text: &str,
+) {
+    if arm.is_default() {
+        return;
+    }
+    if !arm.uses_embeddings() {
+        for file in &mut result.files {
+            for signal in &mut file.signals {
+                if signal == "embedding" {
+                    *signal = "cards".to_string();
+                }
+            }
+        }
+    }
+    if let Some(kind) = arm.scorer {
+        scorer::run_scorer_stage(result, graph, text, kind);
+    }
+    result.retrieval_arm = Some(arm.name());
 }
 
 pub fn run_with_graph_capture_at_ref(
@@ -6602,7 +7409,40 @@ fn clean_issue_text(text: &str) -> String {
     let re_checkbox = regex::Regex::new(r"(?m)^-\s*\[.\]\s+.*$").unwrap();
     let text = re_checkbox.replace_all(&text, "");
 
-    text.to_string()
+    strip_tracker_references(&text)
+}
+
+/// Drop the links and references an issue uses to point at other issues, pull
+/// requests and discussions, and keep a link to a file as the file's path.
+///
+/// A reference such as `https://github.com/fastapi/fastapi/discussions/11424`,
+/// `PR #11425` or `Discussion #14265` names a conversation on the code host,
+/// never code in this repository. Left in, its words ("github", "discussions",
+/// "pull", the owner and repository names) are query terms like any other, and
+/// they match whatever code in the repository talks to that host: on fastapi, the
+/// maintainer scripts that page through GitHub discussions and pull requests
+/// filled the entity list of issues that only linked to one. A link into the
+/// repository's tree (`/blob/<ref>/<path>`) does name code, so it keeps its path.
+fn strip_tracker_references(text: &str) -> String {
+    static FILE_LINK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"https?://(?:www\.)?(?:github|gitlab)\.com/[^/\s]+/[^/\s]+/(?:-/)?(?:blob|tree)/[^/\s]+/([^\s#?)\]>]+)[^\s)\]>]*",
+        )
+        .expect("file link pattern compiles")
+    });
+    static HOST_LINK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"https?://(?:www\.)?(?:github|gitlab)\.com/[^\s)\]>]*")
+            .expect("host link pattern compiles")
+    });
+    static NUMBERED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)(?:\b(?:discussions?|issues?|pull\s+requests?|prs?|pull)\s*)?(?:[\w.-]+/[\w.-]+)?#\d+\b",
+        )
+        .expect("numbered reference pattern compiles")
+    });
+    let text = FILE_LINK.replace_all(text, "$1");
+    let text = HOST_LINK.replace_all(&text, " ");
+    NUMBERED.replace_all(&text, " ").into_owned()
 }
 
 fn strip_pr_template_boilerplate(text: &str) -> String {
@@ -6982,18 +7822,18 @@ fn admit_text_matched_artifacts(
     if admittable.len() > limit {
         record_degradation(
             degradations,
-            RetrievalDegradation {
-                component: "artifact_candidates".to_string(),
-                reason: "over_admit_limit".to_string(),
-                detail: format!(
+            // The admit limit is the same for every query, so reaching it is a
+            // policy this ranking applied, not a capability it lost.
+            RetrievalPolicyNote::ArtifactCandidatesOverAdmitLimit.degradation(
+                format!(
                     "{} tracked artifacts matched this query's text; {} were admitted to the \
                      ranking",
                     admittable.len(),
                     limit
                 ),
-                remediation: "narrow the query to a semantic entity; unparsed content requires conversion coverage"
-                    .to_string(),
-            },
+                "narrow the query to a semantic entity; unparsed content requires conversion \
+                 coverage",
+            ),
         );
     }
 
@@ -9520,6 +10360,69 @@ fn normalize_traceback_path(path: &str) -> String {
 // 2. Entity search
 // ---------------------------------------------------------------------------
 
+/// How many entities one verbatim name may name and still be seeded as the
+/// symbol the question asked for. A name more entities share than this
+/// (`__init__`, `get`, `run`) says nothing about which one is meant.
+const VERBATIM_NAME_MAX_ENTITIES: usize = 4;
+
+/// How many verbatim names one query seeds, in the order it spells them.
+const VERBATIM_NAME_LIMIT: usize = 12;
+
+/// Whether `entity` is code this repository declares under `name`: its name, or
+/// the last segment of its qualified name, is `name` exactly, and it is source
+/// or test code rather than an imported external symbol, documentation or
+/// vendored code.
+fn verbatim_name_declares(entity: &kin_model::Entity, name: &str) -> bool {
+    matches!(entity.role, EntityRole::Source | EntityRole::Test)
+        && (entity.name == name || qualified_name_tail(&entity.name) == name)
+}
+
+/// The identifier-shaped tokens a query spells verbatim that are the exact name
+/// of a declared entity, in the order the query first spells them.
+///
+/// Term curation keeps a handful of terms for text search, and it reads them in
+/// a fixed order (backticked code, then CamelCase, then snake_case) that has
+/// nothing to do with which of them name the answer. On a question that pastes
+/// a traceback, the frames' own function names come last and fall off: a
+/// fastapi issue whose traceback ended `in analyze_param` curated
+/// `string_serialise` and `lambda`, and `analyze_param` never became a
+/// candidate, so the name tier that would have put it first never saw it.
+///
+/// A token counts when it is identifier-shaped ([`token_is_identifier_shaped`],
+/// the same reading the name tier uses, so a plain word such as `complete` is
+/// never one), when at least one and at most [`VERBATIM_NAME_MAX_ENTITIES`]
+/// entities the repository declares carry it ([`verbatim_name_declares`]), and while
+/// fewer than [`VERBATIM_NAME_LIMIT`] have been taken.
+fn verbatim_entity_names(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<String>> {
+    static TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("token pattern compiles")
+    });
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for token in TOKEN.find_iter(text).map(|found| found.as_str()) {
+        if names.len() >= VERBATIM_NAME_LIMIT {
+            break;
+        }
+        if token.len() < 3 || !token_is_identifier_shaped(token) || !seen.insert(token) {
+            continue;
+        }
+        let filter = EntityFilter {
+            name_pattern: Some(token.to_string()),
+            ..Default::default()
+        };
+        let named = graph
+            .query_entities(&filter)?
+            .into_iter()
+            .filter(|entity| verbatim_name_declares(entity, token))
+            .take(VERBATIM_NAME_MAX_ENTITIES + 1)
+            .count();
+        if (1..=VERBATIM_NAME_MAX_ENTITIES).contains(&named) {
+            names.push(token.to_string());
+        }
+    }
+    Ok(names)
+}
+
 /// Phase 1 entity-first search: returns entity seeds (scored entities).
 /// Entity seeds are resolved to files in Phase 2 via graph relations.
 fn extract_search_signals(
@@ -9532,7 +10435,15 @@ fn extract_search_signals(
         tracing::info_span!("locate.extract_search_signals", text_len = text.len()).entered();
     let mut entity_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
 
-    let identifiers = curate_search_terms(text, graph)?;
+    let mut identifiers = curate_search_terms(text, graph)?;
+    for name in verbatim_entity_names(text, graph)? {
+        if !identifiers
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case(&name))
+        {
+            identifiers.push(name);
+        }
+    }
     if identifiers.is_empty() {
         return Ok(entity_seeds);
     }
@@ -10484,6 +11395,9 @@ pub fn auto_fanout_should_fuse(separation: Option<f32>) -> bool {
 /// keep the separation gate. Unknown composition (the budget-exhausted
 /// fallback path) also falls back to the separation gate.
 pub fn auto_fanout_should_fuse_for(result: &LocateResult) -> bool {
+    if result.score_composition == Some(ScoreComposition::EntityFirst) {
+        return false;
+    }
     if result.score_composition == Some(ScoreComposition::DirectEntityOrdered) {
         return true;
     }
@@ -11256,6 +12170,27 @@ fn is_noise_term(s: &str) -> bool {
 // 3. Multi-hop graph walk (relation-aware, 2-hop)
 // ---------------------------------------------------------------------------
 
+/// Walk steps one millisecond of the multihop allowance buys.
+///
+/// The allowance is still written in milliseconds, because that is the unit an
+/// operator and the capability tiers already use, but it is spent as a count
+/// of steps at this fixed rate: 4,000 steps on the minimal tier, 10,000 on the
+/// standard one, 20,000 on the performance one. The rate is a choice, not a
+/// measurement of any host: it fixes what an allowance buys, so the walk is a
+/// function of the graph and the query and of nothing else.
+const MULTIHOP_STEPS_PER_MS: usize = 20;
+
+/// The multihop walk's allowance as a number of steps, or `None` when the
+/// operator disabled it.
+fn multihop_step_budget(allowance: kin_core::env_registry::MsBound) -> Option<usize> {
+    match allowance {
+        kin_core::env_registry::MsBound::Limited(ms) => {
+            Some((ms as usize).saturating_mul(MULTIHOP_STEPS_PER_MS))
+        }
+        kin_core::env_registry::MsBound::Unbounded => None,
+    }
+}
+
 fn extract_multihop_signals(
     seed_hit_sets: &[&HashMap<String, Vec<FileHit>>],
     graph: &kin_db::InMemoryGraph,
@@ -11289,14 +12224,22 @@ fn extract_multihop_signals(
         profile.multihop_frontier_limit(),
     );
     // `0` means unbounded (disable the bound), never an instant zero-length
-    // timeout that would gut multihop retrieval. BFS is still bounded by
+    // allowance that would gut multihop retrieval. BFS is still bounded by
     // `max_depth`/`frontier_limit`, so unbounded here cannot run away.
-    let timeout = kin_core::env_registry::env_ms_bound(
+    let allowance = kin_core::env_registry::env_ms_bound(
         "KIN_LOCATE_MULTIHOP_TIMEOUT_MS",
         kin_core::env_registry::MsBound::Limited(profile.multihop_timeout_ms()),
-    )
-    .as_duration();
-    let bfs_start = std::time::Instant::now();
+    );
+    // The allowance is spent as WORK, never read off a clock. It used to be a
+    // wall-clock cut, so the walk stopped wherever the host had got to when
+    // the time ran out, and the ranking changed with the machine's load: on
+    // one Flask store 15 of 373 descriptions returned a different top five on
+    // a second identical call, and the same query reported 67, 70 or 72 ranked
+    // rows depending on where the walk was cut. A step is one node taken off
+    // the walk's queue, the same on every host, so the cut falls in the same
+    // place every time.
+    let step_budget = multihop_step_budget(allowance);
+    let mut walk_steps = 0usize;
 
     let mut seed_scores: HashMap<String, f32> = HashMap::new();
     for hit_set in seed_hit_sets {
@@ -11467,12 +12410,9 @@ fn extract_multihop_signals(
     ];
 
     'outer: for (seed_path, _seed_score) in &seed_files {
-        // Timeout guard: return what we have so far
-        if bfs_start.elapsed() > timeout {
-            tracing::debug!(
-                "multihop BFS timeout reached after {:?}",
-                bfs_start.elapsed()
-            );
+        // Allowance guard: return what we have so far
+        if step_budget.is_some_and(|budget| walk_steps >= budget) {
+            tracing::debug!(walk_steps, "multihop walk allowance spent");
             cut_timeout = true;
             break;
         }
@@ -11505,12 +12445,13 @@ fn extract_multihop_signals(
             let mut visited = HashSet::from([entity.id]);
 
             while let Some((current, depth)) = queue.pop_front() {
-                // Timeout guard within BFS loop
-                if bfs_start.elapsed() > timeout {
-                    tracing::debug!("multihop BFS timeout reached mid-walk");
+                // Allowance guard within the walk
+                if step_budget.is_some_and(|budget| walk_steps >= budget) {
+                    tracing::debug!(walk_steps, "multihop walk allowance spent mid-walk");
                     cut_timeout = true;
                     break 'outer;
                 }
+                walk_steps += 1;
 
                 if depth >= max_depth {
                     cut_depth_limit_hits += 1;
@@ -11721,12 +12662,12 @@ fn extract_multihop_signals(
                 name: None,
                 score: None,
                 dropped: None,
-                limit: Some(timeout.as_millis() as usize),
+                limit: step_budget,
                 threshold: None,
                 detail: format!(
-                    "graph walk stopped early at {:?} (KIN_LOCATE_MULTIHOP_TIMEOUT_MS, \
-                     profile-scaled); remaining seeds/frontier unexplored",
-                    bfs_start.elapsed()
+                    "graph walk stopped after {walk_steps} steps (KIN_LOCATE_MULTIHOP_TIMEOUT_MS, \
+                     profile-scaled, spent at {MULTIHOP_STEPS_PER_MS} steps per millisecond); \
+                     remaining seeds/frontier unexplored"
                 ),
             });
         }
@@ -12192,9 +13133,15 @@ fn extract_source_text_signals_scoped(
         .filter(|path| scope.include_tests || !is_test_path(path))
         .collect();
     let withheld_test_paths = source_paths.len() - observed_paths.len();
-    let graph_bodies = GraphBodyCoverage::observe(observed_paths, withheld_test_paths, |path| {
-        preview_source_texts.contains_key(path)
-    });
+    // A path with no text body may still have a fully known one: the empty
+    // string. The tree is consulted only for paths the text sets missed.
+    let empty_blob = kin_blobs::digest(&[]);
+    let graph_bodies = GraphBodyCoverage::observe(
+        observed_paths,
+        withheld_test_paths,
+        |path| preview_source_texts.contains_key(path),
+        |path| graph_admits_empty_file(graph, path, &empty_blob),
+    );
     let mut path_term_support: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut terms = extract_search_terms(text);
@@ -13108,7 +14055,11 @@ fn extract_embedding_signals(
         }
     };
 
-    record_query_producer_verdict(degradations, search_graph, &produced.query_producers);
+    let verdict =
+        record_query_producer_verdict(degradations, search_graph, &produced.query_producers);
+    if exclude_mismatched_query_vectors(&verdict, degradations) {
+        return Ok(entity_seeds);
+    }
     let all_results = produced.matches;
 
     // Drop weak semantic matches before they enter the signal column. The
@@ -19013,6 +19964,9 @@ fn artifact_locate_entity(file: &LocateFileEntry, query: &str) -> LocateEntity {
         matched_queries: Vec::new(),
         collapsed_rows: 0,
         name_tier: None,
+        scorer_probability: None,
+        proven_callers: None,
+        hops_from_root: None,
     }
 }
 
@@ -19929,6 +20883,9 @@ pub fn build_entity_view(
                     matched_queries: Vec::new(),
                     collapsed_rows: 0,
                     name_tier: None,
+                    scorer_probability: None,
+                    proven_callers: None,
+                    hops_from_root: None,
                 },
             ));
         }
@@ -20123,6 +21080,9 @@ pub fn build_entity_view(
                     matched_queries: Vec::new(),
                     collapsed_rows: 0,
                     name_tier: None,
+                    scorer_probability: None,
+                    proven_callers: None,
+                    hops_from_root: None,
                 },
             ));
         }
@@ -20139,6 +21099,89 @@ pub fn build_entity_view(
         // And the same evidence price, against the rows retrieval found.
         if let Some(evidence) = &descriptive_evidence {
             apply_descriptive_evidence(&mut admitted, &name_query, &evidence_weights, evidence);
+        }
+        ranked.extend(admitted);
+    }
+
+    // An entity the query names verbatim is on the surface whether or not its
+    // file survived the file cut. The surface is a projection of the file
+    // ranking, and a file ranking is a fusion of many weak signals in which the
+    // one file holding the named symbol can land eleventh of ten: a fastapi
+    // traceback ending `in analyze_param` put `fastapi/dependencies/utils.py`
+    // second on entity resolution and seventeenth after fusion, so the name
+    // tier that would have ranked `analyze_param` first never saw it. The row
+    // takes the score of this ranking's best row, so the tier decides where it
+    // lands and the file order breaks the tie.
+    if locate_env_bool("KIN_LOCATE_VERBATIM_NAME_ROWS", true) {
+        let best = ranked
+            .iter()
+            .map(|(_, entity)| entity.score)
+            .fold(0.0_f32, f32::max);
+        let reference = if best > 0.0 { best } else { anchor_base };
+        let file_rank_of = |path: &str| {
+            result
+                .files
+                .iter()
+                .position(|file| file.path == path)
+                .unwrap_or(result.files.len())
+        };
+        let mut admitted: Vec<(usize, LocateEntity)> = Vec::new();
+        for name in verbatim_entity_names(query, graph)? {
+            let filter = EntityFilter {
+                name_pattern: Some(name.clone()),
+                ..Default::default()
+            };
+            for entity in graph.query_entities(&filter)? {
+                if !verbatim_name_declares(&entity, &name) {
+                    continue;
+                }
+                let entity_id = entity.id.to_string();
+                if !seen.insert(entity_id.clone()) {
+                    continue;
+                }
+                let Some(path) = entity.file_origin.as_ref().map(|origin| origin.0.clone()) else {
+                    continue;
+                };
+                let body = if opts.bodies {
+                    bounded_entity_body_with_note(
+                        held_authority,
+                        &entity,
+                        opts.max_lines,
+                        opts.max_chars,
+                        source_scope,
+                        &mut result.degradations,
+                    )
+                } else {
+                    None
+                };
+                admitted.push((
+                    file_rank_of(&path),
+                    LocateEntity {
+                        entity_id,
+                        id_space: LocateIdSpace::Entity,
+                        artifact_path: None,
+                        kind: format!("{:?}", entity.kind).to_lowercase(),
+                        name: entity.name.clone(),
+                        signature: entity.signature.clone(),
+                        score: reference * entity_projection_role_penalty(&path, test_query),
+                        definition: true,
+                        span: entity_span_pair(&entity).into_iter().next(),
+                        body,
+                        match_kind: Some(classify_locate_match(query, &entity.name, "", None)),
+                        provenance: LocateProvenance {
+                            file: Some(path),
+                            origin: String::new(),
+                            cosine: None,
+                        },
+                        matched_queries: Vec::new(),
+                        collapsed_rows: 0,
+                        name_tier: None,
+                        scorer_probability: None,
+                        proven_callers: None,
+                        hops_from_root: None,
+                    },
+                ));
+            }
         }
         ranked.extend(admitted);
     }
@@ -20567,6 +21610,7 @@ pub fn fuse_locate_results(
         && !entities
             .iter()
             .any(|entity| entity.match_kind == Some(LocateMatchKind::Name));
+    let scorer = scorer::fuse_scorer_reports(results.iter().map(|result| result.scorer.as_ref()));
     let primary = results.into_iter().next().unwrap_or_default();
     LocateResult {
         entities,
@@ -20580,6 +21624,8 @@ pub fn fuse_locate_results(
         degradations,
         queries: variants,
         score_composition: None,
+        retrieval_arm: primary.retrieval_arm,
+        scorer,
     }
 }
 
@@ -20709,8 +21755,8 @@ fn coverage_banner(coverage: &SemanticCoverage) -> Option<String> {
     }
     Some(coverage.note.clone().unwrap_or_else(|| {
         format!(
-            "semantic (embedding) signal incomplete: {}/{} entities indexed, \
-             {} pending; lexical + graph signals still ran",
+            "search by meaning is incomplete: {} of {} entities are indexed, {} still \
+             pending; word and link matching still ran",
             coverage.indexed, coverage.total, coverage.pending
         )
     }))
@@ -20864,7 +21910,7 @@ fn coverage_notes(result: &LocateResult) -> Vec<CoverageNote> {
         // check that reads both forms is what caught it.
         notes.push(CoverageNote {
             component: SEMANTIC_COVERAGE_COMPONENT.to_string(),
-            full: format!("{SEMANTIC_COVERAGE_COMPONENT}: {banner}"),
+            full: format!("{}: {banner}", component_topic(SEMANTIC_COVERAGE_COMPONENT)),
         });
     }
     for degradation in &result.degradations {
@@ -20875,11 +21921,17 @@ fn coverage_notes(result: &LocateResult) -> Vec<CoverageNote> {
             continue;
         }
         let full = if degradation.remediation.is_empty() {
-            format!("{}: {}", degradation.component, degradation.detail)
+            format!(
+                "{}: {}",
+                component_topic(&degradation.component),
+                degradation.detail
+            )
         } else {
             format!(
                 "{}: {}; {}",
-                degradation.component, degradation.detail, degradation.remediation
+                component_topic(&degradation.component),
+                degradation.detail,
+                degradation.remediation
             )
         };
         notes.push(CoverageNote {
@@ -20906,15 +21958,60 @@ fn collapsed_notes_line(notes: &[CoverageNote]) -> Option<String> {
     if notes.is_empty() {
         return None;
     }
-    let mut components: Vec<&str> = notes.iter().map(|note| note.component.as_str()).collect();
+    let mut components: Vec<String> = notes
+        .iter()
+        .map(|note| component_topic(&note.component))
+        .collect();
     components.dedup();
     Some(format!(
-        "{} note{} on how this answer was produced ({}). Re-run with --explain to read {}.",
+        "{} note{} about how this answer was found ({}). Re-run with --explain to read {}.",
         notes.len(),
         if notes.len() == 1 { "" } else { "s" },
         components.join(", "),
         if notes.len() == 1 { "it" } else { "them" },
     ))
+}
+
+/// The part of the search a coverage note is about, in words a person knows.
+///
+/// The component names stay what they are in `--json`; this is the label the
+/// terminal prints for them.
+fn component_topic(component: &str) -> String {
+    match component {
+        "semantic_coverage" => "how much of the code can be searched by meaning",
+        "capability_tier" => "this machine's limits",
+        "cross_encoder" => "re-ranking of results",
+        "entity_source" => "code snippets",
+        "graph_role_filter" => "files left out, such as tests",
+        "graph_source_bodies" => "code bodies",
+        "pipeline" => "the search steps",
+        "text_index" => "the word index",
+        "vector_index" => "the meaning index",
+        "artifact_candidates" => "documents and other files that are not code",
+        other => return other.replace('_', " "),
+    }
+    .to_string()
+}
+
+/// One search signal a file row rests on, in words a person knows.
+fn signal_topic(signal: &str) -> String {
+    match signal {
+        "traceback" => "stack trace",
+        "multihop" => "related code",
+        "tests" => "tests",
+        "snippets" => "code snippets",
+        "imports" => "imports",
+        "errors" => "error text",
+        "cochange" => "files changed together",
+        "entity_resolve" => "symbol name",
+        "source_text" | "lexical" => "words in the code",
+        "embedding" | "embeddings" => "meaning",
+        "graph" => "code links",
+        "search" => "search",
+        "body" => "code body",
+        other => return other.replace('_', " "),
+    }
+    .to_string()
 }
 
 /// What evidence one ranked row rests on, from the symbols locate attributed
@@ -20948,8 +22045,8 @@ fn file_row_match_kind(entry: &LocateFileEntry, query: &str) -> LocateMatchKind 
 fn match_kind_row_label(kind: LocateMatchKind) -> &'static str {
     match kind {
         LocateMatchKind::Name => "named match",
-        LocateMatchKind::Semantic => "vector match",
-        LocateMatchKind::TextFallback => "lexical and graph only",
+        LocateMatchKind::Semantic => "matches by meaning",
+        LocateMatchKind::TextFallback => "word and link matches only",
     }
 }
 
@@ -20978,10 +22075,10 @@ fn answer_floor_note(result: &LocateResult, query: &str) -> Option<String> {
     }
     let rows = result.files.len();
     Some(format!(
-        "no row cleared the answer floor, which is one returned file holding a symbol this \
-         query named, or one carrying vector evidence. All {rows} rank on lexical and graph \
-         signals alone, so they are this store's nearest neighbours for your words rather \
-         than a match. Name a symbol, file or identifier for a stronger answer."
+        "None of these files is a confirmed match: no returned file holds a symbol your query \
+         named, and none matched by meaning. All {rows} came from word and link matches alone, \
+         so they are the closest files to your words, not proven matches. Name a symbol, file \
+         or identifier for a stronger answer."
     ))
 }
 
@@ -21058,19 +22155,29 @@ fn locate_text_lines(result: &LocateResult, explain: bool, query: &str) -> Vec<S
     let mut lines = Vec::new();
     for (index, entry) in result.files.iter().enumerate() {
         let rank = index + 1;
-        let signals = entry.signals.join(", ");
+        let signals = entry
+            .signals
+            .iter()
+            .map(|signal| signal_topic(signal))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let signals = if signals.is_empty() {
+            "words only".to_string()
+        } else {
+            signals
+        };
         // Appended after the existing parenthesised group rather than inside
         // it, so the row shape every other surface and test already pins stays
         // byte-identical up to the bracket.
         let strength = match_kind_row_label(file_row_match_kind(entry, query));
         if explain {
             lines.push(format!(
-                "  {:>3}. {:<50} (score: {:.2}, signals: {}) [{}]",
+                "  {:>3}. {:<50} (score: {:.2}, matched on: {}) [{}]",
                 rank, entry.path, entry.score, signals, strength
             ));
         } else {
             lines.push(format!(
-                "  {:>3}. {:<50} (signals: {}) [{}]",
+                "  {:>3}. {:<50} (matched on: {}) [{}]",
                 rank, entry.path, signals, strength
             ));
         }
@@ -21145,15 +22252,160 @@ mod tests {
             entry.detail
         );
         assert!(
-            entry.remediation.contains("granularity: \"file\""),
-            "the remediation must name the granularity that stayed useful: {}",
+            entry.remediation.contains("narrower follow-up query")
+                && entry.remediation.contains("by its id"),
+            "the remediation must name a semantic next step: {}",
             entry.remediation
         );
         assert!(
-            entry.remediation.contains("existing files[] rollup"),
-            "the CLI must receive advice it can act on without a granularity flag: {}",
+            kin_mcp::semantic_surface::diagnostic(&entry.remediation) == entry.remediation,
+            "an agent must receive the remediation, not a withheld note: {}",
             entry.remediation
         );
+        assert_eq!(entry.severity(), DegradationSeverity::Note);
+    }
+
+    /// A query vector from a runtime the store's vectors were not built by is
+    /// left out of the ranking, and the ledger entry says so in words rather
+    /// than calling the ranking merely unproven. Every other verdict leaves the
+    /// ranking as it was.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn a_mismatched_query_vector_is_left_out_and_the_entry_says_so() {
+        use kin_core::vector_producer_policy::QueryProducerVerdict;
+        let mismatch = QueryProducerVerdict::Mismatched {
+            query: "cpu".to_string(),
+            index: "metal".to_string(),
+        };
+        let mut sink = Vec::new();
+        record_degradation(
+            &mut sink,
+            RetrievalDegradation {
+                component: "vector_index".to_string(),
+                reason: mismatch.reason().unwrap().to_string(),
+                detail: mismatch.detail().unwrap(),
+                remediation: mismatch.remediation().unwrap().to_string(),
+            },
+        );
+        assert!(exclude_mismatched_query_vectors(&mismatch, &mut sink));
+        let entry = &sink[0];
+        assert!(
+            entry.detail.contains("produced by metal"),
+            "{}",
+            entry.detail
+        );
+        assert!(
+            entry.detail.contains("embeds queries on cpu"),
+            "{}",
+            entry.detail
+        );
+        assert!(
+            entry
+                .detail
+                .contains("unusable for this query and were left out"),
+            "{}",
+            entry.detail
+        );
+        assert!(entry.detail.contains("lexical and graph signals only"));
+        assert!(entry.severity().is_refusing());
+        assert!(entry.remediation.contains("KIN_EMBED_BACKEND"));
+
+        for clean in [
+            QueryProducerVerdict::NotRanked,
+            QueryProducerVerdict::Attributed,
+        ] {
+            let mut untouched = sink.clone();
+            assert!(!exclude_mismatched_query_vectors(&clean, &mut untouched));
+            assert_eq!(untouched, sink);
+        }
+        // An index without producer evidence keeps ranking as it always did,
+        // beside its own refusing entry: only a proved mismatch is left out.
+        let unattributed = QueryProducerVerdict::IndexUnattributed {
+            index: "none".to_string(),
+        };
+        assert!(!exclude_mismatched_query_vectors(
+            &unattributed,
+            &mut sink.clone()
+        ));
+    }
+
+    /// A policy note says so on the wire, and nothing else does.
+    ///
+    /// The four notes are facts about how the query was asked or scoped. Every
+    /// label below is a fact about how the run went, and each of them was seen
+    /// bounding a real answer, so none may ever serialize as a note.
+    #[test]
+    fn only_listed_policy_entries_serialize_as_notes() {
+        for note in RetrievalPolicyNote::ALL {
+            let entry = note.degradation("what happened", "what lifts it");
+            assert_eq!(entry.severity(), DegradationSeverity::Note, "{note:?}");
+            // Written in the words the verdict reader keys on, so a rename on
+            // either side fails here rather than turning every note refusing.
+            let wire = serde_json::to_value(&entry).unwrap();
+            assert_eq!(
+                wire[kin_mcp::negative::DEGRADATION_SEVERITY_KEY],
+                kin_mcp::negative::DEGRADATION_NOTE,
+                "{wire}"
+            );
+            assert_eq!(
+                RetrievalPolicyNote::of(&entry.component, &entry.reason),
+                Some(note)
+            );
+        }
+        for (component, reason) in [
+            ("vector_index", "query_failed"),
+            ("vector_index", "empty"),
+            ("cross_encoder", "model_not_cached"),
+            ("response_budget", "bounded"),
+            ("focal_resolution", "ambiguous_name"),
+            ("call_sites", "receiver_name_candidates"),
+            ("graph_source_bodies", "partial"),
+            ("text_index", "refused"),
+            ("artifact_candidates", "no_text_match"),
+            ("graph_role_filter", "something_else"),
+        ] {
+            let entry = RetrievalDegradation {
+                component: component.to_string(),
+                reason: reason.to_string(),
+                detail: "detail".to_string(),
+                remediation: String::new(),
+            };
+            assert_eq!(
+                entry.severity(),
+                DegradationSeverity::Refusing,
+                "{component}:{reason}"
+            );
+            let wire = serde_json::to_value(&entry).unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({"component": component, "reason": reason, "detail": "detail"}),
+                "a refusing entry keeps the exact shape it always had"
+            );
+        }
+    }
+
+    /// The note list is the one authority in both directions: an incoming
+    /// `severity` is not trusted, and an entry without one is read by identity.
+    #[test]
+    fn severity_is_read_from_identity_not_from_an_incoming_field() {
+        let claimed: RetrievalDegradation = serde_json::from_value(serde_json::json!({
+            "component": "vector_index", "reason": "query_failed", "severity": "note",
+        }))
+        .unwrap();
+        assert_eq!(claimed.severity(), DegradationSeverity::Refusing);
+        assert!(serde_json::to_value(&claimed)
+            .unwrap()
+            .get("severity")
+            .is_none());
+
+        let old: RetrievalDegradation = serde_json::from_value(serde_json::json!({
+            "component": "graph_role_filter", "reason": "tests_withheld",
+        }))
+        .unwrap();
+        assert_eq!(old.severity(), DegradationSeverity::Note);
+        let round_trip: RetrievalDegradation =
+            serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        assert_eq!(round_trip, old);
     }
 
     /// The misread host in the surface a caller actually reads. A tier the host
@@ -21337,6 +22589,9 @@ mod tests {
             matched_queries: Vec::new(),
             collapsed_rows: 0,
             name_tier: None,
+            scorer_probability: None,
+            proven_callers: None,
+            hops_from_root: None,
         }
     }
 
@@ -21593,6 +22848,7 @@ mod tests {
                 merge_transaction_delta: None,
                 sealed_observation: None,
                 collaboration_delta: None,
+                git_snapshot_proofs: Vec::new(),
             };
             drop(lease);
             manager.commit_repository_transaction(transaction).unwrap();
@@ -22573,6 +23829,9 @@ mod tests {
             matched_queries: Vec::new(),
             collapsed_rows: 0,
             name_tier: None,
+            scorer_probability: None,
+            proven_callers: None,
+            hops_from_root: None,
         }
     }
 
@@ -22927,6 +24186,9 @@ mod tests {
             matched_queries: Vec::new(),
             collapsed_rows: 0,
             name_tier: None,
+            scorer_probability: None,
+            proven_callers: None,
+            hops_from_root: None,
         }
     }
 
@@ -23091,7 +24353,7 @@ mod tests {
                 "a cross-row-incomparable score must not imply a sort key: {line:?}"
             );
             assert!(
-                line.contains("(signals: lexical, graph)"),
+                line.contains("(matched on: words in the code, code links)"),
                 "signals still explain why a row was admitted: {line:?}"
             );
         }
@@ -23101,12 +24363,12 @@ mod tests {
     fn locate_text_rows_carry_score_under_explain() {
         let lines = locate_text_lines(&non_monotonic_ranking(), true, "");
         assert!(
-            lines[1].contains("(score: 45.79, signals: lexical, graph)"),
+            lines[1].contains("(score: 45.79, matched on: words in the code, code links)"),
             "explain keeps the score as a diagnostic: {:?}",
             lines[1]
         );
         assert!(
-            lines[2].contains("(score: 85.10, signals: lexical, graph)"),
+            lines[2].contains("(score: 85.10, matched on: words in the code, code links)"),
             "explain keeps the score as a diagnostic: {:?}",
             lines[2]
         );
@@ -23163,7 +24425,7 @@ mod tests {
             "the count is the point of the line: {summary}"
         );
         assert!(
-            summary.contains("capability_tier") && summary.contains("graph_role_filter"),
+            summary.contains("this machine's limits") && summary.contains("files left out"),
             "and the components are named, so a reader can tell whether theirs is in \
              there without re-running: {summary}"
         );
@@ -23228,12 +24490,12 @@ mod tests {
         let explained = coverage_note_lines(&covered, true).join("\n");
         for note in coverage_notes(&covered) {
             assert!(
-                summary.contains(&note.component),
+                summary.contains(&component_topic(&note.component)),
                 "the summary names every note: {summary} is missing {}",
                 note.component
             );
             assert!(
-                explained.contains(&note.component),
+                explained.contains(&component_topic(&note.component)),
                 "and --explain carries every name the summary used: {explained} is missing {}",
                 note.component
             );
@@ -23250,7 +24512,7 @@ mod tests {
         );
         let one = collapsed_notes_line(&notes[..1]).expect("one note still collapses");
         assert!(
-            one.contains("1 note on") && one.contains("read it."),
+            one.contains("1 note about") && one.contains("read it."),
             "the singular reads as a sentence: {one}"
         );
     }
@@ -23321,17 +24583,17 @@ mod tests {
         let note = answer_floor_note(&weak, "Blueprint werkzeug wsgi_app")
             .expect("an answer where nothing matched says so");
         assert!(
-            note.contains("answer floor") && note.contains("symbol this query named"),
+            note.contains("confirmed match") && note.contains("symbol your query named"),
             "the floor is named rather than left as a number: {note}"
         );
         assert!(
-            note.contains("2 rank on lexical and graph signals alone"),
+            note.contains("All 2 came from word and link matches alone"),
             "and the reader is told how many rows it covers: {note}"
         );
 
         let lines = locate_text_lines(&weak, false, "Blueprint werkzeug wsgi_app");
         assert!(
-            lines[0].ends_with("[lexical and graph only]"),
+            lines[0].ends_with("[word and link matches only]"),
             "every row carries its label, so an absent one is a bug rather than good news: {:?}",
             lines[0]
         );
@@ -23342,7 +24604,7 @@ mod tests {
             named_lines[0]
         );
         assert!(
-            named_lines[0].contains("(signals: lexical, graph)"),
+            named_lines[0].contains("(matched on: words in the code, code links)"),
             "the label is appended, so the row shape other surfaces pin is unchanged: {:?}",
             named_lines[0]
         );
@@ -26586,6 +27848,75 @@ mod tests {
         );
     }
 
+    /// An entity the query names verbatim reaches the surface, at the top,
+    /// even when its file fell out of the file ranking. The control turns the
+    /// admission off and shows the file cut alone losing the named symbol.
+    #[test]
+    fn a_symbol_the_query_names_verbatim_is_on_the_surface_without_its_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let named = test_entity("analyze_param", "fastapi/dependencies/utils.py", 400, 520);
+        let ranked_row = test_entity("APIRoute.__init__", "fastapi/routing.py", 600, 700);
+        graph.upsert_entity(&named).unwrap();
+        graph.upsert_entity(&ranked_row).unwrap();
+        let question = "startup fails with AssertionError: File \"utils.py\", line 510, in \
+                        analyze_param is_scalar_field(field)";
+        let build = |admit: &str| {
+            let _guard =
+                kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_VERBATIM_NAME_ROWS", admit);
+            let mut result = LocateResult {
+                files: vec![LocateFileEntry {
+                    path: "fastapi/routing.py".to_string(),
+                    score: 1.4,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![LocateSymbol {
+                        name: "APIRoute.__init__".to_string(),
+                        span: Some([600, 700]),
+                        score: 300.0,
+                        kind: "method".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                }],
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                question,
+                false,
+            )
+            .unwrap();
+            result
+                .entities
+                .iter()
+                .map(|entity| (entity.name.clone(), entity.match_kind))
+                .collect::<Vec<_>>()
+        };
+
+        let control = build("0");
+        assert!(
+            control.iter().all(|(name, _)| name != "analyze_param"),
+            "control: the file cut alone loses the named symbol: {control:?}"
+        );
+        let fixed = build("1");
+        assert_eq!(
+            fixed.first(),
+            Some(&("analyze_param".to_string(), Some(LocateMatchKind::Name))),
+            "{fixed:?}"
+        );
+        assert!(fixed.iter().any(|(name, _)| name == "APIRoute.__init__"));
+    }
+
     /// A query that SPELLS the symbol has named it, qualifier and all.
     ///
     /// The prose-word rule takes the exact-name tier away from a name match resting on
@@ -29809,6 +31140,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn locate_reports_an_unbuilt_vector_index_on_a_fresh_store() {
+        if !kin_core::test_env::alone_in_process() {
+            return;
+        }
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
@@ -29818,8 +31152,26 @@ mod tests {
             "fixture control: this store must carry no vector index"
         );
 
+        // The fused arm, named: with nothing named, a store with no vectors
+        // ranks on entity cards and has no vector gap to report.
+        let home = tempfile::tempdir().unwrap();
+        crate::embed_model::record_model_fetch(
+            home.path(),
+            crate::embed_model::MODEL_FETCH_DEFERRED,
+        )
+        .unwrap();
         let _strict = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
-            .without(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+            .without(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV)
+            .with("KIN_HOME", home.path())
+            .with("HF_HOME", home.path().join("hf"))
+            .with("HF_HUB_OFFLINE", "1")
+            .with("KIN_MODEL_EMBEDDINGS_PROVIDER", "built-in")
+            .without("KIN_EMBED_PROVIDER")
+            .without("KIN_MODEL_EMBEDDINGS_MODEL")
+            .without("KIN_EMBED_MODEL_ID")
+            .without("KIN_EMBED_OPENAI_MODEL")
+            .with(crate::retrieval_arm::ARM_ENV, "fused");
+        assert!(kin_db::embed::embedding_slot_enabled());
 
         let result = run_with_graph_capture_in_workspace_budgeted(
             &graph,
@@ -29851,6 +31203,10 @@ mod tests {
             "the detail must say which state this is: {}",
             entry.detail
         );
+        assert!(
+            !home.path().join("hf").exists(),
+            "an absent vector index must not initialize or download a query model"
+        );
     }
 
     #[cfg(not(feature = "vector"))]
@@ -29862,9 +31218,12 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
+        // The fused arm, named: with nothing named, this build ranks on entity
+        // cards and has no vector gap to report.
         let _coverage =
             kin_core::test_env::EnvVarGuard::set("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1")
-                .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+                .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
+                .with(crate::retrieval_arm::ARM_ENV, "fused");
         let result = run_with_graph_capture_in_workspace_budgeted(
             &graph,
             None,
@@ -29999,8 +31358,11 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
+        // The fused arm, named: with nothing named, a store with no vectors
+        // ranks on entity cards and has no vector gap to report.
         let _coverage = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
-            .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+            .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
+            .with(crate::retrieval_arm::ARM_ENV, "fused");
         let result = run_with_graph_capture_in_workspace_budgeted(
             &graph,
             None,
@@ -30027,11 +31389,11 @@ mod tests {
         );
     }
 
-    /// The featureless half of the graceful-degradation contract. The
-    /// vector-gated case above covers the strict knob; this covers the default
-    /// path, where a build with no embedding pipeline must still answer and
-    /// must say plainly that the semantic signal is unavailable rather than
-    /// reporting it as merely incomplete.
+    /// The featureless half of the graceful-degradation contract. A build with
+    /// no vector pipeline answers on its default path from entity cards and the
+    /// graph, and says the vectors were not used rather than reporting them as
+    /// merely incomplete. A fused arm named explicitly in the same build still
+    /// says plainly that the semantic signal is unavailable.
     #[cfg(not(feature = "vector"))]
     #[test]
     #[serial_test::serial]
@@ -30041,19 +31403,24 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         admit_test_source(&graph, "src/lib.py", "def handler():\n    pass\n");
 
-        let _coverage = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
-            .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
-        let result = run_with_graph_capture_in_workspace_budgeted(
-            &graph,
-            None,
-            "handler failure",
-            true,
-            10,
-            true,
-            LocateBudget::unbounded(),
-        )
-        .expect("a vector-free build must degrade gracefully, not error");
+        let mut env = kin_core::test_env::EnvVarGuard::unset("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
+            .without("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
+            .without(crate::retrieval_arm::ARM_ENV);
+        let run = || {
+            run_with_graph_capture_in_workspace_budgeted(
+                &graph,
+                None,
+                "handler failure",
+                true,
+                10,
+                true,
+                LocateBudget::unbounded(),
+            )
+            .expect("a vector-free build must degrade gracefully, not error")
+        };
 
+        let result = run();
+        assert_eq!(result.retrieval_arm.as_deref(), Some("cards"));
         let coverage = result
             .semantic_coverage
             .expect("semantic_coverage must be reported");
@@ -30062,6 +31429,23 @@ mod tests {
             "a vector-free build must report semantic ranking as unsupported"
         );
         assert_eq!(coverage.indexed, 0, "no embeddings indexed in this graph");
+        assert_eq!(coverage.embedding_state, EmbeddingState::NotUsed);
+        assert!(
+            !coverage
+                .limited_by
+                .iter()
+                .any(|limit| limit == COVERAGE_LIMIT_VECTOR_SUPPORT_DISABLED),
+            "{:?}",
+            coverage.limited_by
+        );
+
+        env.apply(crate::retrieval_arm::ARM_ENV, Some("fused"));
+        let fused = run();
+        assert!(fused.retrieval_arm.is_none());
+        let coverage = fused
+            .semantic_coverage
+            .expect("semantic_coverage must be reported");
+        assert!(!coverage.supported);
         assert!(!coverage.complete, "coverage must be marked incomplete");
         assert!(
             coverage.note.is_some(),
@@ -32099,6 +33483,82 @@ mod tests {
 
         assert!(priority > regular);
         assert!(priority > 0.7);
+    }
+
+    /// A traceback's frames name the functions it ran through, and the one it
+    /// died in is usually the answer. Term curation keeps a few terms in a
+    /// fixed order and dropped them; the verbatim names reach the search stage
+    /// whatever curation kept, as exact-name seeds. A name shared by many
+    /// entities, and a plain word that happens to name one, are not seeded.
+    #[test]
+    fn a_name_the_query_spells_verbatim_is_seeded_as_an_exact_name() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = test_entity("analyze_param", "fastapi/dependencies/utils.py", 400, 520);
+        let caller = test_entity("get_dependant", "fastapi/dependencies/utils.py", 258, 339);
+        let word = test_entity("complete", "fastapi/utils.py", 1, 5);
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&word).unwrap();
+        for owner in ["A", "B", "C", "D", "E"] {
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{owner}.__init__"),
+                    "fastapi/x.py",
+                    1,
+                    2,
+                ))
+                .unwrap();
+        }
+        graph.flush_text_index().unwrap();
+        let text = "Improve the error for a wrongly typed query parameter so startup does not \
+            complete with AssertionError BeforeValidator WithJsonSchema FilterableStr: \
+            File \"routing.py\", line 630, in __init__ self.dependant = get_dependant(path=p) \
+            File \"dependencies/utils.py\", line 510, in analyze_param is_scalar_field(field)";
+
+        let names = verbatim_entity_names(text, &graph).unwrap();
+        assert_eq!(names, vec!["get_dependant", "analyze_param"], "{names:?}");
+
+        let seeds = extract_search_signals(text, &graph, false, &mut Vec::new()).unwrap();
+        let seeded = seeds
+            .get(&target.id)
+            .expect("the named function is a candidate");
+        assert!(
+            seeded.exact_name,
+            "it is seeded as the name the query spelled"
+        );
+        assert!(
+            !seeds.get(&word.id).is_some_and(|seed| seed.exact_name),
+            "a plain word is not an exact-name seed"
+        );
+    }
+
+    #[test]
+    fn tracker_references_leave_the_query_and_file_links_keep_their_path() {
+        let query = "Show a clear error on attempt to include router into itself. Previously \
+            discussed in https://github.com/fastapi/fastapi/discussions/11424 with the PR at \
+            https://github.com/fastapi/fastapi/pull/11425, cf Discussion #14265 and PR #7, \
+            fixes encode/httpx#3001. The check lives in \
+            https://github.com/fastapi/fastapi/blob/master/fastapi/routing.py#L1200-L1210.";
+        let cleaned = clean_issue_text(query);
+        let lower = cleaned.to_ascii_lowercase();
+        for gone in [
+            "github",
+            "discussions",
+            "discussion",
+            "pull",
+            "11424",
+            "14265",
+            "#7",
+            "3001",
+        ] {
+            assert!(!lower.contains(gone), "{gone} survived: {cleaned}");
+        }
+        assert!(cleaned.contains("include router into itself"), "{cleaned}");
+        assert!(cleaned.contains("fastapi/routing.py"), "{cleaned}");
+        assert!(!cleaned.contains("#L1200"), "{cleaned}");
+        // Words that only look like references stay.
+        let prose = "the discussion of issues with pull-based parsing in item 3";
+        assert_eq!(clean_issue_text(prose), prose);
     }
 
     #[test]
@@ -34365,8 +35825,13 @@ mod tests {
             .note
             .as_deref()
             .expect("a cleared flag owes a reason");
+        // The note speaks of test-role code rather than counting source
+        // paths: the cause is the include_tests: false filter and what it
+        // excluded, and the lift is include_tests: true.
         assert!(
-            note.contains("role filter") && note.contains("include_tests"),
+            note.contains("include_tests: false filter")
+                && note.contains("test-role code")
+                && note.contains("include_tests: true"),
             "the note must name the cause and the parameter that lifts it: {note}"
         );
     }
@@ -35644,6 +37109,81 @@ mod tests {
         assert!(healed.sample.is_empty());
     }
 
+    /// An empty file's body is the empty string, and the tree knows it exactly.
+    ///
+    /// Measured on a Python web framework: every gap path locate reported was a
+    /// zero-byte package marker. They carry no text preview because there is no
+    /// text, and counting them as gaps made locate over that store refuse on a
+    /// hole that does not exist. A path whose bytes are NOT empty and that still
+    /// has no body is the real gap, and it stays one.
+    #[test]
+    fn an_empty_file_counts_as_a_body_and_a_bodyless_non_empty_file_stays_a_gap() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("request", "src/pkg/api.py", 1, 20))
+            .unwrap();
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("src/pkg/api.py"),
+                content_hash: Hash256::from_bytes([9; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("def request(method, url): return send(method, url)".into()),
+            })
+            .unwrap();
+        // Admitted, source-like, and zero bytes long.
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("src/pkg/__init__.py"),
+                content_hash: kin_blobs::digest(&[]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: None,
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let bodies = extract_source_text_signals("where is the request path", &graph)
+            .unwrap()
+            .graph_bodies
+            .expect("observed");
+        assert_eq!(bodies.source_paths, 2, "{bodies:?}");
+        assert_eq!(
+            bodies.with_body, 2,
+            "an empty file has a known body: {bodies:?}"
+        );
+        assert_eq!(bodies.empty_paths, 1, "{bodies:?}");
+        assert_eq!(bodies.gap_paths, 0, "{bodies:?}");
+        assert!(bodies.sample.is_empty(), "{bodies:?}");
+        let coverage = fully_embedded_coverage().with_graph_bodies(bodies);
+        assert!(coverage.complete, "no gap, so nothing clears complete");
+        assert!(coverage.limited_by.is_empty(), "{:?}", coverage.limited_by);
+
+        // Same store plus a non-empty file the graph holds no body for.
+        graph
+            .put_opaque(&OpaqueArtifact {
+                file_id: FilePathId::new("src/pkg/client.py"),
+                content_hash: Hash256::from_bytes([12; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: None,
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+        let bodies = extract_source_text_signals("where is the request path", &graph)
+            .unwrap()
+            .graph_bodies
+            .expect("observed");
+        assert_eq!(bodies.source_paths, 3, "{bodies:?}");
+        assert_eq!(bodies.with_body, 2, "{bodies:?}");
+        assert_eq!(bodies.empty_paths, 1, "{bodies:?}");
+        assert_eq!(bodies.gap_paths, 1, "{bodies:?}");
+        assert_eq!(bodies.sample, vec!["src/pkg/client.py".to_string()]);
+        let coverage = fully_embedded_coverage().with_graph_bodies(bodies);
+        assert!(!coverage.complete, "a real gap still clears complete");
+        assert_eq!(
+            coverage.limited_by,
+            vec![COVERAGE_LIMIT_GRAPH_BODY_GAP.to_string()]
+        );
+    }
+
     /// The shape every admitted store has at HEAD: parsed source paths carry
     /// entities whose bodies live in `embedding_body_preview`, and no opaque
     /// artifact at all. Those bodies are graph-owned and must count as such and
@@ -36709,6 +38249,112 @@ mod tests {
         );
     }
 
+    /// The multihop walk is cut by work done, never by the clock.
+    ///
+    /// It used to stop when a wall-clock timeout ran out, so a loaded host cut
+    /// it earlier than an idle one and the same query ranked differently from
+    /// one call to the next. A walk that is cut must be cut in the same place
+    /// every time, and must say how far it got.
+    #[test]
+    fn the_multihop_walk_is_cut_at_the_same_step_on_every_call() {
+        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+
+        let _env = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_MULTIHOP_TIMEOUT_MS", "1");
+        let graph = kin_db::InMemoryGraph::new();
+        let seed = test_entity("Seed", "src/seed.py", 1, 5);
+        graph.upsert_entity(&seed).unwrap();
+        // A fan of sixty callees, each in its own file and each calling one
+        // more: far more than one millisecond's twenty steps can take.
+        for i in 0..60 {
+            let near = test_entity(&format!("Near{i:02}"), &format!("src/near{i:02}.py"), 1, 5);
+            let far = test_entity(&format!("Far{i:02}"), &format!("src/far{i:02}.py"), 1, 5);
+            graph.upsert_entity(&near).unwrap();
+            graph.upsert_entity(&far).unwrap();
+            for (src, dst) in [(seed.id, near.id), (near.id, far.id)] {
+                graph
+                    .upsert_relation(&Relation {
+                        id: RelationId::new(),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(src),
+                        dst: GraphNodeId::Entity(dst),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        let seeds = HashMap::from([(
+            String::from("src/seed.py"),
+            vec![FileHit {
+                score: 100.0,
+                spans: vec![],
+            }],
+        )]);
+        let walk = || {
+            let mut ledger = Vec::new();
+            let hits = extract_multihop_signals(
+                &[&seeds],
+                &graph,
+                LocateProfile::Performance,
+                false,
+                Some(&mut ledger),
+            )
+            .unwrap();
+            let mut reached: Vec<(String, u32)> = hits
+                .iter()
+                .map(|(path, file_hits)| {
+                    let best = file_hits.iter().map(|hit| hit.score).fold(0.0f32, f32::max);
+                    (path.clone(), best.to_bits())
+                })
+                .collect();
+            reached.sort();
+            let cut = ledger
+                .iter()
+                .find(|event| event.stage == "multihop_timeout")
+                .map(|event| (event.limit, event.detail.clone()));
+            (reached, cut)
+        };
+
+        let (first, first_cut) = walk();
+        let (cut_limit, cut_detail) =
+            first_cut.expect("a one-millisecond allowance must cut this walk");
+        assert_eq!(
+            cut_limit,
+            Some(MULTIHOP_STEPS_PER_MS),
+            "the allowance is spent as steps"
+        );
+        assert!(
+            cut_detail.contains(&format!("stopped after {MULTIHOP_STEPS_PER_MS} steps")),
+            "the cut must say how far the walk got: {cut_detail}"
+        );
+        assert!(
+            !first.is_empty() && first.len() < 120,
+            "the cut walk reached some files and not all of them: {}",
+            first.len()
+        );
+        for _ in 0..5 {
+            let (again, again_cut) = walk();
+            assert_eq!(
+                again, first,
+                "a cut walk must reach the same files with the same scores"
+            );
+            assert_eq!(again_cut.map(|(limit, _)| limit), Some(cut_limit));
+        }
+
+        // The allowance in milliseconds is a count of steps, and zero turns it off.
+        assert_eq!(
+            multihop_step_budget(kin_core::env_registry::MsBound::Limited(1000)),
+            Some(1000 * MULTIHOP_STEPS_PER_MS)
+        );
+        assert_eq!(
+            multihop_step_budget(kin_core::env_registry::MsBound::Unbounded),
+            None
+        );
+    }
+
     #[test]
     fn collect_signals_names_cochange_label() {
         let all_hits = vec![
@@ -37330,11 +38976,11 @@ mod tests {
         };
         let synth = coverage_banner(&partial_no_note).expect("degraded coverage emits a banner");
         assert!(
-            synth.contains("4/10"),
+            synth.contains("4 of 10"),
             "synthesized banner cites indexed/total"
         );
         assert!(
-            synth.contains("6 pending"),
+            synth.contains("6 still pending"),
             "synthesized banner cites pending"
         );
     }
@@ -37501,7 +39147,7 @@ mod tests {
         let lines = locate_trailing_notes(&weak, "where is the request body size limit", fetch);
         assert_eq!(lines.len(), 2, "both notes are emitted: {lines:?}");
         assert!(
-            lines[0].contains("no row cleared the answer floor"),
+            lines[0].contains("None of these files is a confirmed match"),
             "the floor sentence still leads: {:?}",
             lines[0]
         );
@@ -37531,7 +39177,7 @@ mod tests {
         let lines = locate_trailing_notes(&weak, "where is the request body size limit", fetch);
         assert_eq!(lines.len(), 1, "a cached model adds no line: {lines:?}");
         assert!(
-            lines[0].contains("no row cleared the answer floor"),
+            lines[0].contains("None of these files is a confirmed match"),
             "and the floor sentence is the one that survives: {:?}",
             lines[0]
         );
@@ -37579,8 +39225,12 @@ mod tests {
         .iter()
         .map(|path| (*path).to_string())
         .collect();
-        let bodies =
-            GraphBodyCoverage::observe(paths.iter(), 0, |path: &str| path.ends_with("api.py"));
+        let bodies = GraphBodyCoverage::observe(
+            paths.iter(),
+            0,
+            |path: &str| path.ends_with("api.py"),
+            |_| false,
+        );
 
         assert_eq!(bodies.source_paths, 4);
         assert_eq!(bodies.with_body, 1);
@@ -37603,7 +39253,7 @@ mod tests {
         let paths: Vec<String> = (0..40)
             .map(|index| format!("src/mod{index:02}.py"))
             .collect();
-        let bodies = GraphBodyCoverage::observe(paths.iter(), 0, |_| false);
+        let bodies = GraphBodyCoverage::observe(paths.iter(), 0, |_| false, |_| false);
 
         assert_eq!(bodies.gap_paths, 40, "the count must be the whole truth");
         assert_eq!(
@@ -37629,6 +39279,7 @@ mod tests {
             ]
             .iter(),
             0,
+            |_| false,
             |_| false,
         ));
 
@@ -37666,6 +39317,7 @@ mod tests {
             ["src/requests/api.py".to_string()].iter(),
             0,
             |_| true,
+            |_| false,
         ));
         assert!(observed.complete, "no gap, so nothing to clear");
         assert!(observed.note.is_none(), "no gap, so no note");
@@ -37698,6 +39350,7 @@ mod tests {
         let coverage = partial.with_graph_bodies(GraphBodyCoverage::observe(
             ["src/requests/sessions.py".to_string()].iter(),
             0,
+            |_| false,
             |_| false,
         ));
 
@@ -37811,3 +39464,8 @@ mod tests {
         );
     }
 }
+
+// After the inline test module, so the zero-file-search guard's first
+// `#[cfg(test)] mod` is that module and its span stays exact.
+#[cfg(test)]
+mod arm_tests;

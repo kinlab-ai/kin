@@ -103,11 +103,52 @@ const NOT_ON_DAEMON_PATH: &str = "is on this daemon's PATH";
 ///
 /// `command` is the server the daemon tried to start, when it knows which.
 pub fn no_server_on_daemon_path(command: Option<&str>) -> String {
-    match command {
+    no_server_on_daemon_path_in(command, None)
+}
+
+/// [`no_server_on_daemon_path`], naming the directories the daemon looked in
+/// when it knows them. A daemon started by a service manager or an editor
+/// often has a shorter `PATH` than the shell its user installed the server
+/// from, and naming the directories is what shows that.
+pub fn no_server_on_daemon_path_in(command: Option<&str>, searched: Option<&str>) -> String {
+    let missing = match command {
         Some(command) => format!("no `{command}` {NOT_ON_DAEMON_PATH}"),
         None => format!("no server for it {NOT_ON_DAEMON_PATH}"),
+    };
+    match searched.filter(|searched| !searched.is_empty()) {
+        Some(searched) => format!("{missing} (looked in {searched})"),
+        None => missing,
     }
 }
+
+/// A language's display label, `TypeScript` for the row `typescript`, for
+/// the sentences that name a language to a reader. The row's own name when
+/// it is not one this build enriches.
+pub fn language_display_label(language: &str) -> String {
+    ENRICHABLE_LANGUAGES
+        .iter()
+        .find(|candidate| candidate.to_string() == language)
+        .map(|candidate| candidate.profile().display_name.to_string())
+        .unwrap_or_else(|| language.to_string())
+}
+
+/// The sentence for a language whose language server cannot start, built
+/// from its display label and the reason the start failed.
+pub fn enrichment_unavailable_sentence(label: &str, reason: &str) -> String {
+    format!("{label} enrichment unavailable: {reason}")
+}
+
+/// The sentence for a language whose language server runs without the
+/// environment the repository chose, so calls into its dependencies get no
+/// answer. `reason` is why the environment is missing.
+pub fn enrichment_partial_sentence(label: &str, reason: &str) -> String {
+    format!("{label} enrichment is partial: calls into dependencies get no answer: {reason}")
+}
+
+/// Per-language partial gaps of servers that run: why the environment each
+/// analyses against is missing, as its adapter reported. A language with no
+/// entry has no gap known.
+pub type LanguageServerGapMap = std::collections::HashMap<LanguageId, String>;
 
 /// Whether a skip reason says no server is installed, which installing one
 /// repairs.
@@ -361,9 +402,36 @@ pub struct LanguageReferenceCoverage {
     /// surfaces that probed.
     #[serde(default)]
     pub reference_enrichment: ReferenceEnrichment,
+    /// Why this language's language-server enrichment is not whole, in the
+    /// server's or the adapter's own words: why its server cannot start, when
+    /// `reference_enrichment` is `language_server_unusable`, or why the server
+    /// that runs analyses without the repository's dependencies, when it is
+    /// `available`. `None` when nothing is known to be missing, which is
+    /// every row an older daemon wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_enrichment_reason: Option<String>,
 }
 
 impl LanguageReferenceCoverage {
+    /// What this row's language-server enrichment is missing, as the sentence
+    /// a reader sees, or `None` when nothing is known to be missing.
+    ///
+    /// Built from the language's display label and the recorded reason, so
+    /// every surface says it the same way: "TypeScript enrichment
+    /// unavailable: <reason>" for a server that cannot start, and a named
+    /// partial gap for one that runs without the dependencies.
+    pub fn enrichment_gap_sentence(&self) -> Option<String> {
+        let reason = self.reference_enrichment_reason.as_deref()?;
+        let label = language_display_label(&self.language);
+        match self.reference_enrichment {
+            ReferenceEnrichment::LanguageServerUnusable => {
+                Some(enrichment_unavailable_sentence(&label, reason))
+            }
+            ReferenceEnrichment::Available => Some(enrichment_partial_sentence(&label, reason)),
+            _ => None,
+        }
+    }
+
     /// The warning line for one language no language server can enrich, in a
     /// sentence the output prints verbatim.
     ///
@@ -385,8 +453,12 @@ impl LanguageReferenceCoverage {
             self.files,
             if self.files == 1 { "" } else { "s" }
         );
-        let gap = match self.reference_enrichment {
-            ReferenceEnrichment::LanguageServerUnusable => {
+        let gap = match (self.reference_enrichment, self.enrichment_gap_sentence()) {
+            (ReferenceEnrichment::LanguageServerUnusable, Some(why)) => format!(
+                "no language server for {} can run ({files}): {why}",
+                self.language
+            ),
+            (ReferenceEnrichment::LanguageServerUnusable, None) => {
                 format!("no language server for {} can run ({files})", self.language)
             }
             _ => format!("no language server for {} ({files})", self.language),
@@ -604,8 +676,80 @@ impl ReferenceEdgeCoverage {
                 Some(id) => reference_enrichment_for(id, readiness),
                 None => ReferenceEnrichment::Unsupported,
             };
+            // The reason a server could not start is kept with the row, so no
+            // sentence about it has to say only that it did not.
+            language.reference_enrichment_reason = match enrichable
+                .and_then(|id| readiness.get(&id))
+            {
+                Some(LanguageServerReadiness::Unusable { reason }) if !reason.trim().is_empty() => {
+                    Some(reason.trim().to_string())
+                }
+                _ => None,
+            };
         }
         self
+    }
+
+    /// Record, on each language whose server runs, why it runs without the
+    /// environment the repository chose, from `gaps` as the process that
+    /// started the servers published them.
+    ///
+    /// A server that starts with a TypeScript from outside the repository and
+    /// none of its dependencies answers for the repository's own code and
+    /// nothing it imports. That is enrichment, partial, and the row says so
+    /// rather than reading whole. Call after [`Self::with_language_servers`].
+    pub fn with_language_server_gaps(mut self, gaps: &LanguageServerGapMap) -> Self {
+        for language in &mut self.languages {
+            if language.reference_enrichment != ReferenceEnrichment::Available {
+                continue;
+            }
+            let gap = ENRICHABLE_LANGUAGES
+                .iter()
+                .find(|candidate| candidate.to_string() == language.language)
+                .and_then(|id| gaps.get(id))
+                .map(|gap| gap.trim())
+                .filter(|gap| !gap.is_empty());
+            if let Some(gap) = gap {
+                language.reference_enrichment_reason = Some(gap.to_string());
+            }
+        }
+        self
+    }
+
+    /// Languages with no language server installed, which an install repairs.
+    /// A server that is installed and cannot start is not among them.
+    pub fn languages_without_a_language_server(&self) -> Vec<&str> {
+        self.languages_in_state(ReferenceEnrichment::NoLanguageServer)
+    }
+
+    /// One sentence per language whose language server cannot start, naming
+    /// why when the reason is known.
+    pub fn language_server_start_failures(&self) -> Vec<String> {
+        self.languages
+            .iter()
+            .filter(|language| {
+                language.reference_enrichment == ReferenceEnrichment::LanguageServerUnusable
+            })
+            .map(|language| {
+                language.enrichment_gap_sentence().unwrap_or_else(|| {
+                    format!(
+                        "{} enrichment unavailable: its language server is installed and Kin \
+                         holds no record of why it did not start",
+                        language_display_label(&language.language)
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// One sentence per language whose server runs without the repository's
+    /// dependencies.
+    pub fn partial_enrichment_notes(&self) -> Vec<String> {
+        self.languages
+            .iter()
+            .filter(|language| language.reference_enrichment == ReferenceEnrichment::Available)
+            .filter_map(LanguageReferenceCoverage::enrichment_gap_sentence)
+            .collect()
     }
 
     /// Languages whose edges cannot support an absence claim, worst first.
@@ -741,13 +885,36 @@ impl ReferenceEdgeCoverage {
                 not_installed.join(", ")
             ));
         }
-        let cannot_start = self.languages_in_state(ReferenceEnrichment::LanguageServerUnusable);
-        if !cannot_start.is_empty() {
+        // Each language whose server cannot start is named with its own
+        // reason, which is the repair. A row an older daemon wrote carries
+        // none, and keeps the sentence it always had.
+        let (with_reason, without_reason): (Vec<_>, Vec<_>) = self
+            .languages
+            .iter()
+            .filter(|language| {
+                language.reference_enrichment == ReferenceEnrichment::LanguageServerUnusable
+            })
+            .partition(|language| language.enrichment_gap_sentence().is_some());
+        for language in with_reason {
+            lines.push(format!(
+                "  cross-file reference and override edges cannot be produced for {}: {}",
+                language.language,
+                language.enrichment_gap_sentence().unwrap_or_default()
+            ));
+        }
+        if !without_reason.is_empty() {
             lines.push(format!(
                 "  cross-file reference and override edges cannot be produced for {}: a language \
                  server is installed but it did not start",
-                cannot_start.join(", ")
+                without_reason
+                    .iter()
+                    .map(|language| language.language.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
+        }
+        for note in self.partial_enrichment_notes() {
+            lines.push(format!("  {note}"));
         }
         let unsupported: Vec<&str> = self
             .languages
@@ -1099,6 +1266,7 @@ where
                 external_reference_edges: tally.external,
                 resolution,
                 reference_enrichment: ReferenceEnrichment::Unknown,
+                reference_enrichment_reason: None,
             }
         })
         .collect();
@@ -2247,6 +2415,7 @@ mod tests {
                 external_reference_edges: 0,
                 resolution: ReferenceResolution::PartiallyResolved,
                 reference_enrichment: ReferenceEnrichment::NoLanguageServer,
+                reference_enrichment_reason: None,
             }],
             totals: Some(GraphRelationTotals {
                 entity_relations: 17,
@@ -2436,6 +2605,7 @@ mod tests {
             external_reference_edges: 0,
             resolution: ReferenceResolution::FullyResolved,
             reference_enrichment: enrichment,
+            reference_enrichment_reason: None,
         }
     }
 
@@ -2484,6 +2654,117 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("no language server found"), "{rendered}");
+    }
+
+    /// The field report's "would not start": the reason a probe recorded
+    /// reaches the coverage line, the warning and the doctor's sentence, named
+    /// by the language's display label, instead of stopping at the readiness
+    /// map.
+    #[test]
+    fn an_unusable_server_names_its_reason_on_every_coverage_line() {
+        let reason = "`/opt/homebrew/bin/typescript-language-server` refused initialize: Could \
+                      not find a valid TypeScript installation";
+        let readiness = LanguageServerReadinessMap::from([(
+            LanguageId::TypeScript,
+            LanguageServerReadiness::Unusable {
+                reason: reason.to_string(),
+            },
+        )]);
+        let mut typescript = language_row("typescript", ReferenceEnrichment::Unknown);
+        typescript.files = 12;
+        let coverage = ReferenceEdgeCoverage {
+            parse: None,
+            languages: vec![typescript],
+            totals: None,
+        }
+        .with_language_servers(&readiness);
+        let row = &coverage.languages[0];
+        assert_eq!(
+            row.reference_enrichment,
+            ReferenceEnrichment::LanguageServerUnusable
+        );
+        assert_eq!(row.reference_enrichment_reason.as_deref(), Some(reason));
+        let expected = format!("TypeScript enrichment unavailable: {reason}");
+
+        let rendered = coverage.summary_lines().join("\n");
+        assert!(
+            rendered.contains(&format!(
+                "cross-file reference and override edges cannot be produced for typescript: \
+                 {expected}"
+            )),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("did not start"), "{rendered}");
+
+        let warnings = coverage.missing_language_server_warnings();
+        assert!(
+            warnings[0].starts_with(&format!(
+                "no language server for typescript can run (12 files): {expected}; "
+            )),
+            "the prefix graders key on stays, and the reason follows it: {}",
+            warnings[0]
+        );
+
+        assert_eq!(coverage.language_server_start_failures(), vec![expected]);
+        assert!(
+            coverage.languages_without_a_language_server().is_empty(),
+            "a server that cannot start is not reported as missing"
+        );
+
+        // A row an older daemon serialized has no reason and still reads.
+        let mut old = serde_json::to_value(row).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("reference_enrichment_reason");
+        let read: LanguageReferenceCoverage = serde_json::from_value(old).unwrap();
+        assert_eq!(read.reference_enrichment_reason, None);
+        let none = language_row("python", ReferenceEnrichment::Available);
+        assert!(serde_json::to_value(&none)
+            .unwrap()
+            .get("reference_enrichment_reason")
+            .is_none());
+    }
+
+    /// A server that starts without the repository's dependencies is named as
+    /// partial enrichment, with why, and never as a missing or broken server.
+    #[test]
+    fn a_server_running_without_dependencies_is_a_named_partial_gap() {
+        let readiness = LanguageServerReadinessMap::from([(
+            LanguageId::TypeScript,
+            LanguageServerReadiness::Usable,
+        )]);
+        let gaps = LanguageServerGapMap::from([(
+            LanguageId::TypeScript,
+            "no lockfile, and no node_modules".to_string(),
+        )]);
+        let coverage = ReferenceEdgeCoverage {
+            parse: None,
+            languages: vec![language_row("typescript", ReferenceEnrichment::Unknown)],
+            totals: None,
+        }
+        .with_language_servers(&readiness)
+        .with_language_server_gaps(&gaps);
+        let note = "TypeScript enrichment is partial: calls into dependencies get no answer: no \
+                    lockfile, and no node_modules";
+        assert_eq!(coverage.partial_enrichment_notes(), vec![note.to_string()]);
+        assert!(
+            coverage.summary_lines().join("\n").contains(note),
+            "{:?}",
+            coverage.summary_lines()
+        );
+        assert!(coverage.missing_language_server_warnings().is_empty());
+        assert!(coverage.language_server_start_failures().is_empty());
+    }
+
+    #[test]
+    fn a_missing_server_reason_can_name_where_the_daemon_looked() {
+        let reason =
+            no_server_on_daemon_path_in(Some("typescript-language-server"), Some("/usr/bin, /bin"));
+        assert_eq!(
+            reason,
+            "no `typescript-language-server` is on this daemon's PATH (looked in /usr/bin, /bin)"
+        );
+        assert!(skip_reason_is_missing_server(&reason));
     }
 
     /// No server and no cross-file edge keeps the sentence it always had, word

@@ -13,7 +13,9 @@ use kin_db::storage::binding_history::{
     BINDING_HISTORY_PROTOCOL,
 };
 use kin_db::{GraphSnapshot, InMemoryGraph, KinDbError};
-use kin_model::{ArtifactId, ChangeStore, FilePathId, Hash256, Relation, RepoPath, TreeEntry};
+use kin_model::{
+    ArtifactId, ChangeStore, FilePathId, Hash256, Relation, RepoPath, ResolvedTree, TreeEntry,
+};
 use std::collections::{BTreeMap, HashMap};
 
 pub struct LocalBindingHistoryVerifier;
@@ -423,7 +425,14 @@ pub fn verify_rederived_graph(
 
 struct TransitionVerifier<'a> {
     load_body: &'a dyn Fn(Hash256) -> Result<Option<Vec<u8>>, KinDbError>,
-    parsed: HashMap<(FilePathId, Hash256), std::sync::Arc<crate::IndexedFile>>,
+    parsed: HashMap<
+        (
+            FilePathId,
+            Hash256,
+            kin_parser::project_manifest::UnitContext,
+        ),
+        std::sync::Arc<crate::IndexedFile>,
+    >,
     /// The bodies `parsed` was read from, which a language-server obligation's
     /// cited token is read against.
     bodies: HashMap<Hash256, std::sync::Arc<Vec<u8>>>,
@@ -692,12 +701,20 @@ fn debts(snapshot: &GraphSnapshot) -> Result<BTreeMap<ArtifactId, LocalBindingDe
 }
 
 impl TransitionVerifier<'_> {
+    /// The parse of `file`'s body `hash`, named under the manifests of `tree`.
     fn parse(
         &mut self,
         file: &FilePathId,
         hash: Hash256,
+        tree: &ResolvedTree,
     ) -> Result<std::sync::Arc<crate::IndexedFile>, String> {
-        let key = (file.clone(), hash);
+        let load_body = self.load_body;
+        let project = crate::project_files::TreeProjectFiles::new(tree, |hash| {
+            load_body(hash).ok().flatten()
+        });
+        let pipeline = crate::IndexPipeline::new();
+        let unit = pipeline.unit_context(file, &project).map_err(text)?;
+        let key = (file.clone(), hash, unit);
         if let Some(parsed) = self.parsed.get(&key) {
             return Ok(parsed.clone());
         }
@@ -708,8 +725,8 @@ impl TransitionVerifier<'_> {
         if kin_blobs::digest(&bytes) != digest {
             return Err("binding source CAS digest differs".into());
         }
-        let file = crate::IndexPipeline::new()
-            .index_file_content_with_tests(file, &bytes, digest)
+        let file = pipeline
+            .index_file_content_with_unit(file, &bytes, digest, &key.2)
             .map_err(text)?
             .indexed_file;
         let file = std::sync::Arc::new(file);
@@ -894,7 +911,17 @@ impl TransitionVerifier<'_> {
                 .iter()
                 .find(|old| old.retired_relation.id == relation.id)
             {
-                if !same_obligation(existing, &obligation, source_file) {
+                // An outstanding obligation that names this exact relation,
+                // recorded when an earlier body withdrew it, already accounts
+                // for the binding: the relation came back unchanged and is
+                // withdrawn again. The outstanding one is kept as it stands.
+                // A second obligation under the same relation identity could
+                // only repeat it at another digest, and refusing the whole
+                // transition instead leaves a store that can never publish
+                // again. Anything else that differs is still a collision.
+                if !same_obligation(existing, &obligation, source_file)
+                    && !same_binding_at_another_body(existing, &obligation, source_file)
+                {
                     return Err("prior obligation identity collides".into());
                 }
             } else {
@@ -943,14 +970,14 @@ impl TransitionVerifier<'_> {
                     .prior_source_file
                     .as_ref()
                     .unwrap_or(&current_file);
-                let old = self.parse(old_file, obligation.source_digest)?;
+                let old = self.parse(old_file, obligation.source_digest, &before.resolved_tree)?;
                 let old_source = self.body(obligation.source_digest)?;
                 if old_file == &current_file {
                     obligation.prior_source_file = None;
                 }
                 let (_, current_digest) =
                     source_entry(after, &current_file)?.ok_or("current source is absent")?;
-                let current = self.parse(&current_file, current_digest)?;
+                let current = self.parse(&current_file, current_digest, &after.resolved_tree)?;
                 let entities: Vec<_> = after
                     .entities
                     .values()
@@ -968,13 +995,25 @@ impl TransitionVerifier<'_> {
                     return Err("current source declaration body differs".into());
                 }
                 // A sealed partial parse is supported evidence, but cannot
-                // discharge a prior binding. Preserve its exact obligation
-                // without turning parser coverage into a publication error.
+                // discharge a prior binding by absence. Preserve its exact
+                // obligation without turning parser coverage into a
+                // publication error, unless a language-server proof at each
+                // re-found occurrence refutes the name-only guess it holds.
                 // CAS and current source seals above remain mandatory.
                 if !matches!(old.parse_state, kin_model::ParseState::Valid)
                     || !matches!(current.parse_state, kin_model::ParseState::Valid)
                 {
-                    unaccounted.push((current_file.clone(), obligation));
+                    if !crate::binding_debt::inferred_guess_is_refuted_under_recovered_parse(
+                        &graph,
+                        &obligation,
+                        &old,
+                        &old_source,
+                        &current,
+                        &entities,
+                        &produced,
+                    )? {
+                        unaccounted.push((current_file.clone(), obligation));
+                    }
                     continue;
                 }
                 if !crate::binding_debt::obligation_is_satisfied(
@@ -1001,9 +1040,27 @@ fn same_obligation(
     right: &LocalBindingObligation,
     current: &FilePathId,
 ) -> bool {
+    left.source_digest == right.source_digest && same_binding(left, right, current)
+}
+
+/// Two obligations for the identical retired relation, between the same named
+/// ends in the same files, observed at different bodies of the source.
+fn same_binding_at_another_body(
+    left: &LocalBindingObligation,
+    right: &LocalBindingObligation,
+    current: &FilePathId,
+) -> bool {
+    left.source_digest != right.source_digest && same_binding(left, right, current)
+}
+
+/// Everything two obligations say except the source body they were observed at.
+fn same_binding(
+    left: &LocalBindingObligation,
+    right: &LocalBindingObligation,
+    current: &FilePathId,
+) -> bool {
     left.retired_relation == right.retired_relation
         && left.source_name == right.source_name
-        && left.source_digest == right.source_digest
         && left.target_artifact == right.target_artifact
         && left.target_file == right.target_file
         && left.target_name == right.target_name
@@ -1206,6 +1263,17 @@ mod context_refresh_tests {
         body: &str,
         caller_name: &str,
     ) -> RefinementFixture {
+        inferred_call_refinement_parsed(external, body, caller_name, false)
+    }
+
+    /// [`inferred_call_refinement_body`] over a caller body whose parse
+    /// recovers from a syntax error when `recovered` holds.
+    fn inferred_call_refinement_parsed(
+        external: bool,
+        body: &str,
+        caller_name: &str,
+        recovered: bool,
+    ) -> RefinementFixture {
         use kin_model::{CallSite, CallSiteLedger, CallSiteState, ExternalReference};
         let mut before = GraphSnapshot::empty();
         let mut bodies = HashMap::new();
@@ -1224,7 +1292,12 @@ mod context_refresh_tests {
                 .index_file_content_with_tests(&FilePathId::new(path), content.as_bytes(), digest)
                 .unwrap()
                 .indexed_file;
-            assert!(matches!(parsed.parse_state, kin_model::ParseState::Valid));
+            assert_eq!(
+                matches!(parsed.parse_state, kin_model::ParseState::Valid),
+                !(recovered && path == "caller.py"),
+                "{path}: {:?}",
+                parsed.parse_state
+            );
             if path == "caller.py" {
                 calls = parsed
                     .extracted_relations
@@ -1567,6 +1640,144 @@ mod context_refresh_tests {
         }
     }
 
+    /// Every ledger answer at the fixture's call sites set to `state`, with
+    /// the language-server edge that carried the old proofs gone.
+    fn answer_every_site(case: &mut RefinementFixture, state: kin_model::CallSiteState) {
+        let ResolutionRecord::CallSites(ledger) = case
+            .fixture
+            .after
+            .resolution_records
+            .get_mut(&case.ledger)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        for site in &mut ledger.sites {
+            site.state = state.clone();
+        }
+        case.fixture.after.relations.remove(&case.replacement);
+    }
+
+    #[test]
+    fn inferred_call_refinement_settles_guesses_proven_outside_or_inside_the_caller() {
+        // A proof that the call leaves the repository without naming the
+        // symbol, and one that it reaches a declaration inside the caller
+        // itself, each refute the guess, and neither mints an edge.
+        for outside in [true, false] {
+            let mut case = inferred_call_refinement_fixture(false);
+            let state = if outside {
+                kin_model::CallSiteState::ProvenOutside
+            } else {
+                kin_model::CallSiteState::ProvenTarget {
+                    target: case.caller,
+                }
+            };
+            answer_every_site(&mut case, state);
+            assert!(
+                case.fixture.verifies(&case.fixture.after),
+                "outside={outside}"
+            );
+            let debt = debt_for_withdrawal(&case.fixture);
+            let mut held = case.fixture.after.clone();
+            held.relations.insert(debt.id, debt.clone());
+            assert_eq!(
+                settled_binding_debt_deltas(&held, &|hash| Ok(case
+                    .fixture
+                    .bodies
+                    .get(&hash)
+                    .cloned()))
+                .unwrap(),
+                vec![kin_model::RelationDelta::Removed { old: debt }],
+                "outside={outside}"
+            );
+            // Any one site the resolver did not answer keeps the whole
+            // obligation owed.
+            let ResolutionRecord::CallSites(ledger) = case
+                .fixture
+                .after
+                .resolution_records
+                .get_mut(&case.ledger)
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            ledger.sites[1].state = kin_model::CallSiteState::Unresolved {
+                reason: kin_model::UnresolvedReason::NoAnswer,
+            };
+            assert!(
+                !case.fixture.verifies(&case.fixture.after),
+                "outside={outside}"
+            );
+        }
+        // A proven in-repository target other than the caller still needs its
+        // own language-server edge.
+        let mut case = inferred_call_refinement_fixture(false);
+        let old_target = case.fixture.before.relations[&case.fixture.relation]
+            .dst
+            .as_entity()
+            .unwrap();
+        let other = *case
+            .fixture
+            .after
+            .entities
+            .keys()
+            .find(|id| **id != case.caller && **id != old_target)
+            .unwrap();
+        answer_every_site(
+            &mut case,
+            kin_model::CallSiteState::ProvenTarget { target: other },
+        );
+        assert!(!case.fixture.verifies(&case.fixture.after));
+    }
+
+    #[test]
+    fn inferred_call_refinement_settles_a_recovered_parse_by_presence_alone() {
+        // The calls parse cleanly; a later declaration does not, so the file's
+        // parse is recovered, not valid.
+        let body = "def run(options):\n    options.pop(\"a\", options.pop(\"b\", None))\n    options.pop(\"c\", None)\n\n\ndef broken(value:\n    return value\n";
+        for external in [false, true] {
+            let case = inferred_call_refinement_parsed(external, body, "run", true);
+            assert!(
+                case.fixture.verifies(&case.fixture.after),
+                "external={external}"
+            );
+            let debt = debt_for_withdrawal(&case.fixture);
+            let mut held = case.fixture.after.clone();
+            held.relations.insert(debt.id, debt.clone());
+            let load = |hash| Ok(case.fixture.bodies.get(&hash).cloned());
+            assert_eq!(
+                settled_binding_debt_deltas(&held, &load).unwrap(),
+                vec![kin_model::RelationDelta::Removed { old: debt }]
+            );
+        }
+        // Presence is all a recovered parse can argue from: an unanswered
+        // site, or a guess that was not a name-only one, stays owed.
+        let mut case = inferred_call_refinement_parsed(false, body, "run", true);
+        let ResolutionRecord::CallSites(ledger) = case
+            .fixture
+            .after
+            .resolution_records
+            .get_mut(&case.ledger)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        ledger.sites[0].state = kin_model::CallSiteState::Unresolved {
+            reason: kin_model::UnresolvedReason::NoAnswer,
+        };
+        assert!(!case.fixture.verifies(&case.fixture.after));
+        for origin in [RelationOrigin::Parsed, RelationOrigin::Lsp] {
+            let mut case = inferred_call_refinement_parsed(false, body, "run", true);
+            case.fixture
+                .before
+                .relations
+                .get_mut(&case.fixture.relation)
+                .unwrap()
+                .origin = origin;
+            assert!(!case.fixture.verifies(&case.fixture.after), "{origin:?}");
+        }
+    }
+
     #[test]
     fn existing_binding_debt_rechecks_current_proof_without_new_withdrawals() {
         let mut case = inferred_call_refinement_fixture(true);
@@ -1597,7 +1808,9 @@ mod context_refresh_tests {
         let ResolutionRecord::CallSites(ledger) = record else {
             unreachable!()
         };
-        ledger.sites[0].state = kin_model::CallSiteState::ProvenOutside;
+        ledger.sites[0].state = kin_model::CallSiteState::Unresolved {
+            reason: kin_model::UnresolvedReason::NoAnswer,
+        };
         case.fixture.after.relations.insert(debt.id, debt);
         assert!(
             settled_binding_debt_deltas(&case.fixture.after, &|digest| Ok(case
@@ -2575,6 +2788,105 @@ mod context_refresh_tests {
         assert!(
             classify(&fixture, &recorded, &[old]).is_err(),
             "lost existing debt must be preserved, not silently recreated from a new plan"
+        );
+    }
+
+    /// A relation an earlier body withdrew, whose obligation is still
+    /// outstanding, can come back unchanged and be withdrawn again at a later
+    /// body: a commit clears a language-server site's position, the sweep
+    /// proves the relation again, and the next commit clears it again. The
+    /// outstanding obligation names that exact relation, so it is kept and the
+    /// transition is accounted for. It used to fail the whole plan with "prior
+    /// obligation identity collides", after which the store never published.
+    #[test]
+    fn binding_history_keeps_the_outstanding_obligation_when_the_same_relation_is_withdrawn_again()
+    {
+        let mut fixture = Fixture::new();
+        let proven = fixture.before.relations[&fixture.relation].clone();
+        // What two cleared sites leave: two records alike with no position.
+        let unplaced = RelationEvidence {
+            parser_rule: Some("lsp_call_hierarchy".into()),
+            ..Default::default()
+        };
+        let mut held = proven.clone();
+        held.evidence = vec![unplaced.clone(), unplaced.clone()];
+        fixture.before.relations.insert(held.id, held.clone());
+
+        let source = fixture.before.entities[&held.src.as_entity().unwrap()].clone();
+        let target = fixture.before.entities[&held.dst.as_entity().unwrap()].clone();
+        let file = source.file_origin.clone().unwrap();
+        let target_file = target.file_origin.clone().unwrap();
+        let (artifact, current) = source_entry(&fixture.before, &file).unwrap().unwrap();
+        let (target_artifact, _) = source_entry(&fixture.before, &target_file)
+            .unwrap()
+            .unwrap();
+        // The body the relation was first withdrawn at.
+        let earlier_body = format!("{SOURCE}\n\ndef later():\n    return None\n");
+        let earlier = Hash256::from_bytes(kin_blobs::digest(earlier_body.as_bytes()).0);
+        fixture.bodies.insert(earlier, earlier_body.into_bytes());
+        let outstanding = |retired: &Relation| {
+            crate::binding_debt::build_local_binding_debt(
+                artifact,
+                LocalBindingDebt {
+                    source_file: file.clone(),
+                    observed_source_digest: current,
+                    obligations: vec![LocalBindingObligation {
+                        retired_relation: retired.clone(),
+                        source_name: source.name.clone(),
+                        source_digest: earlier,
+                        prior_source_file: None,
+                        target_artifact,
+                        target_file: target_file.clone(),
+                        target_name: target.name.clone(),
+                    }],
+                },
+            )
+            .unwrap()
+        };
+        let debt = outstanding(&held);
+        fixture.before.relations.insert(debt.id, debt.clone());
+
+        // The sweep proves the relation again: one record for the two alike,
+        // and the site.
+        let mut after = fixture.after.clone();
+        let mut refreshed = fixture.after.relations[&fixture.relation].clone();
+        refreshed.evidence.insert(0, unplaced.clone());
+        after.relations.insert(refreshed.id, refreshed);
+        after.relations.insert(debt.id, debt.clone());
+
+        assert!(
+            classify(&fixture, &after, std::slice::from_ref(&held))
+                .unwrap()
+                .is_empty(),
+            "the outstanding obligation already accounts for this exact relation"
+        );
+        assert!(
+            fixture.verifies(&after),
+            "the same transition is admitted with the obligation kept"
+        );
+
+        // Kept, never dropped: a successor without the debt is still refused.
+        let mut dropped = after.clone();
+        dropped.relations.remove(&debt.id);
+        assert!(classify(&fixture, &dropped, std::slice::from_ref(&held)).is_err());
+        assert!(!fixture.verifies(&dropped));
+
+        // An outstanding obligation for a different record of the relation is
+        // still a collision.
+        let mut another = held.clone();
+        another.evidence.push(unplaced);
+        let other_debt = outstanding(&another);
+        fixture
+            .before
+            .relations
+            .insert(other_debt.id, other_debt.clone());
+        after.relations.insert(other_debt.id, other_debt);
+        let error = classify(&fixture, &after, std::slice::from_ref(&held))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("prior obligation identity collides"),
+            "{error}"
         );
     }
 }

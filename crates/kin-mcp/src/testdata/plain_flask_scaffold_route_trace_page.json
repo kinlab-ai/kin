@@ -1,0 +1,1015 @@
+{
+ "_kin": {
+  "binding_coverage": {
+   "binding_scope": {
+    "basis": "answer_entities",
+    "languages": [
+     "Python"
+    ],
+    "outstanding_local_binding_obligations": 0,
+    "prior_local_binding": "no_recorded_debt"
+   },
+   "checked_scope": "admitted_inventory",
+   "local_binding_requirement": "required",
+   "scope": "live_head"
+  },
+  "completeness": {
+   "bound": "at_least",
+   "counted": {
+    "exact": false
+   },
+   "limits": [
+    "trace_page_partial"
+   ],
+   "status": "partial"
+  },
+  "envelope_version": 2,
+  "graph_as_of": {
+   "generation": 9
+  },
+  "page": {
+   "answer_rows_complete": true,
+   "answer_rows_has_more": false,
+   "byte_offset": 0,
+   "compacted": [
+    {
+     "path": "binding_coverage",
+     "same_as": "_kin.binding_coverage"
+    },
+    {
+     "path": "negative.advice",
+     "restates": [
+      "negative.subject",
+      "negative.trust_reason"
+     ]
+    }
+   ],
+   "complete": false,
+   "evidence_has_more": true,
+   "field_offset": 0,
+   "has_more": true,
+   "next_byte": 0,
+   "next_field": 0,
+   "next_record": 42,
+   "record_offset": 0,
+   "total_answer_records": 18,
+   "total_candidates": 0,
+   "total_records": 48,
+   "total_steps": 8,
+   "version": 1
+  },
+  "repository": {
+   "authority_context": "00e8118e1a9a24c2017907fb6f2df6d0ce110f2b6bcdabfbafc5fe3fcc844aa8"
+  },
+  "response": {
+   "bounded": true,
+   "chars_after_budget": 23766,
+   "compact": true,
+   "max_chars": 24576
+  },
+  "runtime": "repo-daemon",
+  "semantic_surface": 1,
+  "trace_question": {
+   "depth": 8,
+   "direction": "callers",
+   "focal_name": "Scaffold.route",
+   "limit_per_step": 12
+  },
+  "verdict": {
+   "absence_claim": "not_applicable",
+   "limiting_factor": "method_call_resolution_incomplete; named_leftovers; unkeyed_lookups_counted; trace_walk_degraded; retrieval_degraded",
+   "safe_to_conclude_absent": false,
+   "state": "inconclusive"
+  }
+ },
+ "chain": [
+  {
+   "body": null,
+   "code": "return self.route(rule, methods=[method], **options)",
+   "crossing": null,
+   "depth": 1,
+   "entity_id": "b73b943b-fc7f-4cf7-a237-8d46397f7989",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold._method_route",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 0,
+   "proof": null,
+   "reference_lines": [
+    293
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self.route(rule, methods=[method], **options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "def _method_route(self, method: str, rule: str, options: dict[str, t.Any],) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 1,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": "return self._method_route(\"GET\", rule, options)",
+   "crossing": null,
+   "depth": 2,
+   "entity_id": "d2da314d-21b2-4b40-b318-497b9d92fe11",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold.get",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 1,
+   "proof": null,
+   "reference_lines": [
+    301
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self._method_route(\"GET\", rule, options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "@setupmethod def get(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 2,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": "return self._method_route(\"PUT\", rule, options)",
+   "crossing": null,
+   "depth": 2,
+   "entity_id": "13ff7565-34c4-4f2b-b502-359b247681a3",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold.put",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 1,
+   "proof": null,
+   "reference_lines": [
+    325
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self._method_route(\"PUT\", rule, options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "@setupmethod def put(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 3,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": "return self._method_route(\"POST\", rule, options)",
+   "crossing": null,
+   "depth": 2,
+   "entity_id": "4e6e9bfe-d8ec-41ee-b121-953fba24688e",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold.post",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 1,
+   "proof": null,
+   "reference_lines": [
+    317
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self._method_route(\"POST\", rule, options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "@setupmethod def post(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 4,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": "return self._method_route(\"PATCH\", rule, options)",
+   "crossing": null,
+   "depth": 2,
+   "entity_id": "0397d37a-26e9-4b80-8235-7b1672e2dbe1",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold.patch",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 1,
+   "proof": null,
+   "reference_lines": [
+    341
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self._method_route(\"PATCH\", rule, options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "@setupmethod def patch(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 5,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": "return self._method_route(\"QUERY\", rule, options)",
+   "crossing": null,
+   "depth": 2,
+   "entity_id": "0cccc712-a689-4fb1-895c-12d8fb9cb0f6",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold.query",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 1,
+   "proof": null,
+   "reference_lines": [
+    309
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self._method_route(\"QUERY\", rule, options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "@setupmethod def query(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 6,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": "return self._method_route(\"DELETE\", rule, options)",
+   "crossing": null,
+   "depth": 2,
+   "entity_id": "c8c41b9f-dd02-4992-9f68-4ff86bc6df66",
+   "entity_kind": "Method",
+   "entity_name": "Scaffold.delete",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 1,
+   "proof": null,
+   "reference_lines": [
+    333
+   ],
+   "reference_lines_absent_reason": null,
+   "reference_lines_partial_reason": null,
+   "reference_sites": [
+    {
+     "expr": "return self._method_route(\"DELETE\", rule, options)"
+    }
+   ],
+   "relation_kind": "Calls",
+   "resolution": "type_resolved",
+   "role": "caller",
+   "signature": "@setupmethod def delete(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 7,
+   "symbol": null,
+   "terminal": null
+  },
+  {
+   "body": null,
+   "code": null,
+   "crossing": null,
+   "depth": 3,
+   "entity_id": "aff428c2-3609-470d-8dc5-cbdc955e767e",
+   "entity_kind": "Method",
+   "entity_name": "BlueprintSetupState.__init__",
+   "entity_role": "source",
+   "external": false,
+   "fanout_dropped": 0,
+   "fanout_truncated": false,
+   "package": null,
+   "parent_step": 2,
+   "proof": null,
+   "reference_lines": [],
+   "reference_lines_absent_reason": "unconfirmed_sites_withheld",
+   "reference_lines_partial_reason": "unconfirmed_sites_withheld",
+   "reference_sites": null,
+   "relation_kind": "Calls",
+   "resolution": "name_only",
+   "role": "caller",
+   "signature": "def __init__(self, blueprint: Blueprint, app: App, options: t.Any, first_registration: bool,) -> None",
+   "site_state": null,
+   "sites": null,
+   "span_coherence": null,
+   "stdlib": null,
+   "step": 8,
+   "symbol": null,
+   "terminal": null
+  }
+ ],
+ "negative": {
+  "interpretation": "qualified_answer",
+  "safe_to_conclude_absent": false,
+  "subject": "trace_page"
+ },
+ "next_cursor": "eyJ2IjoxLCJzbmFwc2hvdCI6ImQ3YmM3MGU4LWQxYTItNDczOC1hN2MwLWNmMjBhMzcwZjBmOCIsInJlY29yZCI6NDIsImZpZWxkIjowLCJieXRlIjowfQ",
+ "reach": {
+  "also_referenced_by": [
+   {
+    "id": "42201a15-5a82-4c30-a18d-e70ae24e6cd5",
+    "kind": "Function",
+    "name": "Scaffold.route.<locals>.decorator",
+    "refs": [
+     {
+      "code": "self.add_url_rule(rule, endpoint, f, **options)",
+      "how": "type",
+      "to": "cfaa9527-8673-4daa-8d27-d8a5ac89d37c",
+      "to_name": "Scaffold.route"
+     }
+    ]
+   },
+   {
+    "id": "faaf4790-2f6f-4225-9505-d5fdb01d2004",
+    "kind": "Method",
+    "name": "MethodView.dispatch_request",
+    "refs": [
+     {
+      "code": "meth = getattr(self, \"get\", None)",
+      "how": "value",
+      "to": "d2da314d-21b2-4b40-b318-497b9d92fe11",
+      "to_name": "Scaffold.get",
+      "value": "assignment"
+     }
+    ]
+   }
+  ],
+  "frontier": [
+   {
+    "code": "@setupmethod def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "cfaa9527-8673-4daa-8d27-d8a5ac89d37c",
+    "to_name": "Scaffold.route",
+    "why": "the language can run `route` without a call that spells its name, and no record lists where"
+   },
+   {
+    "code": "@setupmethod def patch(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "0397d37a-26e9-4b80-8235-7b1672e2dbe1",
+    "to_name": "Scaffold.patch",
+    "why": "the language can run `patch` without a call that spells its name, and no record lists where"
+   },
+   {
+    "code": "@setupmethod def query(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "0cccc712-a689-4fb1-895c-12d8fb9cb0f6",
+    "to_name": "Scaffold.query",
+    "why": "the language can run `query` without a call that spells its name, and no record lists where"
+   },
+   {
+    "code": "@setupmethod def put(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "13ff7565-34c4-4f2b-b502-359b247681a3",
+    "to_name": "Scaffold.put",
+    "why": "the language can run `put` without a call that spells its name, and no record lists where"
+   },
+   {
+    "code": "@setupmethod def post(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "4e6e9bfe-d8ec-41ee-b121-953fba24688e",
+    "to_name": "Scaffold.post",
+    "why": "the language can run `post` without a call that spells its name, and no record lists where"
+   },
+   {
+    "code": "@setupmethod def delete(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "c8c41b9f-dd02-4992-9f68-4ff86bc6df66",
+    "to_name": "Scaffold.delete",
+    "why": "the language can run `delete` without a call that spells its name, and no record lists where"
+   },
+   {
+    "code": "@setupmethod def get(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "in": null,
+    "in_name": null,
+    "kind": "implicit_dispatch",
+    "to": "d2da314d-21b2-4b40-b318-497b9d92fe11",
+    "to_name": "Scaffold.get",
+    "why": "the language can run `get` without a call that spells its name, and no record lists where"
+   }
+  ],
+  "members": [
+   {
+    "code": "return self.route(rule, methods=[method], **options)",
+    "distance": 1,
+    "id": "b73b943b-fc7f-4cf7-a237-8d46397f7989",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold._method_route",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "cfaa9527-8673-4daa-8d27-d8a5ac89d37c"
+   },
+   {
+    "code": "return self._method_route(\"GET\", rule, options)",
+    "distance": 2,
+    "id": "d2da314d-21b2-4b40-b318-497b9d92fe11",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold.get",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "b73b943b-fc7f-4cf7-a237-8d46397f7989"
+   },
+   {
+    "code": "return self._method_route(\"QUERY\", rule, options)",
+    "distance": 2,
+    "id": "0cccc712-a689-4fb1-895c-12d8fb9cb0f6",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold.query",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "b73b943b-fc7f-4cf7-a237-8d46397f7989"
+   },
+   {
+    "code": "return self._method_route(\"POST\", rule, options)",
+    "distance": 2,
+    "id": "4e6e9bfe-d8ec-41ee-b121-953fba24688e",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold.post",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "b73b943b-fc7f-4cf7-a237-8d46397f7989"
+   },
+   {
+    "code": "return self._method_route(\"PUT\", rule, options)",
+    "distance": 2,
+    "id": "13ff7565-34c4-4f2b-b502-359b247681a3",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold.put",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "b73b943b-fc7f-4cf7-a237-8d46397f7989"
+   },
+   {
+    "code": "return self._method_route(\"DELETE\", rule, options)",
+    "distance": 2,
+    "id": "c8c41b9f-dd02-4992-9f68-4ff86bc6df66",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold.delete",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "b73b943b-fc7f-4cf7-a237-8d46397f7989"
+   },
+   {
+    "code": "return self._method_route(\"PATCH\", rule, options)",
+    "distance": 2,
+    "id": "0397d37a-26e9-4b80-8235-7b1672e2dbe1",
+    "kind": "Method",
+    "module": "flask.sansio.scaffold",
+    "name": "Scaffold.patch",
+    "proof": "type_resolved",
+    "proven_path": true,
+    "via": "b73b943b-fc7f-4cf7-a237-8d46397f7989"
+   }
+  ],
+  "name_only": [
+   {
+    "code": "subdomain = self.options.get(\"subdomain\")",
+    "distance": 3,
+    "id": "aff428c2-3609-470d-8dc5-cbdc955e767e",
+    "kind": "Method",
+    "module": "flask.sansio.blueprints",
+    "name": "BlueprintSetupState.__init__",
+    "proof": "name_only",
+    "proven_path": false,
+    "via": "d2da314d-21b2-4b40-b318-497b9d92fe11"
+   }
+  ]
+ },
+ "readings": [
+  {
+   "key": "reach",
+   "value": {
+    "also_imported_by": 0,
+    "also_referenced_total": 2,
+    "blind_spots": {
+     "calls_through_values": 676,
+     "unkeyed_lookups": 14,
+     "value_holders": {
+      "complete": true,
+      "rows": 1,
+      "why": "A call through a value that spells no member's name can run a member only through a value taken where the census lists the member held as one. rows counts the also_referenced_by rows that hold a member as a value (each such ref carries value), in_members names members that hold one themselves, and unlisted counts places no served row names. complete is true when every member has a census and every such place is served: those holders are then the places to check, not the calls_through_values count."
+     },
+     "why": "counted, not listed: lookups by a name built at run time, and calls through a value that spell no member's name; any reader that does not run the program shares them, and where each member is held as a value is listed under also_referenced_by"
+    },
+    "bounds": [],
+    "calls_measured": true,
+    "frontier_folded": {
+     "by_reason": {
+      "constructor_dispatch": 1
+     },
+     "count": 1,
+     "scope": {
+      "known_outside_callers": "excluded",
+      "mode": "paths",
+      "module": "flask",
+      "unplaced_callers": "retained"
+     },
+     "unit": "observations",
+     "why": "Counted observations, not distinct sites or callers, and not in frontier_total. The same site can be observed for several reached members. scope names the caller filter used for this count, separately from the blind_spots counts. caller_text_not_read: code whose text Kin could not read, so whether it calls a member is unknown; it could add a caller only if that unread code calls one. call_protocol and constructor_dispatch: places the language runs __call__ or __init__ from, which could add a caller only through a call of an instance or a construction of the class. refs with details:true on a member lists its own."
+    },
+    "frontier_total": 7,
+    "frontier_withheld": [],
+    "members_total": 7,
+    "name_only_total": 1,
+    "packages": [
+     {
+      "held": 1,
+      "members": 7,
+      "module": "flask.sansio.scaffold",
+      "places": 7,
+      "state": "open"
+     },
+     {
+      "members": 0,
+      "module": "flask.sansio.blueprints",
+      "name_only": 1,
+      "places": 1,
+      "state": "open"
+     }
+    ],
+    "policy": {
+     "bounds": {
+      "frontier_reads_max": 24,
+      "members_max": 2000
+     },
+     "counted_only": [
+      "Imports",
+      "unkeyed_lookup",
+      "call_through_value"
+     ],
+     "follows": [
+      "Calls:type_resolved",
+      "Calls:import_scoped",
+      "Calls:name_only",
+      "call_site:name_unique",
+      "ledger:callback",
+      "ledger:dispatch"
+     ],
+     "not_followed": "calls made later through a member held as a value, and calls resolved to a method a member overrides",
+     "reported_apart": [
+      "References",
+      "UsesType",
+      "Instantiates",
+      "value_use"
+     ]
+    },
+    "question": "which entities in flask can end up calling the focal on a path that stays in flask",
+    "scope": {
+     "frontier_outside": 476,
+     "mode": "paths",
+     "module": "flask",
+     "outside": 118,
+     "referrers_outside": 117
+    },
+    "settled_by_membership": 5,
+    "state": "open",
+    "statement": "Every entity in flask that reaches Scaffold.route through a followed call on a path that stays in flask is in members (7). 7 places could still add callers; each is in frontier with its code and why. 1 more entity reaches it only through a call matched by name alone, which no resolver tied to its target; see name_only. 2 more entities refer to them without calling them; see also_referenced_by.",
+    "target": {
+     "entity_id": "cfaa9527-8673-4daa-8d27-d8a5ac89d37c",
+     "name": "Scaffold.route"
+    },
+    "witness_paths": "follow via from any member to the focal; each row's line and code are the call it makes to its via"
+   }
+  },
+  {
+   "key": "_kin",
+   "value": {
+    "binding_coverage": {
+     "binding_scope": {
+      "basis": "answer_entities",
+      "languages": [
+       "Python"
+      ],
+      "outstanding_local_binding_obligations": 0,
+      "prior_local_binding": "no_recorded_debt"
+     },
+     "checked_scope": "admitted_inventory",
+     "local_binding_requirement": "required",
+     "scope": "live_head"
+    },
+    "completeness": {
+     "bound": "at_least",
+     "classes": {
+      "calls": "present",
+      "imports": "present",
+      "references": "present"
+     },
+     "counted": {
+      "exact": false,
+      "reported": 8,
+      "unit": "steps"
+     },
+     "decided_by": [
+      "calls",
+      "imports",
+      "references"
+     ],
+     "limits": [
+      "verdict_inconclusive"
+     ],
+     "status": "unknown",
+     "substrate": "edges"
+    },
+    "degraded": {
+     "embed_persistence_unavailable": false,
+     "embed_worker_failed": false,
+     "mass_deletion_blocked": false
+    },
+    "durability": {
+     "durable_entities": 1917,
+     "durable_relations": 13808,
+     "live_entities": 1917,
+     "live_only_entities": 0,
+     "live_only_relations": 0,
+     "live_relations": 13808,
+     "state": "recorded"
+    },
+    "envelope_version": 2,
+    "freshness": {
+     "state": "no_admission_recorded"
+    },
+    "graph_as_of": {
+     "generation": 9
+    },
+    "graph_state": {
+     "entity_count": 1917,
+     "initialized": true,
+     "loaded": true
+    },
+    "hydration_semantics": {
+     "created_under": 35,
+     "derives": 37,
+     "standing": "current",
+     "upgraded_under": 37
+    },
+    "repository": {
+     "authority_context": "00e8118e1a9a24c2017907fb6f2df6d0ce110f2b6bcdabfbafc5fe3fcc844aa8"
+    },
+    "runtime": "repo-daemon",
+    "semantic_surface": 1,
+    "verdict": {
+     "absence_claim": "not_applicable",
+     "inputs": {
+      "absence_gate": "inconclusive",
+      "call_sites": "inconclusive",
+      "caller_arrival": "not_applicable",
+      "completeness": "certified",
+      "cross_repo": "not_applicable",
+      "degradations": "inconclusive",
+      "edge_coverage": "certified",
+      "enrichment": "not_applicable",
+      "graph_empty": "not_applicable",
+      "graph_freshness": "not_applicable",
+      "outside_graph": "not_applicable",
+      "source_body": "not_applicable",
+      "source_derivation": "not_applicable",
+      "tracked_changes": "not_applicable",
+      "watcher_loss": "not_applicable",
+      "withheld_candidates": "not_applicable"
+     },
+     "limiting_factor": "method_call_resolution_incomplete; named_leftovers; unkeyed_lookups_counted; trace_walk_degraded; retrieval_degraded",
+     "safe_to_conclude_absent": false,
+     "state": "inconclusive"
+    }
+   }
+  },
+  {
+   "key": "bodies_included",
+   "value": false
+  },
+  {
+   "key": "call_sites",
+   "value": {
+    "by_step": [
+     {
+      "candidates": [
+       {
+        "callee": "route",
+        "caller": "073c6d6f-95c4-4de6-a424-111701c9f0f9",
+        "caller_name": "test_app_tearing_down_with_handled_exception_by_app_handler.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "fe7f5a7f-f54f-441e-abf3-0f0ea1009574",
+        "caller_name": "test_app_tearing_down_with_unhandled_exception.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "5f498b89-ac9c-45c8-ad76-c5b23cec9ce2",
+        "caller_name": "test_basic_url_generation.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "3458e51b-fcd8-496f-8bb3-1b79945880a8",
+        "caller_name": "test_context_refcounts.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "9540bf1d-b26a-4986-bb7c-b37ec720ad39",
+        "caller_name": "test_after_request_processing.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "c1b32be7-b2ab-4228-a8e0-436472fb6128",
+        "caller_name": "test_baseexception_error_handling.<locals>.broken_func",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "420681a0-72eb-49a2-a1ac-3c165074ba68",
+        "caller_name": "test_before_after_request_order.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "63730ee1-c742-4e5a-b5cb-d5fc025caa9f",
+        "caller_name": "test_enctype_debug_helper.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "3c3af697-2c57-4cc2-8c31-1f4e5b34dcdd",
+        "caller_name": "test_error_handler_after_processor_error.<locals>.index",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       },
+       {
+        "callee": "route",
+        "caller": "963d9db2-f494-4955-822d-135f68df383e",
+        "caller_name": "test_error_handling.<locals>.error",
+        "line_in_entity": 0,
+        "state": "unresolved"
+       }
+      ],
+      "candidates_withheld": 167,
+      "entity_name": "Scaffold.route",
+      "escape": {
+       "unkeyed_lookups": 15
+      },
+      "open": [
+       "implicit_dispatch_unnamed"
+      ],
+      "step": 0
+     },
+     {
+      "entity_name": "Scaffold._method_route",
+      "step": 1,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "Scaffold.get",
+      "step": 2,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "Scaffold.put",
+      "step": 3,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "Scaffold.post",
+      "step": 4,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "Scaffold.patch",
+      "step": 5,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "Scaffold.query",
+      "step": 6,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "Scaffold.delete",
+      "step": 7,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     },
+     {
+      "entity_name": "BlueprintSetupState.__init__",
+      "step": 8,
+      "unread": "after_a_method_that_is_not_accounted_for"
+     }
+    ],
+    "clauses": [
+     "method_call_resolution_incomplete: receiver-method calls are linked by bare name and may be unresolved, and the callers of Scaffold.route (implicit_dispatch_unnamed) are not all proven or listed, and 8 more method(s) the walk expanded were not read, each marked unread under `call_sites.by_step`, so the chain may be missing callers",
+     "named_leftovers: 177 unproven call site(s) spell the name of 1 traced method(s), each listed under `call_sites.by_step`, so the chain is complete except those sites",
+     "unkeyed_lookups_counted: 1 traced method(s) could be reached by lookups by a name computed at run time that spell none of their names, counted under `call_sites.by_step` rather than listed"
+    ],
+    "methods": {
+     "accounted": 0,
+     "read": 1,
+     "walked": 9
+    },
+    "scope": "each traced method's named callers",
+    "settled": false
+   }
+  },
+  {
+   "key": "degradations",
+   "value": [
+    {
+     "component": "call_resolution",
+     "detail": "1 of 8 steps were reached through an edge matched by name alone, so the flow each claims may not exist",
+     "reason": "name_only_steps",
+     "remediation": "read each step's `resolution` field, and treat a `name_only` hop as a candidate rather than a call"
+    }
+   ]
+  },
+  {
+   "key": "depth",
+   "value": 8
+  },
+  {
+   "key": "direction",
+   "value": "callers"
+  },
+  {
+   "key": "edge_coverage",
+   "value": {
+    "budget_exhausted": false,
+    "classes": {
+     "calls": "present",
+     "imports": "present",
+     "references": "present"
+    },
+    "entities_examined": 5,
+    "language": "Python",
+    "limits": [
+     "absence_gate:inconclusive",
+     "call_sites:inconclusive",
+     "degradations:inconclusive"
+    ],
+    "reference_enrichment": "available",
+    "requested_classes": [
+     "calls",
+     "imports",
+     "references"
+    ],
+    "scan": "ran",
+    "scope": "language",
+    "unproduced_evidence": null,
+    "witnessed_by_answer": []
+   }
+  },
+  {
+   "key": "focal",
+   "value": null
+  },
+  {
+   "key": "focal_entity",
+   "value": {
+    "body": null,
+    "crossing": null,
+    "entity_id": "cfaa9527-8673-4daa-8d27-d8a5ac89d37c",
+    "entity_kind": "Method",
+    "entity_name": "Scaffold.route",
+    "entity_role": "source",
+    "external": false,
+    "signature": "@setupmethod def route(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]",
+    "span_coherence": null
+   }
+  },
+  {
+   "key": "focal_id",
+   "value": "cfaa9527-8673-4daa-8d27-d8a5ac89d37c"
+  },
+  {
+   "key": "focal_kind",
+   "value": "Method"
+  },
+  {
+   "key": "focal_name",
+   "value": "Scaffold.route"
+  },
+  {
+   "key": "focal_resolution",
+   "value": {
+    "addressed_by": "entity_id",
+    "matched": "exact_focal_name",
+    "other_candidates": [],
+    "same_name_candidates": 1
+   }
+  },
+  {
+   "key": "include_type_edges",
+   "value": false
+  },
+  {
+   "key": "limit_per_step",
+   "value": 12
+  },
+  {
+   "key": "max_response_chars",
+   "value": 24576
+  }
+ ],
+ "total_steps": 8
+}

@@ -19,7 +19,8 @@ Kin's baseline trust boundary is the **local operating-system user account**. Ki
 trusts the user it runs as, the integrity of that user's filesystem, and the
 OS-level isolation between users and between a user's processes and other users'
 processes. A repository's graph, indexes, blobs, and configuration live under the
-repository's `.kin/` directory and are protected by ordinary filesystem
+repository's store directory (the central stores directory, which Kin creates readable only by
+its owner, or an in-tree `.kin/`) and are protected by ordinary filesystem
 permissions.
 
 The following are therefore **in scope** for this document:

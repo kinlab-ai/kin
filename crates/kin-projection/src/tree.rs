@@ -445,7 +445,7 @@ fn stage_entry(root: &Path, entry: &PlannedEntry, blobs: &BlobStore) -> Result<(
                 .map_err(|error| io(&destination, error))?;
             file.write_all(&content)
                 .map_err(|error| io(&destination, error))?;
-            file.sync_all().map_err(|error| io(&destination, error))?;
+            kin_blobs::durable::sync_all(&file).map_err(|error| io(&destination, error))?;
             set_executable(&destination, executable)?;
         }
         TreeEntry::Symlink { target_blob } => {
@@ -882,7 +882,7 @@ fn sync_directory_tree(root: &Path) -> Result<()> {
     #[cfg(unix)]
     for directory in directories.into_iter().rev() {
         std::fs::File::open(&directory)
-            .and_then(|file| file.sync_all())
+            .and_then(|file| kin_blobs::durable::sync_all(&file))
             .map_err(|error| io(&directory, error))?;
     }
     // Windows refuses `File::open` on a directory outright, so reaching the

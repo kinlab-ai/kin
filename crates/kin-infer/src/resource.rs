@@ -920,11 +920,11 @@ fn detect_gpu_cores() -> Option<usize> {
     None
 }
 
-/// Detect the best accelerator from read-only device discovery. Does not create
-/// a compute instance or load a model. `max_inflight_command_buffers` /
-/// `allow_cpu_fallback` are defaulted here and finalized by
-/// [`ResourcePlan::for_profile`].
-pub fn detect_accelerator() -> AcceleratorInfo {
+/// The backend, memory model and memory figures of the device the engine would
+/// compute on: `(backend, unified_memory, device_total_bytes,
+/// recommended_working_set_bytes)`.
+#[cfg(feature = "engine")]
+fn accelerator_device() -> (AcceleratorBackend, bool, Option<u64>, Option<u64>) {
     let device = crate::gpu::best_device();
     let backend = match device.backend {
         crate::gpu::GpuBackend::Metal => AcceleratorBackend::Metal,
@@ -939,10 +939,32 @@ pub fn detect_accelerator() -> AcceleratorInfo {
         }
         _ => (None, None),
     };
+    (
+        backend,
+        device.unified_memory,
+        device_total_bytes,
+        recommended_working_set_bytes,
+    )
+}
+
+/// Without the engine nothing here computes on a GPU, so the device is the CPU,
+/// exactly as an engine built without a GPU backend reports it.
+#[cfg(not(feature = "engine"))]
+fn accelerator_device() -> (AcceleratorBackend, bool, Option<u64>, Option<u64>) {
+    (AcceleratorBackend::Cpu, false, None, None)
+}
+
+/// Detect the best accelerator from read-only device discovery. Does not create
+/// a compute instance or load a model. `max_inflight_command_buffers` /
+/// `allow_cpu_fallback` are defaulted here and finalized by
+/// [`ResourcePlan::for_profile`].
+pub fn detect_accelerator() -> AcceleratorInfo {
+    let (backend, unified_memory, device_total_bytes, recommended_working_set_bytes) =
+        accelerator_device();
     AcceleratorInfo {
         backend,
         device_index: 0,
-        unified_memory: device.unified_memory,
+        unified_memory,
         device_total_bytes,
         device_available_bytes: None,
         recommended_working_set_bytes,

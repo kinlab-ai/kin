@@ -336,15 +336,15 @@ pub enum ServerInstall {
 /// Decide what to do about `missing`, the repository's languages whose server
 /// this host lacks.
 ///
-/// Only a recorded yes installs. No answer is not consent, and `--no-enrich`
-/// runs no linking, so a server installed for it would serve nothing this
-/// command does.
+/// Only a recorded yes installs. No answer is not consent, and a command that
+/// skips its sweep (`--no-enrich` or `--defer-enrich`) runs no linking, so a
+/// server installed for it would serve nothing this command does.
 pub fn server_install(
     consent: Option<bool>,
-    no_enrich: bool,
+    skips_sweep: bool,
     missing: &[kin_model::LanguageId],
 ) -> ServerInstall {
-    if no_enrich || missing.is_empty() {
+    if skips_sweep || missing.is_empty() {
         return ServerInstall::Nothing;
     }
     match consent {
@@ -444,10 +444,15 @@ pub enum Linking {
     BudgetSpent { done: u64, total: u64 },
     /// No language server could serve this repository.
     NoServer,
-    /// `--no-enrich` asked for none.
+    /// `--defer-enrich` asked for none here; the next daemon links.
     Skipped,
+    /// `--no-enrich` switched enrichment off for the repository.
+    SwitchedOff,
     /// It did not run, for this reason.
     NotRun(String),
+    /// The daemon was still loading the repository when this command stopped
+    /// waiting for it, and it links once it has loaded.
+    WaitsForDaemon,
 }
 
 /// The Linked row: its status, its value, and a line under it when a reader
@@ -504,8 +509,21 @@ pub fn linked_row(
         ),
         Linking::Skipped => (
             Status::Off,
-            "skipped (--no-enrich) · kin daemon sweep links them".to_string(),
+            "skipped (--defer-enrich) · the next daemon links them".to_string(),
             None,
+        ),
+        Linking::SwitchedOff => (
+            Status::Off,
+            "off for this repository (--no-enrich)".to_string(),
+            Some(format!(
+                "{} turns it on",
+                kin_core::enrichment_setting::TURN_ON_COMMAND
+            )),
+        ),
+        Linking::WaitsForDaemon => (
+            Status::Warn,
+            "waits for the daemon, still loading · it links them once loaded".to_string(),
+            Some("kin status says when it is ready".to_string()),
         ),
         Linking::NotRun(cause) => (
             Status::Warn,
@@ -930,7 +948,7 @@ mod tests {
         assert_eq!(
             server_install(Some(true), true, &missing),
             ServerInstall::Nothing,
-            "--no-enrich links nothing, so nothing is installed for it"
+            "a command that skips its sweep links nothing, so nothing is installed for it"
         );
         assert_eq!(
             server_install(Some(true), false, &[]),

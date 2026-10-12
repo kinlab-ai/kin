@@ -167,6 +167,10 @@ pub fn format_version(package_version: &str, info: BuildInfo) -> String {
     )
 }
 
+// The build script's watch set, compiled here only so its tests run.
+#[cfg(test)]
+mod watch_set;
+
 #[cfg(test)]
 mod tests {
     use super::*;

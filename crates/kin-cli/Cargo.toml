@@ -10,16 +10,21 @@ description = "CLI for Kin semantic VCS"
 repository.workspace = true
 
 [features]
-default = ["vector", "embeddings", "metal"]
+# The default build carries no embedding model. Description queries rank on
+# entity cards, and it links none of the local inference engine. An external
+# provider makes model requests only when explicitly configured.
+default = ["vector", "external-embeddings"]
 vector = ["kin-db/vector"]
+external-embeddings = ["kin-db/external-embeddings"]
+# Local embedding and semantic vector search: the inference engine, the model
+# loader and the one path that can download a model, which runs only after
+# someone asks for it (`kin embed`, or `kin setup` answering yes).
 embeddings = ["kin-db/embeddings"]
-# `metal` is a macOS GPU-acceleration *marker* feature, kept in `default` so that
-# cfg!(feature = "metal") (read by src/commands/bench_meta.rs to report `metal_enabled`)
-# stays true on the bench platform. It intentionally does NOT pull `kin-db/metal` —
-# Cargo features cannot be target-gated, so doing so would force the macOS-only
-# kin-infer/metal backend on Linux too. The real `kin-db/metal` activation is in the
-# `[target.'cfg(target_os = "macos")'.dependencies]` block below (additive via unification).
-metal = ["embeddings"]
+decision = ["kin-infer/decision"]
+# Embeddings on Apple's GPU, with Accelerate on the CPU path. Every Metal and
+# Accelerate site in kin-infer is gated on `target_os = "macos"` as well, so on
+# any other platform this is `embeddings` and nothing more.
+metal = ["embeddings", "kin-db/metal", "kin-db/accelerate"]
 
 [[bin]]
 name = "kin"
@@ -32,6 +37,7 @@ kin-core = { workspace = true }
 kin-daemon-spawn = { workspace = true }
 kin-blobs = { workspace = true }
 kin-parser = { workspace = true }
+kin-io = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
 kin-reconcile = { workspace = true }
@@ -45,7 +51,9 @@ kin-runtime = { workspace = true }
 kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
+kin-search = { workspace = true }
 similar = { workspace = true }
+# The resource plan only. The engine arrives through `kin-db/embeddings`.
 kin-infer = { workspace = true }
 kin-ranking = { workspace = true }
 kin-lsp = { workspace = true }
@@ -128,10 +136,3 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
-
-# macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
-# Feature unification is additive, so on macOS kin-db is built with metal; on Linux this
-# block is absent and metal is never requested, keeping the Linux build green.
-[target.'cfg(target_os = "macos")'.dependencies]
-kin-db = { workspace = true, features = ["metal", "accelerate"] }
-kin-infer = { workspace = true, features = ["metal"] }

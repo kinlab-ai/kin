@@ -68,21 +68,14 @@
 //! imported the version-9 deltas with no provenance beside them, and every
 //! surface read `Current` over the result.
 //!
-//! The pack declares it now. `RepositoryTransferPack::source_hydration_semantics`
-//! carries the sending store's own creation record, and
-//! [`transfer_preserves_creation_record`] is the single comparison a receiver
-//! makes over it: the record survives when the sender declared the exact version
-//! this store records, and [`invalidate_for_unversioned_transfer`] discards it
-//! otherwise, durably, before the authority commit that makes the history
-//! visible. So two replicas of one build keep certifying their history through
-//! every sync, and a receiver that admits history authored under a version it
-//! cannot match reads [`HydrationStanding::Unstamped`] rather than certifying
-//! provenance it does not have.
-//!
-//! Discarding is still what an unversioned sender gets, and that is the whole of
-//! the conservative half: a hosted daemon owns no local creation record, and a
-//! build older than this wire field declares nothing, so both leave the receiver
-//! unstamped exactly as every transfer did before.
+//! The pack declares the sending store's creation version and, for a peer
+//! advertising `source-derivation-v1`, its full creation derivation identity.
+//! The receiver retains its record only when both match. Unknown or different
+//! provenance durably invalidates only the receiving store's stamp before the
+//! incoming history can become visible. A hosted sender has no local stamp,
+//! and a legacy sender carries no derivation identity; both remain admissible
+//! but leave the new receiver unstamped. The identity is never inferred from
+//! the running binary or from a later upgrade record.
 //!
 //! ## What `kin upgrade` adds to the record
 //!
@@ -118,6 +111,24 @@
 //! record denies unknown fields, so it reads [`HydrationStanding::Unreadable`]
 //! and advises upgrading Kin rather than certifying state a newer build derived.
 //!
+//! ## Which build, not only which version
+//!
+//! The version is frozen, so every build since shares it, and two builds that
+//! derive different graphs from one tree would each read the other's store as
+//! current. The record therefore also names the [`binary_derivation`] of the
+//! build that created the store, and an upgrade names its own. That identity
+//! is a key taken at build time over the sources that decide the derivation,
+//! so no person chooses it. Where the served version equals this build's, the
+//! identity decides: a different one, or none at all in a record written
+//! before identities existed, reads [`HydrationStanding::OtherDerivation`], a
+//! gap whose remedy is `kin upgrade`. A record without an identity is never
+//! relabelled as this build's; only a re-derivation earns the identity.
+//!
+//! A build that predates identities refuses a record naming one, so it reads a
+//! gap rather than certifying state whose derivation it cannot compare. That
+//! includes an earlier build of this very version, which is the case the
+//! identity exists for.
+//!
 //! ## What this module deliberately does not do
 //!
 //! It does not re-derive, and it does not refuse to answer. A gap is disclosed
@@ -128,6 +139,7 @@ use crate::layout::KinLayout;
 use chrono::{DateTime, Utc};
 use kin_model::SemanticChangeId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Schema token carried in the record so a future format change is legible
 /// rather than silently misparsed.
@@ -142,14 +154,211 @@ pub const HYDRATION_SEMANTICS_SCHEMA: &str = "kin.hydration-semantics.v1";
 /// addressed different files.
 pub const HYDRATION_SEMANTICS_FILE_NAME: &str = "hydration-semantics";
 
-/// The replay-semantics version this binary derives history under.
+/// The replay-semantics epoch this binary derives history under.
 ///
-/// Read straight from the declaring constant rather than mirrored here. A second
-/// copy of a dial is a second thing to forget, and the manifest guard
-/// (`scripts/verify-hydration-semantics.py`) pins the constant where it is
-/// declared, not where it is consumed.
+/// Frozen at [`FROZEN_HYDRATION_SEMANTICS_VERSION`]: records written before
+/// [`binary_derivation`] existed name it, and the derivation identity decides
+/// everything since. Read straight from the declaring constant rather than
+/// mirrored here.
 pub fn binary_version() -> u32 {
     kin_index::history::HYDRATION_SEMANTICS_VERSION
+}
+
+/// The value the replay-semantics epoch was frozen at. A test holds the
+/// constant to it, so the number cannot move again by hand.
+pub const FROZEN_HYDRATION_SEMANTICS_VERSION: u32 = 50;
+
+/// The release that records creation or an explicit upgrade. Unlike the
+/// derivation key, release precedence establishes which binary is newer.
+pub fn binary_release() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The keys kin-derivation-inputs took over this build's classified sources
+/// when kin-core was compiled. See `build.rs`.
+mod derivation_inputs {
+    include!(concat!(env!("OUT_DIR"), "/derivation_inputs.rs"));
+}
+
+/// The identity of the derivation code compiled into this binary.
+///
+/// [`binary_version`] is frozen, so every build shares it. Two builds can
+/// derive different graphs from the same tree, and the version alone would
+/// certify a store either of them made as current for the other. This
+/// identity is what tells them apart.
+///
+/// It is the `graph` key kin-derivation-inputs takes when kin-core is built:
+/// a digest over every source and dependency that a `derivation-inputs.toml`
+/// classifies as deciding the entities and relations a store serves, from
+/// this crate through every workspace crate it reaches that way (the model,
+/// the parser and its grammars, the index, Git import and the storage code
+/// replay applies deltas through). It moves exactly when one of those moves,
+/// so a rebuild that changed nothing the derivation runs keeps it and a store
+/// made by that build stays current, while two changes made side by side each
+/// move it, and their merge moves it again.
+pub fn binary_derivation() -> &'static str {
+    derivation_inputs::GRAPH
+}
+
+/// Every input [`binary_derivation`] covers, as its path from the workspace
+/// root (or the manifest that names a registry dependency) and its digest.
+pub fn derivation_inputs() -> &'static [(&'static str, &'static str)] {
+    derivation_inputs::GRAPH_INPUTS
+}
+
+/// [`binary_derivation`] by part of Kin: one digest per crate whose sources
+/// it covers, and one per crate's deciding library releases, so a store can
+/// record what derived it and a later build can say what changed since.
+pub fn derivation_parts() -> &'static BTreeMap<String, String> {
+    static PARTS: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    PARTS.get_or_init(|| parts_of(derivation_inputs()))
+}
+
+/// The part an input belongs to: `kin-parser` for a source of that crate,
+/// `kin-parser dependencies` for a library release it reads source with.
+fn part_of(input: &str) -> String {
+    let crate_name = input
+        .strip_prefix("crates/")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or(input);
+    if input.contains("/Cargo.toml ") {
+        format!("{crate_name} dependencies")
+    } else {
+        crate_name.to_string()
+    }
+}
+
+fn parts_of(inputs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    let mut grouped: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
+    for (name, digest) in inputs {
+        grouped
+            .entry(part_of(name))
+            .or_default()
+            .push((name, digest));
+    }
+    grouped
+        .into_iter()
+        .map(|(part, mut members)| {
+            members.sort();
+            let text: String = members
+                .iter()
+                .map(|(name, digest)| format!("{name}\0{digest}\n"))
+                .collect();
+            (part, format!("sha256:{}", sha256_hex(text.as_bytes())))
+        })
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// The parts of Kin whose code differs between `recorded` and this build,
+/// sorted: a part either side lacks counts as changed.
+pub fn changed_parts(recorded: &BTreeMap<String, String>) -> Vec<String> {
+    changed_between(recorded, derivation_parts())
+}
+
+fn changed_between(
+    recorded: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> Vec<String> {
+    recorded
+        .keys()
+        .chain(current.keys())
+        .filter(|part| recorded.get(*part) != current.get(*part))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// What a part of Kin decides, in words a person reads.
+fn part_in_words(part: &str) -> String {
+    if let Some(crate_name) = part.strip_suffix(" dependencies") {
+        return match crate_name {
+            "kin-parser" => "the grammars source is parsed with".to_string(),
+            "kin-index" => "the libraries linking reads manifests with".to_string(),
+            "kin-git" => "the library Git history is read with".to_string(),
+            other => format!("the libraries {} uses", part_in_words(other)),
+        };
+    }
+    match part {
+        "kin-parser" => "how source is parsed",
+        "kin-grammar-typescript" => "the TypeScript grammar",
+        "kin-index" => "how calls, imports and history are linked",
+        "kin-model" => "how entities and relations are shaped and identified",
+        "kin-db" => "how stored history is replayed",
+        "kin-git" => "how Git history is imported",
+        "kin-core" => "how a repository is converted",
+        "kin-projection" => "how entity layouts are derived",
+        "kin-blobs" => "how content is hashed",
+        other => other,
+    }
+    .to_string()
+}
+
+/// `parts` as one phrase: "how source is parsed and how calls, imports and
+/// history are linked".
+pub fn parts_in_words(parts: &[String]) -> String {
+    let words: Vec<String> = parts.iter().map(|part| part_in_words(part)).collect();
+    match words.as_slice() {
+        [] => "Kin's derivation".to_string(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Why this build re-derives what `read` says the store serves, as a clause
+/// that follows "because": which part of Kin changed since the build that
+/// derived it, when the record says which build that was.
+pub fn why_rederived(read: &HydrationSemanticsRead) -> String {
+    match read {
+        HydrationSemanticsRead::Recorded(stamp) => match stamp.served_parts() {
+            Some(recorded) => {
+                let changed = changed_parts(recorded);
+                if changed.is_empty() {
+                    "another build of Kin derived it".to_string()
+                } else {
+                    format!(
+                        "{} changed in Kin since the build that derived it",
+                        parts_in_words(&changed)
+                    )
+                }
+            }
+            None if stamp
+                .served()
+                .0
+                .is_some_and(|version| version < binary_version()) =>
+            {
+                "an earlier release of Kin derived it".to_string()
+            }
+            None => "another build of Kin derived it, and that build recorded no account of \
+                     its code"
+                .to_string(),
+        },
+        HydrationSemanticsRead::Absent => {
+            "the store recorded nothing about the build that derived it".to_string()
+        }
+        HydrationSemanticsRead::Unreadable(_) => {
+            "the store's record of the build that derived it could not be read".to_string()
+        }
+    }
+}
+
+/// The first twelve hex digits of a derivation identity, for a sentence a
+/// person reads. The full identity stays in every structured record.
+pub fn short_derivation(identity: &str) -> &str {
+    let hex = identity.strip_prefix("sha256:").unwrap_or(identity);
+    hex.get(..12).unwrap_or(hex)
 }
 
 /// The replay-semantics version a store was created under, and the last
@@ -158,6 +367,10 @@ pub fn binary_version() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct HydrationSemanticsStamp {
     pub schema: String,
+    /// The release that created this store. Absent in legacy records; never
+    /// inferred from an epoch or filled in by a later upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<String>,
     /// The value of `HYDRATION_SEMANTICS_VERSION` in the binary that created
     /// this store.
     ///
@@ -166,6 +379,19 @@ pub struct HydrationSemanticsStamp {
     /// unreadable, because it establishes no version at all.
     pub created_under: Option<u32>,
     pub at: DateTime<Utc>,
+    /// The [`binary_derivation`] of the binary that created this store.
+    ///
+    /// `None` in a record a build older than derivation identities wrote. That
+    /// record proves the version and nothing about which build of it derived
+    /// the store, so it reads as [`HydrationStanding::OtherDerivation`] and is
+    /// never relabelled as this build's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<String>,
+    /// The [`derivation_parts`] of the build that created this store, so a
+    /// later build can say which part of Kin's code changed since. `None` in
+    /// a record a build older than this field wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_parts: Option<BTreeMap<String, String>>,
     /// The last `kin upgrade`, when one ran.
     ///
     /// Omitted when absent, so a creation record serializes exactly as it did
@@ -178,12 +404,47 @@ pub struct HydrationSemanticsStamp {
 }
 
 impl HydrationSemanticsStamp {
+    /// A creation record this binary writes: `created_under` beside this
+    /// binary's own [`binary_derivation`].
     pub fn new(created_under: u32, at: DateTime<Utc>) -> Self {
         Self {
             schema: HYDRATION_SEMANTICS_SCHEMA.to_string(),
+            release_version: Some(binary_release().to_string()),
             created_under: Some(created_under),
             at,
+            derivation: Some(binary_derivation().to_string()),
+            derivation_parts: Some(derivation_parts().clone()),
             upgrade: None,
+        }
+    }
+
+    /// A creation record as a build older than derivation identities wrote
+    /// it: the version and nothing about which build of it derived the store.
+    pub fn without_derivation(created_under: u32, at: DateTime<Utc>) -> Self {
+        Self {
+            release_version: None,
+            derivation: None,
+            derivation_parts: None,
+            ..Self::new(created_under, at)
+        }
+    }
+
+    /// The version and derivation identity the state this store serves was
+    /// derived under: the last upgrade's when one ran, the creation record's
+    /// otherwise.
+    pub fn served(&self) -> (Option<u32>, Option<&str>) {
+        match &self.upgrade {
+            Some(upgrade) => (Some(upgrade.under), upgrade.derivation.as_deref()),
+            None => (self.created_under, self.derivation.as_deref()),
+        }
+    }
+
+    /// The [`derivation_parts`] of the build that derived the state this
+    /// store serves, when that build recorded them.
+    pub fn served_parts(&self) -> Option<&BTreeMap<String, String>> {
+        match &self.upgrade {
+            Some(upgrade) => upgrade.derivation_parts.as_ref(),
+            None => self.derivation_parts.as_ref(),
         }
     }
 
@@ -195,8 +456,11 @@ impl HydrationSemanticsStamp {
     pub fn without_upgrade(&self) -> Option<Self> {
         self.created_under.map(|created_under| Self {
             schema: self.schema.clone(),
+            release_version: self.release_version.clone(),
             created_under: Some(created_under),
             at: self.at,
+            derivation: self.derivation.clone(),
+            derivation_parts: self.derivation_parts.clone(),
             upgrade: None,
         })
     }
@@ -207,6 +471,10 @@ impl HydrationSemanticsStamp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HydrationUpgrade {
+    /// The release that re-derived the served state. The creation release is
+    /// preserved separately on the enclosing record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<String>,
     /// The replay version the served state was re-derived under.
     pub under: u32,
     /// The version the store recorded before this upgrade, from its creation
@@ -217,6 +485,13 @@ pub struct HydrationUpgrade {
     /// re-derived, as lowercase hex change ids. A state descends from this
     /// upgrade's semantics only through one of these.
     pub anchors: Vec<String>,
+    /// The [`binary_derivation`] of the build that ran this upgrade. `None`
+    /// in a record a build older than derivation identities wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<String>,
+    /// The [`derivation_parts`] of the build that ran this upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_parts: Option<BTreeMap<String, String>>,
 }
 
 impl HydrationUpgrade {
@@ -261,6 +536,14 @@ impl HydrationSemanticsRead {
         }
     }
 
+    /// The creation identity, never the later upgrade's identity.
+    pub fn creation_derivation(&self) -> Option<&str> {
+        match self {
+            Self::Recorded(stamp) => stamp.derivation.as_deref(),
+            Self::Absent | Self::Unreadable(_) => None,
+        }
+    }
+
     /// The last `kin upgrade` this read records, when it records one.
     pub fn upgrade(&self) -> Option<&HydrationUpgrade> {
         match self {
@@ -277,6 +560,15 @@ impl HydrationSemanticsRead {
 /// surface renders it; none of them decides it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydrationStanding {
+    /// A recorded creation or upgrade release is newer, even if the legacy
+    /// epoch and graph identity happen to match this build.
+    NewerRelease {
+        recorded_release: String,
+        current_release: String,
+        created_under: Option<u32>,
+        upgraded_under: Option<u32>,
+        derives: u32,
+    },
     /// The store was created under the version this binary derives.
     Current { version: u32 },
     /// The store records an older creation-time version than this binary
@@ -298,6 +590,28 @@ pub enum HydrationStanding {
         under: u32,
         created_under: Option<u32>,
         derives: u32,
+    },
+    /// The store records the replay version this build derives, and the state
+    /// it serves was derived by a build whose derivation code differs from
+    /// this one's, or by a build that recorded no derivation identity.
+    ///
+    /// Its own variant because the version alone cannot see it: every build
+    /// inside one unreleased version shares the number, so a store an earlier
+    /// build of the same version derived would otherwise read as current over
+    /// derivations this build would not produce. `kin upgrade` re-derives it.
+    OtherDerivation {
+        /// The replay version the store records, equal to this build's.
+        version: u32,
+        /// The derivation identity the store records, or `None` for a record
+        /// written before derivation identities existed. That record proves
+        /// the version and nothing about the build, so it is never relabelled
+        /// as this build's.
+        recorded: Option<String>,
+        /// This build's [`binary_derivation`].
+        derivation: String,
+        /// Whether the recorded state came from a `kin upgrade` rather than
+        /// the store's creation.
+        rederived: bool,
     },
     /// The store carries no record, so no creation-time comparison can be made.
     /// See the producer enumeration in the module doc.
@@ -329,9 +643,11 @@ impl HydrationStanding {
     /// would reintroduce the defect this record exists to end.
     pub fn is_gap(&self) -> bool {
         match self {
+            Self::NewerRelease { .. } => true,
             Self::Current { .. } => false,
             Self::Rederived { under, derives, .. } => under != derives,
             Self::Behind { .. } | Self::Ahead { .. } | Self::Unstamped { .. } => true,
+            Self::OtherDerivation { .. } => true,
             Self::Unreadable { .. } => true,
         }
     }
@@ -343,6 +659,7 @@ impl HydrationStanding {
     /// build and not how the record came to hold it.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::NewerRelease { .. } => "ahead",
             Self::Current { .. } => "current",
             Self::Behind { .. } => "behind",
             Self::Ahead { .. } => "ahead",
@@ -351,6 +668,7 @@ impl HydrationStanding {
                 std::cmp::Ordering::Less => "behind",
                 std::cmp::Ordering::Greater => "ahead",
             },
+            Self::OtherDerivation { .. } => "other_build",
             Self::Unstamped { .. } => "unstamped",
             Self::Unreadable { .. } => "unreadable",
         }
@@ -360,69 +678,63 @@ impl HydrationStanding {
     /// `kin doctor` recognises it on `kin graph status` and in an agent's
     /// envelope.
     ///
-    /// Names both numbers wherever both are known. "The graph is stale" invites
-    /// a shrug; "the store records 9 at creation, this build derives 10" tells a
-    /// reader what changed without claiming more provenance than the record
-    /// contains.
+    /// Describes the recorded derivation and the action it needs, without
+    /// presenting the frozen compatibility epoch as a changing product version.
+    /// Structured observations retain those legacy numbers for old records.
     pub fn sentence(&self) -> String {
         match self {
-            Self::Current { version } => format!(
-                "this store records hydration semantics version {version} at creation, matching \
-                 the version this build derives"
+            Self::NewerRelease { recorded_release, current_release, .. } => format!(
+                "this store records Kin {recorded_release}, newer than this build ({current_release}), \
+                 so this build cannot certify or re-derive its state"
             ),
-            Self::Behind {
-                created_under,
-                derives,
-            } => format!(
-                "this store records hydration semantics version {created_under} at creation and \
-                 this build derives version {derives}, so the store cannot certify that the state \
-                 it serves reflects this build's replay semantics until `kin upgrade` re-derives it"
-            ),
-            Self::Ahead {
-                created_under,
-                derives,
-            } => format!(
-                "this store records hydration semantics version {created_under} at creation and \
-                 this build derives the older version {derives}, so this binary predates the \
-                 store's recorded semantics"
-            ),
-            Self::Rederived {
-                under,
-                created_under,
-                derives,
-            } => {
-                let creation = match created_under {
-                    Some(version) => format!("it records version {version} at creation"),
-                    None => "it recorded no version at creation".to_string(),
+            Self::Current { .. } =>
+                "this store records a creation derivation that matches this build of Kin".to_string(),
+            Self::Behind { .. } =>
+                "this store records an earlier derivation at creation, so it cannot certify that \
+                 the state it serves reflects this build of Kin until `kin upgrade` re-derives it".to_string(),
+            Self::Ahead { .. } =>
+                "this store records a newer derivation at creation, so this binary predates the \
+                 store's recorded semantics".to_string(),
+            Self::Rederived { under, derives, created_under } => match under.cmp(derives) {
+                std::cmp::Ordering::Equal => {
+                    let mut sentence = "`kin upgrade` re-derived the state this store serves for \
+                        this build of Kin; changes recorded before that upgrade keep the \
+                        derivation that authored them".to_string();
+                    if created_under.is_none() {
+                        sentence.push_str("; it recorded no derivation provenance at creation");
+                    }
+                    sentence
+                },
+                std::cmp::Ordering::Less =>
+                    "`kin upgrade` last re-derived the state this store serves for an earlier \
+                     derivation, so it cannot certify that the state it serves reflects this build \
+                     of Kin until `kin upgrade` re-derives it again".to_string(),
+                std::cmp::Ordering::Greater =>
+                    "`kin upgrade` last re-derived the state this store serves for a newer \
+                     derivation, so this binary predates the store's recorded semantics".to_string(),
+            },
+            Self::OtherDerivation { recorded, rederived, .. } => {
+                let how = if *rederived {
+                    "`kin upgrade` last re-derived the state this store serves"
+                } else {
+                    "this store was created"
                 };
-                match under.cmp(derives) {
-                    std::cmp::Ordering::Equal => format!(
-                        "`kin upgrade` re-derived the state this store serves under hydration \
-                         semantics version {under} ({creation}), matching the version this build \
-                         derives; changes recorded before that upgrade keep the replay version \
-                         that authored them"
-                    ),
-                    std::cmp::Ordering::Less => format!(
-                        "`kin upgrade` re-derived the state this store serves under hydration \
-                         semantics version {under} ({creation}) and this build derives version \
-                         {derives}, so the store cannot certify that the state it serves reflects \
-                         this build's replay semantics until `kin upgrade` re-derives it again"
-                    ),
-                    std::cmp::Ordering::Greater => format!(
-                        "`kin upgrade` re-derived the state this store serves under hydration \
-                         semantics version {under} ({creation}) and this build derives the older \
-                         version {derives}, so this binary predates the store's recorded semantics"
-                    ),
+                if recorded.is_some() {
+                    format!("{how} by a build of Kin whose derivation differs from this build's, \
+                             so the state it serves may not be what this build derives until \
+                             `kin upgrade` re-derives it")
+                } else {
+                    format!("{how} by a build of Kin that recorded no derivation identity, so it \
+                             cannot be shown that the state it serves is what this build derives \
+                             until `kin upgrade` re-derives it")
                 }
             }
-            Self::Unstamped { derives } => format!(
-                "this store records no hydration semantics version, so its persisted history \
-                 cannot be shown to match the version {derives} this build derives"
-            ),
-            Self::Unreadable { reason, derives } => format!(
-                "this store's hydration semantics record could not be read ({reason}), so its \
-                 creation-time version cannot be shown to match the version {derives} this build \
-                 derives"
+            Self::Unstamped { .. } =>
+                "this store records no derivation provenance, so its persisted history cannot \
+                 be shown to match what this build of Kin derives".to_string(),
+            Self::Unreadable { reason, .. } => format!(
+                "this store's derivation record could not be read ({reason}), so its recorded \
+                 derivation cannot be shown to match this build of Kin"
             ),
         }
     }
@@ -439,6 +751,12 @@ impl HydrationStanding {
     /// branch and review it held, and `kin upgrade` carries all of them.
     pub fn remedy(&self) -> Option<String> {
         match self {
+            Self::NewerRelease {
+                recorded_release, ..
+            } => Some(format!(
+                "upgrade this Kin build to Kin {recorded_release} or newer; an older release \
+                 neither certifies nor re-derives a store a newer release recorded"
+            )),
             Self::Current { .. } => None,
             Self::Behind { .. } => Some(upgrade_remedy()),
             Self::Ahead { .. } => Some(AHEAD_REMEDY.to_string()),
@@ -447,6 +765,7 @@ impl HydrationStanding {
                 std::cmp::Ordering::Less => Some(upgrade_remedy()),
                 std::cmp::Ordering::Greater => Some(AHEAD_REMEDY.to_string()),
             },
+            Self::OtherDerivation { .. } => Some(upgrade_remedy()),
             Self::Unstamped { .. } => Some(format!(
                 "upgrade Kin to the newest build first, because a store a newer build created can \
                  have lost its record. Then run `kin upgrade` in this repository \
@@ -481,10 +800,39 @@ const AHEAD_REMEDY: &str = "upgrade this Kin build to at least the one that reco
      store's replay semantics; an older build neither certifies nor re-derives state a newer \
      build recorded";
 
-/// Compare `read` against `derives`.
+/// Compare `read` against `derives` and this binary's [`binary_derivation`].
 ///
 /// Split from the filesystem so every branch is testable without a store.
 pub fn standing_of(read: &HydrationSemanticsRead, derives: u32) -> HydrationStanding {
+    standing_against(read, derives, binary_derivation())
+}
+
+/// [`standing_of`] against an explicit derivation identity.
+///
+/// Recorded releases are checked first so an older release refuses a newer
+/// store even when the graph key is equal. The legacy epoch then decides: a
+/// store behind or ahead reads so whatever identity it records. Only where the
+/// served version equals `derives` does the identity decide, and there an
+/// identity that differs, or none at all, is a gap rather than agreement.
+pub fn standing_against(
+    read: &HydrationSemanticsRead,
+    derives: u32,
+    derivation: &str,
+) -> HydrationStanding {
+    if let HydrationSemanticsRead::Recorded(stamp) = read {
+        if let Some(standing) = release_gate(stamp, derives, binary_release()) {
+            return standing;
+        }
+        let (served, recorded) = stamp.served();
+        if served == Some(derives) && recorded != Some(derivation) {
+            return HydrationStanding::OtherDerivation {
+                version: derives,
+                recorded: recorded.map(str::to_string),
+                derivation: derivation.to_string(),
+                rederived: stamp.upgrade.is_some(),
+            };
+        }
+    }
     match read {
         HydrationSemanticsRead::Recorded(stamp) => match (&stamp.upgrade, stamp.created_under) {
             (Some(upgrade), created_under) => HydrationStanding::Rederived {
@@ -516,6 +864,61 @@ pub fn standing_of(read: &HydrationSemanticsRead, derives: u32) -> HydrationStan
             derives,
         },
     }
+}
+
+/// A release check precedes both epoch and graph-key comparisons. Check both
+/// recorded releases: an older-looking upgrade must not conceal a creation
+/// record from a newer release. Build metadata does not order SemVer releases.
+fn release_gate(
+    stamp: &HydrationSemanticsStamp,
+    derives: u32,
+    current: &str,
+) -> Option<HydrationStanding> {
+    let current_version = match semver::Version::parse(current) {
+        Ok(version) => version,
+        Err(error) => {
+            return Some(HydrationStanding::Unreadable {
+                reason: format!("this build's release version is invalid: {error}"),
+                derives,
+            })
+        }
+    };
+    let mut newest: Option<semver::Version> = None;
+    for recorded in [
+        stamp.release_version.as_deref(),
+        stamp
+            .upgrade
+            .as_ref()
+            .and_then(|upgrade| upgrade.release_version.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let version = match semver::Version::parse(recorded) {
+            Ok(version) => version,
+            Err(error) => {
+                return Some(HydrationStanding::Unreadable {
+                    reason: format!("recorded Kin release {recorded:?} is invalid: {error}"),
+                    derives,
+                })
+            }
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|held| version.cmp_precedence(held).is_gt())
+        {
+            newest = Some(version);
+        }
+    }
+    newest
+        .filter(|version| version.cmp_precedence(&current_version).is_gt())
+        .map(|version| HydrationStanding::NewerRelease {
+            recorded_release: version.to_string(),
+            current_release: current.to_string(),
+            created_under: stamp.created_under,
+            upgraded_under: stamp.upgrade.as_ref().map(|upgrade| upgrade.under),
+            derives,
+        })
 }
 
 /// Read the record for `layout`.
@@ -618,7 +1021,7 @@ pub fn write(layout: &KinLayout, stamp: &HydrationSemanticsStamp) -> std::io::Re
     {
         let mut file = std::fs::File::create(&staged)?;
         file.write_all(&body)?;
-        file.sync_all()?;
+        kin_blobs::durable::sync_all(&file)?;
     }
     if let Err(error) = std::fs::rename(&staged, &path) {
         let _ = std::fs::remove_file(&staged);
@@ -628,20 +1031,31 @@ pub fn write(layout: &KinLayout, stamp: &HydrationSemanticsStamp) -> std::io::Re
     Ok(())
 }
 
-/// Whether a receiver may keep its own creation record after admitting history
-/// a pack declared was authored under `declared`.
-///
-/// True only when both numbers exist and are equal, which is deliberately narrow.
-/// The record claims a creation-time version, so it can survive exactly the case
-/// where the arriving deltas were replayed under the same version this store's
-/// own history was. Every other pairing leaves the store holding history its
-/// number does not speak for, which is what
-/// [`invalidate_for_unversioned_transfer`] is for.
-///
-/// A receiver with no record of its own reads `false`, and that costs nothing:
-/// discarding an absent record is a no-op that still makes the absence durable.
-pub fn transfer_preserves_creation_record(recorded: Option<u32>, declared: Option<u32>) -> bool {
-    recorded.is_some() && recorded == declared
+/// Whether incoming history establishes the same creation provenance.
+/// Both versions and full canonical derivation identities must exist and agree.
+/// A shared hand-maintained version alone says nothing about different builds
+/// of that version. Unknown, malformed or different provenance returns false.
+pub fn transfer_preserves_creation_record(
+    recorded: Option<u32>,
+    recorded_derivation: Option<&str>,
+    declared: Option<u32>,
+    declared_derivation: Option<&str>,
+) -> bool {
+    recorded.is_some()
+        && recorded == declared
+        && recorded_derivation.is_some_and(is_derivation_identity)
+        && recorded_derivation == declared_derivation
+}
+
+/// The canonical identity a creation record can compare across a transfer.
+/// Malformed declarations establish no provenance, even if their bytes agree.
+pub fn is_derivation_identity(identity: &str) -> bool {
+    identity.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// The record `kin upgrade` writes once its repository transaction is durable.
@@ -660,6 +1074,9 @@ pub fn upgraded_stamp(
 ) -> Result<HydrationSemanticsStamp, String> {
     let (created_under, created_at, from) = match previous {
         HydrationSemanticsRead::Recorded(stamp) => {
+            if let Some(standing) = release_gate(stamp, under, binary_release()) {
+                return Err(standing.sentence());
+            }
             let recorded = stamp
                 .upgrade
                 .as_ref()
@@ -686,13 +1103,28 @@ pub fn upgraded_stamp(
     anchors.dedup();
     Ok(HydrationSemanticsStamp {
         schema: HYDRATION_SEMANTICS_SCHEMA.to_string(),
+        release_version: match previous {
+            HydrationSemanticsRead::Recorded(stamp) => stamp.release_version.clone(),
+            _ => None,
+        },
         created_under,
         at: created_at,
+        derivation: match previous {
+            HydrationSemanticsRead::Recorded(stamp) => stamp.derivation.clone(),
+            _ => None,
+        },
+        derivation_parts: match previous {
+            HydrationSemanticsRead::Recorded(stamp) => stamp.derivation_parts.clone(),
+            _ => None,
+        },
         upgrade: Some(HydrationUpgrade {
+            release_version: Some(binary_release().to_string()),
             under,
             from,
             at,
             anchors,
+            derivation: Some(binary_derivation().to_string()),
+            derivation_parts: Some(derivation_parts().clone()),
         }),
     })
 }
@@ -857,14 +1289,9 @@ impl HydrationStampCapability {
         read_from(|| self.kindb.read_to_string(HYDRATION_SEMANTICS_FILE_NAME))
     }
 
-    /// Reconcile this store's creation record against the version a received
-    /// pack declared for the history it carries.
-    ///
-    /// Keeps the record when the sender declared the exact version this store
-    /// records at creation, because the arriving deltas were then replayed under
-    /// the same semantics this store's own history was and the number still
-    /// speaks for the whole store. Discards it otherwise, which is what every
-    /// transfer did before the wire carried a version at all.
+    /// Reconcile incoming history against this store's creation provenance.
+    /// Keep the record only when both creation version and full identity match;
+    /// otherwise discard it durably before the authority commit.
     ///
     /// The error is returned rather than logged, for the reason
     /// [`invalidate_for_unversioned_transfer`] states: this runs immediately
@@ -876,9 +1303,19 @@ impl HydrationStampCapability {
     /// this store serves descends from its anchors, and transported history can
     /// move a ref to state any build derived, so the store falls back to its
     /// creation record and the comparison below is made against that.
-    pub fn reconcile_after_transfer(&self, declared: Option<u32>) -> std::io::Result<()> {
+    pub fn reconcile_after_transfer(
+        &self,
+        declared: Option<u32>,
+        declared_derivation: Option<&str>,
+    ) -> std::io::Result<()> {
         self.drop_upgrade()?;
-        if transfer_preserves_creation_record(self.read().created_under(), declared) {
+        let read = self.read();
+        if transfer_preserves_creation_record(
+            read.created_under(),
+            read.creation_derivation(),
+            declared,
+            declared_derivation,
+        ) {
             return Ok(());
         }
         self.invalidate_for_unversioned_transfer()
@@ -943,7 +1380,7 @@ impl HydrationStampCapability {
         {
             let mut file = self.kindb.create(&staged)?;
             file.write_all(&body)?;
-            file.sync_all()?;
+            crate::tree::sync_capability_file(&file)?;
         }
         if let Err(error) = self
             .kindb
@@ -966,7 +1403,7 @@ impl HydrationStampCapability {
     /// Make the unlink itself durable before a caller commits over it.
     #[cfg(unix)]
     fn sync_kindb_metadata(&self) -> std::io::Result<()> {
-        self.sync_handle.sync_all()
+        kin_blobs::durable::sync_all(&self.sync_handle)
     }
 
     /// Same durability boundary the record's writer states for this platform:
@@ -982,7 +1419,7 @@ impl HydrationStampCapability {
 /// itself durable.
 #[cfg(unix)]
 fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(path).and_then(|directory| directory.sync_all())
+    std::fs::File::open(path).and_then(|directory| kin_blobs::durable::sync_all(&directory))
 }
 
 /// Non-unix platforms expose no portable directory handle to sync, so the
@@ -1005,6 +1442,138 @@ mod tests {
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    #[test]
+    fn a_newer_release_refuses_even_an_identical_graph_and_epoch() {
+        let mut stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+        stamp.release_version = Some("9999.0.0".to_string());
+        let read = HydrationSemanticsRead::Recorded(stamp);
+        let standing = standing_of(&read, binary_version());
+        assert!(matches!(standing, HydrationStanding::NewerRelease { .. }));
+        assert_eq!(standing.label(), "ahead");
+        assert!(standing.is_gap());
+        assert!(standing.sentence().contains("Kin 9999.0.0"));
+        assert!(standing.remedy().unwrap().contains("9999.0.0 or newer"));
+        assert!(upgraded_stamp(&read, binary_version(), &[], at(2)).is_err());
+    }
+
+    #[test]
+    fn creation_and_upgrade_releases_are_preserved_and_both_checked() {
+        let mut creation = HydrationSemanticsStamp::new(binary_version(), at(1));
+        creation.release_version = Some("0.1.0".to_string());
+        let mut upgraded = upgraded_stamp(
+            &HydrationSemanticsRead::Recorded(creation.clone()),
+            binary_version(),
+            &[],
+            at(2),
+        )
+        .unwrap();
+        assert_eq!(upgraded.release_version, creation.release_version);
+        assert_eq!(
+            upgraded
+                .upgrade
+                .as_ref()
+                .unwrap()
+                .release_version
+                .as_deref(),
+            Some(binary_release())
+        );
+        assert_eq!(upgraded.without_upgrade().unwrap(), creation);
+        upgraded.upgrade.as_mut().unwrap().release_version = Some("9999.0.0".to_string());
+        let read = HydrationSemanticsRead::Recorded(upgraded.clone());
+        assert!(matches!(
+            standing_of(&read, binary_version()),
+            HydrationStanding::NewerRelease { .. }
+        ));
+        assert!(upgraded_stamp(&read, binary_version(), &[], at(3)).is_err());
+        upgraded.release_version = Some("9999.0.0".to_string());
+        upgraded.upgrade.as_mut().unwrap().release_version = Some("0.1.0".to_string());
+        assert!(matches!(
+            release_gate(&upgraded, binary_version(), binary_release()),
+            Some(HydrationStanding::NewerRelease { .. })
+        ));
+    }
+
+    #[test]
+    fn release_precedence_uses_semver_and_rejects_unknown_versions() {
+        let mut stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+        for (recorded, current, ahead) in [
+            ("0.10.0", "0.9.0", true),
+            ("1.0.0", "1.0.0-rc.1", true),
+            ("1.0.0-rc.2", "1.0.0-rc.1", true),
+            ("1.0.0-rc.1", "1.0.0", false),
+            ("1.0.0+new", "1.0.0+old", false),
+        ] {
+            stamp.release_version = Some(recorded.to_string());
+            assert_eq!(
+                release_gate(&stamp, binary_version(), current).is_some(),
+                ahead,
+                "{recorded} vs {current}"
+            );
+        }
+        for invalid in ["", "unknown", "1.2", "v1.2.3"] {
+            stamp.release_version = Some(invalid.to_string());
+            let read = HydrationSemanticsRead::Recorded(stamp.clone());
+            assert!(matches!(
+                standing_of(&read, binary_version()),
+                HydrationStanding::Unreadable { .. }
+            ));
+            assert!(upgraded_stamp(&read, binary_version(), &[], at(2)).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_release_provenance_is_not_invented_on_upgrade() {
+        let legacy = HydrationSemanticsStamp::without_derivation(binary_version(), at(1));
+        let raw = serde_json::to_string(&legacy).unwrap();
+        assert!(!raw.contains("release_version"));
+        let read = read_from(|| Ok(raw));
+        assert!(matches!(read, HydrationSemanticsRead::Recorded(_)));
+        let upgraded = upgraded_stamp(&read, binary_version(), &[], at(2)).unwrap();
+        assert_eq!(upgraded.release_version, None);
+        assert_eq!(
+            upgraded
+                .upgrade
+                .as_ref()
+                .unwrap()
+                .release_version
+                .as_deref(),
+            Some(binary_release())
+        );
+        assert_eq!(upgraded.without_upgrade().unwrap(), legacy);
+    }
+
+    #[test]
+    fn authored_legacy_epochs_remain_upgradable_when_fingerprints_replace_counters() {
+        for epoch in [47, 48, 49, 50] {
+            let creation = HydrationSemanticsStamp::without_derivation(epoch, at(1));
+            let read = HydrationSemanticsRead::Recorded(creation.clone());
+            let standing = standing_of(&read, binary_version());
+            assert!(
+                matches!(
+                    standing,
+                    HydrationStanding::Behind { .. } | HydrationStanding::OtherDerivation { .. }
+                ),
+                "{epoch}: {standing:?}"
+            );
+            let upgraded = upgraded_stamp(&read, binary_version(), &[], at(2)).unwrap();
+            assert_eq!(upgraded.without_upgrade().unwrap(), creation);
+            assert!(!standing_of(
+                &HydrationSemanticsRead::Recorded(upgraded),
+                binary_version()
+            )
+            .is_gap());
+        }
+        let future = HydrationSemanticsRead::Recorded(HydrationSemanticsStamp::without_derivation(
+            binary_version() + 1,
+            at(1),
+        ));
+        assert!(matches!(
+            standing_of(&future, binary_version()),
+            HydrationStanding::Ahead { .. }
+        ));
+        assert!(upgraded_stamp(&future, binary_version(), &[], at(2)).is_err());
     }
 
     #[test]
@@ -1059,6 +1628,14 @@ mod tests {
         );
     }
 
+    /// The epoch is frozen. A change to what Kin derives moves the
+    /// derivation identity by itself; moving this number by hand as well
+    /// would only make every older store read as behind a second way.
+    #[test]
+    fn the_replay_semantics_epoch_is_frozen() {
+        assert_eq!(binary_version(), FROZEN_HYDRATION_SEMANTICS_VERSION);
+    }
+
     #[test]
     fn a_missing_record_is_unstamped_and_names_both_facts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1070,11 +1647,11 @@ mod tests {
         assert!(
             standing
                 .sentence()
-                .contains("records no hydration semantics"),
+                .contains("records no derivation provenance"),
             "an unstamped store must say so: {}",
             standing.sentence()
         );
-        assert!(standing.sentence().contains("10"));
+        assert!(standing.sentence().contains("cannot be shown to match"));
     }
 
     /// Absent and unreadable must not collapse into each other, and neither may
@@ -1219,30 +1796,37 @@ mod tests {
         }
     }
 
-    /// Both numbers, in every gap sentence that knows both. "The graph is
-    /// stale" is true and unusable; the pair is what lets a reader look up what
-    /// the newer version changed.
+    /// People see the direction and action, while structured reports retain
+    /// legacy compatibility epochs for machines.
     #[test]
-    fn every_gap_sentence_names_the_numbers_it_knows() {
+    fn standing_sentences_do_not_present_the_frozen_epoch_as_a_product_version() {
         for standing in [
+            HydrationStanding::Current { version: 987 },
             HydrationStanding::Behind {
-                created_under: 9,
-                derives: 10,
+                created_under: 986,
+                derives: 987,
             },
             HydrationStanding::Ahead {
-                created_under: 11,
-                derives: 10,
+                created_under: 988,
+                derives: 987,
+            },
+            HydrationStanding::Rederived {
+                under: 987,
+                created_under: Some(986),
+                derives: 987,
+            },
+            HydrationStanding::Unstamped { derives: 987 },
+            HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 987,
             },
         ] {
             let sentence = standing.sentence();
             assert!(
-                sentence.contains("10"),
-                "missing the derived version: {sentence}"
+                !sentence.contains("987") && !sentence.contains("986") && !sentence.contains("988"),
+                "{sentence}"
             );
-            assert!(
-                sentence.contains('9') || sentence.contains("11"),
-                "missing the recorded version: {sentence}"
-            );
+            assert!(!sentence.contains("semantics version"), "{sentence}");
         }
     }
 
@@ -1256,7 +1840,7 @@ mod tests {
             derives: 10,
         }
         .sentence();
-        assert!(behind.contains("records hydration semantics version 9 at creation"));
+        assert!(behind.contains("records an earlier derivation at creation"));
         assert!(!behind.contains("was authored under"), "{behind}");
 
         let unstamped = HydrationStanding::Unstamped { derives: 10 }.sentence();
@@ -1344,12 +1928,103 @@ mod tests {
     /// whole point of the change.
     #[test]
     fn a_creation_record_survives_only_a_declaration_that_matches_it() {
-        assert!(transfer_preserves_creation_record(Some(10), Some(10)));
-        assert!(!transfer_preserves_creation_record(Some(10), Some(9)));
-        assert!(!transfer_preserves_creation_record(Some(9), Some(10)));
-        assert!(!transfer_preserves_creation_record(Some(10), None));
-        assert!(!transfer_preserves_creation_record(None, Some(10)));
-        assert!(!transfer_preserves_creation_record(None, None));
+        assert!(transfer_preserves_creation_record(
+            Some(10),
+            Some(binary_derivation()),
+            Some(10),
+            Some(binary_derivation())
+        ));
+        assert!(!transfer_preserves_creation_record(
+            Some(10),
+            Some(binary_derivation()),
+            Some(9),
+            Some(binary_derivation())
+        ));
+        assert!(!transfer_preserves_creation_record(
+            Some(9),
+            Some(binary_derivation()),
+            Some(10),
+            Some(binary_derivation())
+        ));
+        assert!(!transfer_preserves_creation_record(
+            Some(10),
+            Some(binary_derivation()),
+            None,
+            Some(binary_derivation())
+        ));
+        assert!(!transfer_preserves_creation_record(
+            None,
+            Some(binary_derivation()),
+            Some(10),
+            Some(binary_derivation())
+        ));
+        assert!(!transfer_preserves_creation_record(
+            None,
+            Some(binary_derivation()),
+            None,
+            Some(binary_derivation())
+        ));
+    }
+
+    #[test]
+    fn a_transfer_requires_the_same_complete_creation_derivation() {
+        let current = binary_derivation();
+        let other = format!("sha256:{}", "0".repeat(64));
+        assert_ne!(current, other);
+        for (recorded, declared) in [
+            (Some(current), None),
+            (None, Some(current)),
+            (None, None),
+            (Some(current), Some(other.as_str())),
+            (Some("sha256:short"), Some("sha256:short")),
+            (Some(""), Some("")),
+        ] {
+            assert!(!transfer_preserves_creation_record(
+                Some(47),
+                recorded,
+                Some(47),
+                declared
+            ));
+        }
+        assert!(transfer_preserves_creation_record(
+            Some(47),
+            Some(current),
+            Some(47),
+            Some(current)
+        ));
+    }
+
+    #[test]
+    fn another_or_unknown_creation_derivation_discards_the_stamp_durably() {
+        let other = format!("sha256:{}", "0".repeat(64));
+        for identity in [None, Some(other.as_str()), Some("malformed")] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = layout_in(dir.path());
+            stamp_staged(&layout).unwrap();
+            let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+            capability
+                .reconcile_after_transfer(Some(binary_version()), identity)
+                .unwrap();
+            drop(capability);
+            let reopened = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+            assert_eq!(reopened.read(), HydrationSemanticsRead::Absent);
+            assert!(standing(&layout).is_gap());
+        }
+    }
+
+    #[test]
+    fn the_creation_declaration_never_borrows_an_upgrade_identity() {
+        let mut stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+        let original = format!("sha256:{}", "0".repeat(64));
+        stamp.derivation = Some(original.clone());
+        let read = HydrationSemanticsRead::Recorded(stamp);
+        let upgraded = upgraded_stamp(&read, binary_version(), &[], at(2)).unwrap();
+        assert_eq!(
+            upgraded.upgrade.as_ref().unwrap().derivation.as_deref(),
+            Some(binary_derivation())
+        );
+        let read = HydrationSemanticsRead::Recorded(upgraded);
+        assert_eq!(read.creation_derivation(), Some(original.as_str()));
     }
 
     /// The capability and the layout read one file through one parser. Asserted
@@ -1395,7 +2070,9 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
 
-        capability.reconcile_after_transfer(Some(10)).unwrap();
+        capability
+            .reconcile_after_transfer(Some(10), Some(binary_derivation()))
+            .unwrap();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -1406,7 +2083,9 @@ mod tests {
             HydrationStanding::Current { version: 10 }
         );
 
-        capability.reconcile_after_transfer(Some(9)).unwrap();
+        capability
+            .reconcile_after_transfer(Some(9), Some(binary_derivation()))
+            .unwrap();
         assert_eq!(
             read(&layout),
             HydrationSemanticsRead::Absent,
@@ -1430,7 +2109,7 @@ mod tests {
 
         HydrationStampCapability::open(&layout.kindb_dir())
             .unwrap()
-            .reconcile_after_transfer(None)
+            .reconcile_after_transfer(None, Some(binary_derivation()))
             .unwrap();
 
         assert_eq!(read(&layout), HydrationSemanticsRead::Absent);
@@ -1629,10 +2308,8 @@ mod tests {
         assert!(standing.remedy().is_none());
         let sentence = standing.sentence();
         assert!(
-            sentence.contains(
-                "re-derived the state this store serves under hydration semantics version 20"
-            ) && sentence.contains("it records version 11 at creation")
-                && sentence.contains("keep the replay version that authored them"),
+            sentence.contains("re-derived the state this store serves for this build of Kin")
+                && sentence.contains("keep the derivation that authored them"),
             "{sentence}"
         );
     }
@@ -1689,7 +2366,7 @@ mod tests {
         assert!(
             standing
                 .sentence()
-                .contains("it recorded no version at creation"),
+                .contains("it recorded no derivation provenance at creation"),
             "{}",
             standing.sentence()
         );
@@ -1720,9 +2397,22 @@ mod tests {
             created_under: u32,
             at: DateTime<Utc>,
         }
+        // A creation record without a derivation identity is the shape that
+        // build wrote, and it still reads it.
+        let legacy =
+            serde_json::to_string(&HydrationSemanticsStamp::without_derivation(11, at(1))).unwrap();
+        serde_json::from_str::<PreUpgradeStamp>(&legacy)
+            .expect("a record without an identity must stay readable to an older build");
+        // One that names this build's derivation is refused by a build that
+        // predates identities, which then reads a gap rather than certifying
+        // state whose derivation it cannot compare. That includes an earlier
+        // build of this very version, which is the case the identity exists
+        // for.
         let creation = serde_json::to_string(&HydrationSemanticsStamp::new(11, at(1))).unwrap();
-        serde_json::from_str::<PreUpgradeStamp>(&creation)
-            .expect("a creation record must stay readable to an older build");
+        assert!(
+            serde_json::from_str::<PreUpgradeStamp>(&creation).is_err(),
+            "a build without derivation identities parsed a record naming one: {creation}"
+        );
         let upgraded = upgraded_stamp(
             &HydrationSemanticsRead::Recorded(HydrationSemanticsStamp::new(11, at(1))),
             20,
@@ -1885,7 +2575,9 @@ mod tests {
         let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
 
         upgraded(&layout);
-        capability.reconcile_after_transfer(Some(20)).unwrap();
+        capability
+            .reconcile_after_transfer(Some(20), Some(binary_derivation()))
+            .unwrap();
         assert_eq!(
             read(&layout),
             HydrationSemanticsRead::Absent,
@@ -1893,7 +2585,9 @@ mod tests {
         );
 
         upgraded(&layout);
-        capability.reconcile_after_transfer(Some(11)).unwrap();
+        capability
+            .reconcile_after_transfer(Some(11), Some(binary_derivation()))
+            .unwrap();
         assert_eq!(read(&layout), HydrationSemanticsRead::Recorded(creation));
     }
 
@@ -1967,5 +2661,314 @@ mod tests {
             !paragraph.contains("re-ingest") && !paragraph.contains("kin init"),
             "{paragraph}"
         );
+    }
+
+    /// The identity this binary carries is the `graph` key its build took,
+    /// well formed for every record and transfer that compares it.
+    #[test]
+    fn the_binary_derivation_is_the_graph_key_this_build_took() {
+        assert_eq!(binary_derivation(), derivation_inputs::GRAPH);
+        assert!(is_derivation_identity(binary_derivation()));
+        assert_eq!(short_derivation(binary_derivation()).len(), 12);
+        let names: std::collections::BTreeSet<&str> =
+            derivation_inputs().iter().map(|(name, _)| *name).collect();
+        assert_eq!(names.len(), derivation_inputs().len(), "each input once");
+        for (name, digest) in derivation_inputs() {
+            assert!(is_derivation_identity(digest), "{name}: {digest}");
+        }
+        // The parser, its grammars, the linker, replay, Git import and the
+        // Hash256 representation every model revision identity serializes.
+        for expected in [
+            "crates/kin-blobs/src/lib.rs",
+            "crates/kin-parser/src/languages/python.rs",
+            "crates/kin-parser/src/languages/python_fields.rs",
+            "crates/kin-parser/src/literal_members.rs",
+            "crates/kin-parser/src/declaration_only.rs",
+            "crates/kin-parser/src/languages/hcl.rs",
+            "crates/kin-parser/src/languages/shallow_backed.rs",
+            "crates/kin-parser/Cargo.toml tree-sitter-python",
+            "crates/kin-grammar-typescript/grammar/typescript/src/parser.c",
+            "crates/kin-index/src/linker.rs",
+            "crates/kin-index/src/history.rs",
+            "crates/kin-git/src/semantic_import.rs",
+            "crates/kin-core/src/ref_view.rs",
+        ] {
+            assert!(names.contains(expected), "{expected} is not covered");
+        }
+    }
+
+    /// Every file whose functions the retired replay guard pinned by hand is
+    /// covered by the key, whole, so the key moves for every edit that guard
+    /// saw and for the edits beside them it never saw.
+    #[test]
+    fn the_key_covers_every_surface_the_retired_replay_guard_pinned() {
+        let names: std::collections::BTreeSet<&str> =
+            derivation_inputs().iter().map(|(name, _)| *name).collect();
+        for pinned in [
+            "crates/kin-core/src/ref_view.rs",
+            "crates/kin-git/src/semantic_import.rs",
+            "crates/kin-index/src/history.rs",
+            "crates/kin-index/src/linker.rs",
+            "crates/kin-index/src/occurrence.rs",
+            "crates/kin-index/src/pipeline.rs",
+            "crates/kin-index/src/receiver_origin.rs",
+            "crates/kin-index/src/relation_source.rs",
+            "crates/kin-index/src/rust_project.rs",
+            "crates/kin-index/src/rust_project/syntax.rs",
+            "crates/kin-index/src/rust_project/targets.rs",
+            "crates/kin-model/src/value_escape.rs",
+            "crates/kin-parser/src/import_witness.rs",
+            "crates/kin-parser/src/import_witness/python_namespace.rs",
+            "crates/kin-parser/src/languages/javascript.rs",
+            "crates/kin-parser/src/languages/javascript_imported_receiver.rs",
+            "crates/kin-parser/src/languages/python.rs",
+            "crates/kin-parser/src/languages/python_escape.rs",
+            "crates/kin-parser/src/value_origins/java.rs",
+            "crates/kin-parser/src/value_origins/javascript.rs",
+            "crates/kin-parser/src/value_origins/kotlin.rs",
+            "crates/kin-parser/src/value_origins/mod.rs",
+            "crates/kin-parser/src/value_origins/python.rs",
+            "crates/kin-parser/src/value_origins/rust.rs",
+        ] {
+            assert!(
+                names.contains(pinned),
+                "{pinned} was pinned and is not covered"
+            );
+        }
+    }
+
+    /// The record keeps the identity by part of Kin, one digest per crate
+    /// and per crate's deciding library releases, and a later build names the
+    /// parts that differ.
+    #[test]
+    fn the_identity_is_recorded_by_part_and_a_later_build_names_what_changed() {
+        let parts = parts_of(&[
+            ("crates/kin-parser/src/lib.rs", "sha256:1"),
+            ("crates/kin-parser/src/languages/python.rs", "sha256:2"),
+            (
+                "crates/kin-parser/Cargo.toml tree-sitter-python",
+                "sha256:3",
+            ),
+            ("crates/kin-index/src/linker.rs", "sha256:4"),
+        ]);
+        assert_eq!(
+            parts.keys().collect::<Vec<_>>(),
+            ["kin-index", "kin-parser", "kin-parser dependencies"]
+        );
+        let moved = parts_of(&[
+            ("crates/kin-parser/src/lib.rs", "sha256:1"),
+            ("crates/kin-parser/src/languages/python.rs", "sha256:5"),
+            (
+                "crates/kin-parser/Cargo.toml tree-sitter-python",
+                "sha256:3",
+            ),
+            ("crates/kin-index/src/linker.rs", "sha256:4"),
+            ("crates/kin-git/src/semantic_import.rs", "sha256:6"),
+        ]);
+        let changed = changed_between(&parts, &moved);
+        assert_eq!(changed, ["kin-git", "kin-parser"]);
+        assert_eq!(
+            parts_in_words(&changed),
+            "how Git history is imported and how source is parsed"
+        );
+        assert_eq!(
+            parts_in_words(&["kin-parser dependencies".to_string()]),
+            "the grammars source is parsed with"
+        );
+
+        let stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+        assert_eq!(stamp.served_parts(), Some(derivation_parts()));
+        assert!(changed_parts(derivation_parts()).is_empty());
+        assert!(derivation_parts().contains_key("kin-parser"));
+        assert!(derivation_parts().contains_key("kin-parser dependencies"));
+    }
+
+    /// The reason an upgrade gives names the code that changed when the
+    /// record says which build derived the store, and says plainly when it
+    /// cannot.
+    #[test]
+    fn an_upgrade_says_why_in_words() {
+        let mut stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+        let mut parts = derivation_parts().clone();
+        parts.insert("kin-index".to_string(), "sha256:another".to_string());
+        stamp.derivation_parts = Some(parts);
+        assert_eq!(
+            why_rederived(&HydrationSemanticsRead::Recorded(stamp.clone())),
+            "how calls, imports and history are linked changed in Kin since the build that \
+             derived it"
+        );
+        stamp.derivation_parts = None;
+        assert!(
+            why_rederived(&HydrationSemanticsRead::Recorded(stamp)).contains("recorded no account")
+        );
+        let older = HydrationSemanticsStamp::without_derivation(binary_version() - 1, at(1));
+        assert_eq!(
+            why_rederived(&HydrationSemanticsRead::Recorded(older)),
+            "an earlier release of Kin derived it"
+        );
+        assert!(!why_rederived(&HydrationSemanticsRead::Absent).contains("version"));
+    }
+
+    /// Two changes made side by side from one base each move the key, and
+    /// their merge moves it again (kin-derivation-inputs proves that over a
+    /// workspace it builds). A store either change derived alone therefore
+    /// records a key the merged build does not carry, and reads as another
+    /// build's: a gap `kin upgrade` removes, never agreement.
+    #[test]
+    fn a_store_either_side_by_side_change_derived_is_behind_their_merge() {
+        let one = format!("sha256:{}", "1".repeat(64));
+        let other = format!("sha256:{}", "2".repeat(64));
+        let merged = format!("sha256:{}", "3".repeat(64));
+        for derived in [&one, &other] {
+            let mut stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+            stamp.derivation = Some(derived.clone());
+            let standing = standing_against(
+                &HydrationSemanticsRead::Recorded(stamp),
+                binary_version(),
+                &merged,
+            );
+            assert!(standing.is_gap(), "{standing:?}");
+            assert!(matches!(
+                standing,
+                HydrationStanding::OtherDerivation { .. }
+            ));
+        }
+        let mut stamp = HydrationSemanticsStamp::new(binary_version(), at(1));
+        stamp.derivation = Some(merged.clone());
+        assert_eq!(
+            standing_against(
+                &HydrationSemanticsRead::Recorded(stamp),
+                binary_version(),
+                &merged
+            ),
+            HydrationStanding::Current {
+                version: binary_version()
+            }
+        );
+    }
+
+    /// Same version, same identity: current. Same version, another identity:
+    /// a gap `kin upgrade` removes, and the sentence says which build.
+    #[test]
+    fn another_build_of_the_same_version_is_a_gap_the_upgrade_removes() {
+        let this = "sha256:aaaaaaaaaaaaaaaa";
+        let other = "sha256:bbbbbbbbbbbbbbbb";
+        let mut stamp = HydrationSemanticsStamp::new(32, at(1));
+        stamp.derivation = Some(this.to_string());
+        let same = HydrationSemanticsRead::Recorded(stamp.clone());
+        assert_eq!(
+            standing_against(&same, 32, this),
+            HydrationStanding::Current { version: 32 }
+        );
+
+        stamp.derivation = Some(other.to_string());
+        let differs = standing_against(&HydrationSemanticsRead::Recorded(stamp), 32, this);
+        assert_eq!(
+            differs,
+            HydrationStanding::OtherDerivation {
+                version: 32,
+                recorded: Some(other.to_string()),
+                derivation: this.to_string(),
+                rederived: false,
+            }
+        );
+        assert!(differs.is_gap());
+        assert_eq!(differs.label(), "other_build");
+        let sentence = differs.sentence();
+        assert!(
+            sentence.contains("derivation differs from this build's"),
+            "{sentence}"
+        );
+        assert!(!sentence.contains("bbbbbbbbbbbb"), "{sentence}");
+        assert!(!sentence.contains("aaaaaaaaaaaa"), "{sentence}");
+        assert!(differs.remedy().unwrap().contains("kin upgrade"));
+
+        // The version still decides first.
+        let mut behind = HydrationSemanticsStamp::new(31, at(1));
+        behind.derivation = Some(other.to_string());
+        assert_eq!(
+            standing_against(&HydrationSemanticsRead::Recorded(behind), 32, this).label(),
+            "behind"
+        );
+    }
+
+    /// A record from before identities proves the version and nothing about
+    /// the build. It is disclosed and upgradable, never relabelled current.
+    #[test]
+    fn a_record_without_an_identity_is_disclosed_and_upgradable() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        write(
+            &layout,
+            &HydrationSemanticsStamp::without_derivation(binary_version(), at(1)),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(layout.kindb_hydration_semantics_path()).unwrap();
+        assert!(!raw.contains("derivation"), "{raw}");
+        let standing = standing(&layout);
+        assert_eq!(
+            standing,
+            HydrationStanding::OtherDerivation {
+                version: binary_version(),
+                recorded: None,
+                derivation: binary_derivation().to_string(),
+                rederived: false,
+            }
+        );
+        assert!(standing.is_gap());
+        assert!(
+            standing
+                .sentence()
+                .contains("recorded no derivation identity"),
+            "{}",
+            standing.sentence()
+        );
+        assert!(standing.remedy().unwrap().contains("kin upgrade"));
+
+        // The upgrade's record names this build, keeps the creation record as
+        // it was, and reads current.
+        let upgraded =
+            upgraded_stamp(&read(&layout), binary_version(), &[change(9)], at(2)).unwrap();
+        assert_eq!(upgraded.derivation, None);
+        assert_eq!(
+            upgraded.upgrade.as_ref().unwrap().derivation.as_deref(),
+            Some(binary_derivation())
+        );
+        write(&layout, &upgraded).unwrap();
+        assert!(!standing_of(&read(&layout), binary_version()).is_gap());
+        // And dropping that upgrade returns the store to the gap it was in.
+        let dropped = upgraded.without_upgrade().unwrap();
+        assert_eq!(dropped.derivation, None);
+        assert_eq!(
+            standing_of(&HydrationSemanticsRead::Recorded(dropped), binary_version()).label(),
+            "other_build"
+        );
+    }
+
+    /// An upgrade another build of this version ran is the same gap, stated as
+    /// an upgrade's.
+    #[test]
+    fn an_upgrade_by_another_build_of_this_version_is_a_gap() {
+        let mut upgraded = upgraded_stamp(
+            &HydrationSemanticsRead::Recorded(HydrationSemanticsStamp::new(30, at(1))),
+            32,
+            &[change(4)],
+            at(2),
+        )
+        .unwrap();
+        let read_back = HydrationSemanticsRead::Recorded(upgraded.clone());
+        assert!(!standing_of(&read_back, 32).is_gap());
+        upgraded.upgrade.as_mut().unwrap().derivation = Some("sha256:cc".to_string());
+        let standing = standing_of(&HydrationSemanticsRead::Recorded(upgraded), 32);
+        assert!(matches!(
+            standing,
+            HydrationStanding::OtherDerivation {
+                rederived: true,
+                ..
+            }
+        ));
+        assert!(standing
+            .sentence()
+            .starts_with("`kin upgrade` last re-derived"));
     }
 }

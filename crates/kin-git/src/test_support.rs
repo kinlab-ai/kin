@@ -57,43 +57,31 @@ impl std::fmt::Debug for FixtureGitCommand {
 
 impl FixtureGitCommand {
     fn git() -> Self {
-        let resolution_root = std::env::current_dir()
-            .unwrap_or_else(|error| panic!("locate current directory for host Git: {error}"));
-        let host_path = absolute_fixture_host_path(raw_fixture_host_path(), &resolution_root)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "normalize KIN_ORIGINAL_PATH/PATH against {} for host Git: {error}",
-                    resolution_root.display()
-                )
-            });
-        let git =
-            which::which_in("git", Some(&host_path), &resolution_root).unwrap_or_else(|error| {
-                panic!(
-                    "locate host Git executable from KIN_ORIGINAL_PATH/PATH at {}: {error}",
-                    resolution_root.display()
-                )
-            });
-        let git = if git.is_absolute() {
-            git
-        } else {
-            resolution_root.join(git)
-        };
+        let (git, host_path) = resolve_host_git();
         let mut command = Self::for_program_with_host_path(git, "Git fixture", host_path);
-        let hooks = command.sandbox.path().join("hooks");
+        let prefix = command.git_configuration_prefix();
+        command.inner_mut().args(prefix);
+        command
+    }
+
+    /// The `-c` arguments every fixture Git invocation carries ahead of its
+    /// own: hooks bound to this launch's empty sandbox directory, no automatic
+    /// maintenance, and local file transport.
+    fn git_configuration_prefix(&self) -> [OsString; 8] {
+        let hooks = self.sandbox.path().join("hooks");
         std::fs::create_dir_all(&hooks).expect("create isolated Git fixture hooks directory");
         let mut hooks_config = OsString::from("core.hooksPath=");
         hooks_config.push(hooks.as_os_str());
-        command.inner_mut().args([
-            OsStr::new("-c"),
-            hooks_config.as_os_str(),
-            OsStr::new("-c"),
-            OsStr::new("maintenance.auto=false"),
-            OsStr::new("-c"),
-            OsStr::new("gc.auto=0"),
-            OsStr::new("-c"),
-            OsStr::new("protocol.file.allow=always"),
-        ]);
-        command
+        [
+            OsString::from("-c"),
+            hooks_config,
+            OsString::from("-c"),
+            OsString::from("maintenance.auto=false"),
+            OsString::from("-c"),
+            OsString::from("gc.auto=0"),
+            OsString::from("-c"),
+            OsString::from("protocol.file.allow=always"),
+        ]
     }
 
     #[cfg(test)]
@@ -415,6 +403,308 @@ pub fn fixture_git_in(repository: &Path) -> FixtureGitCommand {
     let mut command = fixture_git();
     command.current_dir(repository);
     command
+}
+
+/// Resolve the host Git executable and the absolute host `PATH` it came from.
+fn resolve_host_git() -> (std::path::PathBuf, OsString) {
+    let resolution_root = std::env::current_dir()
+        .unwrap_or_else(|error| panic!("locate current directory for host Git: {error}"));
+    let host_path = absolute_fixture_host_path(raw_fixture_host_path(), &resolution_root)
+        .unwrap_or_else(|error| {
+            panic!(
+                "normalize KIN_ORIGINAL_PATH/PATH against {} for host Git: {error}",
+                resolution_root.display()
+            )
+        });
+    let git = which::which_in("git", Some(&host_path), &resolution_root).unwrap_or_else(|error| {
+        panic!(
+            "locate host Git executable from KIN_ORIGINAL_PATH/PATH at {}: {error}",
+            resolution_root.display()
+        )
+    });
+    let git = if git.is_absolute() {
+        git
+    } else {
+        resolution_root.join(git)
+    };
+    (git, host_path)
+}
+
+/// Several fixture Git invocations launched as one contained process tree.
+///
+/// Every [`FixtureGitCommand`] launch first starts a process-group guardian, a
+/// sentinel and a watcher that are each a fresh exec of the test binary, and
+/// only then Git. A fixture that configures and commits a repository through
+/// twenty separate launches pays for twenty guardians, which is most of what
+/// such a fixture costs. A batch runs the same Git invocations, in order, from
+/// one `/bin/sh` inside one guardian. The authority scrub, the sandboxed home,
+/// the per-invocation `-c` prefix, the deadline and the whole-tree cleanup are
+/// the ones a single command gets, applied to the batch as a whole.
+///
+/// The first step that fails ends the batch with that step's status, and
+/// standard error names the step. Standard output is discarded unless a step
+/// was queued with [`FixtureGitBatch::git_stdout`]; the kept output is
+/// returned in step order. Steps take no standard input. Targets without
+/// `/bin/sh` run the steps as separate launches with the same result.
+#[derive(Debug, Default, Clone)]
+pub struct FixtureGitBatch {
+    steps: Vec<FixtureGitBatchStep>,
+}
+
+#[derive(Debug, Clone)]
+struct FixtureGitBatchStep {
+    arguments: Vec<OsString>,
+    environment: Vec<(&'static str, OsString)>,
+    keep_stdout: bool,
+}
+
+impl FixtureGitBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue one Git invocation whose standard output is discarded.
+    pub fn git<I, S>(&mut self, arguments: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.push(arguments, false)
+    }
+
+    /// Queue one Git invocation whose standard output is kept in the batch's
+    /// output.
+    pub fn git_stdout<I, S>(&mut self, arguments: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.push(arguments, true)
+    }
+
+    /// Set `GIT_AUTHOR_DATE` for the step queued last.
+    pub fn author_date(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        self.last_step_env("GIT_AUTHOR_DATE", value)
+    }
+
+    /// Set `GIT_COMMITTER_DATE` for the step queued last.
+    pub fn committer_date(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
+        self.last_step_env("GIT_COMMITTER_DATE", value)
+    }
+
+    /// Number of queued steps.
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    fn push<I, S>(&mut self, arguments: I, keep_stdout: bool) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.steps.push(FixtureGitBatchStep {
+            arguments: arguments
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect(),
+            environment: Vec::new(),
+            keep_stdout,
+        });
+        self
+    }
+
+    fn last_step_env(&mut self, key: &'static str, value: impl AsRef<OsStr>) -> &mut Self {
+        let step = self
+            .steps
+            .last_mut()
+            .expect("a fixture Git batch step environment needs a queued step");
+        step.environment.retain(|(existing, _)| *existing != key);
+        step.environment.push((key, value.as_ref().to_os_string()));
+        self
+    }
+
+    /// Run every queued step in `directory` and panic, with the batch's
+    /// output, unless all of them succeed. Returns the kept standard output.
+    pub fn run_in(&self, directory: impl AsRef<Path>) -> Vec<u8> {
+        let directory = directory.as_ref();
+        let output = self
+            .output_in(directory)
+            .unwrap_or_else(|error| panic!("launch fixture Git batch in {directory:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "fixture Git batch in {directory:?} failed: {}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// Run every queued step in `directory`, stopping at the first failure.
+    #[cfg(unix)]
+    pub fn output_in(&self, directory: impl AsRef<Path>) -> io::Result<Output> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        if self.steps.is_empty() {
+            return Err(io_other("a fixture Git batch needs at least one step"));
+        }
+        let (git, host_path) = resolve_host_git();
+        let mut command = FixtureGitCommand::for_program_with_host_path(
+            "/bin/sh",
+            "Git fixture batch",
+            host_path,
+        );
+        let prefix = command.git_configuration_prefix();
+        let total = self.steps.len();
+        let mut script = Vec::new();
+        for (index, step) in self.steps.iter().enumerate() {
+            for (key, value) in &step.environment {
+                script.extend_from_slice(key.as_bytes());
+                script.push(b'=');
+                push_shell_quoted(&mut script, value.as_bytes());
+                script.push(b' ');
+            }
+            push_shell_quoted(&mut script, git.as_os_str().as_bytes());
+            for argument in prefix.iter().chain(&step.arguments) {
+                script.push(b' ');
+                push_shell_quoted(&mut script, argument.as_bytes());
+            }
+            if !step.keep_stdout {
+                script.extend_from_slice(b" >/dev/null");
+            }
+            let printable = step
+                .arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            script.extend_from_slice(
+                b" || { kin_status=$?; printf 'fixture Git batch step %s of %s failed with status %s: git %s\\n' ",
+            );
+            script.extend_from_slice(format!("{} {} ", index + 1, total).as_bytes());
+            script.extend_from_slice(b"\"$kin_status\" ");
+            push_shell_quoted(&mut script, printable.as_bytes());
+            script.extend_from_slice(b" >&2; exit \"$kin_status\"; }\n");
+        }
+        command
+            .arg("-c")
+            .arg(OsStr::from_bytes(&script))
+            .arg("kin-fixture-git-batch")
+            .current_dir(directory);
+        command.output()
+    }
+
+    /// Run every queued step in `directory`, stopping at the first failure.
+    #[cfg(not(unix))]
+    pub fn output_in(&self, directory: impl AsRef<Path>) -> io::Result<Output> {
+        if self.steps.is_empty() {
+            return Err(io_other("a fixture Git batch needs at least one step"));
+        }
+        let directory = directory.as_ref();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut last = None;
+        let total = self.steps.len();
+        for (index, step) in self.steps.iter().enumerate() {
+            let mut command = fixture_git_in(directory);
+            command.args(&step.arguments);
+            for (key, value) in &step.environment {
+                command.safe_git_environment.insert(*key, value.clone());
+            }
+            let output = command.output()?;
+            if step.keep_stdout {
+                stdout.extend_from_slice(&output.stdout);
+            }
+            stderr.extend_from_slice(&output.stderr);
+            if !output.status.success() {
+                stderr.extend_from_slice(
+                    format!(
+                        "fixture Git batch step {} of {total} failed with status {}: git {}\n",
+                        index + 1,
+                        output.status,
+                        step.arguments
+                            .iter()
+                            .map(|argument| argument.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                    .as_bytes(),
+                );
+                return Ok(Output {
+                    status: output.status,
+                    stdout,
+                    stderr,
+                });
+            }
+            last = Some(output.status);
+        }
+        Ok(Output {
+            status: last.expect("a non-empty batch ran at least one step"),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// Write the local configuration a fixture would otherwise set with one `git
+/// config` launch per key, as the bytes those commands leave behind.
+///
+/// `git init` writes a `[core]` section and nothing else, which this checks
+/// rather than assumes. Git appends a key it adds to an existing section at
+/// that section's end and starts every new section at the end of the file,
+/// so keys set in order leave `[core]` with the `core_paths` entries
+/// appended, followed by `sections` in the order the commands created them.
+/// A path is written unquoted, as Git writes a value with no character it
+/// would escape, and a path that has one is refused rather than written
+/// differently. Fixtures that use this should compare it once against the
+/// commands it replaces.
+pub fn write_fixture_git_config(repository: &Path, core_paths: &[(&str, &Path)], sections: &str) {
+    let path = repository.join(".git/config");
+    let mut config = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(
+        config.starts_with("[core]\n")
+            && config.ends_with('\n')
+            && config.lines().filter(|line| line.starts_with('[')).count() == 1,
+        "git init is expected to write [core] alone: {config:?}"
+    );
+    for (key, value) in core_paths {
+        let value = value
+            .to_str()
+            .unwrap_or_else(|| panic!("fixture config path {value:?} is not UTF-8"));
+        assert!(
+            !value.is_empty()
+                && !value.contains(['"', '\\', '\n', '\t', ';', '#'])
+                && value.trim() == value,
+            "fixture path {value:?} would need Git config quoting"
+        );
+        config.push('\t');
+        config.push_str(key);
+        config.push_str(" = ");
+        config.push_str(value);
+        config.push('\n');
+    }
+    config.push_str(sections);
+    std::fs::write(&path, config)
+        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+}
+
+/// Append `bytes` to a POSIX shell script as one single-quoted word.
+#[cfg(unix)]
+fn push_shell_quoted(script: &mut Vec<u8>, bytes: &[u8]) {
+    script.push(b'\'');
+    for &byte in bytes {
+        if byte == b'\'' {
+            script.extend_from_slice(b"'\\''");
+        } else {
+            script.push(byte);
+        }
+    }
+    script.push(b'\'');
 }
 
 /// Remove Git, Kin VFS, dynamic-loader, and external-program authority from a
@@ -1755,6 +2045,95 @@ mod tests {
             "git {args:?} failed: stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_batch_runs_its_steps_in_order_and_keeps_only_requested_stdout() {
+        let temp = tempfile::tempdir().unwrap();
+        // Quotes, a shell expansion, a newline and a backslash must reach Git
+        // as the bytes written here rather than as shell syntax.
+        let hostile = "it's \"quoted\" $HOME `id` \\ ; exit 9\nsecond line";
+        let mut batch = FixtureGitBatch::new();
+        batch
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "kin.first", "one"])
+            .git(["config", "kin.hostile", hostile])
+            .git_stdout(["config", "--get", "kin.first"])
+            .git(["config", "--list", "--show-origin"])
+            .git_stdout(["config", "--get", "kin.hostile"]);
+        assert_eq!(batch.len(), 6);
+        let stdout = batch.run_in(temp.path());
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("one\n{hostile}\n")
+        );
+        // What the batch wrote is what a single launch reads back.
+        let output = fixture_git_in(temp.path())
+            .args(["config", "--get", "kin.hostile"])
+            .output()
+            .unwrap();
+        assert_success(&["config", "--get", "kin.hostile"], &output);
+        assert_eq!(output.stdout, format!("{hostile}\n").into_bytes());
+    }
+
+    #[test]
+    fn a_batch_stops_at_the_first_failing_step_and_names_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut batch = FixtureGitBatch::new();
+        batch
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "--get", "kin.absent"])
+            .git(["config", "kin.after", "ran"]);
+        let output = batch.output_in(temp.path()).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("step 2 of 3") && stderr.contains("config --get kin.absent"),
+            "{stderr}"
+        );
+        let after = fixture_git_in(temp.path())
+            .args(["config", "--get", "kin.after"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            after.status.code(),
+            Some(1),
+            "a step after the failure ran: {after:?}"
+        );
+        assert!(FixtureGitBatch::new().output_in(temp.path()).is_err());
+    }
+
+    #[test]
+    fn a_batch_step_carries_its_own_dates_and_the_scrubbed_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file.txt"), b"dated\n").unwrap();
+        let mut batch = FixtureGitBatch::new();
+        batch
+            .git(["init", "--initial-branch=main"])
+            .git(["config", "user.name", "Batch Fixture"])
+            .git(["config", "user.email", "batch@example.invalid"])
+            .git(["add", "file.txt"])
+            .git(["commit", "--no-gpg-sign", "-m", "dated"])
+            .author_date("2030-01-02T03:04:05 +0000")
+            .committer_date("2031-01-02T03:04:05 +0000")
+            .git(["commit", "--no-gpg-sign", "--allow-empty", "-m", "undated"])
+            .git_stdout([
+                "log",
+                "--format=%an %ad|%cd",
+                "--date=format:%Y%m%d%H%M%S",
+                "HEAD~1",
+            ]);
+        let stdout = String::from_utf8(batch.run_in(temp.path())).unwrap();
+        assert_eq!(stdout, "Batch Fixture 20300102030405|20310102030405\n");
+        let undated = fixture_git_in(temp.path())
+            .args(["log", "-1", "--format=%cd", "--date=format:%Y"])
+            .output()
+            .unwrap();
+        assert_success(&["log"], &undated);
+        assert_ne!(
+            undated.stdout, b"2031\n",
+            "a date set on one step leaked into the next"
         );
     }
 

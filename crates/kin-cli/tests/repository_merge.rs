@@ -71,7 +71,7 @@ fn initialize_kin_repo(
         String::from_utf8_lossy(&init.stdout),
         String::from_utf8_lossy(&init.stderr)
     );
-    kin_core::KinLayout::discover(repo).expect("discover exact layout")
+    runtime.layout_for(repo)
 }
 
 fn repository_id(layout: &kin_core::KinLayout) -> RepositoryId {
@@ -602,8 +602,8 @@ fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicte
     // would stay green with the entity detector deleted, because divergent
     // bytes report an artifact conflict for the same file either way.
     assert!(
-        stdout.contains("artifact shared.txt"),
-        "the listing names the conflicting artifact: {stdout}"
+        stdout.contains("plain text `shared.txt`"),
+        "the listing names the conflicting member by kind and name: {stdout}"
     );
     assert!(
         stdout.contains("entity "),
@@ -697,8 +697,12 @@ fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
         "the listing names the conflict set: {stdout}"
     );
     assert!(
-        stdout.contains("artifact src/lib.rs"),
-        "the whole artifact is what conflicted, not a line range: {stdout}"
+        stdout.contains("source `lib.rs`"),
+        "the whole member is what conflicted, not a line range: {stdout}"
+    );
+    assert!(
+        !stdout.contains("src/lib.rs"),
+        "the listing names the member, never where it is projected: {stdout}"
     );
 
     // No ref moved and the working copy is untouched.
@@ -769,8 +773,12 @@ fn merge_of_a_move_against_an_edit_is_parked_atomically() {
         "the listing names the conflict set: {stdout}"
     );
     assert!(
-        stdout.contains("src/lib.rs"),
-        "the listing names the artifact both branches moved apart: {stdout}"
+        stdout.contains("source `lib.rs`"),
+        "the listing names the unit both branches moved apart by kind and name: {stdout}"
+    );
+    assert!(
+        !stdout.contains("src/lib.rs"),
+        "the listing names the unit, never where it is projected: {stdout}"
     );
 
     // No ref moved and the working copy is untouched.

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-fn entity_patch_operation(source: &serde_json::Value, edits: &[(&str, &str)]) -> serde_json::Value {
+fn entity_patch_private_operation(
+    source: &serde_json::Value,
+    edits: &[(&str, &str)],
+) -> serde_json::Value {
     serde_json::json!({
         "verb":"patch", "target":source["id"], "description":"exact anchored entity edit",
         "payload":{"EntitySourcePatch":{
@@ -9,6 +12,10 @@ fn entity_patch_operation(source: &serde_json::Value, edits: &[(&str, &str)]) ->
             "edits":edits.iter().map(|(old,new)| serde_json::json!({"old_text":old,"new_text":new})).collect::<Vec<_>>()
         }}
     })
+}
+
+fn entity_patch_operation(source: &serde_json::Value, edits: &[(&str, &str)]) -> serde_json::Value {
+    ticketed_source_operation(entity_patch_private_operation(source, edits))
 }
 
 async fn entity_patch_read(
@@ -84,9 +91,13 @@ async fn entity_patch_original_utf8_anchors_and_same_file_entities_commit_atomic
         .find(|e| e.name == "sibling")
         .unwrap();
     let sibling = entity_patch_read(&state, &serde_json::json!(sibling.id)).await;
+    assert!(kin_mcp::source_ticket::is_ticket(&source["source_base"]));
+    assert!(kin_mcp::source_ticket::is_ticket(&sibling["source_base"]));
+    let source_witness = source_base_read(&state, &source["id"]).await;
+    let sibling_witness = source_base_read(&state, &sibling["id"]).await;
     assert_eq!(
-        source["source_base"]["context"],
-        sibling["source_base"]["context"]
+        source_witness["source_base"]["context"],
+        sibling_witness["source_base"]["context"]
     );
     let session = mcp_test_session(&state);
     let tx = mcp_lifecycle_begin(&state, &session).await;
@@ -122,7 +133,7 @@ async fn entity_patch_original_utf8_anchors_and_same_file_entities_commit_atomic
 #[serial_test::serial]
 async fn entity_patch_stale_mutation_retains_anchors_without_publication() {
     let (dir, state, source) = source_base_fixture().await;
-    let operation = entity_patch_operation(&source, &[("{ 1 }", "{ 2 }")]);
+    let operation = entity_patch_private_operation(&source, &[("{ 1 }", "{ 2 }")]);
     source_base_commit_fresh(
         &state,
         &source["id"],
@@ -133,7 +144,18 @@ async fn entity_patch_stale_mutation_retains_anchors_without_publication() {
     let before = source_base_roots(&state);
     let disk = std::fs::read(dir.path().join("src/value.rs")).unwrap();
     let session = mcp_test_session(&state);
-    let result=mutate_http(&state,"kin_mutate",serde_json::json!({"session_id":session,"request_id":"stale-patch","operations":[operation.clone()]}),&session).await;
+    let public = mutate_http(&state, "kin_mutate", serde_json::json!({"session_id":session,
+        "request_id":"stale-public-ticket", "operations":[ticketed_source_operation(operation.clone())]}), &session).await;
+    assert_eq!(public.is_error, Some(true));
+    assert!(
+        mcp_result_text(&public).contains("source_base_changed"),
+        "{}",
+        mcp_result_text(&public)
+    );
+    assert!(mutation_record(&state, "stale-public-ticket").is_none());
+    // The expanded private writer separately guarantees custody of a stale
+    // patch that reached admission. Public ticket refusal never reaches it.
+    let result = private_source_base_mutate(&state,"kin_mutate",serde_json::json!({"session_id":session,"request_id":"stale-patch","operations":[operation.clone()]}),&session).await;
     assert_eq!(result.is_error, Some(true));
     assert!(
         kin_mcp::source_base::is_source_base_conflict(&mcp_result_text(&result)),
@@ -220,7 +242,7 @@ async fn entity_patch_refusals_leave_batch_graph_tree_and_projection_unchanged()
         let expected = match refusal {
             "missing" => "absent",
             "duplicate-entity" => "edited more than once",
-            "semantic-identity" => "create or remove",
+            "semantic-identity" => "this edit of sibling no longer declares sibling",
             other => other,
         };
         assert!(
@@ -308,4 +330,111 @@ async fn entity_patch_noop_and_unknown_fields_refuse_before_staging() {
         );
         assert_eq!(source_base_roots(&state), before, "{shape}");
     }
+}
+
+/// What a client is served for one `get_entity_source` call over the route:
+/// the daemon's answer, paged the way the MCP server presents it.
+async fn entity_patch_presented(
+    state: &Arc<DaemonState>,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let mut result = mcp_call(
+        router(Arc::clone(state)),
+        "get_entity_source",
+        arguments.clone(),
+    )
+    .await;
+    let sent: HashMap<String, serde_json::Value> = serde_json::from_value(arguments).unwrap();
+    kin_mcp::source_pages::present("get_entity_source", &sent, &mut result);
+    assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
+    tool_result_payload(&result)
+}
+
+/// A function longer than any reply serves whole pages like any long body,
+/// `full_body` included. Every excerpt carries the ticket a patch needs, a
+/// patch copied from an excerpt's lines lands, and a whole replacement
+/// written with that ticket is refused, since no read served the body whole.
+#[tokio::test]
+#[serial_test::serial]
+async fn entity_patch_a_function_longer_than_a_whole_read_pages_and_takes_a_patch() {
+    let (dir, state, source) = source_base_fixture().await;
+    let mut body = String::from("pub fn value() -> u8 {\n");
+    for step in 0..1_000 {
+        body.push_str(&format!("    let step_{step:04} = {step};\n"));
+    }
+    body.push_str("    1\n}");
+    assert!(body.len() > kin_mcp::source_pages::FULL_BODY_MAX_BYTES);
+    source_base_commit_fresh(&state, &source["id"], &body, "grow the function").await;
+
+    let first = entity_patch_presented(&state, serde_json::json!({"entity_id": source["id"]})).await;
+    let asked_whole = entity_patch_presented(
+        &state,
+        serde_json::json!({"entity_id": source["id"], "full_body": true}),
+    )
+    .await;
+    assert_eq!(asked_whole, first, "full_body pages like any long body");
+    assert_eq!(first["body_complete"], false, "{first}");
+    assert!(
+        first["body"].as_str().unwrap().len() <= kin_mcp::source_pages::SOURCE_PAGE_BYTES,
+        "{first}"
+    );
+    assert!(
+        kin_mcp::source_ticket::is_ticket(&first["source_base"]),
+        "{first}"
+    );
+    let note = first["note"].as_str().unwrap();
+    assert!(note.contains("a body over 16 KB is never served whole."), "{note}");
+    assert!(!note.contains("full_body"), "{note}");
+
+    // Followed to the end, the excerpts are the body, each with the ticket.
+    let mut joined = first["body"].as_str().unwrap().to_string();
+    let mut page = first.clone();
+    while let Some(cursor) = page["next_cursor"].as_str().map(str::to_string) {
+        page = entity_patch_presented(
+            &state,
+            serde_json::json!({"entity_id": source["id"], "cursor": cursor}),
+        )
+        .await;
+        assert_eq!(page["source_base"], first["source_base"], "{page}");
+        joined.push_str(page["body"].as_str().unwrap());
+    }
+    assert_eq!(joined, body);
+
+    // A patch copied from the first excerpt's lines lands.
+    assert!(first["body"].as_str().unwrap().contains("let step_0001 = 1;"));
+    let session = mcp_test_session(&state);
+    let request = serde_json::json!({"session_id": session, "request_id": "long-patch",
+        "operations": [entity_patch_operation(&first, &[("let step_0001 = 1;", "let step_0001 = 10;")])],
+        "summary": "Change one step of a long function"});
+    let receipt = mutation_receipt(&mutate_http(&state, "kin_mutate", request, &session).await);
+    assert_eq!(receipt["ops_applied"], 1);
+    let patched = body.replacen("let step_0001 = 1;", "let step_0001 = 10;", 1);
+    assert_eq!(source_base_read(&state, &source["id"]).await["body"], patched);
+    assert!(std::fs::read_to_string(dir.path().join("src/value.rs"))
+        .unwrap()
+        .contains("let step_0001 = 10;"));
+
+    // A whole replacement written with an excerpt's ticket is refused, and
+    // nothing changes.
+    let current = entity_patch_presented(&state, serde_json::json!({"entity_id": source["id"]})).await;
+    let roots = source_base_roots(&state);
+    let request = serde_json::json!({"session_id": session, "request_id": "long-replace",
+        "operations": [{
+            "verb": "update", "target": source["id"], "body": "pub fn value() -> u8 { 2 }",
+            "payload": {"EntitySourceBase": current["source_base"]},
+            "description": "replace a long function whole"
+        }],
+        "summary": "Replace a long function whole"});
+    let result = mutate_http(&state, "kin_mutate", request, &session).await;
+    assert_eq!(result.is_error, Some(true), "{}", mcp_result_text(&result));
+    assert!(
+        mcp_result_text(&result).contains(
+            "value holds more code than one reply carries, so it is changed by patch and never \
+             replaced whole"
+        ),
+        "{}",
+        mcp_result_text(&result)
+    );
+    assert_eq!(source_base_roots(&state), roots);
+    assert_eq!(source_base_read(&state, &source["id"]).await["body"], patched);
 }

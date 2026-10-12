@@ -8,7 +8,10 @@ use crate::adapter::{
     collect_error_ranges, compute_fingerprint, make_parser, span_from_node, LanguageAdapter,
 };
 use crate::error::Result;
-use crate::extract::{ExtractedEntity, ExtractedRelation, FileImport, ImportedName, ParseOutput};
+use crate::extract::{
+    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
+    ParseOutput,
+};
 
 pub struct CSharpAdapter;
 pub struct RubyAdapter;
@@ -35,6 +38,16 @@ impl LanguageAdapter for CSharpAdapter {
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         Ok(extract_csharp_output(tree, source, file_id))
     }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::csharp_declarations::csharp_declaration_census(
+            tree, source,
+        ))
+    }
 }
 
 impl LanguageAdapter for RubyAdapter {
@@ -59,6 +72,16 @@ impl LanguageAdapter for RubyAdapter {
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
         Ok(extract_ruby_output(tree, source, file_id))
     }
+
+    fn declaration_census(
+        &self,
+        tree: &Tree,
+        source: &[u8],
+    ) -> Option<Vec<crate::declaration_census::SeenDeclaration>> {
+        Some(super::ruby_declarations::ruby_declaration_census(
+            tree, source,
+        ))
+    }
 }
 
 fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> ParseOutput {
@@ -74,18 +97,31 @@ fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pa
     let mut imports = Vec::new();
     let root = tree.root_node();
     let mut cursor = root.walk();
+    // A file-scoped namespace (`namespace Shop;`) holds no body: it applies to
+    // every declaration after it in the unit, which the grammar writes as its
+    // siblings. They are named under it exactly as a block namespace's
+    // members are.
+    let mut file_namespace: Option<String> = None;
     for child in root.children(&mut cursor) {
         extract_csharp_node(
             &child,
             source,
             file_id,
-            None,
+            file_namespace.as_deref(),
             None,
             None,
             &mut entities,
             &mut relations,
             &mut imports,
         );
+        if child.kind() == "file_scoped_namespace_declaration" {
+            if let Some(name) = child_field_text(&child, "name", source) {
+                file_namespace = Some(qualify_container(
+                    file_namespace.as_deref(),
+                    &normalize_scoped_name(&name),
+                ));
+            }
+        }
     }
 
     annotate_import_sources(&mut relations, &imports);
@@ -95,10 +131,58 @@ fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pa
         entities,
         relations,
         imports,
-        tests: Vec::new(),
+        tests: csharp_tests(&root, source),
         parse_state,
         parsed_call_sites: None,
+        nested_definitions: None,
     }
+}
+
+/// The test methods a C# unit declares: a method carrying a test framework's
+/// attribute, `[Fact]` or `[Theory]` (xUnit), `[Test]` or `[TestCase]`
+/// (NUnit), `[TestMethod]` or `[DataTestMethod]` (MSTest).
+fn csharp_tests(root: &Node, source: &[u8]) -> Vec<ExtractedTest> {
+    let mut tests = Vec::new();
+    let mut pending = vec![*root];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+        if node.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(name) = child_field_text(&node, "name", source) else {
+            continue;
+        };
+        let mut lists = node.walk();
+        let runner = node
+            .named_children(&mut lists)
+            .filter(|child| child.kind() == "attribute_list")
+            .flat_map(|list| {
+                let mut attributes = list.walk();
+                list.named_children(&mut attributes)
+                    .filter(|attribute| attribute.kind() == "attribute")
+                    .filter_map(|attribute| child_field_text(&attribute, "name", source))
+                    .collect::<Vec<_>>()
+            })
+            .find_map(|attribute| {
+                let leaf = attribute.rsplit('.').next().unwrap_or(&attribute);
+                let leaf = leaf.strip_suffix("Attribute").unwrap_or(leaf);
+                match leaf {
+                    "Fact" | "Theory" => Some("xunit"),
+                    "Test" | "TestCase" => Some("nunit"),
+                    "TestMethod" | "DataTestMethod" => Some("mstest"),
+                    _ => None,
+                }
+            });
+        if let Some(runner) = runner {
+            tests.push(ExtractedTest {
+                name,
+                kind: ExtractedTestKind::Unit,
+                runner: runner.to_string(),
+            });
+        }
+    }
+    tests
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,7 +268,9 @@ fn extract_csharp_node(
         | "enum_declaration"
         | "delegate_declaration" => {
             if let Some(raw_name) = child_field_text(node, "name", source) {
-                let full_name = qualify_container(namespace_ctx, &raw_name);
+                // A type declared inside a type is named under that type, as
+                // its methods are; a top-level type under its namespace.
+                let full_name = qualify_container(type_ctx.or(namespace_ctx), &raw_name);
                 let kind = match node.kind() {
                     "interface_declaration" => EntityKind::Interface,
                     "enum_declaration" => EntityKind::EnumDef,
@@ -198,10 +284,13 @@ fn extract_csharp_node(
                     visibility: csharp_visibility(node, source),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
-                if let Some(parent) = namespace_ctx.or(type_ctx) {
+                if let Some(parent) = type_ctx.or(namespace_ctx) {
                     relations.push(ExtractedRelation {
                         site: None,
                         receiver: None,
@@ -260,8 +349,12 @@ fn extract_csharp_node(
                         visibility: csharp_visibility(node, source),
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
+                        span: crate::declaration_extent::span_with_comments(node, source, file_id)
+                            .0,
+                        declaration_line: crate::declaration_extent::span_with_comments(
+                            node, source, file_id,
+                        )
+                        .1,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -287,8 +380,12 @@ fn extract_csharp_node(
                         visibility: csharp_visibility(node, source),
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
+                        span: crate::declaration_extent::span_with_comments(node, source, file_id)
+                            .0,
+                        declaration_line: crate::declaration_extent::span_with_comments(
+                            node, source, file_id,
+                        )
+                        .1,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -313,8 +410,12 @@ fn extract_csharp_node(
                         visibility: csharp_visibility(node, source),
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
+                        span: crate::declaration_extent::span_with_comments(node, source, file_id)
+                            .0,
+                        declaration_line: crate::declaration_extent::span_with_comments(
+                            node, source, file_id,
+                        )
+                        .1,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -339,8 +440,12 @@ fn extract_csharp_node(
                         visibility: Visibility::Public,
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
+                        span: crate::declaration_extent::span_with_comments(node, source, file_id)
+                            .0,
+                        declaration_line: crate::declaration_extent::span_with_comments(
+                            node, source, file_id,
+                        )
+                        .1,
                     });
                     relations.push(ExtractedRelation {
                         site: None,
@@ -451,6 +556,14 @@ fn extract_csharp_calls(
                         .unwrap_or_default(),
                     _ => normalize_scoped_name(text_of(&function, source).trim()),
                 };
+                // `this` is the lexical containing type, including inside a
+                // lambda. A different receiver or `base` keeps its old shape.
+                let callee = function
+                    .child_by_field_name("expression")
+                    .filter(|object| object.kind() == "this")
+                    .and_then(|_| context_name.rsplit_once('.'))
+                    .map(|(owner, _)| format!("{owner}.{callee}"))
+                    .unwrap_or(callee);
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
                         // The invocation itself, so a reference row can report
@@ -535,6 +648,8 @@ fn extract_ruby_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pars
         );
     }
 
+    qualify_ruby_self_calls(root, source, &entities, &mut relations);
+
     annotate_import_sources(&mut relations, &imports);
 
     ParseOutput {
@@ -542,10 +657,146 @@ fn extract_ruby_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pars
         entities,
         relations,
         imports,
-        tests: Vec::new(),
+        tests: ruby_tests(&tree.root_node(), source),
         parse_state,
         parsed_call_sites: None,
+        nested_definitions: None,
     }
+}
+
+/// Retain the method owner for explicit `self` and declared bare siblings.
+/// Check the syntax rather than interpreting every receiver-less relation as
+/// a bare call: calls through other objects currently have the same shape.
+fn qualify_ruby_self_calls(
+    root: Node<'_>,
+    source: &[u8],
+    entities: &[ExtractedEntity],
+    relations: &mut [ExtractedRelation],
+) {
+    use std::collections::{HashMap, HashSet};
+    let members: HashSet<&str> = entities
+        .iter()
+        .filter(|entity| entity.kind == EntityKind::Method)
+        .map(|entity| entity.name.as_str())
+        .collect();
+    let sites: HashMap<_, _> = relations
+        .iter()
+        .enumerate()
+        .filter(|(_, relation)| relation.kind == kin_model::RelationKind::Calls)
+        .filter_map(|(index, relation)| {
+            relation
+                .site
+                .as_ref()
+                .map(|site| ((site.start_byte, site.end_byte), index))
+        })
+        .collect();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+        if node.kind() != "call" {
+            continue;
+        }
+        let Some(&index) = sites.get(&(node.start_byte(), node.end_byte())) else {
+            continue;
+        };
+        let receiver = node.child_by_field_name("receiver");
+        if receiver.is_some_and(|receiver| receiver.kind() != "self")
+            || !ruby_keeps_self(node, source)
+        {
+            continue;
+        }
+        let relation = &mut relations[index];
+        let Some((owner, _)) = relation.src_name.rsplit_once('.') else {
+            continue;
+        };
+        let qualified = format!("{owner}.{}", relation.dst_name);
+        if receiver.is_some() || members.contains(qualified.as_str()) {
+            relation.dst_name = qualified;
+        }
+    }
+}
+
+/// Explicit eval/exec blocks can replace `self`; never charge their calls to
+/// the surrounding method's owner. A method definition starts a fresh scope.
+fn ruby_keeps_self(mut node: Node<'_>, source: &[u8]) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "method" | "singleton_method" => return true,
+            "singleton_class" | "class" | "module" => return false,
+            "block" | "do_block" => {
+                if parent
+                    .parent()
+                    .and_then(|call| child_field_text(&call, "method", source))
+                    .is_some_and(|name| {
+                        matches!(
+                            name.as_str(),
+                            "instance_eval"
+                                | "instance_exec"
+                                | "class_eval"
+                                | "class_exec"
+                                | "module_eval"
+                                | "module_exec"
+                        )
+                    })
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        node = parent;
+    }
+    false
+}
+
+/// The test methods a Ruby unit declares: each `test_*` method of a class
+/// that derives from `Minitest::Test` or `Test::Unit::TestCase`.
+fn ruby_tests(root: &Node, source: &[u8]) -> Vec<ExtractedTest> {
+    let mut tests = Vec::new();
+    let mut pending = vec![*root];
+    while let Some(node) = pending.pop() {
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+        if node.kind() != "class" {
+            continue;
+        }
+        let runner = match node
+            .child_by_field_name("superclass")
+            .map(|superclass| normalize_ruby_name(text_of(&superclass, source).trim()))
+            .as_deref()
+        {
+            Some(base) if base.ends_with("Minitest.Test") || base.ends_with("Minitest::Test") => {
+                "minitest"
+            }
+            Some(base)
+                if base.ends_with("Test.Unit.TestCase")
+                    || base.ends_with("Test::Unit::TestCase") =>
+            {
+                "test-unit"
+            }
+            _ => continue,
+        };
+        let Some(body) = node.child_by_field_name("body") else {
+            continue;
+        };
+        let mut members = body.walk();
+        for member in body.named_children(&mut members) {
+            if member.kind() != "method" {
+                continue;
+            }
+            if let Some(name) =
+                child_field_text(&member, "name", source).filter(|name| name.starts_with("test_"))
+            {
+                tests.push(ExtractedTest {
+                    name,
+                    kind: ExtractedTestKind::Unit,
+                    runner: runner.to_string(),
+                });
+            }
+        }
+    }
+    tests
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -590,8 +841,11 @@ fn extract_ruby_node(
                     visibility: Visibility::Public,
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
                 if let Some(parent) = container_ctx {
                     relations.push(ExtractedRelation {
@@ -639,9 +893,12 @@ fn extract_ruby_node(
         }
         "method" | "singleton_method" => {
             if let Some(raw_name) = child_field_text(node, "name", source) {
+                // `def self.name` is a method of the module or class it is
+                // written in; `def Other.name` is one of `Other`.
                 let owner = if node.kind() == "singleton_method" {
                     child_field_text(node, "object", source)
                         .map(|value| normalize_ruby_name(&value))
+                        .filter(|object| object != "self")
                         .or_else(|| container_ctx.map(|value| value.to_string()))
                 } else {
                     container_ctx.map(|value| value.to_string())
@@ -661,8 +918,11 @@ fn extract_ruby_node(
                     visibility: ruby_visibility(&raw_name),
                     doc_summary: extract_preceding_comment(node, source),
                     fingerprint: compute_fingerprint(node, source),
-                    span: span_from_node(node, file_id),
-                    declaration_line: None,
+                    span: crate::declaration_extent::span_with_comments(node, source, file_id).0,
+                    declaration_line: crate::declaration_extent::span_with_comments(
+                        node, source, file_id,
+                    )
+                    .1,
                 });
                 if let Some(owner_name) = owner {
                     relations.push(ExtractedRelation {
@@ -702,8 +962,12 @@ fn extract_ruby_node(
                         visibility: Visibility::Public,
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
-                        span: span_from_node(node, file_id),
-                        declaration_line: None,
+                        span: crate::declaration_extent::span_with_comments(node, source, file_id)
+                            .0,
+                        declaration_line: crate::declaration_extent::span_with_comments(
+                            node, source, file_id,
+                        )
+                        .1,
                     });
                     if let Some(owner) = container_ctx {
                         relations.push(ExtractedRelation {
@@ -1050,5 +1314,98 @@ mod tests {
                 && rel.src_name == "Services.UserService.display_name"
                 && rel.dst_name == "helper_internal"
         }));
+    }
+    #[test]
+    fn csharp_this_keeps_lexical_owner_including_lambdas() {
+        let source = br#"namespace Demo { class Outer {
+            void Ping() {}
+            void Run(Other other) { this.Ping(); other.Ping(); System.Action f = () => this.Ping(); }
+            class Inner { void Run() { this.Ping(); } void Ping() {} }
+        } }"#;
+        let tree = CSharpAdapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = parse_output(&CSharpAdapter, "Outer.cs", source);
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|r| r.dst_name == "Demo.Outer.Ping")
+                .count(),
+            2,
+            "{calls:?}; {}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|r| r.dst_name == "Demo.Outer.Inner.Ping")
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|r| r.dst_name == "Ping").count(),
+            1,
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_self_and_bare_siblings_keep_owner_but_other_and_rebound_self_do_not() {
+        let source = br#"module Shop
+          class Account
+            def ping(); end
+            def run(other)
+              self.ping()
+              ping()
+              other.ping()
+              other.instance_eval { self.ping(); ping() }
+              missing()
+            end
+          end
+          module Ledger
+            def self.clamp(value); value; end
+            def self.total(values); values.sum { |value| clamp(value) }; end
+          end
+        end
+        "#;
+        let tree = RubyAdapter.parse(source).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let output = parse_output(&RubyAdapter, "account.rb", source);
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|r| r.dst_name == "Shop.Account.ping")
+                .count(),
+            2,
+            "{calls:?}; {}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(
+            calls.iter().filter(|r| r.dst_name == "ping").count(),
+            3,
+            "{calls:?}"
+        );
+        assert!(calls.iter().any(|r| r.dst_name == "missing"));
+        assert!(calls
+            .iter()
+            .any(|r| r.src_name == "Shop.Ledger.total" && r.dst_name == "Shop.Ledger.clamp"));
     }
 }

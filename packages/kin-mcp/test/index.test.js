@@ -35,6 +35,8 @@ import {
   INSTRUCTIONS_BY_NAME,
   instructionsForProfile,
   MCP_PROTOCOL_VERSION,
+  MCP_PROTOCOL_VERSIONS,
+  negotiateProtocolVersion,
   STARTUP_STATUS_TOOL
 } from '../src/first-launch.js';
 import { PassThrough } from 'node:stream';
@@ -168,6 +170,16 @@ const fakeKinPreload = [
   "const fs = require('node:fs');",
   "const path = require('node:path');",
   "const command = path.basename(process.argv[1] || '');",
+  "if (command === 'store') {",
+  "  if (process.env.KIN_MCP_FAKE_STORE_REPLY) { process.stdout.write(process.env.KIN_MCP_FAKE_STORE_REPLY); process.exit(0); }",
+  "  let dir = process.cwd();",
+  "  for (;;) {",
+  "    if (fs.existsSync(path.join(dir, '.kin'))) { process.stdout.write(JSON.stringify({ schema: 'kin.store-path.v1', working_dir: dir, store: path.join(dir, '.kin'), external: false })); process.exit(0); }",
+  "    if (fs.existsSync(path.join(dir, '.git')) && !process.env.KIN_ALLOW_PARENT_STORE) break;",
+  "    const parent = path.dirname(dir); if (parent === dir) break; dir = parent;",
+  "  }",
+  "  process.stderr.write('not a Kin repository'); process.exit(1);",
+  "}",
   "if (command === 'init' || command === 'mcp' || command === 'daemon') {",
   "  const args = [command, ...process.argv.slice(2)];",
   "  if (process.env.KIN_MCP_FAKE_LOG) {",
@@ -756,9 +768,10 @@ test('runKinMcp starts the server when the launch directory is no Kin repository
       'mcp\nstart\n',
       'the wrapper must reach `kin mcp start`, and must not run `kin init` unasked'
     );
-    // Commands the reader has: the MCP tool, and the npx form of this
-    // release, since a registry install puts no `kin` on PATH.
-    assert.match(stderr, /call kin_init/);
+    // The command the reader has: the npx form of this release, since a
+    // registry install puts no `kin` on PATH. No agent surface sets a folder
+    // up, so the notice never sends the agent to an init tool.
+    assert.doesNotMatch(stderr, /init tool/);
     assert.match(stderr, /npx -y @kinlab\/kin@\S+ init \./);
     assert.doesNotMatch(stderr, /Run `kin init \.`/);
     assert.match(stderr, /Starting anyway/);
@@ -814,10 +827,11 @@ test('initialize is served through the wrapper in an empty directory', async () 
     );
     assert.doesNotMatch(
       result.stdout,
-      /no \.kin\/ found/i,
+      /no Kin store found/i,
       'the notice belongs on stderr; a byte of prose on stdout corrupts the first frame'
     );
-    assert.match(result.stderr, /call kin_init/);
+    assert.doesNotMatch(result.stderr, /init tool/);
+    assert.match(result.stderr, /npx -y @kinlab\/kin@\S+ init \./);
     assert.equal(await exists(path.join(tmpDir, '.kin')), false);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
@@ -827,77 +841,122 @@ test('initialize is served through the wrapper in an empty directory', async () 
 test('the notices name commands a registry user has, pinned to this release', () => {
   const notice = noRepositoryNotice('/work/app', '9.9.9');
   assert.match(notice, /\/work\/app is not a Kin repository/);
-  assert.match(notice, /call kin_init/);
+  assert.doesNotMatch(notice, /init tool/);
   assert.match(notice, /`npx -y @kinlab\/kin@9\.9\.9 init \.`/);
   assert.ok(noRepositoryNotice('/w').includes(`@kinlab/kin@${PACKAGE_VERSION} init`));
   const enclosing = enclosingRepositoryNotice('/work/repo/app', '/work/repo');
   assert.match(enclosing, /\/work\/repo\/app is not a Kin repository of its own/);
   assert.match(enclosing, /serves the Kin repository at\n?\s*\/work\/repo/);
-  assert.match(enclosing, /kin_init/);
+  assert.doesNotMatch(enclosing, /init tool/);
+  assert.match(enclosing, /`npx -y @kinlab\/kin@\S+ init \.` in it\./);
   assert.doesNotMatch(notice + enclosing, /\u2014/);
 });
 
-// Setting a folder up is a write, so a read-only profile never offers kin_init,
-// and names the command a person runs instead.
-test('only a profile that writes is told to call kin_init', () => {
-  for (const profile of ['agent-default', 'agent-routed', 'full', undefined]) {
-    assert.equal(profileServesInit(profile), true, String(profile));
-    assert.match(noRepositoryNotice('/w', '9.9.9', { profile }), /call kin_init/);
-    assert.match(enclosingRepositoryNotice('/w/app', '/w', { profile }), /call kin_init/);
-  }
-  for (const profile of ['agent-query', 'agent-search', 'agent-routed-query', 'benchmark', 'context-bench']) {
-    assert.equal(profileServesInit(profile), false, profile);
+// Setting a folder up is a command a person runs, not semantic agent work, so
+// no profile serves an init tool, the writing ones included, and every notice
+// names the command a person runs instead.
+test('no profile is told to call an init tool', () => {
+  for (const profile of [
+    'agent-default',
+    'agent-routed',
+    'full',
+    undefined,
+    'agent-query',
+    'agent-search',
+    'agent-ask',
+    'agent-routed-query',
+    'benchmark',
+    'context-bench'
+  ]) {
+    assert.equal(profileServesInit(profile), false, String(profile));
     const unbound = noRepositoryNotice('/w', '9.9.9', { profile });
     const nested = enclosingRepositoryNotice('/w/app', '/w', { profile, version: '9.9.9' });
-    assert.doesNotMatch(unbound + nested, /kin_init/, profile);
-    assert.match(unbound, /To set this folder up, run\n`npx -y @kinlab\/kin@9\.9\.9 init \.`/, profile);
-    assert.match(nested, /`npx -y @kinlab\/kin@9\.9\.9 init \.` in it\./, profile);
+    assert.doesNotMatch(unbound + nested, /init tool/, String(profile));
+    assert.match(unbound, /To set this folder up, run\n`npx -y @kinlab\/kin@9\.9\.9 init \.`/, String(profile));
+    assert.match(nested, /`npx -y @kinlab\/kin@9\.9\.9 init \.` in it\./, String(profile));
   }
 });
 
 // `kin mcp start` trims the profile it is handed, reads it in any case, and
 // serves agent-default when the value is empty or names no profile, so the
-// notice decides the same way and offers kin_init exactly when it is served.
+// notice decides the same way: whatever spelling reaches it, no resolved
+// profile serves an init tool and no notice offers one.
 test('profileServesInit resolves a profile the way kin mcp start does', () => {
-  for (const profile of ['AGENT-ROUTED', ' Full ', 'Agent-Default', '', '   ', null, 'agent-defualt']) {
-    assert.equal(profileServesInit(profile), true, JSON.stringify(profile));
-  }
-  for (const profile of ['AGENT-QUERY', ' agent-routed-query ', 'Context-Bench', 'Agent-Search']) {
-    assert.equal(profileServesInit(profile), false, profile);
-    assert.doesNotMatch(noRepositoryNotice('/w', '9.9.9', { profile }), /kin_init/, profile);
+  for (const profile of [
+    'AGENT-ROUTED',
+    ' Full ',
+    'Agent-Default',
+    '',
+    '   ',
+    null,
+    'agent-defualt',
+    'AGENT-QUERY',
+    ' agent-routed-query ',
+    'Context-Bench',
+    'Agent-Search'
+  ]) {
+    assert.equal(profileServesInit(profile), false, JSON.stringify(profile));
+    assert.doesNotMatch(noRepositoryNotice('/w', '9.9.9', { profile }), /init tool/, JSON.stringify(profile));
+    assert.doesNotMatch(
+      enclosingRepositoryNotice('/w/app', '/w', { profile }),
+      /init tool/,
+      JSON.stringify(profile)
+    );
   }
 });
 
-// The walk `kin mcp start` makes, so the notice names the repository that
-// will actually answer.
-test('findKinRepository walks up the way kin mcp start does', async () => {
-  const tmpDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-walk-')));
-  const home = path.join(tmpDir, 'home');
+test('findKinRepository delegates central and enclosing store discovery to the product', async () => {
+  const start = path.resolve('/work/repo/nested');
+  const working = path.resolve('/work/repo');
+  const store = path.resolve('/owned/stores/repo');
+  const env = { KIN_HOME: path.resolve('/owned') };
+  let calls = 0;
+  const run = async (binary, args, options) => {
+    calls += 1;
+    assert.equal(binary, '/resolved/kin');
+    assert.deepEqual(args, ['store', 'path', '--json', start]);
+    assert.equal(options.env, env);
+    assert.equal(options.cwd, start);
+    assert.equal(options.timeout, 3_000);
+    assert.equal(options.maxBuffer, 64 * 1024);
+    return { stdout: JSON.stringify({ schema: 'kin.store-path.v1', working_dir: working, store, external: true }) };
+  };
+  assert.equal(await findKinRepository(start, { env, binaryPath: '/resolved/kin', run }), working);
+  assert.equal(calls, 1);
+});
+
+test('unreadable discovery never authorizes automatic initialization', async () => {
+  const start = process.cwd();
+  const options = { binaryPath: '/resolved/kin' };
+  for (const stdout of ['not json', '{}', '[]', JSON.stringify({ schema: 'kin.store-path.v1', working_dir: 'relative', store: '/store', external: true })]) {
+    assert.equal(await findKinRepository(start, { ...options, run: async () => ({ stdout }) }), undefined);
+  }
+  for (const error of [Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }),
+                       Object.assign(new Error('permission refused'), { code: 1 })]) {
+    assert.equal(await findKinRepository(start, { ...options, run: async () => { throw error; } }), undefined);
+  }
+  assert.equal(await findKinRepository(start, { ...options, run: async () => {
+    throw Object.assign(new Error('not a Kin repository'), { code: 1 });
+  } }), null);
+});
+
+test('a central store or unreadable discovery does not trigger wrapper auto-init', async () => {
+  const tmpDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-central-')));
+  const logPath = path.join(tmpDir, 'calls.txt');
   try {
-    const repo = path.join(tmpDir, 'repo');
-    const nested = path.join(repo, 'packages', 'app');
-    await fs.mkdir(path.join(repo, '.kin'), { recursive: true });
-    await fs.mkdir(nested, { recursive: true });
-    await fs.mkdir(home, { recursive: true });
-    const options = { env: {}, homeDir: home };
-
-    assert.equal(await findKinRepository(repo, options), repo);
-    assert.equal(await findKinRepository(nested, options), repo, 'a plain nested folder is served by the repository above it');
-
-    // A nested Git repository with no store of its own is a boundary.
-    await fs.mkdir(path.join(nested, '.git'));
-    assert.equal(await findKinRepository(nested, options), null);
-    assert.equal(
-      await findKinRepository(nested, { env: { KIN_ALLOW_PARENT_STORE: '1' }, homeDir: home }),
-      repo
-    );
-
-    // Kin's own install root is never a repository.
-    const outside = path.join(home, 'projects', 'x');
-    await fs.mkdir(outside, { recursive: true });
-    await fs.mkdir(path.join(home, '.kin', 'bin'), { recursive: true });
-    await fs.writeFile(path.join(home, '.kin', 'registry.toml'), '');
-    assert.equal(await findKinRepository(outside, options), null);
+    for (const reply of [JSON.stringify({ schema: 'kin.store-path.v1', working_dir: tmpDir,
+      store: path.join(tmpDir, 'central-store'), external: true }), 'unreadable']) {
+      await fs.rm(logPath, { force: true });
+      const env = await fakeKinEnvironment(tmpDir, {
+        KIN_MCP_AUTO_INIT: '1', KIN_MCP_FAKE_LOG: logPath, KIN_MCP_FAKE_STORE_REPLY: reply
+      });
+      let stderr = '';
+      assert.equal(await runKinMcp([], { env, cwd: tmpDir, stdio: 'ignore',
+        stderr: { write(chunk) { stderr += chunk; } } }), 0);
+      assert.equal(await fs.readFile(logPath, 'utf8'), 'mcp\nstart\n');
+      assert.equal(await exists(path.join(tmpDir, '.kin')), false);
+      assert.doesNotMatch(stderr, /running kin init|neither is any folder above it/);
+    }
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -1018,7 +1077,7 @@ test('--stop stops idle daemons through the cached kin and names what stays on d
     }
     assert.match(stdout, /3 MB/, stdout);
     assert.match(stdout, /embedding model/, stdout);
-    assert.match(stdout, /\.kin directory beside its code/, stdout);
+    assert.match(stdout, /Repository graphs live in the Kin home stores directory/, stdout);
     if (process.platform !== 'win32') {
       assert.ok(stdout.includes(`rm -rf -- '${model.replaceAll("'", "'\\''")}'`), stdout);
     }
@@ -1457,9 +1516,30 @@ test('the first-launch handshake speaks the protocol version kin mcp start speak
     new URL('../../../crates/kin-mcp/src/server.rs', import.meta.url),
     'utf8'
   );
-  const declared = /const SUPPORTED_PROTOCOL_VERSION: &str = "([^"]+)";/.exec(serverSource);
-  assert.ok(declared, 'crates/kin-mcp/src/server.rs no longer declares SUPPORTED_PROTOCOL_VERSION');
-  assert.equal(MCP_PROTOCOL_VERSION, declared[1]);
+  const declared = /const SUPPORTED_PROTOCOL_VERSIONS: \[&str; \d+\] = \[([^\]]+)\];/.exec(
+    serverSource
+  );
+  assert.ok(declared, 'crates/kin-mcp/src/server.rs no longer declares SUPPORTED_PROTOCOL_VERSIONS');
+  const versions = [...declared[1].matchAll(/"([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual([...MCP_PROTOCOL_VERSIONS], versions);
+  const fallback = /const FALLBACK_PROTOCOL_VERSION: &str = "([^"]+)";/.exec(serverSource);
+  assert.ok(fallback, 'crates/kin-mcp/src/server.rs no longer declares FALLBACK_PROTOCOL_VERSION');
+  assert.equal(MCP_PROTOCOL_VERSION, fallback[1]);
+});
+
+// The same table the server's own test holds `negotiate_protocol_version` to.
+test('the first-launch handshake negotiates a version the way kin mcp start does', () => {
+  for (const [requested, answered] of [
+    ['2025-11-25', '2025-11-25'],
+    ['2025-06-18', '2025-06-18'],
+    ['2024-11-05', '2024-11-05'],
+    ['2026-07-28', '2025-11-25'],
+    ['2025-03-26', '2024-11-05'],
+    ['2024-10-07', '2024-11-05'],
+    [undefined, '2024-11-05']
+  ]) {
+    assert.equal(negotiateProtocolVersion(requested), answered, String(requested));
+  }
 });
 
 /** The value of a Rust string literal, from its source text between the quotes. */
@@ -1497,6 +1577,8 @@ function rustStringValue(source) {
 // these for each profile.
 const SERVER_INSTRUCTION_CONSTANTS = [
   'SERVER_INSTRUCTIONS',
+  'ASK_SERVER_INSTRUCTIONS',
+  'ASK_ONLY_SERVER_INSTRUCTIONS',
   'SEARCH_SERVER_INSTRUCTIONS',
   'ROUTED_SERVER_INSTRUCTIONS',
   'ROUTED_QUERY_SERVER_INSTRUCTIONS',
@@ -1659,6 +1741,8 @@ test('a first launch hands out the instructions for the profile kin mcp start wi
     ['agent-routed', 'agent-routed'],
     [' Agent-Routed-Query ', 'agent-routed-query'],
     ['AGENT-SEARCH', 'agent-search'],
+    ['agent-query', 'agent-query'],
+    ['agent-ask', 'agent-ask'],
     ['context-bench', 'context-bench'],
     ['agent-defualt', 'agent-default']
   ];
@@ -1753,7 +1837,7 @@ test('a failed first-launch download is reported in the answer to every tool cal
 
 // A release archive laid out as the real one is, whose `kin` runs a fake Kin
 // written in node. The fake answers `kin mcp start` over newline-delimited
-// JSON-RPC and `kin init`, and each test steers it through the environment:
+// JSON-RPC, `kin store path` and `kin init`; each test steers it through the environment:
 //   KIN_MCP_FAKE_SERVER_LOG       every argv and message it sees, one per line
 //   KIN_MCP_FAKE_HOLD_INITIALIZE  a path; `initialize` is answered once it exists
 //   KIN_MCP_FAKE_REFUSE_INITIALIZE=1  answer `initialize` with an error, stay up
@@ -1762,6 +1846,7 @@ test('a failed first-launch download is reported in the answer to every tool cal
 //   KIN_MCP_FAKE_INIT_EXIT        the exit code `kin init` finishes with
 const fakeKinSource = [
   "const fs = require('node:fs');",
+  "const path = require('node:path');",
   'const env = process.env;',
   "const log = line => fs.appendFileSync(env.KIN_MCP_FAKE_SERVER_LOG, JSON.stringify(line) + '\\n');",
   'log({ argv: process.argv.slice(2), pid: process.pid });',
@@ -1769,7 +1854,12 @@ const fakeKinSource = [
   '  if (!marker || fs.existsSync(marker)) return then();',
   '  setTimeout(() => waitFor(marker, then), 20);',
   '};',
-  "if (process.argv[2] === 'init') {",
+  "if (process.argv[2] === 'store') {",
+  "  const store = path.join(process.cwd(), '.kin');",
+  "  if (!fs.existsSync(store)) { process.stderr.write('not a Kin repository'); process.exit(1); }",
+  "  process.stdout.write(JSON.stringify({ schema: 'kin.store-path.v1', working_dir: process.cwd(), store, external: false }));",
+  "  process.exit(0);",
+  "} else if (process.argv[2] === 'init') {",
   '  waitFor(env.KIN_MCP_FAKE_INIT_HOLD, () => {',
   "    process.stderr.write('fatal: the fake init stopped here\\n', () => {",
   "      process.exit(Number(env.KIN_MCP_FAKE_INIT_EXIT || '0'));",
@@ -1968,7 +2058,9 @@ test(
     wrapper.child.stdin.end();
     assert.deepEqual(await wrapper.exited, { code: 0, signal: null });
 
-    const seen = await readServerLog(serverLog);
+    const allCalls = await readServerLog(serverLog);
+    assert.deepEqual(allCalls[0].argv, ['store', 'path', '--json', await fs.realpath(repoDir)]);
+    const seen = allCalls.slice(1);
     assert.deepEqual(seen[0].argv, ['mcp', 'start']);
     const methods = seen.slice(1).map(message => message.method);
     assert.deepEqual(methods, [

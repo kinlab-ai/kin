@@ -66,6 +66,16 @@ pub struct ServerLaunch {
     pub backend_exit_report: Option<String>,
     /// How the server shows it can answer.
     pub readiness: Readiness,
+    /// What the adapter looked for and did not find that the server needs to
+    /// start, and where it looked, as a sentence. `None` when nothing is
+    /// missing.
+    ///
+    /// A start that fails carries it in its reason, because it is usually
+    /// why: typescript-language-server refuses to initialize without a
+    /// TypeScript to run, and its own message cannot say where Kin looked.
+    /// Not part of the proof of which configuration answered, since a server
+    /// that answers was not short of it.
+    pub toolchain_gap: Option<String>,
 }
 
 /// How a server shows that it can answer.
@@ -215,6 +225,26 @@ pub trait LspAdapter: Send + Sync {
     /// Used for progress reporting, not as a hard timeout.
     fn estimated_index_time_secs(&self) -> u32 {
         30
+    }
+}
+
+/// The adapter Kin enriches `language` with, or `None` for a language this
+/// build wires no language server for.
+///
+/// The one map from a language to its adapter, so a surface that starts a
+/// server (the daemon's sweep, its readiness probe, `kin doctor`'s own probe)
+/// starts the same one with the same launch, and none of them names a
+/// language itself.
+pub fn for_language(language: LanguageId) -> Option<&'static dyn LspAdapter> {
+    match language {
+        LanguageId::Rust => Some(&rust_analyzer::RustAnalyzerAdapter),
+        LanguageId::Python => Some(&python::PyrightAdapter),
+        // One adapter serves both. `typescript-language-server` resolves a
+        // CommonJS `require` chain through the same tsserver project model it
+        // uses for TypeScript imports.
+        LanguageId::TypeScript | LanguageId::JavaScript => Some(&typescript::TypeScriptAdapter),
+        LanguageId::Go => Some(&go::GoplsAdapter),
+        _ => None,
     }
 }
 

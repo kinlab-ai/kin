@@ -1213,13 +1213,9 @@ impl RetainedSession {
 
         let workspace = open_root_nofollow(layout.working_dir())?;
         let workspace_identity = directory_identity(&workspace)?;
-        let kin = open_directory_nofollow(
-            &workspace,
-            layout
-                .root()
-                .file_name()
-                .ok_or_else(|| anyhow!("repository control root has no leaf"))?,
-        )?;
+        // A central or custom store is independent of the working tree.
+        // Retain the actual store root, never a same-named workspace child.
+        let kin = open_root_nofollow(layout.root())?;
         let kin_identity = directory_identity(&kin)?;
         let runs = open_directory_nofollow(&kin, std::ffi::OsStr::new("runs"))
             .context("open retained repository session root")?;
@@ -1349,13 +1345,7 @@ impl RetainedSession {
             self.workspace_identity,
             "retained workspace",
         )?;
-        let kin = open_directory_nofollow(
-            &workspace,
-            layout
-                .root()
-                .file_name()
-                .ok_or_else(|| anyhow!("repository control root has no leaf"))?,
-        )?;
+        let kin = open_root_nofollow(layout.root())?;
         require_directory_identity(&kin, self.kin_identity, "repository control root")?;
         require_directory_identity(&self.kin, self.kin_identity, "retained repository control")?;
         let runs = open_directory_nofollow(&kin, std::ffi::OsStr::new("runs"))?;

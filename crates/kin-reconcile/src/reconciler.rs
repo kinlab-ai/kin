@@ -302,27 +302,59 @@ fn reanchor_evidence_span(
 
 /// The same relation with every evidence span that points into `file` placed
 /// where this pass moved it, or `None` when nothing changed.
+///
+/// A record whose span cannot be placed says only that the relation was proven
+/// somewhere in the old code, and it says that once. When clearing a span
+/// leaves a record equal to one the relation already carries, from an earlier
+/// edit or from another site this pass cleared, the relation keeps one of
+/// them. Held twice they are two records alike that nothing can tell apart:
+/// the next language-server pass merges them into one, the binding history
+/// then reads one fewer as a binding withdrawn, and the obligation it records
+/// cites no position, so nothing can ever settle it.
 fn relation_with_reanchored_evidence(
     relation: &Relation,
     file: &FilePathId,
     moves: &[SpanMove],
 ) -> Option<Relation> {
-    let mut updated = relation.clone();
     let mut changed = false;
-    for evidence in &mut updated.evidence {
-        let Some(span) = evidence.source_span.as_ref() else {
-            continue;
-        };
-        if &span.file != file {
-            continue;
+    let mut evidence: Vec<kin_model::RelationEvidence> =
+        Vec::with_capacity(relation.evidence.len());
+    // The records this pass cleared, by their place in `evidence`.
+    let mut cleared: Vec<usize> = Vec::new();
+    for record in &relation.evidence {
+        let mut record = record.clone();
+        let moved = record
+            .source_span
+            .as_ref()
+            .filter(|span| &span.file == file)
+            .map(|span| reanchor_evidence_span(span, moves));
+        match moved {
+            Some(placed) if placed != record.source_span => {
+                changed = true;
+                let unplaced = placed.is_none();
+                record.source_span = placed;
+                if unplaced {
+                    cleared.push(evidence.len());
+                }
+            }
+            _ => {}
         }
-        let placed = reanchor_evidence_span(span, moves);
-        if placed.as_ref() != evidence.source_span.as_ref() {
-            evidence.source_span = placed;
-            changed = true;
+        evidence.push(record);
+    }
+    // Later cleared records go first, so the one kept is the earliest.
+    for index in cleared.into_iter().rev() {
+        let alike = evidence
+            .iter()
+            .enumerate()
+            .any(|(other, record)| other != index && record == &evidence[index]);
+        if alike {
+            evidence.remove(index);
         }
     }
-    changed.then_some(updated)
+    changed.then(|| Relation {
+        evidence,
+        ..relation.clone()
+    })
 }
 
 /// Outcome of reconciling a single file change.
@@ -467,6 +499,11 @@ fn batch_source_files(
     }
     files
 }
+
+/// Why a source's persisted layout was refused: its regions name declarations
+/// or ranges a fresh parse of its exact bytes does not produce.
+pub const LAYOUT_DIFFERS_FROM_SOURCE: &str =
+    "its persisted layout differs from a fresh parse of its bytes";
 
 /// An admitted source whose graph declarations this build does not derive from
 /// the exact bytes the tree names for it.
@@ -672,7 +709,7 @@ impl Reconciler {
         graph: &G,
         blobs: &BlobStore,
     ) -> Result<()> {
-        self.restore_canonical_source_state_inner(graph, blobs, None)
+        self.restore_canonical_source_state_inner(graph, blobs, None, false)
     }
 
     /// The same checked restore, except that a source whose graph declarations
@@ -683,18 +720,41 @@ impl Reconciler {
     /// and installed it, exactly as [`Self::restore_canonical_source_state`]
     /// does. A non-empty answer names every stale source and installs nothing,
     /// so the caller can re-derive all of them in one pass and then restore
-    /// strictly. Stopping at the first one would hand the caller a repair set
-    /// the next source outside it can still refuse. Every other failure (a
-    /// missing body, a digest mismatch, a layout that disagrees with its
-    /// source) is still an error, because re-deriving cannot repair it.
+    /// again. Stopping at the first one would hand the caller a repair set the
+    /// next source outside it can still refuse. A persisted layout that
+    /// disagrees with a fresh parse of its source is named the same way,
+    /// because re-deriving the source republishes its layout. Every other
+    /// failure (a missing body, a digest mismatch) is still an error, because
+    /// re-deriving cannot repair it.
     pub fn restore_canonical_source_state_or_name_stale<G: GraphStore>(
         &mut self,
         graph: &G,
         blobs: &BlobStore,
     ) -> Result<Vec<StaleCanonicalSource>> {
         let mut stale = Vec::new();
-        self.restore_canonical_source_state_inner(graph, blobs, Some(&mut stale))?;
+        self.restore_canonical_source_state_inner(graph, blobs, Some(&mut stale), false)?;
         Ok(stale)
+    }
+
+    /// The checked restore after a re-derivation pass: every coherent source is
+    /// installed, and a source that still fails a check is withheld and named
+    /// with the check it failed.
+    ///
+    /// One unit whose declarations or layout disagree with its bytes, after its
+    /// bytes were re-derived, is a defect in how that unit is read, and it must
+    /// not keep the rest of the repository from being served. A withheld source
+    /// keeps the declarations the graph holds for it and its last-known-good
+    /// state, the way a partially parsed source does: it gets no editable
+    /// projection and supplies no dependency knowledge. The caller records each
+    /// one so readers can see which unit is held partly parsed, and why.
+    pub fn restore_canonical_source_state_withholding<G: GraphStore>(
+        &mut self,
+        graph: &G,
+        blobs: &BlobStore,
+    ) -> Result<Vec<StaleCanonicalSource>> {
+        let mut withheld = Vec::new();
+        self.restore_canonical_source_state_inner(graph, blobs, Some(&mut withheld), true)?;
+        Ok(withheld)
     }
 
     fn restore_canonical_source_state_inner<G: GraphStore>(
@@ -702,6 +762,7 @@ impl Reconciler {
         graph: &G,
         blobs: &BlobStore,
         mut stale: Option<&mut Vec<StaleCanonicalSource>>,
+        withhold: bool,
     ) -> Result<()> {
         let tree = graph
             .resolved_tree_snapshot()
@@ -724,19 +785,43 @@ impl Reconciler {
             .map(str::to_owned)
             .collect();
         let mut staged = self.cross_file.checked_fork()?;
-        let sources =
-            staged.restore_canonical_sources(graph, blobs, paths, stale.as_deref_mut())?;
-        if stale.is_some_and(|stale| !stale.is_empty()) {
+        let sources = staged.restore_canonical_sources(
+            graph,
+            blobs,
+            paths,
+            stale.as_deref_mut(),
+            withhold,
+        )?;
+        if !withhold && stale.as_deref().is_some_and(|stale| !stale.is_empty()) {
             return Ok(());
         }
-        for source in &sources {
+        let mut coherent = Vec::with_capacity(sources.len());
+        for source in sources {
             if let Some(held) = graph
                 .get_file_layout(&source.indexed.file_id)
                 .map_err(|error| ReconcileError::Graph(error.to_string()))?
             {
-                validate_restored_layout(&held, &source.indexed.file_layout, source.content.len())?;
+                if let Err(error) = validate_restored_layout(
+                    &held,
+                    &source.indexed.file_layout,
+                    source.content.len(),
+                ) {
+                    let Some(stale) = stale.as_deref_mut() else {
+                        return Err(error);
+                    };
+                    stale.push(StaleCanonicalSource {
+                        file: source.indexed.file_id.clone(),
+                        reason: LAYOUT_DIFFERS_FROM_SOURCE,
+                    });
+                    continue;
+                }
             }
+            coherent.push(source);
         }
+        if !withhold && stale.is_some_and(|stale| !stale.is_empty()) {
+            return Ok(());
+        }
+        let sources = coherent;
         // No fallible work follows. Installing a whole checked projection census
         // removes obsolete old paths while preserving the separate LKG store.
         let mut projection = ProjectionState::new();
@@ -931,12 +1016,15 @@ impl Reconciler {
         let file_id = kin_index::normalize_file_path_id(path, &self.working_dir);
         let old_tree = self.tree_cache.get(&file_id);
 
-        let (indexed, tree) = self.pipeline.index_file_relative_with_hint(
+        // The manifests of the graph's tree name it, read as every check of
+        // the derivation reads them.
+        let (indexed, tree) = self.pipeline.index_file_relative_with_hint_in(
             path,
             blob_store,
             &self.working_dir,
             old_tree,
             Some(edit_hint),
+            &kin_index::GraphProjectFiles::new(graph, blob_store),
         )?;
 
         let result_file_id = indexed.file_id.clone();
@@ -1000,9 +1088,12 @@ impl Reconciler {
         blob_store: &BlobStore,
         graph: &G,
     ) -> Result<ReconcileResult> {
-        let indexed = self
-            .pipeline
-            .index_file_relative(path, blob_store, &self.working_dir)?;
+        let indexed = self.pipeline.index_file_relative_in(
+            path,
+            blob_store,
+            &self.working_dir,
+            &kin_index::GraphProjectFiles::new(graph, blob_store),
+        )?;
         let file_id = indexed.file_id.clone();
 
         // RACE CONDITION HARDENING: Verify the file hasn't changed since we
@@ -1175,6 +1266,11 @@ impl Reconciler {
         let graph = kin_db::InMemoryGraph::from_snapshot(snapshot)
             .map_err(|error| ReconcileError::Graph(error.to_string()))?;
         let mut files = files.to_vec();
+        // A manifest the batch changes can rename sources whose bytes it does
+        // not change, and those are derived again with it.
+        files.extend(crate::admitted_source::renamed_by_manifests(
+            &graph, blobs, &files,
+        )?);
         files.sort_by(|left, right| left.0.cmp(&right.0));
         if files.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(ReconcileError::InvalidTransaction(
@@ -1184,6 +1280,7 @@ impl Reconciler {
         let mut prepared = Vec::new();
         let mut non_source = Vec::new();
         let mut artifacts = HashMap::new();
+        let project = kin_index::GraphProjectFiles::new(&graph, blobs);
         for file in &files {
             let path = kin_model::RepoPath::from_utf8(file.0.clone())
                 .map_err(|error| ReconcileError::Graph(error.to_string()))?;
@@ -1200,7 +1297,7 @@ impl Reconciler {
             };
             let digest = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
             let body = blobs.read(&digest)?;
-            match IndexPipeline::new().index_any_content(file, &body, digest)? {
+            match kin_index::shared_index::index_any(file, &body, digest, &project)? {
                 kin_index::IndexedAny::EntitySource(indexed) => {
                     if !matches!(indexed.parse_state, ParseState::Valid) {
                         return Err(ReconcileError::InvalidTransaction(format!(
@@ -1321,7 +1418,7 @@ impl Reconciler {
             let content = blobs.read(&digest)?;
             // Non-source authored inputs keep their old retirement behavior.
             let kin_index::IndexedAny::EntitySource(mut indexed) =
-                IndexPipeline::new().index_any_content(&file, &content, digest)?
+                kin_index::shared_index::index_any(&file, &content, digest, &project)?
             else {
                 continue;
             };
@@ -1726,6 +1823,9 @@ impl Reconciler {
         let coverage_artifact = crate::coverage::admitted_artifact(graph, indexed)?;
         // Get existing entities for this file from the graph
         let existing = self.get_file_entities(graph, file_id)?;
+        // The manifests the graph's own declarations were named under, for
+        // every earlier body this pass reads back.
+        let prior_project = kin_index::GraphProjectFiles::new(graph, blob_store);
 
         // Build scopes for collision checking: all entities that will be
         // affected (existing + new ones from parse).
@@ -1992,7 +2092,13 @@ impl Reconciler {
         // they were linked, so only this file is resolved.
         let dependents = if self.cross_file.is_seeded()
             && !crate::linker_surface::edit_moves_linker_surface(
-                file_id, indexed, &existing, &added, &removed, blob_store,
+                file_id,
+                indexed,
+                &existing,
+                &added,
+                &removed,
+                blob_store,
+                &prior_project,
             ) {
             crate::cross_file::Dependents::Unaffected
         } else {
@@ -2205,10 +2311,10 @@ impl Reconciler {
                 if stable_src != relation.src || stable_dst != relation.dst {
                     if let (Some(src), Some(dst)) = (stable_src.as_entity(), stable_dst.as_entity())
                     {
-                        let remapped_id = RelationId::from_content(
-                            &src.to_string(),
-                            &dst.to_string(),
-                            &format!("{:?}", stable_relation.kind),
+                        let remapped_id = kin_index::linker::stable_relation_id(
+                            &src,
+                            &dst,
+                            &stable_relation.kind,
                         );
                         kin_index::occurrence::rebind_identity(
                             &mut stable_relation,
@@ -2446,7 +2552,11 @@ impl Reconciler {
                                             .find(|old| old.id == source)
                                             .is_some_and(|old| {
                                                 prior_call_sites.supports_retirement(
-                                                    relation, old, &entity, blob_store,
+                                                    relation,
+                                                    old,
+                                                    &entity,
+                                                    blob_store,
+                                                    &prior_project,
                                                 )
                                             }))
                             })
@@ -2713,7 +2823,7 @@ impl Reconciler {
 
         if let Some(artifact) = coverage_artifact {
             let current = matches!(indexed.parse_state, ParseState::Valid)
-                .then(|| self.cross_file.coverage_for(indexed, artifact));
+                .then(|| self.cross_file.coverage_for(graph, indexed, artifact));
             delta.relation_deltas.extend(crate::coverage::reconcile(
                 graph, file_id, artifact, current,
             )?);
@@ -2727,7 +2837,7 @@ impl Reconciler {
                 graph,
                 &source.file_id,
                 artifact,
-                Some(self.cross_file.coverage_for(source, artifact)),
+                Some(self.cross_file.coverage_for(graph, source, artifact)),
             )?);
         }
 
@@ -2839,6 +2949,17 @@ impl Reconciler {
             )?;
             delta.relation_deltas.extend(changes);
         }
+
+        crate::named_imports::refresh_changed_source(
+            graph,
+            blob_store,
+            indexed,
+            &existing,
+            &stable_entities,
+            &cross_file.named_import_observations,
+            &produced,
+            &mut delta,
+        )?;
 
         crate::named_imports::refresh(
             graph,
@@ -4654,7 +4775,9 @@ mod tests {
             .into_iter()
             .find(|e| e.name == "good")
             .unwrap();
-        let after = format!("// prefix\n{}", PARTIAL_C.replace("value", "longer_name"));
+        // A blank line keeps the prefix from documenting the declaration, so
+        // the declaration itself moves.
+        let after = format!("// prefix\n\n{}", PARTIAL_C.replace("value", "longer_name"));
         let result = partial_pass(&mut reconciler, &blobs, &graph, &after);
         assert!(
             matches!(&result.outcome, ReconcileOutcome::PartiallyUpdated { modified, .. } if modified.contains(&old.id))
@@ -6471,5 +6594,59 @@ mod tests {
             relation_with_reanchored_evidence(&relation, &FilePathId::new("sessions.py"), &moves)
                 .expect("the span changed, so a delta is owed");
         assert!(updated.evidence[0].source_span.is_none());
+    }
+
+    /// A cleared record says the relation was proven somewhere, once. Two
+    /// sites cleared by one edit leave one record, and a site cleared after an
+    /// earlier edit already left such a record adds nothing to it. A record
+    /// that differs in anything else, and one this pass could place, stay.
+    #[test]
+    fn records_alike_once_their_spans_are_cleared_are_held_once() {
+        let moves = vec![
+            (span("sessions.py", 30, 40), span("sessions.py", 56, 70)),
+            (span("sessions.py", 80, 90), span("sessions.py", 110, 120)),
+        ];
+        let site = |line: u32, rule: &str| kin_model::RelationEvidence {
+            source_span: Some(span("sessions.py", line, line)),
+            parser_rule: Some(rule.to_string()),
+            ..kin_model::RelationEvidence::default()
+        };
+        let unplaced = |rule: &str| kin_model::RelationEvidence {
+            parser_rule: Some(rule.to_string()),
+            ..kin_model::RelationEvidence::default()
+        };
+        let file = FilePathId::new("sessions.py");
+        let rule = "lsp_definition";
+
+        // Two sites inside the declaration that grew.
+        let mut relation = relation_of(kin_model::RelationOrigin::Lsp);
+        relation.evidence = vec![site(34, rule), site(36, rule)];
+        let updated = relation_with_reanchored_evidence(&relation, &file, &moves).unwrap();
+        assert_eq!(updated.evidence, vec![unplaced(rule)]);
+
+        // An earlier edit left one such record, and a later pass proved the
+        // site again.
+        relation.evidence = vec![unplaced(rule), site(34, rule)];
+        let updated = relation_with_reanchored_evidence(&relation, &file, &moves).unwrap();
+        assert_eq!(updated.evidence, vec![unplaced(rule)]);
+
+        // Another rule's record is another statement, and a site in a
+        // declaration that only moved keeps its place.
+        relation.evidence = vec![
+            site(34, rule),
+            site(36, "lsp_references"),
+            site(84, rule),
+            site(38, rule),
+        ];
+        let updated = relation_with_reanchored_evidence(&relation, &file, &moves).unwrap();
+        assert_eq!(
+            updated.evidence,
+            vec![unplaced(rule), unplaced("lsp_references"), site(114, rule)]
+        );
+
+        // Nothing this pass cleared, so nothing it may drop: records an older
+        // build left alike are not this pass's to change.
+        relation.evidence = vec![unplaced(rule), unplaced(rule)];
+        assert!(relation_with_reanchored_evidence(&relation, &file, &moves).is_none());
     }
 }

@@ -25,17 +25,32 @@ pub fn persist_locate_cursor(next_cursor: Option<&str>) {
     let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
         return;
     };
-    let path = locate_cursor_path(&layout);
+    let Ok(store) = cursor_store(&layout) else {
+        return;
+    };
     match next_cursor {
         Some(cursor) => {
-            let _ = std::fs::write(&path, cursor);
+            let _ = store.write_scratch_record(LOCATE_CURSOR_RECORD, cursor.as_bytes());
         }
         // No further pages: clear any stale cursor so a later bare `--next`
         // fails loud instead of paging a dead ranking.
         None => {
-            let _ = std::fs::remove_file(&path);
+            let _ = store.remove_record(LOCATE_CURSOR_RECORD);
         }
     }
+}
+
+/// The cursor's record name in the store, beside [`locate_cursor_path`].
+const LOCATE_CURSOR_RECORD: &str = "locate-cursor";
+
+/// The longest cursor read back. A cursor is a short continuation token.
+const MAX_LOCATE_CURSOR_BYTES: u64 = 64 * 1024;
+
+/// The store's own records. The cursor is a record of this store, never
+/// repository content, so the capability that holds it reaches the store and
+/// nothing outside it.
+fn cursor_store(layout: &kin_core::KinLayout) -> std::io::Result<kin_io::StoreDir> {
+    kin_io::StoreDir::open(layout.root(), &kin_io::Grant::ambient())
 }
 
 /// Read the persisted next-page cursor for `kin locate --next`. Errors loud when
@@ -43,12 +58,17 @@ pub fn persist_locate_cursor(next_cursor: Option<&str>) {
 pub fn read_persisted_locate_cursor() -> Result<String> {
     let cwd = std::env::current_dir()?;
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
-    let path = locate_cursor_path(&layout);
-    let cursor = std::fs::read_to_string(&path).map_err(|_| {
+    let no_page = || {
         anyhow::anyhow!(
             "no locate page to advance: run `kin locate <query>` first, then `kin locate --next`"
         )
-    })?;
+    };
+    let cursor = cursor_store(&layout)
+        .and_then(|store| store.read_record(LOCATE_CURSOR_RECORD, MAX_LOCATE_CURSOR_BYTES))
+        .ok()
+        .flatten()
+        .ok_or_else(no_page)?;
+    let cursor = String::from_utf8(cursor).map_err(|_| no_page())?;
     let cursor = cursor.trim().to_string();
     if cursor.is_empty() {
         anyhow::bail!("no further locate pages (the previous page was the last)");

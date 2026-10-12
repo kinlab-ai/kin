@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-87 commands are documented below. 5 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `revert`, `semantic-only-guard`) are hidden from `kin --help` because they are not part of the supported surface. `revert` specifically refuses on purpose and names `rollback` instead, so typing it out of Git habit gets that explanation rather than a real command.
+87 commands are documented below. 5 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `revert`, `semantic-only-guard`) are hidden from `kin --help` because they are not part of the supported surface. `revert` specifically refuses on purpose and names `rollback` instead, so typing it out of Git habit gets that explanation rather than a real command. `kin places <ENTITY_ID>... [--json]` is hidden for a different reason: it is the call an editor makes to open an entity where the working copy holds it, answering each id with the path its declaration is projected to and the declaration's 1-based start and end, or with the reason the graph cannot place it. Explore a repository with `kin locate`, `kin refs` and `kin source` instead.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -45,7 +45,7 @@ The everyday path, in the order the CLI's own help lists it.
 
 ### `kin init`
 
-Initialize a new Kin repository
+Start Kin in a repository, new or existing
 
 ```
 kin init [path] [options]
@@ -58,8 +58,30 @@ kin init [path] [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON status instead of human text |
-| `--no-enrich` |  | Skip the cross-file enrichment phase |
+| `--no-enrich` |  | Switch language-server enrichment off for this repository. No daemon that serves it runs a sweep until `kin daemon sweep --enable`. On a repository that already exists it records the same setting and stops the daemon serving it |
+| `--defer-enrich` |  | Skip the language-server sweep now. Enrichment stays on, and the next daemon start runs the sweep |
+| `--store <dir>` |  | Keep the store in this directory instead of the central stores directory. `KIN_STORE` sets the same thing. |
 | `--verbose` |  | Print the full record: every admission stage, the ids and the enrichment detail |
+| `--history <mode>` | `background` | How much Git history to admit: `background`, `none` or `full` |
+
+`--history` decides how much of a Git repository's history `kin init` admits:
+
+- `background`, the default, admits the checked-out commit's exact tree first, so `locate`,
+  `refs`, `context`, `impact` and `trace` answer as soon as it is published, and derives the full
+  history afterwards in a worker at background priority with a quarter of the machine's threads
+  and a third of its memory ceiling. The derivation is staged beside the repository and replaces
+  the store the next time no daemon is serving it; a daemon that restarts resumes it.
+- `none` admits the checked-out commit only and never derives history, for CI jobs, containers
+  and agent sandboxes. It also admits a shallow clone.
+- `full` admits the whole reachable history before the store is published, as `kin init` always
+  did before this option.
+
+`KIN_INIT_HISTORY` sets the mode when `--history` is not given. Until the full history is
+attached, the store records its history as partial: `kin log`, `kin history`, `kin blame`,
+`kin diff`, `kin status` and `kin graph status` say so and how far the derivation got, MCP answers
+carry `_kin.partial_history`, and `kin push`, `kin pull`, `kin git export`, `kin eject`,
+`kin upgrade` and prepared-state publication refuse. Over an existing store, `--history full`
+derives and attaches its history now, and `background` or `none` changes what it does next.
 
 On a terminal, `kin init` prints one live line per phase and a short result: rows for reading
 history, linking and the search index, what is not linked yet and why, and a `kin refs` command
@@ -72,6 +94,48 @@ repository's languages need before it links. Without that answer it installs not
 
 A second `kin init` in a repository this build can open says so and exits 0. Over a store this
 build cannot open it still refuses and exits 1, as does `--json`.
+
+A new store lives in the central stores directory beside the registry, `~/.kin/stores/<name>`,
+where the name is the working tree's directory name and a short hash of its path. With
+`--store <dir>`, or `KIN_STORE=<dir>`, the store is created at that directory instead, which must
+be absent or empty and outside the working tree. Either way the working tree carries nothing Kin
+wrote: no store, no pointer file and no exclude rule, so the store never appears in the tree's diff,
+the daemon's own writes never reach the tree's file watchers, and a read-only checkout can be
+served. Every later command, the daemon, `kin mcp start` and the editor extension find the store
+from anywhere inside the tree through a store index kept beside the registry, so `KIN_HOME` and
+`KIN_REGISTRY_PATH` bound it the way they bound the registry. `kin store path` prints where a tree's
+store is.
+
+A store an earlier version created in the working tree, as `.kin`, keeps working where it is, and
+`kin init` adds `/.kin/` to `.git/info/exclude` for it. `KIN_STORE_LAYOUT=in-tree` keeps a new store
+in the working tree too, for a setup where the store has to travel with the checkout, such as a
+container whose Kin home is thrown away while the repository is a bind mount. When the central
+stores directory cannot be created, `kin init` keeps the store in the working tree rather than
+failing.
+
+Discovery looks for the store of the working tree a command runs in: from the current directory
+upward, each directory is asked whether a store serves exactly it, and the walk stops at the first
+directory carrying `.git`. A nested repository, a linked worktree or a submodule without a store of
+its own therefore has none, and a store above it is neither used nor mentioned.
+`KIN_ALLOW_PARENT_STORE=1` walks past that boundary.
+
+A store records the Git commit its checkout had out. When a checkout is moved or renamed, the next
+command in the new location, `kin init` included, finds the store whose working tree is gone and
+whose recorded commit this checkout's history holds, attaches it again, says so in one line, and
+answers. When several stores match, it refuses and names them; `kin store attach <store>`
+continues one of them. A copy of a checkout whose store still serves the original is told so, and
+`kin init` in the copy gives it a store of its own.
+
+When this machine already holds a store admitted from exactly the same Git refs and `HEAD`, a
+`kin init` of a clean Git checkout reuses that store instead of deriving it again, and so does
+`kin clone` over Git transport. Kin finds it through a catalog beside the registry, never by
+searching the disk, and checks it again before using it: the store must still hold only its Git
+admission, with no commit, branch or edit since. The copy is hashed file by file and its authority
+is verified before `.kin` is published, and the store it came from is only read. A store another
+build of Kin derived is re-derived by `kin upgrade` on the copy first. The result says what was
+reused and what was recomputed, with the time of each step, and `--json` prints it as a
+`kin.init-reuse.v1` document under `reuse`. A checkout with uncommitted or untracked files, or
+with any other ref, is admitted from scratch. `KIN_PREPARED_STORE_REUSE=0` turns reuse off.
 
 `kin init` stages its conversion beside the repository and publishes `.kin` into the repository
 root, so it first checks that it can create entries in both. When either directory is not writable
@@ -118,9 +182,10 @@ the reference, override and type-use edges a single-file parse cannot derive. `k
 reports what that phase did under `cross_file_enrichment`, and the exit code does not change with
 it:
 
-- `state`: `produced` when a sweep finished, enriched files and owes none, `owed` when the graph
-  handed over lacks some or all of those edges, and `unknown` when the run could not read what its
-  sweep did.
+- `state`: `produced` when a sweep finished, enriched what it was asked about and owes nothing,
+  `owed` when the graph handed over lacks some or all of those edges and a later sweep supplies
+  them, `off` when `--no-enrich` switched enrichment off for this repository, so no sweep runs
+  until `kin daemon sweep --enable`, and `unknown` when the run could not read what its sweep did.
 - `reason`: why, as one of the stable codes below. Absent when `state` is `produced`.
 - `detail`: the sentence the human summary prints, naming what is missing and what supplies it.
 - `cause`: the error or observation behind `reason`, when there was one.
@@ -128,7 +193,8 @@ it:
 
 | `reason` | What happened |
 | --- | --- |
-| `not_requested` | `--no-enrich` skipped the sweep. |
+| `not_requested` | `--defer-enrich` skipped the sweep. Enrichment stays on, and the next daemon start runs it. |
+| `switched_off` | `--no-enrich` recorded enrichment off for this repository. No daemon that serves it runs a sweep until `kin daemon sweep --enable`. |
 | `daemon_spawn_disabled` | `KIN_NO_DAEMON` is set, so no daemon could be started to run the sweep. |
 | `loopback_blocked` | The operating system refuses this process every loopback connection, as a sandbox or seccomp filter that denies `connect()` does, so no daemon it started could be reached. |
 | `daemon_unavailable` | No daemon could be started or reached for another reason. `cause` says which. |
@@ -144,10 +210,12 @@ it:
 `daemon_spawn_disabled` and `loopback_blocked` are decided before anything is started, so the phase
 returns at once instead of waiting on a daemon that cannot run the sweep. In every `owed` case
 `detail` names what supplies the missing edges, and `kin daemon sweep` runs the sweep on demand.
+When the reason is `switched_off` the state is `off` rather than `owed`: the repository stays off,
+and `kin daemon sweep` refuses, until `kin daemon sweep --enable` turns it on.
 
 ### `kin clone`
 
-Clone a repository
+Clone a repository into Kin
 
 A hosted locator such as `kinlab://<org>/<repository-id>` carries its repository identity with it. A plain peer daemon HTTP endpoint does not, so `--repository` supplies the identity to adopt there. A Git clone URL takes neither, and passing `--repository` with one is refused before any negotiation rather than failing later against a remote that was never a Kin peer.
 
@@ -173,7 +241,7 @@ same short form on a terminal.
 
 ### `kin status`
 
-Show coherent repository-v6 workspace status
+Show your changes, your branch and Kin's progress
 
 ```
 kin status [options]
@@ -201,6 +269,8 @@ The commit lands in Kin's own authority, not in Git. Nothing is written to `.git
 > Recorded in Kin authority, not in git. `git status` stays dirty until you run `kin eject` or push this branch to a Kin remote.
 
 `kin commit --amend` replaces the current change with the full working state and keeps that change's parents. The message is kept unless `-m` supplies a new one. The replaced change stays immutable in history with its author, and the amend is recorded as the caller's operation. An amend is refused while a merge is open and when the selected head moved since it was read. A detached workspace amends only its own workspace and moves no ref. A plain `kin commit` with nothing to record still refuses as before.
+
+A commit records its author, so with no author configured it refuses and exits 10. The first line names what is missing, such as `Git has no user.name and no user.email`, and the lines after it give the `git config` commands that set them and the Kin-only alternative. Every command that records an author refuses the same way with the same status. Measuring the working copy never needs one: `kin status`, `kin diff`, `kin admit` and the review guide work with no Git identity configured.
 
 ```
 kin commit [options]
@@ -630,7 +700,8 @@ caller of the entity may be among those sites. When no resolver can prove a
 caller's sites on this host now, because the daemon runs with language-server
 enrichment switched off, no language server serves the language, or the one
 that does cannot start, the caller is counted as one that can't be linked on
-this machine, with why for each language. Waiting does not settle those;
+this machine, with why for each language. A repository switched off by its own
+setting says so, and names `kin daemon sweep --enable`, which turns it on. Waiting does not settle those;
 installing the server does, once the next sweep runs. The daemon's JSON carries
 the block under `call_sites`, with the verdict codes, such as
 `call_sites_owed`, that a program reads.
@@ -897,7 +968,7 @@ kin security [options]
 
 ### `kin languages`
 
-List the languages Kin extracts semantics from
+List the languages Kin understands
 
 ```
 kin languages [options]
@@ -1004,7 +1075,7 @@ kin branch delete [name] [options]
 
 #### `kin branch switch`
 
-Switch workspace authority and projection atomically Uncommitted work comes with you, the way it does across a Git checkout. Pending work at a path the destination branch does not track moves across and is still uncommitted when you arrive. Pending work at a path the destination already tracks with identical content becomes an ordinary member of that branch. A pending edit to a member both branches hold identically moves across too. The switch refuses only where replaying the work would lose something: a new file whose path the destination tracks with different content, or an edit to a member the destination holds differently or does not hold at all. It names every blocked path, and commit or `kin stash push` clears the way.
+Switch workspace authority and projection atomically Uncommitted work comes with you, the way it does across a Git checkout. Pending work at a path the destination branch does not track moves across and is still uncommitted when you arrive. Pending work at a path the destination already tracks with identical content becomes an ordinary member of that branch. A pending edit to a member both branches hold identically moves across too. The switch refuses only where replaying the work would lose something: a new member the destination already holds with different content, or an edit to a member the destination holds differently or does not hold at all. It names the entities every blocked change holds, and commit or `kin stash push` clears the way.
 
 ```
 kin branch switch [name] [options]
@@ -1017,6 +1088,15 @@ kin branch switch [name] [options]
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--ref-hex <lower-hex>` |  | Canonical lowercase hex for a fully-qualified byte-exact branch ref |
+| `--detach` |  | Detach at the admitted commit or change NAME instead of entering a branch |
+
+With `--detach`, NAME is any point in history the store admitted: `git:<sha>` (whole or a unique
+prefix), a change id or prefix, or `HEAD~3`. The workspace moves there with a detached head by the
+same exact transition: it replays the recorded state of that commit, writes only the files that
+differ, and parses nothing. A working tree that Git already moved to that commit is accepted as
+it is, so `git checkout --detach <sha>` followed by `kin branch switch --detach git:<sha>` leaves
+nothing pending. Language-server enrichment derived for the previous state is retired, and
+`kin daemon sweep` derives it for the new one.
 
 ### `kin checkout`
 
@@ -1249,7 +1329,7 @@ kin reconcile [session] [options]
 
 ### `kin migrate`
 
-Migrate an existing Git repository into graph-owned Kin truth
+Move an existing Git repository into Kin, in place or to a new directory
 
 ```
 kin migrate [source] [options]
@@ -1501,6 +1581,194 @@ kin review show <review-id>
 | Argument | Required | Description |
 | --- | --- | --- |
 | `<review-id>` | yes | Review ID |
+
+#### `kin review guide`
+
+Walk a change step by step: connected entities in reading order, each with its before and after text and what reaches it
+
+```
+kin review guide [change] [options]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `[change]` | no | What to walk: a change ID, branch name or imported Git commit, or a range as `<base>..<head>` (defaults to the current change) |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--working` |  | Walk the uncommitted work in the working tree |
+| `--base <REF>` |  | Walk everything the change reaches that this ref does not |
+| `--json` |  | Output the walkthrough as machine-readable JSON |
+
+A guide orders a change the way the graph connects it. Changed entities that
+the recorded relations tie together form one chapter, and inside a chapter
+what the others rely on comes first, so a function is read before the callers
+that changed with it. An entity that changed on its own gets a chapter when
+something reaches it, and the rest are grouped by whether they were modified,
+added or removed.
+
+Each step names the entity and what contains it, such as its module or class,
+what moved in its record, and its text at the two changes: before at the change's first parent, after at the change itself. A
+merge is read as what it brought into its first parent's line. Both
+are the entity's own span read from recorded state, never a file. A body the
+store cannot serve is reported with the reason in place of the text. Each step
+then lists the recorded consumers and tests that reach the entity, and says
+whether this change changed them too. A removed entity is gone at the change with
+the relations into it, so its step reads what reached it where it still
+existed, and a consumer it leaves behind counts against the change's risk.
+
+Each step also says what its change asks of the consumers that did not change
+with it. A comment, the layout or a docstring asks nothing, so they need no
+update. The guide reads this from the graph's fingerprint of the entity's
+tokens, which skips comments and whitespace, and, where the entity's language
+records one, from its behaviour equivalence class, which reads past a
+docstring. A comment written inside a parameter list is therefore not a
+signature change, even though the signature's recorded text takes it in. A
+body that changed under a signature that held may change what a consumer gets
+back, so its consumers may need review. A signature that changed, an entity
+that stopped being public or one that was removed, where the review finds it
+breaks a consumer outside the change, leaves the consumers that did not change
+with it not updated. The guide's opening sentence follows the same verdicts.
+
+Nothing in a guide is written by a model. The chapters, the order and every
+sentence are derived from the change, the relations committed at it and the
+review's findings, so the same change always reads the same way. The guide
+carries the review's own completeness line, and a count it gives is a lower
+bound wherever the review says enrichment is pending.
+
+A guide walks at most 60 entities. A larger change walks the ones with the
+highest recorded risk and reach, and says how many it left to
+`kin review <change> --details`.
+
+A guide ends with the reviews recorded against the change, each with where it
+stands and its decisions and notes in the order they were recorded. It lists
+the 20 newest reviews and each one's latest 200 entries, cuts long text short
+with a mark, and says how many it left to `kin review list` and
+`kin review show`. A review is listed when its head names
+this change: the change's whole id, or the explicit `kin:` or `change:` form,
+which may be a unique prefix. A review opened against a branch name is not
+listed, because the branch moves and the decision was about wherever it
+pointed then.
+
+`--working` walks what the working tree holds beyond the last recorded
+change. "Before" is each entity's text at that change and "after" is its text
+in the working tree, so the walk shows an edit, what relies on it and what you
+have not updated yet, before anything is committed. The working copy is
+admitted first, as `kin diff` admits it, so an edit made a moment ago is in the
+walk, and when that cannot run the guide says so. Work that changed no entity
+is still uncommitted, and the guide says so rather than reporting a clean tree.
+Nothing is recorded against uncommitted work: a decision or a note names a
+change, and this work is not one yet.
+
+A range walks several changes as one review. `kin review guide main..` walks
+everything the current change holds that `main` does not, `main..feature` names
+both ends, and `--base main` is the same range by its flag. "Before" is read at
+the change the two refs share, so work the base did on its own after the branch
+left it is not shown as something the branch undid, and an entity several
+changes touched is one step. The guide names the changes the range holds. A
+range keeps reviews of its own: it lists a review whose head is the range's
+head and whose base reads "before" at the same change, and a review of its last
+change alone is not one of them. The base has to be written as a whole change
+id. A review opened against a branch name is not matched to a range, because
+the name moves and the review would join or leave the range with it.
+
+`--json` answers the same walkthrough under the `kin.review.guide.v1` schema.
+Its `kind` is `change`, `working` or `range`. A range carries the two refs it
+was asked for and the changes between them, and uncommitted work carries
+`working_tree`: whether the working tree differs from the last recorded change
+at all, and whether what changed was derived into entities.
+
+Each step's `consumer_verdict` carries its `verdict`: `needs_no_update`,
+`may_need_review`, `not_updated`, or `updated` when the change would break a
+consumer and nothing outside the change reaches the entity. Its `reason` is
+`comments_or_layout_only`, `behavior_equivalent`, `visibility_widened`,
+`moved`, `body_changed`, `visibility_reduced`, `signature_changed`,
+`contract_changed`, `added` or `removed`, and `consumers` counts the
+recorded consumers outside the change it covers. The summary counts each
+recorded consumer once, under the most any change it reaches asks of it, in
+`consumers_not_updated`, `consumers_may_need_review` and
+`consumers_need_no_update`, which add up to `recorded_consumers`.
+
+#### `kin review open`
+
+Serve the guided review as a local page on this machine
+
+```
+kin review open [change] [options]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `[change]` | no | What to open first: a change, or a range as `<base>..<head>` (defaults to the current change) |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--working` |  | Open the uncommitted work in the working tree first |
+| `--base <REF>` |  | Open everything the change reaches that this ref does not |
+| `--port <port>` |  | Port to bind on 127.0.0.1. When the default is taken, the next free port is used |
+| `--no-browser` |  | Serve the page without opening a browser |
+
+The page shows what `kin review guide` prints, with the repository's recorded
+changes listed beside it: the chapters, each step's changed lines with its
+before and after text, the consumers and tests that reach it, and the record
+each line stands on. Opening a consumer or a test reads that entity's own text
+at the same change. It keeps no state of its own. Every request is answered
+by the repository's daemon, the same authority the terminal commands ask.
+
+A guide opens with one sentence that says what the change means, and a map of
+it: each changed entity under the first changed entity it relies on, with the
+consumers and tests that reach it from outside listed beneath. A consumer left
+as it was under an entity whose signature broke is marked "Not updated". Changed
+lines are coloured by language and read in one column or side by side. Each
+step can show how its entity got here: the recorded changes that changed it
+on the line of history the guide ends at, each a way into that change's own
+walk.
+
+The list beside the guide starts with the uncommitted work. Opened, it is the
+`--working` guide, and it is read again as the working tree changes, so an edit
+made in an editor shows up on the page without a reload. On a branch other
+than the default one, the list also offers that branch against the default as
+one range. Any other range is opened from the search box by typing it the way
+a terminal takes it, such as `main..` or `main..feature`. The list shows where
+each change's newest review stands and can be narrowed to the ones still to
+review, and it follows the repository, so a change recorded while the page is
+open appears in it.
+
+The search box, opened with `/`, jumps to a step, a change, a branch or an
+action. `?` lists the keyboard shortcuts. Each step and each entity that reaches
+it opens in an editor on this machine once one is chosen: VS Code, Cursor or
+Zed.
+Where the checkout holds an entity is recorded at the guide's head, so the
+Open link appears only when that is what is checked out: in the uncommitted
+work, and in a guide that ends at the change the working tree stands on.
+"Copy summary" puts the walk on the clipboard as Markdown, for a pull request
+description or a message.
+
+The page also records a review. Approve, Needs work and Block record a
+decision, with a comment when you give one, and a note can be left on the
+change or on any step. Each is written the way `kin review decide` and
+`kin review note` write it, by the repository's daemon, under the actor a
+terminal command in the same shell would record, and `kin review show` prints
+it afterwards. The first decision or note on a change opens a review of it,
+from the change the guide read as "before" to the change itself. Later ones
+join the newest review stored between those same two changes. When a change holds
+more than one review, the page shows each one's history apart. A decision on a
+range opens a review of the range, from the change it reads "before" at to its
+head, and is kept apart from a review of the range's last change. Uncommitted
+work takes no decision and no note.
+
+It is served from this machine only. The server binds 127.0.0.1, the page is
+built into the `kin` binary and loads nothing from the network, and a request
+whose `Host` is not the server's own loopback address is refused. A write is
+held to more: it must carry a token minted for this run and given only to the
+server's own page, and an `Origin` that is the server's own when the browser
+sends one, so no other page open in the browser can record anything. The default
+port is 4221. A port named with `--port` is used or the command fails; without
+it, a taken port moves the page to the next free one, and the command prints
+the address it chose. Press Ctrl-C to stop it.
+
+Which steps you have marked read, the colour theme, the diff layout and the
+editor you chose are kept in your browser, not in the repository.
 
 ### `kin approvals`
 
@@ -2057,7 +2325,6 @@ error exits 1, with the answer printed as usual.
 
 ```
 kin call graph_neighborhood '{"entity_id":"<entity id from kin locate>","depth":2}'
-kin call kin_session_start '{"vendor":"shell","client_name":"my script","cwd":"/path/to/repo"}'
 kin call kin_mutate - < change.json
 ```
 
@@ -3198,6 +3465,69 @@ kin cache gc [options]
 | `--budget-gb <gb>` |  | Evict the oldest entries until the cache fits this many gigabytes. Overrides KIN_EMBED_CACHE_BUDGET_GB; unset means no budget eviction. |
 | `--prune-stale-schema` |  | Also remove every abandoned (non-current) schema-version subtree |
 
+### `kin store`
+
+Show where a working tree's store lives, attach a copied or moved store to a checkout, and list or
+prune the stores kept outside their working trees.
+
+```
+kin store <subcommand>
+```
+
+#### `kin store path`
+
+Print the store serving a directory, in the tree or kept outside it. Starts nothing.
+
+```
+kin store path [path] [--json]
+```
+
+`--json` prints `kin.store-path.v1`: the working tree, the store and whether the store is kept
+outside the tree.
+
+#### `kin store attach`
+
+Make a copied or moved store, kept outside any tree, serve a working tree.
+
+```
+kin store attach <store> [path] [--json]
+```
+
+Use it for a copy of a prepared store taken for one checkout, such as an APFS clone, or for a store
+a moved checkout left behind. The store's contents are unchanged: the first daemon reconciles the
+tree, and `kin branch switch --detach git:<sha>` moves the store to the commit the checkout holds
+without parsing anything. It refuses a tree that already has a store, a store that still serves
+another tree, and a store a daemon is still serving.
+
+#### `kin store list`
+
+List every store kept outside its working tree, and how each stands. Starts nothing.
+
+```
+kin store list [--size] [--json]
+```
+
+It lists each store the store index names and each store in the central stores directory. A store
+is `serving` its tree, `detached` (its tree exists and finds another store or none), `gone` (its
+tree was moved or deleted and the directory that held it is still there), `unreachable` (its tree
+and the directory above it are both missing, which can mean a volume that is not mounted), or
+`reserved` (the index holds a location and no store is there yet). `--size` also measures what each
+store occupies on disk. `--json` prints `kin.store-list.v1`.
+
+#### `kin store prune`
+
+Delete central stores whose working tree is gone.
+
+```
+kin store prune [--yes] [--unreachable] [--json]
+```
+
+Without `--yes` it only lists what it would remove: a store holds the native Kin history of its
+tree, which Git cannot rebuild. It deletes only stores in the central stores directory, never one a
+daemon is still serving, and never one placed with `--store`, which it reports instead. A store
+whose tree is `unreachable` is kept unless `--unreachable` is given. With `--yes` it also removes
+store index entries that can never bind a store. `--json` prints `kin.store-prune.v1`.
+
 ### `kin backup`
 
 Create and restore complete native recovery carriers.
@@ -3338,8 +3668,23 @@ Subcommands:
 Show the supervisor and every repo worker daemon, with stale-file detection
 
 ```
-kin daemon status [options]
+kin daemon status [path] [options]
 ```
+
+`path` names the repository whose own daemon to describe, in either store layout; the current
+directory when omitted. Under `--json`, `current_repo` names that repository's `store`, its
+`layout` (`in-tree` or `outside-tree`), whether a daemon holds the store's lock (`lock_held`), the
+daemon's `pid`, `port` and `state`, and the executable it runs (`daemon_binary`). Endpoint files
+that name a live process holding no lock of this store, as a copied store's do, read as not
+running: that process serves another store.
+
+Each entry in `repo_daemons`, and `current_repo`, carries an `activity` object saying what that
+repository's daemon is doing now: `phase`, `since` (RFC 3339, or null when not known) and a
+plain-English `detail`. The phase is `starting` (opening its graph), `reconciling` (taking in
+working-copy changes), `indexing` (building the search index or another derived index),
+`enriching` (language servers resolving references), `reading_history` (older history deriving in
+the background), `idle`, `stopped` (not running), or `unknown` (alive and not answering). It is
+read from the daemon's own `/health` answer and the store's history record, and names no path.
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -3376,11 +3721,25 @@ When the language server answers that a call names a declaration outside the rep
 
 Every entity with source text in a file the sweep finishes gets a call-site ledger: how many call expressions Kin's parser reads in its body, and one state for each of them, keyed by where its callee sits inside the entity. A site is proven (to a repository declaration, to a named external symbol, or outside the repository with no symbol to name), a call through a value binding that proves no target, in a file no build compiles, a site where the language server timed out, crashed or broke protocol, or unresolved, with the reason. An entity with no call gets a ledger that counts none, so an entity without a ledger is one whose enrichment is still owed. A file is recorded as finished only once every entity in it has a ledger, and an edit that changes an entity drops its ledger and the file's record together. A proven site is carried by a call edge whose evidence names the proof context. When a file is proven again after every pass over it finished, a proof its ledgers no longer hold, including one made under another context or under none, leaves its edge, and an edge left with no site is removed; a file whose passes failed keeps its proofs. A file whose language server repeatedly returns non-transient errors on the same bytes under the same proof context is recorded on its third attempt with the sites the server failed at, so the sweep stops asking about it. Timeouts and crashed server sessions remain owed. The sweep retries an interrupted file once within the pass, restarting a dead server, and the idle daemon queues another pass when persisted retry backoff expires. Repeated crashes without completing a file stop that language for the pass; completed files preserve progress and renew its restart allowance. A store that holds call-site ledgers is written at authority snapshot format version 25 (26 when it carries a graph section), journal frame version 8 and graph delta version 7, which a Kin build that reads at most snapshot version 24, frame version 7 and delta version 6 refuses at the header. Every store is swept once more after upgrading to this build, because files an earlier sweep finished have no ledgers.
 
+On a repository whose language-server enrichment is off, as `kin init --no-enrich` leaves it,
+`kin daemon sweep` refuses and names `kin daemon sweep --enable`. That records enrichment on for
+the repository, stops the daemon serving it, which started with enrichment off, and sweeps in the
+next one. A daemon can also be switched off by something the setting does not reach, and its answer
+to the sweep request (or, when its checkout may not change its graph, its refusal of it) names
+which under `switched_off_by`: `enrichment_switch` for
+`KIN_DAEMON_DISABLE_LSP=1`, `filesystem_reconcile_switch` for
+`KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE=1`, `graph_only_store` for a store whose graph is its only
+write authority, and `repository_setting` for the repository's own setting. The refusal names that
+cause and its way out: unset the switch, stop the daemon and sweep again, or, for a graph-only store,
+nothing, because enrichment does not run there. `--enable` restarts a daemon only when the next one
+would enrich, so it never asks to be run again over a cause it cannot lift.
+
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--no-wait` |  | Return as soon as the sweep is queued, instead of waiting for it |
 | `--json` |  | Emit machine-readable JSON |
 | `--verbose` |  | Print the daemon's answer and a line per file, not one live line |
+| `--enable` |  | Turn language-server enrichment on for this repository, then sweep |
 
 ### `kin registry`
 
@@ -3534,7 +3893,7 @@ First-run setup, readiness, and keeping the install current.
 
 ### `kin capabilities`
 
-Show which Git-replacement commands are ready on repository-v6
+Show which Git commands Kin replaces, and how ready each one is
 
 ```
 kin capabilities [options]
@@ -3547,7 +3906,7 @@ kin capabilities [options]
 
 ### `kin setup`
 
-First-time setup and health checks for the Kin system
+Set up this machine: connect AI clients and add kin to your shell
 
 ```
 kin setup [<subcommand>] [options]
@@ -3555,19 +3914,22 @@ kin setup [<subcommand>] [options]
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--intent <intent>` |  | First-run intent: local, agent, editor, hosted, or advanced |
-| `--mode <mode>` |  | Repository mode: native or compatibility |
+| `--intent <intent>` |  | What to set up: `local` sets up kin in your shell and connects no AI client, `agent` also connects the AI clients installed here, `editor` and `hosted` are local setup plus a pointer to the editor extension or your KinLab sign-in, and `advanced` lets you choose each step |
 | `--shell <shell>` |  | Shell to configure: zsh, bash, or powershell |
-| `--auto-daemon` |  | Auto-start kin-daemon when entering workspaces |
-| `--no-interactive` |  | Run non-interactively using defaults or provided flags |
-| `--skip-mcp-check` |  | Skip the MCP round trip that proves each configured AI client can actually call Kin (for a scripted install with no repository yet) |
-| `--install-language-servers` |  | Install the missing language servers without asking: only for the languages the repository setup runs in uses, and for every language outside one. An install can write outside Kin's directory, and the run says so before it does, so an interactive run asks first and a scripted one needs this flag |
+| `--auto-daemon` |  | Start the Kin daemon on its own when you enter a Kin repository |
+| `--no-interactive` |  | Ask nothing: use the defaults and any flags given |
+| `--skip-mcp-check` |  | Skip the test call that proves each connected AI client can reach Kin (for a scripted install outside a repository) |
+| `--clients <id,...>` |  | Connect only these AI clients, by the ids `kin setup clients` lists, leaving every other client as it is. An empty list (`--clients ""`) runs the rest of setup and connects none |
+| `--shell-only` |  | Add kin to your shell and nothing else: only setup's shell step (the shell hook, and the line that puts Kin's bin directory on PATH). It asks nothing, connects no AI client, and leaves the daemon, the prompt hook and language servers as they are. Exits 1 when the profile cannot be written |
+| `--json` |  | With `--shell-only`: print the result as one JSON object, `kin.setup-shell.v1` |
+| `--install-language-servers` |  | Install missing language servers without asking: inside a repository, only the servers its languages need; outside one, the servers for the languages Kin supports. An install can write outside Kin's directory, and the run says so before it does, so an interactive run asks first and a scripted one needs this flag |
 | `--resource-profile <profile>` |  | Record this machine's resource profile without the advanced prompt: proof, interactive, throughput, or ci |
-| `--embedding-model <when>` | `later` | When the embedding model is fetched: `later`, or `never` on a machine that does not fetch it. Setup never downloads it either way |
+| `--embedding-model <when>` | `later` | When to download the search model: `later`, the first time `kin embed` or `kin init` needs it, or `never` on a machine that does not download it. Setup itself never downloads it |
 | `--embedding-provider <where>` | `local` | Where vectors are computed: `local`, or `remote` for an OpenAI-compatible endpoint. `remote` collects no credential |
-| `--skip-path` |  | Do not add `~/.kin/bin` to the shell profile. Only asked about for an npm or npx install, which cannot make the edit itself |
+| `--skip-path` |  | Leave your shell profile without the line that puts kin on PATH. Setup asks about this only for an npm or npx install, which cannot add the line itself |
 | `--tool-profile <profile>` |  | Tool profile to write into every AI client this run configures: agent-default, agent-query, agent-search, agent-routed or agent-routed-query. Without it each client gets its own default, and a profile set by hand is kept and pinned; with it the entry carries `KIN_MCP_TOOL_PROFILE_PINNED=1`, and later `kin setup` and `kin update` runs keep the profile |
-| `--check` |  | Skip the wizard and only run the first-run health check |
+| `--check` |  | Only run the health check, without the questions |
+| `--verbose` |  | Print every step and check in full, instead of the short summary |
 
 The wizard opens with a hardware check. It reports the architecture, the
 physical and logical core counts, the memory and the accelerator this machine
@@ -3589,8 +3951,18 @@ defaults to later and never downloads during setup, and where vectors are
 computed, which recommends local and states that a remote provider sends entity
 text to the endpoint you configure.
 
-A non-interactive run prints every decision it answered for you, the value it
-took, and the command or flag that changes it later.
+Setup prints a short summary by default, on a terminal and through a pipe, CI or an installer
+alike: what it asked or took as a default, what needs you, the AI clients it connected and the
+next step. `--verbose` prints the full record instead, and there a non-interactive run lists every
+decision it answered for you, the value it took, and the command or flag that changes it later.
+`--mode` is still accepted so older scripts keep running, and says it is ignored: Kin has one
+repository format.
+
+`kin setup --shell-only --json` reports the shell step as `kin.setup-shell.v1`: the `shell` it
+configured, `status` (`installed`, or `not_written` when the profile refused the write),
+`clients_connected` (always empty), `reason` (null unless not written), `add_by_hand` (each
+profile and the lines to add to it yourself when the write was refused) and `next`. What it writes
+is recorded in the install ledger, so `kin doctor` checks it and `kin setup uninstall` removes it.
 
 Run `kin setup` with no subcommand for the default behavior above, or one of:
 
@@ -3623,9 +3995,25 @@ kin setup doctor [options]
 | `--fix` |  | Apply safe automatic repairs (shell hook, MCP configs, config dirs) |
 | `--json` |  | Emit the machine-readable health report as JSON |
 
+#### `kin setup clients`
+
+List the AI clients Kin can connect, and which are installed and connected
+
+```
+kin setup clients [options]
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--json` |  | Emit the list as JSON (`kin.setup-clients.v1`) |
+
+Each row names a client, says whether it is installed here and whether Kin is connected to it, and
+ends with the id `kin setup --clients` takes. When a client is installed and not yet connected,
+the list ends with the command that connects it. It reads only and changes nothing.
+
 #### `kin setup ledger`
 
-Show the install ledger and verify it against disk
+Show what `kin setup` installed, and whether it is still in place
 
 ```
 kin setup ledger [options]
@@ -3637,7 +4025,7 @@ kin setup ledger [options]
 
 #### `kin setup uninstall`
 
-Remove exactly what `kin setup` recorded (ledger-verified)
+Remove what `kin setup` installed, exactly as it recorded it
 
 ```
 kin setup uninstall [options]
@@ -3722,9 +4110,9 @@ kin update [options]
 | `--channel <channel>` |  | Release channel: `stable` (default) or `alpha` (latest pre-release, unstable). A mutating update saves the choice; check-only never writes it. |
 | `--expect-version <semver>` |  | Require the selected release to have this exact SemVer. This selects a release; it does not authenticate archive bytes. Automation must provide the complete pinned expectation tuple. Conflicts with `--ack-restart`. |
 | `--expect-sha <40hex>` |  | Require the selected release tag to peel to this exact Kin commit. This selects the tag source; it does not authenticate archive bytes. Conflicts with `--ack-restart`. |
-| `--expect-archive-sha256 <64hex>` |  | Require the downloaded platform archive to match this exact SHA-256. Supply it only after external cryptographic attestation verification pins firelock-ai/kin, release.yml, the release tag, and source commit. Conflicts with `--ack-restart`. |
+| `--expect-archive-sha256 <64hex>` |  | Require the downloaded platform archive to match this exact SHA-256. Supply it only after external cryptographic attestation verification pins kinlab-ai/kin, release.yml, the release tag, and source commit. Conflicts with `--ack-restart`. |
 | `--check-only` |  | Check whether an update is available without downloading or installing it. |
-| `--json` |  | Emit the check-only result as JSON. |
+| `--json` |  | Emit the check-only result as one JSON object, `kin.update-check.v1`, every time. See below. |
 | `--ack-restart` |  | Verify the durable restart fence and exact installed binary identities for the release awaiting acknowledgement. Legacy markers may additionally require explicit replacement-session evidence. |
 | `--runtime-session <kind=pid>` |  | Legacy-marker live replacement proof: `daemon=PID`, `mcp=PID`, or `vfs=PID`. New stop-before-update markers reject these arguments and require no replacement session evidence. Repeatable. |
 | `--set-policy <policy>` |  | Set how an available update should reach this machine and exit. `auto` (the default) installs unattended through the gated executor: it waits for a moment with no managed Kin daemon or VFS server, defers at most a bounded window, and runs the full stop-install-acknowledge chain. An open agent session does not hold it back. `prompt` notifies with the remedy attached and waits to be told. `manual` never notifies; checks still run. |
@@ -3732,6 +4120,23 @@ kin update [options]
 | `--dry-run` |  | With --apply: print the ordered steps and change nothing. |
 | `--unattended` |  | Run the unattended executor (what the update watchdog invokes on a stale install with policy auto): evaluate the machine-activity gates, and on proceed stop the managed daemon and VFS server cooperatively and run the full --apply chain. Agent MCP servers keep running; each picks up the new binary when its agent next starts it. Blocked runs persist a deferral clock instead of installing. The final stdout line is one JSON record (also appended to ~/.kin/update-ledger.jsonl) carrying the decision, reason, blocked_seconds, window_seconds, and how many releases the deferral has blocked across. |
 | `--force-window` |  | With --unattended: apply despite the activity gates. For the watchdog once a deferred record shows blocked_seconds >= window_seconds, which starts at 24h and shortens as the installation falls further behind, to a floor of 6h. Never overrides a recorded prompt or manual policy, only the executor's own activity gates. |
+
+`kin update --check-only --json` prints one JSON object whatever happens. Every report carries
+`current_version`, `latest_version` (null when unknown), `update_available`, `install_method`
+(`kin_installer`, `homebrew`, `npm`, `cargo` or `unknown`) and `reason`. A completed check has a
+null `reason`, adds the release, channel, policy and pending-marker fields, and exits 0. A check
+that cannot finish exits 1 and names why in `reason`, with a plain-English `message`:
+
+| `reason` | Meaning |
+| --- | --- |
+| `install_root_missing` | Kin's installer has not set up this machine, so there is nothing for `kin update` to update. |
+| `unsupported_install_method` | Homebrew, Cargo or something else put this `kin` here, so `kin update` cannot replace it. |
+| `update_interrupted` | An earlier update stopped partway. Run `kin update` to recover it. |
+| `network_unavailable` | Kin could not reach its release server. |
+| `release_lookup_failed` | The release server answered with something other than a usable release. |
+| `check_failed` | Anything else. `message` carries Kin's own words. |
+
+Without `--json`, the output is unchanged.
 
 ### `kin upgrade`
 

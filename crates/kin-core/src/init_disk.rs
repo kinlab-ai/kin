@@ -55,7 +55,7 @@ const VERBATIM_COPIES: u64 = 2;
 
 /// The smallest store-to-Git-object-store ratio measured on a real repository
 /// on a current release: expressjs/express under kin 0.7.21, whose own closing
-/// line read "513.7 MiB under .kin/, 48.5x the 10.6 MiB Git object store".
+/// line read "513.7 MiB in the store, 48.5x the 10.6 MiB Git object store".
 ///
 /// In tenths, because the measurement has one decimal and rounding it to a
 /// whole number would state a range the measurements do not.

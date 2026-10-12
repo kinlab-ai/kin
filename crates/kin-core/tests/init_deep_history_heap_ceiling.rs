@@ -89,8 +89,11 @@ const SUMMARY_PHASE: &str = "kin.init.commit.enrichment_summary";
 const PEAK_HEAP_CEILING: usize = 900 * 1024 * 1024;
 
 fn git(repo: &Path, args: &[&str]) {
+    // Fixture commits must finish without detached maintenance still mutating
+    // the object database when admission checks the repository's lock state.
     let status = Command::new("git")
         .current_dir(repo)
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")

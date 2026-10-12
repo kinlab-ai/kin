@@ -37,7 +37,7 @@ use kin_model::{
 use crate::local_repository_authority::ActiveLocalRepositoryAuthority;
 use crate::repository_merge::{
     classify_merge_error, local_workspace, merge_bad_request, merge_bind_refusal, merge_conflict,
-    publish_resolved_merge, render_artifact, render_conflict_lines, render_entry, render_subject,
+    publish_resolved_merge, render_artifact, render_candidate, render_conflict_lines, render_entry,
     render_subject_identity, repository_finalization_error, restore_point, MergeExecution,
 };
 use crate::state::DaemonState;
@@ -1707,6 +1707,7 @@ fn record_transaction(
         merge_transaction_delta: Some(delta),
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     }
 }
 
@@ -1771,16 +1772,22 @@ fn select_subject(record: &MergeTransactionRecord, selector: &str) -> Result<Mer
              conflicts`"
         ))),
         [entry] => Ok(entry.subject.clone()),
-        several => Err(merge_bad_request(format!(
-            "{needle} matches {} recorded merge conflicts; name one exactly: {}",
-            several.len(),
-            several
-                .iter()
-                .map(|entry| render_subject(entry))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
+        several => Err(merge_bad_request(ambiguous_selector(needle, several))),
     }
+}
+
+/// The refusal for a selector that matched several conflicts, naming each
+/// candidate so a reader can tell them apart and pass one back.
+fn ambiguous_selector(needle: &str, several: &[&kin_model::MergeConflictEntry]) -> String {
+    format!(
+        "{needle} matches {} recorded merge conflicts; name one exactly: {}",
+        several.len(),
+        several
+            .iter()
+            .map(|entry| render_candidate(entry))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Identity first, then the label a listing showed. A caller may name what they
@@ -1884,6 +1891,72 @@ pub(crate) fn describe_unresolved(record: &MergeTransactionRecord) -> String {
         .map(render_entry)
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod ambiguous_selector_tests {
+    use super::*;
+    use kin_model::{EntityId, MergeConflictEntry, MergeDivergence, MergeSideValue};
+
+    fn entity_entry(entity: EntityId, label: &str) -> MergeConflictEntry {
+        MergeConflictEntry {
+            subject: MergeConflictSubject::Entity { entity },
+            divergence: MergeDivergence::ChangedBothSides,
+            base: MergeSideValue::Absent,
+            ours: MergeSideValue::Absent,
+            theirs: MergeSideValue::Absent,
+            label: Some(label.to_string()),
+            resolution: MergeEntryResolution::Unresolved,
+        }
+    }
+
+    /// Two functions that share a name in two modules match one bare name.
+    /// The refusal names each by the unit that holds it, as an entity, beside
+    /// the identity a caller passes back, so the two read differently. It
+    /// never names where either unit is projected.
+    #[test]
+    fn an_ambiguous_name_names_each_candidate_by_the_unit_that_holds_it() {
+        let (one, two) = (EntityId::new(), EntityId::new());
+        let entries = [
+            entity_entry(one, "summarize in pkg/one.py"),
+            entity_entry(two, "summarize in pkg/two.py"),
+        ];
+        let several: Vec<&MergeConflictEntry> = entries.iter().collect();
+
+        let refusal = ambiguous_selector("summarize", &several);
+
+        assert!(
+            refusal.starts_with("summarize matches 2 recorded merge conflicts; name one exactly: "),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("entity `summarize` in source `one.py` ({one})")),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("entity `summarize` in source `two.py` ({two})")),
+            "{refusal}"
+        );
+        for place in ["pkg/", "path", "file"] {
+            assert!(!refusal.contains(place), "{place} in {refusal}");
+        }
+    }
+
+    /// An entity with no span has a label that is its bare name, and a
+    /// candidate of that shape is still named by its name and identity.
+    #[test]
+    fn a_candidate_with_no_unit_is_named_by_its_name_and_identity() {
+        let entity = EntityId::new();
+        let entries = [entity_entry(entity, "summarize")];
+        let several: Vec<&MergeConflictEntry> = entries.iter().collect();
+
+        let refusal = ambiguous_selector("summarize", &several);
+
+        assert!(
+            refusal.ends_with(&format!("entity `summarize` ({entity})")),
+            "{refusal}"
+        );
+    }
 }
 
 #[cfg(test)]

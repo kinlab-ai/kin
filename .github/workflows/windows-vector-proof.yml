@@ -111,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target x86_64-pc-windows-msvc \
-            -p kin-cli -p kin-daemon
+            -p kin-cli -p kin-daemon --features kin-cli/embeddings,kin-daemon/embeddings
           sccache --show-stats
 
       - name: Prove the built binary carries vectors

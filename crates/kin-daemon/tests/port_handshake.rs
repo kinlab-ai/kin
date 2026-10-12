@@ -4,7 +4,7 @@
 //! End-to-end proof of the daemon-owned port handshake.
 //!
 //! The daemon binds an OS-assigned ephemeral port (`--port 0`) and publishes the
-//! *actual* bound port to `.kin/daemon.port`. The CLI reads the port from that
+//! *actual* bound port to the admitted store's `daemon.port`. The CLI reads that
 //! file instead of reserving a port and releasing it before the daemon re-binds
 //! — the reserve-release-rebind window a sibling process could steal, killing
 //! the daemon during startup under parallel load.
@@ -113,23 +113,18 @@ async fn direct_containment_hard_parent_worker() {
     }
 }
 
-fn spawn_daemon_ephemeral(repo_root: &Path) -> DaemonChild {
+fn spawn_daemon_ephemeral(repository: &common::NativeDaemonRepository) -> DaemonChild {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kin-daemon"));
     isolate_daemon_test_command(&mut command);
+    repository.bind(&mut command);
     command
         .arg("--repo")
-        .arg(repo_root)
+        .arg(repository.layout.working_dir())
         // The feature under test: the daemon, not the launcher, picks the port.
         .arg("--port")
         .arg("0")
         // Keep the test hermetic and light: no LSP discovery on the host.
         .env("KIN_DAEMON_DISABLE_LSP", "1")
-        // Startup pins sibling repository authority from the registry. Keep
-        // that read inside this scratch repository rather than ~/.kin.
-        .env(
-            "KIN_REGISTRY_PATH",
-            repo_root.join(".kin/test-runtime/registry.toml"),
-        )
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     spawn_daemon_test_command(command, "ephemeral-port daemon")
@@ -159,17 +154,17 @@ fn assert_child_alive(child: &mut DaemonChild, what: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn daemon_binds_ephemeral_port_and_publishes_it() {
     let repo = tempfile::TempDir::new().expect("tempdir");
-    kin_core::init(repo.path()).expect("init scratch repo");
-    let kin_root = repo.path().join(".kin");
+    let repository = common::initialize_native_repository(repo.path()).await;
+    let kin_root = repository.layout.root();
 
-    let mut child = spawn_daemon_ephemeral(repo.path());
+    let mut child = spawn_daemon_ephemeral(&repository);
     let deadline = Instant::now() + READINESS_TIMEOUT;
 
     // Handshake half 1: the daemon must publish a real, non-zero bound port —
     // never the sentinel 0 we passed on the command line.
     let port = loop {
         assert_child_alive(&mut child, "bound");
-        if let Some(port) = read_port_file(&kin_root) {
+        if let Some(port) = read_port_file(kin_root) {
             assert_ne!(port, 0, "daemon must publish its real bound port, not 0");
             break port;
         }
@@ -251,11 +246,11 @@ async fn dropping_a_direct_daemon_child_terminates_its_containment() {
     #[cfg(not(windows))]
     {
         let repo = tempfile::TempDir::new().expect("tempdir");
-        kin_core::init(repo.path()).expect("init scratch repo");
-        let mut child = spawn_daemon_ephemeral(repo.path());
+        let repository = common::initialize_native_repository(repo.path()).await;
+        let mut child = spawn_daemon_ephemeral(&repository);
         let pid = child.id().expect("spawned daemon pid");
         let deadline = Instant::now() + READINESS_TIMEOUT;
-        while read_port_file(&repo.path().join(".kin")).is_none() {
+        while read_port_file(repository.layout.root()).is_none() {
             assert_child_alive(&mut child, "bound");
             assert!(
                 Instant::now() < deadline,

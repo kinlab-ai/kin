@@ -96,6 +96,7 @@ fn unavailable_inventory_survives_transaction_pages_without_claiming_file_covera
             &value["enrichment"],
             true,
             crate::handlers::entities::GraphStatusScope::Head,
+            true,
         )
         .unwrap();
         validate_collections(
@@ -156,6 +157,7 @@ fn unavailable_inventory_discloses_requested_dependencies_without_inventing_miss
                 &value["enrichment"],
                 current,
                 crate::handlers::entities::GraphStatusScope::Head,
+                false,
             )
             .unwrap();
             request.cursor = Some("cannot-resume-an-unavailable-inventory".into());
@@ -184,6 +186,7 @@ fn unavailable_inventory_rejects_malformed_limits_or_inventory_completion_claims
                 &invalid,
                 true,
                 crate::handlers::entities::GraphStatusScope::Head,
+                false,
             )
             .is_err(),
             "accepted malformed observation: {invalid}"
@@ -199,6 +202,7 @@ fn unavailable_inventory_rejects_malformed_limits_or_inventory_completion_claims
             &invalid,
             true,
             crate::handlers::entities::GraphStatusScope::Head,
+            false,
         )
         .is_err());
     }
@@ -211,6 +215,7 @@ fn available_inventory_keeps_its_existing_page_contract() {
         &full["enrichment"],
         true,
         crate::handlers::entities::GraphStatusScope::Head,
+        false,
     )
     .unwrap();
     let result = page(
@@ -227,6 +232,7 @@ fn available_inventory_keeps_its_existing_page_contract() {
         &value["enrichment"],
         true,
         crate::handlers::entities::GraphStatusScope::Head,
+        false,
     )
     .unwrap();
     let request = StatusRequest {

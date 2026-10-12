@@ -153,29 +153,49 @@ fn swift_chained_call_emits_both_simple_names() {
     );
 }
 
+/// `self.m()` names a member of the enclosing type, so it is emitted
+/// owner-qualified, the shape the Python adapter gives `self.m()` and the
+/// linker's inheritance-aware tier reads, never with the `self.` text.
 #[test]
-fn swift_self_call_strips_self_prefix() {
+fn swift_self_call_is_owner_qualified() {
     let calls = swift_calls(SWIFT_FIXTURE);
     assert!(
         calls
             .iter()
-            .any(|c| c.src_name == "Service.selfCall" && c.dst_name == "helper"),
-        "expected Service.selfCall -> helper (no `self.` prefix), got {:?}",
+            .any(|c| c.src_name == "Service.selfCall" && c.dst_name == "Service.helper"),
+        "expected Service.selfCall -> Service.helper, got {:?}",
         calls
     );
 }
 
+/// A call through a declared receiver carries its receiver and the bare
+/// method for the linker's value-origin tier.
 #[test]
-fn swift_call_dst_names_never_contain_dots() {
+fn swift_typed_receiver_call_carries_its_receiver() {
+    let calls = swift_calls(SWIFT_FIXTURE);
+    assert!(
+        calls.iter().any(|c| c.src_name == "Service.memberCall"
+            && c.dst_name == "run"
+            && c.receiver.as_deref() == Some("obj")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn swift_call_dst_names_are_simple_or_owner_qualified() {
     let calls = swift_calls(SWIFT_FIXTURE);
     let dotted: Vec<&str> = calls
         .iter()
         .map(|c| c.dst_name.as_str())
-        .filter(|n| n.contains('.'))
+        .filter(|n| n.contains('.') && !n.starts_with("Service."))
         .collect();
     assert!(
         dotted.is_empty(),
-        "Calls dst_names must be simple identifiers, but got dotted: {:?}",
+        "Calls dst_names must be simple identifiers or a `self` call's owner-qualified name, but got: {:?}",
         dotted
+    );
+    assert!(
+        calls.iter().all(|c| !c.dst_name.contains("self")),
+        "{calls:?}"
     );
 }

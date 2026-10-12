@@ -9,7 +9,13 @@ pub enum ContextError {
     #[error("entity not found: {0}")]
     EntityNotFound(String),
 
-    #[error("token budget exceeded: {actual} > {budget}")]
+    /// Raised only once the pack is down to one focal named by its kind, with
+    /// nothing around it, and still measures over its budget. `actual` is
+    /// what that smallest pack measures, which is a budget that builds it.
+    #[error(
+        "the smallest context pack for this request measures {actual} tokens, more than the \
+         {budget}-token budget; ask for a budget of at least {actual} tokens"
+    )]
     BudgetExceeded { actual: usize, budget: usize },
 
     #[error("graph error: {0}")]

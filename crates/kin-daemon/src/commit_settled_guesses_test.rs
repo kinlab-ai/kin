@@ -31,7 +31,9 @@ fn calls_from(
 
 /// Whether `graph` holds relation `id`, which `caller` sources.
 fn holds_call(graph: &kin_db::InMemoryGraph, caller: &Entity, id: &kin_model::RelationId) -> bool {
-    calls_from(graph, caller).iter().any(|(_, _, held)| held == id)
+    calls_from(graph, caller)
+        .iter()
+        .any(|(_, _, held)| held == id)
 }
 
 /// The workspace graph repository authority holds now.
@@ -194,3 +196,136 @@ fn a_commit_to_one_file_keeps_the_guesses_proof_retired_in_another() {
     );
 }
 
+/// A sweep takes the guesses it contradicted out of the live graph first and
+/// tells repository authority at its next publication. Between the two,
+/// authority holds a relation the live graph does not, and that is a
+/// retirement waiting to be published, not authority the daemon lost: a
+/// commit made then lands. It used to be refused as "relation ... is missing"
+/// with an instruction to send it again, for as long as the publication had
+/// not happened, and for good once a publication failed.
+#[test]
+fn a_commit_lands_while_a_retired_guess_awaits_its_publication() {
+    let (_dir, state) = test_state();
+    let (run, guess, b_remove) = guessed_call_fixture(&state);
+    state.graph.remove_relation(&guess.id).unwrap();
+    state.lsp_settled_guesses.lock().unwrap().insert(guess.id);
+    assert!(
+        holds_call(&authority_workspace_graph(&state), &run, &guess.id),
+        "nothing was published, so authority still holds the guess"
+    );
+
+    let sessions = test_sessions();
+    let (_, arguments) = stage_entity_edit(
+        &state,
+        &sessions,
+        &b_remove,
+        "remove(): number {\n        return y() + 1;\n    }",
+    );
+    let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+
+    // The commit lands the live graph on what it committed, so the two agree
+    // about the guess afterwards, whichever way the commit left it.
+    assert_eq!(
+        holds_call(state.graph.as_ref(), &run, &guess.id),
+        holds_call(&authority_workspace_graph(&state), &run, &guess.id),
+        "live {:?}",
+        calls_from(state.graph.as_ref(), &run)
+    );
+}
+
+/// A relation the live graph lacks and no sweep recorded as retired is lost,
+/// and no commit can land over it. The refusal does not ask for the commit
+/// again, because the same commit meets the same refusal for as long as this
+/// daemon runs. It says what ends it, and names a failing publication when
+/// there is one.
+#[test]
+fn a_commit_over_a_relation_the_daemon_lost_is_refused_without_asking_for_it_again() {
+    let (_dir, state) = test_state();
+    let (_run, guess, b_remove) = guessed_call_fixture(&state);
+    state.graph.remove_relation(&guess.id).unwrap();
+
+    let sessions = test_sessions();
+    let (transaction_id, arguments) = stage_entity_edit(
+        &state,
+        &sessions,
+        &b_remove,
+        "remove(): number {\n        return y() + 1;\n    }",
+    );
+    let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+    assert_eq!(result.is_error, Some(true));
+    let message = result_text(&result);
+    assert!(
+        message.contains(&format!("relation {} is missing", guess.id)),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "No repository authority moved and the staged operations are untouched. Sending \
+             this commit again will not help: the running daemon does not get back what its \
+             graph lost. Stop the daemon with `kin daemon stop`; the next call starts one that \
+             reads the repository again, and the commit can be sent then."
+        ),
+        "{message}"
+    );
+    assert!(
+        !message.contains("re-send this commit unchanged"),
+        "{message}"
+    );
+    assert_eq!(
+        sessions.get_transaction(&transaction_id).unwrap().state,
+        "active"
+    );
+
+    // With a publication failing, the refusal names why.
+    *state.lsp_publication_failure.lock().unwrap() =
+        Some("binding withdrawal planning: prior obligation identity collides".to_string());
+    let result = commit_exact_transaction(&state, &sessions, &arguments, None);
+    assert_eq!(result.is_error, Some(true));
+    let message = result_text(&result);
+    assert!(
+        message.contains(
+            "Its background work also could not publish what it derived (binding withdrawal \
+             planning: prior obligation identity collides), which a new daemon will meet again \
+             until that is repaired."
+        ),
+        "{message}"
+    );
+}
+
+/// The daemon remembers why its last enrichment publication failed, and
+/// forgets it when one succeeds.
+#[test]
+fn a_failed_enrichment_publication_is_remembered_until_one_succeeds() {
+    let (_dir, state) = test_state();
+    let (run, guess, b_remove) = guessed_call_fixture(&state);
+    assert!(state.lsp_publication_failure.lock().unwrap().is_none());
+
+    // A validation that could not be recorded holds every publication back.
+    state
+        .lsp_unrecorded_validations
+        .lock()
+        .unwrap()
+        .insert(kin_model::LanguageId::TypeScript);
+    state.graph.remove_relation(&guess.id).unwrap();
+    state.lsp_settled_guesses.lock().unwrap().insert(guess.id);
+    state.mark_dirty();
+    let error = state
+        .save_snapshot()
+        .expect_err("the publication is held back")
+        .to_string();
+    assert_eq!(
+        state.lsp_publication_failure.lock().unwrap().as_deref(),
+        Some(error.as_str())
+    );
+
+    state.lsp_unrecorded_validations.lock().unwrap().clear();
+    state.mark_dirty();
+    state.save_snapshot().unwrap();
+    assert!(state.lsp_publication_failure.lock().unwrap().is_none());
+    assert!(
+        !holds_call(&authority_workspace_graph(&state), &run, &guess.id),
+        "the publication that succeeded carried the retirement"
+    );
+    let _ = b_remove;
+}

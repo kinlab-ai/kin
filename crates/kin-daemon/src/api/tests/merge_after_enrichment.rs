@@ -253,6 +253,51 @@ async fn a_merge_after_post_commit_enrichment_publishes_and_records_no_content_f
     enrich_caller_to_callee(&state);
 }
 
+/// Work in a member Kin does not parse refuses a merge too, and the refusal
+/// names it as the unparsed entity it is, by its kind and its own name, never
+/// by where it is projected and never in the vocabulary of files and paths.
+#[tokio::test]
+#[serial_test::serial(repository_commit)]
+async fn a_merge_refusal_names_an_unparsed_member_by_kind_and_name() {
+    let (state, _layout, repository, _main_change, _feature_change) =
+        universal_branch_test_state("merge-refuses-unparsed-work");
+    std::fs::write(
+        repository.join("selected/compose.yaml"),
+        b"services:\n  api:\n    image: unparsed-edit\n",
+    )
+    .unwrap();
+    admit_through_api(&router(Arc::clone(&state))).await;
+    let pending = workspace_of(&state);
+    assert!(
+        pending.holds_uncommitted_work(),
+        "the edit must be admitted"
+    );
+
+    let (status, body) = merge_through_api(&state, b"feature").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["refused_before_write"], true, "{body}");
+    let message = body["message"]
+        .as_str()
+        .map_or_else(|| body.to_string(), str::to_string);
+    assert!(
+        message.contains("holds 1 changed entity (Compose configuration `compose.yaml`)"),
+        "{message}"
+    );
+    assert!(message.contains("commit it with `kin commit`"), "{message}");
+    assert!(!message.contains("selected/"), "{message}");
+    assert!(
+        !message.contains(repository.to_string_lossy().as_ref()),
+        "{message}"
+    );
+    assert!(!message.contains("file"), "{message}");
+    assert!(!message.contains("path"), "{message}");
+    assert_eq!(
+        workspace_of(&state),
+        pending,
+        "a refused merge moves no authority"
+    );
+}
+
 /// The control. Work nobody has committed still refuses, and the refusal names
 /// committing, the one remedy that carries the work through the merge.
 #[tokio::test]
@@ -274,14 +319,20 @@ async fn a_merge_still_refuses_uncommitted_work_beside_the_enrichment() {
     let (status, body) = merge_through_api(&state, b"feature").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["refused_before_write"], true, "{body}");
-    let message = body.to_string();
-    assert!(
-        message.contains("a working tree that has moved off its base change"),
-        "{message}"
-    );
-    // The guidance names what the workspace holds: "it" for a moved tree
-    // alone, "them" once the edit's parse is also a pending semantic overlay,
-    // as it is when the edit's parse publishes with its bytes.
+    let message = body["message"]
+        .as_str()
+        .map_or_else(|| body.to_string(), str::to_string);
+    // The refusal names the work by entity: the function the edit changed,
+    // never the place it is projected at, and never in the vocabulary of
+    // files and paths.
+    assert!(message.contains("changed entit"), "{message}");
+    assert!(message.contains("function `caller`"), "{message}");
+    assert!(!message.contains("enriched.py"), "{message}");
+    assert!(!message.contains("file"), "{message}");
+    assert!(!message.contains("path"), "{message}");
+    assert!(!message.contains("working tree"), "{message}");
+    // The guidance names what the workspace holds: "it" for one changed
+    // entity, "them" for more.
     assert!(
         message.contains("commit it with `kin commit`")
             || message.contains("commit them with `kin commit`"),

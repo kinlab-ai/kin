@@ -61,14 +61,14 @@ const STOCK_MACOS_SOFT_LIMIT: &str = "256";
 /// writes its refusal to stderr and returns non-zero without stopping a `;`
 /// chain, so a separator here would run the admission at the machine's own
 /// limit and pass for the wrong reason.
-const LIMITED_SOFT: &str = "ulimit -Sn 256 && exec \"$0\" init --no-enrich \"$1\"";
+const LIMITED_SOFT: &str = "ulimit -Sn 256 && exec \"$0\" init --defer-enrich \"$1\"";
 
 /// The same, with the hard limit pinned so the raise cannot succeed.
 ///
 /// Order matters. `ulimit -Hn` below the current soft limit is refused by the
 /// kernel, so the soft limit has to come down first.
 const LIMITED_SOFT_AND_HARD: &str =
-    "ulimit -Sn 256 && ulimit -Hn 256 && exec \"$0\" init --no-enrich \"$1\"";
+    "ulimit -Sn 256 && ulimit -Hn 256 && exec \"$0\" init --defer-enrich \"$1\"";
 
 fn run_git(path: &Path, args: &[&str]) {
     let output = common::Command::new("git")

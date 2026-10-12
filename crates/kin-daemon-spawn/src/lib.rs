@@ -563,7 +563,7 @@ pub fn process_footprint_bytes(pid: u32) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return macos_phys_footprint(pid);
+        macos_phys_footprint(pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -934,6 +934,15 @@ pub enum EnrichmentState {
     AlreadyDisabled,
     /// No language server exists on this host, so the switch changes nothing.
     Unavailable,
+    /// The repository's own setting switches enrichment off, so every daemon
+    /// that serves it starts without a sweep and the switch changes nothing.
+    ///
+    /// Kept apart from [`EnrichmentState::AlreadyDisabled`] because the
+    /// setting belongs to the store rather than to whichever process started a
+    /// daemon: a daemon reads it when it starts, so there is no running daemon
+    /// left to restart into it, and advice to set the environment switch would
+    /// describe a lever this repository has already pulled for every caller.
+    OffForRepository,
 }
 
 /// Whether a value read from [`DISABLE_ENRICHMENT_ENV`] turns enrichment off.
@@ -950,6 +959,111 @@ pub fn enrichment_disabled_by(value: Option<&str>) -> bool {
 /// [`enrichment_disabled_by`] against this process's own environment.
 pub fn enrichment_disabled() -> bool {
     enrichment_disabled_by(std::env::var(DISABLE_ENRICHMENT_ENV).ok().as_deref())
+}
+
+/// The environment switch that keeps a daemon's checkout from changing its
+/// graph. A daemon started with it treats the graph as its only write
+/// authority, so no language server adds relations either.
+pub const DISABLE_FILESYSTEM_RECONCILE_ENV: &str = "KIN_DAEMON_DISABLE_FILESYSTEM_RECONCILE";
+
+/// Whether a value read from [`DISABLE_FILESYSTEM_RECONCILE_ENV`] turns
+/// filesystem reconcile off.
+///
+/// The one rule for it: `kin-daemon` reads the switch through this, and so
+/// does every sentence that has to say whether a daemon this process starts
+/// would carry it.
+pub fn filesystem_reconcile_disabled_by(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// [`filesystem_reconcile_disabled_by`] against this process's own environment.
+pub fn filesystem_reconcile_disabled() -> bool {
+    filesystem_reconcile_disabled_by(
+        std::env::var(DISABLE_FILESYSTEM_RECONCILE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Why a daemon started with language-server enrichment switched off.
+///
+/// A daemon decides this once, when it starts, and names the cause in its
+/// answer to a sweep request under `enrichment_unavailable.switched_off_by`.
+/// The causes are kept apart because their ways out differ: a repository's
+/// own setting is turned on with `kin daemon sweep --enable`, an environment
+/// switch is lifted by starting the daemon without it, and a graph-only store
+/// never enriches. A caller that cannot tell them apart offers the one way out
+/// to every case, and for the other two that advice repeats forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentSwitchedOffBy {
+    /// The store's graph is its only write authority, so nothing read from a
+    /// checkout may change it, language-server edges included. True of every
+    /// daemon that serves the store.
+    GraphOnlyStore,
+    /// [`DISABLE_ENRICHMENT_ENV`] in the environment the daemon started with.
+    EnrichmentSwitch,
+    /// [`DISABLE_FILESYSTEM_RECONCILE_ENV`] in the environment the daemon
+    /// started with.
+    FilesystemReconcileSwitch,
+    /// The repository's own `lsp.enabled = false`, as it read when the daemon
+    /// started.
+    RepositorySetting,
+}
+
+impl EnrichmentSwitchedOffBy {
+    /// Every cause, for tests that walk them.
+    pub const ALL: [Self; 4] = [
+        Self::GraphOnlyStore,
+        Self::EnrichmentSwitch,
+        Self::FilesystemReconcileSwitch,
+        Self::RepositorySetting,
+    ];
+
+    /// The cause as a daemon's answer spells it.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::GraphOnlyStore => "graph_only_store",
+            Self::EnrichmentSwitch => "enrichment_switch",
+            Self::FilesystemReconcileSwitch => "filesystem_reconcile_switch",
+            Self::RepositorySetting => "repository_setting",
+        }
+    }
+
+    /// The cause a daemon's answer names, or `None` for a spelling this build
+    /// does not know, such as one from a newer daemon.
+    pub fn from_wire(wire: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.wire() == wire)
+    }
+
+    /// The first cause that holds for a daemon start, or `None` when it
+    /// enriches.
+    ///
+    /// A graph-only store comes first because nothing lifts it, then the two
+    /// environment switches, then the repository's own setting, so the cause a
+    /// reader is told is one that still holds after they lift it.
+    pub fn decide(
+        enrichment_switch: bool,
+        repository_enabled: bool,
+        filesystem_reconcile_disabled: bool,
+        graph_only_store: bool,
+    ) -> Option<Self> {
+        if graph_only_store {
+            Some(Self::GraphOnlyStore)
+        } else if enrichment_switch {
+            Some(Self::EnrichmentSwitch)
+        } else if filesystem_reconcile_disabled {
+            Some(Self::FilesystemReconcileSwitch)
+        } else if !repository_enabled {
+            Some(Self::RepositorySetting)
+        } else {
+            None
+        }
+    }
 }
 
 /// The enrichment half of a memory remediation, in the tense this process's own
@@ -982,17 +1096,17 @@ pub fn enrichment_remedy_clause_for(disabled: bool) -> String {
 
 /// The clause for a known enrichment state.
 ///
-/// `Unavailable` returns `None` rather than a sentence, because the honest
-/// answer there is that this remedy does not exist, and a caller that received
-/// a string would print it beside the memory remedy as though the reader had
-/// two options.
+/// `Unavailable` and `OffForRepository` return `None` rather than a sentence,
+/// because the honest answer there is that this remedy does not exist: no
+/// sweep runs to turn off. A caller that received a string would print it
+/// beside the memory remedy as though the reader had two options.
 ///
 /// Delegates to [`enrichment_remedy_clause_for`] for the two states that have a
 /// lever, rather than the other way round, so that function keeps returning a
 /// `String` for the callers it already has and nothing here needs an unwrap.
 pub fn enrichment_remedy_clause_in(state: EnrichmentState) -> Option<String> {
     match state {
-        EnrichmentState::Unavailable => None,
+        EnrichmentState::Unavailable | EnrichmentState::OffForRepository => None,
         EnrichmentState::AlreadyDisabled => Some(enrichment_remedy_clause_for(true)),
         EnrichmentState::Available => Some(enrichment_remedy_clause_for(false)),
     }
@@ -2226,6 +2340,9 @@ fn open_windows_regular_nofollow(path: &Path) -> std::io::Result<File> {
     }
     Ok(file)
 }
+
+#[cfg(unix)]
+pub mod test_runtime;
 
 #[cfg(unix)]
 const TEST_RUNTIME_OWNER_ENV: &str = "KIN_TEST_RUNTIME_OWNER_TOKEN";
@@ -3743,6 +3860,7 @@ fn transfer_owned_process_group_children_to_reaper(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn reap_failed_process_group_watcher(
     mut watcher: std::process::Child,
     mut sentinel: std::process::Child,
@@ -4620,8 +4738,15 @@ fn contextual_guardian_io(
 pub struct DaemonSpawnPlan {
     /// The `kin-daemon` executable to run.
     pub daemon_bin: PathBuf,
-    /// The repository working directory (the parent of `.kin`).
+    /// The repository working directory the daemon serves. It is also the
+    /// daemon's routing identity, so it is always the working tree, even when
+    /// the store is kept outside it.
     pub working_dir: PathBuf,
+    /// The store directory, passed as `--store` when the store is kept outside
+    /// the working tree. The daemon and the supervisor then read it from the
+    /// daemon's own arguments rather than depending on a lookup in whatever
+    /// environment they run in. `None` for an in-tree `.kin`.
+    pub store_root: Option<PathBuf>,
     /// Idle timeout to inject, or `None` to leave the daemon's default alone.
     ///
     /// An explicit `KIN_DAEMON_IDLE_TIMEOUT_SECS` in the caller's environment
@@ -4650,6 +4775,9 @@ impl DaemonSpawnPlan {
             "--port",
             DAEMON_PORT_ARGUMENT,
         ]);
+        if let Some(store_root) = &self.store_root {
+            cmd.arg("--store").arg(store_root);
+        }
         if let Some(timeout) = &self.idle_timeout_secs {
             cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
         }
@@ -4657,6 +4785,11 @@ impl DaemonSpawnPlan {
             cmd.env("KIN_SUPERVISOR_URL", supervisor_url);
         }
         carry_operator_auto_embed(&mut cmd, std::env::var_os(DAEMON_AUTO_EMBED_ENV));
+        carry_test_flush(
+            &mut cmd,
+            cfg!(debug_assertions),
+            std::env::var_os(kin_blobs::durable::TEST_FLUSH_ENV),
+        );
         detach_from_caller(&mut cmd);
         cmd
     }
@@ -4678,6 +4811,23 @@ impl DaemonSpawnPlan {
 fn carry_operator_auto_embed(cmd: &mut Command, value: Option<std::ffi::OsString>) {
     if let Some(value) = value {
         cmd.env(DAEMON_AUTO_EMBED_ENV, value);
+    }
+}
+
+/// Pin the test flush switch onto a daemon that a debug build spawns.
+///
+/// A debug build of Kin reads `KIN_TEST_FLUSH` (see the `durable` module of kin-blobs) so
+/// a test suite can replace Apple's full drive flush with a plain fsync. The
+/// daemon would inherit the variable anyway, because the authority scrub
+/// leaves it alone; pinning it states the carriage at the boundary, for the
+/// same reason as the background-embedding opt-out above. A release build pins
+/// nothing, and a release daemon ignores the variable.
+fn carry_test_flush(cmd: &mut Command, debug_build: bool, value: Option<std::ffi::OsString>) {
+    if !debug_build {
+        return;
+    }
+    if let Some(value) = value {
+        cmd.env(kin_blobs::durable::TEST_FLUSH_ENV, value);
     }
 }
 
@@ -5486,6 +5636,22 @@ pub fn clear_orphaned_port_record(kin_root: &Path) -> bool {
 /// Rather than let the MCP path go on skipping registration — leaving revived
 /// daemons invisible to the supervisor's routing table — `kin-cli` installs its
 /// implementation here and both spawn paths reach it through this seam.
+/// A bounded, read-only route probe. Only `Serving` authorizes delegation.
+/// Failure to resolve a route is not proof that a daemon is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningDaemonRouteReading {
+    Serving(String),
+    NotReady {
+        detail: String,
+        warming: bool,
+    },
+    Unresolved {
+        detail: String,
+    },
+    /// No ready route was found. This does not establish daemon absence.
+    Absent,
+}
+
 pub trait DaemonSpawnRegistrar: Send + Sync {
     /// The supervisor endpoint a daemon about to be spawned should be told
     /// about, starting the supervisor if it is not already up.
@@ -5504,20 +5670,29 @@ pub trait DaemonSpawnRegistrar: Send + Sync {
         daemon_url: String,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
 
-    /// The endpoint of a daemon that is **already** serving `kin_root`, or
-    /// `None` when none is. Starts nothing.
-    ///
-    /// This is the same resolution `kin doctor` reports its daemon-reachability
-    /// verdict from, exposed here so a process that cannot depend on the CLI
-    /// asks the identical question. Two surfaces answering "is the daemon
-    /// reachable" from two different resolutions is how `kin doctor` came to
-    /// report a healthy daemon at the same instant every MCP tool call reported
-    /// it unavailable: the CLI resolved the route at call time while MCP read a
-    /// URL resolved once at startup.
+    /// Legacy optional route lookup. Starts nothing, but `None` covers
+    /// unavailable and unresolved routes. It does not certify readiness;
+    /// use `reading_if_running` to diagnose a missing delegate.
     fn route_if_running(
         &self,
         kin_root: PathBuf,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+    /// Probe without starting anything, preserving readiness and uncertainty.
+    /// The legacy optional route cannot certify readiness, so implementers
+    /// must opt in to this stronger contract rather than inherit that claim.
+    fn reading_if_running(
+        &self,
+        _kin_root: PathBuf,
+        _budget: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RunningDaemonRouteReading> + Send>>
+    {
+        Box::pin(async {
+            RunningDaemonRouteReading::Unresolved {
+                detail: "the installed registrar has no typed readiness probe".to_string(),
+            }
+        })
+    }
 }
 
 /// Resolve the supervisor endpoint through the installed seam, if there is one.
@@ -5529,12 +5704,27 @@ pub async fn supervisor_url_for_spawn() -> Option<String> {
 /// The endpoint of a daemon already serving `kin_root`, resolved through the
 /// installed seam without starting anything.
 ///
-/// `None` covers both "no daemon serves this repository" and "no seam is
-/// installed in this process", which are the same thing to a caller: it has no
-/// route to a daemon and must not invent one.
+/// `None` covers unresolved probes as well as missing routes or registrars.
+/// Use [`running_daemon_route_reading`] when reporting why delegation failed.
 pub async fn running_daemon_route(kin_root: &Path) -> Option<String> {
     let registrar = registrar()?;
     registrar.route_if_running(kin_root.to_path_buf()).await
+}
+
+/// Resolve a trusted, ready route through the installed seam within `budget`.
+/// A missing seam is uncertainty, not an observation of daemon absence.
+pub async fn running_daemon_route_reading(
+    kin_root: &Path,
+    budget: std::time::Duration,
+) -> RunningDaemonRouteReading {
+    let Some(registrar) = registrar() else {
+        return RunningDaemonRouteReading::Unresolved {
+            detail: "no daemon registrar is installed in this process".to_string(),
+        };
+    };
+    registrar
+        .reading_if_running(kin_root.to_path_buf(), budget)
+        .await
 }
 
 static REGISTRAR: OnceLock<Arc<dyn DaemonSpawnRegistrar>> = OnceLock::new();
@@ -7843,6 +8033,7 @@ mod tests {
         let plan = DaemonSpawnPlan {
             daemon_bin: PathBuf::from("/usr/bin/kin-daemon"),
             working_dir: PathBuf::from("/repo"),
+            store_root: None,
             idle_timeout_secs: None,
             supervisor_url: None,
         };
@@ -7855,10 +8046,32 @@ mod tests {
     }
 
     #[test]
+    fn spawn_plan_names_a_store_kept_outside_the_working_tree() {
+        let plan = DaemonSpawnPlan {
+            daemon_bin: PathBuf::from("/usr/bin/kin-daemon"),
+            working_dir: PathBuf::from("/repo"),
+            store_root: Some(PathBuf::from("/stores/repo")),
+            idle_timeout_secs: None,
+            supervisor_url: None,
+        };
+        let args: Vec<_> = plan
+            .command()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["--repo", "/repo", "--port", "0", "--store", "/stores/repo"],
+            "the working tree stays the routing identity and the store rides beside it"
+        );
+    }
+
+    #[test]
     fn spawn_plan_passes_idle_timeout_and_supervisor_when_present() {
         let plan = DaemonSpawnPlan {
             daemon_bin: PathBuf::from("/usr/bin/kin-daemon"),
             working_dir: PathBuf::from("/repo"),
+            store_root: None,
             idle_timeout_secs: Some(MCP_IDLE_TIMEOUT_SECS.to_string()),
             supervisor_url: Some("http://127.0.0.1:9000".to_string()),
         };
@@ -7930,6 +8143,34 @@ mod tests {
             command_env(&command).get(DAEMON_AUTO_EMBED_ENV),
             Some(&Some("false".to_string())),
             "the daemon authority scrub removed the operator's background-embedding opt-out"
+        );
+    }
+
+    #[test]
+    fn a_debug_spawn_carries_the_test_flush_switch() {
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        carry_test_flush(&mut command, true, Some(std::ffi::OsString::from("fsync")));
+        scrub_daemon_process_authority(&mut command);
+        assert_eq!(
+            command_env(&command).get(kin_blobs::durable::TEST_FLUSH_ENV),
+            Some(&Some("fsync".to_string())),
+            "a debug daemon spawn dropped the test flush switch"
+        );
+        assert!(
+            !is_daemon_ambient_authority(std::ffi::OsStr::new(kin_blobs::durable::TEST_FLUSH_ENV)),
+            "the authority scrub would strip the inherited test flush switch"
+        );
+    }
+
+    #[test]
+    fn a_release_spawn_pins_no_test_flush_switch() {
+        let mut command = Command::new("/usr/bin/kin-daemon");
+        carry_test_flush(&mut command, false, Some(std::ffi::OsString::from("fsync")));
+        carry_test_flush(&mut command, true, None);
+        assert_eq!(
+            command_env(&command).get(kin_blobs::durable::TEST_FLUSH_ENV),
+            None,
+            "a daemon spawn pinned a test flush switch it should not have"
         );
     }
 
@@ -9432,6 +9673,73 @@ Shared_Dirty:          0 kB\n";
         assert!(remedy.contains("9.0 GiB"), "{remedy}");
     }
 
+    /// Every cause round-trips through its wire spelling, an unknown spelling
+    /// reads as no cause rather than a wrong one, and the decision names the
+    /// cause that still holds once the ones before it are lifted.
+    #[test]
+    fn the_switched_off_cause_round_trips_and_names_what_still_holds() {
+        for cause in EnrichmentSwitchedOffBy::ALL {
+            assert_eq!(
+                EnrichmentSwitchedOffBy::from_wire(cause.wire()),
+                Some(cause)
+            );
+        }
+        assert_eq!(
+            EnrichmentSwitchedOffBy::from_wire("enrichment_disabled"),
+            None
+        );
+
+        use EnrichmentSwitchedOffBy::*;
+        let decide = EnrichmentSwitchedOffBy::decide;
+        assert_eq!(decide(false, true, false, false), None);
+        assert_eq!(decide(false, false, false, false), Some(RepositorySetting));
+        assert_eq!(
+            decide(false, false, true, false),
+            Some(FilesystemReconcileSwitch)
+        );
+        assert_eq!(decide(true, false, true, false), Some(EnrichmentSwitch));
+        // A graph-only store disables filesystem reconcile on its own, and
+        // nothing lifts it, so it is named over every switch.
+        assert_eq!(decide(true, false, true, true), Some(GraphOnlyStore));
+    }
+
+    /// The filesystem-reconcile switch reads the way `kin-daemon` has always
+    /// read it: trimmed and case-insensitive.
+    #[test]
+    fn the_filesystem_reconcile_switch_reads_one_table() {
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(filesystem_reconcile_disabled_by(Some(on)), "{on}");
+        }
+        for off in ["", "0", "false", "off", "no", "2"] {
+            assert!(!filesystem_reconcile_disabled_by(Some(off)), "{off}");
+        }
+        assert!(!filesystem_reconcile_disabled_by(None));
+    }
+
+    /// A repository whose own setting switches enrichment off is offered no
+    /// enrichment lever either. Every daemon that serves it already starts
+    /// without a sweep, so the environment switch would turn off nothing and a
+    /// restart would start a daemon exactly like the one that died.
+    #[test]
+    fn a_repository_switched_off_by_its_own_setting_is_offered_no_lever() {
+        let record = killed_holding(Some(9 * 1024 * 1024 * 1024), None);
+        let remedy = record.remediation_in(EnrichmentState::OffForRepository);
+        assert!(
+            !remedy.contains(DISABLE_ENRICHMENT_ENV),
+            "a repository with enrichment off was told to turn it off: {remedy}"
+        );
+        assert!(
+            !remedy.contains("kin daemon stop"),
+            "and it must not be told to restart into a switch it already has: {remedy}"
+        );
+        assert!(remedy.contains("To recover:"), "{remedy}");
+        assert!(remedy.contains("9.0 GiB"), "{remedy}");
+        assert_eq!(
+            enrichment_remedy_clause_in(EnrichmentState::OffForRepository),
+            None
+        );
+    }
+
     /// And the two states that DO have a lever still print one, so the change
     /// above is a third case rather than a deletion.
     #[test]
@@ -9864,4 +10172,105 @@ Shared_Dirty:          0 kB\n";
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, named here only so the case above
     /// reads as the job shape it describes rather than as a bare number.
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_FOR_TEST: u32 = 0x0000_2000;
+}
+
+#[cfg(test)]
+mod route_reading_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    struct LegacyRegistrar;
+    impl DaemonSpawnRegistrar for LegacyRegistrar {
+        fn supervisor_url(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+            Box::pin(async { None })
+        }
+        fn register(
+            &self,
+            _: PathBuf,
+            _: String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn route_if_running(
+            &self,
+            _: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+            Box::pin(async { Some("https://unchecked.invalid".to_string()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_optional_route_is_not_promoted_to_certified_readiness() {
+        let reading = LegacyRegistrar
+            .reading_if_running(PathBuf::from("/synthetic/.kin"), Duration::from_millis(10))
+            .await;
+        assert!(matches!(
+            reading,
+            RunningDaemonRouteReading::Unresolved { .. }
+        ));
+    }
+
+    struct TypedRegistrar {
+        reading: Mutex<RunningDaemonRouteReading>,
+        request: Mutex<Option<(PathBuf, Duration)>>,
+    }
+    impl DaemonSpawnRegistrar for TypedRegistrar {
+        fn supervisor_url(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+            LegacyRegistrar.supervisor_url()
+        }
+        fn register(
+            &self,
+            root: PathBuf,
+            url: String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> {
+            LegacyRegistrar.register(root, url)
+        }
+        fn route_if_running(
+            &self,
+            root: PathBuf,
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> {
+            LegacyRegistrar.route_if_running(root)
+        }
+        fn reading_if_running(
+            &self,
+            root: PathBuf,
+            budget: Duration,
+        ) -> Pin<Box<dyn Future<Output = RunningDaemonRouteReading> + Send>> {
+            *self.request.lock().unwrap() = Some((root, budget));
+            let reading = self.reading.lock().unwrap().clone();
+            Box::pin(async { reading })
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_route_seam_preserves_readiness_states_and_explicit_budget() {
+        let registrar = Arc::new(TypedRegistrar {
+            reading: Mutex::new(RunningDaemonRouteReading::Absent),
+            request: Mutex::new(None),
+        });
+        assert!(install_registrar(registrar.clone()));
+        let root = Path::new("/synthetic/.kin");
+        let budget = Duration::from_millis(45);
+        for expected in [
+            RunningDaemonRouteReading::Absent,
+            RunningDaemonRouteReading::NotReady {
+                detail: "warming synthetic authority".to_string(),
+                warming: true,
+            },
+            RunningDaemonRouteReading::Unresolved {
+                detail: "no answer".to_string(),
+            },
+            RunningDaemonRouteReading::Serving("http://127.0.0.1:51000".to_string()),
+        ] {
+            *registrar.reading.lock().unwrap() = expected.clone();
+            assert_eq!(running_daemon_route_reading(root, budget).await, expected);
+            assert_eq!(
+                *registrar.request.lock().unwrap(),
+                Some((root.to_path_buf(), budget))
+            );
+        }
+    }
 }

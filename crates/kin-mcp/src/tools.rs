@@ -58,11 +58,11 @@ fn context_max_chars_property() -> serde_json::Value {
         "type": "integer",
         "description": format!(
             "UTF-8 bytes of JSON text, the `_kin` envelope included and JSON-RPC escaping \
-             excluded, this response may occupy (default {default}, clamped {min}..{max}). It is \
-             a hard limit here: the pack is cut to fit both this and its `token_budget`, \
-             rendered `lines` first, then inline source, then rows one at a time from the end of \
-             each section in turn, and a pack whose remaining metadata still cannot fit both is \
-             refused with an error rather than shipped over. A section the budget cut can be \
+             excluded, this response may occupy (default {default}, clamped {min}..{max}). The \
+             pack is cut to fit this, neighbour bodies first, then rows one at a time from the \
+             end of each section in turn, then the focals' own bodies, and every withheld body \
+             and row is named by id under `withheld`. A pack that still cannot fit is served as \
+             it stands with a `response_over_budget` note, never refused. A section the budget cut can be \
              left empty, so read `elisions`: it names each cut section with what it kept, what it \
              lost, and why, and `kept: 0` there means the budget emptied that section rather \
              than the graph holding nothing for it. Any cut is also reported in `degradations` \
@@ -165,7 +165,7 @@ fn destructive_idempotent(title: &str) -> ToolAnnotations {
 /// There is no unguarded body edit, and a structured `Entity` payload carries
 /// no body. Structured mutations address entities or edges. Conversion-shaped
 /// file operations are not part of this agent schema.
-fn transaction_operation_schema() -> serde_json::Value {
+pub(crate) fn transaction_operation_schema() -> serde_json::Value {
     serde_json::json!({
         "oneOf": [
             {
@@ -195,7 +195,7 @@ fn transaction_operation_schema() -> serde_json::Value {
                     "description": { "type": "string", "description": "Human-readable explanation of this change." },
                     "payload": {
                         "type": "object",
-                        "properties": { "EntitySourceBase": crate::source_base::source_base_schema() },
+                        "properties": { "EntitySourceBase": crate::source_ticket::write_base_schema() },
                         "required": ["EntitySourceBase"],
                         "additionalProperties": false
                     }
@@ -270,6 +270,30 @@ fn transaction_operation_schema() -> serde_json::Value {
                 },
                 "required":["verb","target","payload","description"],
                 "additionalProperties":false
+            },
+            {
+                "title": "EntityContent",
+                "type":"object",
+                "properties": {
+                    "verb":{"type":"string","enum":crate::artifact_entity::CONTENT_VERBS},
+                    "target":{"type":"string","format":"uuid","description":"Exact source_base entity UUID: the entity replaced, or the one a created entity is placed beside."},
+                    "description":{"type":"string"},
+                    "payload":{"type":"object","properties":{"EntityContent":{
+                        "type":"object",
+                        "description":"Content Kin already holds, for an entity Kin holds without parsing it. replace takes content_of and at; create takes name and one of content_of and text.",
+                        "properties":{
+                            "source_base":crate::source_ticket::write_base_schema(),
+                            "name":{"type":"string","description":"The new entity's own name, with no separator, for a create."},
+                            "content_of":{"type":"string","description":"UUID or module :: name of the unparsed entity whose content is taken."},
+                            "at":{"type":"string","description":"A change id: content_of's content as it stood at that change."},
+                            "text":{"type":"string","description":"The new entity's whole text, for a create."}
+                        },
+                        "required":["source_base"],
+                        "additionalProperties":false
+                    }},"required":["EntityContent"],"additionalProperties":false}
+                },
+                "required":["verb","target","payload","description"],
+                "additionalProperties":false
             }
         ]
     })
@@ -283,7 +307,7 @@ fn transaction_operation_schema() -> serde_json::Value {
 /// as pointing at a tool the profile withholds when five of them merely mention
 /// the tool they are served beside. A word here is `[A-Za-z0-9_]`, which is what
 /// every MCP tool name is spelled from.
-fn names_tool_as_a_word(text: &str, name: &str) -> bool {
+pub(crate) fn names_tool_as_a_word(text: &str, name: &str) -> bool {
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let bytes = text.as_bytes();
     let mut from = 0;
@@ -300,6 +324,20 @@ fn names_tool_as_a_word(text: &str, name: &str) -> bool {
     false
 }
 
+/// Whether `text` points a reader at the tool `name`.
+///
+/// A verb is a plain word, and "trace the call chain" or "the session it
+/// opened" names no tool, so a verb counts only as a code span, `` `trace` ``,
+/// which is how every verb-speaking description names one. Any other tool name
+/// is snake case and counts as a whole word.
+pub(crate) fn names_tool_in(text: &str, name: &str) -> bool {
+    if crate::verbs::is_plain_word(name) {
+        text.contains(&format!("`{name}`"))
+    } else {
+        names_tool_as_a_word(text, name)
+    }
+}
+
 /// Every tool `description` points the reader at that this profile does not
 /// serve, in name order.
 ///
@@ -314,8 +352,8 @@ pub fn unserved_tools_named_in(
 ) -> Vec<String> {
     let mut named: Vec<String> = registered
         .iter()
-        .filter(|name| !served.contains(*name))
-        .filter(|name| names_tool_as_a_word(description, name))
+        .filter(|name| !crate::verbs::allows(served, name))
+        .filter(|name| names_tool_in(description, name))
         .cloned()
         .collect();
     named.sort();
@@ -403,12 +441,27 @@ pub fn served_tools_list(
     allowed: Option<&std::collections::HashSet<String>>,
     agent_belt: bool,
 ) -> ToolsListResult {
-    let mut tools = tool_definitions();
+    // A profile that names an old tool explicitly, which only the citable ones
+    // do, is served the registry as it was, byte for byte. Every other profile
+    // speaks verbs: the surface `full` serves, cut to its names.
+    let speaks_verbs = crate::verbs::speaks_verbs(allowed);
+    let mut tools = if speaks_verbs {
+        surface_definitions()
+    } else {
+        tool_definitions()
+    };
     // Captured before the filter, because the annotation below has to tell a
     // registered tool this profile withholds from a phrase that is simply
     // prose. After the retain, the withheld ones are gone and that distinction
-    // is unrecoverable.
-    let registered: Vec<String> = tools.tools.iter().map(|tool| tool.name.clone()).collect();
+    // is unrecoverable. A listing that does not speak verbs never points at a
+    // verb, and a verb is a plain word, so its annotation reads only the
+    // registered names it has always read.
+    let registered: Vec<String> = tools
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .filter(|name| speaks_verbs || !crate::verbs::is_plain_word(name))
+        .collect();
     if let Some(allowed) = allowed {
         tools.tools.retain(|tool| allowed.contains(&tool.name));
     }
@@ -467,11 +520,9 @@ pub fn name_set(names: &[&str]) -> std::collections::HashSet<String> {
 /// Conversion and materialization use their explicit internal boundaries.
 pub fn retired_file_operation(name: &str) -> Option<&'static str> {
     match name {
-        "kin_artifact_read" => Some(
-            "Whole-artifact reading is unavailable; select get_entity_source or bounded get_context_pack for a semantic entity",
-        ),
-        "kin_artifact_list" | "list_file_entities" => Some(
-            "File catalogs are unavailable on agent surfaces; find entities with semantic_search or semantic_locate, then follow graph_neighborhood or find_references",
+        "kin_artifact_read" | "kin_artifact_list" | "list_file_entities"
+        | "kin_todo_import" | "kin_session_exec" | "exec" | "kin_init" | "init" => Some(
+            "This operation is unavailable on the semantic agent surface. Select an entity with locate, then use source, context or mutate.",
         ),
         _ => None,
     }
@@ -483,12 +534,41 @@ pub fn retired_file_operation(name: &str) -> Option<&'static str> {
 /// `tools/list`, so a surface that reordered between builds would miss that
 /// cache for every session. Sorting by name also means the order does not
 /// depend on where a new tool is inserted in the registry below.
+///
+/// It holds every name a call may use: the verbs in [`crate::verbs`], and the
+/// names they replaced, which stay registered as hidden aliases for one
+/// version. What a profile lists is [`served_tools_list`]'s business.
 pub fn tool_definitions() -> ToolsListResult {
     let mut list = registered_tools();
     list.tools.extend(crate::entity_drafts::tool_definitions());
-    list.tools.push(crate::repository_init::tool_definition());
-    list.tools.push(crate::session_exec::tool_definition());
+    list.tools.push(crate::ask::definition());
+    let verbs = crate::verbs::definitions(&list.tools);
+    list.tools.extend(verbs);
+    for tool in &mut list.tools {
+        crate::input_contract::semantic_query_definition(tool);
+    }
+    list.tools
+        .retain(|tool| retired_file_operation(&tool.name).is_none());
     list.tools.sort_by(|left, right| left.name.cmp(&right.name));
+    list
+}
+
+/// The surface the `full` profile serves: every registered tool except the
+/// hidden aliases, with every description naming the verbs rather than the
+/// names they replaced. In name order, like the registry it is cut from.
+///
+/// [`crate::handlers::tool_search`] answers from this too, so a tool found by
+/// describing a job is found under the name a call should use.
+pub fn surface_definitions() -> ToolsListResult {
+    let mut list = tool_definitions();
+    list.tools
+        .retain(|tool| !crate::verbs::is_alias(&tool.name));
+    for tool in &mut list.tools {
+        if !crate::verbs::is_verb(&tool.name) {
+            tool.description = crate::verbs::speak_verbs(&tool.description);
+            crate::verbs::speak_verbs_in_schema(&mut tool.input_schema);
+        }
+    }
     list
 }
 
@@ -583,7 +663,8 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity UUID, or a name: one exact name or lone member answers, others list candidates." }
+                        "entity_id": { "type": "string", "description": "Entity UUID, or a name: one exact name or lone member answers, others list candidates." },
+                        "full_body": { "type": "boolean", "description": "Serve the whole body and its source_base in one reply, up to 16 KB. Past that a class or object literal is served as its shape, and any other body as excerpts whose source_base carries a patch, never a whole replacement. A Python module returns its own module-level code, each entity it holds as one marker line; any other module returns its recorded member inventory and never an aggregate body or edit base. Default false: a body over 12 KB returns an excerpt with next_cursor, and classes and object literals over 4 KB return their header and members by id and signature.", "default": false }
                     },
                     "required": ["entity_id"]
                 }),
@@ -648,19 +729,19 @@ fn registered_tools() -> ToolsListResult {
                             "type": "array",
                             "items": { "type": "string" },
                             "minItems": 1,
-                            "maxItems": 8,
+                            "maxItems": crate::requests::CONTEXT_ENTITIES_MAX,
                             "description": "Several focal entities, by name or UUID, when the question is about how they connect. A name with twins in the store can pin the one it means: Name@file, Name@file:line, Name#Kind. The pack carries every focal, the graph route between connected ones first, then each focal's neighborhood, and it comes in under token_budget."
                         },
                         "question": {
                             "type": "string",
                             "description": "Resolve the focals from this question through Kin's own ranking, instead of naming them. Needs the repo daemon, which is where the ranking runs."
                         },
-                        "token_budget": { "type": "integer", "description": "Exact positive token budget for the rendered pack; 0 uses 8000", "default": 16000 },
+                        "token_budget": { "type": "integer", "description": "Exact positive token budget for the whole reply, metadata included; answer_tokens reports its code; 0 uses 8000", "default": 16000 },
                         "depth": { "type": "integer", "description": "Dependency traversal depth", "default": 2 },
                         "include_traffic": { "type": "boolean", "description": "Include active nearby agent traffic in response", "default": true },
-                        "compact": { "type": "boolean", "description": "If true, neighbours carry no projection and the transitive, tests and contracts sections are dropped; the focal body is still served unless focal_body is false. If false (default), the focal gets its body, dependencies and dependents get SignatureOnly unless neighbor_bodies is true, and transitive rows get NameAndKind.", "default": false },
-                        "neighbor_bodies": { "type": "boolean", "description": "Also serve the exact bodies of dependencies and dependents within the budget. Default false: neighbours are signatures. Single entity_id packs only.", "default": false },
-                        "focal_body": { "type": "boolean", "description": "Serve the focal's exact body. False returns the neighbourhood with the focal as its signature, for a caller that already holds the body. Single entity_id packs only.", "default": true }
+                        "compact": { "type": "boolean", "description": "If true, neighbours show their signatures or identities without bodies and the transitive, tests and contracts sections are dropped; the focal body is still served unless focal_body is false. If false (default), the focal gets its body, dependencies and dependents get SignatureOnly unless neighbor_bodies is true, and transitive rows get NameAndKind.", "default": false },
+                        "neighbor_bodies": { "type": "boolean", "description": "Also serve the exact bodies of dependencies and dependents within the budget, in every mode. Default false: neighbours are signatures. A body that does not fit is named under withheld.bodies by id.", "default": false },
+                        "focal_body": { "type": "boolean", "description": "Serve each focal's exact body, in every mode. False returns the neighbourhood with each focal as its signature, for a caller that already holds the bodies.", "default": true }
                     }
                 }),
             },
@@ -687,7 +768,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "focal": { "type": "string", "description": "Focal entity UUID or exact entity name to start tracing from" },
+                        "focal": { "type": "string", "description": "Focal entity UUID, exact entity name, or module-qualified name (`Scheduler.advanceTimers`) to start tracing from. A name several distinct entities carry is refused with every candidate and its `qualified_name`; call again with one." },
                         "cursor": { "type": "string", "maxLength": 256, "description": "Opaque next_cursor from the prior trace page. Repeat the same focal and traversal arguments; only the byte budget may change. Changed graph/scope or expired snapshot requires restarting without cursor." },
                         "depth": { "type": "integer", "description": "Maximum traversal depth from the focal (default 3, capped at 8)", "default": 3, "minimum": 1, "maximum": 8 },
                         "direction": {
@@ -708,10 +789,25 @@ fn registered_tools() -> ToolsListResult {
                             "description": "Alias for include_body: false. Ignored when include_body is given explicitly.",
                             "default": false
                         },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Read code whose stored role is Test. True by default. False leaves tests out of a callers walk: a test is never a step, a reach member or a place that could add a caller, and `reach.tests_excluded` counts what was left out. What the focal calls is followed wherever it leads.",
+                            "default": true
+                        },
                         "include_type_edges": {
                             "type": "boolean",
                             "description": "Walk THROUGH a type-annotation edge to a type this repository defines (default false). A dataclass field typed with a repo class is a real flow into that class, so the hop is available; it is off by default because a shared type name otherwise joins every entity that annotates with it to every other one. An annotation target the repository does not define stays a leaf either way.",
                             "default": false
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Confine the walk to a semantic scope: a module path prefix, as a row's `module` field spells it (`shop.billing`, `app-server-handler`). An entity is in scope when its module path is the scope or starts with it at a dot, as the graph's module records place it. A scope that sits inside exactly one module path is read as that path, and one that names none is refused. The reply's `scope` block names the scope as resolved, how many out-of-scope entities the walk met and did not follow, the frontier it did not read past with why, and whether the scoped answer is complete. A callers walk's answer is `reach`, closed over the scope and not cut at depth; a calls walk's answer is the chain, and a step cut at the depth bound is frontier, never completeness."
+                        },
+                        "scope_mode": {
+                            "type": "string",
+                            "enum": ["paths", "rows"],
+                            "description": "What scope restricts. `paths` (default): the walk follows no edge to an entity outside the scope, so a path that leaves it and comes back does not count. `rows`: the walk is whole and only its rows are held to the scope; the out-of-scope entities a listed row's witness path runs through are listed apart, so every `via` can still be followed.",
+                            "default": "paths"
                         },
                         "max_response_chars": trace_max_chars_property(),
                         "max_chars": trace_max_chars_alias_property()
@@ -726,7 +822,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "from": { "type": "string", "description": "Source end: entity UUID, exact name, or name@file to pin one of two same-named entities." },
+                        "from": { "type": "string", "description": "Source end: entity UUID, exact name, or module-qualified name (`Scheduler.advanceTimers`). A name several distinct entities carry is refused with every candidate and its `qualified_name`; pass one of those or its id." },
                         "to": { "type": "string", "description": "Target end, in the same forms." },
                         "from_file": { "type": "string", "description": "Deprecated, answered through 0.7.16; pass the entity id in `from`. Pins `from` by file." },
                         "to_file": { "type": "string", "description": "Deprecated, answered through 0.7.16; pass the entity id in `to`. Pins `to` by file." },
@@ -751,16 +847,27 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "cursor": { "type": "string", "maxLength": 256, "description": "Continue a frozen reference answer with its next_cursor and the same query and filters. Byte budgets may change. An expired or stale cursor requires a fresh query." },
+                        "cursor": { "type": "string", "maxLength": 256, "description": "Send answer_next_cursor alone for more recorded rows, or evidence_next_cursor alone for unresolved candidates and coverage. next_cursor continues both. Completed rows do not close unresolved callers. Byte budgets may change. An expired or stale cursor requires a fresh query." },
                         "answer_only": { "type": "boolean", "description": "Return reference rows, named call-site candidates and trust limits. False restores detailed coverage and every candidate.", "default": false },
                         "max_chars": max_chars_property(),
                         "compact": { "type": "boolean", "description": "If true (default), omit ranking explanation and per-signal breakdowns and return one shape per hit. Pass false (or explain: true) to get the breakdowns back.", "default": true },
-                        "entity_id": { "type": "string", "description": "Exact entity UUID, or external_reference:<uuid> for a symbol outside the repository. Optional if query is provided." },
-                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided. Alone it is ranked, not exact. When several declarations share the name, the ranking prefers the most referenced one, and `focal_resolution` reports the rest. An owner-qualified name (`Receiver.method` in Go, `Owner.member` in TypeScript, and the same shape in other languages where the graph names members that way) is exact. An exact whole name answers first. With none, a bare member name (`get` for the method `Scaffold.get`, a field, or an enum variant) reaches the owners' members: one answers directly, and several are each answered in their own section under `candidates_by_owner`. An `entity_id` from semantic_locate or semantic_search is exact too." },
+                        "entity_id": { "type": "string", "description": "Entity UUID returned by Kin; pass names in query. Also accepts external_reference:<uuid> for a symbol outside the repository. Optional if query is provided." },
+                        "proof_for_caller": { "type": "string", "maxLength": 36, "description": "UUID of the caller containing the call; entity_id stays the target callee UUID. Return only this caller's stored receiver chain or an explicit gap. No cursor." },
+                        "view": { "type": "string", "enum": ["references", "overrides"], "description": "overrides returns only overriding methods and inheritance coverage; requires entity_id and excludes reference filters. Omit for references. Continue either view with its cursor alone." },
+                        "query": { "type": "string", "description": "Exact symbol name to resolve. Optional if entity_id is provided. A name several distinct entities carry is never ranked to one: each is answered in its own section under `candidates_by_owner`, with its own verdict and a `qualified_name` that names it alone. The twins of one declaration (a prototype and its definition, overload signatures, conditional arms in one file) count once. A module-qualified name (`app._make_timedelta`, `Scheduler.advanceTimers`) pins one by the module that holds it. An owner-qualified name (`Receiver.method` in Go, `Owner.member` in TypeScript, and the same shape in other languages where the graph names members that way) is exact. An exact whole name answers first. With none, a bare member name (`get` for the method `Scaffold.get`, a field, or an enum variant) reaches the owners' members: one answers directly, and several are each answered in their own section under `candidates_by_owner`. An `entity_id` from semantic_locate or semantic_search is exact too." },
                         "relation_kinds": {
                             "type": "array",
                             "description": "Filter relation kinds. Supported values: calls, imports, references. Defaults to all three.",
                             "items": { "type": "string" }
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "description": "Include callers whose current stored role is Test. True by default. False excludes only those callers from reference answers and coverage; other roles remain. Cursor-only calls inherit this scope. False cannot be combined with proof_for_caller or view=overrides.",
+                            "default": true
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "List only the callers inside this module path, the dotted prefix of a row's `module` (pkg or pkg.sub), matched against the graph's module records. The callers recorded outside it are counted under `caller_scope.outside_module`, and the reading of unresolved call sites speaks of the callers inside it. A scope that names no module path, or sits inside several, is refused. Cannot be combined with proof_for_caller or view=overrides, or asked of a symbol outside the repository."
                         },
                         "include_snippets": {
                             "type": "boolean",
@@ -799,7 +906,7 @@ fn registered_tools() -> ToolsListResult {
                         },
                         "compact": {
                             "type": "boolean",
-                            "description": "If true (default), return only {entity_id, has_references, reference_count} per result. If false, also include name/kind/file_path/matched_kinds.",
+                            "description": "If true (default), return only {entity_id, has_references, reference_count} per result. If false, also include name/kind/matched_kinds.",
                             "default": true
                         }
                     },
@@ -818,9 +925,12 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to analyze impact for" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "Deprecated, answered through 0.7.16; use entity_ids. File paths resolved to entities." },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine and analyze impact" },
-                        "include_traffic": { "type": "boolean", "description": "Include active traffic on impacted entities", "default": true }
+                        "include_traffic": { "type": "boolean", "description": "Include active traffic on impacted entities", "default": true },
+                        "include_tests": { "type": "boolean", "description": "Read code whose stored role is Test. True by default. False leaves test code out of every row list and out of the reading of the changed entities' callers, and `tests_excluded.entities` counts the affected entities left out.", "default": true },
+                        "scope": { "type": "string", "description": "List only the affected entities inside this module path, the dotted prefix of a row's `module` (pkg or pkg.sub), matched against the graph's module records. The entities left out are counted under `row_scope.outside`, and the reading of the changed entities' callers speaks of the callers inside it. A scope that names no module path, or sits inside several, is refused." },
+                        "dependents": { "type": "boolean", "description": "Ask for the lists of what depends on the callers. They are always in this reply; true marks them as asked for with `dependents_asked`, which a plain reply reads to list them instead of counting them.", "default": false },
+                        "cursor": { "type": "string", "maxLength": 256, "description": "Continue a frozen impact answer with its next_cursor and the same targets and filters. Byte budgets may change. An expired or stale cursor requires a fresh query." }
                     }
                 }),
             },
@@ -834,7 +944,6 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to diff (current state vs history)" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "Deprecated, answered through 0.7.16; use entity_ids. File paths resolved to entities." },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one diff" }
                     }
                 }),
@@ -849,9 +958,8 @@ fn registered_tools() -> ToolsListResult {
                         "base": { "type": "string", "description": "Base semantic change ID (hex)" },
                         "head": { "type": "string", "description": "Head semantic change ID (hex)" },
                         "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Entity UUIDs to review (current state vs history)" },
-                        "files": { "type": "array", "items": { "type": "string" }, "description": "Deprecated, answered through 0.7.16; use entity_ids. File paths resolved to entities." },
                         "change_ids": { "type": "array", "items": { "type": "string" }, "description": "Change ID hexes to combine into one review" },
-                        "format": { "type": "string", "enum": ["text", "json"], "description": "Response format. Use json for editor integrations.", "default": "text" },
+                        "format": { "type": "string", "enum": ["text", "json"], "description": "Both return the complete structured report. text adds a concise semantic prose message; json omits that message.", "default": "text" },
                         "include_traffic": { "type": "boolean", "description": "Include active traffic on reviewed entities", "default": true }
                     }
                 }),
@@ -881,11 +989,6 @@ fn registered_tools() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "limit": { "type": "integer", "description": "Max results", "default": 50 },
-                        "files": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Optional repo-relative file paths. When provided, dead_code returns only dead functions/classes from those files."
-                        }
                     }
                 }),
             },
@@ -961,8 +1064,11 @@ fn registered_tools() -> ToolsListResult {
                         "max_chars": max_chars_property(),
                         "literal": { "type": "string", "description": "The exact token, call/member fragment, string, or short phrase to find. A bare literal, not a sentence describing it: 'fetchCodespaces', not 'where is fetchCodespaces called from'. Optional only when `cursor` is given, which already carries it. ASCII case-insensitive, including punctuation; max 4096 bytes." },
                         "kind": { "type": "string", "description": "Entity kind (function, class, etc.); test selects test role. Unknown kinds refuse." },
+                        "pattern": { "type": "boolean", "description": "For held text only: read the query as a regular expression. False by default. Cursor-only calls inherit it.", "default": false },
+                        "ignore_case": { "type": "boolean", "description": "For held text only: ignore case when matching. False by default. Cursor-only calls inherit it.", "default": false },
+                        "include_tests": { "type": "boolean", "description": "Include stored test-role entities. False by default; kind test implies true unless explicitly false, which refuses. Cursor-only calls inherit this scope.", "default": false },
                         "limit": { "type": "integer", "description": "Max hits per page (default 20, clamped 1..100).", "default": 20, "minimum": 1, "maximum": 100 },
-                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`, returning the next page of the same lookup. Carries `literal`, `kind`, and a digest of matching entity contents. Supplied filters must agree; changed contents require restarting without the cursor." }
+                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`, returning the next page of the same lookup. Carries `literal`, `kind`, `include_tests`, and a digest of matching entity contents. Supplied filters must agree; changed contents require restarting without the cursor." }
                     }
                 }),
             },
@@ -979,7 +1085,7 @@ fn registered_tools() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "register_session".into(),
-                description: crate::handlers::sessions::REGISTER_SESSION_DESC.into(),
+                description: "Register a lightweight assistant identity. New integrations normally use the connection session opened by a write or intent.".into(),
                 annotations: mutates("Register assistant session"),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -993,7 +1099,7 @@ fn registered_tools() -> ToolsListResult {
             // ── Phase 7: Session/Intent/Traffic tools ──
             ToolDefinition {
                 name: "kin_session_start".into(),
-                description: crate::handlers::sessions::SESSION_START_DESC.into(),
+                description: "Start an agent session for this connection with vendor, client name, capabilities and optional PID. Keep it alive with kin_session_heartbeat and close it with kin_session_end. Returned capabilities reflect store policy and your declared limits. Supply the original session_id UUID only to recover an absent daemon session; an already registered UUID refuses.".into(),
                 annotations: mutates("Start agent session"),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -1003,7 +1109,6 @@ fn registered_tools() -> ToolsListResult {
                         "client_name": { "type": "string", "description": "Human-readable client name" },
                         "transport": { "type": "string", "description": "Connection type: mcp, cli, wrapper, or ui", "default": "mcp" },
                         "pid": { "type": "integer", "description": "OS process ID of the agent (optional)" },
-                        "cwd": { "type": "string", "description": "Working directory of the agent" },
                         "capabilities": {
                             "type": "object",
                             "description": "Agent capabilities",
@@ -1017,7 +1122,7 @@ fn registered_tools() -> ToolsListResult {
                             }
                         }
                     },
-                    "required": ["vendor", "client_name", "cwd"]
+                    "required": ["vendor", "client_name"]
                 }),
             },
             ToolDefinition {
@@ -1054,14 +1159,14 @@ fn registered_tools() -> ToolsListResult {
                         "session_id": { "type": "string", "description": "Session UUID" },
                         "scopes": {
                             "type": "array",
-                            "description": "Target scopes: [{\"Entity\": \"uuid\"}, {\"Contract\": \"uuid\"}, {\"Artifact\": \"path\"}]",
+                            "description": "Target scopes: [{\"Entity\": \"uuid\"}, {\"Contract\": \"uuid\"}]",
                             "items": { "type": "object" }
                         },
                         "lock_type": { "type": "string", "description": "Lock strength: soft or hard", "default": "soft" },
                         "task_description": { "type": "string", "description": "What the agent plans to do" },
                         "expires_at": { "type": "string", "description": "Optional ISO 8601 expiry timestamp" }
                     },
-                    "required": ["session_id", "scopes", "task_description"]
+                    "required": ["scopes", "task_description"]
                 }),
             },
             ToolDefinition {
@@ -1074,7 +1179,7 @@ fn registered_tools() -> ToolsListResult {
                         "session_id": { "type": "string", "description": "Session UUID" },
                         "intent_id": { "type": "string", "description": "Intent UUID to release" }
                     },
-                    "required": ["session_id", "intent_id"]
+                    "required": ["intent_id"]
                 }),
             },
             ToolDefinition {
@@ -1086,7 +1191,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "scopes": {
                             "type": "array",
-                            "description": "Target scopes to check: [{\"Entity\": \"uuid\"}, {\"Contract\": \"uuid\"}, {\"Artifact\": \"path\"}]",
+                            "description": "Target scopes to check: [{\"Entity\": \"uuid\"}, {\"Contract\": \"uuid\"}]",
                             "items": { "type": "object" }
                         }
                     },
@@ -1101,7 +1206,7 @@ fn registered_tools() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string", "description": "Session UUID owning the transaction" },
-                        "scope": { "type": "string", "description": "A short label for the change, such as \"repository\" or \"add the store package\". It is recorded with the transaction and never addresses a file." }
+                        "scope": { "type": "string", "description": "A short label for the change, such as \"repository\" or \"add the store package\". It is recorded with the transaction." }
                     },
                     "required": ["session_id", "scope"]
                 }),
@@ -1234,7 +1339,7 @@ fn registered_tools() -> ToolsListResult {
                         "kind": { "type": "string", "description": "Work kind: feature, task, issue, debt, todo, investigation" },
                         "title": { "type": "string", "description": "Work item title" },
                         "description": { "type": "string", "description": "Detailed description" },
-                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Semantic scopes: entity:<uuid>, contract:<uuid>, artifact:<path>" },
+                        "scopes": { "type": "array", "items": { "type": "string" }, "description": "Semantic scopes: entity:<uuid>, contract:<uuid>" },
                         "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "List of acceptance criteria" }
                     },
                     "required": ["kind", "title"]
@@ -1340,7 +1445,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "kind": { "type": "string", "description": "Annotation kind: comment, warning, instruction, reasoning" },
                         "body": { "type": "string", "description": "Annotation text" },
-                        "targets": { "type": "array", "items": { "type": "string" }, "description": "Target scopes or work items: entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>" },
+                        "targets": { "type": "array", "items": { "type": "string" }, "description": "Target scopes or work items: entity:<uuid>, contract:<uuid>, change:<id>, work:<uuid>" },
                         "scopes": { "type": "array", "items": { "type": "string" }, "description": "Legacy alias for scope-only targets" }
                     },
                     "required": ["kind", "body"]
@@ -1353,7 +1458,7 @@ fn registered_tools() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "targets": { "type": "array", "items": { "type": "string" }, "description": "Targets to query: entity:<uuid>, contract:<uuid>, artifact:<path>, change:<id>, work:<uuid>" },
+                        "targets": { "type": "array", "items": { "type": "string" }, "description": "Targets to query: entity:<uuid>, contract:<uuid>, change:<id>, work:<uuid>" },
                         "scopes": { "type": "array", "items": { "type": "string" }, "description": "Legacy alias for scope-only targets" },
                         "include_stale": { "type": "boolean", "description": "Include stale annotations", "default": true }
                     }
@@ -1369,17 +1474,6 @@ fn registered_tools() -> ToolsListResult {
                         "annotation_id": { "type": "string", "description": "Annotation UUID" }
                     },
                     "required": ["annotation_id"]
-                }),
-            },
-            ToolDefinition {
-                name: "kin_todo_import".into(),
-                description: crate::handlers::work::TODO_IMPORT_DESC.into(),
-                annotations: mutates("Import TODO markers"),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Root directory to scan (defaults to working directory)" }
-                    }
                 }),
             },
             // Phase 9-10: Verification, security, release, contract, and provenance tools
@@ -1474,7 +1568,7 @@ fn registered_tools() -> ToolsListResult {
                         "description": { "type": "string", "description": "Optional review description" },
                         "scopes": { "type": "array", "items": { "type": "string" }, "description": "Optional semantic scopes to restrict review to" },
                         "scope_type": { "type": "string", "description": "Optional KinLab-style scope type: entity, module, or work-item" },
-                        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional entity IDs or artifact paths for repo-local review creation" },
+                        "entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional entity UUIDs or entity:/contract: scopes for review creation" },
                         "created_by": { "type": "string", "description": "Optional creator identity" },
                         "created_by_kind": { "type": "string", "description": "Optional creator kind: human, assistant, agent, or system" },
                         "requested_reviewers": { "type": "array", "items": { "type": "string" }, "description": "Optional initial reviewer assignments" }
@@ -1508,9 +1602,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "review_id": { "type": "string", "description": "Review UUID" },
                         "body": { "type": "string", "description": "Note body text" },
-                        "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or artifact:<path>)" },
-                        "file_path": { "type": "string", "description": "Optional file anchor path (translated to artifact scope)" },
-                        "line": { "type": "integer", "description": "Optional line anchor. Stored as metadata on the caller side; graph stores artifact scope only." },
+                        "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or contract:<uuid>)" },
                         "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" },
                         "author_kind": { "type": "string", "description": "Optional author kind: human, assistant, agent, or system" }
                     },
@@ -1526,9 +1618,7 @@ fn registered_tools() -> ToolsListResult {
                     "properties": {
                         "review_id": { "type": "string", "description": "Review UUID" },
                         "body": { "type": "string", "description": "Initial discussion message" },
-                        "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or artifact:<path>)" },
-                        "file_path": { "type": "string", "description": "Optional file anchor path (translated to artifact scope)" },
-                        "line": { "type": "integer", "description": "Optional line anchor. Stored as caller metadata; graph stores artifact scope only." },
+                        "scope": { "type": "string", "description": "Optional scope (entity:<uuid> or contract:<uuid>)" },
                         "author": { "type": "string", "description": "Author identity (defaults to mcp-client)" },
                         "author_kind": { "type": "string", "description": "Optional author kind: human, assistant, agent, or system" }
                     },
@@ -1695,76 +1785,53 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
     ]
 }
 
-/// Tool names for the small default agent profile.
+/// Tool names for the small default agent profile: thirteen plain verbs, named
+/// the way the `kin` CLI names the same capability.
+///
+/// Each verb takes the arguments of the tool it replaced, and a choice that used
+/// to be a choice between tools is an option with a default: `locate` reads its
+/// query by name, by description or as literal text through `mode`, `trace`
+/// finds the route between two entities when it is given `to`, and `session`
+/// and `transaction` take an `action`. [`crate::verbs`] routes each call to the
+/// registered tool that answers it, and the names they replaced are still
+/// accepted on this profile for one version.
 pub fn agent_default_tool_names() -> &'static [&'static str] {
     &[
-        "kin_graph_status",
-        "semantic_locate",
-        "semantic_search",
-        "get_context_pack",
+        crate::verbs::STATUS,
+        // Declarations by name, entities by what they do, and exact literals,
+        // one tool with a mode rather than three a model has to choose between
+        // before it knows which shape its question has.
+        crate::verbs::LOCATE,
+        crate::verbs::CONTEXT,
         // The flagship question a Kin agent is asked is "what breaks if I change
         // this". Its named tool belongs in the profile every configured agent
         // receives; without it the CLI can answer what the agent cannot.
-        "impact_analysis",
-        // A profile carrying the transaction write surface must carry a direct
-        // entity-body read. Staging a body update means restating the entity's
-        // current source, so an agent without a body read can only guess it --
-        // and a guessed body silently overwrites the real one on commit. The
-        // discovery tools hand back ids and bounded snippets; this is the tool
-        // that turns an id into the exact graph-owned body.
-        "get_entity_source",
-        "trace_data_flow",
-        // The route between two named things is the ordinary shape of a code
-        // question, and no single-rooted walk can answer it (FIR-3070). It is
-        // one call where the locate-then-trace loop cost five.
-        crate::handlers::path::TOOL_NAME,
-        "find_references",
-        // The literal-lookup complement to `find_references`: a lexical hit
-        // over indexed text, for a literal-shaped question or for
-        // corroboration when a structural tool's own verdict came back
-        // inconclusive (see `kin-agent`'s system prompt for the routing rule).
-        crate::handlers::lexical::TOOL_NAME,
-        "graph_neighborhood",
-        // The enumeration half of discovery. Every other retrieval tool in this
-        // profile ranks, filters, or walks, and none of them can say what it
-        // left out, so "what is in this file" -- the cheapest question the graph
-        // answers and the first one a file-first user asks -- had to be answered
-        // by scavenging ids out of a locate ranking and hoping it was whole
-        // (FIR-2546).
-        "kin_session_start",
-        "kin_session_heartbeat",
-        "kin_session_end",
-        "kin_transaction_begin",
-        "kin_transaction_stage",
-        "kin_transaction_commit",
-        "kin_mutate",
-        // Without abort, an agent that decides against a transaction, or that
-        // wants to start clean after a refusal, has no way out of the one it
-        // holds: begin/stage/commit can only push work forward. A write profile
-        // that cannot abandon a transaction cannot honor "nothing half-applies".
-        "kin_transaction_abort",
-        "kin_provenance_query",
-        // The first call a new user's agent makes answers "not a Kin
-        // repository", and on a registry install there is no `kin` on the
-        // user's PATH to run `kin init` with. This profile already writes, so
-        // it carries the setup itself. It is a write: it creates a store and
-        // the repository's canonical state, so the profiles that only read
-        // never carry it, and their refusal names the command to run instead.
-        crate::repository_init::TOOL_NAME,
-        // The other half of writing code through this belt: building, testing
-        // and running what `kin_mutate` wrote. `kin setup` serves this profile
-        // to Claude Code, and `kin with --semantic-only` launches it with no
-        // shell at all, so without it an agent Kin itself configured could
-        // create code and never run it. It writes the manifests a toolchain
-        // run hands back, so the read-only profiles never carry it.
-        crate::session_exec::TOOL_NAME,
+        crate::verbs::IMPACT,
+        // A profile carrying the write surface must carry a direct entity-body
+        // read. Updating a body means restating the entity's current source, so
+        // an agent without a body read can only guess it -- and a guessed body
+        // silently overwrites the real one on commit. The discovery tools hand
+        // back ids and bounded snippets; this is the tool that turns an id into
+        // the exact graph-owned body.
+        crate::verbs::SOURCE,
+        // One entity's call chain, or, given `to`, the route between two named
+        // things, which is the ordinary shape of a code question and one call
+        // where the locate-then-trace loop cost five.
+        crate::verbs::TRACE,
+        crate::verbs::REFS,
+        crate::verbs::NEIGHBORS,
+        // Writes open the connection's own semantic session. Transactions
+        // group a change across several targeted calls.
+        crate::verbs::TRANSACTION,
+        crate::verbs::MUTATE,
+        crate::verbs::HISTORY,
     ]
 }
 
 /// Tool names for the query half of the agent belt.
 ///
-/// [`agent_default_tool_names`] minus the session and transaction tools. Same
-/// tools, same served names, same short descriptions and trimmed schemas: this
+/// [`agent_default_tool_names`] minus its writes: `init`, `mutate`, `exec`
+/// and `transaction`. Same tools, same served names, same short descriptions and trimmed schemas: this
 /// is that profile with its write half removed, not a second belt to keep in
 /// step with it.
 ///
@@ -1787,25 +1854,25 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
 /// A second served list, not a mode. `agent-default` is unchanged and still
 /// serves every write tool, and nothing here makes Kin itself read-only.
 ///
-/// `get_entity_source` stays. It joined `agent-default` because staging a body
+/// `source` stays. It joined `agent-default` because staging a body
 /// update means restating the current source, which is a write-side argument,
 /// but it is also the tool that turns an id into the exact graph-owned body,
 /// and a querying belt whose discovery tools hand back bounded snippets needs
 /// that door as much as a writing one does.
 pub fn agent_query_tool_names() -> &'static [&'static str] {
     &[
-        "kin_graph_status",
-        "semantic_locate",
-        "semantic_search",
-        "get_context_pack",
-        "impact_analysis",
-        "get_entity_source",
-        "trace_data_flow",
-        crate::handlers::path::TOOL_NAME,
-        "find_references",
-        crate::handlers::lexical::TOOL_NAME,
-        "graph_neighborhood",
-        "kin_provenance_query",
+        // A question in plain words, answered by the verbs below in one reply.
+        // The verbs stay for the steps it does not take.
+        crate::ask::TOOL_NAME,
+        crate::verbs::STATUS,
+        crate::verbs::LOCATE,
+        crate::verbs::CONTEXT,
+        crate::verbs::IMPACT,
+        crate::verbs::SOURCE,
+        crate::verbs::TRACE,
+        crate::verbs::REFS,
+        crate::verbs::NEIGHBORS,
+        crate::verbs::HISTORY,
     ]
 }
 
@@ -1824,9 +1891,178 @@ pub fn agent_routed_tool_names() -> &'static [&'static str] {
 /// The most bytes `agent-query`'s served `tools/list` may cost.
 ///
 /// 14,610 at 97c719c8d, measured on 2026-09-22 before its descriptions were
-/// halved, and 11,079 after. A ceiling, so a description edit that saves bytes
-/// passes and one that grows the list back fails.
-pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 11_079;
+/// halved, and 11,079 after. 9,474 at bfb744592, and 8,084 once the 2026-09-28
+/// cut took the prose that restated a schema and the deprecated inputs off the
+/// read tools it shares with `agent-default`. 8,184 after that cut gained one
+/// served control and two address lines moved: `get_entity_source` serves
+/// `full_body` as its short line, `trace_path`'s `from` line names a
+/// module-qualified name, and the `find_references` query line is one byte
+/// shorter. 6,087 once the twelve tools became nine verbs: `locate` folds the
+/// name filter, the ranking and the literal lookup into one schema with a
+/// `mode`, and `trace` folds the route into the walk with a `to`. 6,218 once each
+/// query verb's description led with the question it answers (2026-10-01):
+/// measured with a local model on tuned tasks, that surface cut generated
+/// tokens by a third at the same exact answers, which is far more than the
+/// 131 bytes it costs a turn, as served to a client that declares it only reads.
+/// 6,300 once `refs` served `include_tests`, the caller-role scope control:
+/// 108 bytes for the control, less 5 from a cursor line that now names the
+/// scope it inherits. 5,836 once the 2026-10-03 cut, recorded on
+/// [`AGENT_DEFAULT_DEFINITION_CEILING_BYTES`], reached the read verbs it
+/// shares with `agent-default`, and 5,622 once the 2026-10-04 cut recorded
+/// there did: 1,666 Qwen3.8 tokens a turn became 1,599.
+/// 5,690 once `trace` served `details`, which serves a walk's rows whole
+/// behind its short default: 68 bytes for the one property.
+/// 5,737 once `trace` served `include_tests`, the control that leaves test
+/// code out of a callers walk so a question that excludes tests is answered
+/// complete in one call: 47 bytes for the one property.
+/// 5,819 once `impact` served `include_tests` and `dependents`, so a change
+/// question leaves test code out and counts what else the change could reach
+/// instead of listing it: 82 bytes for the two properties.
+/// 5,820 once `context` took sixteen entities in one call instead of eight:
+/// one byte, for the second digit of the list's bound.
+/// 5,872 once `refs` and `impact` took `scope`, the module path a walk
+/// already takes, so a question about one package is one call: 52 bytes for
+/// the two properties, described once, on `trace`.
+/// 5,879 once `locate` took mode `text`, exact text in what Kin holds of each
+/// parsed module, answered with the entity that holds it: 7 bytes for the one
+/// enum value.
+/// A ceiling, so a description edit that saves bytes passes and one that grows
+/// the list back fails.
+/// 6,028 once `locate` took `scope` and `sort`: `scope` confines the rows to
+/// a module path, undescribed as on `refs` and `impact`; `sort` re-sorts the 20
+/// most relevant rows by proven callers or hops from a root, with its measured
+/// cost in one clause: 149 bytes for the two properties.
+/// 6,362 once it listed `ask`, the front door that routes a plain question to
+/// these verbs and composes one reply, served with its question alone: 334
+/// bytes for the definition and its annotations, about 85 tokens a turn.
+pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 6_362;
+
+/// The most bytes `agent-default`'s served `tools/list` may cost: what a bare
+/// `kin mcp start` hands every client, and what `kin setup` writes for every
+/// client that is not an eager one.
+///
+/// 47,538 at bfb744592, 22 tools, of which `kin_transaction_stage` and
+/// `kin_transaction_commit` were 29,866 because each carried the whole nested
+/// operation contract. An eager client resends the list every turn, and on the
+/// 0.8.2 head-to-head's local 27B model, prefill grew with it while model time
+/// was 95 to 100 percent of every run. 14,619 after the 2026-09-28 cut, with
+/// the same 22 tools: the operation shape is served once, on `kin_mutate`,
+/// with the rarer forms spelled out by the refusal a caller gets when it sends
+/// one wrong, and the prose that restated a name, an enum or a bound is gone.
+/// 14,719 once `get_entity_source` served `full_body` and the shared address
+/// lines moved by the same net five bytes as the query profile. 10,500 once the
+/// 22 tools became 13 verbs: the three locate tools, the walk and the route,
+/// the four session tools and the four transaction tools each fold into one
+/// schema with an option, and nine fewer tools carry nine fewer annotation
+/// objects. 10,516 once each query verb's description led with the question it
+/// answers, as [`AGENT_QUERY_LIST_CEILING_BYTES`] records. 9,421 over 11 verbs
+/// on 2026-10-03, with the ceiling left where it was, 8,672 after that day's
+/// cut, and 8,431 after the 2026-10-04 cut, both recorded on
+/// [`AGENT_DEFAULT_DEFINITION_CEILING_BYTES`].
+///
+/// Measured as the stdio handler serves it, annotations included. They and
+/// their keys are 1,421 of these bytes: every hint on every tool is serialized
+/// on purpose (see [`crate::types::ToolAnnotations`]), and clients read them
+/// for permissions and display rather than sending them to the model.
+/// [`AGENT_DEFAULT_DEFINITION_CEILING_BYTES`] holds the part a model reads.
+/// 8,499 once `trace` served `details`, which serves a walk's rows whole
+/// behind its short default: 68 bytes for the one property.
+/// 8,546 once `trace` served `include_tests`, the control that leaves test
+/// code out of a callers walk so a question that excludes tests is answered
+/// complete in one call: 47 bytes for the one property.
+/// 8,628 once `impact` served `include_tests` and `dependents`, so a change
+/// question leaves test code out and counts what else the change could reach
+/// instead of listing it: 82 bytes for the two properties.
+/// 8,629 once `context` took sixteen entities in one call instead of eight:
+/// one byte, for the second digit of the list's bound.
+/// 8,681 once `refs` and `impact` took `scope`, the module path a walk
+/// already takes, so a question about one package is one call: 52 bytes for
+/// the two properties, described once, on `trace`.
+/// 8,759 once `mutate` said how a Python method is created, beside a method or
+/// as a member of its class, which no other served line says: 78 bytes on
+/// the one description.
+/// 9,056 once `mutate` served `EntityContent`, the one payload that gives an
+/// entity Kin holds without parsing content Kin already holds, by replace or
+/// create: 297 bytes for the payload, its sentence and its verb pairing.
+/// 9,203 once `locate` took `scope` and `sort`: `scope` confines the rows to
+/// a module path, undescribed as on `refs` and `impact`; `sort` re-sorts the 20
+/// most relevant rows by proven callers or hops from a root, with its measured
+/// cost in one clause: 147 bytes for the two properties.
+pub const AGENT_DEFAULT_LIST_CEILING_BYTES: usize = 9_203;
+
+/// The most bytes `agent-default`'s tool definitions may cost, summed one
+/// definition at a time as a client hands each to its model: name,
+/// description and input schema. An agent re-sends every one on every model
+/// turn, so this is a per-turn cost.
+///
+/// Measured as a listing of those three fields, it was 44,620 bytes at
+/// bfb744592, 11,701 after the 2026-09-28 cut, 11,801 after `full_body`, 8,816
+/// over the 13 verbs, and 8,000 over the 11 verbs on 2026-10-03, which is 7,978
+/// summed per definition, about 2,600 tokens a turn with Qwen3.8's tokenizer.
+///
+/// 7,229 after the 2026-10-03 cut. No property, type, enum value, bound,
+/// required list or argument name moved, and the server checks every call
+/// exactly as before. What went: property prose the name, the served default or
+/// the tool's own description already says (`locate`'s `mode` and `query`,
+/// `trace`'s `include_body` and `cursor`, `context`'s body toggles, `history`'s
+/// `offset`, `mutate`'s `operations`, `summary` and `transaction_id`, and
+/// `transaction`'s `transaction_id` and `message`, each kept on `full`); the
+/// numeric and choice defaults a handler applies whether or not they are
+/// advertised, while a default the belt injects is still served; and two
+/// clauses of `mutate`'s payload prose.
+///
+/// 6,988 after the 2026-10-04 cut. Measured with the served model's own
+/// tokenizer (Qwen3.8, each definition rendered as its chat template renders
+/// it), the 11 definitions went from 2,428 tokens a turn to 2,351. No tool,
+/// property, type, enum value, required list or argument name moved, and the
+/// server checks every call exactly as before. What went: the continuation
+/// clause on `locate`, `impact`, `status` and `refs`'s `cursor`, which every
+/// paged reply already spells out; the length bound on the five values a
+/// caller copies back from a reply rather than chooses
+/// ([`crate::request_schema::Field::from_reply`]), still enforced and still
+/// served on `full`; `details`' cursor-inheritance clause on `locate` and
+/// `refs`, replaced by what the toggle buys; the enum `transaction` restated
+/// in prose; and `mutate`'s pairing branches, which name each verb with
+/// `const` rather than a one-value `enum`. `trace`'s `scope` gained the form it
+/// takes, a dotted module prefix as rows spell `module`: the only scored cell
+/// whose listing has offered `scope` so far asked a package-scoped reach
+/// question, and its agent traced unscoped once, then read 359 KB through
+/// eleven `refs` calls.
+///
+/// What holds it here rather than lower: every budgeted verb serves
+/// `max_output_bytes` with its minimum, default and maximum, which
+/// `response_budget_elisions.py` `check_2` grades on this profile (595 bytes,
+/// 280 tokens); every served schema refuses what the server refuses wherever a
+/// caller's own choice can break the rule, so the bounds and `mutate`'s verb
+/// and payload pairing stay (held by
+/// `every_invalid_probe_is_refused_with_the_fix`). Even with no property prose,
+/// bound, pairing or unbudgeted default at all, the names, types, enums,
+/// required lists, budgets and tool descriptions come to 4,695 bytes, and the
+/// per-tool wrapper a client adds is 34 tokens a tool before any of it.
+/// 7,056 once `trace` served `details`, which serves a walk's rows whole
+/// behind its short default: 68 bytes for the one property.
+/// 7,103 once `trace` served `include_tests`, the control that leaves test
+/// code out of a callers walk so a question that excludes tests is answered
+/// complete in one call: 47 bytes for the one property.
+/// 7,185 once `impact` served `include_tests` and `dependents`, so a change
+/// question leaves test code out and counts what else the change could reach
+/// instead of listing it: 82 bytes for the two properties.
+/// 7,186 once `context` took sixteen entities in one call instead of eight:
+/// one byte, for the second digit of the list's bound.
+/// 7,238 once `refs` and `impact` took `scope`, the module path a walk
+/// already takes, so a question about one package is one call: 52 bytes for
+/// the two properties, described once, on `trace`.
+/// 7,316 once `mutate` said how a Python method is created, beside a method or
+/// as a member of its class, which no other served line says: 78 bytes on
+/// the one description.
+/// 7,613 once `mutate` served `EntityContent`, the one payload that gives an
+/// entity Kin holds without parsing content Kin already holds, by replace or
+/// create: 297 bytes for the payload, its sentence and its verb pairing.
+/// 7,760 once `locate` took `scope` and `sort`: `scope` confines the rows to
+/// a module path, undescribed as on `refs` and `impact`; `sort` re-sorts the 20
+/// most relevant rows by proven callers or hops from a root, with its measured
+/// cost in one clause: 147 bytes for the two properties.
+pub const AGENT_DEFAULT_DEFINITION_CEILING_BYTES: usize = 7_760;
 
 /// The most bytes the tool-search profile's `tools/list` may cost, measured on
 /// the profile AS SERVED.
@@ -1842,7 +2078,27 @@ pub const AGENT_QUERY_LIST_CEILING_BYTES: usize = 11_079;
 /// sentence to any served description naming a withheld tool, and this profile
 /// withholds 62 of 67, so a ceiling computed before that annotation would be
 /// measuring a listing no client receives.
-pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 8_000;
+///
+/// 4,231 after the 2026-10-03 cut recorded on
+/// [`AGENT_DEFAULT_DEFINITION_CEILING_BYTES`], and 4,108 after the 2026-10-04
+/// one, which also took the default and ceiling `kin_tool_search`'s `limit`
+/// restated beside its own schema and the second of its two "omit `need`"
+/// sentences. Held here so the saving cannot quietly grow back.
+/// 4,176 once `trace` served `details`, which serves a walk's rows whole
+/// behind its short default: 68 bytes for the one property.
+/// 4,223 once `trace` served `include_tests`, the control that leaves test
+/// code out of a callers walk so a question that excludes tests is answered
+/// complete in one call: 47 bytes for the one property.
+/// 4,224 once `context` took sixteen entities in one call instead of eight:
+/// one byte, for the second digit of the list's bound.
+/// 4,231 once `locate` took mode `text`: 7 bytes for the one enum value.
+/// 4,380 once `locate` took `scope` and `sort`: `scope` confines the rows to
+/// a module path, undescribed as on `refs` and `impact`; `sort` re-sorts the 20
+/// most relevant rows by proven callers or hops from a root, with its measured
+/// cost in one clause: 149 bytes for the two properties.
+/// 4,714 once it listed `ask` in its always-on set, served with its question
+/// alone, the same 334 bytes `agent-query` pays for it.
+pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 4_714;
 
 /// Tool names for the always-on set the tool-search profile serves.
 ///
@@ -1880,13 +2136,27 @@ pub const AGENT_SEARCH_LIST_CEILING_BYTES: usize = 8_000;
 /// not introduce.
 pub fn agent_search_tool_names() -> &'static [&'static str] {
     &[
-        "semantic_locate",
-        "trace_data_flow",
-        "get_context_pack",
-        "kin_graph_status",
+        crate::ask::TOOL_NAME,
+        crate::verbs::LOCATE,
+        crate::verbs::TRACE,
+        crate::verbs::CONTEXT,
+        crate::verbs::STATUS,
         crate::handlers::tool_search::TOOL_NAME,
         crate::tool_invocation::TOOL_NAME,
     ]
+}
+
+/// Tool names for `agent-ask`: the front door alone.
+///
+/// The surface the 2026-10-07 sealed comparison measured: the model asked
+/// Kin through one tool taking a question in plain words, and Kin routed it,
+/// ran the verbs and composed the reply. It is the smallest named surface this
+/// crate serves, one definition a turn, and every read verb stays reachable
+/// through it because [`crate::ask`] runs them. It writes nothing. It is not
+/// the default; whether it becomes the read default is decided after a gate
+/// on the default profile.
+pub fn agent_ask_tool_names() -> &'static [&'static str] {
+    &[crate::ask::TOOL_NAME]
 }
 
 /// Tool names for the READ-ONLY graph-native ContextBench profile.
@@ -2041,7 +2311,7 @@ mod tests {
     /// without either looking wrong on its own.
     #[test]
     fn a_served_description_never_points_at_a_withheld_tool_in_silence() {
-        let registered: Vec<String> = tool_definitions()
+        let registered: Vec<String> = surface_definitions()
             .tools
             .iter()
             .map(|tool| tool.name.clone())
@@ -2050,7 +2320,7 @@ mod tests {
         let served_set: std::collections::HashSet<String> =
             served.iter().map(|name| (*name).to_string()).collect();
 
-        let mut list = tool_definitions();
+        let mut list = surface_definitions();
         list.tools.retain(|tool| served_set.contains(&tool.name));
         assert_eq!(
             list.tools.len(),
@@ -2098,8 +2368,8 @@ mod tests {
         let find_references = list
             .tools
             .iter()
-            .find(|tool| tool.name == "find_references")
-            .expect("find_references is in agent-default");
+            .find(|tool| tool.name == crate::verbs::REFS)
+            .expect("refs is in agent-default");
         assert!(
             find_references
                 .description
@@ -2132,7 +2402,7 @@ mod tests {
     /// handler calls, and grades the description as served.
     #[test]
     fn no_served_description_on_any_belt_profile_points_at_a_withheld_tool_in_silence() {
-        let registered: Vec<String> = tool_definitions()
+        let registered: Vec<String> = surface_definitions()
             .tools
             .iter()
             .map(|tool| tool.name.clone())
@@ -2143,6 +2413,7 @@ mod tests {
             ("agent-default", agent_default_tool_names()),
             ("agent-query", agent_query_tool_names()),
             ("agent-search", agent_search_tool_names()),
+            ("agent-ask", agent_ask_tool_names()),
         ] {
             let allowed = name_set(names);
             let served = served_tools_list(Some(&allowed), true);
@@ -2197,13 +2468,33 @@ mod tests {
             }
         }
 
-        // Two since 2026-09-22: the halved `get_context_pack` short form no
-        // longer names `get_entity_source`, so `agent-search` carries two notes,
-        // for `semantic_locate` and `trace_data_flow`, where it carried three.
+        // None since the verbs: the one pointer a belt short form carries,
+        // `trace` from `refs` and `neighbors`, is served wherever they are, and
+        // the choices that used to point at a second tool are options on one.
+        assert_eq!(
+            annotated_total, 0,
+            "a belt profile serves a description pointing at a tool it withholds"
+        );
+
+        // The control: a listing that serves `refs` and withholds `trace` must
+        // say where `trace` is, or the sweep above is passing because it cannot
+        // see a verb at all.
+        let allowed = name_set(&[crate::verbs::REFS, crate::handlers::tool_search::TOOL_NAME]);
+        let served = served_tools_list(Some(&allowed), true);
+        let refs = served
+            .tools
+            .iter()
+            .find(|tool| tool.name == crate::verbs::REFS)
+            .expect("the control serves refs");
         assert!(
-            annotated_total >= 2,
-            "the sweep annotated {annotated_total} served descriptions across three profiles, \
-             so it is not reaching the surface it grades"
+            refs.description
+                .contains("not served by this tool profile: trace")
+                && refs.description.contains(&format!(
+                    "Call {} for",
+                    crate::handlers::tool_search::TOOL_NAME
+                )),
+            "a withheld verb went unannotated: {}",
+            refs.description
         );
     }
 
@@ -2324,12 +2615,14 @@ mod tests {
     /// with whatever the registry claims and could never disagree with it. Each
     /// name here was classified by reading its handler.
     const WRITING_TOOLS: &[&str] = &[
+        crate::verbs::MUTATE,
+        crate::verbs::SESSION,
+        crate::verbs::TRANSACTION,
         "kin_draft_apply",
         "kin_draft_create",
         "kin_draft_save",
         "kin_annotation_add",
         "kin_annotation_mark_resolved",
-        "kin_init",
         "kin_mutate",
         "kin_register_intent",
         "kin_release_intent",
@@ -2342,10 +2635,8 @@ mod tests {
         "kin_review_note_add",
         "kin_review_unassign",
         "kin_session_end",
-        "kin_session_exec",
         "kin_session_heartbeat",
         "kin_session_start",
-        "kin_todo_import",
         "kin_transaction_abort",
         "kin_transaction_begin",
         "kin_transaction_commit",
@@ -2368,12 +2659,15 @@ mod tests {
     /// replace a state field in place; `kin_annotation_mark_resolved` deletes
     /// the annotation; `kin_review_unassign` removes the assignment;
     /// `kin_session_exec` records the manifests and lockfiles a toolchain
-    /// rewrote over the ones the repository held.
+    /// rewrote over the ones the repository held. The verbs that fold one of
+    /// these, `mutate`, `exec`, `transaction` and the retired `session`, carry
+    /// its hint.
     const DESTRUCTIVE_TOOLS: &[&str] = &[
+        crate::verbs::MUTATE,
+        crate::verbs::TRANSACTION,
         "kin_draft_apply",
         "kin_annotation_mark_resolved",
         "kin_mutate",
-        "kin_session_exec",
         "kin_review_discuss_resolve",
         "kin_review_unassign",
         "kin_transaction_abort",
@@ -2410,10 +2704,11 @@ mod tests {
                 tool.name.len()
             );
             // One exception, and it is the honest hint: a toolchain run may
-            // fetch from a package registry, which is outside the graph.
+            // fetch from a package registry, which is outside the graph. The
+            // `exec` verb serves that run, and the retired `session` verb
+            // still folds it as its exec action.
             assert_eq!(
-                annotations.open_world_hint,
-                tool.name == crate::session_exec::TOOL_NAME,
+                annotations.open_world_hint, false,
                 "{} claims the wrong world; the rest of the surface answers from the local graph",
                 tool.name
             );
@@ -2561,23 +2856,24 @@ mod tests {
             .as_array()
             .expect("serialized tools/list must contain a tools array");
 
-        for (tool_name, expected_description, expected_top_required) in [
+        for (tool_name, expected_top_required) in [
             (
                 "kin_transaction_stage",
-                crate::handlers::sessions::TRANSACTION_STAGE_DESC,
                 ["operations", "transaction_id"].as_slice(),
             ),
-            (
-                "kin_transaction_commit",
-                crate::handlers::sessions::TRANSACTION_COMMIT_DESC,
-                ["transaction_id"].as_slice(),
-            ),
+            ("kin_transaction_commit", ["transaction_id"].as_slice()),
         ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == tool_name)
                 .unwrap_or_else(|| panic!("{tool_name} must be exposed by tools/list"));
-            assert_eq!(tool["description"], expected_description);
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.contains("EntitySourcePatch"), "{description}");
+            assert!(
+                description.to_lowercase().contains("unknown fields"),
+                "{description}"
+            );
+            assert!(!description.contains("modified_files"), "{description}");
             if tool_name == "kin_transaction_stage" {
                 let description = tool["description"].as_str().unwrap();
                 assert!(
@@ -2598,7 +2894,7 @@ mod tests {
             let variants = tool["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .expect("transaction operations must be disjoint oneOf variants");
-            assert_eq!(variants.len(), 6, "{tool_name}");
+            assert_eq!(variants.len(), 7, "{tool_name}");
             let imports = variants
                 .iter()
                 .find(|variant| variant["title"] == "UnitImports")
@@ -2638,9 +2934,14 @@ mod tests {
                 assert!(!title.contains("source file"), "{tool_name}: {title}");
                 assert!(variant["properties"].get("destination").is_none());
                 let verbs = variant["properties"]["verb"]["enum"].as_array().unwrap();
+                // EntityContent's replace gives an entity Kin holds without
+                // parsing it content Kin already holds, by its address; no
+                // path or body travels, so it is no whole-source write.
+                let content = title == "EntityContent";
                 for forbidden in ["replace", "overwrite", "rename", "move"] {
                     assert!(
-                        !verbs.iter().any(|verb| verb == forbidden),
+                        (content && forbidden == "replace")
+                            || !verbs.iter().any(|verb| verb == forbidden),
                         "{tool_name}: {forbidden}"
                     );
                 }
@@ -2709,8 +3010,13 @@ mod tests {
         // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
         // + 1 get_entity_sources + 1 trace_path + 1 kin_tool_search + 1 kin_mutate
         // + 6 durable entity draft tools + 1 lexical_lookup + 1 kin_tool_call
-        // + 1 kin_init + 1 kin_session_exec = 75
-        assert_eq!(list.tools.len(), 75);
+        // + 1 kin_init + 1 kin_session_exec = 75, + 13 verbs and the retired
+        // `session` = 89. The 23 names the verbs replaced, `session` among
+        // them, stay registered as hidden aliases, so `full` serves 66.
+        // `ask`, the front door that routes a plain question to these verbs,
+        // makes 85 registered and 65 served on `full`.
+        assert_eq!(list.tools.len(), 85);
+        assert_eq!(surface_definitions().tools.len(), 65);
     }
 
     /// The reference lists each category's members on a line opening with this
@@ -2817,7 +3123,10 @@ mod tests {
     #[test]
     fn mcp_doc_enumerates_exactly_the_registered_tools() {
         let doc = include_str!("../../../docs/mcp-tools.md");
-        let list = tool_definitions();
+        // The surface `full` serves. The names the verbs replaced are accepted
+        // and never listed, so the page names each in its deprecated-alias
+        // table rather than in a category roster.
+        let list = surface_definitions();
         let registered: BTreeSet<String> =
             list.tools.iter().map(|tool| tool.name.clone()).collect();
         assert_eq!(
@@ -2832,6 +3141,14 @@ mod tests {
             "docs/mcp-tools.md disagrees with the registry:\n{}",
             problems.join("\n")
         );
+        for (alias, verb) in crate::verbs::ALIASES {
+            assert!(
+                doc.lines()
+                    .any(|line| line.starts_with(&format!("| `{alias}` |"))
+                        && line.contains(&format!("`{verb}`"))),
+                "docs/mcp-tools.md has no deprecated-alias row saying {alias} is now {verb}"
+            );
+        }
     }
 
     #[test]
@@ -2945,6 +3262,8 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         // of this profile has no way to give. 24 since kin_init joined: on a
         // registry install the first answer says the folder is not a Kin
         // repository, and no `kin` is on the user's PATH to fix that with.
+        // 13 since the verbs: one tool per capability, the choice between the
+        // tools one used to be split across an option on it.
         assert!(
             profile.len() >= 10 && profile.len() <= 24,
             "agent-default should be small but cover the wedge; got {}",
@@ -2963,16 +3282,15 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             );
         }
         for required in [
+            // Name search, description ranking and literal lookup.
             "semantic_locate",
+            "semantic_search",
+            "lexical_lookup",
             "get_context_pack",
             // The write surface is only safe with a body read beside it.
             "get_entity_source",
             "kin_transaction_commit",
             "kin_provenance_query",
-            // kin_session_start tells the agent to keep the session alive with
-            // this tool. A profile that carries the advice without the tool
-            // strands any agent whose read phase outlasts the idle TTL.
-            "kin_session_heartbeat",
             // The only clean exit from a transaction the agent decided against.
             "kin_transaction_abort",
             // The flagship question. A configured agent that cannot ask what a
@@ -2983,9 +3301,10 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             // B" spends five calls on single-rooted walks (FIR-3070).
             crate::handlers::path::TOOL_NAME,
         ] {
+            let verb = crate::verbs::verb_for(required).expect("a verb serves it");
             assert!(
-                profile.contains(&required),
-                "agent-default must include {required}"
+                profile.contains(&verb),
+                "agent-default must reach {required}, through {verb}"
             );
         }
 
@@ -2994,11 +3313,11 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         let context_pack = list
             .tools
             .iter()
-            .find(|tool| tool.name == "get_context_pack")
-            .expect("get_context_pack is in the profile");
+            .find(|tool| tool.name == crate::verbs::CONTEXT)
+            .expect("context is in the profile");
         assert!(
             context_pack.description.contains("focal_entity.body"),
-            "get_context_pack must name the field carrying the source text"
+            "context must name the field carrying the source text"
         );
 
         // Structural guard on the write half of this profile: any profile that can
@@ -3007,12 +3326,10 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         // current source, and a guessed body overwrites the real one on commit.
         let can_write = profile
             .iter()
-            .any(|name| name.starts_with("kin_transaction_"));
+            .any(|name| matches!(*name, crate::verbs::TRANSACTION | crate::verbs::MUTATE));
         if can_write {
             assert!(
-                profile
-                    .iter()
-                    .any(|name| matches!(*name, "get_entity_source" | "get_entity_body")),
+                profile.iter().any(|name| *name == crate::verbs::SOURCE),
                 "a profile with the transaction write surface must carry a direct \
                  entity-body read; got {profile:?}"
             );
@@ -3053,18 +3370,16 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         assert_eq!(
             sorted,
             vec![
-                "find_references",
-                "get_context_pack",
-                "get_entity_source",
-                "graph_neighborhood",
-                "impact_analysis",
-                "kin_graph_status",
-                "kin_provenance_query",
-                "lexical_lookup",
-                "semantic_locate",
-                "semantic_search",
-                "trace_data_flow",
-                "trace_path",
+                "ask",
+                "context",
+                "history",
+                "impact",
+                "locate",
+                "neighbors",
+                "refs",
+                "source",
+                "status",
+                "trace",
             ],
             "the query profile's served names moved; a name here is a public surface"
         );
@@ -3089,7 +3404,14 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         }
 
         let default: BTreeSet<&str> = agent_default_tool_names().iter().copied().collect();
-        let query_set: BTreeSet<&str> = query.iter().copied().collect();
+        // The front door is the one name agent-query serves ahead of the
+        // default belt: the default profile changes only after a benchmark
+        // gate on it says the front door helps.
+        let query_set: BTreeSet<&str> = query
+            .iter()
+            .copied()
+            .filter(|name| *name != crate::ask::TOOL_NAME)
+            .collect();
         assert!(
             query_set.is_subset(&default),
             "agent-query serves a name agent-default does not, so the two belts have drifted: {:?}",
@@ -3098,18 +3420,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         let removed: Vec<&str> = default.difference(&query_set).copied().collect();
         assert_eq!(
             removed,
-            vec![
-                "kin_init",
-                "kin_mutate",
-                "kin_session_end",
-                "kin_session_exec",
-                "kin_session_heartbeat",
-                "kin_session_start",
-                "kin_transaction_abort",
-                "kin_transaction_begin",
-                "kin_transaction_commit",
-                "kin_transaction_stage",
-            ],
+            vec!["mutate", "transaction"],
             "the query profile removed something other than the write half"
         );
     }
@@ -3139,7 +3450,9 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         // rather than the measured number: the point is that the write
         // contracts are gone, and pinning the exact byte count would fail on
         // every description edit while saying nothing about that.
-        const CEILING_PERCENT: usize = 65;
+        // Retiring the two operator tools shrank the default denominator.
+        // Absolute per-profile byte ceilings below still prevent growth.
+        const CEILING_PERCENT: usize = 70;
 
         let default = served_tools_list(Some(&name_set(agent_default_tool_names())), true);
         let query = served_tools_list(Some(&name_set(agent_query_tool_names())), true);
@@ -3173,19 +3486,19 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             query_bytes > 5_000,
             "the query listing is {query_bytes} bytes, which is too small to be a real surface"
         );
-        let serialized = serde_json::to_string(&query).expect("a tool listing serializes");
+        let names: BTreeSet<&str> = query.tools.iter().map(|tool| tool.name.as_str()).collect();
         for withheld in [
-            "kin_transaction_stage",
-            "kin_transaction_commit",
-            "kin_session_start",
+            crate::verbs::TRANSACTION,
+            crate::verbs::EXEC,
+            crate::verbs::MUTATE,
         ] {
             assert!(
-                !serialized.contains(withheld),
+                !names.contains(withheld),
                 "the query listing still carries `{withheld}`, so the saving is not what it looks"
             );
         }
         assert!(
-            serialized.contains("semantic_locate") && serialized.contains("trace_data_flow"),
+            names.contains(crate::verbs::LOCATE) && names.contains(crate::verbs::TRACE),
             "the query listing lost the retrieval tools it exists to serve"
         );
     }
@@ -3212,7 +3525,7 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             query
                 .tools
                 .iter()
-                .any(|tool| tool.name == "get_entity_source"
+                .any(|tool| tool.name == crate::verbs::SOURCE
                     && tool.description == crate::entity_lines::NUMBERED_SOURCE_DESCRIPTION),
             "the measured listing is not the numbered one agent-query serves"
         );
@@ -3231,6 +3544,150 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         );
         // The control: a real surface, not an empty one under a ceiling.
         assert!(bytes > 5_000, "the query listing is {bytes} bytes");
+    }
+
+    /// `agent-default`'s served list cannot grow back past what it cost after
+    /// the 2026-10-03 cut, with every one of its verbs served. The part a model
+    /// reads is held per definition by
+    /// `agent_default_definitions_stay_under_their_lean_ceiling`.
+    ///
+    /// A bare `kin mcp start` serves this profile, so these bytes ride every
+    /// turn of every client that loads what it is handed. Printed per tool as
+    /// well as asserted, because the numbers are the artifact.
+    #[test]
+    fn the_default_listing_stays_under_its_measured_ceiling() {
+        // Measured as the server serves it: a write connection, so entity
+        // lines are not numbered.
+        let config = crate::server::McpServerConfig {
+            allowed_tools: Some(name_set(agent_default_tool_names())),
+            agent_belt: true,
+            number_entity_lines: false,
+            ..crate::server::McpServerConfig::default()
+        };
+        let served = crate::server::served_tools_for(&config);
+        assert_eq!(
+            served.tools.len(),
+            agent_default_tool_names().len(),
+            "a tool left the profile; the ceiling holds bytes, not capabilities"
+        );
+        let wire = serde_json::to_string(&served)
+            .expect("a tool listing serializes")
+            .len();
+        // What a client hands its model: name, description and input schema.
+        let model_facing = |tools: &[ToolDefinition]| {
+            serde_json::to_string(&json!({
+                "tools": tools
+                    .iter()
+                    .map(|tool| json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": tool.input_schema,
+                    }))
+                    .collect::<Vec<_>>()
+            }))
+            .expect("a tool listing serializes")
+            .len()
+        };
+        let model = model_facing(&served.tools);
+        for tool in &served.tools {
+            println!(
+                "agent-default {:<24} {:>5} bytes, schema {:>5}",
+                tool.name,
+                serde_json::to_string(tool)
+                    .map(|text| text.len())
+                    .unwrap_or(0),
+                serde_json::to_string(&tool.input_schema)
+                    .map(|text| text.len())
+                    .unwrap_or(0),
+            );
+        }
+        println!(
+            "tools/list bytes: agent-default {wire} (ceiling {AGENT_DEFAULT_LIST_CEILING_BYTES}, \
+             47,538 at bfb744592, 14,719 over 22 tools before the verbs), model-facing {model} \
+             (44,620 at bfb744592)"
+        );
+        assert!(
+            wire <= AGENT_DEFAULT_LIST_CEILING_BYTES,
+            "agent-default's tools/list is {wire} bytes, over its \
+             {AGENT_DEFAULT_LIST_CEILING_BYTES}-byte ceiling; a description or schema grew back"
+        );
+        // The controls: a real surface, carrying its write half, and the
+        // registry it was cut from still far larger.
+        assert!(wire > 6_000, "the default listing is {wire} bytes");
+        for name in [crate::verbs::MUTATE, crate::verbs::TRANSACTION] {
+            assert!(
+                served.tools.iter().any(|tool| tool.name == name),
+                "agent-default lost {name}"
+            );
+        }
+        // A write opens its connection's own session, so none is listed.
+        assert!(
+            !served
+                .tools
+                .iter()
+                .any(|tool| tool.name == crate::verbs::SESSION),
+            "agent-default lists the retired session tool"
+        );
+        let registered: Vec<ToolDefinition> = tool_definitions()
+            .tools
+            .into_iter()
+            .filter(|tool| agent_default_tool_names().contains(&tool.name.as_str()))
+            .collect();
+        assert!(
+            model_facing(&registered) > model * 4,
+            "the registered forms of these tools must be far larger than the served ones"
+        );
+    }
+
+    /// Every `agent-default` definition a model is handed, measured one tool at
+    /// a time as name, description and input schema, and their total held under
+    /// [`AGENT_DEFAULT_DEFINITION_CEILING_BYTES`].
+    ///
+    /// Printed per tool with the served definition itself, because a client
+    /// re-sends these on every model turn and the next person to touch a schema
+    /// should see what each one costs.
+    #[test]
+    fn agent_default_definitions_stay_under_their_lean_ceiling() {
+        let config = crate::server::McpServerConfig {
+            allowed_tools: Some(name_set(agent_default_tool_names())),
+            agent_belt: true,
+            number_entity_lines: false,
+            ..crate::server::McpServerConfig::default()
+        };
+        let served = crate::server::served_tools_for(&config);
+        assert_eq!(served.tools.len(), agent_default_tool_names().len());
+        let mut total = 0;
+        for tool in &served.tools {
+            let definition = serde_json::to_string(&json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            }))
+            .expect("a tool definition serializes");
+            let schema = serde_json::to_string(&tool.input_schema)
+                .expect("a schema serializes")
+                .len();
+            println!(
+                "agent-default {:<12} definition {:>5} bytes, description {:>4}, schema {:>5}\n  {definition}",
+                tool.name,
+                definition.len(),
+                tool.description.len(),
+                schema,
+            );
+            total += definition.len();
+        }
+        println!(
+            "agent-default definitions: {total} bytes over {} tools, ceiling \
+             {AGENT_DEFAULT_DEFINITION_CEILING_BYTES}",
+            served.tools.len()
+        );
+        assert!(
+            total <= AGENT_DEFAULT_DEFINITION_CEILING_BYTES,
+            "agent-default's tool definitions are {total} bytes, over their \
+             {AGENT_DEFAULT_DEFINITION_CEILING_BYTES}-byte ceiling; a description or schema grew back"
+        );
+        // The control: a real surface, not an empty one under a ceiling.
+        assert!(total > 3_000, "the default definitions are {total} bytes");
     }
 
     /// A named write connection is told apart from a read-only one by the
@@ -3273,12 +3730,13 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
         assert_eq!(
             unique,
             BTreeSet::from([
-                "get_context_pack",
-                "kin_graph_status",
+                crate::verbs::CONTEXT,
+                crate::verbs::STATUS,
                 crate::handlers::tool_search::TOOL_NAME,
                 crate::tool_invocation::TOOL_NAME,
-                "semantic_locate",
-                "trace_data_flow",
+                crate::verbs::LOCATE,
+                crate::verbs::TRACE,
+                crate::ask::TOOL_NAME,
             ]),
             "the always-on set moved; that is a public surface change and it ships with its \
              docs and its acceptance case in the same commit"
@@ -3339,7 +3797,14 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             "agent-search is {bytes} bytes and must remain smaller than agent-query's {query_bytes}"
         );
         let serialized = serde_json::to_string(&served).expect("a tool listing serializes");
-        for withheld in ["impact_analysis", "find_references", "get_entity_source"] {
+        for withheld in [
+            crate::verbs::IMPACT,
+            crate::verbs::REFS,
+            crate::verbs::SOURCE,
+            "impact_analysis",
+            "find_references",
+            "get_entity_source",
+        ] {
             assert!(
                 !serialized.contains(&format!("\"name\":\"{withheld}\"")),
                 "the search listing still serves `{withheld}`"
@@ -3351,11 +3816,13 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
     ///
     /// Assertion 2, and the new silent failure this surface creates: a tool that
     /// nothing serves and nothing finds is gone from the product without a line
-    /// of code saying so. Driven over the whole registry rather than a sample,
-    /// because a sample passes while one tool falls out of the index.
+    /// of code saying so. Driven over the whole served surface rather than a
+    /// sample, because a sample passes while one tool falls out of the index.
+    /// A name a verb replaced is found as its verb, which is the name a call
+    /// should use.
     #[test]
     fn every_registry_tool_is_reachable_through_the_search_tool() {
-        let registry = tool_definitions();
+        let registry = surface_definitions();
         let mut unreachable: Vec<String> = Vec::new();
         for tool in &registry.tools {
             let mut args = std::collections::HashMap::new();

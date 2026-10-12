@@ -73,6 +73,58 @@ pub fn qualify(
     envelope: &kin_mcp::Envelope,
     indent: &str,
 ) -> Vec<String> {
+    qualify_in_kin_words(tool, payload, envelope, indent)
+        .iter()
+        .map(|line| crate::plain_words::line(line))
+        .collect()
+}
+
+/// How the terminal names the `mass_deletion_blocked` signal. Shared so a test
+/// that checks a rendered line names this signal reads the wording from here.
+pub const MASS_DELETION_BLOCKED_WORDS: &str = "a mass deletion was blocked";
+
+/// One machine label a verdict carries, said the way a person would say it.
+///
+/// The labels stay on the machine surface (`--json`); this is only what the
+/// terminal sentence names.
+fn signal_words(label: &str) -> String {
+    match label {
+        "absence_coverage:unreported" => {
+            "Kin was not told which kinds of code it could read here".to_string()
+        }
+        "absence_coverage:classes_unmeasured" => {
+            "Kin has not checked which kinds of code it can read for this language".to_string()
+        }
+        "absence_coverage:scope_empty" => "no files were in scope to check".to_string(),
+        "absence_coverage:name_filter_narrowed" => {
+            "the name filter narrowed the search to nothing".to_string()
+        }
+        "edge_coverage:unreported" => {
+            "Kin has no record of which links between files it built".to_string()
+        }
+        "edge_coverage:reference_enrichment_unsupported" => {
+            "linking references between files is not supported for this language".to_string()
+        }
+        "edge_coverage:reference_enrichment_unknown" => {
+            "Kin has not confirmed whether references between files were linked".to_string()
+        }
+        "mass_deletion_blocked" => MASS_DELETION_BLOCKED_WORDS.to_string(),
+        "memory_pressure" => "the machine was low on memory".to_string(),
+        "embed_worker_failed" => "the background search indexer failed".to_string(),
+        other => {
+            // `family:detail`, or `family:class_state` for one kind of link.
+            let detail = other.split_once(':').map_or(other, |(_, detail)| detail);
+            detail.replace('_', " ")
+        }
+    }
+}
+
+fn qualify_in_kin_words(
+    tool: &str,
+    payload: &serde_json::Value,
+    envelope: &kin_mcp::Envelope,
+    indent: &str,
+) -> Vec<String> {
     let response_gaps = kin_mcp::verdict::Verdict::pre_negative_gaps(payload);
     let Some(negative) = kin_mcp::negative::negative_for(tool, payload, envelope, &response_gaps)
     else {
@@ -151,15 +203,16 @@ pub fn qualify(
                 signals
                     .iter()
                     .filter_map(serde_json::Value::as_str)
+                    .map(signal_words)
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join("; ")
             })
             .filter(|disclosed| !disclosed.is_empty());
         return match disclosed {
             Some(disclosed) => {
                 let mut lines = vec![format!(
-                    "{indent}{QUALIFIER_MARK} {subject}: this answer carries [{disclosed}], so it \
-                     may not reflect current truth."
+                    "{indent}{QUALIFIER_MARK} {subject}: {disclosed}, so this answer may be \
+                     incomplete."
                 )];
                 // Signals describe the substrate; they must not replace the
                 // verdict's more specific source, caller or binding limitation.
@@ -208,7 +261,7 @@ pub fn qualify(
             String::new()
         } else {
             format!(
-                " Cross-file {} edges exist but do not stand in for {} edges.",
+                " Links between files by {} exist, but they do not stand in for {} links.",
                 present.join(" and "),
                 short.join(" or ")
             )
@@ -228,9 +281,9 @@ pub fn qualify(
             String::new()
         };
         said.push(format!(
-            "{indent}{QUALIFIER_MARK} {subject}: this build mints no entity-level {} edge for \
-             {language} at all, and the graph therefore holds none to find, {}. The gap is in \
-             this build, not in the code.{tail}",
+            "{indent}{QUALIFIER_MARK} {subject}: this version of Kin does not record {} links \
+             for {language} at all, so the graph has none to find, {}. That is a limit of \
+             Kin, not a finding about your code.{tail}",
             unminted.join(" or "),
             absence_direction(tool)
         ));
@@ -242,9 +295,8 @@ pub fn qualify(
             String::new()
         };
         said.push(format!(
-            "{indent}{QUALIFIER_MARK} {subject}: this build produced no entity-level {} edge for \
-             {language} although the source carries {} sites, {}. The gap is in the linker, \
-             not in the code.{tail}",
+            "{indent}{QUALIFIER_MARK} {subject}: Kin built no {} links for {language} although the \
+             source contains {} sites, {}. The gap is in Kin's linking, not in the code.{tail}",
             unproduced.join(" or "),
             unproduced.join(" or "),
             absence_direction(tool)
@@ -253,7 +305,7 @@ pub fn qualify(
     if !missing.is_empty() {
         let tail = stand_in(&short_all);
         said.push(format!(
-            "{indent}{QUALIFIER_MARK} {subject}: this graph holds no cross-file {} edges for \
+            "{indent}{QUALIFIER_MARK} {subject}: the graph holds no {} links between files for \
              {language}, {}.{tail}",
             missing.join(" or "),
             absence_direction(tool)
@@ -277,9 +329,12 @@ pub fn qualify(
         .unwrap_or_default();
     if !independent.is_empty() {
         said.push(format!(
-            "{indent}{QUALIFIER_MARK} {subject}: this answer also carries [{}], so it may not \
-             reflect current truth.",
-            independent.join(", ")
+            "{indent}{QUALIFIER_MARK} {subject}: also, {}, so this answer may be incomplete.",
+            independent
+                .iter()
+                .map(|label| signal_words(label))
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
     debug_assert!(
@@ -513,7 +568,7 @@ mod tests {
         let payload = json!({
             "references": [],
             "call_sites": block,
-            "relation_kinds": ["calls", "imports", "references"],
+            "relation_kinds": ["calls"],
             "focal_resolution": {"addressed_by": "entity_id", "same_name_candidates": 1},
             "cross_repo": {"status": "not_configured"},
             "caller_arrival": {"state": "accounted"},
@@ -572,7 +627,17 @@ mod tests {
             "embed_worker_failed": true
         }));
         let payload = json!({
-            "entity_impacts": [{"entity_name": "target", "consumer_count": 0}],
+            "entity_impacts": [{"entity_id": "target", "entity_name": "target", "consumer_count": 0}],
+            // This test isolates owed callers. The zero's non-call reading
+            // is measured for this same focal, so it cannot mask that gap.
+            "call_sites": {
+                "entity_id": "target",
+                "settled": true,
+                "clauses": [],
+                "focal_escape": {"residue": {"mentions": {
+                    "measured": true, "count": 0, "matched": {}
+                }}}
+            },
             "caller_arrival": {
                 "state": "accounted",
                 "owed_outside_scope": {"file_count": 1, "callers": 2}
@@ -635,7 +700,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("reference_enrichment_unknown"),
+            rendered.contains("Kin has not confirmed whether references between files were linked"),
             "{rendered}"
         );
         assert!(
@@ -670,7 +735,7 @@ mod tests {
             .unwrap()
             .contains("mass_deletion_blocked"));
         let lines = qualify("trace_data_flow", &payload, &envelope, "").join("\n");
-        assert!(lines.contains("mass_deletion_blocked"), "{lines}");
+        assert!(lines.contains("a mass deletion was blocked"), "{lines}");
         assert!(!lines.contains("embed_worker_failed"), "{lines}");
     }
 
@@ -704,16 +769,19 @@ mod tests {
                 "scope": "language", "language": "Rust",
                 "requested_classes": ["calls", "imports", "references"],
                 "classes": {"calls": "present", "imports": "present", "references": "present"},
-                "cross_file_classes": ["calls", "imports", "references"],
+                "cross_unit_classes": ["calls", "imports", "references"],
                 "reference_enrichment": "available", "budget_exhausted": false,
                 "entities_examined": 2
             }
         });
         let lines = qualify("find_references", &payload, &envelope, "");
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("find_references did not report cross-repo authority")),
+            lines.iter().any(|line| line
+                .contains("`kin refs` did not report whether it checked other repositories")),
+            "the terminal line names the command a person ran, not the MCP tool: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("find_references")),
             "{lines:?}"
         );
         payload["cross_repo"] = json!({"status": "not_configured"});

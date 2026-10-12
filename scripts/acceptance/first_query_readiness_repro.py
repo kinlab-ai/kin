@@ -59,6 +59,11 @@ import sys
 import tempfile
 import time
 
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
+
 TICKET = "FIR-1926"
 PASS = "PASS"
 FAIL = "FAIL"
@@ -372,9 +377,14 @@ class Suite(object):
         self.repo = os.path.join(workdir, "repo")
         self.owned_repos = {self.repo}
         self.env = dict(os.environ)
+        # This fixture inspects/copies an in-tree store; central layout is
+        # qualified separately by brownfield_repro --store-layout central.
+        self.env["KIN_STORE_LAYOUT"] = "in-tree"
         self.env.pop("KIN_DIR", None)
         self.env.pop("KIN_MCP_REPO", None)
         self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env["HOME"] = os.path.join(workdir, "home")
         # The whole point of this suite. Every sibling sets this to 0, which is
         # why nothing in the estate can observe the sweep queued behind the

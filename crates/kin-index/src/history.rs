@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use kin_blobs::BlobStore;
 use kin_model::{
     ArtifactId, ChangeOrigin, Entity, EntityDelta, EntityId, EntityKind, EntityMetadata,
@@ -30,105 +32,31 @@ use crate::linker::{
 };
 use crate::pipeline::IndexPipeline;
 
-/// Declared version of the replay semantics that author historical deltas.
+#[cfg(test)]
+#[allow(dead_code)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
+
+/// The replay-semantics epoch, frozen: no change moves it any more.
 ///
-/// Kin's deep history is not a stored fact. It is re-authored here from
-/// graph-owned trees and CAS bodies, so editing any of the replay functions
-/// pinned by `scripts/hydration-semantics-manifest.json` changes what a
-/// repository's past is said to contain the next time that repository is
-/// admitted. A digest mismatch in that guard is a decision to make, not a file
-/// to regenerate: establish whether replay semantics actually changed, and if
-/// they did, bump this constant and the manifest's recorded version together.
-/// Never regenerate a digest silently.
+/// It used to be a dial bumped by hand whenever replay authored different
+/// deltas. It was missed, raised late and taken twice by changes made side by
+/// side, so a store could read as current over a derivation the running build
+/// would not produce. What decides whether a store must re-derive is now
+/// `kin_core::hydration_semantics::binary_derivation`, a key taken when Kin is
+/// built over every source and dependency classified as deciding the graph
+/// (each crate's `derivation-inputs.toml`). Any change to this file's replay
+/// moves that key, and `kin upgrade` re-derives the state a store serves
+/// through [`rederive_tree_semantics`], recording each head's transition as a
+/// new change. History recorded before it is not re-derived, because a
+/// change's identity hashes its deltas.
 ///
-/// This constant is now persisted and compared, and it is still not an
-/// enforcement point. `kin_core::hydration_semantics` records its value into
-/// every store at creation and compares the record when a store is read, so
-/// `kin graph status`, `kin doctor` and the `_kin` envelope all disclose a gap
-/// between what a store was created under and what this build derives. Native
-/// transfer carries the sending store's creation record. Admission preserves
-/// the receiver's record only when that transported authoring version matches;
-/// an absent or mismatched version durably discards the local record.
-///
-/// What bumping the dial does not do by itself: it re-derives nothing. Every
-/// store an earlier build admitted then reads behind, and `kin upgrade`
-/// re-derives the state such a store serves through [`rederive_tree_semantics`]
-/// and records each head's transition as a new change. History recorded
-/// before that change is not re-derived, because a change's identity hashes
-/// its deltas, and keeps what the build that recorded it authored.
-/// Version 19 records that `is_external_import_placeholder` now recognizes an
-/// `Overrides` crossing alongside `Calls` and `References`. The predicate
-/// decides which inferred imported crossings become persisted external target
-/// entities during replay, so a repository re-admitted under this build has
-/// external targets authored for base-class crossings its past did not carry.
-/// That is a replay-semantics change and it is recorded here rather than
-/// regenerated into the manifest in silence.
-/// Version 20 records three replay-semantics changes that landed after
-/// version 19 without moving this dial. `resolve_one_file` now resolves a Go
-/// call through a receiver whose method is promoted from an embedded type, so
-/// replay authors call edges it did not. Import edges are anchored on the line
-/// that carries the imported name rather than on the statement's first line,
-/// so replay authors different evidence positions. And the JavaScript,
-/// TypeScript, Go, Java, PHP, Kotlin and Swift adapters mint a file's module
-/// surface only when the file produced a declaration or an import, so replay
-/// authors no module entity for a file that produced neither a declaration nor an import.
-/// Version 21 records that `resolve_one_file`'s same-file tier no longer links
-/// a relation that resolved to a definition in its own file to every
-/// same-named entity in other files. Only a same-file prototype, or a
-/// same-file definition whose known arity rejects the call, still hands the
-/// relation on to those entities as name-only candidates, so replay authors
-/// fewer edges than it did: calls above all, and also the containment,
-/// reference and implements edges the same tier linked by name. No history
-/// re-admitted under this build carries the removed ones.
-/// Version 22 records that `make_external_reference_relation` no longer mints
-/// an external-import edge for a call on a receiver, other than the JavaScript
-/// imported-getter receiver. A method whose name matched an import, such as
-/// Rust's `cmd.env(..)` beside `use std::env;`, was persisted as a call edge to
-/// that import, so a repository re-admitted under this build carries none of
-/// those edges its past did. In Rust such a call now gets no edge at all: the
-/// adapter still pins it to the import by name, so it never reaches the
-/// receiver-method tier. A reference on a receiver is unchanged and still mints
-/// one: Python's class-body `session: Session` keeps the attribute in the
-/// receiver and names the imported `Session` itself.
-/// Version 23 records that the same-file tier no longer settles a relation
-/// locally in four shapes where version 21 did. A Kotlin or Swift top-level
-/// function is handed on to the same-named functions elsewhere, since another
-/// file of its package or module can overload it. A C++ function is handed on
-/// when the calling file or a header in its include closure declares another
-/// overload the call's argument count admits. A TypeScript ambient declaration,
-/// which the adapter now marks `declare`, counts as a declaration and is handed
-/// on like a C prototype. And a call that carries an import of the name it
-/// calls, from a language other than Rust, links its same-file match as a
-/// name-only candidate and goes on to the import tiers, which resolve the
-/// imported binding. A same-file definition whose arity rejects the call is
-/// now authored as a name-only candidate instead of a parser-certain edge, and
-/// a C++ definition reads its default arguments from its same-named
-/// declarations before its arity can reject anything. A Go call through an
-/// imported package, such as `errors.New` in a file that defines its own
-/// `New`, no longer reaches the same-file tier at all and is resolved inside
-/// the imported package, so replay stops authoring the edge to the calling
-/// file's own function. The tier also never hands a call on to a module entity
-/// that shares the called name. Replay therefore authors more name-only edges
-/// than version 21 in the hand-on shapes and for imported calls, a different
-/// confidence on the local edge in two shapes, and fewer edges for Go package
-/// calls.
-/// Version 26 binds Rust import edges to the importing file's own module
-/// coordinate, not the first module in stored entity order. Re-admission and
-/// explicit upgrade therefore author deterministic import owners; existing
-/// immutable changes retain the semantics under which they were recorded.
-/// Version 29 also excludes macro placeholder names and function declarations
-/// from Rust call extraction. Explicit replay uses the corrected parser while
-/// existing immutable changes keep their original recorded semantics.
-/// Version 30 records independently bound parser occurrence tiers on Calls.
-/// A stronger occurrence no longer lends its authority to weaker sites on the
-/// same logical edge. Explicit replay authors the new evidence; old immutable
-/// changes retain their original records and disclose unqualified site attribution.
-/// It also binds Go receiver methods to the unique type in their admitted package,
-/// withholding an ambiguous owner instead of selecting a same-named declaration.
-/// Version 31 retires Python language-server bindings obtained before initialize
-/// named the workspace. The explicit store upgrade keeps parser/history state
-/// and re-asks the server under that corrected scope.
-pub const HYDRATION_SEMANTICS_VERSION: u32 = 31;
+/// The number stays because records written before the key existed name it:
+/// a store's creation record, a native transfer pack's declared authoring
+/// version, and the Python language-server scope gate that compares against
+/// it. A record below it reads as behind; at it, the derivation key decides.
+pub const HYDRATION_SEMANTICS_VERSION: u32 = 50;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.
 ///
@@ -160,12 +88,21 @@ struct ParsedFile {
 struct SemanticFileState {
     artifact_id: ArtifactId,
     entry: TreeEntry,
+    /// What the file's project declared about it when it was parsed. A file
+    /// whose bytes did not change is reparsed when this did, as a Rust crate
+    /// root is when its package is renamed.
+    unit: kin_parser::project_manifest::UnitContext,
     completeness: Arc<ParseCompleteness>,
     parse_data: Arc<FileParseData>,
 }
 
 #[derive(Clone, Default)]
 struct SemanticTreeState {
+    /// Every manifest the tree holds that an adapter names units from, by
+    /// path, with the links it follows and the body it reads. A child tree
+    /// holding the same ones gives each unchanged file the same project
+    /// declarations, and a link whose target's body moved is not the same.
+    manifests: BTreeMap<String, (TreeEntry, crate::project_files::Followed)>,
     files: BTreeMap<ArtifactId, SemanticFileState>,
     entities: BTreeMap<EntityId, Entity>,
     relations: BTreeMap<RelationId, Relation>,
@@ -434,11 +371,14 @@ pub fn rederive_tree_semantics<'held>(
 /// derive it with [`rederive_tree_semantics`].
 ///
 /// Only entity sources and Cargo manifests are read by a derivation, so only
-/// those are staged. `load_body` is the caller's store, returning the exact
-/// bytes a content address names or `None` when it holds none; a missing body
-/// is refused, and a body whose digest is not its address is refused, because
-/// a derivation is only as exact as the bytes it read. The scratch store lives
-/// for this call only.
+/// those are staged, with a manifest held as a link staged through its chain:
+/// each link's body and the body it leads to inside the tree, whatever that
+/// target is named. `load_body` is the caller's store, returning the exact
+/// bytes a content address names or `None` when it holds none; a missing
+/// source or manifest body is refused, and a body whose digest is not its
+/// address is refused, because a derivation is only as exact as the bytes it
+/// read. A link whose own body the store lacks leads nowhere, as it does when
+/// a live batch reads it. The scratch store lives for this call only.
 pub fn rederive_tree_semantics_from<'held>(
     tree: &ResolvedTree,
     held: impl IntoIterator<Item = &'held Entity>,
@@ -449,37 +389,62 @@ pub fn rederive_tree_semantics_from<'held>(
         .tempdir()
         .map_err(|error| invalid(format!("create a scratch source store: {error}")))?;
     let bodies = BlobStore::new_ephemeral(scratch.path().join("cas"))?;
+    let load_body = std::cell::RefCell::new(load_body);
     let mut staged = HashSet::new();
-    for artifact in tree.artifacts() {
-        let TreeEntry::Blob { hash, .. } = artifact.entry else {
-            continue;
-        };
-        let Some(path) = artifact.path.as_utf8() else {
-            continue;
-        };
-        let source = matches!(
-            FileClassifier::classify(Path::new(path)),
-            FileClassification::EntitySource
-        );
-        if !source && path.rsplit('/').next() != Some("Cargo.toml") {
-            continue;
-        }
+    let mut stage = |path: &str, hash: Hash256, required: bool| -> Result<()> {
         if !staged.insert(hash) {
-            continue;
+            return Ok(());
         }
-        let body = load_body(hash)
-            .map_err(|error| invalid(format!("read the body of {path} ({hash}): {error}")))?
-            .ok_or_else(|| {
-                invalid(format!(
-                    "the store holds no body for {path} ({hash}), and a derivation reads only \
-                     bytes the store keeps"
-                ))
-            })?;
+        let loaded = (load_body.borrow_mut())(hash)
+            .map_err(|error| invalid(format!("read the body of {path} ({hash}): {error}")))?;
+        let Some(body) = loaded else {
+            if !required {
+                return Ok(());
+            }
+            return Err(invalid(format!(
+                "the store holds no body for {path} ({hash}), and a derivation reads only \
+                 bytes the store keeps"
+            )));
+        };
         let written = bodies.write(&body)?;
         if written != hash {
             return Err(invalid(format!(
                 "the body read for {path} does not hash to {hash}"
             )));
+        }
+        Ok(())
+    };
+    let lookup = |at: &str| {
+        let at = kin_model::RepoPath::from_utf8(at.to_string()).ok()?;
+        Some(tree.artifact_at_path(&at)?.entry)
+    };
+    let read = |hash: Hash256| (load_body.borrow_mut())(hash).ok().flatten();
+    for artifact in tree.artifacts() {
+        let Some(path) = artifact.path.as_utf8() else {
+            continue;
+        };
+        let naming = kin_parser::project_manifest::is_naming_manifest_path(path);
+        match artifact.entry {
+            TreeEntry::Blob { hash, .. } => {
+                let source = matches!(
+                    FileClassifier::classify(Path::new(path)),
+                    FileClassification::EntitySource
+                );
+                if source || naming {
+                    stage(path, hash, true)?;
+                }
+            }
+            TreeEntry::Symlink { .. } if naming => {
+                let followed =
+                    crate::project_files::follow_manifest(path, &artifact.entry, &lookup, &read);
+                for link in followed.links {
+                    stage(path, link, false)?;
+                }
+                if let Some((target, hash)) = followed.body {
+                    stage(&target, hash, true)?;
+                }
+            }
+            _ => {}
         }
     }
     rederive_tree_semantics(tree, held, &bodies)
@@ -524,6 +489,7 @@ fn derive_tree_semantics_once(
             SemanticFileState {
                 artifact_id,
                 entry,
+                unit: Default::default(),
                 completeness: Arc::new(ParseCompleteness::Full),
                 parse_data: Arc::new(FileParseData {
                     file_path: HELD_IDENTITIES_ONLY.to_string(),
@@ -635,12 +601,50 @@ fn semantic_state_for_tree(
     external_fingerprints: &mut BTreeMap<EntityId, SemanticFingerprint>,
 ) -> Result<SemanticTreeState> {
     let mut files = BTreeMap::new();
+    // The manifests of this exact tree, which name its units.
+    let project = crate::project_files::TreeProjectFiles::from_blobs(tree, blob_store);
+    let lookup = |at: &str| {
+        let at = kin_model::RepoPath::from_utf8(at.to_string()).ok()?;
+        Some(tree.artifact_at_path(&at)?.entry)
+    };
+    let read = |hash: Hash256| blob_store.read(&hash).ok();
+    let manifests: BTreeMap<String, (TreeEntry, crate::project_files::Followed)> = tree
+        .artifacts()
+        .filter_map(|artifact| {
+            let path = artifact.path.as_utf8()?;
+            kin_parser::project_manifest::is_naming_manifest_path(path).then(|| {
+                let followed =
+                    crate::project_files::follow_manifest(path, &artifact.entry, &lookup, &read);
+                (path.to_string(), (artifact.entry, followed))
+            })
+        })
+        .collect();
 
+    // Which artifacts this tree must parse, in tree order: a file a parent
+    // already parsed from the same bytes at the same path, under the same
+    // project declarations, is carried forward.
+    enum Source<'a, A, H> {
+        Carried(&'a A, &'a SemanticFileState),
+        Parse(
+            &'a A,
+            &'a str,
+            &'a H,
+            kin_parser::project_manifest::UnitContext,
+        ),
+    }
+    // Whether each parent holds this tree's own manifests, read once per
+    // parent rather than per file: under the same manifests an unchanged file
+    // is named as it was, and only where they moved is a file's naming read.
+    let same_manifests: Vec<bool> = parents
+        .iter()
+        .map(|parent| parent.manifests == manifests)
+        .collect();
+    let mut sources = Vec::new();
     for artifact in tree.artifacts() {
         let Some(path) = artifact.path.as_utf8() else {
             continue;
         };
-        let TreeEntry::Blob { hash, .. } = artifact.entry else {
+        let TreeEntry::Blob { hash, .. } = &artifact.entry else {
             continue;
         };
         if !matches!(
@@ -649,46 +653,98 @@ fn semantic_state_for_tree(
         ) {
             continue;
         }
-
-        if let Some(existing) = parents.iter().find_map(|parent| {
-            parent
+        let file = FilePathId::new(path);
+        let mut unit = None;
+        let mut carried = None;
+        for (parent, same) in parents.iter().zip(&same_manifests) {
+            let Some(held) = parent
                 .files
                 .get(&artifact.artifact_id)
-                .filter(|file| file.parse_data.file_path == path && file.entry == artifact.entry)
-        }) {
-            if files
-                .insert(artifact.artifact_id, existing.clone())
-                .is_some()
-            {
+                .filter(|held| held.parse_data.file_path == path && held.entry == artifact.entry)
+            else {
+                continue;
+            };
+            if *same {
+                carried = Some(held);
+                break;
+            }
+            let now = match &unit {
+                Some(now) => now,
+                None => unit.insert(pipeline.unit_context(&file, &project)?),
+            };
+            if held.unit == *now {
+                carried = Some(held);
+                break;
+            }
+        }
+        match carried {
+            Some(existing) => sources.push(Source::Carried(artifact, existing)),
+            None => {
+                let unit = match unit {
+                    Some(unit) => unit,
+                    None => pipeline.unit_context(&file, &project)?,
+                };
+                sources.push(Source::Parse(artifact, path, hash, unit));
+            }
+        }
+    }
+
+    // Every new file is parsed on its own, so the parses run in parallel and
+    // are folded below in tree order, exactly as a sequential walk folds
+    // them, stopping at the first failure in that order.
+    let parses: Vec<Result<Option<ParsedFile>>> = sources
+        .par_iter()
+        .map(|source| {
+            let Source::Parse(_, path, hash, unit) = source else {
+                return Ok(None);
+            };
+            let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
+            let body = blob_store.read(&body_hash)?;
+            if kin_blobs::digest_bytes(&body) != *hash.as_bytes() {
                 return Err(invalid(format!(
-                    "tree assigns artifact {:?} to multiple semantic files",
-                    artifact.artifact_id
+                    "CAS body for {path} does not match exact tree identity {hash}"
                 )));
             }
-            continue;
-        }
+            if !matches!(
+                FileClassifier::classify_with_content(Path::new(path), &body),
+                FileClassification::EntitySource
+            ) {
+                return Ok(None);
+            }
+            let indexed = pipeline.index_file_content_with_unit(
+                &FilePathId::new(*path),
+                &body,
+                body_hash,
+                unit,
+            )?;
+            let indexed = indexed.indexed_file;
+            Ok(Some(ParsedFile {
+                completeness: indexed.file_layout.parse_completeness,
+                entities: indexed.entities,
+                relations: indexed.extracted_relations,
+                imports: indexed.imports,
+            }))
+        })
+        .collect();
 
-        let body_hash = kin_blobs::Hash256::from_bytes(*hash.as_bytes());
-        let body = blob_store.read(&body_hash)?;
-        if kin_blobs::digest_bytes(&body) != *hash.as_bytes() {
-            return Err(invalid(format!(
-                "CAS body for {path} does not match exact tree identity {hash}"
-            )));
-        }
-        if !matches!(
-            FileClassifier::classify_with_content(Path::new(path), &body),
-            FileClassification::EntitySource
-        ) {
+    for (source, parsed) in sources.into_iter().zip(parses) {
+        let (artifact, path, unit) = match source {
+            Source::Carried(artifact, existing) => {
+                if files
+                    .insert(artifact.artifact_id, existing.clone())
+                    .is_some()
+                {
+                    return Err(invalid(format!(
+                        "tree assigns artifact {:?} to multiple semantic files",
+                        artifact.artifact_id
+                    )));
+                }
+                continue;
+            }
+            Source::Parse(artifact, path, _, unit) => (artifact, path, unit),
+        };
+        let Some(parsed) = parsed? else {
             continue;
-        }
-        let indexed =
-            pipeline.index_file_content_with_tests(&FilePathId::new(path), &body, body_hash)?;
-        let indexed = indexed.indexed_file;
-        let parsed = ParsedFile {
-            completeness: indexed.file_layout.parse_completeness,
-            entities: indexed.entities,
-            relations: indexed.extracted_relations,
-            imports: indexed.imports,
         };
         let old_entities = parents
             .iter()
@@ -700,6 +756,7 @@ fn semantic_state_for_tree(
         let state = SemanticFileState {
             artifact_id: artifact.artifact_id,
             entry: artifact.entry,
+            unit,
             completeness: Arc::new(parsed.completeness),
             parse_data: Arc::new(FileParseData {
                 file_path: path.to_string(),
@@ -836,6 +893,7 @@ fn semantic_state_for_tree(
     }
 
     Ok(SemanticTreeState {
+        manifests,
         files,
         entities,
         relations,
@@ -1285,7 +1343,7 @@ mod tests {
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("history-enrichment").unwrap(),
             &blob_store,
         )
@@ -1410,7 +1468,7 @@ mod tests {
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("history-merge").unwrap(),
             &blob_store,
         )
@@ -1506,7 +1564,7 @@ mod tests {
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("history-external-import").unwrap(),
             &blob_store,
         )
@@ -1673,7 +1731,7 @@ mod tests {
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("history-conditional-duplicates").unwrap(),
             &blob_store,
         )
@@ -1745,7 +1803,7 @@ mod tests {
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("history-order").unwrap(),
             &blob_store,
         )
@@ -1802,7 +1860,7 @@ mod tests {
         git(&repository, &["commit", "-m", "retain source unchanged"]);
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("span-provenance-history").unwrap(),
             &blob_store,
         )
@@ -1946,7 +2004,7 @@ mod tests {
         );
         let blobs = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("cargo-history").unwrap(),
             &blobs,
         )
@@ -2023,6 +2081,209 @@ mod tests {
         }
     }
 
+    /// A crate root's name follows its manifest through history even where
+    /// the root's own bytes never change: a commit that renames the package
+    /// renames the module of a root carried forward unchanged, and one that
+    /// changes nothing the naming reads carries it forward as it was.
+    #[test]
+    fn a_crate_root_carried_forward_takes_its_manifests_name_at_each_commit() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        let manifest = |name: &str, version: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n")
+        };
+        write(
+            &repository,
+            "Cargo.toml",
+            manifest("first-name", "0.1.0").as_bytes(),
+        );
+        write(
+            &repository,
+            "src/lib.rs",
+            b"pub mod store;\npub use store::open;\n",
+        );
+        write(&repository, "src/store.rs", b"pub fn open() -> u8 { 1 }\n");
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "first name"]);
+        write(
+            &repository,
+            "Cargo.toml",
+            manifest("second-name", "0.1.0").as_bytes(),
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "renamed package"]);
+        write(
+            &repository,
+            "Cargo.toml",
+            manifest("second-name", "0.2.0").as_bytes(),
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "version bump"]);
+        let blobs = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &worktree(&repository),
+            RepositoryId::new("crate-name-history").unwrap(),
+            &blobs,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blobs).unwrap();
+        let trees = trees_by_change(&plan, &snapshot, &blobs);
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        fs::remove_dir_all(&repository).unwrap();
+        let derived = derive_historical_semantic_deltas(&changes, &trees, &blobs).unwrap();
+        assert_eq!(derived.len(), 3);
+        // The module each source holds after each commit, folded from the
+        // deltas the way a replay folds them.
+        let mut held: BTreeMap<EntityId, Entity> = BTreeMap::new();
+        let mut modules = Vec::new();
+        for delta in &derived {
+            for change in &delta.entity_deltas {
+                match change {
+                    EntityDelta::Removed { old } => {
+                        held.remove(&old.id);
+                    }
+                    other => {
+                        if let Some(new) = other.new_state() {
+                            held.insert(new.id, new.clone());
+                        }
+                    }
+                }
+            }
+            let surface = |file: &str| {
+                held.values()
+                    .find(|entity| {
+                        entity.file_origin == Some(FilePathId::new(file))
+                            && kin_model::is_file_module_surface(entity)
+                    })
+                    .map(|entity| entity.name.clone())
+            };
+            modules.push((surface("src/lib.rs"), surface("src/store.rs")));
+        }
+        let named = |root: &str| (Some(root.to_string()), Some("store".to_string()));
+        assert_eq!(
+            modules,
+            vec![
+                named("first_name"),
+                named("second_name"),
+                named("second_name")
+            ]
+        );
+        // The version bump renamed nothing, so it moved no module.
+        assert!(!derived[2].entity_deltas.iter().any(|delta| delta
+            .new_state()
+            .is_some_and(|entity| entity.kind == EntityKind::Module)));
+    }
+
+    /// A crate whose `Cargo.toml` is a link to a manifest named otherwise is
+    /// named by the package the link's target declares: across a history in
+    /// which only the target's body moves, and when its tree is re-derived
+    /// from a store as an upgrade does, which stages the link and its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_manifest_names_its_crate_at_each_commit_and_on_rederivation() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("source");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            &["config", "user.email", "kin@example.invalid"],
+        );
+        git(&repository, &["config", "user.name", "Kin Test"]);
+        let manifest = |name: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+        };
+        write(
+            &repository,
+            "shared/tool.toml",
+            manifest("tool-one").as_bytes(),
+        );
+        fs::create_dir_all(repository.join("tools/src")).unwrap();
+        std::os::unix::fs::symlink("../shared/tool.toml", repository.join("tools/Cargo.toml"))
+            .unwrap();
+        write(
+            &repository,
+            "tools/src/lib.rs",
+            b"pub fn tool() -> u8 { 1 }\n",
+        );
+        git(&repository, &["add", "--all"]);
+        git(&repository, &["commit", "-m", "linked tool"]);
+        write(
+            &repository,
+            "shared/tool.toml",
+            manifest("tool-two").as_bytes(),
+        );
+        git(&repository, &["add", "--all"]);
+        git(
+            &repository,
+            &["commit", "-m", "renamed the target's package"],
+        );
+        let blobs = BlobStore::new(root.path().join("cas")).unwrap();
+        let snapshot = capture_lossless_git_repository(
+            &worktree(&repository),
+            RepositoryId::new("linked-crate-name-history").unwrap(),
+            &blobs,
+        )
+        .unwrap();
+        let plan = plan_semantic_git_import(&snapshot, &blobs).unwrap();
+        let trees = trees_by_change(&plan, &snapshot, &blobs);
+        let changes = plan
+            .changes
+            .iter()
+            .collect::<kin_git::Result<Vec<_>>>()
+            .unwrap();
+        fs::remove_dir_all(&repository).unwrap();
+        let derived = derive_historical_semantic_deltas(&changes, &trees, &blobs).unwrap();
+        assert_eq!(derived.len(), 2);
+        let surface = |held: &BTreeMap<EntityId, Entity>| {
+            held.values()
+                .find(|entity| {
+                    entity.file_origin == Some(FilePathId::new("tools/src/lib.rs"))
+                        && kin_model::is_file_module_surface(entity)
+                })
+                .map(|entity| entity.name.clone())
+        };
+        let mut held: BTreeMap<EntityId, Entity> = BTreeMap::new();
+        let mut modules = Vec::new();
+        for delta in &derived {
+            for change in &delta.entity_deltas {
+                match change {
+                    EntityDelta::Removed { old } => {
+                        held.remove(&old.id);
+                    }
+                    other => {
+                        if let Some(new) = other.new_state() {
+                            held.insert(new.id, new.clone());
+                        }
+                    }
+                }
+            }
+            modules.push(surface(&held));
+        }
+        assert_eq!(
+            modules,
+            vec![Some("tool_one".to_string()), Some("tool_two".to_string())]
+        );
+
+        let head = &trees[&changes[1].id];
+        let rederived = rederive_tree_semantics_from(head, held.values(), &mut |hash| {
+            Ok(blobs.read(&hash).ok())
+        })
+        .unwrap();
+        assert_eq!(surface(&rederived.entities), Some("tool_two".to_string()));
+    }
+
     /// A two-commit history in four languages, replayed the way admission
     /// replays it, and the state its head serves: the fold of every delta.
     struct ReplayedHead {
@@ -2081,7 +2342,7 @@ mod tests {
 
         let blob_store = BlobStore::new(root.path().join("cas")).unwrap();
         let snapshot = capture_lossless_git_repository(
-            &repository,
+            &worktree(&repository),
             RepositoryId::new("history-rederivation").unwrap(),
             &blob_store,
         )

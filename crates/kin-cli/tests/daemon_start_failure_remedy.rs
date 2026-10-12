@@ -113,7 +113,7 @@ fn a_daemon_that_cannot_start_still_names_a_remedy() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let kin_root = repo.path().join(".kin");
+    let kin_root = runtime.layout().root().to_path_buf();
 
     // Stop whatever init started, so the next command pays for a start rather
     // than attaching to a live daemon and never reaching the code under test.

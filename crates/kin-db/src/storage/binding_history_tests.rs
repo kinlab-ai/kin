@@ -712,3 +712,115 @@ fn binding_history_a_lineage_starting_part_way_must_start_with_a_rederivation() 
     let truncated: PersistedRepositoryAuthority = serde_json::from_value(truncated).unwrap();
     assert!(crate::storage::binding_history::validate_metadata(&truncated).is_err());
 }
+
+/// A history verifier that accounts for nothing, standing in for kin-index's
+/// over a real repository's history, where one withdrawn local binding it
+/// cannot account for is enough to leave the bootstrap unproven.
+struct UnaccountedHistory;
+
+impl crate::storage::binding_history::BindingHistoryVerifier for UnaccountedHistory {
+    fn verify_transition(
+        &self,
+        _transition: crate::storage::binding_history::BindingHistoryTransition<'_>,
+    ) -> Result<crate::storage::binding_history::BindingHistoryDecision, KinDbError> {
+        Ok(crate::storage::binding_history::BindingHistoryDecision::Unknown)
+    }
+}
+
+/// Commit the imported-repository fixture the way `kin init` commits a Git
+/// bootstrap, with its history streamed beside the transaction.
+fn commit_streamed_git_bootstrap(
+    manager: &RepositoryAuthorityManager<MemoryBackend>,
+    history: &dyn crate::storage::binding_history::BindingHistoryVerifier,
+    rederivation: &FixedRederivation,
+) {
+    let (mut transaction, _, _) = imported_repository_transaction(manager);
+    let mut changes = ChangeMap::new();
+    for change in std::mem::take(&mut transaction.changes) {
+        changes.append_change(change).unwrap();
+    }
+    manager
+        .commit_git_bootstrap_with_binding_history(transaction, changes, history, rederivation)
+        .unwrap();
+}
+
+/// A Git bootstrap whose history the transition verifier cannot account for
+/// starts its lineage at the bootstrap through the re-derivation verifier, so
+/// a store `kin init` just wrote is checked from its first generation and the
+/// first daemon start finds nothing to re-qualify. A history the transition
+/// verifier does account for keeps its genesis claim and is never offered to
+/// the re-derivation verifier, and a graph the re-derivation does not
+/// reproduce stays unproven, exactly as before.
+#[test]
+fn binding_history_a_git_bootstrap_with_unaccounted_history_starts_at_a_rederivation() {
+    use kin_model::EntityStore;
+
+    let backend = Arc::new(MemoryBackend::default());
+    let manager = initial_manager(Arc::clone(&backend));
+    let rederivation = FixedRederivation::accepting();
+    commit_streamed_git_bootstrap(&manager, &UnaccountedHistory, &rederivation);
+    assert_eq!(
+        proof_qualifications(&manager),
+        vec!["CheckedRederivation".to_string()],
+        "the lineage must start at the bootstrap, as a re-derivation"
+    );
+    assert_eq!(manager.read_authority().metadata().operation_log.len(), 1);
+    let workspace = manager.read_authority().metadata().workspaces[0].workspace_id;
+    let committed = manager
+        .read_authority()
+        .workspace_graph_snapshot(&workspace)
+        .unwrap()
+        .unwrap();
+    {
+        let offered = rederivation.offered.lock().unwrap();
+        assert_eq!(offered.len(), 1, "one workspace, offered once");
+        assert_eq!(
+            offered[0].to_bytes().unwrap(),
+            committed.to_bytes().unwrap(),
+            "the verifier must judge the committed bootstrap graph"
+        );
+    }
+    let witnesses = manager.read_authority().metadata().binding_history.clone();
+    drop(manager);
+    let reopened = initial_manager(backend);
+    assert_eq!(
+        reopened.read_authority().metadata().binding_history,
+        witnesses,
+        "the lineage survives a cold read"
+    );
+    let selected = reopened
+        .read_authority()
+        .workspace_graph_snapshot(&workspace)
+        .unwrap()
+        .unwrap();
+    let graph = InMemoryGraph::from_snapshot_without_text_index(selected).unwrap();
+    assert!(matches!(
+        graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Checked { .. }
+    ));
+
+    let accounted = initial_manager(Arc::new(MemoryBackend::default()));
+    let unused = FixedRederivation::accepting();
+    commit_streamed_git_bootstrap(&accounted, &StorageTestVerifier, &unused);
+    assert_eq!(
+        proof_qualifications(&accounted),
+        vec!["CheckedHistoryGenesis".to_string()],
+        "an accounted history keeps its genesis claim"
+    );
+    assert!(unused.offered.lock().unwrap().is_empty());
+
+    let unproven = initial_manager(Arc::new(MemoryBackend::default()));
+    commit_streamed_git_bootstrap(
+        &unproven,
+        &UnaccountedHistory,
+        &FixedRederivation::declining(),
+    );
+    assert!(
+        unproven
+            .read_authority()
+            .metadata()
+            .binding_history
+            .is_empty(),
+        "a bootstrap graph the re-derivation does not reproduce stays unproven"
+    );
+}

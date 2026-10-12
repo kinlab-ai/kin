@@ -118,15 +118,23 @@ from __future__ import print_function
 from trace_pages import mcp_references, mcp_trace
 
 import argparse
+import copy
 import functools
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+
+# An agent profile serves each answer in plain words and leaves out the verdict
+# codes and evidence blocks this suite reads. Ask every kin it starts for the
+# machine replies instead; the full profile always serves them.
+os.environ.setdefault("KIN_MCP_MACHINE_REPLIES", "1")
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -161,6 +169,107 @@ FIXTURE_SCOPE = (
 )
 
 AUTO_EMBED_OPT_OUT_LINE = "background embedding deferred by operator opt-out"
+
+# CI uploads the report directory, while the fixture roots live elsewhere.
+# Keep diagnostic tails beside the report so an unreadable sweep does not lose
+# the query failures that preceded its final accounting. These files are text,
+# including the payload excerpt: redaction or clipping need not preserve JSON.
+DIAGNOSTIC_BYTES = 1024 * 1024
+DIAGNOSTIC_SENSITIVE = re.compile(
+    r"authorization|\bbearer\b|password|passwd|secret|credential|"
+    r"(?:access|refresh|auth|api)[_ -]?(?:token|key)|private[_ -]?key|"
+    r"[?&](?:token|key)=|env_registry|environment variable|"
+    r"[A-Z][A-Z0-9_]*(?:TOKEN|KEY|PASSWORD|SECRET)\s*[=:]",
+    re.IGNORECASE)
+
+
+def retain_failure_diagnostics(suite, report_path, expected_exit):
+    """Retain only owned fixture logs and captured replies, never the home/env.
+
+    The verdict and return code do not depend on copying diagnostics. Missing
+    files, clipping, redaction and concurrent writes remain explicit findings.
+    No directory walk follows token files, environment dumps or arbitrary logs.
+    """
+    parent = os.path.dirname(os.path.abspath(report_path))
+    directory = tempfile.mkdtemp(prefix=os.path.basename(report_path) + ".diagnostics-",
+                                 dir=parent)
+    manifest = {"schema": "kin.brownfield-failure-diagnostics.v1",
+                "expected_suite_exit": expected_exit, "per_file_byte_limit": DIAGNOSTIC_BYTES,
+                "files": []}
+    sources = [("mcp-payloads.txt", os.path.join(suite.workdir, "mcp-payloads.json"))]
+    for name in sorted(CORPORA):
+        if name not in suite.fixtures:
+            continue
+        try:
+            store = suite.store_path(suite.fixtures[name])
+            sources.append((name + "-daemon.txt", os.path.join(store, "daemon.log")))
+            # What the sweep still owes and what it finished, by unit and
+            # reason: the records that say why a sweep gate refused, which the
+            # log names only in part.
+            for record in ("lsp-owed-files.json", "lsp-enriched-files.json"):
+                sources.append(("%s-%s.txt" % (name, record.rsplit(".", 1)[0]),
+                                os.path.join(store, record)))
+        except Exception as exc:
+            manifest["files"].append({"artifact": name + "-daemon.txt",
+                                      "format": "redacted text",
+                                      "capture_error": type(exc).__name__})
+    root = os.path.realpath(suite.workdir)
+    for name, source in sources:
+        row = {"artifact": name, "format": "redacted text"}
+        manifest["files"].append(row)
+        try:
+            if (os.path.commonpath([root, os.path.realpath(source)]) != root
+                    or os.path.islink(source)):
+                raise ValueError("diagnostic is outside the owned run or a symlink")
+            fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError("diagnostic is not a regular file")
+                offset = max(0, before.st_size - DIAGNOSTIC_BYTES)
+                handle.seek(offset)
+                captured = handle.read(DIAGNOSTIC_BYTES)
+                after = os.fstat(handle.fileno())
+            # Drop a clipped first line: a credential label may be outside the
+            # retained slice while its value is inside it.
+            text = captured.decode("utf-8", "replace")
+            if offset:
+                text = text.partition("\n")[2]
+            first_end, first_begin = text.find("-----END "), text.find("-----BEGIN ")
+            pem = bool(offset and first_end >= 0 and (first_begin < 0 or first_end < first_begin))
+            lines, redacted = [], 0
+            for line in text.splitlines(keepends=True):
+                pem = pem or "-----BEGIN " in line
+                if pem or DIAGNOSTIC_SENSITIVE.search(line):
+                    redacted += 1
+                else:
+                    lines.append(line)
+                if "-----END " in line:
+                    pem = False
+            # Omissions never expand output. Invalid UTF-8 can expand on
+            # replacement, so keep the encoded artifact within the same cap.
+            kept = "".join(lines).encode()[:DIAGNOSTIC_BYTES].decode("utf-8", "ignore").encode()
+            destination = os.path.join(directory, name)
+            with open(destination, "xb") as handle:
+                handle.write(kept)
+            row.update({"source_bytes": before.st_size, "source_offset": offset,
+                        "truncated": bool(offset), "captured_bytes": len(captured),
+                        "source_sha256": hashlib.sha256(captured).hexdigest() if not offset else None,
+                        "captured_slice_sha256": hashlib.sha256(captured).hexdigest(),
+                        "artifact_sha256": hashlib.sha256(kept).hexdigest(),
+                        "artifact_bytes": len(kept), "redacted_lines": redacted,
+                        "source_stable": (before.st_size, before.st_mtime_ns)
+                                         == (after.st_size, after.st_mtime_ns)})
+        except (OSError, ValueError) as exc:
+            # Exception text can contain private paths; the type names the
+            # capture failure without exporting another unfiltered stream.
+            row["capture_error"] = type(exc).__name__
+    encoded = (json.dumps(manifest, indent=2) + "\n").encode()
+    with open(os.path.join(directory, "manifest.json"), "xb") as handle:
+        handle.write(encoded)
+    return {"directory": os.path.basename(directory),
+            "manifest_sha256": hashlib.sha256(encoded).hexdigest()}
 
 CORPORA = {
     "requests": {
@@ -543,6 +652,26 @@ def sweep_lines(log_text):
     return out
 
 
+def wait_for_latest_sweep(log_path, wait_seconds=10):
+    """Passively wait for the latest attempt, never borrow an older finish.
+
+    Reads can reopen a daemon and start a new sweep after init completed. A
+    bounded wait observes that attempt without starting or retrying work. An
+    unfinished, interrupted or incomplete record retains its ordinary refusal.
+    """
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            with open(log_path) as handle:
+                attempts = sweep_lines(handle.read())
+        except OSError:
+            attempts = []
+        remaining = deadline - time.monotonic()
+        if (attempts and attempts[-1].get("finish") != "running") or remaining <= 0:
+            return attempts
+        time.sleep(min(1, remaining))
+
+
 def sweep_has_no_new_evidence(line):
     """A current-context skip needs no new publication; attempted work does.
 
@@ -696,7 +825,8 @@ def sweep_verdict(lines, dependencies=None):
 
 class Suite(object):
     def __init__(self, kin, workdir, corpus_cache, daemon=None, offline=False,
-                 verbose=False):
+                 verbose=False, store_layout="default"):
+        workdir = os.path.abspath(workdir)
         self.kin = kin
         self.daemon = daemon
         self.workdir = workdir
@@ -704,8 +834,9 @@ class Suite(object):
         self.offline = offline
         self.verbose = verbose
         self.fixtures = {}
+        self.stores = {}
+        self.store_layout = store_layout
         self.payloads = {}
-        self.sweep_gates = {}
         self.run_id = "r%d" % os.getpid()
         self.kin_home = os.path.join(workdir, "kin-home-" + self.run_id)
         if not os.path.isdir(self.kin_home):
@@ -715,8 +846,16 @@ class Suite(object):
         # the auto-embed opt-out is what keeps it off the GPU. Check 0 asserts both
         # held rather than trusting that setting them was enough.
         self.env["KIN_HOME"] = self.kin_home
+        self.env["KIN_REGISTRY_PATH"] = os.path.join(self.kin_home, "registry.toml")
+        # A caller's store selection must never escape the owned fixture root.
+        for key in ("KIN_STORE", "KIN_STORE_LAYOUT", "KIN_ALLOW_PARENT_STORE"):
+            self.env.pop(key, None)
+        if store_layout != "default":
+            self.env["KIN_STORE_LAYOUT"] = store_layout
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_VFS_DISABLE"] = "1"
+        # Written against a store that holds its complete history.
+        self.env["KIN_INIT_HISTORY"] = "full"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:
@@ -726,6 +865,41 @@ class Suite(object):
 
     def kin_run(self, args, repo, timeout=900):
         return run([self.kin] + args, cwd=repo, env=self.env, timeout=timeout)
+
+    def store_path(self, repo):
+        """Resolve exactly this fixture through Kin before reading or stopping it.
+
+        Discovery is read-only and starts no daemon. A parent repository, a
+        foreign store, a malformed answer or a missing manifest never grants
+        cleanup or diagnostic access. Both central and in-tree stores work.
+        """
+        rc, out, _err = self.kin_run(["store", "path", "--json"], repo, timeout=30)
+        try:
+            answer = json.loads(out) if rc == 0 else None
+        except (TypeError, ValueError):
+            answer = None
+        root = os.path.realpath(self.workdir)
+        working = os.path.realpath(repo)
+        if (not isinstance(answer, dict) or answer.get("schema") != "kin.store-path.v1"
+                or not isinstance(answer.get("working_dir"), str)
+                or not isinstance(answer.get("store"), str)
+                or not os.path.isabs(answer["store"])
+                or os.path.realpath(answer["working_dir"]) != working
+                or os.path.commonpath([root, working]) != root):
+            raise ProbeError("store discovery did not identify exactly the owned fixture")
+        store = os.path.realpath(answer["store"])
+        manifest = os.path.join(store, "manifest.json")
+        if (os.path.commonpath([root, store]) != root
+                or not os.path.isfile(manifest) or os.path.islink(manifest)):
+            raise ProbeError("fixture store is outside the owned run or its manifest is missing")
+        external = store != os.path.join(working, ".kin")
+        if answer.get("external") is not external:
+            raise ProbeError("store discovery disagrees with the fixture's actual layout")
+        if ((self.store_layout == "central" and not external)
+                or (self.store_layout == "in-tree" and external)):
+            raise ProbeError("fixture store does not use the requested layout")
+        self.stores[working] = {"store": store, "external": external}
+        return store
 
     def git(self, args, cwd=None, timeout=900):
         base = ["git",
@@ -932,6 +1106,7 @@ class Suite(object):
         rc, out, err = self.kin_run(["init", "."], path)
         if rc != 0:
             raise ProbeError("kin init failed in %s: %s" % (path, failure_excerpt(err or out)))
+        self.store_path(path)
         return path
 
     def shutdown(self):
@@ -940,11 +1115,8 @@ class Suite(object):
         if not self.fixtures:
             res.ok("no fixtures were created")
         for path in self.fixtures.values():
-            # Without this boundary, repo discovery could select a parent repo.
-            if not os.path.isfile(os.path.join(path, ".kin", "manifest.json")):
-                res.bad("%s: fixture manifest missing; stop was not attempted" % path)
-                continue
             try:
+                self.store_path(path)
                 rc, out, err = self.kin_run(["daemon", "stop", "--json"], path, timeout=60)
                 report = json.loads(out) if rc == 0 else {}
                 stopped = report.get("stopped") if isinstance(report, dict) else None
@@ -1016,34 +1188,14 @@ class Suite(object):
         silent.
         """
         dependencies = tuple(sorted(set(dependencies))) if dependencies is not None else None
-        cache_key = (name, dependencies)
-        if cache_key in self.sweep_gates:
-            ok, detail = self.sweep_gates[cache_key]
-            if ok:
-                return detail
-            raise ProbeError(detail)
         repo = self.fixture(name)
-        log_path = os.path.join(repo, ".kin", "daemon.log")
-        # The daemon that ran init's sweep has usually exited by now, deleting
-        # its port file, and a freshly spawned daemon's counters start at zero,
-        # so the live /lsp/sweep/status endpoint is the wrong authority for a
-        # post-init read. The store's own daemon.log carries the sweep's
-        # accounting line durably. Init waits for its sweep, so one short retry
-        # window covers filesystem lag, not sweep progress.
-        deadline = time.time() + 10
-        text = ""
-        while True:
-            try:
-                with open(log_path) as handle:
-                    text = handle.read()
-            except OSError:
-                text = ""
-            if sweep_lines(text) or time.time() >= deadline:
-                break
-            time.sleep(1)
-        ok, detail = sweep_verdict(sweep_lines(text), dependencies)
+        log_path = os.path.join(self.store_path(repo), "daemon.log")
+        # Re-read for every check: a previous gate cannot stand in for a new
+        # attempt started by a later MCP read. The durable log remains the
+        # authority after init's daemon exits and its port file disappears.
+        attempts = wait_for_latest_sweep(log_path)
+        ok, detail = sweep_verdict(attempts, dependencies)
         detail = "fixture %s: %s" % (name, detail)
-        self.sweep_gates[cache_key] = (ok, detail)
         print("kin-brownfield-repro: %s" % detail)
         if not ok:
             raise ProbeError(detail)
@@ -1104,14 +1256,82 @@ def find_row(rows, wanted):
 
 
 def projection_path(row):
-    """The file a reference row's caller is projected into, or None.
+    """The file a reply itself says a row or focal is projected into, or None.
 
-    A row names its caller by `entity_id` and serves the caller's file only as
-    `projection.path`, the projection it is and never an address.
+    Replies address an entity by id and no longer serve its file: the reply
+    surface strips every projection and coordinate field. A build that still
+    serves `projection.path` is read here; every other check places the entity
+    through `entity_file`, which reads the store's own metadata.
     """
     projection = row.get("projection") if isinstance(row, dict) else None
     path = projection.get("path") if isinstance(projection, dict) else None
     return path if isinstance(path, str) and path else None
+
+
+def entity_placement(suite, repo, entity_id):
+    """An entity's file, current span, kind and name, from the store's metadata.
+
+    A reply names its rows and its focal by entity id and serves neither a file
+    nor a line, and this suite's ground truth is a file line in a pinned
+    upstream tree, so the entity is placed here, at the fixture boundary and
+    nowhere else: `kin graph inspect <id> --json` reads the store's record of
+    the entity and refuses to print a stale span. It is never a reply field.
+    """
+    cache = suite.__dict__.setdefault("placements", {})
+    key = (repo, entity_id)
+    if key in cache:
+        return cache[key]
+    try:
+        rc, out, err = suite.kin_run(["graph", "inspect", entity_id, "--json"], repo,
+                                    timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProbeError("graph inspect(%s) metadata unavailable: %s" % (entity_id, exc))
+    try:
+        record = json.loads(out)
+    except (ValueError, TypeError):
+        raise ProbeError("graph inspect(%s) did not return metadata JSON" % entity_id)
+    lines = record.get("lines") if isinstance(record, dict) else None
+    if (rc != 0 or not isinstance(record, dict) or record.get("error")
+            or not isinstance(lines, list) or any(not isinstance(line, str) for line in lines)):
+        raise ProbeError("graph inspect(%s) metadata unavailable: %s" % (entity_id, err))
+    lines = [line.strip() for line in lines]
+    identities = [line.removeprefix("ID: ") for line in lines if line.startswith("ID: ")]
+    files = [line.removeprefix("File: ") for line in lines if line.startswith("File: ")]
+    entities = [line.removeprefix("Entity: ") for line in lines if line.startswith("Entity: ")]
+    spans = [line for line in lines if line.startswith("Span: ")]
+    match = re.fullmatch(r"Span: lines ([0-9]+)-([0-9]+)", spans[0]) if len(spans) == 1 else None
+    heading = re.fullmatch(r"(.+) \(([^()]+)\)", entities[0]) if len(entities) == 1 else None
+    if identities != [entity_id] or len(files) != 1 or not files[0] or not match or not heading:
+        raise ProbeError("graph inspect(%s) has no exact current identity, file and span"
+                         % entity_id)
+    start, end = map(int, match.groups())
+    if start < 1 or end < start:
+        raise ProbeError("graph inspect(%s) has an invalid span" % entity_id)
+    placement = {"file": files[0], "start": start, "end": end,
+                 "name": heading.group(1), "kind": heading.group(2).lower()}
+    cache[key] = placement
+    return placement
+
+
+def entity_file(suite, repo, record):
+    """The file a reply row or focal is projected into, or None.
+
+    A build that still serves `projection` is read as it says, and a malformed
+    one places nothing. A record that carries no `projection` at all, which is
+    every reply the projection-free surface serves, is placed by its id through
+    the store's metadata.
+    """
+    if not isinstance(record, dict):
+        return None
+    if "projection" in record:
+        return projection_path(record)
+    entity_id = record.get("entity_id") or record.get("id")
+    if not isinstance(entity_id, str) or not entity_id:
+        return None
+    try:
+        return entity_placement(suite, repo, entity_id)["file"]
+    except ProbeError:
+        return None
 
 
 def malformed_sites(row):
@@ -1142,39 +1362,20 @@ def malformed_sites(row):
 
 
 def module_span_lines(suite, repo, row):
-    """Read a module's current projection span without requesting its file body.
+    """Read a module's current span without requesting its file body.
 
     `graph inspect --json` exposes metadata and refuses to print stale spans.
     This is the pinned-fixture materialization boundary, not a source fallback.
     """
     entity_id = row["entity_id"]
-    try:
-        rc, out, err = suite.kin_run(["graph", "inspect", entity_id, "--json"], repo,
-                                    timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ProbeError("graph inspect(%s) metadata unavailable: %s" % (entity_id, exc))
-    try:
-        record = json.loads(out)
-    except (ValueError, TypeError):
-        raise ProbeError("graph inspect(%s) did not return metadata JSON" % entity_id)
-    lines = record.get("lines") if isinstance(record, dict) else None
-    if (rc != 0 or not isinstance(record, dict) or record.get("error")
-            or not isinstance(lines, list) or any(not isinstance(line, str) for line in lines)):
-        raise ProbeError("graph inspect(%s) metadata unavailable: %s" % (entity_id, err))
-    lines = [line.strip() for line in lines]
-    identities = [line.removeprefix("ID: ") for line in lines if line.startswith("ID: ")]
-    files = [line.removeprefix("File: ") for line in lines if line.startswith("File: ")]
-    entities = [line for line in lines if line.startswith("Entity: ")]
-    spans = [line for line in lines if line.startswith("Span: ")]
+    placement = entity_placement(suite, repo, entity_id)
+    served = projection_path(row)
     expected_kind = str(row.get("kind", "")).lower()
-    match = re.fullmatch(r"Span: lines ([0-9]+)-([0-9]+)", spans[0]) if len(spans) == 1 else None
-    if (identities != [entity_id] or files != [projection_path(row)] or len(entities) != 1
-            or not entities[0].lower().endswith("(%s)" % expected_kind) or not match):
-        raise ProbeError("graph inspect(%s) has no exact current module identity and span" % entity_id)
-    start, end = map(int, match.groups())
-    if start < 1 or end < start:
-        raise ProbeError("graph inspect(%s) has an invalid module span" % entity_id)
-    return start, end
+    if (placement["kind"] != expected_kind
+            or (served is not None and served != placement["file"])):
+        raise ProbeError("graph inspect(%s) has no exact current module identity and span"
+                         % entity_id)
+    return placement["start"], placement["end"]
 
 
 def site_file_lines(suite, repo, row, call=None):
@@ -1211,10 +1412,17 @@ def site_file_lines(suite, repo, row, call=None):
                  and start + site["line_in_entity"] <= end else None, site)
                 for site in sites]
     record = suite.cached(repo, "get_entity_source", {"entity_id": entity_id})
-    start = record.get("start_line") if isinstance(record, dict) else None
     body = record.get("body") if isinstance(record, dict) else None
-    if type(start) is not int or start < 1 or not isinstance(body, str):
-        raise ProbeError("get_entity_source(%s) carries no positive start_line and body"
+    if not isinstance(body, str):
+        raise ProbeError("get_entity_source(%s) carries no body" % entity_id)
+    # A reply serves the body and no line; the first line comes from the
+    # store's metadata, unless a build still serves it.
+    if "start_line" in record:
+        start = record["start_line"]
+    else:
+        start = entity_placement(suite, repo, entity_id)["start"]
+    if type(start) is not int or start < 1:
+        raise ProbeError("get_entity_source(%s) places the entity at no positive line"
                          % entity_id)
     body_lines = body.splitlines()
     placed = []
@@ -1265,7 +1473,7 @@ def grade_pinned_call_site(res, suite, repo, row, caller, call, path, line):
     old absolute `reference_lines` membership proved plus the text Kin now reads
     at the site.
     """
-    projected = projection_path(row)
+    projected = entity_file(suite, repo, row)
     if projected != path:
         res.bad("%s is counted, but its row is projected into %r, not %s, so its sites "
                 "cannot be the call at %s:%d" % (caller, projected, path, path, line))
@@ -1302,6 +1510,10 @@ def grade_pinned_call_site(res, suite, repo, row, caller, call, path, line):
 # a sound. The next word anyone adds lands in UnknownClassState instead.
 CLASS_PRESENT = frozenset(["present"])
 CLASS_SHORT = frozenset(["absent", "unknown", "unproduced"])
+# Declaration censuses use their own closed vocabulary. Listed residue and an
+# unmeasured census both refuse completeness; they are not generic edge states.
+DECLARATIONS_PRESENT = CLASS_PRESENT | frozenset(["complete"])
+DECLARATIONS_SHORT = CLASS_SHORT | frozenset(["complete_except", "unmeasured"])
 
 
 class UnknownClassState(Exception):
@@ -1314,17 +1526,22 @@ def class_shortfall(classes, surface):
     A word the grader does not know is never sorted into either bucket; the
     caller reports the payload UNREADABLE and names the word.
     """
+    if (not isinstance(classes, dict)
+            or any(not isinstance(name, str) or not name for name in classes)):
+        raise UnknownClassState("%s carries malformed coverage classes: %r" % (surface, classes))
     short = []
     for name in sorted(classes):
         state = classes[name]
-        if state in CLASS_PRESENT:
+        present = DECLARATIONS_PRESENT if name == "declarations" else CLASS_PRESENT
+        missing = DECLARATIONS_SHORT if name == "declarations" else CLASS_SHORT
+        if isinstance(state, str) and state in present:
             continue
-        if state in CLASS_SHORT:
+        if isinstance(state, str) and state in missing:
             short.append(name)
             continue
         raise UnknownClassState(
             "%s carries a class state this grader does not know: %s=%r (known: %s)"
-            % (surface, name, state, ", ".join(sorted(CLASS_PRESENT | CLASS_SHORT))))
+            % (surface, name, state, ", ".join(sorted(present | missing))))
     return short
 
 
@@ -1363,7 +1580,7 @@ def verdict_surfaces(payload):
     if isinstance(kin_envelope, dict) and "verdict" in kin_envelope:
         verdict = kin_envelope["verdict"]
         if (not isinstance(verdict, dict)
-                or verdict.get("state") not in ("certified", "inconclusive")
+                or verdict.get("state") not in ("certified", "certified_except", "inconclusive")
                 or not isinstance(verdict.get("safe_to_conclude_absent"), bool)
                 or "limiting_factor" not in verdict
                 or (verdict["limiting_factor"] is not None
@@ -1374,12 +1591,14 @@ def verdict_surfaces(payload):
         out["_kin.verdict"] = (
             "certify" if state == "certified" else "refuse",
             "state=%r limiting_factor=%r" % (state, factor))
-        if state == "inconclusive" and not (factor and factor.strip()):
+        # A named remainder qualifies its proven rows, never the full set.
+        # Both qualified and inconclusive verdicts must identify their limit.
+        if state != "certified" and not (factor and factor.strip()):
             raise UnknownClassState("_kin.verdict refuses without a limiting factor")
         if factor is not None:
             out["_kin.verdict.limiting_factor"] = ("refuse", "limiting_factor=%r" % factor)
         # False is normal on a populated certified answer: it claims no
-        # absence. True, however, cannot agree with an inconclusive verdict.
+        # absence. True cannot agree with a qualified or inconclusive verdict.
         if verdict["safe_to_conclude_absent"] is True:
             out["_kin.verdict.absence"] = ("certify", "safe_to_conclude_absent=True")
     completeness = kin_envelope.get("completeness") if isinstance(kin_envelope, dict) else None
@@ -1417,7 +1636,18 @@ def verdict_surfaces(payload):
         if enrichment in ("unknown", "unsupported", "absent", "unprobed"):
             gaps.append("reference_enrichment=%r" % enrichment)
         scan = coverage.get("scan")
-        if isinstance(scan, str) and scan.startswith("skipped"):
+        # A declaration-only name filter requests no relationship scan, whether
+        # it matched nothing (`absence_scope`) or matched rows (`query_matches`,
+        # the match set before pagination). Require one of those explicit
+        # scopes, so missing or actual edge scope still refuses. Declaration
+        # shortfalls above remain independent limits.
+        no_edge_dependency = (
+            scan == "skipped_no_edge_dependency"
+            and coverage.get("scope") in ("absence_scope", "query_matches")
+            and coverage.get("requested_classes") == []
+            and coverage.get("cross_unit_classes") == []
+            and isinstance(classes, dict) and set(classes) == {"declarations"})
+        if isinstance(scan, str) and scan.startswith("skipped") and not no_edge_dependency:
             gaps.append("scan=%r" % scan)
         if coverage.get("budget_exhausted") is True:
             gaps.append("budget_exhausted=True")
@@ -1521,7 +1751,7 @@ def check_0(suite):
     # run whose opt-out was in fact honored.
     status = suite.graph_status("express")
     repo = suite.fixture("express")
-    log = os.path.join(repo, ".kin", "daemon.log")
+    log = os.path.join(suite.store_path(repo), "daemon.log")
     if not os.path.exists(log):
         res.unknown("no daemon log at %s, cannot confirm the opt-out was honored" % log)
     else:
@@ -2151,6 +2381,7 @@ def check_7(suite):
     try:
         suite.sweep_gate("express")
         payload = suite.cached(repo, "find_references", {"query": EXPRESS_EXPORT})
+        payload = express_export_reference_body(suite, repo, payload, EXPRESS_EXPORT)
     except ProbeError as exc:
         res.unknown(str(exc))
         return res
@@ -2175,6 +2406,28 @@ def check_7(suite):
                 "candidate(s)) on a symbol used 32 times in this repository"
                 % (EXPRESS_EXPORT, total, len(withheld)))
     return res
+
+
+def populated_search_problems(results, negative):
+    """Problems with a populated semantic_search answer's negative block.
+
+    A populated answer never licenses an absence, so `safe_to_conclude_absent`
+    must not be true. `trust: authoritative` there says the rows are the whole
+    set, which is a claim that can be false: it is wrong exactly when the known
+    method is missing from those rows. Trust that is not authoritative claims
+    nothing about the set and is never a problem on its own.
+    """
+    problems = []
+    if negative.get("safe_to_conclude_absent") is True:
+        problems.append("semantic_search returned %d result(s) and still reports "
+                        "safe_to_conclude_absent=True" % len(results))
+    found = any(name_matches(n, PY_KNOWN_METHOD) for n in entity_names(results))
+    if negative.get("trust") == "authoritative" and not found:
+        problems.append("semantic_search certified its %d result(s) as the whole set "
+                        "(trust='authoritative') without %s, a method at %s:%d"
+                        % (len(results), PY_KNOWN_METHOD, PY_KNOWN_METHOD_FILE,
+                           PY_KNOWN_METHOD_LINE))
+    return problems
 
 
 def check_8(suite):
@@ -2204,18 +2457,14 @@ def check_8(suite):
     certified = (negative.get("safe_to_conclude_absent") is True
                  or negative.get("trust") == "authoritative")
     if results:
-        names = entity_names(results)
-        if any(name_matches(n, PY_KNOWN_METHOD) for n in names):
-            res.ok("semantic_search found %s among %d result(s)"
-                   % (PY_KNOWN_METHOD, len(results)))
-        else:
-            res.ok("semantic_search returned %d result(s) and certified nothing "
-                   "absent" % len(results))
-        if certified:
-            res.bad("semantic_search returned %d result(s) and still reports "
-                    "safe_to_conclude_absent=%r trust=%r"
-                    % (len(results), negative.get("safe_to_conclude_absent"),
-                       negative.get("trust")))
+        problems = populated_search_problems(results, negative)
+        for problem in problems:
+            res.bad(problem)
+        if not problems:
+            found = any(name_matches(n, PY_KNOWN_METHOD) for n in entity_names(results))
+            res.ok("semantic_search %s among %d result(s) and claimed no absence (trust=%r)"
+                   % ("found " + PY_KNOWN_METHOD if found else "certified nothing",
+                      len(results), negative.get("trust")))
         return res
     coverage = payload.get("edge_coverage") or {}
     if certified:
@@ -2318,7 +2567,7 @@ def rescue_kill_init_mid_ladder(suite, repo, log_path):
     trigger on a pre-fix binary as on a fixed one.
     """
     with open(log_path, "wb") as log:
-        proc = subprocess.Popen([suite.kin, "init", ".", "--no-enrich"],
+        proc = subprocess.Popen([suite.kin, "init", ".", "--defer-enrich"],
                                 cwd=repo, stdout=subprocess.DEVNULL,
                                 stderr=log, env=suite.env)
         reached = 0
@@ -2368,8 +2617,15 @@ def check_9(suite):
     staging still sitting there unnamed. On a pre-fix binary all three answer
     with silence.
     """
+    # This historical interrupted-admission witness inspects staging beside an
+    # in-tree store. Keep that scope explicit; it does not qualify central-store
+    # interrupted admission. Other checks continue with the requested layout.
+    suite = copy.copy(suite)
+    suite.env = dict(suite.env, KIN_STORE_LAYOUT="in-tree")
+    suite.store_layout = "in-tree"
     res = Result("9", "FIR-2639", "a killed kin init leaves a post-mortem, a "
                                   "named restart and no silent orphan")
+    res.note("fixture layout: in-tree; central-store interruption is a separate witness")
     try:
         parent, repo = rescue_fixture(suite)
     except ProbeError as exc:
@@ -2439,7 +2695,7 @@ def check_9(suite):
     # ARM 2. The re-run says whether it is resuming or restarting, and why.
     rerun_log = os.path.join(parent, "rerun-init.err")
     with open(rerun_log, "wb") as handle:
-        rerun = subprocess.Popen([suite.kin, "init", ".", "--no-enrich"],
+        rerun = subprocess.Popen([suite.kin, "init", ".", "--defer-enrich"],
                                  cwd=repo, stdout=subprocess.DEVNULL,
                                  stderr=handle, env=suite.env)
         rerun.wait()
@@ -2710,7 +2966,7 @@ def check_10(suite):
     return res
 
 
-def express_export_reference_body(payload, export):
+def express_export_reference_body(suite, repo, payload, export):
     """Select the pinned export's answer, independently of its reference rows.
 
     Bare names can produce labelled sections instead of a single focal. In the
@@ -2737,13 +2993,12 @@ def express_export_reference_body(payload, export):
         if not isinstance(body, dict):
             raise ProbeError("reference section is not an object")
         focal = body.get("focal_entity")
-        # The focal is addressed by id with its file only as the labelled
-        # projection, as every row is. A focal still carrying `file_path` is
-        # the retired shape and establishes no identity.
+        # The focal is addressed by id, as every row is, and the reply serves
+        # no file for it. A focal still carrying `file_path` is the retired
+        # shape and establishes no identity.
         if (not isinstance(focal, dict)
                 or any(not isinstance(focal.get(key), str) or not focal[key]
                        for key in ("id", "name", "kind"))
-                or projection_path(focal) is None
                 or "file_path" in focal):
             raise ProbeError("reference response carries no valid focal identity")
         if focal["id"] in identities:
@@ -2752,7 +3007,7 @@ def express_export_reference_body(payload, export):
         if sectioned and (body.get("entity_id") != focal["id"]
                           or body.get("owner_qualified_name") != focal["name"]):
             raise ProbeError("reference section label disagrees with its focal identity")
-        if (focal["name"] == export and projection_path(focal) == "lib/express.js"
+        if (focal["name"] == export and entity_file(suite, repo, focal) == "lib/express.js"
                 and focal["kind"].lower() == "constant"):
             matches.append(body)
     if len(matches) != 1:
@@ -2805,13 +3060,13 @@ def check_11(suite):
     for export, caller_file, line in EXPRESS_MODULE_SOURCED_SITES:
         try:
             payload = suite.cached(repo, "find_references", {"query": export})
-            payload = express_export_reference_body(payload, export)
+            payload = express_export_reference_body(suite, repo, payload, export)
         except ProbeError as exc:
             res.unknown("find_references(%s): %s" % (export, exc))
             return res
         counted, _withheld = upstream_rows(payload)
         row = next((r for r in counted
-                    if projection_path(r) == caller_file
+                    if entity_file(suite, repo, r) == caller_file
                     and str(r.get("kind", "")).lower() == "module"), None)
         if row is None:
             res.bad("%s: no module-sourced row for %s among %d counted row(s); the "
@@ -2914,6 +3169,54 @@ def self_test():
     certifying, refusing = surface_conflict(verdict_surfaces(search))
     expect("search payload certifying", certifying, ["negative"])
     expect("search payload refusing", refusing, ["edge_coverage"])
+
+    # The populated name filter as the server ships it: one match, the
+    # declaration census complete, no relationship scan because none was
+    # needed, and every surface certifying. One verdict, agreed.
+    populated = {
+        "negative": {"safe_to_conclude_absent": False, "trust": "authoritative"},
+        "_kin": {"verdict": {"state": "certified", "safe_to_conclude_absent": False,
+                             "limiting_factor": None},
+                 "completeness": {"status": "complete", "bound": "exact",
+                                  "classes": {"graph": "present"}}},
+        "edge_coverage": {"scope": "query_matches", "requested_classes": [],
+                          "cross_unit_classes": [],
+                          "classes": {"declarations": "complete"},
+                          "reference_enrichment": "available",
+                          "scan": "skipped_no_edge_dependency"},
+    }
+    certifying, refusing = surface_conflict(verdict_surfaces(populated))
+    expect("a populated name filter with no edge dependency agrees", refusing, None)
+    for label, mutate in (
+            ("no scope", lambda p: p["edge_coverage"].pop("scope")),
+            ("an edge scope", lambda p: p["edge_coverage"].update(scope="reference_walk")),
+            ("a requested edge class",
+             lambda p: p["edge_coverage"].update(requested_classes=["calls"])),
+            ("a cross-unit edge class",
+             lambda p: p["edge_coverage"].update(cross_unit_classes=["imports"])),
+            ("no cross-unit class list",
+             lambda p: p["edge_coverage"].pop("cross_unit_classes")),
+            ("an edge class beside declarations",
+             lambda p: p["edge_coverage"]["classes"].update(calls="present"))):
+        broken = copy.deepcopy(populated)
+        mutate(broken)
+        expect("a skipped scan with %s still refuses" % label,
+               verdict_surfaces(broken)["edge_coverage"][0], "refuse")
+
+    found = [{"name": PY_KNOWN_METHOD, "kind": "method"}]
+    missing = [{"name": "Session.send", "kind": "method"}]
+    expect("an authoritative populated search holding the method passes",
+           populated_search_problems(found, {"trust": "authoritative",
+                                             "safe_to_conclude_absent": False}), [])
+    expect("an authoritative populated search missing the method fails",
+           len(populated_search_problems(missing, {"trust": "authoritative",
+                                                   "safe_to_conclude_absent": False})), 1)
+    expect("an inconclusive populated search missing the method passes",
+           populated_search_problems(missing, {"trust": "inconclusive",
+                                               "safe_to_conclude_absent": False}), [])
+    expect("a populated search claiming an absence fails",
+           len(populated_search_problems(found, {"trust": "inconclusive",
+                                                 "safe_to_conclude_absent": True})), 1)
 
     # The inverse: one verdict, agreed. The grader must NOT report a conflict here,
     # or every fixed build would still read as broken.
@@ -3200,6 +3503,8 @@ def main(argv):
     parser.add_argument("--corpus-cache",
                         default=os.path.expanduser("~/.cache/kin-brownfield-repro"))
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--store-layout", choices=("default", "central", "in-tree"),
+                        default="default", help="fixture layout; check 9 remains an explicit in-tree witness")
     parser.add_argument("--label", default="")
     parser.add_argument("--only", default="")
     parser.add_argument("--json", dest="json_out")
@@ -3242,13 +3547,14 @@ def main(argv):
     wanted = [w.strip() for w in opts.only.split(",") if w.strip()] or None
 
     suite = Suite(kin, workdir, corpus_cache, daemon=daemon, offline=opts.offline,
-                  verbose=opts.verbose)
+                  verbose=opts.verbose, store_layout=opts.store_layout)
     print("kin-brownfield-repro: %s" % NON_CITABLE)
     print("kin-brownfield-repro: %s" % FIXTURE_SCOPE)
     print("kin-brownfield-repro: %s" % version)
     print("kin-brownfield-repro: binary %s" % kin)
     print("kin-brownfield-repro: daemon %s" % (daemon or "(resolved by kin itself)"))
     print("kin-brownfield-repro: workdir %s" % workdir)
+    print("kin-brownfield-repro: fixture store layout %s (check 9: in-tree)" % opts.store_layout)
     print("kin-brownfield-repro: corpus cache %s%s"
           % (corpus_cache, " (offline)" if opts.offline else ""))
     for name in sorted(CORPORA):
@@ -3341,13 +3647,24 @@ def main(argv):
                        for key, value in suite.payloads.items()], handle, indent=2)
         print("kin-brownfield-repro: failing-run MCP payloads %s" % payload_path)
 
+    diagnostics = None
+    if opts.json_out and (failed or unread):
+        try:
+            diagnostics = retain_failure_diagnostics(suite, opts.json_out, 1 if failed else 2)
+        except Exception as exc:
+            diagnostics = {"capture_error": type(exc).__name__}
+
     if opts.json_out:
         with open(opts.json_out, "w") as handle:
             json.dump({"citable": False, "lane": "DEV-LOCAL",
                        "fixture_scope": FIXTURE_SCOPE,
                        "label": opts.label, "kin": kin, "version": version,
                        "workdir": workdir, "daemon": daemon,
+                       "store_layout": opts.store_layout,
+                       "fixture_stores": getattr(suite, "stores", {}),
+                       "layout_exceptions": {"9": "in-tree interrupted-admission witness"},
                        "corpora": CORPORA,
+                       "failure_diagnostics": diagnostics,
                        "compared_against": prior_label,
                        "results": [{"id": r.id, "ticket": r.ticket, "title": r.title,
                                     "status": r.status, "detail": r.detail,

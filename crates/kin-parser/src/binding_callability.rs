@@ -36,8 +36,10 @@ pub fn attach_binding_callability(
         if let Some((name, value, immutable)) = scalar_binding(node, source, language) {
             if scalar(value, language) {
                 // Java exposes the whole field declaration for each member;
-                // other adapters expose the binding itself. Rust additionally
-                // includes leading documentation, handled by its line marker.
+                // other adapters expose the binding itself. An entity whose
+                // span also holds what stands around the binding (its
+                // documentation, its declaration keyword, the statement's
+                // terminator) is matched by the line its id keys on.
                 let declaration = if language == LanguageId::Java {
                     node.parent().unwrap_or(node)
                 } else {
@@ -72,12 +74,19 @@ pub fn attach_binding_callability(
                 .get(crate::extract::DECLARATION_LINE_KEY)
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(span.start_line as u64);
+            // What follows the binding inside the span is at most the
+            // statement's terminator, so a binding nested in the value (a
+            // local inside an initializer) is never taken for the entity's.
+            let ends_the_span = range.end <= span.end_byte
+                && source.get(range.end..span.end_byte).is_some_and(|tail| {
+                    tail.iter()
+                        .all(|byte| byte.is_ascii_whitespace() || *byte == b';')
+                });
             name == leaf
-                && span.end_byte == range.end
-                && (span.start_byte == range.start
-                    || (language == LanguageId::Rust
-                        && span.start_byte < range.start
-                        && declaration_line == *row as u64))
+                && span.start_byte <= range.start
+                && ends_the_span
+                && ((span.start_byte == range.start && span.end_byte == range.end)
+                    || declaration_line == *row as u64)
         }) {
             entity.metadata.extra.insert(
                 BINDING.into(),

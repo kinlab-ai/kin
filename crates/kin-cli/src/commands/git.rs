@@ -103,13 +103,19 @@ pub(crate) fn capture_export_snapshot_from_state(
 pub fn export(output: PathBuf) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
+    kin_core::history_state::require_complete_for(&layout, "kin git export")
+        .map_err(anyhow::Error::msg)?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let output = validate_export_destination(&layout, &cwd, &output)?;
     let authority = ActiveRepositoryAuthority::open(&binding)?;
     let captured = capture_export_snapshot(&authority)?;
     let mut source = RepositorySource::new(&authority);
-    let result = kin_git::export_repository_to_git(&captured.plan, &mut source, &output)
-        .context("project repository-v6 authority to Git")?;
+    let result = kin_git::export_repository_to_git(
+        &captured.plan,
+        &mut source,
+        &kin_io::WorktreeRoot::new(&output, &kin_io::Grant::ambient()),
+    )
+    .context("project repository-v6 authority to Git")?;
 
     // A read lease remains immutable, but a distinct writer can publish a new
     // generation while export is running. Report the exact generation that

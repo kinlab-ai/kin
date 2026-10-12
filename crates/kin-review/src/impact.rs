@@ -68,6 +68,22 @@ pub trait ImpactGraph {
         self.impact_enrichment_observation(targets, unknown_target)
     }
 
+    /// [`Self::impact_enrichment_observation_with_source`] with every host
+    /// observation the answer's source holds. A view that cannot speak for
+    /// this host, such as a historical one, ignores the resolver source.
+    fn impact_enrichment_observation_with_sources(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+        sources: crate::enrichment::ObservationSources<'_>,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        self.impact_enrichment_observation_with_source(
+            targets,
+            unknown_target,
+            sources.escape_evidence,
+        )
+    }
+
     /// Whether graph-owned parser coverage proves complete source coverage for
     /// this view. The default is fail-closed so implementations of
     /// the older public trait remain source-compatible without certifying new
@@ -281,6 +297,21 @@ impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
         .map(Some)
     }
 
+    fn impact_enrichment_observation_with_sources(
+        &self,
+        targets: &[Entity],
+        unknown_target: bool,
+        sources: crate::enrichment::ObservationSources<'_>,
+    ) -> Result<Option<crate::enrichment::EnrichmentObservation>, ReviewError> {
+        crate::enrichment::observe_selected_impact_with_sources(
+            self.0,
+            targets,
+            unknown_target,
+            sources,
+        )
+        .map(Some)
+    }
+
     fn call_shape_binding_prerequisites_complete(&self) -> Result<bool, ReviewError> {
         live_call_shape_prerequisites_with_tree_read(
             self.0,
@@ -377,6 +408,26 @@ pub struct ImpactReport {
     pub affected_contract_consumers: Vec<Entity>,
     /// Tests that cover changed entities.
     pub affected_tests: Vec<Entity>,
+    /// Methods that override a changed entity, directly or through a chain of
+    /// overrides, read off incoming `Overrides` edges. An override does not
+    /// call the method it overrides, so none of the consumer buckets above
+    /// can hold it, and it is exactly what has to change in step when the
+    /// overridden method's signature changes. Their callers are
+    /// [`Self::affected_override_callers`].
+    #[serde(default)]
+    pub affected_overrides: Vec<Entity>,
+    /// Entities proven to call an override in [`Self::affected_overrides`]
+    /// that are not proven callers of a changed entity themselves, each with
+    /// the override it calls. A call settled on an override is not an edge to
+    /// the method it overrides, so no other bucket can hold these, and each
+    /// changes with that method's signature exactly as a direct caller does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_override_callers: Vec<crate::override_callers::OverrideCaller>,
+    /// Entities whose every call to an override was matched by name only,
+    /// and that no other bucket already lists. Candidates to check, never
+    /// counted as affected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_caller_candidates: Vec<crate::override_callers::OverrideCaller>,
     /// Active work items scoped to changed entities.
     pub affected_work_items: Vec<WorkItem>,
     /// Annotations on changed entities that may become stale.
@@ -639,6 +690,9 @@ impl ImpactReport {
             && self.affected_dependents.is_empty()
             && self.affected_contract_consumers.is_empty()
             && self.affected_tests.is_empty()
+            && self.affected_overrides.is_empty()
+            && self.affected_override_callers.is_empty()
+            && self.override_caller_candidates.is_empty()
             && self.affected_work_items.is_empty()
             && self.affected_annotations.is_empty()
             && self.unreviewed_agent_changes.is_empty()
@@ -666,6 +720,13 @@ impl ImpactReport {
         for e in &self.affected_tests {
             seen.insert(e.id);
         }
+        for e in &self.affected_overrides {
+            seen.insert(e.id);
+        }
+        // Candidates are not counted: a name match is not an affected entity.
+        for row in &self.affected_override_callers {
+            seen.insert(row.entity.id);
+        }
         seen.len()
     }
 }
@@ -687,6 +748,17 @@ pub fn analyze_impact_with_source<G: GraphStore>(
     analyze_impact_at_with_source(&LiveGraph(store), diff, escape_evidence)
 }
 
+/// [`analyze_impact_with_source`] with every host observation the answer's
+/// source holds, so its enrichment observation reads a caller no resolver can
+/// prove on this host the way the store-wide status reads it.
+pub fn analyze_impact_with_sources<G: GraphStore>(
+    store: &G,
+    diff: &SemanticDiff,
+    sources: crate::enrichment::ObservationSources<'_>,
+) -> Result<ImpactReport, ReviewError> {
+    analyze_impact_at_with_sources(&LiveGraph(store), diff, sources)
+}
+
 /// Analyze the impact of changes described in a `SemanticDiff` by walking
 /// the supplied [`ImpactGraph`] for each changed entity.
 ///
@@ -705,6 +777,21 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
     graph: &I,
     diff: &SemanticDiff,
     escape_evidence: Option<&crate::enrichment::EscapeEvidence<'_>>,
+) -> Result<ImpactReport, ReviewError> {
+    analyze_impact_at_with_sources(
+        graph,
+        diff,
+        crate::enrichment::ObservationSources {
+            escape_evidence,
+            no_resolver: None,
+        },
+    )
+}
+
+pub fn analyze_impact_at_with_sources<I: ImpactGraph>(
+    graph: &I,
+    diff: &SemanticDiff,
+    sources: crate::enrichment::ObservationSources<'_>,
 ) -> Result<ImpactReport, ReviewError> {
     let changed_ids = diff.changed_entity_ids();
     let changed_set: HashSet<EntityId> = changed_ids.iter().copied().collect();
@@ -729,11 +816,19 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
     let mut dependents = Vec::new();
     let mut contract_consumers = Vec::new();
     let mut tests = Vec::new();
+    let mut overrides = Vec::new();
 
     let mut seen_callers = HashSet::new();
     let mut seen_dependents = HashSet::new();
     let mut seen_consumers = HashSet::new();
     let mut seen_tests = HashSet::new();
+    let mut seen_overrides = HashSet::new();
+    // Entities a proven `Calls` edge reaches a changed entity from, and each
+    // changed entity's overrides, for the override callers read after the
+    // walk: a proven direct caller is listed already, and a caller of an
+    // override of any changed entity is read once against every family.
+    let mut proven_callers: HashSet<EntityId> = HashSet::new();
+    let mut families: Vec<(EntityId, Vec<Entity>)> = Vec::new();
 
     let mut entity_impacts: Vec<EntityImpact> = Vec::new();
     let call_shape_binding_prerequisites_complete =
@@ -907,6 +1002,9 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
             }
             match rel.kind {
                 RelationKind::Calls => {
+                    if RelationResolution::of(rel).is_proven() {
+                        proven_callers.insert(affected_id);
+                    }
                     if seen_callers.insert(affected_id) {
                         callers.push(entity);
                     }
@@ -928,12 +1026,33 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
             }
         }
 
+        // The methods that override this one, and the ones that override
+        // those. Read before the transitive walk below, which follows every
+        // incoming edge kind and would otherwise file an override under
+        // `affected_dependents` beside two-hop reach, where nothing says it is
+        // a declaration that must change with this one's signature.
+        let mut ent_overrides: HashSet<EntityId> = HashSet::new();
+        let mut family: Vec<Entity> = Vec::new();
+        for entity in overriders_of(graph, &entity_id)? {
+            if changed_set.contains(&entity.id) {
+                continue;
+            }
+            ent_overrides.insert(entity.id);
+            family.push(entity.clone());
+            if seen_overrides.insert(entity.id) {
+                overrides.push(entity);
+            }
+        }
+        if !family.is_empty() {
+            families.push((entity_id, family));
+        }
+
         // Also use get_downstream_impact for transitive effects; the walk
         // follows incoming edges, so its results are inbound by construction.
         let downstream = graph.get_downstream_impact(&entity_id, 2)?;
 
         for entity in downstream {
-            if changed_set.contains(&entity.id) {
+            if changed_set.contains(&entity.id) || ent_overrides.contains(&entity.id) {
                 continue;
             }
             if entity.role == EntityRole::Test {
@@ -986,6 +1105,27 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
     }
 
     entity_impacts.sort_by_key(|impact| impact.entity_id);
+
+    // The callers of every override, the part of a signature change no edge
+    // to a changed entity reaches. A family member is listed as one already,
+    // and a caller changed in this diff moved with it. A proven direct caller
+    // is listed under `affected_callers`; one whose direct edge is a name
+    // match is listed here too when its call to an override is proven, and a
+    // name-matched override caller is a candidate only when no bucket lists
+    // it at all.
+    let found =
+        crate::override_callers::override_callers_at(graph, &families, |caller, proven| {
+            changed_set.contains(&caller.id)
+                || seen_overrides.contains(&caller.id)
+                || changed_keys.contains(&entity_identity_key(caller))
+                || if proven {
+                    proven_callers.contains(&caller.id)
+                } else {
+                    seen_callers.contains(&caller.id)
+                }
+        })?;
+    let override_callers = found.proven;
+    let override_caller_candidates = found.candidates;
 
     // Query work items and annotations scoped to changed entities.
     let mut work_items = Vec::new();
@@ -1094,14 +1234,21 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
             .chain(&dependents)
             .chain(&contract_consumers)
             .chain(&tests)
+            .chain(&overrides)
+            .chain(
+                override_callers
+                    .iter()
+                    .chain(&override_caller_candidates)
+                    .map(|row| &row.entity),
+            )
             .cloned(),
     );
     enrichment_targets.sort_by(|left, right| (left.id, &left.name).cmp(&(right.id, &right.name)));
     enrichment_targets.dedup_by(|left, right| left.id == right.id && left.name == right.name);
-    let enrichment = graph.impact_enrichment_observation_with_source(
+    let enrichment = graph.impact_enrichment_observation_with_sources(
         &enrichment_targets,
         unknown_target,
-        escape_evidence,
+        sources,
     )?;
 
     Ok(ImpactReport {
@@ -1110,6 +1257,9 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
         affected_dependents: dependents,
         affected_contract_consumers: contract_consumers,
         affected_tests: tests,
+        affected_overrides: overrides,
+        affected_override_callers: override_callers,
+        override_caller_candidates,
         affected_work_items: work_items,
         affected_annotations: annotations,
         changed_ids,
@@ -1117,6 +1267,79 @@ pub fn analyze_impact_at_with_source<I: ImpactGraph>(
         actor_attribution,
         entity_impacts,
     })
+}
+
+/// How many override levels [`overriders_of`] descends below a method.
+///
+/// Real override chains are shallow: a base, an adapter, a test double. The
+/// bound is insurance against a malformed hierarchy, not a trim of real ones.
+pub const OVERRIDE_CLOSURE_DEPTH: usize = 8;
+
+/// How many overriding methods [`overriders_of`] collects for one method.
+pub const OVERRIDE_CLOSURE_MAX: usize = 512;
+
+/// Whether `relation` says its source redeclares its destination: an
+/// `Overrides` edge, or an `Implements` edge whose source is itself a callable
+/// member, which is how an adapter records a method satisfying a declared
+/// contract member. A type-level `Implements` (a class implementing an
+/// interface) names no member and is not followed.
+pub fn is_member_redeclaration(relation: &Relation, source: &Entity) -> bool {
+    match relation.kind {
+        RelationKind::Overrides => true,
+        RelationKind::Implements => matches!(
+            source.kind,
+            kin_model::entity::EntityKind::Method | kin_model::entity::EntityKind::Function
+        ),
+        _ => false,
+    }
+}
+
+/// Every method that overrides `id`, directly or through a chain of overrides,
+/// in breadth-first order and each at most once. A member that implements a
+/// declared contract member counts too, by [`is_member_redeclaration`].
+///
+/// Read off incoming edges through the graph's read view, so an override the
+/// linker attributed to an inferred member never reaches here. The walk stops
+/// at [`OVERRIDE_CLOSURE_DEPTH`] levels and [`OVERRIDE_CLOSURE_MAX`] rows.
+pub fn overriders_of<I: ImpactGraph>(graph: &I, id: &EntityId) -> Result<Vec<Entity>, ReviewError> {
+    let mut seen: HashSet<EntityId> = HashSet::from([*id]);
+    let mut found = Vec::new();
+    let mut frontier = vec![*id];
+    for _ in 0..OVERRIDE_CLOSURE_DEPTH {
+        let mut next = Vec::new();
+        for current in frontier {
+            for rel in graph.get_all_relations_for_entity(&current)? {
+                if !matches!(rel.kind, RelationKind::Overrides | RelationKind::Implements)
+                    || rel.dst != GraphNodeId::Entity(current)
+                {
+                    continue;
+                }
+                let Some(child) = rel.src.as_entity() else {
+                    continue;
+                };
+                if seen.contains(&child) {
+                    continue;
+                }
+                let Some(entity) = graph.get_entity(&child)? else {
+                    continue;
+                };
+                if !is_member_redeclaration(&rel, &entity) {
+                    continue;
+                }
+                seen.insert(child);
+                found.push(entity);
+                next.push(child);
+                if found.len() >= OVERRIDE_CLOSURE_MAX {
+                    return Ok(found);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok(found)
 }
 
 /// Source file a consumer entity lives in, from its span or file origin.
@@ -1247,6 +1470,9 @@ mod tests {
             ..Default::default()
         };
         let report = analyze_impact(&graph, &diff).unwrap();
+        // An override the linker attributed to an inferred member is read as
+        // absent, so it names no override to change.
+        assert!(report.affected_overrides.is_empty());
         let candidate = report.entity_impact(&target.id).unwrap();
         assert_eq!(candidate.proven_consumer_count, 0);
         assert_eq!(candidate.strong_consumer_count, 0);
@@ -1261,6 +1487,74 @@ mod tests {
         assert_eq!(row.path[0].confidence_basis_points, 3000);
         assert_eq!(row.path[0].resolution, "name_only");
         assert_ne!(row.path[0].relation_kind, RelationKind::Overrides);
+    }
+
+    #[test]
+    fn overrides_of_a_changed_method_are_their_own_bucket_through_the_chain() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut base = entity_in_file("SessionInterface.open_session", "sessions.py", 10);
+        let mut child = entity_in_file(
+            "SecureCookieSessionInterface.open_session",
+            "sessions.py",
+            40,
+        );
+        let mut grandchild =
+            entity_in_file("test_x.<locals>.Failing.open_session", "tests/test_x.py", 5);
+        for method in [&mut base, &mut child, &mut grandchild] {
+            method.kind = EntityKind::Method;
+        }
+        let caller = entity_in_file("AppContext._get_session", "ctx.py", 3);
+        let unrelated = entity_in_file("other", "other.py", 1);
+        for entity in [&base, &child, &grandchild, &caller, &unrelated] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        let overrides = |src: &Entity, dst: &Entity| {
+            let mut relation = calls(src, dst);
+            relation.kind = RelationKind::Overrides;
+            relation
+        };
+        for relation in [
+            overrides(&child, &base),
+            overrides(&grandchild, &child),
+            calls(&caller, &base),
+            calls(&unrelated, &child),
+        ] {
+            graph.upsert_relation(&relation).unwrap();
+        }
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&base)],
+            ..Default::default()
+        };
+        let report = analyze_impact(&graph, &diff).unwrap();
+        let names = |entities: &[Entity]| {
+            entities
+                .iter()
+                .map(|entity| entity.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&report.affected_overrides),
+            [
+                "SecureCookieSessionInterface.open_session",
+                "test_x.<locals>.Failing.open_session"
+            ]
+        );
+        assert_eq!(names(&report.affected_callers), ["AppContext._get_session"]);
+        // The override is not also filed as two-hop reach, and a caller of an
+        // override still is.
+        assert!(!report
+            .affected_dependents
+            .iter()
+            .any(|entity| entity.id == child.id || entity.id == grandchild.id));
+        assert!(report
+            .affected_dependents
+            .iter()
+            .any(|entity| entity.id == unrelated.id));
+        // Overrides are not consumers: the per-entity counts are unchanged.
+        let row = report.entity_impact(&base.id).unwrap();
+        assert_eq!(row.consumer_count, 1);
+        assert_eq!(report.total_affected(), 4);
+        assert!(!report.is_empty());
     }
 
     #[test]

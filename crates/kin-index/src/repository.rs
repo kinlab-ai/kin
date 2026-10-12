@@ -45,11 +45,17 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
+use kin_io::WorktreeRoot;
 use kin_model::RepoPath;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::admission::ResolvedAdmissionMatcher;
+
+#[cfg(test)]
+fn worktree(path: &std::path::Path) -> kin_io::WorktreeRoot {
+    kin_io::WorktreeRoot::new(path, &kin_io::Grant::ambient())
+}
 
 /// Exact materialization kind observed at a host filesystem boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,7 +374,8 @@ impl RepositoryIgnore {
         }
     }
 
-    pub fn load(root: &Path) -> Result<Self, IncompleteRepositoryScan> {
+    pub fn load(root: &WorktreeRoot) -> Result<Self, IncompleteRepositoryScan> {
+        let root = root.path();
         let path = root.join(".kinignore");
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -687,7 +694,16 @@ pub fn tracked_paths_retracted_by_ignore<'a>(
 /// entry or fail on exactly the events that matter most. Resolving the parent
 /// also rejects a path that reads as being beneath the root but leaves it
 /// through a directory symlink, which a purely lexical test admits.
-pub fn canonicalize_host_parent_preserving_leaf(path: &Path) -> io::Result<PathBuf> {
+///
+/// It reads the host filesystem, so it takes the working tree's authority.
+pub fn canonicalize_host_parent_preserving_leaf(
+    _root: &WorktreeRoot,
+    path: &Path,
+) -> io::Result<PathBuf> {
+    canonicalize_parent_preserving_leaf(path)
+}
+
+pub(crate) fn canonicalize_parent_preserving_leaf(path: &Path) -> io::Result<PathBuf> {
     let leaf = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -838,7 +854,7 @@ pub fn should_track_host_relative_path(path: &Path) -> bool {
 /// `tracked_paths` is graph-owned identity state. Ignore rules never hide
 /// those paths, including paths below an ignored directory.
 pub fn scan_repository<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
@@ -875,7 +891,7 @@ pub fn scan_repository<'a>(
 /// admitted regardless of what the policy says today, and retracting it is a
 /// separate, announced decision made against graph truth rather than here.
 pub fn scan_repository_preserving_graph_only<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
@@ -894,7 +910,7 @@ pub fn scan_repository_preserving_graph_only<'a>(
 /// and target CAS against its successor tree before publishing the result.
 /// Existing callers retain ordinary single-generation behavior above.
 pub fn scan_repository_with_root_unignore<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
     root_unignore: Option<(&ResolvedAdmissionMatcher, &ResolvedAdmissionMatcher)>,
@@ -924,7 +940,7 @@ pub struct NativeScanAdmission<'a> {
 }
 
 pub fn scan_repository_with_native_admission<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
     root_unignore: Option<(&ResolvedAdmissionMatcher, &ResolvedAdmissionMatcher)>,
@@ -932,6 +948,7 @@ pub fn scan_repository_with_native_admission<'a>(
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<CompleteRepositoryScan, IncompleteRepositoryScan> {
+    let root = root.path();
     let mut scanner = prepare_scanner(
         root,
         ignore,
@@ -1156,13 +1173,14 @@ impl WorkingCopyChangesSince {
 /// A leaf whose timestamps will not read counts as modified: the window exists
 /// to find work the graph missed, and losing a file is the worse error.
 pub fn scan_working_copy_changes_since<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
     admitted: impl IntoIterator<Item = (&'a RepoPath, kin_model::TreeEntry)>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
     since: SystemTime,
 ) -> Result<WorkingCopyChangesSince, IncompleteRepositoryScan> {
+    let root = root.path();
     let admitted = admitted.into_iter().collect::<BTreeMap<_, _>>();
     let tracked_since = since
         .checked_sub(TRACKED_CHANGE_WINDOW_MARGIN)
@@ -1218,7 +1236,7 @@ pub fn scan_working_copy_changes_since<'a>(
         let host_path = host_path_from_repo_path(root, &path)
             .map_err(|error| scanner.fail(root, "resolve tracked host path", error))?;
         changes.tracked_candidates_read += 1;
-        match observe_host_tree_entry(&host_path) {
+        match observe_host_entry(&host_path) {
             Ok(Some((observed, bytes))) => {
                 changes.tracked_bytes_read = changes.tracked_bytes_read.saturating_add(bytes);
                 if observed != expected {
@@ -1280,7 +1298,16 @@ fn removal_inside_window(
 /// reads, so a link compares by its target bytes and a regular file by its
 /// content and executable bit. A directory or special entry where graph truth
 /// holds a file is reported as an entry no admitted artifact can equal.
-pub fn observe_host_tree_entry(path: &Path) -> io::Result<Option<(kin_model::TreeEntry, u64)>> {
+///
+/// It reads the host filesystem, so it takes the working tree's authority.
+pub fn observe_host_tree_entry(
+    _root: &WorktreeRoot,
+    path: &Path,
+) -> io::Result<Option<(kin_model::TreeEntry, u64)>> {
+    observe_host_entry(path)
+}
+
+fn observe_host_entry(path: &Path) -> io::Result<Option<(kin_model::TreeEntry, u64)>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1342,12 +1369,13 @@ pub fn observe_host_tree_entry(path: &Path) -> io::Result<Option<(kin_model::Tre
 /// Produces no [`CompleteScanToken`], which is deliberate: this walk observed no
 /// content and must never be mistaken for one that did.
 pub fn scan_repository_untracked_paths<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+    let root = root.path();
     let mut scanner = prepare_scanner(
         root,
         ignore,
@@ -1378,12 +1406,13 @@ pub fn scan_repository_untracked_paths<'a>(
 /// Opens nothing, hashes nothing, and produces no [`CompleteScanToken`]: this
 /// walk observed no content and must never be mistaken for one that did.
 pub fn scan_repository_never_met_directories<'a>(
-    root: &Path,
+    root: &WorktreeRoot,
     ignore: &RepositoryIgnore,
     policy: Option<&ResolvedAdmissionMatcher>,
     tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
     graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
 ) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+    let root = root.path();
     let mut scanner = prepare_scanner(
         root,
         ignore,
@@ -1881,6 +1910,9 @@ impl Scanner<'_> {
 ///
 /// Callers that persist blobs after walking (commit, init snapshot) must use
 /// this instead of reopening `host_path` with a path-following read.
+///
+/// The entry comes from a scan, which already took the working tree's
+/// authority; this re-reads what that scan admitted.
 pub fn read_verified_scanned_entry(entry: &ScannedRepositoryEntry) -> io::Result<Vec<u8>> {
     let changed = || {
         io::Error::new(
@@ -2023,8 +2055,8 @@ mod tests {
     }
 
     fn scan(root: &Path) -> CompleteRepositoryScan {
-        let ignore = RepositoryIgnore::load(root).unwrap();
-        scan_repository(root, &ignore, std::iter::empty()).unwrap()
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
+        scan_repository(&worktree(root), &ignore, std::iter::empty()).unwrap()
     }
 
     /// Compile one graph-owned policy from rule bytes, as the durable authority
@@ -2048,19 +2080,19 @@ mod tests {
     fn captured_root_rule_distinguishes_absence_empty_and_later_host_bytes() {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(
-            RepositoryIgnore::load(temp.path())
+            RepositoryIgnore::load(&worktree(temp.path()))
                 .unwrap()
                 .captured_kinignore_bytes(),
             None
         );
         let path = temp.path().join(".kinignore");
         std::fs::write(&path, b"").unwrap();
-        let empty = RepositoryIgnore::load(temp.path()).unwrap();
+        let empty = RepositoryIgnore::load(&worktree(temp.path())).unwrap();
         assert_eq!(empty.captured_kinignore_bytes(), Some(b"".as_slice()));
         std::fs::write(&path, b"keep.py\n").unwrap();
         assert_eq!(empty.captured_kinignore_bytes(), Some(b"".as_slice()));
         assert_eq!(
-            RepositoryIgnore::load(temp.path())
+            RepositoryIgnore::load(&worktree(temp.path()))
                 .unwrap()
                 .captured_kinignore_bytes(),
             Some(b"keep.py\n".as_slice())
@@ -2087,10 +2119,10 @@ mod tests {
         std::fs::create_dir_all(root.join("brand_new")).unwrap();
         std::fs::write(root.join("brand_new/module.py"), "NEW = 3\n").unwrap();
 
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         let tracked = [path("known/tracked.py")];
         let untracked = scan_repository_untracked_paths(
-            root,
+            &worktree(root),
             &ignore,
             None,
             tracked.iter(),
@@ -2115,7 +2147,7 @@ mod tests {
         ];
         assert!(
             scan_repository_untracked_paths(
-                root,
+                &worktree(root),
                 &ignore,
                 None,
                 all_tracked.iter(),
@@ -2142,10 +2174,10 @@ mod tests {
         std::fs::create_dir_all(root.join("brand_new")).unwrap();
         std::fs::write(root.join("brand_new/module.py"), "NEW = 3\n").unwrap();
 
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         let tracked = [path("known/tracked.py")];
         let never_met = scan_repository_never_met_directories(
-            root,
+            &worktree(root),
             &ignore,
             None,
             tracked.iter(),
@@ -2167,7 +2199,7 @@ mod tests {
         let met_every_directory = [path("known/tracked.py"), path("brand_new/module.py")];
         assert!(
             scan_repository_never_met_directories(
-                root,
+                &worktree(root),
                 &ignore,
                 None,
                 met_every_directory.iter(),
@@ -2203,7 +2235,7 @@ mod tests {
     }
 
     fn admitted_entry(path: &Path) -> kin_model::TreeEntry {
-        observe_host_tree_entry(path)
+        observe_host_entry(path)
             .unwrap()
             .expect("the fixture file exists")
             .0
@@ -2273,9 +2305,9 @@ mod tests {
         // records it.
         stamp_directory_modified(&known, after);
 
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         let changes = scan_working_copy_changes_since(
-            root,
+            &worktree(root),
             &ignore,
             None,
             admitted.iter().map(|(path, entry)| (path, *entry)),
@@ -2346,9 +2378,9 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(root.join("script.sh"), permissions).unwrap();
 
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         let changes = scan_working_copy_changes_since(
-            root,
+            &worktree(root),
             &ignore,
             None,
             admitted.iter().map(|(path, entry)| (path, *entry)),
@@ -2384,13 +2416,13 @@ mod tests {
             (path("vendor/submodule"), kept),
         ];
         let graph_only = [path("vendor/submodule")];
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         // The window opens before the fixture was written, so every directory
         // it touched is inside it and only the two exclusions keep these
         // paths from being named removed. A window that opened after the
         // fixture would pass with neither exclusion in place.
         let changes = scan_working_copy_changes_since(
-            root,
+            &worktree(root),
             &ignore,
             None,
             admitted.iter().map(|(path, entry)| (path, *entry)),
@@ -2421,10 +2453,10 @@ mod tests {
         std::fs::write(root.join("excluded.py"), "EXCLUDED = 2\n").unwrap();
         std::fs::write(root.join("kept.py"), "KEPT = 3\n").unwrap();
 
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         let policy = graph_owned_policy("excluded.py\n");
         let untracked = scan_repository_untracked_paths(
-            root,
+            &worktree(root),
             &ignore,
             Some(&policy),
             std::iter::empty::<&RepoPath>(),
@@ -2433,7 +2465,7 @@ mod tests {
         .unwrap();
 
         let content = scan_repository_preserving_graph_only(
-            root,
+            &worktree(root),
             &ignore,
             Some(&policy),
             std::iter::empty::<&RepoPath>(),
@@ -2488,7 +2520,7 @@ mod tests {
         let policy = graph_owned_policy(".claude/\n");
 
         let scan = scan_repository_preserving_graph_only(
-            root,
+            &worktree(root),
             &ignore,
             Some(&policy),
             std::iter::empty(),
@@ -2517,7 +2549,7 @@ mod tests {
         // read all of it, so the assertions above describe the policy rather
         // than a fixture that was never walkable.
         let everything = scan_repository_preserving_graph_only(
-            root,
+            &worktree(root),
             &ignore,
             None,
             std::iter::empty(),
@@ -2552,7 +2584,7 @@ mod tests {
         let policy = graph_owned_policy("vendor/\n");
 
         let scan = scan_repository_preserving_graph_only(
-            root,
+            &worktree(root),
             &ignore,
             Some(&policy),
             [&tracked],
@@ -2735,10 +2767,10 @@ mod tests {
         fs::write(root.join("vendor/pkg/index.js"), b"generated").unwrap();
         fs::write(root.join(".env"), b"SECRET=never-admit-untracked").unwrap();
         fs::write(root.join(".kinignore"), b"build/\nvendor/\n.env\n").unwrap();
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         assert!(ignore.is_configured());
 
-        let initial = scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        let initial = scan_repository(&worktree(root), &ignore, std::iter::empty()).unwrap();
         assert!(initial.entry(&path("build/nested/new.bin")).is_none());
         assert!(initial.entry(&path("build/retained.bin")).is_none());
         assert!(initial.entry(&path("vendor/pkg/index.js")).is_none());
@@ -2746,7 +2778,7 @@ mod tests {
 
         let retained = path("build/retained.bin");
         fs::write(root.join("build/retained.bin"), b"updated tracked bytes").unwrap();
-        let tracked = scan_repository(root, &ignore, [&retained]).unwrap();
+        let tracked = scan_repository(&worktree(root), &ignore, [&retained]).unwrap();
         assert!(
             tracked.entry(&retained).is_none(),
             "a covered path stays out of the hasher once a rule names it"
@@ -2770,7 +2802,7 @@ mod tests {
         let root = temp.path();
         fs::write(root.join("main.rs"), b"fn main() {}").unwrap();
 
-        let unconfigured = RepositoryIgnore::load(root).unwrap();
+        let unconfigured = RepositoryIgnore::load(&worktree(root)).unwrap();
         assert!(!unconfigured.is_configured());
         let warning = unconfigured
             .missing_configuration_warning()
@@ -2783,7 +2815,7 @@ mod tests {
         // Falsification: the same call against a repository that states its
         // rules must go quiet, so the assertions above cannot pass vacuously.
         fs::write(root.join(".kinignore"), b"# stated\n").unwrap();
-        let configured = RepositoryIgnore::load(root).unwrap();
+        let configured = RepositoryIgnore::load(&worktree(root)).unwrap();
         assert!(configured.is_configured());
         assert_eq!(configured.missing_configuration_warning(), None);
         assert!(configured.matches(&path("target/debug/app")));
@@ -2827,7 +2859,7 @@ mod tests {
         // Falsification: the fixture really does contain those trees, so an
         // empty rule set must admit every one of them.
         let everything = scan_repository(
-            root,
+            &worktree(root),
             &RepositoryIgnore::admit_everything(),
             std::iter::empty(),
         )
@@ -2925,8 +2957,8 @@ mod tests {
         create_virtualenv(root, "tools/env");
 
         fs::write(root.join(".kinignore"), b"!venv\n").unwrap();
-        let ignore = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, std::iter::empty()).unwrap();
         assert!(
             scan.entry(&path("venv/bin/activate")).is_some(),
             "!venv did not re-admit the environment it names"
@@ -2938,8 +2970,8 @@ mod tests {
 
         // Falsification: drop the rule and the same fixture loses the tree.
         fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
-        let none = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        let none = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &none, std::iter::empty()).unwrap();
         assert!(scan.entry(&path("venv/bin/activate")).is_none());
     }
 
@@ -2955,7 +2987,7 @@ mod tests {
         let tracked = path("venv/bin/activate");
 
         let ignore = RepositoryIgnore::default();
-        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, [&tracked]).unwrap();
         assert!(
             scan.entry(&tracked).is_some(),
             "a tracked path was dropped by a rule that only governs admission"
@@ -2988,8 +3020,8 @@ mod tests {
 
         // A whole-name re-admission restores the tree.
         fs::write(root.join(".kinignore"), b"!target\n").unwrap();
-        let whole = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &whole, std::iter::empty()).unwrap();
+        let whole = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &whole, std::iter::empty()).unwrap();
         assert!(scan.entry(&path("target/keep.rs")).is_some());
         assert!(scan.entry(&path("target/deep/drop.o")).is_some());
         assert!(scan.entry(&path("dist/app.js")).is_none());
@@ -2997,15 +3029,15 @@ mod tests {
         // A path re-admission descends into an otherwise-pruned directory and
         // restores exactly one member.
         fs::write(root.join(".kinignore"), b"!target/keep.rs\n").unwrap();
-        let single = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &single, std::iter::empty()).unwrap();
+        let single = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &single, std::iter::empty()).unwrap();
         assert!(scan.entry(&path("target/keep.rs")).is_some());
         assert!(scan.entry(&path("target/deep/drop.o")).is_none());
 
         // Falsification: drop the re-admission and the same fixture loses it.
         fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
-        let none = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        let none = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &none, std::iter::empty()).unwrap();
         assert!(scan.entry(&path("target/keep.rs")).is_none());
     }
 
@@ -3020,9 +3052,9 @@ mod tests {
         fs::write(root.join("dist/bundle.js"), b"derived").unwrap();
         fs::write(root.join(".kinignore"), b"!keep.rs\n").unwrap();
 
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
         assert!(!ignore.matches(&path("dist/keep.rs")));
-        let scan = scan_repository(root, &ignore, std::iter::empty()).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, std::iter::empty()).unwrap();
         assert!(
             scan.entry(&path("dist/keep.rs")).is_some(),
             "the predicate admitted the path but the walker never reached it"
@@ -3032,8 +3064,8 @@ mod tests {
 
         // Falsification: without the rule the same fixture keeps the file out.
         fs::write(root.join(".kinignore"), b"# nothing re-admitted\n").unwrap();
-        let none = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &none, std::iter::empty()).unwrap();
+        let none = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &none, std::iter::empty()).unwrap();
         assert!(scan.entry(&path("dist/keep.rs")).is_none());
     }
 
@@ -3045,7 +3077,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::write(root.join(".kinignore"), b"!target\n").unwrap();
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
 
         assert!(!ignore.matches(&path("target/keep.rs")));
         assert!(!ignore.matches(&path("target/deep/keep.rs")));
@@ -3058,7 +3090,7 @@ mod tests {
 
         // A prefix re-admission scopes the same way.
         fs::write(root.join(".kinignore"), b"!target/keep\n").unwrap();
-        let prefixed = RepositoryIgnore::load(root).unwrap();
+        let prefixed = RepositoryIgnore::load(&worktree(root)).unwrap();
         assert!(!prefixed.matches(&path("target/keep/src/lib.rs")));
         assert!(prefixed.matches(&path("target/keep/node_modules/pkg/index.js")));
         assert!(prefixed.matches(&path("target/other.o")));
@@ -3077,8 +3109,8 @@ mod tests {
         fs::write(root.join("target/debug/fresh.o"), b"arrived later").unwrap();
 
         let tracked = path("target/debug/tracked.o");
-        let ignore = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, [&tracked]).unwrap();
 
         assert!(
             scan.missing_tracked_paths([&tracked]).is_empty(),
@@ -3140,7 +3172,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::write(root.join(".kinignore"), b"investor\n").unwrap();
-        let ignore = RepositoryIgnore::load(root).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
 
         let gitlink = path("investor/vendored");
         let tracked = [
@@ -3176,7 +3208,8 @@ mod tests {
         let _listener = UnixListener::bind(root.join("untracked.sock")).unwrap();
 
         let tracked = path("tracked.txt");
-        let complete = scan_repository(root, &RepositoryIgnore::default(), [&tracked]).unwrap();
+        let complete =
+            scan_repository(&worktree(root), &RepositoryIgnore::default(), [&tracked]).unwrap();
         assert!(complete.entry(&tracked).is_some());
         assert!(complete.entry(&path("untracked.sock")).is_none());
         assert_eq!(complete.diagnostics().unsupported_untracked_entries, 1);
@@ -3193,7 +3226,7 @@ mod tests {
         let tracked = path("tracked.sock");
         let _listener = UnixListener::bind(root.join("tracked.sock")).unwrap();
 
-        let incomplete = scan_repository(root, &RepositoryIgnore::default(), [&tracked])
+        let incomplete = scan_repository(&worktree(root), &RepositoryIgnore::default(), [&tracked])
             .expect_err("tracked special entry must fail the complete scan");
         assert_eq!(incomplete.operation, "inspect tracked repository entry");
         assert!(incomplete.reason.contains("tracked path changed"));
@@ -3208,7 +3241,8 @@ mod tests {
         let root = temp.path();
         fs::write(root.join("tracked.txt"), b"tracked").unwrap();
         let tracked = path("tracked.txt");
-        let complete = scan_repository(root, &RepositoryIgnore::default(), [&tracked]).unwrap();
+        let complete =
+            scan_repository(&worktree(root), &RepositoryIgnore::default(), [&tracked]).unwrap();
         assert!(complete.missing_tracked_paths([&tracked]).is_empty());
         let _token = complete.completion();
 
@@ -3216,7 +3250,7 @@ mod tests {
         let _listener = UnixListener::bind(root.join("injected-scan-failure.sock")).unwrap();
         fs::remove_file(root.join("tracked.txt")).unwrap();
         let incomplete = scan_repository(
-            root,
+            &worktree(root),
             &RepositoryIgnore::default(),
             [&tracked, &tracked_special],
         )
@@ -3281,7 +3315,7 @@ mod tests {
         let gitlink = path("submodule");
 
         let scan = scan_repository_preserving_graph_only(
-            root,
+            &worktree(root),
             &RepositoryIgnore::default(),
             None,
             [&gitlink],
@@ -3296,7 +3330,7 @@ mod tests {
 
         fs::remove_dir_all(root.join("submodule")).unwrap();
         let deinitialized = scan_repository_preserving_graph_only(
-            root,
+            &worktree(root),
             &RepositoryIgnore::default(),
             None,
             [&gitlink],
@@ -3328,8 +3362,8 @@ mod tests {
         // Admitted before the rule existed, which is the only way graph truth
         // can hold a path its own rules now exclude.
         let tracked = path("vm/disk.img");
-        let ignore = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, [&tracked]).unwrap();
 
         assert!(scan.entry(&path("src/main.rs")).is_some());
         assert!(scan.entry(&tracked).is_none());
@@ -3350,8 +3384,12 @@ mod tests {
 
         // Falsification: the same fixture under empty rules reads every one of
         // those bytes, so the accounting above cannot pass vacuously.
-        let everything =
-            scan_repository(root, &RepositoryIgnore::admit_everything(), [&tracked]).unwrap();
+        let everything = scan_repository(
+            &worktree(root),
+            &RepositoryIgnore::admit_everything(),
+            [&tracked],
+        )
+        .unwrap();
         assert!(everything.entry(&tracked).is_some());
         assert_eq!(
             everything.diagnostics().content_bytes_read,
@@ -3400,8 +3438,8 @@ mod tests {
         let expected_bytes = (rules.len() + source.len()) as u64;
         let mut source_hash = None;
         for pass in 0..25 {
-            let ignore = RepositoryIgnore::load(&root).unwrap();
-            let scan = scan_repository(&root, &ignore, [&tracked])
+            let ignore = RepositoryIgnore::load(&worktree(&root)).unwrap();
+            let scan = scan_repository(&worktree(&root), &ignore, [&tracked])
                 .unwrap_or_else(|error| panic!("pass {pass} must admit the tree: {error}"));
             let admitted = scan.entry(&path("src/main.rs")).unwrap();
             assert_eq!(*source_hash.get_or_insert(admitted.content_hash), {
@@ -3418,8 +3456,12 @@ mod tests {
         // Positive control: with the churn stopped and no rules at all, the
         // walk really does reach and read that file, so the passes above were
         // scanning a fixture that could have failed them.
-        let everything =
-            scan_repository(&root, &RepositoryIgnore::admit_everything(), [&tracked]).unwrap();
+        let everything = scan_repository(
+            &worktree(&root),
+            &RepositoryIgnore::admit_everything(),
+            [&tracked],
+        )
+        .unwrap();
         assert!(everything.entry(&tracked).is_some());
         assert!(everything.diagnostics().content_bytes_read > 256 * 1024);
     }
@@ -3480,15 +3522,15 @@ mod tests {
         // Tracked, ignored, and no longer materialized. Absence inside a
         // subtree the walk never entered proves nothing about the member.
         let tracked = path("vm/disk.img");
-        let ignore = RepositoryIgnore::load(root).unwrap();
-        let scan = scan_repository(root, &ignore, [&tracked]).unwrap();
+        let ignore = RepositoryIgnore::load(&worktree(root)).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, [&tracked]).unwrap();
         assert!(scan.missing_tracked_paths([&tracked]).is_empty());
         assert_eq!(scan.diagnostics().ignored_tracked_entries_unverified, 1);
 
         // Falsification: an admitted tracked path that really is gone is still
         // reported missing, so the exemption is scoped to ignored paths.
         let admitted = path("gone.rs");
-        let scan = scan_repository(root, &ignore, [&tracked, &admitted]).unwrap();
+        let scan = scan_repository(&worktree(root), &ignore, [&tracked, &admitted]).unwrap();
         assert_eq!(
             scan.missing_tracked_paths([&admitted]),
             std::slice::from_ref(&admitted)
@@ -3500,8 +3542,12 @@ mod tests {
     fn missing_root_is_an_incomplete_scan_with_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing");
-        let error = scan_repository(&missing, &RepositoryIgnore::default(), std::iter::empty())
-            .unwrap_err();
+        let error = scan_repository(
+            &worktree(&missing),
+            &RepositoryIgnore::default(),
+            std::iter::empty(),
+        )
+        .unwrap_err();
         assert_eq!(error.operation, "read directory");
         assert_eq!(error.diagnostics.directories_visited, 1);
     }

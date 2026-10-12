@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# Which of this crate's sources and dependencies decide what Kin derives and
+# stores, read by kin-derivation-inputs. Every file under `roots` is named once.
+
+roots = ["src"]
+
+[[decides]]
+products = ["graph"]
+files = [
+    "src/admission.rs",
+    "src/artifacts.rs",
+    "src/binding_debt.rs",
+    "src/binding_history.rs",
+    "src/classifier.rs",
+    "src/coverage_certificate.rs",
+    "src/dispatch.rs",
+    "src/fingerprint.rs",
+    "src/history.rs",
+    "src/import_binding.rs",
+    "src/kind.rs",
+    "src/lib.rs",
+    "src/linker.rs",
+    "src/occurrence.rs",
+    "src/overlay.rs",
+    "src/pipeline.rs",
+    "src/project_files.rs",
+    "src/receiver_origin.rs",
+    "src/relation_source.rs",
+    "src/repository.rs",
+    "src/resolution.rs",
+    "src/rust_project.rs",
+    "src/rust_project/syntax.rs",
+    "src/rust_project/targets.rs",
+    "src/shared_index.rs",
+]
+
+[[excluded]]
+reason = "tests: linker unit-test modules, each declared under #[cfg(test)] in linker.rs"
+files = [
+    "src/linker/candidate_recall_tests.rs",
+    "src/linker/fixture_receiver_tests.rs",
+    "src/linker/receiver_binding_tests.rs",
+    "src/linker/receiver_origin_tests.rs",
+    "src/linker/receiver_outside_tests.rs",
+]
+
+[[excluded]]
+reason = "filesystem event delivery for the daemon: it reports which paths changed, filtered by lib.rs should_index_repo_relative_path (which decides), and exact-tree reconciliation then reads and derives them, so it sets when derivation runs, not what it derives"
+files = [
+    "src/watcher.rs",
+]
+
+[[excluded]]
+reason = "query-time readers of stored relations (kin-mcp, kin-cli, kin-daemon api, kin-review): relation_read adjusts only the returned copies, overrides reads back the Overrides edges linker.rs derives, and no derivation path calls either"
+files = [
+    "src/overrides.rs",
+    "src/relation_read.rs",
+]
+
+[[excluded]]
+reason = "standalone analyses no derivation path calls: support builds a directory coverage report with no caller in the workspace, key_domain is an opt-in CommonJS key analysis called only by tests/key_domain.rs, and neither writes to a store"
+files = [
+    "src/key_domain.rs",
+    "src/support.rs",
+]
+
+[[excluded]]
+reason = "error type and its messages: a derivation that fails stores nothing, and no IndexError text is written into a stored entity or relation"
+files = [
+    "src/error.rs",
+]
+
+[dependencies]
+kin-io = { reason = "worktree authority tokens for live indexing, watching and test setup; parsing, linking and historical replay derive from supplied bytes without consulting this crate" }
+kin-model = { decides = ["graph"] }
+kin-parser = { decides = ["graph"] }
+kin-blobs = { reason = "content-addressed blob storage IO; the digests this crate takes from it are SHA-256 of the bytes, fixed by the specification, so a release that kept the store readable changes no derived value" }
+kin-projection = { decides = ["graph"] }
+tree-sitter = { decides = ["graph"] }
+kin-db = { decides = ["graph"] }
+notify = { reason = "filesystem event notification for watcher.rs; it decides when derivation runs, never what it derives" }
+rayon = { reason = "data-parallel scheduling; the linker and history collect par_iter results in input order and merge them serially, so a release changes no derived value" }
+serde = { reason = "serialization derive with a fixed, specified format; a release changes no derived value" }
+serde_json = { reason = "JSON serialization with a fixed, specified format; a release changes no derived value" }
+thiserror = { reason = "error type derive; it shapes error messages, not derived data" }
+tracing = { reason = "logging and telemetry only" }
+sha2 = { reason = "SHA-256, fixed by FIPS 180-4; a release changes no digest" }
+hex = { reason = "hexadecimal encoding, fixed by definition; no kin-index source calls it today" }
+uuid = { reason = "UUID layout fixed by RFC 9562; history.rs builds ids from bytes it computes and watcher.rs names a probe file, so a release changes no derived id" }
+tokio = { reason = "async runtime for the watcher's delivery checks only; no derived value passes through it" }
+toml = { decides = ["graph"] }  # reads the Cargo manifests Rust project authority is derived from; a release that accepts another TOML version can change which manifests parse
+rustix = { reason = "system calls for no-follow file opens in the repository scan; it returns the bytes and metadata the OS reports" }
+tempfile = { reason = "scratch directories for staging bodies during re-derivation in history.rs; every body read back is checked against its content address" }

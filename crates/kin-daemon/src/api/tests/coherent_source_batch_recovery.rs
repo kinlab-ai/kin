@@ -233,11 +233,19 @@ async fn coherent_source_batch_complete_subset_preserves_unrelated_partial_debt(
             json!({"entity_ids":[target.id.to_string()],"include_traffic":false})).await;
         assert_ne!(result.is_error, Some(true), "{}", mcp_result_text(&result));
         let raw = tool_result_payload(&result);
-        let report = &raw["source_derivation"]["report"];
+        let observation = serde_json::to_value(observe_live_head_sources(
+            &view, &view.graph, None,
+        )).unwrap();
+        let report = &observation["report"];
         assert!(report.is_object(), "real disclosure required: {raw}");
         assert!(matches!(report["parse_coverage"].as_str(), Some("incomplete" | "unproven")), "{raw}");
         assert_eq!(report["call_shape_parse_coverage_complete"], false, "{raw}");
         assert_eq!(raw["entity_impacts"][0]["call_shapes"]["all_consumers_shaped_calls"], false, "{raw}");
+        assert!(raw.get("source_derivation").is_none(), "{raw}");
+        assert_eq!(raw["binding_coverage"]["checked_scope"], "admitted_inventory", "{raw}");
+        assert_eq!(raw["_kin"]["verdict"]["state"], "inconclusive", "{raw}");
+        assert!(raw["_kin"]["verdict"]["limiting_factor"].as_str().unwrap()
+            .contains("derived_source_stale"), "{raw}");
     }
 }
 
@@ -436,6 +444,10 @@ struct AmbientLoop {
 
 impl AmbientLoop {
     async fn start(layout: kin_core::KinLayout) -> Self {
+        // These tests grade exactly which paths each ambient pass derives. A
+        // lost canary's complete admission would be another pass, by another
+        // route, so delivery is not sampled here.
+        crate::loop_runner::use_delivery_canary_for_test(layout.working_dir(), None);
         let state = Arc::new(DaemonState::open(layout).unwrap());
         let (cancel, receiver) = tokio::sync::watch::channel(false);
         let (armed, ready) = tokio::sync::oneshot::channel();
@@ -445,8 +457,11 @@ impl AmbientLoop {
             receiver,
             Some(crate::loop_runner::WatchArmed::new(armed)),
         ));
+        // The daemon's own arming bound. A readiness probe the host leaves
+        // unanswered takes its whole ten seconds before the loop arms and
+        // recovers, so a fixture that also gave up at ten raced it.
         assert_eq!(
-            crate::daemon::await_watch_armed(ready, std::time::Duration::from_secs(10)).await,
+            crate::daemon::await_watch_armed(ready, crate::daemon::WATCH_ARMING_BOUND).await,
             crate::daemon::WatchArming::Armed
         );
         Self { state, cancel, task }
@@ -455,25 +470,44 @@ impl AmbientLoop {
     /// One group of host writes, made while holding coordination so the loop
     /// observes them but cannot publish between them. Waits, with a bound, for
     /// authority to move and for `settled` to hold on the live graph.
+    ///
+    /// A saturated host can drop a write's notification and say nothing, so the
+    /// same group is written again, under coordination, only while the loop has
+    /// received no notification for one of its paths. Once it has received
+    /// them all this only waits, so a pass that received the edit and failed to
+    /// publish it still fails here.
     async fn edit(
         &self,
         writes: &[(std::path::PathBuf, String)],
         settled: impl Fn(&DaemonState) -> bool,
     ) {
         let before = source_base_roots(&self.state).generation;
-        {
-            let _coordination = self.state.coordination_gate.lock().await;
+        let working_dir = self.state.layout.working_dir().to_path_buf();
+        let paths: Vec<&std::path::Path> = writes.iter().map(|(path, _)| path.as_path()).collect();
+        let notified = crate::loop_runner::HostNotificationMark::take(&working_dir, &paths);
+        let write_all = || {
             for (path, body) in writes {
                 std::fs::write(path, body).unwrap();
             }
+        };
+        {
+            let _coordination = self.state.coordination_gate.lock().await;
+            write_all();
         }
-        let published = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            while !(settled(&self.state) && source_base_roots(&self.state).generation > before) {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .is_ok();
+        let published = notified
+            .await_with_rewrites(
+                &self.state,
+                write_all,
+                true,
+                async {
+                    while !(settled(&self.state) && source_base_roots(&self.state).generation > before) {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                },
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .is_some();
         assert!(published, "the watcher never published this edit");
     }
 

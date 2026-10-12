@@ -1,0 +1,177 @@
+# The capabilities the language conformance suite measures, in scorecard
+# order. Every language's expect.toml declares each one, and the suite for its
+# layer measures it the same way for every language. The parser layer is
+# crates/kin-parser/src/language_conformance_test.rs.
+#
+# scripts/language-scorecard.py renders the declarations into
+# docs/language-support.md in this order, with these summaries.
+
+[[capability]]
+name = "parse_clean"
+layer = "parser"
+summary = "Every source parses with no error node, and extraction calls it valid."
+
+[[capability]]
+name = "entities"
+layer = "parser"
+summary = "Each function, type and method is extracted with its kind and its stored name, which carries the language's member rule."
+
+[[capability]]
+name = "module_name"
+layer = "parser"
+summary = "The module carries a module entity, named by the language's module rule."
+
+[[capability]]
+name = "module_contains"
+layer = "parser"
+summary = "The module entity contains each of its top-level functions, constants, classes and types, directly or through a namespace it contains."
+
+[[capability]]
+name = "declaration_extent"
+layer = "parser"
+summary = "An entity's span starts at its whole declaration: documentation, attributes, decorators and export keywords included."
+
+[[capability]]
+name = "census_clean"
+layer = "parser"
+summary = "The adapter takes a declaration census, and every callable, type and namespace declaration it sees is admitted or local to a callable; HCL also grades its configuration bindings."
+
+[[capability]]
+name = "nested_definition"
+layer = "parser"
+summary = "A definition nested in a function body is admitted under the shared `<locals>` name, or at least recorded as not admitted."
+
+[[capability]]
+name = "call_same_file"
+layer = "parser"
+summary = "A call to a function in the same module is a call edge from the caller."
+
+[[capability]]
+name = "call_receiver"
+layer = "parser"
+summary = "A call through the receiver is a call edge from the method that carries the owner."
+
+[[capability]]
+name = "imports"
+layer = "parser"
+summary = "The import of the helper is read with its module path and the names it binds."
+
+[[capability]]
+name = "tests_detected"
+layer = "parser"
+summary = "The framework test is detected, with its runner."
+
+[[capability]]
+name = "refuse_unparseable"
+layer = "parser"
+summary = "A broken copy of the module is read as broken, at the line of the break."
+
+[[capability]]
+name = "placement_three_forms"
+layer = "parser"
+summary = "An entity's code sent back as read, at the margin, or indented as a whole is placed where it stood."
+
+[[capability]]
+name = "create_remove_spacing"
+layer = "parser"
+summary = "A declaration added after a sibling parses and is spaced like its neighbours, removing it restores the source, and removing a documented declaration takes its documentation."
+
+[[capability]]
+name = "body_edit_keeps_entities"
+layer = "parser"
+summary = "A statement added inside a function body, such as an assignment to a member of a local object, parses and leaves the extracted entities as they were."
+
+[[capability]]
+name = "form_generator"
+layer = "parser"
+summary = "A generator function is an entity."
+
+[[capability]]
+name = "form_async"
+layer = "parser"
+summary = "An async function is an entity."
+
+[[capability]]
+name = "form_bound_lambda"
+layer = "parser"
+summary = "An anonymous function bound to a name at module or type scope is an entity under that name."
+
+[[capability]]
+name = "form_default_export"
+layer = "parser"
+summary = "A default-exported function is an entity under its own name."
+
+[[capability]]
+name = "form_overload"
+layer = "parser"
+summary = "An overloaded function or method is an entity."
+
+[[capability]]
+name = "form_nested_type"
+layer = "parser"
+summary = "A type declared inside a type or namespace is an entity under its qualified name, and so are its methods."
+
+[[capability]]
+name = "form_decorated"
+layer = "parser"
+summary = "A declaration carrying decorators, annotations or attributes is an entity."
+
+[[capability]]
+name = "form_field"
+layer = "parser"
+summary = "Fields and properties are entities of kind field, under their owner-qualified names."
+
+[[capability]]
+name = "form_flow_types"
+layer = "parser"
+summary = "A Flow-annotated JavaScript unit (annotations, maybe types, exact objects, opaque types, Flow's `hook` and `component` declarations) yields its functions as entities."
+
+[[capability]]
+name = "route_source"
+layer = "route"
+summary = "Reading an entity through `source` serves its whole declaration, starting where its span does."
+
+[[capability]]
+name = "route_locate"
+layer = "route"
+summary = "`locate` by an entity's name finds it."
+
+[[capability]]
+name = "route_refs"
+layer = "route"
+summary = "`refs` on a function carries the function in the same module that calls it."
+
+[[capability]]
+name = "route_impact"
+layer = "route"
+summary = "`impact` on a helper reaches the caller in another module."
+
+[[capability]]
+name = "route_context"
+layer = "route"
+summary = "`context` on a type carries its methods."
+
+[[capability]]
+name = "route_update"
+layer = "route"
+summary = "A whole-code `update` of the served code with one token changed lands and writes exactly that change."
+
+[[capability]]
+name = "route_patch"
+layer = "route"
+summary = "An anchored `patch` inside a method lands and writes exactly that change."
+
+[[capability]]
+name = "route_body_edit"
+layer = "route"
+summary = "An `update` that adds a statement inside a function body, such as a member assignment, lands as a plain change."
+
+[[capability]]
+name = "route_create_sibling"
+layer = "route"
+summary = "`create` beside a function lands and the graph holds the new declaration."
+
+[[capability]]
+name = "route_remove"
+layer = "route"
+summary = "`remove` of a function takes its whole declaration out."

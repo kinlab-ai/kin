@@ -434,7 +434,10 @@ mod tests {
         let mut rec = ProofRecorder::with_required(ProofMode::Citable, &[LanguageId::Go]);
         rec.record_gap(&ProviderGap {
             language: LanguageId::Go,
-            reason: ProviderGapReason::NoBinaryOnPath,
+            reason: ProviderGapReason::NoBinaryOnPath {
+                binaries: vec!["gopls".to_string()],
+                searched: "/usr/bin".to_string(),
+            },
             tried: vec![ProviderId::new("gopls")],
         });
         let proof = rec.finish();

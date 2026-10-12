@@ -450,6 +450,17 @@ fn a_binding_only_a_language_server_saw_stays_owed_while_its_call_remains() {
     const DYNAMIC: &str = "def run(callback):\n    return callback()\n";
     const KEPT: &str = "# kept\ndef run(callback):\n    return callback()\n";
     const GONE: &str = "def run(callback):\n    return 7\n";
+    assert!(
+        parse("caller.py", DYNAMIC)
+            .extracted_relations
+            .iter()
+            .any(|raw| {
+                kin_parser::is_scoped_call_extraction_incomplete_marker(raw)
+                    && raw.src_name == "run"
+                    && raw.receiver.as_deref() == Some("callback")
+            }),
+        "the dynamic target stays an explicit negative call occurrence"
+    );
     let mut repo = Repo::new();
     repo.edit("target.py", WORK);
     repo.edit("caller.py", DYNAMIC);
@@ -481,6 +492,18 @@ fn a_binding_only_a_language_server_saw_stays_owed_while_its_call_remains() {
         BTreeSet::from([call.id]),
         "the call it resolved is still there, so the binding is still owed"
     );
+
+    for body in [
+        "def run(callback):\n    return 7\ndef other(callback):\n    return callback()\n",
+        "def run(callback):\n    return callbacks[index]()\n",
+    ] {
+        repo.checked_edit("caller.py", body);
+        assert_eq!(
+            repo.owed("caller.py"),
+            BTreeSet::from([call.id]),
+            "moved or unknown call syntax cannot discharge a language-server binding"
+        );
+    }
 
     repo.checked_edit("caller.py", GONE);
     assert!(

@@ -19,7 +19,6 @@ kin-git = { workspace = true }
 kin-parser = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
-kin-infer = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }

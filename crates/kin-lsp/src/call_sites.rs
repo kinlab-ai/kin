@@ -23,6 +23,9 @@
 
 use std::path::Path;
 
+/// Syntax tree shared by call-site projection callers.
+pub use tree_sitter::Tree as SourceTree;
+
 use kin_model::{
     EntityId, GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin, SourceSpan,
 };
@@ -130,12 +133,18 @@ pub enum UnprovenAnswer {
     /// The answer names more than one declaration, or the call's receiver may
     /// be any of several types.
     AnswersDisagree,
-    /// The server answered in a way this build cannot prove, and answers the
-    /// same bytes the same way every time, or declined the question.
+    /// The server declined the question as not applying where it was asked:
+    /// an answer with nothing in it.
+    Declined,
+    /// The server answered with an error of its own about this position, or
+    /// with an answer this build cannot prove or decode, and answers the same
+    /// bytes the same way every time. The server is at fault here, not the
+    /// site, so this is never read as the server finding no location.
     Refused,
     /// The query timed out.
     Timeout,
-    /// The server stopped answering.
+    /// The server stopped answering, or its own state failed so that it
+    /// failed every question until it was restarted.
     Crash,
     /// The server returned an error of its own.
     ProtocolError,
@@ -429,6 +438,68 @@ pub fn callee_token(file: &str, text: &str, call: &SourceSpan) -> Option<CalleeT
     })
 }
 
+/// Project an exact parser-recorded call to the syntax token the server is
+/// asked about. The tree is parsed once per admitted source, so regex literals,
+/// tagged templates and calls inside substitutions need no second text scan.
+/// A container that merely holds a call is never projected to that inner call.
+pub fn callee_token_in_tree(
+    tree: &SourceTree,
+    text: &str,
+    call: &SourceSpan,
+) -> Option<CalleeToken> {
+    let node = tree
+        .root_node()
+        .named_descendant_for_byte_range(call.start_byte, call.end_byte)?;
+    if node.start_byte() != call.start_byte || node.end_byte() != call.end_byte {
+        return None;
+    }
+    if node.kind() == "decorator" {
+        return bare_decorator(
+            text.get(call.start_byte..call.end_byte)?,
+            syntax_of(&call.file.0),
+            call.start_byte,
+        );
+    }
+    if !matches!(node.kind(), "call" | "call_expression") {
+        return None;
+    }
+    let mut function = node.child_by_field_name("function")?;
+    if function.has_error() {
+        return None;
+    }
+    loop {
+        function = match function.kind() {
+            "generic_function" => function.child_by_field_name("function")?,
+            "parenthesized_expression" => function.named_child(0)?,
+            _ => break,
+        };
+    }
+    let (token, through_member) = match function.kind() {
+        "identifier" | "field_identifier" | "property_identifier" => (function, false),
+        "scoped_identifier" => (function.child_by_field_name("name")?, false),
+        "attribute" => (function.child_by_field_name("attribute")?, true),
+        "member_expression" => (function.child_by_field_name("property")?, true),
+        "field_expression" | "selector_expression" => {
+            (function.child_by_field_name("field")?, true)
+        }
+        _ => return None,
+    };
+    if token.is_missing()
+        || !matches!(
+            token.kind(),
+            "identifier" | "field_identifier" | "property_identifier"
+        )
+    {
+        return None;
+    }
+    Some(CalleeToken {
+        start_byte: token.start_byte(),
+        end_byte: token.end_byte(),
+        name: token.utf8_text(text.as_bytes()).ok()?.to_string(),
+        through_member,
+    })
+}
+
 /// The decorator a bare decorator expression applies: the last name of the
 /// dotted path after `@`, with nothing else in the expression.
 fn bare_decorator(expression: &str, syntax: Syntax, offset: usize) -> Option<CalleeToken> {
@@ -630,6 +701,49 @@ mod tests {
     fn callee(file: &str, text: &str, expression: &str) -> Option<(String, bool, usize)> {
         callee_token(file, text, &span_of(text, expression))
             .map(|token| (token.name, token.through_member, token.start_byte))
+    }
+
+    #[test]
+    fn syntax_projects_tagged_templates_and_calls_inside_substitutions() {
+        let source = "function run(value) { return db.sql`select ${format(value.replace(/[()]/g, ''), sql`nested ${inner(value)}`)}`; }";
+        let adapter = kin_parser::languages::TypeScriptAdapter;
+        let tree = kin_parser::LanguageAdapter::parse(&adapter, source.as_bytes()).unwrap();
+        fn visit(
+            node: tree_sitter::Node<'_>,
+            source: &str,
+            tree: &SourceTree,
+            found: &mut Vec<CalleeToken>,
+        ) {
+            if node.kind() == "call_expression" {
+                let span = kin_parser::adapter::span_from_node(&node, &FilePathId::new("run.ts"));
+                found.push(
+                    callee_token_in_tree(tree, source, &span)
+                        .expect("each named callee has a syntax token"),
+                );
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                visit(child, source, tree, found);
+            }
+        }
+        let mut found = Vec::new();
+        visit(tree.root_node(), source, &tree, &mut found);
+        assert_eq!(
+            found
+                .iter()
+                .map(|token| token.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sql", "format", "replace", "sql", "inner"]
+        );
+        assert!(found[0].through_member);
+        for token in found {
+            assert_eq!(&source[token.start_byte..token.end_byte], token.name);
+        }
+        assert_eq!(
+            callee_token_in_tree(&tree, source, &span_of(source, source)),
+            None,
+            "the containing function is not another call"
+        );
     }
 
     #[test]

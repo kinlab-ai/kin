@@ -434,6 +434,7 @@ fn plan_and_commit(
         merge_transaction_delta: None,
         sealed_observation: None,
         collaboration_delta: None,
+        git_snapshot_proofs: Vec::new(),
     };
     transaction
         .validate()
@@ -447,13 +448,14 @@ fn plan_and_commit(
         &authority.manager,
     )
     .context("validate the exact workspace projection before rolling back")?;
-    if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::projection_conflict(format!(
-            "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
-             reconcile them into graph authority or discard them before rolling back",
-            drift.len()
-        ))
-        .into());
+    if !drift.is_clean() {
+        return Err(
+            kin_core::KinError::projection_conflict(crate::entity_words::drift_refusal(
+                &drift.drifted_paths,
+                "take them in with `kin admit` or discard them before rolling back",
+            ))
+            .into(),
+        );
     }
 
     // The restored state is the target's, which predates the store's last

@@ -137,8 +137,16 @@ impl EnvVarGuard {
     /// The restore value recorded is the one from before this guard first
     /// touched `key`, so a loop that walks a name through several values still
     /// restores what the process had on entry.
+    ///
+    /// # Panics
+    ///
+    /// When `key` is one of [`PROCESS_HOME_NAMES`] and other tests share this
+    /// process. Call [`alone_in_process`] at the start of the test first.
     pub fn apply<K: AsRef<OsStr>, V: AsRef<OsStr>>(&mut self, key: K, value: Option<V>) {
         let key = key.as_ref().to_os_string();
+        if let Some(refusal) = shared_process_refusal(&key, process_runs_one_test()) {
+            panic!("{refusal}");
+        }
         self.restore
             .entry(key.clone())
             .or_insert_with(|| std::env::var_os(&key));
@@ -172,6 +180,214 @@ pub fn install_process_wide(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
     std::env::set_var(key.as_ref(), value.as_ref());
 }
 
+/// The variables that decide where Kin keeps its registry, central stores,
+/// managed home and Git identity.
+///
+/// Every store a test creates is placed and found again through these. A test
+/// that changes one in a process other tests share moves their stores out from
+/// under them: `cargo test` runs every test of a binary as threads of one
+/// process, so a store created while one test pointed `HOME` at its temporary
+/// directory lands there, and is deleted with it, or is looked up in a
+/// different registry than the one it was recorded in. [`EnvVarGuard`] refuses
+/// to change these unless the process runs only one test.
+pub const PROCESS_HOME_NAMES: &[&str] = &[
+    "KIN_REGISTRY_PATH",
+    "KIN_HOME",
+    "KIN_DIR",
+    "KIN_STORE",
+    "KIN_STORE_LAYOUT",
+    "HOME",
+    "USERPROFILE",
+    "XDG_CONFIG_HOME",
+];
+
+/// Set in a child [`alone_in_process`] started, to the path of the one test it
+/// runs.
+const ALONE_IN_PROCESS_ENV: &str = "KIN_TEST_ALONE_IN_PROCESS";
+
+/// Why changing `key` is refused, or `None` when it may be changed: it is not
+/// one of [`PROCESS_HOME_NAMES`], or this process runs only one test.
+fn shared_process_refusal(key: &OsStr, runs_one_test: bool) -> Option<String> {
+    (is_process_home_name(key) && !runs_one_test).then(|| {
+        format!(
+            "{} decides where every test in this process keeps its stores and home, so a test \
+             may change it only in a process of its own: call \
+             kin_core::test_env::alone_in_process() at the start of the test and return when it \
+             returns false",
+            key.to_string_lossy()
+        )
+    })
+}
+
+/// Whether a child run reported exactly one passing test.
+fn child_ran_one_passing_test(succeeded: bool, stdout: &str) -> bool {
+    succeeded
+        && stdout
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed"))
+}
+
+fn is_process_home_name(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    PROCESS_HOME_NAMES.iter().any(|name| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(&key)
+        } else {
+            *name == key
+        }
+    })
+}
+
+/// Whether this process runs exactly one test: the child [`alone_in_process`]
+/// started for it, or a runner that starts one process per test, as
+/// `cargo nextest` does and says in `NEXTEST_EXECUTION_MODE`.
+fn process_runs_one_test() -> bool {
+    std::env::var_os(ALONE_IN_PROCESS_ENV).is_some()
+        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some_and(|mode| mode == "process-per-test")
+}
+
+/// Run the calling test in a process of its own, for a test that changes one
+/// of [`PROCESS_HOME_NAMES`].
+///
+/// Returns `true` when this process already runs only this test: under a
+/// runner that starts one process per test, or in the child this function
+/// started. The caller then runs its body, guards and all, with nothing else
+/// in the process to disturb. Returns `false` in a process other tests share,
+/// after running this same test again as a child of the test binary and
+/// requiring that it passed; the caller returns at once.
+///
+/// Call it first, before any guard: the child starts from this process's
+/// environment as it stands when the child is spawned, which is taken inside
+/// the guard's serialization domain so no other test's guard is mid-scope.
+///
+/// # Panics
+///
+/// Off a test's own thread, whose name is the test's path; and, naming the test
+/// and printing everything the child wrote, when the child failed or ran
+/// anything other than exactly one test, since a path the filter did not match
+/// would otherwise pass without running.
+pub fn alone_in_process() -> bool {
+    if process_runs_one_test() {
+        return true;
+    }
+    let thread = std::thread::current();
+    let test = match thread.name() {
+        Some(name) if name != "main" => name.to_string(),
+        _ => panic!(
+            "alone_in_process() must be called on the test's own thread, whose name is the \
+             test's path, not from a helper thread or a test harness without named threads"
+        ),
+    };
+    let executable = std::env::current_exe().expect("the path of this test binary");
+    let mut command = std::process::Command::new(&executable);
+    command
+        .args([test.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+        .arg("--include-ignored")
+        .env(ALONE_IN_PROCESS_ENV, &test)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = {
+        let _domain = EnvVarGuard::new();
+        command.spawn()
+    }
+    .unwrap_or_else(|error| panic!("{test}: could not start it in its own process: {error}"));
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("{test}: could not read its own process: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !child_ran_one_passing_test(output.status.success(), &stdout) {
+        panic!(
+            "{test} failed in its own process ({}, and the child must report exactly 1 \
+             passed).\n\
+             It changes a variable that decides where stores live, so it runs alone in a \
+             child of {}.\n\
+             ---- child stdout ----\n{stdout}\n---- child stderr ----\n{stderr}",
+            output.status,
+            executable.display(),
+        );
+    }
+    false
+}
+
+/// The registry, store index and central stores every store-creating test in
+/// this process shares: one per test process, created on first use and removed
+/// when the process exits normally.
+///
+/// It is never moved once tests have started, because a store records itself
+/// in the index beside the registry it was created under and is found through
+/// the registry the process names at lookup time. In a process other tests
+/// share, the test environment (scripts/test-env, which nextest and plain
+/// `cargo test` both apply) fixed a private registry before the process
+/// started, and that one is kept: installing another partway through moved the
+/// registry under the stores earlier tests had made. A process that runs one
+/// test gets its own, installed before that test creates anything.
+pub fn install_test_registry() -> &'static std::path::Path {
+    static REGISTRY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let path = REGISTRY.get_or_init(|| {
+        if let Some(path) = registry_fixed_at_start() {
+            if !path.exists() {
+                crate::registry::KinRegistry { repos: Vec::new() }
+                    .save_to(&path)
+                    .expect("write the test registry");
+            }
+            return path;
+        }
+        let root = retained_test_temp_dir("kin-test-registry-");
+        let path = root.join("registry.toml");
+        crate::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&path)
+            .expect("write the test registry");
+        install_process_wide("KIN_REGISTRY_PATH", &path);
+        path
+    });
+    path
+}
+
+/// The private registry the test environment set before this process started,
+/// when this process is shared by several tests and so must keep it.
+fn registry_fixed_at_start() -> Option<std::path::PathBuf> {
+    if process_runs_one_test() {
+        return None;
+    }
+    // Written by scripts/test-env/setup.sh beside the registry it sets.
+    std::env::var_os("KIN_TEST_ENV_FLUSH")?;
+    std::env::var_os("KIN_REGISTRY_PATH").map(std::path::PathBuf::from)
+}
+
+/// A temporary directory that lives as long as the test process and is removed
+/// when it exits normally. An abrupt exit keeps it for inspection.
+fn retained_test_temp_dir(prefix: &str) -> std::path::PathBuf {
+    static DIRS: Mutex<Vec<tempfile::TempDir>> = Mutex::new(Vec::new());
+
+    #[cfg(unix)]
+    extern "C" fn remove_retained_dirs() {
+        let dirs = std::mem::take(&mut *DIRS.lock().unwrap_or_else(|p| p.into_inner()));
+        for dir in dirs {
+            let _ = dir.close();
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        REGISTERED.call_once(|| {
+            // SAFETY: the hook has the C ABI atexit requires, touches only
+            // process-lifetime storage, and does not unwind.
+            assert_eq!(unsafe { libc::atexit(remove_retained_dirs) }, 0);
+        });
+    }
+
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("a temporary directory for the test process");
+    let path = dir.path().to_path_buf();
+    DIRS.lock().unwrap_or_else(|p| p.into_inner()).push(dir);
+    path
+}
+
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         for (key, previous) in std::mem::take(&mut self.restore) {
@@ -195,6 +411,70 @@ pub const MUTATION_ALLOWLIST_FILE: &str = "env_mutation_allowlist.txt";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_home_name_may_change_only_where_one_test_runs() {
+        for name in PROCESS_HOME_NAMES {
+            let refusal = shared_process_refusal(OsStr::new(name), false)
+                .unwrap_or_else(|| panic!("{name} changed in a shared process"));
+            assert!(refusal.contains("alone_in_process()"), "{refusal}");
+            assert!(
+                shared_process_refusal(OsStr::new(name), true).is_none(),
+                "{name}"
+            );
+        }
+        // The control: any other name is the guard's ordinary business.
+        assert!(shared_process_refusal(OsStr::new("KIN_MEMORY_PRESSURE"), false).is_none());
+    }
+
+    #[test]
+    fn only_exactly_one_passing_test_counts_as_the_child_passing() {
+        let one = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                   9 filtered out; finished in 0.01s\n";
+        assert!(child_ran_one_passing_test(true, one));
+        assert!(!child_ran_one_passing_test(false, one), "a failed exit");
+        let none = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; \
+                    10 filtered out; finished in 0.00s\n";
+        assert!(
+            !child_ran_one_passing_test(true, none),
+            "a filter that matched nothing"
+        );
+        assert!(!child_ran_one_passing_test(true, ""), "no summary at all");
+    }
+
+    /// The whole path, under either runner: in a process other tests share it
+    /// runs in a child and returns false here; in the child, or under a
+    /// one-process-per-test runner, it returns true and the change is allowed.
+    #[test]
+    fn a_test_that_changes_home_runs_alone() {
+        if !alone_in_process() {
+            return;
+        }
+        assert!(process_runs_one_test());
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path());
+        assert_eq!(
+            std::env::var_os("HOME").as_deref(),
+            Some(home.path().as_os_str())
+        );
+    }
+
+    #[test]
+    fn one_test_registry_serves_the_whole_process() {
+        // Installing it is a process-wide switch, which the other tests in this
+        // binary must not see halfway through.
+        if !alone_in_process() {
+            return;
+        }
+        let first = install_test_registry();
+        let second = install_test_registry();
+        assert_eq!(first, second);
+        assert!(first.is_file(), "{}", first.display());
+        assert_eq!(
+            std::env::var_os("KIN_REGISTRY_PATH").as_deref(),
+            Some(first.as_os_str())
+        );
+    }
 
     const ABSENT: &str = "KIN_TEST_ENV_GUARD_ABSENT";
     const PRESENT: &str = "KIN_TEST_ENV_GUARD_PRESENT";

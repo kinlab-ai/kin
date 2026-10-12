@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 
+use crate::graph_facts::{language_from_hint, FactsSnapshot, DERIVED_MEMBER_EDGE_CONFIDENCE};
 use crate::index::{fingerprint_match_score, CrossRepoEdge, EntityEntry, SpineIndex};
 use kin_model::{
     Entity, EntityId, EntityKind, EntityRole, Relation, RelationKind, SemanticFingerprint,
@@ -40,6 +41,10 @@ pub struct UnresolvedImport {
     /// Import source module name from Relation.import_source.
     /// When set, the spine uses this to narrow resolution to repos matching this module.
     pub import_source: Option<String>,
+    /// The reference is a candidate: the importing entity is an inferred
+    /// member, or the relation carries derived-member candidate evidence.
+    /// Every edge it binds carries [`DERIVED_MEMBER_EDGE_CONFIDENCE`].
+    pub candidate: bool,
 }
 
 /// Result of attempting to resolve an import.
@@ -67,19 +72,81 @@ pub enum ResolveResult {
 /// 2. If `import_source` is set but doesn't match directly → use it to filter
 ///    `candidate_repos` (medium confidence 0.8)
 /// 3. Fall back to current behavior: name+kind+fingerprint across all candidates
+///
+/// Two graph facts then bound every tier. An import binds only a declaration
+/// its language could reference, so a same-named declaration in a runtime the
+/// importer cannot load is never a match. And an edge that touches an inferred
+/// member, as its source or its target, carries
+/// [`DERIVED_MEMBER_EDGE_CONFIDENCE`], the candidate reading the local graph
+/// gives the same edge.
 pub fn resolve_imports(
     index: &SpineIndex,
     imports: &[UnresolvedImport],
 ) -> Vec<(usize, ResolveResult)> {
     let mut results = Vec::with_capacity(imports.len());
     let registered_repos = index.registered_repo_ids();
+    let facts = index.facts_snapshot();
 
     for (i, import) in imports.iter().enumerate() {
-        let result = resolve_single(index, import, &registered_repos);
-        results.push((i, result));
+        let result = resolve_single(index, &facts, import, &registered_repos);
+        results.push((i, bound_candidates(&facts, import, result)));
     }
 
     results
+}
+
+/// Cap every edge a resolution binds at the candidate confidence when either
+/// end is an inferred member.
+fn bound_candidates(
+    facts: &FactsSnapshot,
+    import: &UnresolvedImport,
+    result: ResolveResult,
+) -> ResolveResult {
+    let cap = |repo: &str, entity: &EntityId, confidence: f32| {
+        if import.candidate || facts.is_derived_member(repo, entity) {
+            confidence.min(DERIVED_MEMBER_EDGE_CONFIDENCE)
+        } else {
+            confidence
+        }
+    };
+    match result {
+        ResolveResult::Resolved {
+            target_repo,
+            target_entity,
+            confidence,
+        } => ResolveResult::Resolved {
+            confidence: cap(&target_repo, &target_entity, confidence),
+            target_repo,
+            target_entity,
+        },
+        ResolveResult::Ambiguous { candidates } => ResolveResult::Ambiguous {
+            candidates: candidates
+                .into_iter()
+                .map(|(repo, entity, confidence)| {
+                    let confidence = cap(&repo, &entity, confidence);
+                    (repo, entity, confidence)
+                })
+                .collect(),
+        },
+        ResolveResult::NotFound => ResolveResult::NotFound,
+    }
+}
+
+/// The declarations named `import.imported_name` that the import's language
+/// could reference, best fingerprint match first.
+fn reachable_matches(
+    index: &SpineIndex,
+    facts: &FactsSnapshot,
+    import: &UnresolvedImport,
+) -> Vec<EntityEntry> {
+    let source_language = import.language.as_deref().and_then(language_from_hint);
+    let mut matches = index.resolve(
+        &import.imported_name,
+        import.imported_kind,
+        import.reference_fingerprint.as_ref(),
+    );
+    matches.retain(|entry| facts.admits(source_language, &entry.repo_id, &entry.entity_id));
+    matches
 }
 
 /// Normalize a crate name or repo id for cross-repo matching: trim, lowercase,
@@ -103,6 +170,7 @@ fn import_source_root(source: &str) -> &str {
 /// Resolve a single import using the 3-tier strategy.
 fn resolve_single(
     index: &SpineIndex,
+    facts: &FactsSnapshot,
     import: &UnresolvedImport,
     registered_repos: &HashSet<String>,
 ) -> ResolveResult {
@@ -128,11 +196,7 @@ fn resolve_single(
             .iter()
             .find(|r| normalize_repo_token(r.as_str()) == normalized_source)
         {
-            let matches = index.resolve(
-                &import.imported_name,
-                import.imported_kind,
-                import.reference_fingerprint.as_ref(),
-            );
+            let matches = reachable_matches(index, facts, import);
             let in_source: Vec<&EntityEntry> = matches
                 .iter()
                 .filter(|e| e.repo_id == *matched_repo)
@@ -175,11 +239,7 @@ fn resolve_single(
         };
 
         if !filtered_candidates.is_empty() {
-            let matches = index.resolve(
-                &import.imported_name,
-                import.imported_kind,
-                import.reference_fingerprint.as_ref(),
-            );
+            let matches = reachable_matches(index, facts, import);
             let in_filtered: Vec<&EntityEntry> = matches
                 .iter()
                 .filter(|e| filtered_candidates.contains(&e.repo_id))
@@ -206,16 +266,16 @@ fn resolve_single(
     }
 
     // Tier 3: Fall back to name+kind+fingerprint across all candidate repos
-    resolve_fallback(index, import)
+    resolve_fallback(index, facts, import)
 }
 
 /// Tier 3 fallback: original name+kind+fingerprint resolution.
-fn resolve_fallback(index: &SpineIndex, import: &UnresolvedImport) -> ResolveResult {
-    let matches = index.resolve(
-        &import.imported_name,
-        import.imported_kind,
-        import.reference_fingerprint.as_ref(),
-    );
+fn resolve_fallback(
+    index: &SpineIndex,
+    facts: &FactsSnapshot,
+    import: &UnresolvedImport,
+) -> ResolveResult {
+    let matches = reachable_matches(index, facts, import);
 
     // Filter to candidate repos
     let filtered: Vec<&EntityEntry> = if import.candidate_repos.is_empty() {
@@ -473,6 +533,11 @@ pub fn collect_unresolved_imports(
             language: Some(src_entity.language.to_string()),
             reference_fingerprint: None,
             import_source: Some(source),
+            candidate: kin_model::is_derived_member(src_entity)
+                || rel.evidence.iter().any(|evidence| {
+                    evidence.parser_rule.as_deref()
+                        == Some(kin_model::derivation::DERIVED_MEMBER_CANDIDATE_RULE)
+                }),
         });
     }
 
@@ -524,6 +589,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: None,
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -564,6 +630,7 @@ mod tests {
             language: None,
             reference_fingerprint: None,
             import_source: None,
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -590,6 +657,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: None,
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -633,6 +701,7 @@ mod tests {
             language: None,
             reference_fingerprint: Some(ref_fp),
             import_source: None,
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -685,6 +754,7 @@ mod tests {
             language: Some("python".to_string()),
             reference_fingerprint: None,
             import_source: Some("requests".to_string()),
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -722,6 +792,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: Some("kin::platform".to_string()),
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -744,6 +815,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: None,
+            candidate: false,
         }];
         let forged = vec![(
             0,
@@ -791,6 +863,7 @@ mod tests {
             language: None,
             reference_fingerprint: Some(ref_fp),
             import_source: None, // No import_source — should fall through to tier 3
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -1186,6 +1259,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: Some("kin_db".to_string()),
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -1226,6 +1300,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: Some("kin_db::graph".to_string()),
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -1264,6 +1339,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: Some("kin_db".to_string()),
+            candidate: false,
         }];
 
         let results = resolve_imports(&index, &imports);
@@ -1287,6 +1363,7 @@ mod tests {
             language: Some("rust".to_string()),
             reference_fingerprint: None,
             import_source: None,
+            candidate: false,
         };
         let imports = vec![import("Graph"), import("Graph"), import("Graph")];
         let resolutions = vec![

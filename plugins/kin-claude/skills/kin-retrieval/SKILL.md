@@ -18,32 +18,35 @@ are separate operations, not retrieval fallbacks.
 
 ## Pick the tool by what you know
 
-You know the name. Use `semantic_search`. It matches parsed declarations by name, kind,
-and language, so it returns functions, classes, structs, traits, enums, interfaces, types,
-and constants rather than every line that mentions the word. Each hit carries its file
-path, line range, signature, and a stable entity id. Despite the name it does not rank by
-vector similarity, so treat it as the fast exact-ish lookup.
+Every Kin tool is a plain verb with options, named the way the `kin` CLI names it.
 
-You only know the behavior. Use `semantic_locate`. It ranks code against a
-natural-language query using the vector index, which is the retrieval that powers
-`kin locate`. Results are semantic entities; file granularity is unavailable. It needs
-the running daemon and an embedded graph, and it reports its coverage in the response.
+You know the name, or only the behavior. Use `locate` with one `query`. With the default
+`mode: "auto"`, a query that looks like an identifier or a dotted name (`parse_config`,
+`app.run`) matches parsed declarations by name, kind, and language, so it returns
+functions, classes, structs, traits, enums, interfaces, types, and constants rather than
+every line that mentions the word. Anything else is ranked against the vector index as a
+description of the behavior, the retrieval that powers `kin locate`, which needs the
+running daemon and an embedded graph and reports its coverage in the response. Pass
+`mode: "name"` or `mode: "description"` to choose, and `mode: "literal"` for exact text,
+punctuation included. Each hit carries its file path, line range, signature, and a stable
+entity id. Results are semantic entities; file granularity is unavailable.
 
-You have an entity and need to understand it. Use `get_context_pack`. It bundles the
-target with its caller and import neighborhood into one prompt-sized payload, which
-replaces a chain of separate reads. `get_entity_source` returns just the implementation
-body when the pack is more than you need.
+You have an entity and need to understand it. Use `context`. It bundles the target with
+its caller and import neighborhood into one prompt-sized payload, which replaces a chain of
+separate reads. `source` returns just the implementation body when the pack is more than
+you need.
 
-You need callers. Use `find_references` for everything that imports, calls, or references
-a symbol. Use `graph_neighborhood` when you want the dependency structure around an
-entity, with `direction` of `out` for what it depends on, `in` for what depends on it, and
-`both` for the merged view.
+You need callers. Use `refs` for everything that imports, calls, or references a symbol.
+Use `neighbors` when you want the dependency structure around an entity, with `direction`
+of `out` for what it depends on, `in` for what depends on it, and `both` for the merged
+view.
 
-You need the path a value travels. Use `trace_data_flow`. It walks the call and data-flow
-chain from a focal entity and returns it as an ordered list of steps.
+You need the path a value travels. Use `trace`. It walks the call and data-flow chain from
+a `focal` entity and returns it as an ordered list of steps. Give `to` as well and it
+returns how the one entity reaches the other, as hops.
 
-You need history. Use `kin_provenance_query` for who changed an entity, how many times,
-what the latest change was, and which approvals are recorded.
+You need history. Use `history` for who changed an entity, how many times, what the latest
+change was, and which approvals are recorded.
 
 A query has no matching semantic entity. Read the coverage evidence and report missing
 conversion coverage. Whole artifacts and importer-created file-module nodes are not source
@@ -57,20 +60,24 @@ Every response carries a `_kin` envelope. It names the runtime that answered
 generation and reconciliation state, embedding coverage, and any degraded flags. There is
 no configuration under which a semantic answer is quietly backfilled from raw file search.
 
-An empty result is not automatically an absence. Before concluding that something is
-absent, require both `negative.safe_to_conclude_absent` and
-`_kin.verdict.safe_to_conclude_absent` to be true, with a certified authoritative verdict
-and no contradictory `_kin.self_check`. A reason label or a loaded graph alone is not
-proof of absence. Report the stated limitation when the evidence is incomplete.
-A name-resolution miss also does not prove that a resolved entity has no references.
+Read `_kin.verdict` and `_kin.meaning` first. `complete` means the answer is whole and
+proven, so use it without checking it again. `complete except the sites listed below` means
+only the sites in `left_to_check` are open, each with its code and a reason; check a site
+only if its reason could apply. Lookups of a name built at run time, counted in `searched`,
+are a blind spot of every tool that reads code, not a site to check. `partial` means there
+may be more, and `meaning` says why. A complete answer was checked against every file Kin
+holds, and each row shows the line of code that proves it, so re-reading source to confirm
+the rows only costs time.
+An empty result is an absence only when its verdict is `complete`. Report the stated
+limitation when the answer is partial. A name-resolution miss also does not prove that a
+resolved entity has no references.
 
-If `semantic_locate` reports thin coverage, embeddings are still building. Run `kin embed`
-in the repository, or use `semantic_search` and the structural tools in the meantime, which
-do not depend on the vector index.
+If `locate` by description reports thin coverage, embeddings are still building. Run
+`kin embed` in the repository, or use `locate` by name and the structural tools in the
+meantime, which do not depend on the vector index.
 
 ## A working order
 
-Start with one `semantic_search` or `semantic_locate` to find the entity. Pull
-`get_context_pack` on the best hit. Add `find_references` if you need the call sites, or
-`impact_analysis` if you are about to change something shared. That is usually two or three
+Start with one `locate` to find the entity. Pull `context` on the best hit. Add `refs` if
+you need the call sites, or `impact` if you are about to change something shared. That is usually two or three
 calls, and it is enough. Stop and answer rather than sweeping the tree.
