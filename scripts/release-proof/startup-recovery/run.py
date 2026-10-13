@@ -70,7 +70,12 @@ def prepare(root, label, output, kin):
     home.mkdir()
     env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home),
            "TMPDIR": str(home)}
-    env.update(KIN_HOME=str(home), KIN_EMBED_BACKEND="cpu", KIN_DAEMON_AUTO_EMBED="false")
+    # The frozen fixtures and the daemon probe below are written against the
+    # in-tree store layout (the probe already starts the daemon with
+    # --storage local), so mint the fresh control pair there too instead of
+    # in the central stores directory a bare init now defaults to.
+    env.update(KIN_HOME=str(home), KIN_EMBED_BACKEND="cpu", KIN_DAEMON_AUTO_EMBED="false",
+               KIN_STORE_LAYOUT="in-tree")
     command = [str(kin), "init", str(fixture), "--defer-enrich", "--json"]
     result = subprocess.run(command, env=env, capture_output=True, text=True)
     (output / (label + "-init.log")).write_text(result.stdout + result.stderr)
