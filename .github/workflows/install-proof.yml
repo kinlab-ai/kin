@@ -505,11 +505,19 @@ jobs:
       # anonymous release job cannot read the checked-in contract script, so it
       # repeats the observable behavior; the authority test keeps it aligned
       # with scripts/assert-windows-init-contract.sh.
+      #
+      # A populated directory with no Git history is the one boundary where
+      # this step and that script differ. The script runs against a binary
+      # built from source and requires admission. This step installs whichever
+      # release is public, and releases through v0.8.6 refuse that directory,
+      # so it takes either answer and holds the binary to the whole contract of
+      # the answer it gave.
       - name: Windows admission contract proof
         if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
+          POPULATED_UNCOMMITTED="Uncommitted work:"
           NON_EMPTY_REFUSAL="requires an empty directory"
 
           scratch="kin-windows-admission"
@@ -634,25 +642,21 @@ jobs:
               git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
             )
           }
-          # Admit a fixture under the default (central) layout, or under
-          # `in-tree` when the fourth argument says so. A new store is central
-          # and the tree carries nothing, so publication is what `kin store
-          # path` discovers.
-          require_admitted() {
-            local layout="${4:-central}"
+          # What an admission that reported success must have published, under
+          # the layout the fourth argument names. A new store is central and
+          # the tree carries nothing, so publication is what `kin store path`
+          # discovers.
+          require_published() {
             local home
             local store
             home="$(fixture_home "$2")"
-            if ! fixture_kin "$2" "$layout" kin init > "$3" 2>&1; then
-              fail "$1 failed" "$3"
-            fi
-            store="$(discovered_store "$2" "$layout" "$3")"
+            store="$(discovered_store "$2" "$4" "$3")"
             if [ -z "$store" ]; then
               fail "$1 returned success but no store serves $2" "$3"
             elif [ ! -f "$store/manifest.json" ]; then
               fail "$1 returned success but the store serving $2 holds no manifest: $store" "$3"
             fi
-            if [ "$layout" = "in-tree" ]; then
+            if [ "$4" = "in-tree" ]; then
               if [ ! -d "$2/.kin" ]; then
                 fail "$1 returned success without publishing $2/.kin" "$3"
               elif [ -n "$store" ] && [ "$(basename "$store")" != ".kin" ]; then
@@ -670,12 +674,20 @@ jobs:
             fi
             require_no_stage_residue "$1" "$2" "$3"
           }
-          require_refused() {
+          # Admit a fixture under the default (central) layout, or under
+          # `in-tree` when the fourth argument says so.
+          require_admitted() {
+            local layout="${4:-central}"
+            if ! fixture_kin "$2" "$layout" kin init > "$3" 2>&1; then
+              fail "$1 failed" "$3"
+            fi
+            require_published "$1" "$2" "$3" "$layout"
+          }
+          # What a refusal must leave behind: no store in the tree, none in the
+          # fixture's stores directory, none that discovery finds, and no stage.
+          require_nothing_published() {
             local home
             home="$(fixture_home "$2")"
-            if fixture_kin "$2" central kin init > "$3" 2>&1; then
-              fail "$1 unexpectedly succeeded" "$3"
-            fi
             if [ -e "$2/.kin" ]; then
               fail "$1 published authority at $2/.kin" "$3"
             fi
@@ -686,7 +698,30 @@ jobs:
               fail "$1 left a store serving $2" "$3"
             fi
             require_no_stage_residue "$1" "$2" "$3"
-            require_text "$1" "$NON_EMPTY_REFUSAL" "$3"
+          }
+          # Run `kin init` once on a populated directory with no Git history
+          # and hold the binary to the whole contract of the answer it gave.
+          # Success must publish exactly as the empty directory does and report
+          # the content as uncommitted work. Failure must publish nothing and
+          # give the refusal's own reason. Anything between the two fails.
+          #
+          # Taking either answer does not let a current binary pass as an older
+          # one. The refusal wording is gone from the source, so nothing built
+          # from it can print that reason, and
+          # scripts/assert-windows-init-contract.sh requires admission from
+          # every source build.
+          require_populated_contract() {
+            if fixture_kin "$2" central kin init > "$3" 2>&1; then
+              populated_outcome="admitted it and reported its content as uncommitted work"
+              echo "$1: kin init succeeded, so the admission contract applies."
+              require_published "$1" "$2" "$3" central
+              require_text "$1" "$POPULATED_UNCOMMITTED" "$3"
+            else
+              populated_outcome="refused it and published nothing, as a release built before populated admission does"
+              echo "$1: kin init failed, so the refusal contract of a release built before populated admission applies."
+              require_nothing_published "$1" "$2" "$3"
+              require_text "$1" "$NON_EMPTY_REFUSAL" "$3"
+            fi
           }
 
           git_boundary="$scratch/exact-git/repo"
@@ -704,19 +739,17 @@ jobs:
           mkdir -p "$native_boundary"
           require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"
 
-          # A capability Windows now has must not become permission to derive
-          # authority from whatever happens to be lying in the directory.
           populated_boundary="$scratch/native-populated/repo"
           populated_log="$scratch/kin-init-native-populated.txt"
           mkdir -p "$populated_boundary"
           printf 'untracked\n' > "$populated_boundary/stray.txt"
-          require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"
+          require_populated_contract "Windows native-populated boundary" "$populated_boundary" "$populated_log"
 
           if [ "$failures" -ne 0 ]; then
             echo "::error::the installed Windows release violated its admission contract ($failures check(s) failed)"
             exit 1
           fi
-          echo "Installed Windows release admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, without stage residue, and refused the non-empty native boundary."
+          echo "Installed Windows release admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, without stage residue. Given a populated directory with no Git history, it $populated_outcome."
 
       # Preserve a pre-repository Windows checkpoint in addition to the full
       # repo/daemon/MCP proof below. It binds CLI provenance and proves that

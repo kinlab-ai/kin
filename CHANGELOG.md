@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The local workspace (`kin ui`) is rebuilt so that each page does one job
+  and shows what Kin knows about the work. The sidebar lists every repository
+  on this machine, with a mark on the ones that hold uncommitted work or a
+  working agent, and the open repository unfolds into its three sections:
+  Work, Agents and Code.
+- Work holds a change at each of its stages as three tabs: Uncommitted,
+  Branches and History. Uncommitted opens with a picture of the work: the entities it changed on one
+  side, joined to the entities that rely on them and did not change on the
+  other, each in the colour of what it asks of you. A larger change is also
+  listed in full, ordered by what needs your attention. The page names any
+  place where an agent's activity meets that work, and commits the work under
+  the same author resolution as `kin commit`.
+- Review is a guided walk, one entity to a page, over uncommitted work, a
+  committed change, or one branch against another. Each page shows the
+  entity's source before and after, a picture of what relies on it and whether
+  each of those changed too, and the tests that reach it. You mark it as looking right or flag it
+  with a note, by button or by key. The last page gathers the flags to copy,
+  commits uncommitted work, or keeps how a committed change read to you. A
+  review is advisory: it stops and starts nothing. What you looked at is kept
+  on this machine and follows uncommitted work into the change it becomes.
+- History lists a repository's changes, says for the newest what each left
+  behind (what relies on it and did not change, and whether a test reaches
+  it), and opens each one in the guided review. Branches creates, switches,
+  merges and compares branches, and settles a merge's conflicts entity by
+  entity, without a terminal.
+- Code asks the repository by meaning or by name. An entity's page says what
+  a change to it might affect, then holds its Connections, Source, Members and
+  History as tabs; Connections is a flat picture of what relies on it and what
+  it relies on, in place of the repository map.
+- Agents gives each coding agent a lane: what it has open, the entities it is
+  looking at, what it did last, and the whole timeline of what it asked Kin
+  for when opened. Where an agent's work meets your uncommitted work is said
+  above the lanes.
+- The pages share one design in the system typeface, with light and dark
+  themes. The single-page review reader shares its colours.
+
+### Added
+
+- `kin ui` starts without a repository and opens Home, which says where things
+  stand on this machine: the work waiting on you, drawn as the same picture;
+  the agents working through Kin right now and what each last did; every
+  repository with its size, its languages and what is in motion in it; and
+  what was committed lately. One question can be put to every open repository
+  at once, and each answers from its own graph. Home lists repositories
+  without starting any of them, then opens the most recently changed few so
+  each can say what it holds. A repository registered after the page server
+  started opens without restarting it.
+- Home adds a repository without a terminal: it looks at a place on this
+  machine and says what it holds, then converts a project, starts a new
+  repository, opens one Kin already holds, or clones one, and shows the
+  conversion's progress.
+- Coding agents found on this machine are connected to Kin from the app.
+
 ## [0.8.6] - 2026-10-13
 
 0.8.6 is the first release after 0.8.1. It ships everything recorded under

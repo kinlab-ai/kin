@@ -237,8 +237,8 @@ fn the_four_frame_probe_is_answered_inside_a_repository_whose_daemon_is_absent()
     let root = tempfile::tempdir().expect("temp root");
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).expect("create home");
-    // Kin-native init requires an empty directory; it will not derive
-    // authority from pre-existing filesystem contents.
+    // An empty directory starts an unborn Kin-native repository with
+    // nothing to take in, so no daemon is needed to finish it.
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 

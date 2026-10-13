@@ -463,9 +463,8 @@ pub async fn run_stdio_daemon(
         ));
     }
 
-    let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
+    let mut reader = BufReader::new(client_input_until_stopped());
 
     // This process is an MCP session from here on: it holds an idle floor on
     // whichever daemon it forwards to, so an attached daemon started with a
@@ -485,7 +484,78 @@ pub async fn run_stdio_daemon(
     // The client closed the session. Hand the daemon back its own idle policy
     // now, rather than one floor from now.
     crate::session_idle_floor::release().await;
+    // Stopped by a signal: the session has ended, so leave now rather than
+    // wait on the read of stdin the runtime would otherwise hold for.
+    let stopped = STOP_CODE.load(std::sync::atomic::Ordering::Acquire);
+    if stopped != 0 {
+        std::process::exit(stopped);
+    }
     served
+}
+
+/// The exit code a stop signal asked for, or 0 while none has arrived.
+static STOP_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The client's input, which ends when the client closes it or when this
+/// process is asked to stop.
+///
+/// Most clients stop an MCP server with a signal rather than by closing its
+/// input. Read as the end of input, a stop lets the loop end the connection's
+/// session on its way out, as a closed connection does, so the agent is not
+/// shown as connected after it has gone. A stop that cannot finish in a few
+/// seconds, behind a tool call still running, exits as the signal would have.
+fn client_input_until_stopped() -> tokio::io::DuplexStream {
+    let (mut feed, input) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        tokio::select! {
+            _ = tokio::io::copy(&mut stdin, &mut feed) => {}
+            code = stop_requested() => {
+                tracing::info!("kin-mcp asked to stop; ending this connection's session");
+                STOP_CODE.store(code, std::sync::atomic::Ordering::Release);
+                // A thread of its own, so a runtime held up by a pending read
+                // of stdin cannot keep the process from leaving.
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(3));
+                    std::process::exit(code);
+                });
+            }
+        }
+        // Dropping `feed` ends the loop's input.
+    });
+    input
+}
+
+/// Resolves with the exit code a stop signal asks for: SIGTERM, SIGHUP or
+/// SIGINT. Never resolves where those signals cannot be watched.
+async fn stop_requested() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let watch = |kind: SignalKind| signal(kind).ok();
+        let (mut term, mut hup, mut int) = (
+            watch(SignalKind::terminate()),
+            watch(SignalKind::hangup()),
+            watch(SignalKind::interrupt()),
+        );
+        async fn next(signal: &mut Option<tokio::signal::unix::Signal>) {
+            match signal {
+                Some(signal) => {
+                    signal.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        tokio::select! {
+            _ = next(&mut term) => 128 + 15,
+            _ = next(&mut hup) => 128 + 1,
+            _ = next(&mut int) => 128 + 2,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<i32>().await
+    }
 }
 
 /// Transport-generic core of [`run_stdio_daemon`].

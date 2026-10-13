@@ -5,8 +5,10 @@
 # The native Windows `kin init` admission contract.
 #
 # Exact Git import and an empty native repository must both publish complete
-# graph authority. A populated non-Git directory must still fail closed: Kin
-# never derives authority from filesystem bytes it was not given exactly.
+# graph authority. A populated directory with no Git history must be admitted
+# as well: Kin starts a native repository there with nothing committed and
+# reports what the directory holds as that repository's uncommitted work, so
+# none of it becomes recorded history until someone commits it.
 #
 # A new store lives in the central stores directory under the Kin home, and the
 # working tree carries nothing. Publication is therefore judged the way every
@@ -53,7 +55,10 @@ unset KIN_STORE KIN_STORE_LAYOUT KIN_REGISTRY_PATH
 # than leaving runner processes behind.
 trap 'taskkill.exe /F /IM kin-daemon.exe >/dev/null 2>&1 || true' EXIT
 
-NON_EMPTY_REFUSAL="requires an empty directory"
+# What `kin init` prints when it takes a populated directory in. The colon is
+# part of the wording: a Git import reports "Uncommitted worktree state:", which
+# shares every character before it.
+POPULATED_UNCOMMITTED="Uncommitted work:"
 
 failures=0
 
@@ -219,28 +224,6 @@ require_admitted() {
   require_no_stage_residue "$label" "$dir" "$log"
 }
 
-require_non_empty_refused() {
-  local label="$1"
-  local dir="$2"
-  local log="$3"
-  local home
-  home="$(fixture_home "$dir")"
-  if fixture_kin "$dir" central "$kin_bin" init > "$log" 2>&1; then
-    fail "$label unexpectedly succeeded" "$log"
-  fi
-  if [ -e "$dir/.kin" ]; then
-    fail "$label published authority at $dir/.kin" "$log"
-  fi
-  if [ "$(count_matching "$home/stores" '*/manifest.json')" != "0" ]; then
-    fail "$label published a store in $home/stores" "$log"
-  fi
-  if [ -n "$(discovered_store "$dir" central "$log")" ]; then
-    fail "$label left a store serving $dir" "$log"
-  fi
-  require_no_stage_residue "$label" "$dir" "$log"
-  require_text "$label" "$NON_EMPTY_REFUSAL" "$log"
-}
-
 # Distinguish an admission result from a binary that never started. Windows
 # gives the main thread a smaller default stack than Unix, which has regressed
 # this command tree before.
@@ -264,17 +247,18 @@ native_log="$scratch/kin-init-native-unborn.txt"
 mkdir -p "$native_boundary"
 require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"
 
+# A directory that already holds something and has no Git history is admitted
+# like the empty one, and the report has to say that its content is waiting as
+# uncommitted work rather than pass over it in silence.
 populated_boundary="$scratch/native-populated/repo"
 populated_log="$scratch/kin-init-native-populated.txt"
 mkdir -p "$populated_boundary"
 printf 'untracked\n' > "$populated_boundary/stray.txt"
-require_non_empty_refused \
-  "Windows non-empty native boundary" \
-  "$populated_boundary" \
-  "$populated_log"
+require_admitted "Windows native-populated bootstrap" "$populated_boundary" "$populated_log"
+require_text "Windows native-populated bootstrap" "$POPULATED_UNCOMMITTED" "$populated_log"
 
 if [ "$failures" -ne 0 ]; then
   echo "::error::Windows admission violated its shipped contract ($failures check(s) failed)"
   exit 1
 fi
-echo "Windows admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, published complete authority without stage residue, and refused the non-empty native boundary."
+echo "Windows admitted exact Git, native-empty and native-populated repositories into central stores and exact Git into its own .kin, published complete authority without stage residue, and reported the populated directory's content as uncommitted work."

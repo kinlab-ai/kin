@@ -11,13 +11,15 @@
       "acceptance_spec": [
         "fresh Git repositories import the complete exact reachable object, ref, change, tree, mode, symlink, gitlink, and non-code-artifact closure atomically",
         "fresh non-Git repositories create only an unborn repository-v6 authority",
-        "existing .kin and non-empty non-Git directories fail without mutation",
+        "an existing .kin fails without mutation",
+        "a non-empty directory with no Git history starts the same unborn authority and commits nothing, its content is admitted as uncommitted work under the normal ignore rules, and the home directory itself, a filesystem root and Kin's own home are refused without mutation",
         "safe exact Git remote mappings are sealed into graph-adjacent local transport config while unsafe mappings fail closed before .kin publication",
         "a Git worktree carrying uncommitted work is admitted at its committed state, with every differing path disclosed in human and JSON output rather than refused",
         "either boundary adopts an existing repository's identity when asked to, so a store created here can publish into a repository that already holds one, and refuses an identity the local store cannot be keyed by before a layout is staged"
       ],
       "evidence_tests": [
         "crates/kin-cli/tests/init_json.rs",
+        "crates/kin-cli/tests/init_without_git_history.rs",
         "kin_core::init::tests::an_adopted_hosted_identity_reaches_the_committed_authority",
         "kin_core::init::tests::a_minted_identity_is_still_required_to_be_a_uuid_v4",
         "kin_core::init::tests::an_adopted_identity_that_is_not_one_path_component_is_refused",

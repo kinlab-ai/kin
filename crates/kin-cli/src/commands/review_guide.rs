@@ -306,6 +306,13 @@ pub struct GuideSummary {
     /// apart from `relation_changes` and not listed on any step.
     #[serde(default)]
     pub relation_changes_position_only: usize,
+    /// Relations that differ from the recorded head because Kin linked them
+    /// for itself after that head was written, not because of this
+    /// uncommitted work. A derived one is not work anybody left uncommitted,
+    /// so they are counted apart from `relation_changes` and not walked.
+    /// Always zero for a recorded change.
+    #[serde(default)]
+    pub relation_changes_settling: usize,
     /// Recorded modifications that moved only a span or its source provenance.
     /// The review excludes them, and the count says how many it excluded.
     pub provenance_only_entity_changes: usize,
@@ -2129,6 +2136,153 @@ pub(crate) fn build_guide(
     )
 }
 
+/// What one working guide was built from: the authority, and the live graph
+/// as it stood. Two reads that find both unchanged read the same working copy
+/// against the same history through the same connections.
+#[derive(Clone, PartialEq, Eq)]
+struct WorkingGuideBasis {
+    repository: kin_model::RepositoryId,
+    workspace: kin_model::WorkspaceId,
+    /// Every authority root, the workspace's generation and tree among them.
+    roots: kin_model::RootBundle,
+    /// Which graph, and how many writes to its truth it has completed.
+    graph: (u64, u64),
+}
+
+/// The last working guide a process built, with what it was built from.
+///
+/// A page that follows the working copy asks for this guide every few
+/// seconds, and building it resolves the whole history and reviews every
+/// change in it, which on a large repository is seconds of work. Nothing it
+/// reads can move while the authority and the graph stand still, so the
+/// answer is kept until either moves. One entry is enough: a daemon serves
+/// one repository, and a command builds one guide and exits.
+static WORKING_GUIDE: std::sync::Mutex<Option<(WorkingGuideBasis, ReviewGuide)>> =
+    std::sync::Mutex::new(None);
+
+/// What a working copy changed, as far as the two ends of a relation can
+/// tell.
+#[derive(Default)]
+struct WorkChanged {
+    /// The artifacts whose content the working copy changed.
+    artifacts: HashSet<kin_model::ArtifactId>,
+    /// Every entity either side of the change holds in one of them.
+    in_changed_artifacts: HashSet<EntityId>,
+    /// The entities whose own code the work wrote: added, removed or
+    /// modified. A module container is recorded as modified whenever anything
+    /// in it is, so it is one of these only when nothing else in its artifact
+    /// changed and its own code is all that can have.
+    edited: HashSet<EntityId>,
+    /// The ones among them that either side lacks.
+    came_or_went: HashSet<EntityId>,
+}
+
+impl WorkChanged {
+    fn of(
+        artifacts: HashSet<kin_model::ArtifactId>,
+        in_changed_artifacts: HashSet<EntityId>,
+        changes: &[kin_review::EntityChange],
+    ) -> Self {
+        let place = |entity: &Entity| entity.file_origin.as_ref().map(|origin| origin.0.clone());
+        let mut edited_per_place: HashMap<Option<String>, usize> = HashMap::new();
+        for change in changes {
+            let entity = match &change.kind {
+                EntityChangeKind::Added(entity) => entity,
+                EntityChangeKind::Modified { new, .. } => new,
+                EntityChangeKind::Removed { old: Some(old) } => old,
+                EntityChangeKind::Removed { old: None } => continue,
+            };
+            *edited_per_place.entry(place(entity)).or_default() += 1;
+        }
+        let mut changed = Self {
+            artifacts,
+            in_changed_artifacts,
+            ..Self::default()
+        };
+        for change in changes {
+            match &change.kind {
+                EntityChangeKind::Modified { new, .. } => {
+                    let alone = edited_per_place.get(&place(new)) == Some(&1);
+                    if alone || !kin_model::is_module_container(new) {
+                        changed.edited.insert(change.entity_id);
+                    }
+                }
+                EntityChangeKind::Added(_) | EntityChangeKind::Removed { .. } => {
+                    changed.edited.insert(change.entity_id);
+                    changed.came_or_went.insert(change.entity_id);
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// Split a working copy's relation deltas into the work's own and the rest,
+/// which is counted.
+///
+/// The working copy differs from the recorded head by two things: what the
+/// work changed, and every relation Kin has linked for itself since that head
+/// was written. The second would be there with no edit at all, and on a
+/// repository whose linking is still settling it is thousands of relations.
+/// Counting them as this work is how a two-entity edit came to read as
+/// fourteen thousand changed relations.
+///
+/// A relation that touches nothing the working copy changed, no entity of a
+/// changed artifact on either side of the change and no changed artifact, is
+/// never the work's own.
+///
+/// Of the rest, the ones Kin's linking wrote are told apart by their origin. A
+/// language server's relation is read from its source's code and names what
+/// that code resolves to, and a name-only guess is retired the same way. Either
+/// is the work's own only when the work wrote the code it was read from, or
+/// added or removed the entity it names. Between two entities the work left
+/// as they were, it is linking that happened to finish after the edit.
+///
+/// Every other delta there is the work's own: what parsing the changed
+/// artifacts produced.
+fn own_relation_deltas(
+    deltas: Vec<kin_model::change::RelationDelta>,
+    changed: &WorkChanged,
+) -> (Vec<kin_model::change::RelationDelta>, usize) {
+    use kin_model::change::RelationDelta;
+    use kin_model::relation::RelationOrigin;
+    use kin_model::GraphNodeId;
+
+    let touches = |relation: &kin_model::Relation| {
+        [&relation.src, &relation.dst]
+            .into_iter()
+            .any(|node| match node {
+                GraphNodeId::Entity(id) => changed.in_changed_artifacts.contains(id),
+                GraphNodeId::Artifact(id) => changed.artifacts.contains(id),
+                _ => false,
+            })
+    };
+    let wrote = |relation: &kin_model::Relation| {
+        let source_edited = relation
+            .src
+            .as_entity()
+            .is_some_and(|id| changed.edited.contains(&id));
+        let target_came_or_went = relation
+            .dst
+            .as_entity()
+            .is_some_and(|id| changed.came_or_went.contains(&id));
+        source_edited || target_came_or_went
+    };
+    let total = deltas.len();
+    let own: Vec<RelationDelta> = deltas
+        .into_iter()
+        .filter(|delta| match delta {
+            RelationDelta::Added { new } if new.origin == RelationOrigin::Lsp => wrote(new),
+            RelationDelta::Removed { old } if old.origin == RelationOrigin::Inferred => wrote(old),
+            RelationDelta::Added { new } => touches(new),
+            RelationDelta::Modified { old, new } => touches(old) || touches(new),
+            RelationDelta::Removed { old } => touches(old),
+        })
+        .collect();
+    let settling = total - own.len();
+    (own, settling)
+}
+
 /// Build the guide for what the working tree holds beyond the last recorded
 /// change: the same walkthrough, of work nobody has committed yet.
 ///
@@ -2140,7 +2294,60 @@ pub(crate) fn build_guide(
 ///
 /// Nothing can be recorded against it. A review names a change, and this work
 /// is not one until it is committed.
+///
+/// A caller that holds the authority open gets the guide it was last given
+/// for as long as neither that authority nor the graph has moved; see
+/// [`WORKING_GUIDE`].
 pub(crate) fn build_working_guide(
+    refs: &RequestRepositoryAuthority,
+    graph: &kin_db::InMemoryGraph,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    escape_evidence: Option<&kin_review::enrichment::EscapeEvidence<'_>>,
+    open_authority: Option<&super::repository_authority::ActiveRepositoryAuthority>,
+) -> Result<ReviewGuide> {
+    let basis = open_authority.map(|authority| WorkingGuideBasis {
+        repository: authority.repository_id.clone(),
+        workspace: authority.workspace_id,
+        roots: authority.manager().read_authority().roots().clone(),
+        graph: (graph.instance_id(), graph.truth_epoch()),
+    });
+    let kept = || {
+        WORKING_GUIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some(basis) = &basis {
+        if let Some((built_from, guide)) = kept().as_ref() {
+            if built_from == basis {
+                let mut guide = guide.clone();
+                // The one field that is the read's own and not the work's.
+                guide.change.timestamp = kin_model::Timestamp::now().to_string();
+                return Ok(guide);
+            }
+        }
+    }
+    let guide = derive_working_guide(
+        refs,
+        graph,
+        repository_authority,
+        escape_evidence,
+        open_authority,
+    )?;
+    // A guide read while the graph was a moment ahead of the authority it
+    // was derived against describes a state that is about to be replaced,
+    // and is not kept.
+    let settled = guide
+        .working_tree
+        .as_ref()
+        .is_some_and(|tree| tree.derived && tree.caught_up);
+    if let (Some(basis), true) = (basis, settled) {
+        *kept() = Some((basis, guide.clone()));
+    }
+    Ok(guide)
+}
+
+/// [`build_working_guide`] without the memory of the last one.
+fn derive_working_guide(
     refs: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
@@ -2153,11 +2360,13 @@ pub(crate) fn build_working_guide(
     // The diff `kin diff` reads, from an authority the caller already holds
     // open when it has one. An open re-verifies every persisted body, and a
     // page that follows the working tree asks this again every few seconds.
-    let report = match open_authority {
+    let (report, endpoints) = match open_authority {
         Some(authority) => {
-            super::diff::inspect_with_endpoint_entities_at(authority, None, None, Some(graph))?.0
+            super::diff::inspect_with_endpoint_entities_at(authority, None, None, Some(graph))?
         }
-        None => super::diff::inspect(refs.binding(), None, None, Some(graph))?,
+        None => {
+            super::diff::inspect_with_endpoint_entities(refs.binding(), None, None, Some(graph))?
+        }
     };
     let head = report.base.change_id;
     let working_tree = GuideWorkingTree {
@@ -2175,6 +2384,31 @@ pub(crate) fn build_working_guide(
         ),
         unmeasured: None,
     };
+    // What the working copy changed: its artifacts, and every entity either
+    // side of the change holds in them.
+    let mut changed_artifacts = HashSet::new();
+    let mut changed_places: HashSet<&str> = HashSet::new();
+    for delta in &report.artifact_deltas {
+        changed_artifacts.insert(delta.artifact_id());
+        for located in [delta.old_state(), delta.new_state()].into_iter().flatten() {
+            if let Some(place) = located.path.as_utf8() {
+                changed_places.insert(place);
+            }
+        }
+    }
+    let in_changed_artifacts: HashSet<EntityId> = endpoints
+        .base
+        .values()
+        .chain(endpoints.head.values())
+        .filter(|entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .is_some_and(|origin| changed_places.contains(origin.0.as_str()))
+        })
+        .map(|entity| entity.id)
+        .collect();
+    drop(changed_places);
     let mut semantic = kin_review::SemanticDiff {
         base: head,
         head: None,
@@ -2198,7 +2432,15 @@ pub(crate) fn build_working_guide(
             .entity_changes
             .push(kin_review::EntityChange { entity_id, kind });
     }
-    for delta in report.relation_deltas {
+    let (relation_deltas, relation_changes_settling) = own_relation_deltas(
+        report.relation_deltas,
+        &WorkChanged::of(
+            changed_artifacts,
+            in_changed_artifacts,
+            &semantic.entity_changes,
+        ),
+    );
+    for delta in relation_deltas {
         semantic.relation_changes.push(RelationChange {
             kind: match delta {
                 RelationDelta::Added { new } => RelationChangeKind::Added(new),
@@ -2230,7 +2472,7 @@ pub(crate) fn build_working_guide(
         _ => {}
     }
     let live = kin_review::impact::LiveGraph(graph);
-    assemble(
+    let mut guide = assemble(
         graph,
         repository_authority,
         Subject {
@@ -2257,7 +2499,9 @@ pub(crate) fn build_working_guide(
             range: None,
             working_tree: Some(working_tree),
         },
-    )
+    )?;
+    guide.summary.relation_changes_settling = relation_changes_settling;
+    Ok(guide)
 }
 
 /// Build the guide for a range: everything `head` reaches that `base` does
@@ -3415,12 +3659,20 @@ fn assemble<I: ImpactGraph>(
         .filter(|gap| !gap_names_one_of(gap, &module_names))
         .cloned()
         .collect();
+    // A note that had to keep a node's id names nothing a reader can use.
+    // The relation it is about is still counted with the relation changes.
+    let notes: Vec<String> = risk
+        .notes
+        .iter()
+        .filter(|note| kin_review::risk::note_names_its_entities(note))
+        .cloned()
+        .collect();
     let finding_count = review.inline_comments.len()
         + risk.breaking_changes.len()
         + risk.contract_violations.len()
         + risk.work_risks.len()
         + test_coverage_gaps.len()
-        + risk.notes.len();
+        + notes.len();
     // Each consumer once, by the most any change it reaches asks of it.
     let consumers_may_need_review = may_need_review.difference(&not_updated).count();
     let consumers_need_no_update = need_no_update
@@ -3458,6 +3710,7 @@ fn assemble<I: ImpactGraph>(
             removed,
             relation_changes: review.diff.relation_changes.len() - relation_changes_position_only,
             relation_changes_position_only,
+            relation_changes_settling: 0,
             provenance_only_entity_changes: review.diff.provenance_only_entity_changes,
             module_containers,
             containers_through_members,
@@ -3477,7 +3730,7 @@ fn assemble<I: ImpactGraph>(
             contract_violations: risk.contract_violations.clone(),
             work_risks: risk.work_risks.clone(),
             test_coverage_gaps,
-            notes: risk.notes.clone(),
+            notes,
         },
         not_walked,
         reviews: reviews.reviews,
@@ -3858,6 +4111,25 @@ pub(crate) fn guide_text(guide: &ReviewGuide) -> String {
     }
     if let Some(line) = through_members_sentence(summary) {
         writeln!(text, "{line}").unwrap();
+    }
+    if summary.relation_changes_settling > 0 {
+        writeln!(
+            text,
+            "{} that Kin linked for itself after the recorded head {} from it because its \
+             linking is still settling, not because of this work. {} not walked.",
+            plural(summary.relation_changes_settling, "relation", "relations"),
+            if summary.relation_changes_settling == 1 {
+                "differs"
+            } else {
+                "differ"
+            },
+            if summary.relation_changes_settling == 1 {
+                "It is"
+            } else {
+                "They are"
+            },
+        )
+        .unwrap();
     }
     if summary.relation_changes_position_only > 0 {
         writeln!(
@@ -4308,6 +4580,135 @@ mod tests {
                 evidence: vec![],
             },
         }
+    }
+
+    fn linked(origin: RelationOrigin, source: &Entity, target: &Entity) -> Relation {
+        let RelationDelta::Added { mut new } = calls(source, target) else {
+            unreachable!("calls builds an addition")
+        };
+        new.origin = origin;
+        new
+    }
+
+    fn edit_of(entity: &Entity) -> kin_review::EntityChange {
+        let mut new = entity.clone();
+        new.fingerprint.behavior_hash = kin_model::Hash256::from_bytes([0xee; 32]);
+        kin_review::EntityChange {
+            entity_id: entity.id,
+            kind: EntityChangeKind::Modified {
+                old: entity.clone(),
+                new,
+            },
+        }
+    }
+
+    fn held_in(entities: &[&Entity]) -> HashSet<EntityId> {
+        entities.iter().map(|entity| entity.id).collect()
+    }
+
+    /// A working copy differs from its head by what the work changed and by
+    /// everything Kin linked for itself after that head was written. Only the
+    /// first is the work's own relation change. A language server's relation,
+    /// or a guess it retired, belongs to the work when the work wrote the code
+    /// it was read from or added the entity it names; between two entities the
+    /// work left as they were it is counted apart, in the changed artifact as
+    /// anywhere else. What parsing the changed artifact produced stays the
+    /// work's own.
+    ///
+    /// Falsify by keeping every delta that touches an entity of a changed
+    /// artifact: the untouched neighbour's linking and the inbound linking of
+    /// the edited entity come back as the work's own.
+    #[test]
+    fn linking_that_settled_after_the_head_is_not_the_works_own_relation_change() {
+        let edited = function("hasKey", "lib/decorate.js", 1);
+        let neighbour = function("checkExistence", "lib/decorate.js", 2);
+        let created = function("freshlyAdded", "lib/decorate.js", 3);
+        let mut module = function("decorate", "lib/decorate.js", 4);
+        module.kind = EntityKind::Module;
+        let caller = function("getDecorator", "lib/reply.js", 5);
+        let callee = function("send", "lib/reply.js", 6);
+
+        let changed = WorkChanged::of(
+            HashSet::new(),
+            held_in(&[&edited, &neighbour, &created, &module]),
+            &[
+                edit_of(&edited),
+                edit_of(&module),
+                kin_review::EntityChange {
+                    entity_id: created.id,
+                    kind: EntityChangeKind::Added(created.clone()),
+                },
+            ],
+        );
+
+        let lsp = RelationOrigin::Lsp;
+        let guess = RelationOrigin::Inferred;
+        let parsed = RelationOrigin::Parsed;
+        let added = |relation: Relation| RelationDelta::Added { new: relation };
+        let removed = |relation: Relation| RelationDelta::Removed { old: relation };
+        let moved = linked(parsed, &neighbour, &edited);
+        let mut moved_to = moved.clone();
+        moved_to.confidence = 0.5;
+
+        let own = [
+            added(linked(lsp, &edited, &callee)),
+            added(linked(lsp, &caller, &created)),
+            removed(linked(guess, &edited, &callee)),
+            added(linked(parsed, &neighbour, &callee)),
+            RelationDelta::Modified {
+                old: moved,
+                new: moved_to,
+            },
+        ];
+        let settling = [
+            added(linked(lsp, &caller, &callee)),
+            added(linked(lsp, &neighbour, &edited)),
+            added(linked(lsp, &caller, &edited)),
+            added(linked(lsp, &module, &callee)),
+            removed(linked(guess, &neighbour, &callee)),
+        ];
+
+        let (kept, counted_apart) = own_relation_deltas(
+            own.iter().chain(settling.iter()).cloned().collect(),
+            &changed,
+        );
+        assert_eq!(kept, own.to_vec());
+        assert_eq!(counted_apart, settling.len());
+    }
+
+    /// A module container is recorded as modified whenever anything in it is,
+    /// which says nothing about its own code. When it is the only entity of
+    /// its artifact that changed, its own code is what changed, and what a
+    /// language server links from that code is the work's own.
+    #[test]
+    fn a_module_container_edited_alone_owns_what_its_own_code_links() {
+        let mut module = function("decorate", "lib/decorate.js", 1);
+        module.kind = EntityKind::Module;
+        let member = function("hasKey", "lib/decorate.js", 2);
+        let callee = function("send", "lib/reply.js", 3);
+        let from_module = RelationDelta::Added {
+            new: linked(RelationOrigin::Lsp, &module, &callee),
+        };
+
+        let alone = WorkChanged::of(
+            HashSet::new(),
+            held_in(&[&module, &member]),
+            &[edit_of(&module)],
+        );
+        assert_eq!(
+            own_relation_deltas(vec![from_module.clone()], &alone),
+            (vec![from_module.clone()], 0)
+        );
+
+        let with_a_member = WorkChanged::of(
+            HashSet::new(),
+            held_in(&[&module, &member]),
+            &[edit_of(&module), edit_of(&member)],
+        );
+        assert_eq!(
+            own_relation_deltas(vec![from_module], &with_a_member),
+            (vec![], 1)
+        );
     }
 
     fn commit(

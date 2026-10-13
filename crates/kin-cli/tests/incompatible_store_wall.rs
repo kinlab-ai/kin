@@ -204,28 +204,38 @@ fn incompatible_native_state_is_preserved_even_with_git_history_and_force() {
 #[test]
 fn a_refused_init_leaves_no_partial_store_behind() {
     // Whatever the refusal says, it must not leave a half-written `.kin` that
-    // the next command then has to interpret.
+    // the next command then has to interpret. A home directory is one of the
+    // places `kin init` will not start a repository in.
     let root = tempdir().expect("temp root");
-    let repo = root.path().join("non-empty");
-    fs::create_dir_all(&repo).expect("create repository directory");
-    fs::write(repo.join("notes.txt"), "untracked\n").expect("write an untracked file");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).expect("create the home directory");
+    fs::write(home.join("notes.txt"), "kept here\n").expect("write something a person keeps");
 
-    let runtime = IsolatedDaemonRuntime::new(&repo);
-    let output = runtime
-        .kin_command()
+    // Run outside the isolated runtime, which owns `HOME`. The refusal comes
+    // before anything is started, so there is no daemon to contain.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kin"))
         .arg("init")
-        .arg(&repo)
+        .arg(&home)
+        .env("HOME", &home)
+        .env("KIN_HOME", root.path().join("kin-home"))
+        .env("KIN_REGISTRY_PATH", root.path().join("registry.toml"))
+        .env("KIN_NO_DAEMON", "1")
+        .current_dir(&home)
         .output()
-        .expect("run kin init over a non-empty non-Git directory");
+        .expect("run kin init over a home directory");
 
     assert!(
         !output.status.success(),
-        "a non-empty directory with no Git history is refused: stdout={} stderr={}",
+        "a home directory is refused: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        !repo.join(".kin").exists(),
+        !home.join(".kin").exists(),
         "a refused init must leave no store at all"
+    );
+    assert!(
+        !root.path().join("kin-home").join("stores").exists(),
+        "a refused init must leave no central store either"
     );
 }

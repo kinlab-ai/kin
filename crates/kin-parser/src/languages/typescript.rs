@@ -17,8 +17,8 @@ use crate::extract::{
 use super::javascript::{
     collect_js_property_definers, collect_js_require_imports, extract_calls_from_context,
     extract_js_assignment_function, extract_js_object_methods, extract_js_property_definition,
-    js_heritage_name, js_module_identity, js_require_target, JsOwners, JsPropertyDefiner,
-    TS_SUFFIXES,
+    extract_preceding_comment, js_heritage_name, js_module_identity, js_require_target, JsOwners,
+    JsPropertyDefiner, TS_SUFFIXES,
 };
 use super::javascript::{parse_with, unparsed_byte_total};
 
@@ -1372,26 +1372,6 @@ fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
     crate::adapter::declaration_signature(node, source)
 }
 
-fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    if prev.kind() == "comment" {
-        let text = prev.utf8_text(source).ok()?;
-        let cleaned = text
-            .lines()
-            .map(|l| l.trim_start_matches('/').trim_start_matches('*').trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if cleaned.is_empty() {
-            None
-        } else {
-            Some(cleaned)
-        }
-    } else {
-        None
-    }
-}
-
 /// Extract import-like file context from import and re-export statements.
 fn extract_ts_import_like(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
     match node.kind() {
@@ -1730,6 +1710,44 @@ mod tests {
             .unwrap();
         assert_eq!(func.kind, EntityKind::Function);
         assert_eq!(func.name, "greet");
+    }
+
+    /// A doc block reads here as it does in JavaScript, through the one
+    /// reading the two adapters share: prose, without line leaders or tags.
+    #[test]
+    fn a_typescript_doc_block_is_summarized_by_its_prose() {
+        let adapter = TypeScriptAdapter;
+        let source = br#"/**
+ * Greets one person by name.
+ *
+ * @param name - who to greet
+ * @returns the greeting
+ */
+function greet(name: string): string { return `Hello ${name}`; }
+
+/**
+ * @internal
+ */
+function hidden(): void {}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("src/greet.ts"))
+            .unwrap();
+        let summary = |name: &str| {
+            output
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} was not extracted"))
+                .doc_summary
+                .clone()
+        };
+        assert_eq!(
+            summary("greet").as_deref(),
+            Some("Greets one person by name.")
+        );
+        assert_eq!(summary("hidden"), None);
     }
 
     #[test]

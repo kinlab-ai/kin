@@ -42,27 +42,59 @@ INSTALL_PS1_POLICY = "scripts/install.ps1"
 # sentence opener is where the installer rendering and the doc rendering split.
 WINDOWS_NOTICE_INSTALLER_TAIL = " If kin init reports"
 
+# The reason a release built before populated admission gives when it refuses
+# a populated directory with no Git history. Releases through v0.8.6 print it.
+# The source no longer contains it, so no checked-in script can own it. The
+# install proof still installs those releases, and this is the reviewed wording
+# its one binding has to repeat.
+RELEASED_NON_EMPTY_REFUSAL = "requires an empty directory"
+
+
+def single_shell_binding(source: str, name: str, owner: str) -> str:
+    """Return the one value a shell source assigns to `name`.
+
+    Every assignment counts, not only the reviewed double-quoted form. A later
+    `NAME=''` would replace the reviewed wording with a needle every line
+    matches, and the text check that reads it would then pass on any output.
+    """
+
+    assignments = [
+        line
+        for line in active_lines(source)
+        if re.match(rf"(?:(?:local|export|readonly|declare)\s+)?{name}=", line)
+    ]
+    if len(assignments) != 1:
+        raise AssertionError(f"{owner} must bind {name} exactly once: {assignments}")
+    binding = re.fullmatch(rf'{name}="([^"$`\\]+)"', assignments[0])
+    if binding is None:
+        raise AssertionError(
+            f"{owner} must bind {name} to one double-quoted literal: "
+            f"{assignments[0]}"
+        )
+    return binding[1]
+
 
 def windows_init_contract_strings() -> dict[str, str]:
-    """Return wording shared by both Windows admission proofs.
+    """Return the wording the install proof's Windows admission step binds.
 
     The install proof installs a public release anonymously and has no
-    checkout, so it cannot run the contract script and retypes these instead.
-    Reading the script here is the only thing that keeps the two statements of
+    checkout, so it cannot run the contract script and retypes its wording
+    instead. `POPULATED_UNCOMMITTED` is shared with that script, which owns it:
+    reading the script here is the only thing that keeps the two statements of
     one contract from drifting apart.
+
+    `NON_EMPTY_REFUSAL` is the install proof's alone. It is what a release
+    built before populated admission prints, and the script states only what a
+    source build does, so `RELEASED_NON_EMPTY_REFUSAL` owns that wording.
     """
 
     source = WINDOWS_INIT_CONTRACT.read_text(encoding="utf-8")
-    strings: dict[str, str] = {}
-    for name in ("NON_EMPTY_REFUSAL",):
-        bindings = re.findall(rf'(?m)^{name}="([^"]+)"$', source)
-        if len(bindings) != 1:
-            raise AssertionError(
-                f"{WINDOWS_INIT_CONTRACT_POLICY} must bind {name} exactly once: "
-                f"{bindings}"
-            )
-        strings[name] = bindings[0]
-    return strings
+    return {
+        "POPULATED_UNCOMMITTED": single_shell_binding(
+            source, "POPULATED_UNCOMMITTED", WINDOWS_INIT_CONTRACT_POLICY
+        ),
+        "NON_EMPTY_REFUSAL": RELEASED_NON_EMPTY_REFUSAL,
+    }
 
 
 def windows_public_support_notice(install_ps1: str) -> str:
@@ -70,12 +102,12 @@ def windows_public_support_notice(install_ps1: str) -> str:
 
     `scripts/assert-windows-init-contract.sh` used to bind this notice, back
     when the whole subject of that contract was that native Windows refused
-    every repository. The contract now proves the opposite: both admission
-    boundaries `require_admitted`, and only a non-empty native directory is
-    refused. It binds no notice at all any more, so the installer's single
-    `$NativeWindowsSupportNotice` literal is the owner. That is the copy a
-    Windows user reads before anything is downloaded, and the copy that went
-    stale in public.
+    every repository. The contract now proves the opposite: every boundary it
+    exercises is one it must `require_admitted`, a populated directory with no
+    Git history included. It binds no notice at all any more, so the
+    installer's single `$NativeWindowsSupportNotice` literal is the owner. That
+    is the copy a Windows user reads before anything is downloaded, and the
+    copy that went stale in public.
     """
 
     bindings = re.findall(
@@ -152,9 +184,8 @@ def assert_windows_public_support_contract(
     for admission in (
         'require_admitted "Windows exact-Git admission"',
         'require_admitted "Windows native-unborn bootstrap"',
-        "require_non_empty_refused",
-        '"Windows non-empty native boundary"',
-        'fail "$label unexpectedly succeeded" "$log"',
+        'require_admitted "Windows native-populated bootstrap"',
+        'fail "$label failed" "$log"',
     ):
         require(
             contract_active,
@@ -307,19 +338,85 @@ def assert_windows_contract_stage_check_is_reachable(contract_source: str) -> No
         require(active, policy, "reachable Windows stage-leak check")
 
 
+# What the install proof requires a refusal to leave behind, as the step's
+# active lines. Pinned whole: its stage count is spelled exactly as the
+# admission's is, so only its place in this function says which answer it
+# judges.
+INSTALL_PROOF_REFUSAL_PUBLISHES_NOTHING = "\n".join(
+    (
+        "require_nothing_published() {",
+        "local home",
+        'home="$(fixture_home "$2")"',
+        'if [ -e "$2/.kin" ]; then',
+        'fail "$1 published authority at $2/.kin" "$3"',
+        "fi",
+        "if [ \"$(count_matching \"$home/stores\" '*/manifest.json')\" != \"0\" ]; then",
+        'fail "$1 published a store in $home/stores" "$3"',
+        "fi",
+        'if [ -n "$(discovered_store "$2" central "$3")" ]; then',
+        'fail "$1 left a store serving $2" "$3"',
+        "fi",
+        'require_no_stage_residue "$1" "$2" "$3"',
+        "}",
+    )
+)
+
+# The one place the install proof takes either of two answers, as the step's
+# active lines. A populated directory with no Git history is admitted by a
+# current binary and refused by a release built before that admission, and the
+# step installs whichever release is public. Pinned whole, because position is
+# the contract here. An assertion moved into the other branch still exists and
+# no longer judges the answer the binary gave, and an outcome sentence moved
+# across makes the closing line report the contract that was not observed.
+INSTALL_PROOF_POPULATED_CONTRACT = "\n".join(
+    (
+        "require_populated_contract() {",
+        'if fixture_kin "$2" central kin init > "$3" 2>&1; then',
+        'populated_outcome="admitted it and reported its content as uncommitted work"',
+        'echo "$1: kin init succeeded, so the admission contract applies."',
+        'require_published "$1" "$2" "$3" central',
+        'require_text "$1" "$POPULATED_UNCOMMITTED" "$3"',
+        "else",
+        'populated_outcome="refused it and published nothing, as a release built before populated admission does"',
+        'echo "$1: kin init failed, so the refusal contract of a release built before populated admission applies."',
+        'require_nothing_published "$1" "$2" "$3"',
+        'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
+        "fi",
+        "}",
+    )
+)
+
+# The last thing an admission's publication check does. The call is spelled as
+# the refusal's is, so it is pinned by the function it closes.
+INSTALL_PROOF_ADMISSION_COUNTS_STAGES = "\n".join(
+    (
+        'require_no_stage_residue "$1" "$2" "$3"',
+        "}",
+        "require_admitted() {",
+    )
+)
+
+
 def assert_install_proof_windows_admission_contract(
     windows_admission: str, contract: dict[str, str]
 ) -> None:
-    """Require released Windows bytes to assert the native admission contract."""
+    """Require released Windows bytes to assert the native admission contract.
+
+    Exact Git in both layouts and an empty native directory must be admitted.
+    A populated directory with no Git history is held to one whole contract,
+    whichever the installed release exhibits: admitted as the empty directory
+    is, with its content reported as uncommitted work, or refused with nothing
+    published and the released refusal's own reason.
+    """
 
     active = "\n".join(active_lines(windows_admission))
     for name, wording in contract.items():
-        binding = f'{name}="{wording}"'
-        if binding not in active:
+        bound = single_shell_binding(windows_admission, name, "install proof")
+        if bound != wording:
             raise AssertionError(
                 "install proof must assert the shipped Windows admission contract "
-                f"verbatim; {name} drifted from {WINDOWS_INIT_CONTRACT_POLICY}: "
-                f"expected {binding}"
+                f"verbatim; {name} drifted from its reviewed wording: "
+                f'expected {name}="{wording}"'
             )
     # A new store is central and the tree carries nothing, so publication is
     # what `kin store path` discovers against each fixture's own Kin home, and
@@ -329,23 +426,87 @@ def assert_install_proof_windows_admission_contract(
         'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
         'require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree',
         'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
-        'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
-        'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
+        # Without this the directory is empty and the step proves the
+        # native-empty boundary a second time.
+        "printf 'untracked\\n' > \"$populated_boundary/stray.txt\"",
+        'require_populated_contract "Windows native-populated boundary" "$populated_boundary" "$populated_log"',
         'fail "$1 failed" "$3"',
-        'fail "$1 unexpectedly succeeded" "$3"',
+        'require_published "$1" "$2" "$3" "$layout"',
         'export KIN_HOME="$home"',
         'if ! answer="$(fixture_kin "$1" "$2" kin store path 2>> "$3")"; then',
         'fail "$1 returned success but no store serves $2" "$3"',
+        'fail "$1 returned success but the store serving $2 holds no manifest: $store" "$3"',
         "if [ \"$(count_matching \"$home/stores\" '*/manifest.json')\" != \"1\" ]; then",
+        'fail "$1 did not publish exactly one store in $home/stores" "$3"',
         'if [ ! -d "$2/.kin" ]; then',
-        'fail "$1 published authority at $2/.kin" "$3"',
-        'fail "$1 published a store in $home/stores" "$3"',
+        'fail "$1 wrote $2/.kin although the default layout keeps the working tree clean" "$3"',
         'parent="$(dirname "$2")"',
         "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
         "staged=\"$(count_matching \"$stores\" '.kin.init-*')\"",
         'if [ "$staged" != "0" ]; then',
+        INSTALL_PROOF_ADMISSION_COUNTS_STAGES,
+        INSTALL_PROOF_REFUSAL_PUBLISHES_NOTHING,
+        INSTALL_PROOF_POPULATED_CONTRACT,
+        # The closing line reports the contract that was observed rather than
+        # asserting one of them.
+        'echo "Installed Windows release admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, without stage residue. Given a populated directory with no Git history, it $populated_outcome."',
     ):
         require(active, policy, "shipped Windows admission contract proof")
+
+
+def assert_windows_admission_script_contract(contract_source: str) -> None:
+    """Hold the source-build contract to admission on every boundary.
+
+    The script runs against a binary built from the commit under review, so it
+    states what that source does and nothing an earlier release did. A
+    populated directory with no Git history must be admitted exactly as the
+    empty one is and must report its content as uncommitted work.
+
+    It may not take the refusal an earlier release gives. The install proof
+    accepts that refusal from an installed release, which is sound only while
+    every source build is required to admit.
+    """
+
+    active = "\n".join(active_lines(contract_source))
+    wording = single_shell_binding(
+        contract_source, "POPULATED_UNCOMMITTED", WINDOWS_INIT_CONTRACT_POLICY
+    )
+    for policy in (
+        '"$kin_bin" init',
+        '"$kin_bin" store path',
+        f'POPULATED_UNCOMMITTED="{wording}"',
+        'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
+        'require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree',
+        'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
+        # Without this the directory is empty and the script proves the
+        # native-empty boundary a second time.
+        "printf 'untracked\\n' > \"$populated_boundary/stray.txt\"",
+        'require_admitted "Windows native-populated bootstrap" "$populated_boundary" "$populated_log"',
+        'require_text "Windows native-populated bootstrap" "$POPULATED_UNCOMMITTED" "$populated_log"',
+        'fail "$label failed" "$log"',
+        'fail "$label returned success but no store serves $dir" "$log"',
+        'fail "$label returned success but the store serving $dir holds no manifest: $store" "$log"',
+        "count_matching \"$home/stores\" '*/manifest.json'",
+        'fail "$label did not publish exactly one store in $home/stores" "$log"',
+        'if [ ! -d "$dir/.kin" ]; then',
+        'if [ -e "$dir/.kin" ]; then',
+        'fail "$label wrote $dir/.kin although the default layout keeps the working tree clean" "$log"',
+        'require_no_stage_residue "$label" "$dir" "$log"',
+        'if [ "$staged" != "0" ]; then',
+        "'.kin.init-*'",
+    ):
+        require(active, policy, "Windows admission contract assertions")
+    for refusal in (
+        "NON_EMPTY_REFUSAL",
+        RELEASED_NON_EMPTY_REFUSAL,
+        "unexpectedly succeeded",
+    ):
+        if refusal in active:
+            raise AssertionError(
+                "Windows admission contract assertions must require a source "
+                "build to admit a populated directory, never accept its "
+                f"refusal: found {refusal!r}"
+            )
 
 
 
@@ -359,8 +520,10 @@ def check_windows_public_support_and_admission(
     update_trust: str,
 ) -> None:
     # Native Windows release bytes must admit both supported repository
-    # boundaries, leave no transaction residue, and retain the non-empty
-    # boundary refusal.
+    # boundaries and leave no transaction residue. A populated directory with
+    # no Git history is held to one whole contract: admitted with its content
+    # reported as uncommitted work, or refused the way a release built before
+    # that admission refuses it.
     windows_contract = windows_init_contract_strings()
     windows_admission = install_proof_step(
         install_proof, "Windows admission contract proof"
@@ -511,6 +674,21 @@ def check_windows_public_support_and_admission(
         ),
     )
     expect_assertion(
+        "the executable contract reverts to refusing a populated directory",
+        "tied to executable admission",
+        lambda: assert_windows_public_support_contract(
+            replace_exactly_once(
+                windows_contract_source,
+                'require_admitted "Windows native-populated bootstrap"',
+                'require_non_empty_refused "Windows native-populated bootstrap"',
+                "populated directory admission",
+            ),
+            install_ps1,
+            windows_public_surfaces,
+            compatibility_mcp_readme,
+        ),
+    )
+    expect_assertion(
         "the installer resolves native ARM64 to a release archive",
         "only windows-x86_64 is published",
         lambda: assert_windows_public_support_contract(
@@ -642,25 +820,77 @@ def check_windows_public_support_and_admission(
         ),
     )
     expect_assertion(
-        "the contract script's non-empty refusal wording drifts from the install proof",
+        "the contract script's uncommitted-work wording drifts from the install proof",
         "drifted from",
         lambda: assert_install_proof_windows_admission_contract(
             windows_admission,
-            {**windows_contract, "NON_EMPTY_REFUSAL": "requires an empty folder"},
+            {**windows_contract, "POPULATED_UNCOMMITTED": "Pending work:"},
         ),
     )
+    expect_assertion(
+        "the install proof rewords the refusal a released binary gives",
+        "drifted from",
+        lambda: assert_install_proof_windows_admission_contract(
+            replace_exactly_once(
+                windows_admission,
+                f'NON_EMPTY_REFUSAL="{RELEASED_NON_EMPTY_REFUSAL}"',
+                'NON_EMPTY_REFUSAL="requires an empty folder"',
+                "released refusal wording",
+            ),
+            windows_contract,
+        ),
+    )
+    for name, wording in windows_contract.items():
+        binding = f'{name}="{wording}"'
+        expect_assertion(
+            f"the install proof rebinds {name} after its reviewed binding",
+            f"must bind {name} exactly once",
+            lambda mutated=replace_exactly_once(
+                windows_admission,
+                binding,
+                f"{binding}\n{name}=''",
+                f"second {name} binding",
+            ): assert_install_proof_windows_admission_contract(
+                mutated, windows_contract
+            ),
+        )
+        expect_assertion(
+            f"the install proof binds {name} to a needle every line matches",
+            f"must bind {name} to one double-quoted literal",
+            lambda mutated=replace_exactly_once(
+                windows_admission, binding, f"{name}=''", f"empty {name} binding"
+            ): assert_install_proof_windows_admission_contract(
+                mutated, windows_contract
+            ),
+        )
     for label, active_line in (
         (
-            "the non-empty Windows refusal may publish a repository anyway",
+            "a refused populated directory may publish a repository anyway",
             'fail "$1 published authority at $2/.kin" "$3"',
         ),
         (
-            "the non-empty Windows refusal may publish a central store anyway",
+            "a refused populated directory may publish a central store anyway",
             'fail "$1 published a store in $home/stores" "$3"',
+        ),
+        (
+            "a refused populated directory may leave a store Kin can discover",
+            'fail "$1 left a store serving $2" "$3"',
         ),
         (
             "a Windows admission may publish no store Kin can discover",
             'fail "$1 returned success but no store serves $2" "$3"',
+        ),
+        (
+            "a Windows admission may publish a store that holds no manifest",
+            'fail "$1 returned success but the store serving $2 holds no manifest: $store" "$3"',
+        ),
+        (
+            "a central Windows admission may publish more or fewer stores than one",
+            'fail "$1 did not publish exactly one store in $home/stores" "$3"',
+        ),
+        (
+            "a central Windows admission may write a store into the working tree",
+            'fail "$1 wrote $2/.kin although the default layout keeps the working tree clean" "$3"',
         ),
         (
             "a central Windows admission may leave its unpublished stage behind",
@@ -675,6 +905,14 @@ def check_windows_public_support_and_admission(
             "staged=\"$(count_matching \"$parent\" '.kin.init-*')\"",
         ),
         (
+            "a Windows admission may fail and still pass",
+            'fail "$1 failed" "$3"',
+        ),
+        (
+            "a Windows admission stops judging what it published",
+            'require_published "$1" "$2" "$3" "$layout"',
+        ),
+        (
             "exact Git stops having to succeed",
             'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
         ),
@@ -683,19 +921,105 @@ def check_windows_public_support_and_admission(
             'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
         ),
         (
-            "the non-empty boundary stops being refused",
-            'require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"',
+            "the populated directory is left empty",
+            "printf 'untracked\\n' > \"$populated_boundary/stray.txt\"",
         ),
         (
-            "the non-empty boundary stops naming its safety reason",
+            "the populated directory stops being held to either contract",
+            'require_populated_contract "Windows native-populated boundary" "$populated_boundary" "$populated_log"',
+        ),
+        (
+            "an admitted populated directory stops having to publish as an admission does",
+            'require_published "$1" "$2" "$3" central',
+        ),
+        (
+            "an admitted populated directory stops having to report its uncommitted work",
+            'require_text "$1" "$POPULATED_UNCOMMITTED" "$3"',
+        ),
+        (
+            "a refused populated directory stops having to publish nothing",
+            'require_nothing_published "$1" "$2" "$3"',
+        ),
+        (
+            "a refused populated directory stops having to give the released refusal's reason",
             'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
         ),
     ):
         expect_assertion(
             label,
             "shipped Windows admission contract proof",
-            lambda mutated=windows_admission.replace(
-                active_line, f"# {active_line}", 1
+            lambda mutated=replace_exactly_once(
+                windows_admission, active_line, f"# {active_line}", label
+            ): assert_install_proof_windows_admission_contract(
+                mutated, windows_contract
+            ),
+        )
+    # The stage count is spelled the same way after an admission and after a
+    # refusal, so each call is removed by its position.
+    stage_count = 'require_no_stage_residue "$1" "$2" "$3"'
+    if windows_admission.count(stage_count) != 2:
+        raise AssertionError(
+            "install proof must count unpublished stages once after an "
+            "admission and once after a refusal"
+        )
+    before_refusal, _, after_refusal = windows_admission.rpartition(stage_count)
+    for label, mutated in (
+        (
+            "an admitted directory may leave its unpublished stage uncounted",
+            windows_admission.replace(stage_count, f"# {stage_count}", 1),
+        ),
+        (
+            "a refused populated directory may leave its unpublished stage uncounted",
+            f"{before_refusal}# {stage_count}{after_refusal}",
+        ),
+    ):
+        expect_assertion(
+            label,
+            "shipped Windows admission contract proof",
+            lambda mutated=mutated: assert_install_proof_windows_admission_contract(
+                mutated, windows_contract
+            ),
+        )
+    # Each of these keeps every assertion in the step. It puts one where it
+    # judges the wrong answer, or makes the step report a contract it did not
+    # observe.
+    for label, before, after in (
+        (
+            "the populated step takes a failed kin init for the admission",
+            'if fixture_kin "$2" central kin init > "$3" 2>&1; then',
+            'if ! fixture_kin "$2" central kin init > "$3" 2>&1; then',
+        ),
+        (
+            "the populated step checks an admission for the refusal's wording",
+            'require_text "$1" "$POPULATED_UNCOMMITTED" "$3"',
+            'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
+        ),
+        (
+            "the populated step checks a refusal for the admission's wording",
+            'require_text "$1" "$NON_EMPTY_REFUSAL" "$3"',
+            'require_text "$1" "$POPULATED_UNCOMMITTED" "$3"',
+        ),
+        (
+            "the populated step judges a refusal as though it had published",
+            'require_nothing_published "$1" "$2" "$3"',
+            'require_published "$1" "$2" "$3" central',
+        ),
+        (
+            "the populated step reports an admission as a refusal",
+            'populated_outcome="admitted it and reported its content as uncommitted work"',
+            'populated_outcome="refused it and published nothing"',
+        ),
+        (
+            "the closing line claims one contract whichever was observed",
+            'with no Git history, it $populated_outcome."',
+            'with no Git history, it admitted it."',
+        ),
+    ):
+        expect_assertion(
+            label,
+            "shipped Windows admission contract proof",
+            lambda mutated=replace_exactly_once(
+                windows_admission, before, after, label
             ): assert_install_proof_windows_admission_contract(
                 mutated, windows_contract
             ),
@@ -718,28 +1042,72 @@ def check_windows_admission_script() -> None:
     # release commit, and letting the two legs carry their own copies restores
     # the drift that made the copies disagree.
     #
-    # Exact Git and native-empty admission are supported. The contract pins
-    # both successes, zero transaction residue, and the retained non-empty
-    # boundary refusal. A new store is central and the tree carries nothing, so
-    # publication is what `kin store path` discovers, and the in-tree layout is
-    # admitted once more and must publish the tree's own `.kin`.
+    # Exact Git, native-empty and native-populated admission are supported. The
+    # contract pins all three successes, zero transaction residue, and the
+    # report that a populated directory's content is waiting as uncommitted
+    # work. A new store is central and the tree carries nothing, so publication
+    # is what `kin store path` discovers, and the in-tree layout is admitted
+    # once more and must publish the tree's own `.kin`.
     windows_admission = (ROOT / "scripts" / "assert-windows-init-contract.sh").read_text(
         encoding="utf-8"
     )
-    for policy in (
-        '"$kin_bin" init',
-        '"$kin_bin" store path',
-        'NON_EMPTY_REFUSAL="requires an empty directory"',
-        'require_admitted "Windows exact-Git admission" "$git_boundary" "$git_log"',
-        'require_admitted "Windows in-tree exact-Git admission" "$in_tree_boundary" "$in_tree_log" in-tree',
-        'require_admitted "Windows native-unborn bootstrap" "$native_boundary" "$native_log"',
-        'require_non_empty_refused',
-        'fail "$label returned success but no store serves $dir" "$log"',
-        "count_matching \"$home/stores\" '*/manifest.json'",
-        'if [ ! -d "$dir/.kin" ]; then',
-        'fail "$label unexpectedly succeeded" "$log"',
-        'if [ -e "$dir/.kin" ]; then',
-        'if [ "$staged" != "0" ]; then',
-        "'.kin.init-*'",
+    assert_windows_admission_script_contract(windows_admission)
+    for label, active_line in (
+        (
+            "the source-build contract stops admitting a populated directory",
+            'require_admitted "Windows native-populated bootstrap" "$populated_boundary" "$populated_log"',
+        ),
+        (
+            "the source-build contract stops requiring the uncommitted-work report",
+            'require_text "Windows native-populated bootstrap" "$POPULATED_UNCOMMITTED" "$populated_log"',
+        ),
+        (
+            "the source-build contract lets a failed admission pass",
+            'fail "$label failed" "$log"',
+        ),
+        (
+            "the source-build contract leaves the populated directory empty",
+            "printf 'untracked\\n' > \"$populated_boundary/stray.txt\"",
+        ),
+        (
+            "the source-build contract may admit with no store Kin can discover",
+            'fail "$label returned success but no store serves $dir" "$log"',
+        ),
+        (
+            "the source-build contract may admit into a store that holds no manifest",
+            'fail "$label returned success but the store serving $dir holds no manifest: $store" "$log"',
+        ),
+        (
+            "the source-build contract may publish more or fewer central stores than one",
+            'fail "$label did not publish exactly one store in $home/stores" "$log"',
+        ),
+        (
+            "the source-build contract may write a store into the working tree",
+            'fail "$label wrote $dir/.kin although the default layout keeps the working tree clean" "$log"',
+        ),
+        (
+            "the source-build contract stops counting unpublished stages",
+            'require_no_stage_residue "$label" "$dir" "$log"',
+        ),
     ):
-        require(windows_admission, policy, "Windows admission contract assertions")
+        expect_assertion(
+            label,
+            "Windows admission contract assertions is missing required policy",
+            lambda mutated=replace_exactly_once(
+                windows_admission, active_line, f"# {active_line}", label
+            ): assert_windows_admission_script_contract(mutated),
+        )
+    expect_assertion(
+        "the source-build contract accepts the refusal an earlier release gives",
+        "never accept its refusal",
+        lambda: assert_windows_admission_script_contract(
+            f'{windows_admission}\nNON_EMPTY_REFUSAL="{RELEASED_NON_EMPTY_REFUSAL}"\n'
+        ),
+    )
+    expect_assertion(
+        "the source-build contract binds its uncommitted-work wording twice",
+        "must bind POPULATED_UNCOMMITTED exactly once",
+        lambda: assert_windows_admission_script_contract(
+            f"{windows_admission}\nPOPULATED_UNCOMMITTED=''\n"
+        ),
+    )

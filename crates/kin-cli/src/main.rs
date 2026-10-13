@@ -919,7 +919,8 @@ enum Command {
     },
     /// Open the local Kin workspace for repositories, entities and review
     Ui {
-        /// Repository working directory (defaults to the current repository)
+        /// Repository working directory (defaults to the current repository,
+        /// or to the list of this machine's repositories outside one)
         path: Option<std::path::PathBuf>,
         /// Serve on this loopback port
         #[arg(long)]

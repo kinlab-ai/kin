@@ -755,20 +755,50 @@ fn pre_release_init_flags_are_not_accepted() {
     }
 }
 
+/// A directory that already holds work and has no Git history starts a
+/// repository whose history is empty. What it holds is not recorded as a first
+/// change behind the caller's back: it is reported as uncommitted work, which
+/// a commit records.
 #[test]
-fn non_git_existing_files_fail_instead_of_becoming_implicit_authority() {
+fn non_git_existing_content_starts_unborn_and_is_reported_as_uncommitted_work() {
     let root = tempdir().expect("temp root");
     let home = root.path().join("home");
-    let repo = root.path().join("files");
+    let repo = root.path().join("project");
     fs::create_dir_all(&home).expect("create home");
     fs::create_dir_all(&repo).expect("create repo");
     fs::write(repo.join("compose.yaml"), "services: {}\n").expect("write source");
 
-    let output = kin_init(&repo, &home, &[]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("will not silently ignore or derive authority"));
-    assert!(!repo.join(".kin").exists());
+    // No daemon is started here, so the content is named as waiting and no
+    // count is claimed for it.
+    let output = Command::new(env!("CARGO_BIN_EXE_kin"))
+        .arg("init")
+        .arg(&repo)
+        .arg("--json")
+        .env("HOME", &home)
+        .env("KIN_HOME", home.join(".kin"))
+        .env("KIN_NO_DAEMON", "1")
+        .output()
+        .expect("run kin init");
+    assert!(
+        output.status.success(),
+        "init over existing content failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("init stdout should be JSON");
+    assert_eq!(payload["source_boundary"], "native-unborn");
+    assert_eq!(payload["history"], "unborn");
+    assert!(
+        payload["initial_change_id"].is_null(),
+        "nothing is committed for the caller: {payload}"
+    );
+    assert_eq!(payload["uncommitted_work"]["taken_in"], false);
+    assert_eq!(
+        fs::read_to_string(repo.join("compose.yaml")).expect("read the content back"),
+        "services: {}\n",
+        "what the directory held is left as it was"
+    );
 }
 
 /// Sum the file bytes under `path`, independently of the implementation under

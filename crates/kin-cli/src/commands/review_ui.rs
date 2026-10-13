@@ -433,7 +433,7 @@ async fn serve_map_js() -> Response {
     static_response(MAP_JS, "application/javascript; charset=utf-8")
 }
 
-async fn serve_highlight_js() -> Response {
+pub(super) async fn serve_highlight_js() -> Response {
     static_response(HIGHLIGHT_JS, "application/javascript; charset=utf-8")
 }
 
@@ -1193,14 +1193,21 @@ fn same_bytes(left: &[u8], right: &[u8]) -> bool {
 /// Whether a request may write: it carries this run's token, and its origin is
 /// this server's own whenever the browser names one.
 pub(super) fn may_write(headers: &HeaderMap, state: &UiState) -> bool {
+    carries_write_authority(headers, &state.token, state.port)
+}
+
+/// The same test for any scope this server mints a token for. A repository's
+/// token and the token of the page that lists them are separate, so a write
+/// in one scope carries no authority in another.
+pub(super) fn carries_write_authority(headers: &HeaderMap, token: &str, port: u16) -> bool {
     let has_token = headers
         .get(WRITE_TOKEN_HEADER)
-        .is_some_and(|sent| same_bytes(sent.as_bytes(), state.token.as_bytes()));
+        .is_some_and(|sent| same_bytes(sent.as_bytes(), token.as_bytes()));
     let own_origin = match headers.get(header::ORIGIN) {
         None => true,
         Some(origin) => origin
             .to_str()
-            .is_ok_and(|origin| is_own_origin(origin, state.port)),
+            .is_ok_and(|origin| is_own_origin(origin, port)),
     };
     has_token && own_origin
 }
@@ -1229,11 +1236,21 @@ pub(super) async fn local_only(
     request: Request,
     next: Next,
 ) -> Response {
+    loopback_only(State(state.port), request, next).await
+}
+
+/// [`local_only`] for routes that belong to no one repository: the same host
+/// check and the same headers, from the port alone.
+pub(super) async fn loopback_only(
+    State(port): State<u16>,
+    request: Request,
+    next: Next,
+) -> Response {
     let own = request
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| is_own_host(host, state.port));
+        .is_some_and(|host| is_own_host(host, port));
     if !own {
         return (
             StatusCode::FORBIDDEN,

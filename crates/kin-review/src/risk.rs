@@ -109,6 +109,38 @@ fn describe_node(node: &GraphNodeId, names: &BTreeMap<EntityId, String>) -> Stri
     }
 }
 
+/// The kinds a graph node prints its id under, as `GraphNodeId` writes them.
+const NODE_ID_KINDS: [&str; 7] = [
+    "entity",
+    "artifact",
+    "test",
+    "contract",
+    "work",
+    "verification_run",
+    "external_reference",
+];
+
+/// Whether `note` names everything it is about.
+///
+/// A relation note names an endpoint the review can see and keeps the node's
+/// id for one it cannot, because a note must not invent a name. That id tells
+/// a person nothing, so a surface that shows notes to a reader shows only the
+/// ones this answers true for. Nothing is lost by leaving the rest out: the
+/// relation is still counted wherever relation changes are counted.
+pub fn note_names_its_entities(note: &str) -> bool {
+    !note
+        .split(|character: char| character.is_whitespace() || character == '`')
+        .any(|word| {
+            word.split_once(':').is_some_and(|(kind, id)| {
+                NODE_ID_KINDS.contains(&kind)
+                    && id.len() >= 32
+                    && id
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit() || character == '-')
+            })
+        })
+}
+
 /// How many dependents a removal finding names before summarising the rest. A
 /// deleted helper can have dozens of callers; naming the first few and counting
 /// the remainder keeps the finding readable without hiding the size.
@@ -2091,6 +2123,51 @@ mod tests {
             !contains_uuid(note),
             "a named endpoint must not fall back to a node id: {note}"
         );
+    }
+
+    /// A note that had to keep a node's id says so to whoever shows notes to a
+    /// reader, and a note that names its endpoints, or names none, does not.
+    #[test]
+    fn a_note_that_kept_a_node_id_does_not_name_its_entities() {
+        use crate::diff::{RelationChange, RelationChangeKind};
+
+        let src = test_entity("caller");
+        let dst = test_entity("callee");
+        let diff = SemanticDiff {
+            relation_changes: vec![RelationChange {
+                kind: RelationChangeKind::Removed {
+                    old: calls_relation(&src, &dst),
+                },
+            }],
+            ..Default::default()
+        };
+        let removal = |impact: &ImpactReport| {
+            assess_risk(&diff, impact)
+                .notes
+                .into_iter()
+                .find(|note| note.starts_with("Relation removed"))
+                .expect("removed relation emits a note")
+        };
+        let named = removal(&ImpactReport {
+            affected_callers: vec![src.clone()],
+            affected_dependents: vec![dst.clone()],
+            ..Default::default()
+        });
+        assert!(note_names_its_entities(&named), "{named}");
+        let half_named = removal(&ImpactReport {
+            affected_callers: vec![src.clone()],
+            ..Default::default()
+        });
+        assert!(!note_names_its_entities(&half_named), "{half_named}");
+        let unnamed = removal(&ImpactReport::default());
+        assert!(!note_names_its_entities(&unnamed), "{unnamed}");
+        for other in [
+            "Modified entity `sign` has no test coverage",
+            "An entity: the one this note is about",
+            "contract: unchanged",
+        ] {
+            assert!(note_names_its_entities(other), "{other}");
+        }
     }
 
     /// An endpoint the review cannot name keeps its id. Inventing a name would

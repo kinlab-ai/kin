@@ -489,6 +489,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          POPULATED_UNCOMMITTED="Uncommitted work:"
           NON_EMPTY_REFUSAL="requires an empty directory"
 
           scratch="kin-windows-admission"
@@ -581,21 +582,17 @@ jobs:
               git -c core.hooksPath= -c commit.gpgsign=false commit -qm probe
             )
           }
-          require_admitted() {
-            local layout="${4:-central}"
+          require_published() {
             local home
             local store
             home="$(fixture_home "$2")"
-            if ! fixture_kin "$2" "$layout" kin init > "$3" 2>&1; then
-              fail "$1 failed" "$3"
-            fi
-            store="$(discovered_store "$2" "$layout" "$3")"
+            store="$(discovered_store "$2" "$4" "$3")"
             if [ -z "$store" ]; then
               fail "$1 returned success but no store serves $2" "$3"
             elif [ ! -f "$store/manifest.json" ]; then
               fail "$1 returned success but the store serving $2 holds no manifest: $store" "$3"
             fi
-            if [ "$layout" = "in-tree" ]; then
+            if [ "$4" = "in-tree" ]; then
               if [ ! -d "$2/.kin" ]; then
                 fail "$1 returned success without publishing $2/.kin" "$3"
               elif [ -n "$store" ] && [ "$(basename "$store")" != ".kin" ]; then
@@ -613,12 +610,16 @@ jobs:
             fi
             require_no_stage_residue "$1" "$2" "$3"
           }
-          require_refused() {
+          require_admitted() {
+            local layout="${4:-central}"
+            if ! fixture_kin "$2" "$layout" kin init > "$3" 2>&1; then
+              fail "$1 failed" "$3"
+            fi
+            require_published "$1" "$2" "$3" "$layout"
+          }
+          require_nothing_published() {
             local home
             home="$(fixture_home "$2")"
-            if fixture_kin "$2" central kin init > "$3" 2>&1; then
-              fail "$1 unexpectedly succeeded" "$3"
-            fi
             if [ -e "$2/.kin" ]; then
               fail "$1 published authority at $2/.kin" "$3"
             fi
@@ -629,7 +630,19 @@ jobs:
               fail "$1 left a store serving $2" "$3"
             fi
             require_no_stage_residue "$1" "$2" "$3"
-            require_text "$1" "$NON_EMPTY_REFUSAL" "$3"
+          }
+          require_populated_contract() {
+            if fixture_kin "$2" central kin init > "$3" 2>&1; then
+              populated_outcome="admitted it and reported its content as uncommitted work"
+              echo "$1: kin init succeeded, so the admission contract applies."
+              require_published "$1" "$2" "$3" central
+              require_text "$1" "$POPULATED_UNCOMMITTED" "$3"
+            else
+              populated_outcome="refused it and published nothing, as a release built before populated admission does"
+              echo "$1: kin init failed, so the refusal contract of a release built before populated admission applies."
+              require_nothing_published "$1" "$2" "$3"
+              require_text "$1" "$NON_EMPTY_REFUSAL" "$3"
+            fi
           }
 
           git_boundary="$scratch/exact-git/repo"
@@ -651,13 +664,13 @@ jobs:
           populated_log="$scratch/kin-init-native-populated.txt"
           mkdir -p "$populated_boundary"
           printf 'untracked\n' > "$populated_boundary/stray.txt"
-          require_refused "Windows non-empty native boundary" "$populated_boundary" "$populated_log"
+          require_populated_contract "Windows native-populated boundary" "$populated_boundary" "$populated_log"
 
           if [ "$failures" -ne 0 ]; then
             echo "::error::the installed Windows release violated its admission contract ($failures check(s) failed)"
             exit 1
           fi
-          echo "Installed Windows release admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, without stage residue, and refused the non-empty native boundary."
+          echo "Installed Windows release admitted exact Git and native-empty repositories into central stores and exact Git into its own .kin, without stage residue. Given a populated directory with no Git history, it $populated_outcome."
 
       - name: Windows repo-free provenance and setup proof
         if: inputs.proof_mode == 'candidate-full' && (runner.os == 'Windows')

@@ -29,9 +29,10 @@ pub const DEFAULT_NODE_LIMIT: usize = 1_400;
 
 /// One drawable node.
 ///
-/// `line` and `signature` are absent unless the caller asked for them through
-/// `include`, so the default payload carries exactly the fields the current
-/// renderers read and nothing that would grow it for no drawn pixel.
+/// `line`, `signature` and `language` are absent unless the caller asked for
+/// them through `include`, so the default payload carries exactly the fields
+/// the current renderers read and nothing that would grow it for no drawn
+/// pixel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphExportNode {
     pub id: String,
@@ -46,6 +47,11 @@ pub struct GraphExportNode {
     pub line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// The language the entity is written in, by its wire name, when the
+    /// caller asked for it. It is what tells two entities of one name and kind
+    /// apart for a reader who is shown no place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// One drawable edge. Both endpoints are ids present in `nodes`.
@@ -103,6 +109,7 @@ pub struct GraphExportPayload {
 pub struct IncludeFields {
     pub line: bool,
     pub signature: bool,
+    pub language: bool,
 }
 
 impl IncludeFields {
@@ -115,6 +122,7 @@ impl IncludeFields {
             match token.trim().to_ascii_lowercase().as_str() {
                 "line" | "lines" => fields.line = true,
                 "signature" | "signatures" => fields.signature = true,
+                "language" | "languages" => fields.language = true,
                 _ => {}
             }
         }
@@ -183,6 +191,7 @@ pub struct NodeMeta {
     pub file: Option<String>,
     pub line: Option<u32>,
     pub signature: Option<String>,
+    pub language: Option<String>,
 }
 
 impl NodeMeta {
@@ -202,6 +211,7 @@ impl NodeMeta {
             } else {
                 Some(entity.signature.clone())
             },
+            language: Some(entity.language.to_string()),
         }
     }
 
@@ -450,6 +460,11 @@ pub fn assemble_payload(
             },
             signature: if options.include.signature {
                 meta.signature
+            } else {
+                None
+            },
+            language: if options.include.language {
+                meta.language
             } else {
                 None
             },
@@ -739,6 +754,7 @@ mod tests {
             file: file.map(str::to_string),
             line: Some(7),
             signature: Some(format!("fn {name}()")),
+            language: Some("rust".to_string()),
         }
     }
 
@@ -1100,6 +1116,7 @@ mod tests {
         );
         assert_eq!(plain.nodes[0].line, None);
         assert_eq!(plain.nodes[0].signature, None);
+        assert_eq!(plain.nodes[0].language, None);
         let json = serde_json::to_string(&plain.nodes[0]).unwrap();
         assert!(
             !json.contains("line"),
@@ -1107,6 +1124,10 @@ mod tests {
         );
         assert!(
             !json.contains("signature"),
+            "an absent field is not on the wire: {json}"
+        );
+        assert!(
+            !json.contains("language"),
             "an absent field is not on the wire: {json}"
         );
 
@@ -1117,12 +1138,13 @@ mod tests {
             &known,
             Vec::new(),
             &ExportOptions {
-                include: IncludeFields::parse("signature,line"),
+                include: IncludeFields::parse("signature,line,language"),
                 ..Default::default()
             },
         );
         assert_eq!(rich.nodes[0].line, Some(7));
         assert_eq!(rich.nodes[0].signature.as_deref(), Some("fn alpha()"));
+        assert_eq!(rich.nodes[0].language.as_deref(), Some("rust"));
     }
 
     /// An unknown `include` name is ignored rather than refused, so a newer

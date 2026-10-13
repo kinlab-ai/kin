@@ -25,6 +25,8 @@
   /** How many unchanged consumers and tests one changed entity shows before the rest are counted. */
   const CONSUMERS_SHOWN = 5;
   const TESTS_SHOWN = 3;
+  /** Past this many separate trees the map is set as rows from the left. */
+  const MANY_ROOTS = 8;
 
   function el(tag, className, ...children) {
     const node = document.createElement(tag);
@@ -37,6 +39,41 @@
   }
 
   const plural = (count, one, many) => (count === 1 ? `1 ${one}` : `${count} ${many}`);
+
+  // An entity's kind as one letter in a small square, tinted by what kind of
+  // thing it is, and a change as a plus, a tilde or a minus: the same glyphs
+  // the workspace sets beside a name. The letter is drawn by the stylesheet
+  // from `data-glyph`, so a glyph never becomes part of the name it sits by.
+  const KIND_FAMILY = {
+    function: ["ƒ", "fn"], method: ["ƒ", "fn"], constructor: ["ƒ", "fn"], callable: ["ƒ", "fn"], macro: ["ƒ", "fn"],
+    class: ["C", "type"], interface: ["I", "type"], struct: ["S", "type"], enum: ["E", "type"], trait: ["T", "type"], type_alias: ["T", "type"], type: ["T", "type"], protocol: ["P", "type"], impl: ["I", "type"],
+    module: ["M", "mod"], package: ["P", "mod"], namespace: ["N", "mod"], crate: ["C", "mod"],
+    constant: ["C", "val"], variable: ["V", "val"], field: ["F", "val"], property: ["P", "val"], static: ["S", "val"],
+    test: ["T", "test"],
+  };
+
+  function kindGlyph(kind, test) {
+    const key = String(kind || "").toLowerCase().replace(/\s+/g, "_");
+    const [letter, family] = test ? ["T", "test"] : KIND_FAMILY[key] || [(key[0] || "·").toUpperCase(), "mod"];
+    const glyph = el("span", `kind kind-${family}`);
+    glyph.setAttribute("data-glyph", letter);
+    glyph.setAttribute("aria-hidden", "true");
+    if (key) glyph.setAttribute("title", key.replace(/_/g, " "));
+    return glyph;
+  }
+
+  const CHANGE_GLYPH = { added: ["+", "Added"], modified: ["~", "Modified"], removed: ["−", "Removed"] };
+
+  function changeGlyph(change) {
+    const known = CHANGE_GLYPH[change] ? change : "modified";
+    const [mark, word] = CHANGE_GLYPH[known];
+    const glyph = el("span", `chg chg-${known}`);
+    glyph.setAttribute("data-glyph", mark);
+    glyph.setAttribute("role", "img");
+    glyph.setAttribute("aria-label", word);
+    glyph.setAttribute("title", word);
+    return glyph;
+  }
 
   /**
    * An entity's name, allowed to wrap after a `.`, `:` or `,` and inside a
@@ -88,6 +125,7 @@
           index,
           name: step.name,
           parameters: step.parameters || null,
+          entityKind: step.kind || null,
           change: step.change,
           risk: step.risk,
           // A signature that moved while a caller stood still is the case a
@@ -153,6 +191,7 @@
             parent: step.entity_id,
             name: link.entity.name,
             parameters: link.entity.parameters || null,
+            entityKind: link.entity.kind || null,
             overloads: link.overloads || 0,
             alike: 0,
             unsettled: node.breaking && kind === "consumer",
@@ -189,17 +228,27 @@
   /** What a guide calls the thing it walks. */
   const nounOf = (guide) => (guide.kind === "working" ? "work" : guide.kind === "range" ? "comparison" : "change");
 
+  /** How a row that relies on a change stands, as a class the stylesheet tints its caption by. */
+  function leafTone(leaf) {
+    if (leaf.kind === "test") return "";
+    if (leaf.unsettled || leaf.verdict === "not_updated") return "relier-unsettled";
+    if (leaf.verdict === "may_need_review") return "relier-check";
+    if (leaf.verdict === "needs_no_update") return "relier-fine";
+    return "";
+  }
+
   function changedButton(node, handlers) {
     const classes = ["node", "node-changed", `node-${node.change}`];
     const word = CHANGE_WORD[node.change] || node.change;
+    // The change is said by its glyph here and in words to a screen reader.
     const button = el(
       "button",
       classes.join(" "),
-      el("span", "node-name", labelNodes(node.name, node.parameters)),
-      el("span", "node-caption", word),
+      el("span", "node-main", changeGlyph(node.change), kindGlyph(node.entityKind, false), el("span", "node-name", labelNodes(node.name, node.parameters))),
       node.also.length ? el("span", "node-also", `also relies on ${node.also.join(", ")}`) : null,
     );
     button.type = "button";
+    button.title = `${word} here`;
     button.setAttribute("aria-label", `${node.name}, ${word.toLowerCase()} here. Go to its step.`);
     button.addEventListener("click", () => handlers.open(node));
     return button;
@@ -213,7 +262,8 @@
       const folded = declarations > 1;
       const row = el(
         "button",
-        `relier relier-${leaf.kind} ${leaf.unsettled ? "relier-unsettled" : ""}`,
+        `relier relier-${leaf.kind} ${leafTone(leaf)}`,
+        kindGlyph(leaf.entityKind, leaf.kind === "test"),
         el("span", "relier-name", folded ? nameNodes(leaf.name) : labelNodes(leaf.name, leaf.parameters)),
         folded ? el("span", "relier-count", `${declarations} overloads`) : null,
         el("span", "relier-caption", leafCaption(leaf)),
@@ -300,12 +350,13 @@
       counts.consumer + counts.test + counts.more ? el("li", null, el("span", "swatch swatch-consumer"), `Relies on it from outside the ${nounOf(guide)}`) : null,
       counts.unsettled ? el("li", null, el("span", "swatch swatch-unsettled"), "Not updated with it") : null,
     );
-    const tree = el("ul", "tree", roots.map((node) => branch(node, handlers)));
+    // Many separate trees read as rows from the left; a few sit centred as one picture.
+    const tree = el("ul", roots.length > MANY_ROOTS ? "tree tree-many" : "tree", roots.map((node) => branch(node, handlers)));
     tree.setAttribute("aria-label", `What this ${nounOf(guide)} touched and what relies on it`);
     const scroller = el("div", "map-scroll", tree);
-    // A map wider than its card scrolls sideways. The edge that hides more
-    // fades, and a hint says so, so nothing is cut off without a word.
-    const hint = el("button", "map-more", "Scroll to see more", el("span", null, " \u2192"));
+    // A map wider than its frame scrolls sideways, and a hint says so, so
+    // nothing is cut off without a word.
+    const hint = el("button", "button button-small button-quiet map-more", "Scroll to see more", el("span", null, " \u2192"));
     hint.type = "button";
     hint.hidden = true;
     hint.addEventListener("click", () => {
@@ -321,7 +372,8 @@
         el(
           "header",
           "map-head",
-          el("div", "map-title", el("h2", null, `What this ${nounOf(guide)} touches`), hint),
+          // A fixed phrase, so it can take the page's section-label style.
+          el("div", "map-title", el("h2", "outline-head", `What this ${nounOf(guide)} touches`), hint),
           el(
             "p",
             "map-sub",
@@ -337,5 +389,5 @@
     };
   }
 
-  root.map = { buildTree, renderMap, nameNodes };
+  root.map = { buildTree, renderMap, nameNodes, kindGlyph, changeGlyph };
 })();

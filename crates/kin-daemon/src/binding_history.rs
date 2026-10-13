@@ -27,6 +27,14 @@ pub(crate) fn restore_exact_authority(state: &DaemonState) {
         })?;
         let lease = authority.read_authority();
         if let Some(snapshot) = lease.workspace_graph_snapshot(&context.workspace_id())? {
+            // An authority that holds no proof has none to restore, and a
+            // graph that holds none has none to lose. Comparing the two would
+            // build the whole authority graph to end in a write that changes
+            // nothing, and that write would still tell every reader of this
+            // graph that its truth had moved.
+            if snapshot.verified_binding_history.is_none() && unproven(state) {
+                return Ok(());
+            }
             let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot)?;
             state.graph.restore_binding_history_from(&graph);
         }
@@ -37,28 +45,48 @@ pub(crate) fn restore_exact_authority(state: &DaemonState) {
     }
 }
 
+/// Whether the live graph holds no binding-history proof.
+fn unproven(state: &DaemonState) -> bool {
+    matches!(
+        state.graph.binding_history_observation(),
+        kin_model::BindingHistoryObservation::Unproven
+    )
+}
+
 pub(crate) struct Derivation<'a> {
     state: &'a DaemonState,
     before: kin_db::GraphSnapshot,
+    /// The graph's completed writes as `before` was about to be observed.
+    began_at: u64,
 }
 
 impl<'a> Derivation<'a> {
     pub(crate) fn begin(state: &'a DaemonState) -> Self {
-        if matches!(
-            state.graph.binding_history_observation(),
-            kin_model::BindingHistoryObservation::Unproven
-        ) {
+        if unproven(state) {
             restore_exact_authority(state);
         }
+        // Read ahead of the observation, so a write that lands between the
+        // two either is in `before` or has moved the count by the time this
+        // drops. It is never missing from both.
+        let began_at = state.graph.truth_epoch();
         Self {
             state,
             before: state.graph.semantic_observation(),
+            began_at,
         }
     }
 }
 
 impl Drop for Derivation<'_> {
     fn drop(&mut self) {
+        // No write completed since this began, so the graph is the one that
+        // was observed and holds whatever proof it held then. There is no
+        // transition to qualify. Qualifying one anyway is a write of its own:
+        // a pass that found nothing to admit would tell every reader of this
+        // graph that its truth had moved, and each would redo what it kept.
+        if self.state.graph.truth_epoch() == self.began_at {
+            return;
+        }
         let load = |digest: kin_model::Hash256| -> Result<Option<Vec<u8>>, kin_db::KinDbError> {
             let hash = kin_blobs::Hash256::from_bytes(*digest.as_bytes());
             if let Ok(bytes) = self.state.blobs.read(&hash) {

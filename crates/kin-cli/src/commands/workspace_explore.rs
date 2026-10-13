@@ -548,6 +548,10 @@ pub(super) fn overview_containers(census: &Census<'_>, limit: usize) -> Map<Stri
                 "id": node.id, "name": node.name, "kind": kind_label(&node.kind),
                 "members": census.members(&node.id), "entities": census.size(&node.id),
                 "container": census.container_of(&node.id),
+                // What tells two containers of one name apart, since no
+                // answer here says where either is. Null from a daemon that
+                // does not report it.
+                "language": node.language.as_deref().map(str::to_lowercase),
             })
         })
         .collect();
@@ -635,7 +639,11 @@ async fn serve_overview(State(state): State<Arc<UiState>>) -> Response {
         compact: true,
     };
     let (export, summary, ranking, branches, log) = tokio::join!(
-        bounded(GRAPH_TIMEOUT, client.graph_export("limit=0")),
+        // With each entity's language, which the container rows carry.
+        bounded(
+            GRAPH_TIMEOUT,
+            client.graph_export("limit=0&include=language")
+        ),
         bounded(READ_TIMEOUT, async {
             let response = client.overview(&summary_request).await?;
             let line = response
@@ -2441,6 +2449,7 @@ mod tests {
             degree: 0,
             line: None,
             signature: None,
+            language: None,
         }
     }
 
@@ -2591,6 +2600,36 @@ mod tests {
         assert_eq!(containers["shown"], 2);
         assert_eq!(containers["items"][1]["name"], "Signer");
         assert_eq!(containers["items"][1]["container"]["name"], "signer");
+    }
+
+    /// Two containers can share a name and a kind, as a JavaScript module and
+    /// the TypeScript one beside it do, and no answer says where either is.
+    /// Each row carries its language so a page can tell them apart, and null
+    /// when the daemon that answered does not report one.
+    #[test]
+    fn a_container_row_carries_its_language_or_null() {
+        let mut payload = fixture();
+        for node in &mut payload.nodes {
+            node.language = match node.id.as_str() {
+                "a-module" => Some("JavaScript".to_string()),
+                "e-module" => Some("typescript".to_string()),
+                _ => None,
+            };
+        }
+        let census = Census::new(&payload);
+        let containers = overview_containers(&census, 10);
+        let language = |name: &str| {
+            containers["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not a container row"))["language"]
+                .clone()
+        };
+        assert_eq!(language("signer"), json!("javascript"));
+        assert_eq!(language("encoding"), json!("typescript"));
+        assert_eq!(language("Signer"), Value::Null);
     }
 
     /// No answer carries a place in the checkout, even though the export

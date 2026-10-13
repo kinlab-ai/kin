@@ -200,7 +200,8 @@
   }
 
   function unifiedRow(row, side) {
-    const sign = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+    // A true minus sign, as wide as the plus above or below it.
+    const sign = row.type === "add" ? "+" : row.type === "del" ? "−" : " ";
     const tokens =
       row.type === "del" ? side.oldTokens && side.oldTokens[row.old] : side.newTokens && side.newTokens[row.neu];
     const signCell = el("span", "sign", sign);

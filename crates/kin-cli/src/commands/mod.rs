@@ -131,6 +131,7 @@ mod workspace_agents;
 mod workspace_conflicts;
 mod workspace_explore;
 mod workspace_graph;
+mod workspace_home;
 pub mod workspace_tip;
 pub mod workspace_ui;
 pub mod write_back;

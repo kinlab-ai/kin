@@ -3788,6 +3788,122 @@ pub(crate) fn connect_waiting_clients(repo_root: &Path, quiet: bool) -> Vec<Clie
     connections
 }
 
+/// What became of one AI client a caller asked to have connected.
+#[derive(Debug)]
+pub(crate) enum ClientConnected {
+    /// Its Kin entry is written into its own configuration.
+    Connected,
+    /// Its Kin entry has to name a repository and there is none to name
+    /// here. It connects when a repository is next added.
+    Waiting,
+    /// The client is not installed on this machine, so nothing was written.
+    NotInstalled,
+    /// Writing its entry failed, for this reason.
+    Failed(String),
+}
+
+/// One named client and how connecting it ended.
+#[derive(Debug)]
+pub(crate) struct NamedClientConnection {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) outcome: ClientConnected,
+}
+
+/// Connect exactly the AI clients named by `ids`, and change nothing else.
+///
+/// This is the client step of `kin setup` on its own, for a caller with no
+/// terminal. Each named client that is installed gets its Kin entry merged
+/// into its own configuration and recorded in the install ledger, and the
+/// reminder that tells a connected client to use Kin is written for the
+/// clients that connected, exactly as `kin setup` writes both. `kin setup
+/// --clients` cannot stand in for it: every setup intent also writes the
+/// shell profile and the daemon's auto-start setting. Here the shell profile,
+/// the prompt hook, that setting and language servers are untouched, no
+/// client outside `ids` is touched, and no connected client is launched to
+/// prove its entry.
+///
+/// A client whose entry names a repository is not connected from outside
+/// one. It is reported as waiting, and consent and the choice are recorded so
+/// `kin init` and `kin clone` connect it when a repository appears.
+pub(crate) fn connect_named_clients(ids: &[String]) -> Result<Vec<NamedClientConnection>> {
+    let chosen = normalized_client_choice(ids)?;
+    let _quiet = ShortFormScope::enter();
+    let assistants = detect_ai_assistants();
+    let mut connections = Vec::new();
+    let mut registered = Vec::new();
+    let mut waiting = Vec::new();
+    for (idx, assistant) in assistants.iter().enumerate() {
+        let Some(id) = client_id(idx).filter(|id| chosen.iter().any(|named| named == id)) else {
+            continue;
+        };
+        let outcome = if !assistant.detected {
+            ClientConnected::NotInstalled
+        } else {
+            match configure_assistant_by_index(idx) {
+                Some(Ok(_)) => {
+                    registered.push(idx);
+                    ClientConnected::Connected
+                }
+                Some(Err(error)) => match client_not_configured_lines(assistant.name, &error).0 {
+                    ClientNotConfigured::Deferred => {
+                        waiting.push(id.to_string());
+                        ClientConnected::Waiting
+                    }
+                    ClientNotConfigured::Failed => ClientConnected::Failed(format!("{error:#}")),
+                },
+                None => continue,
+            }
+        };
+        connections.push(NamedClientConnection {
+            id,
+            name: assistant.name,
+            outcome,
+        });
+    }
+    if !registered.is_empty() {
+        if let Ok(home) = home_dir() {
+            let written =
+                apply_discovery_reminders_for(&home, &registered, &client_profile_for_index);
+            record_discovery_reminders(&written);
+        }
+    }
+    if !waiting.is_empty() {
+        if let Ok(kin_home) = kin_dir() {
+            record_waiting_client_choice(&kin_home, &waiting);
+        }
+    }
+    Ok(connections)
+}
+
+/// Record that `waiting` are to be connected when a repository appears,
+/// keeping whatever was chosen before. No recorded choice already means
+/// every client, and so does `all`; only a narrower list has to grow.
+fn record_waiting_client_choice(kin_home: &Path, waiting: &[String]) {
+    let _ = record_client_consent(kin_home, true);
+    let Some(recorded) = crate::commands::projection::recorded_setup_value(
+        kin_home,
+        CLIENT_CONSENT_TABLE,
+        CLIENT_CHOICE_KEY,
+    ) else {
+        return;
+    };
+    if recorded == "all" {
+        return;
+    }
+    let mut chosen: Vec<String> = recorded
+        .split(',')
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    for id in waiting {
+        if !chosen.contains(id) {
+            chosen.push(id.clone());
+        }
+    }
+    let _ = record_client_choice(kin_home, Some(&chosen));
+}
+
 // ---------------------------------------------------------------------------
 // Which `kin` a new terminal runs
 // ---------------------------------------------------------------------------
@@ -18130,10 +18246,9 @@ fn cleanup_stale_daemons() -> Result<usize> {
 // `kin setup ledger` and `kin setup uninstall`
 // ---------------------------------------------------------------------------
 
-/// `kin setup clients`: every AI client Kin can connect, whether it is
-/// installed here, whether Kin is connected to it, and the id `--clients`
-/// takes. Reads only; changes nothing.
-pub fn clients(json: bool) -> Result<()> {
+/// What `kin setup clients --json` prints (`kin.setup-clients.v1`), for a
+/// caller that shows the same list without a terminal. Reads only.
+pub(crate) fn clients_report() -> serde_json::Value {
     let rows: Vec<serde_json::Value> = detect_ai_assistants()
         .iter()
         .enumerate()
@@ -18151,17 +18266,24 @@ pub fn clients(json: bool) -> Result<()> {
             })
         })
         .collect();
+    serde_json::json!({
+        "schema": "kin.setup-clients.v1",
+        "clients": rows,
+    })
+}
+
+/// `kin setup clients`: every AI client Kin can connect, whether it is
+/// installed here, whether Kin is connected to it, and the id `--clients`
+/// takes. Reads only; changes nothing.
+pub fn clients(json: bool) -> Result<()> {
+    let report = clients_report();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema": "kin.setup-clients.v1",
-                "clients": rows,
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let rows: Vec<ClientRow<'_>> = rows
+    let rows: Vec<ClientRow<'_>> = report["clients"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
         .iter()
         .map(|row| ClientRow {
             name: row["name"].as_str().unwrap_or_default(),

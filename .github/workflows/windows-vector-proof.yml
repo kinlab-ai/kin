@@ -134,8 +134,9 @@ jobs:
           console.log(`feature_flags: ${meta.feature_flags.join(",")}`);
           NODE
 
-      # Admission takes exact Git import or an empty native directory and
-      # refuses a populated non-Git one, so the fixture is a real Git worktree.
+      # The fixture is a real Git worktree with one commit, so admission
+      # imports the entities this proof embeds as recorded history rather than
+      # taking them in as uncommitted work.
       - name: Seed a fixture repository and admit it
         shell: bash
         run: |

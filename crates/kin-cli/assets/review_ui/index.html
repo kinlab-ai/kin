@@ -11,23 +11,37 @@
 <body>
   <a class="skip-link" href="#main">Skip to review</a>
   <div class="app" id="app">
-    <aside class="rail" id="rail" aria-label="Recorded changes">
+    <aside class="rail" id="rail" aria-label="Review">
       <header class="rail-head">
-        <img class="mark" src="/mark.svg" alt="" width="28" height="28" />
-        <div class="rail-id">
-          <div class="rail-repo-name" id="repo"></div>
-          <div class="rail-branch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5v13M18 8.5c0 4.5-6 3.5-12 7.5M6 21a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM18 9a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM6 5.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg><span id="review-branch">Loading branch…</span><span id="review-host"></span></div>
-        </div>
+        <a class="brand" id="brand" aria-label="Kin">
+          <img src="/mark.svg" alt="" width="20" height="20" />
+          <span class="brand-name">KIN</span>
+        </a>
+        <button class="icon-button rail-toggle" id="rail-toggle" type="button" aria-expanded="false" aria-controls="rail-body" aria-label="Browse changes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
       </header>
-      <button class="rail-toggle" id="rail-toggle" type="button" aria-expanded="false" aria-controls="changes filters">Browse changes</button>
-      <div class="rail-tools">
+      <div class="rail-body" id="rail-body">
         <button class="search-open" id="palette-open" type="button">
-          <span>Search changes and steps</span>
-          <kbd>/</kbd>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.3-4.3"/></svg>
+          <span>Search changes and steps</span><kbd>/</kbd>
         </button>
-        <div class="filters" id="filters" role="group" aria-label="Show changes by review"></div>
+        <div class="rail-nav">
+          <a class="rail-back" id="rail-back" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+            <span id="rail-back-label">Back to work</span>
+          </a>
+          <p class="outline-head rail-label">Changes</p>
+          <div class="rail-repo">
+            <span class="repo-dot" id="repo-dot" aria-hidden="true"></span>
+            <span class="rail-repo-name" id="repo"></span>
+            <span class="rail-host" id="review-host"></span>
+            <span class="rail-branch" id="review-branch" title="The branch you are on">Loading branch…</span>
+          </div>
+          <div class="filters segmented" id="filters" role="group" aria-label="Show changes by review"></div>
+        </div>
+        <div class="rail-scroll">
+          <nav class="changes" id="changes" aria-label="Changes, newest first"></nav>
+        </div>
       </div>
-      <nav class="changes" id="changes" aria-label="Changes, newest first"></nav>
       <footer class="rail-foot">
         <div class="rail-foot-row">
           <span class="rail-live" id="live" title="The list follows the repository"></span>
@@ -35,6 +49,9 @@
         </div>
         <div class="rail-foot-row">
           <button class="link-button" id="editor" type="button"></button>
+        </div>
+        <div class="rail-foot-row">
+          <span id="rail-version">Kin</span>
           <button class="rail-theme" id="theme" type="button" aria-label="Change colour theme">Auto</button>
         </div>
       </footer>
@@ -59,7 +76,7 @@
     <div class="help" role="dialog" aria-modal="true" aria-labelledby="help-title">
       <h2 id="help-title">Keyboard shortcuts</h2>
       <dl class="keys-list" id="keys-list"></dl>
-      <button class="write-button" id="help-close" type="button">Close</button>
+      <button class="button" id="help-close" type="button">Close</button>
     </div>
   </div>
 

@@ -509,13 +509,34 @@ async fn wait_for_admission(
 pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("resolve current directory")?;
     let layout = crate::commands::require_repository_layout_at(&cwd)?;
-    let base_url = crate::daemon_client::resolve_daemon_url(&layout)
+    let response = admit_working_copy(&layout, &cwd).await?;
+    for line in &response.lines {
+        println!("{line}");
+    }
+    match admission_failure(&response) {
+        Some(cause) => Err(anyhow::anyhow!(
+            "complete exact-tree admission failed: {cause}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Admit the complete working copy of the repository at `layout` and wait for
+/// that pass to report, as `kin admit` does. `from` is the directory the
+/// request is made from, which the daemon records with the session that
+/// keeps the pass alive.
+///
+/// The answer is returned whole. A caller asks [`admission_failure`] whether
+/// the pass inside it admitted anything.
+pub(crate) async fn admit_working_copy(
+    layout: &kin_core::KinLayout,
+    from: &std::path::Path,
+) -> Result<AdmitResponse> {
+    let cwd = from;
+    let base_url = crate::daemon_client::resolve_daemon_url(layout)
         .await?
         .ok_or_else(|| {
-            crate::daemon_client::daemon_required_error(
-                "admitting the complete exact tree",
-                &layout,
-            )
+            crate::daemon_client::daemon_required_error("admitting the complete exact tree", layout)
         })?;
     // Explicit authority with no session header: this publishes against HEAD
     // authority, so an ambient `KIN_SESSION_ID` inherited from a surrounding
@@ -523,7 +544,7 @@ pub async fn run() -> Result<()> {
     // The lease taken below is a liveness hold, not a scope.
     let client = crate::daemon_client::DaemonClient::from_base_url_with_explicit_authority(
         base_url,
-        crate::daemon_client::resolve_daemon_auth_token_for_layout(&layout),
+        crate::daemon_client::resolve_daemon_auth_token_for_layout(layout),
         None,
     )?;
 
@@ -535,7 +556,7 @@ pub async fn run() -> Result<()> {
         .start_session(
             ADMIT_SESSION_VENDOR,
             ADMIT_SESSION_CLIENT,
-            &cwd,
+            cwd,
             std::process::id(),
             kin_model::session::SessionCapabilities::default(),
         )
@@ -559,16 +580,7 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    let response = outcome?;
-    for line in &response.lines {
-        println!("{line}");
-    }
-    match admission_failure(&response) {
-        Some(cause) => Err(anyhow::anyhow!(
-            "complete exact-tree admission failed: {cause}"
-        )),
-        None => Ok(()),
-    }
+    outcome
 }
 
 #[cfg(test)]
