@@ -220,6 +220,12 @@ def main() -> None:
     )
     test_workflows.check_workflow_token_permissions()
 
+    from release_rehearsal_contract import check_contract
+    check_contract()
+    from release_authority.test_release_rehearsal import check_protected_rehearsal_boundary, check_rehearsal_context_boundary
+    check_rehearsal_context_boundary()
+    check_protected_rehearsal_boundary(release_tag)
+
     print(
         "release workflow authority is reviewed-PR to App-tag automatic, "
         "protected, pinned, GCP-free on release writes, cross-platform "

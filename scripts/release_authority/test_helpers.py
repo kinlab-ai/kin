@@ -348,6 +348,15 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "image": "RC Daemon Image",
         "capability": "RC Capability (${{ matrix.os }})",
         "attest": "RC Attest",
+        "rehearsal": "RC rehearsal",
+    },
+    ".github/workflows/release-rehearsal.yml": {
+        "windows": None,
+        "tooling": "Rehearse release tooling",
+        "collect": "Collect release rehearsal",
+    },
+    ".github/workflows/release-rehearsal-windows.yml": {
+        "install-proof": "${{ matrix.os }}",
     },
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
@@ -454,6 +463,10 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
 }
 EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
+        ".github/workflows/release-rehearsal-windows.yml",
+        "install-proof",
+    ): "9b1bb25eaca3670476e75890b49606cecf502b03abd6f3e7d774d44972750102",
+    (
         ".github/workflows/fuzz.yml",
         "fuzz",
     ): "aa645addde738ea8f1fac9c70071ac0f603fd0030602f15d013535abf9a32443",
@@ -464,7 +477,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/rc-build.yml",
         "build",
-    ): "22d9e7389fc4053a37e86b1eabf0b2da6e18ad3968c96b8e1f21eece4407f5b8",
+    ): "d548aec1dfb72f778e575467b70033f3c9d80688181ec23bb91adbbaf9694c1c",
     (
         ".github/workflows/rc-build.yml",
         "capability",

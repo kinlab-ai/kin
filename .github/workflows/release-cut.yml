@@ -772,6 +772,25 @@ jobs:
           pattern: kin-release-preflight-*
           path: ${{ runner.temp }}/legs
 
+      - name: Require the exact candidate's hosted release rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.select.outputs.candidate }}
+          RC_RUN: ${{ needs.select.outputs.rc_run }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin "$CANDIDATE"
+          gh run download "$RC_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name kin-release-rehearsal --dir "$RUNNER_TEMP/rehearsal"
+          rehearsal_policy="$RUNNER_TEMP/release-rehearsal-policy.py"
+          git --no-replace-objects show "${GITHUB_SHA}:scripts/release-rehearsal.py" > "$rehearsal_policy"
+          test -s "$rehearsal_policy"
+          python3 -I "$rehearsal_policy" verify \
+            --source "$GITHUB_WORKSPACE" --candidate "$CANDIDATE" \
+            --receipt "$RUNNER_TEMP/rehearsal/rehearsal.json" \
+            --run-id "$RC_RUN" --repository "$GITHUB_REPOSITORY"
+
       # The record names the RC Build run every leg judged (rc_build.run_id),
       # and scripts/locate-rc-build.mjs makes release.yml ship from exactly that
       # run, so a commit the merge queue and a fallback dispatch both built is
