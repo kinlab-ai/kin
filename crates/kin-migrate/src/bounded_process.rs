@@ -1235,9 +1235,11 @@ mod tests {
         let reader =
             BoundedCaptureReader::spawn(NeverEofCapturePipe, "stdout", 4_096, events).unwrap();
         let captured = reader.finish_until(Instant::now());
-        assert_eq!(
-            captured.error.as_deref(),
-            Some("stdout capture cancelled before EOF")
+        // Either the worker acknowledges cancellation or the cancellation
+        // deadline expires. Both must remain errors, unlike a clean EOF.
+        assert!(
+            captured.error.is_some(),
+            "a pipe that never reaches EOF must report a capture error"
         );
     }
 
