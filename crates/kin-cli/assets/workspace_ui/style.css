@@ -2531,7 +2531,7 @@ details.more pre {
   .workspace-nav {
     flex-direction: row;
     flex: 1;
-    justify-content: flex-end;
+    justify-content: flex-start;
     gap: 2px;
     overflow-x: auto;
     padding: 8px 12px;

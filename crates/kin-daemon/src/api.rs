@@ -11205,36 +11205,46 @@ async fn locate(
             Some(reference),
         )
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-        if multi_query {
-            run_multiquery_locate_at_ref(
-                &state,
-                &repository_authority,
-                &head,
-                reference,
-                &variants,
-                auto_fanout,
-                explain,
-                req.max_files,
-                req.max_files_explicit,
-                snippet_opts,
-                scope,
-            )
-        } else {
-            kin_cli::commands::locate::run_with_graph_capture_at_ref(
-                &repository_authority,
-                state.graph.as_ref(),
-                state.blobs.as_ref(),
-                &head,
-                reference,
-                &req.text,
-                explain,
-                req.max_files,
-                req.max_files_explicit,
-                snippet_opts,
-                scope,
-            )
-            .map_err(|error| error.to_string())
-        }
+        let query_state = Arc::clone(&state);
+        let reference = reference.to_owned();
+        let text = req.text.clone();
+        let variants = variants.clone();
+        let max_files = req.max_files;
+        let max_files_explicit = req.max_files_explicit;
+        tokio::task::spawn_blocking(move || {
+            if multi_query {
+                run_multiquery_locate_at_ref(
+                    &query_state,
+                    &repository_authority,
+                    &head,
+                    &reference,
+                    &variants,
+                    auto_fanout,
+                    explain,
+                    max_files,
+                    max_files_explicit,
+                    snippet_opts,
+                    scope,
+                )
+            } else {
+                kin_cli::commands::locate::run_with_graph_capture_at_ref(
+                    &repository_authority,
+                    query_state.graph.as_ref(),
+                    query_state.blobs.as_ref(),
+                    &head,
+                    &reference,
+                    &text,
+                    explain,
+                    max_files,
+                    max_files_explicit,
+                    snippet_opts,
+                    scope,
+                )
+                .map_err(|error| error.to_string())
+            }
+        })
+        .await
+        .map_err(internal_error)?
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
@@ -11250,7 +11260,7 @@ async fn locate(
                 run_multiquery_fused_locate(
                     &state,
                     session_id.as_ref(),
-                    graph.as_ref(),
+                    &graph,
                     &variants,
                     auto_fanout,
                     explain,
@@ -11264,7 +11274,7 @@ async fn locate(
                 run_fused_locate_for_state(
                     &state,
                     session_id.as_ref(),
-                    graph.as_ref(),
+                    &graph,
                     &req.text,
                     explain,
                     req.max_files,
@@ -11385,7 +11395,7 @@ fn locate_query_is_one_name(query: &str) -> bool {
 async fn run_fused_locate_for_state(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    graph: &Arc<kin_db::InMemoryGraph>,
     text: &str,
     explain: bool,
     max_files: usize,
@@ -11418,40 +11428,45 @@ async fn run_fused_locate_for_state(
         Some((_, head, _, _)) => kin_mcp::handlers::common::EntitySourceScope::At(*head),
         None => kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
     };
-    let extra_priority_files = scope_ref_string
-        .as_deref()
-        .map(|ref_str| {
-            // `graph` is the session's ref-scoped graph, so the historical
-            // test-artifact signal is read from its graph-owned truth.
-            kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
-                graph, ref_str, text,
-            )
-        })
-        .unwrap_or_default();
+    // Retrieval can lazily construct an external provider's blocking HTTP
+    // client and issue model requests. Run the whole synchronous ranking off
+    // the async worker, keeping the exact graph and authority this call chose.
+    let state = Arc::clone(state);
+    let graph = Arc::clone(graph);
+    let text = text.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let extra_priority_files = scope_ref_string
+            .as_deref()
+            .map(|ref_str| {
+                kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
+                    graph.as_ref(),
+                    ref_str,
+                    &text,
+                )
+            })
+            .unwrap_or_default();
 
-    // Always pass the HEAD graph as vector source for embedding signals.
-    // For scoped sessions, the scoped graph has no vector index — HEAD
-    // vectors are queried and post-filtered to the scoped entity set.
-    // For unscoped queries, the HEAD graph IS the primary graph, so
-    // vector_source provides the same index — but extract_embedding_signals
-    // only uses vector_source when the primary graph has no embeddings,
-    // so there's no double-query.
-    let vector_source = Some(state.graph.as_ref());
-    kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
-        graph,
-        None,
-        text,
-        explain,
-        max_files,
-        max_files_explicit,
-        extra_priority_files,
-        vector_source,
-        snippet_opts,
-        Some(&repository_authority),
-        source_scope,
-        scope,
-    )
-    .map_err(|error| error.to_string())
+        // Scoped graphs query HEAD vectors and filter them to the scoped
+        // entities. For unscoped calls HEAD is the primary graph already.
+        let vector_source = Some(state.graph.as_ref());
+        kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
+            graph.as_ref(),
+            None,
+            &text,
+            explain,
+            max_files,
+            max_files_explicit,
+            extra_priority_files,
+            vector_source,
+            snippet_opts,
+            Some(&repository_authority),
+            source_scope,
+            scope,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("semantic retrieval worker failed: {error}"))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11684,7 +11699,7 @@ const SEMANTIC_LOCATE_DEFAULT_LIMIT: usize = 20;
 async fn rank_agent_query(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    graph: &Arc<kin_db::InMemoryGraph>,
     query: &str,
     variants: &[String],
     auto_fanout: bool,
@@ -11729,7 +11744,7 @@ async fn rank_agent_query(
 async fn rank_context_question(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    graph: &Arc<kin_db::InMemoryGraph>,
     question: &str,
     limit: usize,
 ) -> Option<(Vec<kin_cli::commands::context::QuestionFocal>, String)> {
@@ -11762,7 +11777,7 @@ async fn rank_context_question(
 async fn run_multiquery_fused_locate(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    graph: &Arc<kin_db::InMemoryGraph>,
     variants: &[String],
     auto_fanout: bool,
     explain: bool,
@@ -12045,16 +12060,21 @@ async fn search(
     let mut settle = NameReadWait::begin(&state, &graph);
     let mut result = loop {
         let epoch = settle.sample(&state).await;
-        let result = kin_cli::commands::search::collect_daemon_search_response(
-            graph.as_ref(),
-            &req,
-            // Same substrate reading the impact and trace routes supply, from
-            // the same helper, so no CLI surface can be more confident than its
-            // MCP counterpart about one daemon at one instant. Taken per
-            // attempt, so an answer read after a wait carries the state it was
-            // read in.
-            &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await),
-        )
+        // Capture health for this attempt before handing the selected graph
+        // to the worker; semantic search may perform blocking provider IO.
+        let envelope =
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+        let query_graph = Arc::clone(&graph);
+        let request = req.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            kin_cli::commands::search::collect_daemon_search_response(
+                query_graph.as_ref(),
+                &request,
+                &envelope,
+            )
+        })
+        .await
+        .map_err(internal_error)?
         .map_err(internal_error)?;
         // The builder's own gate for its absence qualifier: no record, or none
         // a name matched.
@@ -12270,11 +12290,17 @@ async fn context(
         let epoch = settle.sample(&state).await;
         let repository_authority =
             require_mcp_command_repository_authority(&state).map_err(internal_error)?;
-        let result = kin_cli::commands::context::build_context_response_with_authority(
-            graph.as_ref(),
-            &req,
-            &repository_authority,
-        )
+        let query_graph = Arc::clone(&graph);
+        let request = req.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            kin_cli::commands::context::build_context_response_with_authority(
+                query_graph.as_ref(),
+                &request,
+                &repository_authority,
+            )
+        })
+        .await
+        .map_err(internal_error)?
         .map_err(internal_error)?;
         let claims_absence = result.error.is_some() || !result.unresolved.is_empty();
         if !claims_absence || settle.settled(&state, epoch) {
@@ -15859,10 +15885,11 @@ const SCOPED_LOCATE_RANKING_DEPTH: usize = 200;
 async fn build_fused_semantic_locate_result(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    ranking_graph: &Arc<kin_db::InMemoryGraph>,
     arguments: &HashMap<String, serde_json::Value>,
     hosted: Option<&HostedSemanticRequest>,
 ) -> std::result::Result<kin_mcp::ToolCallResult, RepoScopedMcpFailure> {
+    let graph = ranking_graph.as_ref();
     let hosted_view = hosted.map(HostedSemanticRequest::view);
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
@@ -16266,7 +16293,7 @@ async fn build_fused_semantic_locate_result(
             let attempt = rank_agent_query(
                 state,
                 session_id,
-                graph,
+                ranking_graph,
                 &query,
                 &variants,
                 auto_fanout,
@@ -19330,7 +19357,7 @@ async fn repo_mcp_tools_call_answer(
             match build_fused_semantic_locate_result(
                 &state,
                 None,
-                view.graph.as_ref(),
+                &view.graph,
                 &arguments,
                 Some(&hosted),
             )
@@ -22178,7 +22205,7 @@ async fn mcp_tools_call_selected(
                 build_fused_semantic_locate_result(
                     &state,
                     session_id.as_ref(),
-                    graph.as_ref(),
+                    &graph,
                     &request.arguments,
                     None,
                 )
@@ -22186,12 +22213,19 @@ async fn mcp_tools_call_selected(
                 .unwrap_or_else(|failure| kin_mcp::ToolCallResult::error(failure.message)),
             ));
         }
-        return Ok(Json(build_semantic_locate_result(
-            &state,
-            graph.as_ref(),
-            &request.arguments,
-            resolve_session_source_scope(&state, session_id.as_ref()).await,
-        )));
+        let source_scope = resolve_session_source_scope(&state, session_id.as_ref()).await;
+        let query_state = Arc::clone(&state);
+        let result = tokio::task::spawn_blocking(move || {
+            build_semantic_locate_result(
+                &query_state,
+                graph.as_ref(),
+                &request.arguments,
+                source_scope,
+            )
+        })
+        .await
+        .map_err(internal_error)?;
+        return Ok(Json(result));
     }
 
     // Serialize the full daemon transaction lifecycle and other graph-mutating
@@ -22813,7 +22847,7 @@ async fn mcp_handler_answer_at(
         .filter(|question| !question.trim().is_empty())
     {
         Some(question) => {
-            rank_context_question(state, session_id, graph.as_ref(), question, question_limit).await
+            rank_context_question(state, session_id, graph, question, question_limit).await
         }
         None => None,
     };
@@ -28254,6 +28288,11 @@ pub(crate) mod tests {
     use kin_model::TransactionDelta;
     #[cfg(unix)]
     mod branch_switch_preview;
+    #[cfg(all(
+        feature = "vector",
+        any(feature = "embeddings", feature = "external-embeddings")
+    ))]
+    mod external_query_runtime;
     #[cfg(unix)]
     mod merge_after_enrichment;
     #[cfg(unix)]
@@ -55931,7 +55970,7 @@ pub(crate) mod tests {
                 let result = build_fused_semantic_locate_result(
                     &state,
                     None,
-                    state.graph.as_ref(),
+                    &state.graph,
                     &arguments,
                     None,
                 )
@@ -56052,7 +56091,7 @@ pub(crate) mod tests {
                 let result = build_fused_semantic_locate_result(
                     &state,
                     None,
-                    state.graph.as_ref(),
+                    &state.graph,
                     &arguments,
                     None,
                 )
@@ -56200,15 +56239,12 @@ pub(crate) mod tests {
             "session cookie",
         ] {
             let arguments = HashMap::from([("query".to_string(), json!(question))]);
-            let located = build_fused_semantic_locate_result(
-                &state,
-                None,
-                state.graph.as_ref(),
-                &arguments,
-                None,
-            )
-            .await
-            .unwrap_or_else(|failure| panic!("locate answers {question:?}: {}", failure.message));
+            let located =
+                build_fused_semantic_locate_result(&state, None, &state.graph, &arguments, None)
+                    .await
+                    .unwrap_or_else(|failure| {
+                        panic!("locate answers {question:?}: {}", failure.message)
+                    });
             let located = serde_json::to_value(&located).unwrap();
             let located: serde_json::Value =
                 serde_json::from_str(located["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -56229,10 +56265,9 @@ pub(crate) mod tests {
                 "locate ranks something for {question:?}: {located}"
             );
 
-            let (focals, _) =
-                rank_context_question(&state, None, state.graph.as_ref(), question, 3)
-                    .await
-                    .unwrap_or_else(|| panic!("the question ranks for {question:?}"));
+            let (focals, _) = rank_context_question(&state, None, &state.graph, question, 3)
+                .await
+                .unwrap_or_else(|| panic!("the question ranks for {question:?}"));
             let focal_ids: Vec<String> = focals.into_iter().map(|focal| focal.entity_id).collect();
             assert_eq!(
                 focal_ids, located_first,
@@ -77726,9 +77761,8 @@ pub(crate) mod tests {
     /// The count is the query path's own property and the one that must stay flat
     /// as the store grows.
     ///
-    /// It counts opens ON THIS THREAD rather than process-wide: this binary runs
-    /// tests in parallel and several siblings project bodies, so a delta on the
-    /// global counter is not this test's own number.
+    /// It counts actual opens of this fixture's repository across workers.
+    /// Parallel tests use other repositories, so their reads cannot inflate it.
     #[tokio::test]
     async fn semantic_locate_fused_page_opens_repository_authority_once() {
         const PAGE: usize = 4;
@@ -77748,14 +77782,18 @@ pub(crate) mod tests {
             .with("KIN_LOCATE_PHASE_SCORING_SECS", "0");
         let state = test_state();
         install_locate_page(&state, PAGE);
+        let opens_probe = kin_core::RepositoryAuthorityOpenProbe::new(
+            state
+                .local_repository_authority_binding()
+                .unwrap()
+                .repository_id()
+                .clone(),
+        );
         let app = router(state);
 
-        // Counted on `kin_core::authority_opens()`, the funnel every path into
-        // KinDB's recovery reaches. The query wrapper's own counter counts only
-        // the opens that wrapper performs, and this daemon's query slot reads
-        // through the authority it already holds, so a count taken there reads
-        // zero whether the page opened once or once per projected body.
-        let before = kin_core::authority_opens();
+        // The probe observes the recovery funnel on the blocking worker too.
+        // A wrapper counter misses opens through another wrapper; a thread-local
+        // reading misses this request's retrieval worker altogether.
         let fused = call_semantic_locate(
             app,
             json!({
@@ -77766,7 +77804,7 @@ pub(crate) mod tests {
             }),
         )
         .await;
-        let opens = kin_core::authority_opens() - before;
+        let opens = opens_probe.opens();
 
         // Non-vacuity first. A page that projected fewer than two bodies cannot
         // tell "one open per request" apart from "one open per body", so the

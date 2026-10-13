@@ -1720,7 +1720,7 @@ mod tests {
     use serial_test::serial;
 
     /// Minimal source-function entity for dedupe-identity tests.
-    fn dedupe_test_entity(name: &str, path: &str) -> Entity {
+    pub(super) fn dedupe_test_entity(name: &str, path: &str) -> Entity {
         Entity {
             id: EntityId::new(),
             kind: EntityKind::Function,
@@ -2362,7 +2362,11 @@ mod tests {
 /// returns over HTTP. Varying only the index producer between the two arms is
 /// what makes the disagreement, and the matching arm is the control that
 /// separates "records on disagreement" from "records whenever a vector ranked".
-#[cfg(all(test, feature = "vector", feature = "embeddings"))]
+#[cfg(all(
+    test,
+    feature = "vector",
+    any(feature = "embeddings", feature = "external-embeddings")
+))]
 mod query_producer_evidence_tests {
     use super::{collect_daemon_semantic_search_response, DaemonSearchRequest};
     use crate::commands::locate::RetrievalDegradation;
@@ -2372,7 +2376,7 @@ mod query_producer_evidence_tests {
     use serial_test::serial;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2392,6 +2396,7 @@ mod query_producer_evidence_tests {
     struct FixtureEmbeddingEndpoint {
         base_url: String,
         stop: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
         server: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -2408,11 +2413,13 @@ mod query_producer_evidence_tests {
                 .expect("the fixture listener accepts without blocking");
             let stop = Arc::new(AtomicBool::new(false));
             let stop_signal = Arc::clone(&stop);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed_requests = Arc::clone(&requests);
             let server = std::thread::spawn(move || {
                 while !stop_signal.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let _ = serve_one_embedding_request(stream);
+                            let _ = serve_one_embedding_request(stream, &observed_requests);
                         }
                         Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
@@ -2424,6 +2431,7 @@ mod query_producer_evidence_tests {
             Self {
                 base_url: format!("http://127.0.0.1:{port}/v1"),
                 stop,
+                requests,
                 server: Some(server),
             }
         }
@@ -2448,7 +2456,10 @@ mod query_producer_evidence_tests {
     /// one, because the parser refuses a response whose vector count does not
     /// match the request, and that refusal would surface as an embedding error
     /// rather than as the producer verdict under test.
-    fn serve_one_embedding_request(mut stream: TcpStream) -> std::io::Result<()> {
+    fn serve_one_embedding_request(
+        mut stream: TcpStream,
+        observed_requests: &AtomicUsize,
+    ) -> std::io::Result<()> {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -2484,6 +2495,7 @@ mod query_producer_evidence_tests {
             .map(|index| serde_json::json!({ "index": index, "embedding": unit }))
             .collect();
         let payload = serde_json::json!({ "data": data }).to_string();
+        observed_requests.fetch_add(1, Ordering::Relaxed);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{payload}",
@@ -2602,6 +2614,70 @@ mod query_producer_evidence_tests {
         )
         .expect("a payload carrying a degradations array carries a verdict")
         .to_value()
+    }
+
+    #[test]
+    #[serial]
+    fn automatic_description_queries_use_the_populated_external_index() {
+        use kin_model::EntityStore;
+
+        let endpoint = FixtureEmbeddingEndpoint::start();
+        let _environment = kin_core::test_env::EnvVarGuard::new()
+            .with("KIN_MODEL_EMBEDDINGS_PROVIDER", "external")
+            .with("KIN_MODEL_EMBEDDINGS_BASE_URL", endpoint.base_url())
+            .with("KIN_MODEL_EMBEDDINGS_MODEL", "fixture-producer-endpoint")
+            .with(
+                "KIN_EMBED_OPENAI_DIMENSIONS",
+                FIXTURE_DIMENSIONS.to_string(),
+            )
+            .with("KIN_EMBED_CACHE", "0")
+            .without(crate::retrieval_arm::ARM_ENV)
+            .without("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = super::tests::dedupe_test_entity("invoice_total", "billing.py");
+        graph.upsert_entity(&entity).unwrap();
+
+        assert_eq!(
+            crate::commands::locate::description_query_arm(&graph),
+            crate::retrieval_arm::RetrievalArm::CARDS,
+            "a model configuration without an index still uses graph cards"
+        );
+        graph
+            .embed_retrievable_texts(
+                &[(entity.id.into(), "Calculate customer invoice totals".into())],
+                1,
+            )
+            .expect("the external endpoint populates the index");
+        assert_eq!(graph.embedding_status().indexed, 1);
+        assert_eq!(
+            crate::commands::locate::description_query_arm(&graph),
+            crate::retrieval_arm::RetrievalArm::FUSED,
+            "a usable external index must enter automatic vector retrieval"
+        );
+
+        let before_query = endpoint.requests.load(Ordering::Relaxed);
+        let answer = crate::commands::locate::run_with_graph_capture(
+            &graph,
+            "Calculate customer invoice totals",
+            false,
+            5,
+            true,
+        )
+        .expect("the description query runs the external embedding path");
+        assert!(
+            endpoint.requests.load(Ordering::Relaxed) > before_query,
+            "the query must actually request its vector from the provider"
+        );
+        assert_ne!(answer.retrieval_arm.as_deref(), Some("cards"));
+        let coverage = serde_json::to_value(answer.semantic_coverage.as_ref().unwrap()).unwrap();
+        assert_eq!(coverage["indexed"], 1);
+        assert_ne!(coverage["embedding_state"], "not_used");
+        assert!(
+            answer.degradations.iter().all(|entry| {
+                entry.reason != "embeddings_not_used" && entry.reason != "query_failed"
+            }),
+            "the query must use the index rather than degrade to graph cards"
+        );
     }
 
     #[test]
