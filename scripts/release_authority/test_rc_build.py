@@ -82,6 +82,7 @@ RELEASE_CRITICAL_MATRIX_JOBS = frozenset(
 )
 RELEASE_CRITICAL_REUSABLE_JOBS = {
     (RELEASE, "install_proof"): "./.github/workflows/install-proof.yml",
+    (RC_BUILD, "rehearsal"): "./.github/workflows/release-rehearsal.yml",
 }
 
 

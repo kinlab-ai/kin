@@ -374,6 +374,7 @@ jobs:
           # then poison PATH or the runner command files before this decision.
           authority_main="$(git rev-parse refs/remotes/origin/main)"
           [[ "$authority_main" =~ ^[0-9a-f]{40}$ ]]
+          echo "authority_main=$authority_main" >> "$GITHUB_OUTPUT"
           resolved_commit="$(git rev-parse "${sha}^{commit}")"
           if [ "$resolved_commit" != "$sha" ]; then
             echo "::error::release sha $sha does not name an exact commit"
@@ -2295,8 +2296,9 @@ jobs:
               --repo "$REPO" \
               --sha "$SHA" \
               --version "${TAG#v}" \
-              --summary "$inert/summary.md"
+              --summary "$inert/summary.md" > "$RUNNER_TEMP/rc-locator-result.txt"
           located=$?
+          cat "$RUNNER_TEMP/rc-locator-result.txt"
           set -e
           for file in env path state output; do
             if [ -s "$inert/$file" ]; then
@@ -2316,6 +2318,51 @@ jobs:
             cat "$inert/summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "release.yml will find the RC Build bytes it ships for ${TAG}"
+
+      - name: Require the exact candidate's hosted release rehearsal
+        if: >-
+          steps.resolve.outputs.needed == 'true' &&
+          steps.prior.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHORITY_MAIN: ${{ steps.resolve.outputs.authority_main }}
+        run: |
+          set -euo pipefail
+          rc_run="$(sed -n 's/^run_id=//p' "$RUNNER_TEMP/rc-locator-result.txt")"
+          [[ "$rc_run" =~ ^[1-9][0-9]*$ ]]
+          gh run download "$rc_run" --repo "$REPO" \
+            --name kin-release-rehearsal --dir "$RUNNER_TEMP/rehearsal"
+          [[ "$AUTHORITY_MAIN" =~ ^[0-9a-f]{40}$ ]]
+          rehearsal_policy="$RUNNER_TEMP/release-rehearsal-policy.py"
+          git --no-replace-objects show "${AUTHORITY_MAIN}:scripts/release-rehearsal.py" > "$rehearsal_policy"
+          test -s "$rehearsal_policy"
+          rehearsal_inert="$RUNNER_TEMP/rehearsal-runner-state"
+          mkdir -p "$rehearsal_inert"
+          for file in env path state output; do : > "$rehearsal_inert/$file"; done
+          rehearsal_before="$(git status --porcelain --untracked-files=all)"
+          set +e
+          GITHUB_ENV="$rehearsal_inert/env" GITHUB_PATH="$rehearsal_inert/path" GITHUB_STATE="$rehearsal_inert/state" GITHUB_OUTPUT="$rehearsal_inert/output" \
+            python3 -I "$rehearsal_policy" verify \
+            --source "$GITHUB_WORKSPACE" --candidate "$SHA" \
+            --receipt "$RUNNER_TEMP/rehearsal/rehearsal.json" \
+            --run-id "$rc_run" --repository "$REPO"
+          rehearsed=$?
+          set -e
+          for file in env path state output; do
+            if [ -s "$rehearsal_inert/$file" ]; then
+              echo "::error::release rehearsal policy attempted to change runner state (${file})"
+              exit 1
+            fi
+          done
+          if [ "$(git status --porcelain --untracked-files=all)" != "$rehearsal_before" ] || [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+            echo "::error::release rehearsal policy changed the admitted checkout"
+            exit 1
+          fi
+          if [ "$rehearsed" -ne 0 ]; then
+            echo "::error::protected release rehearsal policy refused this candidate (exit ${rehearsed})"
+            exit 1
+          fi
 
       - name: Mint kin-release-bot installation token
         id: app-token

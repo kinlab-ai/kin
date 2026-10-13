@@ -109,7 +109,7 @@ jobs:
           echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
 
       - name: Public install (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.local_artifact
         shell: pwsh
         env:
           RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
@@ -154,6 +154,24 @@ jobs:
           KIN_NO_SETUP=1 KIN_VERSION="$version" KIN_BASE_URL="file://$served" \
             sh "$staged/install.sh"
           echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
+
+      - name: Pull request install (Windows)
+        if: runner.os == 'Windows' && inputs.local_artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staged = Join-Path $env:RUNNER_TEMP "kin-pull-request-release"
+          $version = (Get-Content (Join-Path $staged "expected-version.txt") -Raw).Trim()
+          $served = Join-Path $env:RUNNER_TEMP "kin-pull-request-served"
+          $download = Join-Path $served "download/v$version"
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          Copy-Item (Join-Path $staged "kin-windows-x86_64.zip") $download
+          Copy-Item (Join-Path $staged "kin-windows-x86_64.zip.sha256") $download
+          $env:KIN_NO_SETUP = "1"
+          $env:KIN_VERSION = $version
+          $env:KIN_BASE_URL = ([Uri]($served.Replace('\', '/') + '/')).AbsoluteUri.TrimEnd('/')
+          & (Join-Path $staged "install.ps1")
+          "$HOME\.kin\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Verify binaries installed + runnable
         shell: bash

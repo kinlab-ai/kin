@@ -348,6 +348,15 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "image": "RC Daemon Image",
         "capability": "RC Capability (${{ matrix.os }})",
         "attest": "RC Attest",
+        "rehearsal": "RC rehearsal",
+    },
+    ".github/workflows/release-rehearsal.yml": {
+        "windows": None,
+        "tooling": "Rehearse release tooling",
+        "collect": "Collect release rehearsal",
+    },
+    ".github/workflows/release-rehearsal-windows.yml": {
+        "install-proof": "${{ matrix.os }}",
     },
     ".github/workflows/registry-index-migrate.yml": {
         "migrate": None,
@@ -453,6 +462,10 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
 }
 EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
+    (
+        ".github/workflows/release-rehearsal-windows.yml",
+        "install-proof",
+    ): "9b1bb25eaca3670476e75890b49606cecf502b03abd6f3e7d774d44972750102",
     (
         ".github/workflows/fuzz.yml",
         "fuzz",

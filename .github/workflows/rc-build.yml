@@ -1443,3 +1443,17 @@ jobs:
             ${{ runner.temp }}/rc/kin-windows-x86_64/kin-windows-x86_64.zip
             ${{ runner.temp }}/rc/kin-windows-x86_64/kin-windows-x86_64.tar.gz
             ${{ runner.temp }}/rc/kin-daemon-image/kin-daemon-image.oci.tar
+
+  # Execute the full Windows install proof on this run's actual candidate zip
+  # before any tag exists, reusing the build output and its source provenance.
+  rehearsal:
+    name: RC rehearsal
+    needs: build
+    uses: ./.github/workflows/release-rehearsal.yml
+    permissions:
+      contents: read
+      attestations: read
+    with:
+      candidate_sha: ${{ github.sha }}
+      proof_mode: candidate-full
+      local_artifact: kin-windows-x86_64
