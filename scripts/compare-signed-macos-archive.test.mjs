@@ -9,7 +9,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { compare, expectedChecksumList, normalizeUnsignedMachO } from "./compare-signed-macos-archive.mjs";
+import { compare, expectedChecksumList, normalizeUnsignedMachO, trimSignatureAlignment } from "./compare-signed-macos-archive.mjs";
 
 const SCRIPTS = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(SCRIPTS, "..");
@@ -61,6 +61,47 @@ test("a binary the normalizer cannot read exactly is refused", () => {
   const noLinkedit = machO();
   noLinkedit.write("__DATA\0\0\0\0", 32 + 72 + 8, "latin1");
   assert.throws(() => normalizeUnsignedMachO(noLinkedit, "kin"), /0 __LINKEDIT segments/);
+});
+
+// __LINKEDIT made to run from the start of the file to its end, the way it
+// ends every real binary, so its file size describes the file's length.
+function linkeditToEnd(bytes, length = bytes.length) {
+  const copy = Buffer.alloc(length);
+  bytes.copy(copy, 0, 0, Math.min(bytes.length, length));
+  copy.writeBigUInt64LE(0n, 32 + 72 + 40);
+  copy.writeBigUInt64LE(BigInt(length), 32 + 72 + 48);
+  return copy;
+}
+
+test("only the zero padding codesign aligns a signature with is forgiven", () => {
+  // The v0.8.4 x86_64 kin was 96513428 bytes, 4 past a 16-byte boundary.
+  // macOS 15's codesign padded it to 96513440 before the signature and kept
+  // the padding, and __LINKEDIT's growth, when it removed the signature.
+  const rc = linkeditToEnd(machO({ body: "body" }));
+  assert.equal(rc.length % 16, 4);
+  const padded = linkeditToEnd(rc, rc.length + 12);
+  const trimmed = trimSignatureAlignment(rc, padded);
+  assert.ok(trimmed.equals(rc));
+  assert.ok(normalizeUnsignedMachO(trimmed).equals(normalizeUnsignedMachO(rc)));
+  // The input is never modified in place.
+  assert.equal(padded.length, rc.length + 12);
+
+  // Same length, nothing to forgive.
+  assert.equal(trimSignatureAlignment(rc, rc), rc);
+  for (const [label, signed] of [
+    ["padding that is not all zeros", (() => { const b = linkeditToEnd(rc, rc.length + 12); b[b.length - 1] = 1; return b; })()],
+    ["padding past the next 16-byte boundary", linkeditToEnd(rc, rc.length + 28)],
+    ["padding short of the boundary", linkeditToEnd(rc, rc.length + 8)],
+    ["padding __LINKEDIT does not account for", Buffer.concat([rc, Buffer.alloc(12)])],
+  ]) {
+    assert.equal(trimSignatureAlignment(rc, signed), signed, label);
+  }
+  // An RC binary already on a boundary needs no padding, so 16 extra zero
+  // bytes are a real difference.
+  const aligned = linkeditToEnd(machO({ body: "body".repeat(4) }));
+  assert.equal(aligned.length % 16, 0);
+  const grown = linkeditToEnd(aligned, aligned.length + 16);
+  assert.equal(trimSignatureAlignment(aligned, grown), grown);
 });
 
 test("the checksum list is the docs writer's listing of the root", () => {

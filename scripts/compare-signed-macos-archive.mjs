@@ -29,6 +29,13 @@
 // linker-signed arm64 and unsigned x86_64 executables: codesign
 // --remove-signature leaves exactly the 8 bytes of __LINKEDIT's vmsize
 // different from the unsigned original, and nothing else.
+//
+// One exception surfaced on the v0.8.4 release. codesign starts a signature on
+// a 16-byte boundary, so it first pads an unsigned binary whose length is not
+// a multiple of 16 with zeros up to one. macOS 26's codesign drops that
+// padding again when it removes the signature; macOS 15's, on the Intel
+// signing runner, leaves it, with __LINKEDIT's file size grown to cover it.
+// trimSignatureAlignment forgives exactly that padding and nothing more.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -88,6 +95,60 @@ export function normalizeUnsignedMachO(bytes, label = "Mach-O") {
     throw new Error(`${label} has ${linkedit} __LINKEDIT segments, expected exactly one`);
   }
   return copy;
+}
+
+// The __LINKEDIT LC_SEGMENT_64 command's offset in a thin 64-bit Mach-O, or -1.
+function linkeditCommand(bytes) {
+  if (bytes.length < 32 || bytes.readUInt32LE(0) !== MH_MAGIC_64) return -1;
+  const ncmds = bytes.readUInt32LE(16);
+  const end = 32 + bytes.readUInt32LE(20);
+  let offset = 32;
+  for (let index = 0; index < ncmds && offset + 8 <= end && end <= bytes.length; index += 1) {
+    const cmdsize = bytes.readUInt32LE(offset + 4);
+    if (cmdsize < 8) return -1;
+    if (
+      bytes.readUInt32LE(offset) === LC_SEGMENT_64 &&
+      offset + 56 <= end &&
+      bytes.toString("latin1", offset + 8, offset + 24).replace(/\0+$/, "") === "__LINKEDIT"
+    ) {
+      return offset;
+    }
+    offset += cmdsize;
+  }
+  return -1;
+}
+
+// An unsigned RC binary and its signed copy after codesign --remove-signature.
+// When the RC binary ends off a 16-byte boundary, codesign padded it with
+// zeros up to one before placing the signature, and some codesign releases
+// keep that padding when they remove the signature. Returns the signed copy
+// with the padding and the matching growth of __LINKEDIT's file size removed,
+// but only when the copy is exactly that: the RC length rounded up to 16,
+// the extra bytes all zero, and __LINKEDIT ending at the end of the file in
+// both, grown by exactly the padding. Anything else is returned unchanged for
+// the byte comparison to refuse.
+export function trimSignatureAlignment(rcBytes, signedBytes) {
+  const padding = signedBytes.length - rcBytes.length;
+  if (padding <= 0 || padding >= 16 || signedBytes.length % 16 !== 0) return signedBytes;
+  if (!signedBytes.subarray(rcBytes.length).every((byte) => byte === 0)) return signedBytes;
+  const rcLinkedit = linkeditCommand(rcBytes);
+  const signedLinkedit = linkeditCommand(signedBytes);
+  if (rcLinkedit < 0 || signedLinkedit !== rcLinkedit) return signedBytes;
+  const rcEnd = rcBytes.readBigUInt64LE(rcLinkedit + 40) + rcBytes.readBigUInt64LE(rcLinkedit + 48);
+  const signedSize = signedBytes.readBigUInt64LE(signedLinkedit + 48);
+  const signedEnd = signedBytes.readBigUInt64LE(signedLinkedit + 40) + signedSize;
+  if (rcEnd !== BigInt(rcBytes.length) || signedEnd !== BigInt(signedBytes.length)) return signedBytes;
+  const trimmed = Buffer.from(signedBytes.subarray(0, rcBytes.length));
+  trimmed.writeBigUInt64LE(signedSize - BigInt(padding), signedLinkedit + 48);
+  return trimmed;
+}
+
+function firstDifference(left, right) {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    if (left[index] !== right[index]) return index;
+  }
+  return length;
 }
 
 // What scripts/write-release-archive-docs.mjs writes for a root: the sha256 of
@@ -167,16 +228,24 @@ export function compare({ rcArchive, signedArchive, artifact, exec = run, log = 
       }
       if (MACHO_MEMBERS.includes(member)) {
         exec("codesign", ["--verify", "--strict", "--verbose=2", signedFile]);
-        const pair = [rcFile, signedFile].map((source, index) => {
+        const [rcBytes, signedBytes] = [rcFile, signedFile].map((source, index) => {
           const copy = join(work, `${index === 0 ? "rc" : "signed"}-${member.replaceAll("/", "_")}`);
           copyFileSync(source, copy);
           // An RC binary may carry no signature at all (x86_64) or the
           // linker's ad hoc one (arm64); --remove-signature handles both.
           exec("codesign", ["--remove-signature", copy]);
-          return normalizeUnsignedMachO(readFileSync(copy), `${index === 0 ? "RC" : "signed"} ${member}`);
+          return readFileSync(copy);
         });
+        const pair = [
+          normalizeUnsignedMachO(rcBytes, `RC ${member}`),
+          normalizeUnsignedMachO(trimSignatureAlignment(rcBytes, signedBytes), `signed ${member}`),
+        ];
         if (!pair[0].equals(pair[1])) {
-          throw new Error(`${member} differs from the RC build by more than its code signature`);
+          throw new Error(
+            `${member} differs from the RC build by more than its code signature ` +
+              `(unsigned, the RC copy is ${rcBytes.length} bytes and the signed copy ${signedBytes.length}; ` +
+              `they first differ at byte ${firstDifference(pair[0], pair[1])})`,
+          );
         }
         log(`${member}: identical to the RC build apart from its signature`);
         continue;

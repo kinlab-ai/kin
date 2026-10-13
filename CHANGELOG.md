@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-13
+
+0.8.5 is the first release after 0.8.1. It ships everything recorded under
+0.8.4 below, whose tag was superseded before its release completed.
+
+### Fixed
+
+- The release's macOS signing check no longer refuses a correctly signed Intel
+  binary whose size is not a multiple of 16 bytes, and stapling the notifier
+  app retries when Apple's ticket service drops the connection. Together these
+  stopped the 0.8.4 release before it published anything.
+
 ## [0.8.4] - 2026-10-12
 
-0.8.4 is the first release after 0.8.1. The 0.8.2 and 0.8.3 versions were
-never published, so everything they would have carried is listed here.
+The 0.8.2 and 0.8.3 versions were never published, so everything they would
+have carried is listed here.
 
 ### Added
 

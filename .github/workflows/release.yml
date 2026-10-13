@@ -970,8 +970,25 @@ jobs:
           # therefore rely on Apple's servers being reachable for Gatekeeper's
           # online check. KinNotifier.app IS a bundle, so its ticket is stapled
           # into it below and verifies offline.
-          xcrun stapler staple "$STAGE/KinNotifier.app"
-          xcrun stapler validate "$STAGE/KinNotifier.app"
+          #
+          # Stapling fetches the ticket from Apple's CloudKit ticket service,
+          # which dropped the connection on two of the three v0.8.4 attempts
+          # on the Intel runner after notarization had already succeeded.
+          # Retry that fetch rather than fail a release Apple has accepted.
+          stapled=false
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$STAGE/KinNotifier.app" &&
+              xcrun stapler validate "$STAGE/KinNotifier.app"; then
+              stapled=true
+              break
+            fi
+            echo "::warning::stapling KinNotifier.app failed on attempt ${attempt} of 5; retrying"
+            sleep $((attempt * 15))
+          done
+          if [ "$stapled" != true ]; then
+            echo "::error::KinNotifier.app could not be stapled after 5 attempts"
+            exit 1
+          fi
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
