@@ -34,6 +34,7 @@ INPUTS = (
     'scripts/release-rehearsal.py',
     'scripts/release-rehearsal-compat.py',
     'scripts/install.ps1',
+    'scripts/test-windows-install-mirror.ps1',
     'packages/kin/package.json',
     'Cargo.lock',
     'scripts/release-proof/bin/kin-release-preflight',

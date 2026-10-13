@@ -13,6 +13,12 @@ SPEC.loader.exec_module(generator)
 def check_contract(root: Path = ROOT) -> None:
     workflows = root / '.github/workflows'
     windows = (workflows / 'release-rehearsal-windows.yml').read_text()
+    installer = (root / 'scripts/install.ps1').read_text()
+    checksum = installer.split('$ChecksumFile = Join-Path $TmpDir "$Archive.sha256"', 1)[1].split('$ChecksumContent =', 1)[0]
+    if 'Invoke-ArchiveDownload -Uri $ChecksumUrl -OutFile $ChecksumFile -ArchiveName "$Archive.sha256"' not in checksum:
+        raise AssertionError('Windows checksum download must support the same file mirror as its archive')
+    if 'Prove the Windows file mirror checksum boundary' not in windows or 'scripts/test-windows-install-mirror.ps1"' not in windows:
+        raise AssertionError('Windows compatibility rehearsal must execute the actual file mirror boundary proof')
     if windows != generator.render((workflows / 'install-proof.yml').read_text()):
         raise AssertionError('the Windows rehearsal must be generated from the actual install proof')
     rehearsal = (workflows / 'release-rehearsal.yml').read_text()

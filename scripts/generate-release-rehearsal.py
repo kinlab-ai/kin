@@ -65,6 +65,14 @@ SETUP = r'''      - name: Preserve canonical candidate source bytes
           python "rehearsal-source/$SOURCE_PATH/scripts/release-rehearsal.py" bind \
             --source "rehearsal-source/$SOURCE_PATH" --candidate "$CANDIDATE" \
             --release-tag "$BASELINE_TAG" --mode "$PROOF_MODE"
+      - name: Prove the Windows file mirror checksum boundary
+        if: inputs.proof_mode == 'compatibility-baseline'
+        shell: pwsh
+        env:
+          SOURCE_PATH: ${{ inputs.source_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "rehearsal-source/$env:SOURCE_PATH/scripts/test-windows-install-mirror.ps1" -InstallerPath "rehearsal-source/$env:SOURCE_PATH/scripts/install.ps1" -OutputRoot "$env:RUNNER_TEMP/rehearsal/mirror-boundary"
       - name: Install the baseline with the candidate Windows installer
         if: inputs.proof_mode == 'compatibility-baseline'
         shell: pwsh
@@ -124,7 +132,9 @@ RECEIPT = r'''      - name: Record the real Windows rehearsal
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: release-rehearsal-compatibility-captures
-          path: ${{ runner.temp }}/rehearsal/compatibility
+          path: |
+            ${{ runner.temp }}/rehearsal/compatibility
+            ${{ runner.temp }}/rehearsal/mirror-boundary
           if-no-files-found: warn
           retention-days: 30
 '''

@@ -324,7 +324,7 @@ $ChecksumUrl = "$Url.sha256"
 $ChecksumFile = Join-Path $TmpDir "$Archive.sha256"
 
 try {
-    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumFile -UseBasicParsing -ErrorAction Stop
+    Invoke-ArchiveDownload -Uri $ChecksumUrl -OutFile $ChecksumFile -ArchiveName "$Archive.sha256"
 } catch {
     Write-Err "Could not download checksum file: $ChecksumUrl"
     Write-Err "Refusing to install an unverified download. Aborting."
