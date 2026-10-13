@@ -1,5 +1,6 @@
 {
   "README.md": "953b389bb4e3e8ea9e8e336e6f8ddcaed581ea7f47839aaa830c24df3599706b",
+  "fixtures/legacy-fixed-receipt.json": "9b401f0a3658311dc11e4c41403cfa7e440d614ade8b740413771e9e94907259",
   "fixtures/legacy-fixed/.kin/config.toml": "12b6b31f14c661fbff177ceba57a49d6b72f6efcf514cce64521f517a7ac434b",
   "fixtures/legacy-fixed/.kin/kindb/9435d8b0-e3a4-4e16-b446-49016a6e6734/.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "fixtures/legacy-fixed/.kin/kindb/9435d8b0-e3a4-4e16-b446-49016a6e6734/authority.json": "68a1b54a97f54f77e2f313ec027fb1af48bc466c4473fb403826dd608b3916cb",
@@ -20,7 +21,7 @@
   "fixtures/legacy-fixed/empty.pyi": "0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42",
   "fixtures/legacy-fixed/orphan.py": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
   "fixtures/legacy-fixed/sentinel.py": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
-  "fixtures/legacy-fixed-receipt.json": "9b401f0a3658311dc11e4c41403cfa7e440d614ade8b740413771e9e94907259",
+  "fixtures/recorded-fixed-receipt.json": "d8afdc71ac7018f7e36dd202cfccb622e3c900b0683c6d00fc3784aa868dffc1",
   "fixtures/recorded-fixed/.kin/config.toml": "12b6b31f14c661fbff177ceba57a49d6b72f6efcf514cce64521f517a7ac434b",
   "fixtures/recorded-fixed/.kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "fixtures/recorded-fixed/.kin/kindb/24268087-9e18-40f9-8680-33bf6c4efd90/authority.json": "95b5a4bbcb129270cbfa0395c5a7ada8f8ffc2672573b5c3cb35944ca178f54e",
@@ -42,7 +43,6 @@
   "fixtures/recorded-fixed/empty.pyi": "0cbcf8e504eee2fe771a543f161fddd92bc280654a5ce78f46f5fc8828230b42",
   "fixtures/recorded-fixed/orphan.py": "4606c3a9405e3fca4541326a2f337c4a75a1aea108fef45f73935a5a38c43487",
   "fixtures/recorded-fixed/sentinel.py": "34a1dcc6016547f2e309a65ba900b08d707f9551c2699e187d45dc738d558704",
-  "fixtures/recorded-fixed-receipt.json": "d8afdc71ac7018f7e36dd202cfccb622e3c900b0683c6d00fc3784aa868dffc1",
   "probe_startup_binary.py": "3f5eedb83ca73377b515e371c4feb70e11c0e87ab79a898b5a0bd3d47d1da62b",
-  "run.py": "5c0c63c6f3bcb02ef674e756bf7e2577d268556a47aa7e4474abee94e2186f0d"
+  "run.py": "4e8cbb4103dfa0d3a5e8e2b41ed5727295696964a49284a88bb7fc3ecc69a40a"
 }
