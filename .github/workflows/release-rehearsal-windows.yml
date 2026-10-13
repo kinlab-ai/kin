@@ -30,6 +30,7 @@ permissions:
 jobs:
   install-proof:
     name: ${{ matrix.os }}
+    if: ${{ github.event_name != 'release' || inputs.release_tag || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:

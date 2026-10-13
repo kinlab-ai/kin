@@ -49,6 +49,9 @@ test('selectCandidates takes exactly the shape this design creates', () => {
     release({ tag_name: 'v0.6.7-rc.1' }),
     // Not a version tag at all.
     release({ tag_name: 'nightly' }),
+    // App releases and their mutable feed share the repository, not this rail.
+    release({ tag_name: 'mac-v0.1.1-alpha.1' }),
+    release({ tag_name: 'mac-update-feed' }),
   ]);
   assert.deepEqual(picked.map((entry) => entry.tag), ['v0.6.5', 'v0.6.4']);
   assert.equal(picked[0].held, true);
