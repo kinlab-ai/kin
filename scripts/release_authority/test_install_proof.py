@@ -346,6 +346,10 @@ WINDOWS_REQUIRED_VALIDATOR_CHECKS = {
     "kin_daemon_binary": "healthy",
     "shell_path": "healthy",
     "setup_ledger": "healthy",
+    # The leg configures a host Git identity before setup, as a developer's
+    # machine has; a fresh runner without one reads `missing` here, which is
+    # what stopped v0.8.5.
+    "commit_author": "healthy",
     "registry_authority": "unsupported",
     "vfs_projection": "unsupported",
     "semantic_query_readiness": "unsupported",
@@ -2524,6 +2528,9 @@ def assert_install_proof_repo_free_windows_proof(repo_free: str) -> None:
         '["semantic_query_readiness", "unsupported"]',
         '["shell_path", "healthy"]',
         '["setup_ledger", "healthy"]',
+        '["commit_author", "healthy"]',
+        "git config --global user.email ci@firelock.ai",
+        "git config --global user.name ci",
         '["mcp_client_claude", "healthy"]',
         '["mcp_client_cursor", "healthy"]',
         '"mcp_client_codex", "mcp_client_antigravity", "mcp_client_antigravity_workspace"',

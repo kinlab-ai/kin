@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.5] - 2026-10-13
+## [0.8.6] - 2026-10-13
 
-0.8.5 is the first release after 0.8.1. It ships everything recorded under
-0.8.4 below, whose tag was superseded before its release completed.
+0.8.6 is the first release after 0.8.1. It ships everything recorded under
+0.8.5 and 0.8.4 below, whose tags were superseded before their releases
+completed.
+
+### Fixed
+
+- The release's Windows install proof now runs with a Git identity, as a
+  developer's machine has. Without one, Kin's author check correctly reported
+  the fresh install could not commit, which stopped the 0.8.5 release before
+  it was promoted.
+
+## [0.8.5] - 2026-10-13
 
 ### Fixed
 

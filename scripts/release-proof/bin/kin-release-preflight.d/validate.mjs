@@ -195,7 +195,7 @@ import path from "node:path";
 // the same refusal.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "d783bd4b359f011822b61823b79f51821f1cdb48a52f57a1e30350d776cf7133",
+  sha256: "2b2b4a29ab9450a6c1cc29ea8b508e36ee7e8a724d6e747eca7cd9ccb8360cb3",
 };
 
 class Unreadable extends Error {}
