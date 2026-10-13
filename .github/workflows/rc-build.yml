@@ -893,9 +893,15 @@ jobs:
   image:
     name: RC Daemon Image
     if: ${{ github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    # The release image build took 19 to 25 minutes in release.yml; the smokes
-    # add a few. Inside the merge queue's 90-minute window either way.
+    # The same cold, fat-LTO image took 29.4 minutes on the standard pool and
+    # 14.9 on this native 16-core runner, measured once per size on the same
+    # source. 32 cores took 13.4, below the other build legs either way, so
+    # 16 removes the image from the critical path. This pretag producer can
+    # wait for its pool without stranding a release tag; release.yml only
+    # verifies and publishes the archive it uploads.
+    runs-on: depot-ubuntu-24.04-16
+    # A ceiling for a stalled build, with the smokes still inside the merge
+    # queue's 90-minute window.
     timeout-minutes: 45
     permissions:
       contents: read

@@ -7,7 +7,7 @@ rc-build.yml's build job is the only place a release archive is compiled, and
 release.yml compiles nothing: it ships the RC Build bytes the preflight judged.
 These pin the archive build profile, what the archives may contain, that
 release.yml builds nothing, and the runner pools a release-critical workflow
-may use, including the one paid pool RC Build's build job alone is admitted to.
+may use, including the paid pools admitted only to RC Build's pretag producers.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ RC_BUILD = WORKFLOWS / "rc-build.yml"
 
 # A release tag freezes the workflow that its run will execute. Keep every
 # runner selected by the tag mint, tagged release, recovery and public install
-# proof, and by the pretag build apart from the one exception below, on the
+# proof, and by the pretag build apart from the exceptions below, on the
 # standard hosted pool, so a paid or custom pool exhausting its budget cannot
 # strand an immutable release. The tagged release needs no other pool anyway:
 # it builds nothing, so its macOS legs only sign and notarize, which takes
@@ -55,7 +55,7 @@ RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
         "windows-latest",
     }
 )
-# The one exception, and why it is safe. RC Build's build job runs before any
+# The exceptions, and why they are safe. RC Build's producer jobs run before any
 # tag exists, so a paid pool that stops assigning runners there delays a
 # candidate and cannot strand a release: release.yml builds nothing that such a
 # pool could hold up. Its two macOS rows build on the Depot Apple Silicon
@@ -64,12 +64,13 @@ RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
 # release.yml signs them. Its Windows row builds on the 16-core Depot Windows
 # label, where the build step took 18.6 minutes against 39 to 49 on the
 # standard 4-vCPU runner (18.3 on 32 cores, so 16 is the size), and those are
-# the Windows bytes that ship unchanged. The labels are admitted for that one
-# job and nowhere else: RC Build's image, capability and attest jobs, the tag
-# mint, the tagged release, recovery and the public install proof stay on the
-# standard pool.
+# the Windows bytes that ship unchanged. The image producer also uses a
+# reviewed native Linux pool. Each label is admitted only to its producer job:
+# the capability and attest jobs, the tag mint, the tagged release, recovery
+# and the public install proof stay on the standard pool.
 PRETAG_PAID_RUNNERS = {
     (RC_BUILD, "build"): frozenset({"depot-macos-26", "depot-windows-2022-16"}),
+    (RC_BUILD, "image"): frozenset({"depot-ubuntu-24.04-16"}),
 }
 RELEASE_CRITICAL_MATRIX_JOBS = frozenset(
     {
@@ -182,7 +183,10 @@ def assert_release_critical_runner_policy(
                     )
                 seen_matrix_jobs.add(matrix_key)
                 continue
-            if runner not in RELEASE_CRITICAL_STANDARD_RUNNERS:
+            admitted = RELEASE_CRITICAL_STANDARD_RUNNERS | PRETAG_PAID_RUNNERS.get(
+                (workflow, job_id), frozenset()
+            )
+            if runner not in admitted:
                 raise AssertionError(
                     "release-critical runner policy rejects paid, custom, or "
                     f"unreviewed label `{runner}` at {workflow.name}:{job_id}"
@@ -484,6 +488,18 @@ def check_release_critical_runner_pools(workflow_sources: dict[Path, str]) -> No
             "    runs-on: depot-macos-26\n",
         ),
         (
+            "tag mint moves onto the pretag image runner",
+            RELEASE_TAG,
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: depot-ubuntu-24.04-16\n",
+        ),
+        (
+            "RC image moves onto an unreviewed Depot size",
+            RC_BUILD,
+            "    runs-on: depot-ubuntu-24.04-16\n",
+            "    runs-on: depot-ubuntu-24.04-32\n",
+        ),
+        (
             "tagged release returns to a paid runner",
             RELEASE,
             "          - os: macos-15-intel\n",
@@ -556,7 +572,7 @@ def check_release_critical_runner_pools(workflow_sources: dict[Path, str]) -> No
             '{"os":"macos-15-intel","setup-shell":"zsh"}',
             '{"os":"macos-15-large","setup-shell":"zsh"}',
         ),
-        # The pretag Depot label is admitted for RC Build's build job alone.
+        # Each pretag Depot label is admitted for its reviewed producer alone.
         # Each of these moves it somewhere a tag depends on, or widens the
         # exception to a second paid label, and each must still be refused
         # after its matrix contract is deliberately repinned.
@@ -573,6 +589,20 @@ def check_release_critical_runner_pools(workflow_sources: dict[Path, str]) -> No
             "capability",
             "          - os: macos-15-intel\n",
             "          - os: depot-macos-26\n",
+        ),
+        (
+            "a repinned RC capability matrix still rejects the pretag image runner",
+            RC_BUILD,
+            "capability",
+            "          - os: windows-latest\n",
+            "          - os: depot-ubuntu-24.04-16\n",
+        ),
+        (
+            "a repinned RC build matrix still rejects the pretag image runner",
+            RC_BUILD,
+            "build",
+            "          - os: ubuntu-latest\n",
+            "          - os: depot-ubuntu-24.04-16\n",
         ),
         (
             "a repinned install-proof matrix still rejects the pretag Depot runner",
