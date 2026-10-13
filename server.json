@@ -8,12 +8,12 @@
     "url": "https://github.com/kinlab-ai/kin",
     "source": "github"
   },
-  "version": "0.8.4",
+  "version": "0.8.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@kinlab/kin",
-      "version": "0.8.4",
+      "version": "0.8.5",
       "packageArguments": [
         {
           "type": "positional",
