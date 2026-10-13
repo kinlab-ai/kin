@@ -94,10 +94,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A ceiling on a build that stops making progress, not a queue bound. In a
     # merge group it is 60: the whole run has to finish inside the merge
-    # queue's 90-minute check window, and the slowest leg, Windows on the
-    # standard runner, measured 31 to 41 minutes (rc-build runs 38238857203 and
-    # 38255291752), with the Depot macOS legs at 13 to 21. 60 for a build leg
-    # plus 15 for the capability or attest job after it is 75 at worst. A
+    # queue's 90-minute check window. The Windows leg measured 31 to 49
+    # minutes on the standard runner (rc-build runs 38238857203, 38255291752
+    # and 38334103441) and 18.6 on Depot, with the Depot macOS legs at 13 to
+    # 21 and the Linux legs at 16 to 24. 60 for a build leg plus 15 for the
+    # capability or attest job after it is 75 at worst. A
     # dispatched candidate keeps 120: the macOS arm64 leg reached the old
     # 90-minute bound on both 0.8.2 candidate attempts on the standard runner,
     # and a dispatch can still be sent to that pool for a measurement.
@@ -121,8 +122,8 @@ jobs:
           # the kernel's memory pressure at normal throughout. The arm64 leg
           # still links one binary at a time. Linking both at once took 12.4
           # minutes (38255295674) but compressed 8.3 GB and raised the pressure
-          # level to warning, and the Windows leg sets this workflow's critical
-          # path at over 30 minutes either way.
+          # level to warning, and the linux-aarch64 leg, whose build step takes
+          # 23 to 24 minutes, sets this workflow's critical path either way.
           #
           # This is a paid, third-party pool, and the macOS bytes it builds are
           # now the macOS bytes that ship once release.yml signs them. It runs
@@ -148,7 +149,20 @@ jobs:
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
             cross: false
-          - os: windows-latest
+          # The Windows archive builds on a 16-core Depot Windows runner, on
+          # the same terms as the macOS rows above. On the standard 4-vCPU
+          # windows-latest runner its build step took 39 to 49 minutes and set
+          # this workflow's critical path. About 9 of those compile the crates
+          # and the rest is the two fat-LTO links, each on one thread. Measured
+          # once per size on the same source, the step took 18.6 minutes here
+          # and 18.3 on 32 cores, so more cores no longer help. The two links
+          # held about 12 GB resident together and took the machine's commit to
+          # about 17 GB, past the standard runner's 16 GB of RAM, which is the
+          # likely reason they ran so much slower there. This is the Windows
+          # Server 2022 image while windows-latest is Server 2025, and the
+          # capability job below still installs and runs the archive on
+          # windows-latest.
+          - os: depot-windows-2022-16
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
             cross: false
@@ -1382,8 +1396,8 @@ jobs:
   # repository code: it downloads what the build and image jobs uploaded, checks
   # each file against its sidecar, and signs. It runs on a GitHub-hosted runner,
   # which `--deny-self-hosted-runners` in release.yml requires of the signer;
-  # the macOS bytes it signs were built on the Depot pool above, which is what
-  # the run's own job list records.
+  # the macOS and Windows bytes it signs were built on the Depot pools above,
+  # which is what the run's own job list records.
   attest:
     name: RC Attest
     needs: [build, image]

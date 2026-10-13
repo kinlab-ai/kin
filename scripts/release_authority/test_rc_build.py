@@ -58,14 +58,18 @@ RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
 # The one exception, and why it is safe. RC Build's build job runs before any
 # tag exists, so a paid pool that stops assigning runners there delays a
 # candidate and cannot strand a release: release.yml builds nothing that such a
-# pool could hold up. Its two macOS rows build on this Depot Apple Silicon
+# pool could hold up. Its two macOS rows build on the Depot Apple Silicon
 # label, where each build step takes 12 to 21 minutes against 77 to 79 on the
 # standard runners, and those bytes are the macOS bytes that ship once
-# release.yml signs them. The label is admitted for that one job and nowhere
-# else: RC Build's image, capability and attest jobs, the tag mint, the tagged
-# release, recovery and the public install proof stay on the standard pool.
+# release.yml signs them. Its Windows row builds on the 16-core Depot Windows
+# label, where the build step took 18.6 minutes against 39 to 49 on the
+# standard 4-vCPU runner (18.3 on 32 cores, so 16 is the size), and those are
+# the Windows bytes that ship unchanged. The labels are admitted for that one
+# job and nowhere else: RC Build's image, capability and attest jobs, the tag
+# mint, the tagged release, recovery and the public install proof stay on the
+# standard pool.
 PRETAG_PAID_RUNNERS = {
-    (RC_BUILD, "build"): frozenset({"depot-macos-26"}),
+    (RC_BUILD, "build"): frozenset({"depot-macos-26", "depot-windows-2022-16"}),
 }
 RELEASE_CRITICAL_MATRIX_JOBS = frozenset(
     {
@@ -582,6 +586,34 @@ def check_release_critical_runner_pools(workflow_sources: dict[Path, str]) -> No
             "build",
             "          - os: depot-macos-26\n            target: aarch64-apple-darwin\n",
             "          - os: depot-macos-15\n            target: aarch64-apple-darwin\n",
+        ),
+        (
+            "a repinned RC capability matrix still rejects the pretag Depot Windows runner",
+            RC_BUILD,
+            "capability",
+            "          - os: windows-latest\n",
+            "          - os: depot-windows-2022-16\n",
+        ),
+        (
+            "a repinned tagged-release shipping matrix still rejects the pretag Depot Windows runner",
+            RELEASE,
+            "ship_rc_archives",
+            "          - os: windows-latest\n",
+            "          - os: depot-windows-2022-16\n",
+        ),
+        (
+            "a repinned install-proof matrix still rejects the pretag Depot Windows runner",
+            INSTALL_PROOF,
+            "install-proof",
+            '{"os":"windows-latest","setup-shell":"powershell"}',
+            '{"os":"depot-windows-2022-16","setup-shell":"powershell"}',
+        ),
+        (
+            "a repinned RC build matrix still rejects a second Depot Windows size",
+            RC_BUILD,
+            "build",
+            "          - os: depot-windows-2022-16\n",
+            "          - os: depot-windows-2022-32\n",
         ),
     ):
         repinned_spoof = dict(workflow_sources)

@@ -79,7 +79,7 @@ test("prose and registry reads are not compiles", () => {
 // 2. rc-build.yml produces exactly the located archives and the image.
 
 test("an archive RC Build stops building, or builds for another target, is reported", () => {
-  const dropped = replaceOnce(rc, "          - os: windows-latest\n            target: x86_64-pc-windows-msvc\n            artifact: kin-windows-x86_64\n            cross: false\n", "");
+  const dropped = replaceOnce(rc, "          - os: depot-windows-2022-16\n            target: x86_64-pc-windows-msvc\n            artifact: kin-windows-x86_64\n            cross: false\n", "");
   const problems = check(release, dropped);
   assert.ok(problems.some((problem) => /builds kin-linux-x86_64, .* but scripts\/locate-rc-build\.mjs locates/.test(problem)), problems.join("\n"));
   const retargeted = replaceOnce(rc, "            target: aarch64-unknown-linux-musl\n            artifact: kin-linux-aarch64", "            target: aarch64-unknown-linux-gnu\n            artifact: kin-linux-aarch64");

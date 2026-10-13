@@ -464,7 +464,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/rc-build.yml",
         "build",
-    ): "22d9e7389fc4053a37e86b1eabf0b2da6e18ad3968c96b8e1f21eece4407f5b8",
+    ): "d548aec1dfb72f778e575467b70033f3c9d80688181ec23bb91adbbaf9694c1c",
     (
         ".github/workflows/rc-build.yml",
         "capability",
