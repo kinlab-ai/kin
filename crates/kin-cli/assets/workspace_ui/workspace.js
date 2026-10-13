@@ -1306,7 +1306,7 @@
     const feedback = h("span", { class: "note", role: "status" });
     const actions = h("div", { class: "entity-actions" });
     if (data.editor) {
-      actions.append(h("a", { class: "button button-primary", href: data.editor, on: { click: () => { feedback.textContent = "Sent to VS Code. If nothing opens, install Kin for VS Code and open this repository there."; } } }, icon("editor"), "Open in VS Code"));
+      actions.append(h("a", { class: "button button-primary", href: data.editor, on: { click: () => { feedback.textContent = "If prompted, confirm to open VS Code or cancel to stay here. If nothing opens, install Kin for VS Code and open this repository there."; } } }, icon("editor"), "Open in VS Code"));
     }
     actions.append(button("Copy entity ID", async () => {
       try { await navigator.clipboard.writeText(data.id); feedback.textContent = "Copied."; }

@@ -161,4 +161,5 @@ pub use repository_authority::{
     open_persisted_local_repository_authority, published_change, rejoined_receipt,
     revalidate_pinned_local_namespace, DurableSemanticEnrichmentSummary,
     LocalRepositoryAuthorityBinding, PinnedNamespaceRefusal, PublishedChange,
+    RepositoryAuthorityOpenProbe,
 };

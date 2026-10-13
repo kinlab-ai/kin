@@ -3214,7 +3214,10 @@ fn evaluate_embedding_coverage(
 /// an embedding signal that cannot exist. A partial index answers yes: it is
 /// filling, and the fused arm already reports that as the gap it is.
 fn vectors_usable(coverage: &SemanticCoverage, index_attached: bool) -> bool {
-    cfg!(feature = "embeddings") && coverage.supported && index_attached && coverage.indexed > 0
+    cfg!(any(feature = "embeddings", feature = "external-embeddings"))
+        && coverage.supported
+        && index_attached
+        && coverage.indexed > 0
 }
 
 /// The arm a description query on `graph` runs now: the one the environment

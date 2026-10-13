@@ -44,6 +44,9 @@ permissions:
 jobs:
   install-proof:
     name: ${{ matrix.os }}
+    # Explicit callers keep their selected release. Automatic publication only
+    # installs CLI v-tags; Mac app releases use their own namespace and feed.
+    if: ${{ github.event_name != 'release' || inputs.release_tag || startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ${{ matrix.os }}
     # 90 is a runaway backstop, not a ceiling any leg is expected to reach.
     # It was raised from 45 because v0.5.48's Windows leg was cancelled at

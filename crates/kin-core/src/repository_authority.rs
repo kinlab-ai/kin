@@ -589,8 +589,88 @@ thread_local! {
 ///
 /// Read it as a delta across the operation under test, never as an absolute:
 /// the thread may have opened before you looked.
+/// Use [`RepositoryAuthorityOpenProbe`] when the operation runs on other workers.
 pub fn authority_opens() -> u64 {
     AUTHORITY_OPENS.with(std::cell::Cell::get)
+}
+
+#[derive(Debug)]
+struct AuthorityOpenProbeState {
+    repository_id: RepositoryId,
+    opens: std::sync::atomic::AtomicU64,
+}
+
+// Only explicitly observed operations allocate this registry. Weak entries
+// cannot retain a finished measurement, and the scope removes its own entry.
+static AUTHORITY_OPEN_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<Vec<std::sync::Weak<AuthorityOpenProbeState>>>,
+> = std::sync::OnceLock::new();
+
+/// Count persisted-authority open attempts for one repository across workers.
+///
+/// This observes the same recovery funnel as [`authority_opens`], including
+/// failed attempts, while isolating the reading from opens of other repositories.
+/// Other backends or clones carrying the same repository identity are included.
+/// Hold the probe until the operation and its workers have finished, then read
+/// [`Self::opens`]. Dropping it unregisters the scope; no history is accumulated.
+#[derive(Debug)]
+pub struct RepositoryAuthorityOpenProbe {
+    state: Arc<AuthorityOpenProbeState>,
+}
+
+impl RepositoryAuthorityOpenProbe {
+    /// Begin a fresh measurement for `repository_id`.
+    pub fn new(repository_id: RepositoryId) -> Self {
+        let state = Arc::new(AuthorityOpenProbeState {
+            repository_id,
+            opens: std::sync::atomic::AtomicU64::new(0),
+        });
+        let registry = AUTHORITY_OPEN_PROBES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        let mut probes = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        probes.retain(|probe| probe.strong_count() > 0);
+        probes.push(Arc::downgrade(&state));
+        Self { state }
+    }
+
+    /// Actual recovery-funnel attempts since this scope began.
+    pub fn opens(&self) -> u64 {
+        self.state.opens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for RepositoryAuthorityOpenProbe {
+    fn drop(&mut self) {
+        let registry = AUTHORITY_OPEN_PROBES
+            .get()
+            .expect("an authority probe registered its scope");
+        let own_entry = Arc::downgrade(&self.state);
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|probe| probe.strong_count() > 0 && !probe.ptr_eq(&own_entry));
+    }
+}
+
+fn record_scoped_authority_open(repository_id: &RepositoryId) {
+    let Some(registry) = AUTHORITY_OPEN_PROBES.get() else {
+        return;
+    };
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|probe| {
+            let Some(state) = probe.upgrade() else {
+                return false;
+            };
+            if &state.repository_id == repository_id {
+                state
+                    .opens
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            true
+        });
 }
 
 /// Open an already initialized local repository through one coherent recovery.
@@ -621,6 +701,7 @@ pub fn open_persisted_local_repository_authority<B: StorageBackend + ?Sized + 's
     // wrapper's: the count is what an operator needs when a read is slow, and a
     // level nobody turns on is a line nobody reads.
     AUTHORITY_OPENS.with(|count| count.set(count.get() + 1));
+    record_scoped_authority_open(&repository_id);
     let caller = std::panic::Location::caller();
     tracing::info!(
         repository = %repository_id,
@@ -742,6 +823,48 @@ fn classify_pinned_namespace_probe(
 #[cfg(test)]
 mod payload_receipt_tests {
     use super::*;
+
+    #[test]
+    fn scoped_authority_open_probe_follows_workers_and_excludes_other_repositories() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = crate::init(directory.path()).unwrap();
+        let binding = LocalRepositoryAuthorityBinding::from_layout(&initialized.layout).unwrap();
+        let other_directory = tempfile::tempdir().unwrap();
+        let other_initialized = crate::init(other_directory.path()).unwrap();
+        let other_binding =
+            LocalRepositoryAuthorityBinding::from_layout(&other_initialized.layout).unwrap();
+        assert_ne!(binding.repository_id(), other_binding.repository_id());
+
+        let probe = RepositoryAuthorityOpenProbe::new(binding.repository_id().clone());
+        let other_probe = RepositoryAuthorityOpenProbe::new(other_binding.repository_id().clone());
+        let thread_before = authority_opens();
+        std::thread::scope(|workers| {
+            workers.spawn(|| {
+                let before = authority_opens();
+                binding.open_manager().unwrap();
+                binding.open_manager_with_payload_stats().unwrap();
+                assert_eq!(authority_opens() - before, 2);
+            });
+            workers.spawn(|| {
+                other_binding.open_manager().unwrap();
+            });
+        });
+        assert_eq!(authority_opens(), thread_before);
+        assert_eq!(probe.opens(), 2);
+        assert_eq!(other_probe.opens(), 1);
+
+        let retired = Arc::downgrade(&probe.state);
+        drop(probe);
+        assert!(
+            retired.upgrade().is_none(),
+            "finished scopes are not retained"
+        );
+        let fresh = RepositoryAuthorityOpenProbe::new(binding.repository_id().clone());
+        assert_eq!(fresh.opens(), 0);
+        binding.open_manager().unwrap();
+        assert_eq!(fresh.opens(), 1);
+        assert_eq!(other_probe.opens(), 1);
+    }
 
     #[test]
     fn generation_zero_built_only_in_memory_reports_no_payload_receipt() {

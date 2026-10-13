@@ -2069,6 +2069,54 @@ def assert_install_proof_gate_grades_the_merge_queue(ci: str) -> None:
             )
 
 
+INSTALL_PROOF_CLI_RELEASE_EVENT_FILTER = (
+    "${{ github.event_name != 'release' || inputs.release_tag || "
+    "startsWith(github.event.release.tag_name, 'v') }}"
+)
+
+
+def assert_install_proof_cli_release_events_only(install_proof: str) -> None:
+    job = workflow_job_blocks(install_proof)["install-proof"]
+    guards = [value.strip() for key, value in job_top_level_mapping_fields(job) if key == "if"]
+    if len(guards) != 1 or not guards[0].startswith("${{") or not guards[0].endswith("}}"):
+        raise AssertionError("install-proof must carry one job-level release event guard before its matrix")
+    expression = guards[0][3:-2].strip()
+    cases = [
+        ("CLI stable", "release", "v0.8.6", False, "", True),
+        ("CLI stable published as prerelease", "release", "v0.8.7", True, "", True),
+        ("CLI prerelease", "release", "v0.8.7-rc.1", True, "", True),
+        ("retired archive policy remains inside proof", "release", "v0.7.19", False, "", True),
+        ("Mac alpha", "release", "mac-v0.1.1-alpha.1", True, "", False),
+        ("Mac stable", "release", "mac-v1.0.0", False, "", False),
+        ("Mac update feed", "release", "mac-update-feed", True, "", False),
+        ("empty release tag", "release", "", False, "", False),
+        ("workflow dispatch latest", "workflow_dispatch", "", False, "", True),
+        ("workflow dispatch exact", "workflow_dispatch", "", False, "v0.8.6", True),
+        ("weekly latest", "schedule", "", False, "", True),
+        ("called release push", "push", "", False, "v0.8.6", True),
+        ("called merge group", "merge_group", "", False, "v0.8.6", True),
+        ("called pull request", "pull_request", "", False, "v0.8.6", True),
+        ("explicit call from another release event", "release", "mac-v0.1.1-alpha.1", True, "v0.8.6", True),
+    ]
+    payload = [{"name": name, "github": {"event_name": event, "event": {"release": {
+        "tag_name": tag, "prerelease": prerelease}}}, "inputs": {"release_tag": selected},
+        "expected": expected} for name, event, tag, prerelease, selected, expected in cases]
+    # Run the actual job expression. startsWith follows Actions' case-insensitive
+    # string comparison; caller data stays separate from the expression source.
+    script = """const cases = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const guard = new Function('github', 'inputs', 'startsWith', 'return Boolean(' + process.argv[1] + ')');
+const startsWith = (value, prefix) => String(value ?? '').toLowerCase().startsWith(prefix.toLowerCase());
+for (const c of cases) {
+  const actual = guard(c.github, c.inputs, startsWith);
+  if (actual !== c.expected) throw new Error('install-proof misroutes ' + c.name);
+}
+"""
+    result = subprocess.run(["node", "-e", script, expression], input=json.dumps(payload),
+        text=True, capture_output=True, timeout=10)
+    if result.returncode:
+        raise AssertionError(result.stdout + result.stderr)
+
+
 def assert_install_proof_every_leg_gates_the_release(install_proof: str) -> None:
     """Require every install-proof matrix row to gate the release.
 
@@ -2422,9 +2470,10 @@ def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
     spelling of ``runner.os != 'Windows'`` lets an equivalent Linux-only
     expression, a job-level guard, a matrix exclusion, or a fixed non-Windows
     runner silently remove the Windows leg while the policy test stays green.
-    The three release-critical steps are therefore unconditional inside one
-    canonical matrix job whose runner is the matrix OS and whose include list
-    contains an unexcluded ``windows-latest`` row.
+    Only the reviewed CLI release namespace guard may scope the job. The three
+    release-critical steps remain unconditional inside one canonical matrix
+    job whose runner is the matrix OS and whose include list contains an
+    unexcluded ``windows-latest`` row.
     """
 
     jobs = workflow_job_blocks(install_proof)
@@ -2433,10 +2482,11 @@ def assert_install_proof_repo_steps_cover_windows(install_proof: str) -> None:
         raise AssertionError("native Windows release proof lost the install-proof job")
 
     job_fields = job_top_level_mapping_fields(install_job)
-    if any(key == "if" for key, _ in job_fields):
+    conditions = [value.strip() for key, value in job_fields if key == "if"]
+    if conditions != [INSTALL_PROOF_CLI_RELEASE_EVENT_FILTER]:
         raise AssertionError(
             "native Windows release proof lost repository coverage: install-proof "
-            "must not carry a job-level condition"
+            "admits only its reviewed CLI release event job-level condition"
         )
     runs_on = [value.strip() for key, value in job_fields if key == "runs-on"]
     if runs_on != ["${{ matrix.os }}"]:
@@ -3330,6 +3380,18 @@ def check_install_proof_legs_and_pull_request_gate(
     ported_validator: str,
     preflight_driver: str,
 ) -> None:
+    assert_install_proof_cli_release_events_only(install_proof)
+    guard = "    if: " + INSTALL_PROOF_CLI_RELEASE_EVENT_FILTER + "\n"
+    for label, replacement, error in (
+        ("release guard removed", "", "one job-level release event guard"),
+        ("all published releases admitted", "    if: ${{ true }}\n", "misroutes Mac alpha"),
+        ("CLI prerelease publications excluded", "    if: ${{ github.event_name != 'release' || inputs.release_tag || (startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease) }}\n", "misroutes CLI stable published as prerelease"),
+        ("non-release callers excluded", "    if: ${{ startsWith(github.event.release.tag_name, 'v') }}\n", "misroutes workflow dispatch latest"),
+        ("explicit reusable call loses its input", "    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v') }}\n", "misroutes explicit call from another release event"),
+    ):
+        expect_assertion(label, error,
+            lambda replacement=replacement: assert_install_proof_cli_release_events_only(
+                replace_exactly_once(install_proof, guard, replacement, label)))
     assert_install_proof_repo_steps_cover_windows(install_proof)
     for repo_step in (
         "First-run repository, daemon, and setup proof",
