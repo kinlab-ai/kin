@@ -129,6 +129,7 @@ def main() -> None:
     test_installers.check_installer_registry_authority(install_ps1, install_sh)
     test_release.check_release_trigger_and_completion_seal(release)
     test_release.check_release_consumes_rc_build(release)
+    test_release.check_linux_notarization_refused(release)
     test_release_tag.check_release_tag_authority(release_tag)
     test_release_train.check_release_train_authority(release_train)
     test_release_tag.check_abandoned_tag_admission(

@@ -182,8 +182,8 @@ ACCEPTANCE_CONTEXTS = (("Product Acceptance", ACCEPTANCE_WORKFLOW_ID, ACCEPTANCE
 # release/v0.8.2-candidate branch still points at it, so neither the cut nor the
 # mint may act on either version even if main still stages one of them.
 RETIRED_VERSIONS = {
-    "0.8.2": "cancelled on 2026-10-12; the next release is 0.8.4",
-    "0.8.3": "cancelled on 2026-10-12; the next release is 0.8.4",
+    "0.8.2": "cancelled on 2026-10-12 and never published",
+    "0.8.3": "cancelled on 2026-10-12 and never published",
 }
 # The commit status the cut posts on a merge group commit, so the merge queue
 # can hold a release candidate until its preflight record is filed and the push

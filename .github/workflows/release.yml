@@ -92,6 +92,14 @@ jobs:
   # dispatch is intentionally disabled: a dispatch can target branch-controlled
   # workflow code, which must never inherit Apple or package-publish secrets.
   # When the variable is not true, notarization stays on native notarytool.
+  #
+  # The Linux path cannot ship yet, so this job refuses the variable when it is
+  # true. sign_macos packs the archive before notarize_linux submits, and
+  # notarize_linux only runs `rcodesign notary-submit`: it never staples
+  # KinNotifier.app or repacks the archive, so the bundle would ship without
+  # the ticket the notarytool path staples into it. Lift the refusal in the
+  # same change that makes notarize_linux staple the bundle, then repack the
+  # archive and regenerate its checksum and provenance manifest.
   config:
     name: Resolve release config
     runs-on: ubuntu-latest
@@ -132,13 +140,13 @@ jobs:
         env:
           REPO_VAR: ${{ vars.NOTARIZE_ON_LINUX }}
         run: |
+          set -euo pipefail
           if [ "$REPO_VAR" = "true" ]; then
-            echo "notarize_on_linux=true" >> "$GITHUB_OUTPUT"
-            echo "Notarization backend: rcodesign on Linux"
-          else
-            echo "notarize_on_linux=false" >> "$GITHUB_OUTPUT"
-            echo "Notarization backend: xcrun notarytool on macOS (default)"
+            echo "::error::NOTARIZE_ON_LINUX is true, but the Linux notarization path cannot ship a notarized release: notarize_linux submits after sign_macos has packed the archive and never staples KinNotifier.app or repacks, so the bundle would ship without its ticket. Unset the variable to notarize with notarytool on macOS."
+            exit 1
           fi
+          echo "notarize_on_linux=false" >> "$GITHUB_OUTPUT"
+          echo "Notarization backend: xcrun notarytool on macOS (default)"
 
       - name: Refuse release-channel rollback
         id: release_order
@@ -1016,7 +1024,9 @@ jobs:
           # fail with no daemon on PATH, so a missing daemon must fail the build.
           cp "$STAGE/kin-daemon" "$ARTIFACT/"
           # KinNotifier.app is macOS-only and is copied whole: -R preserves the
-          # bundle structure and the stapled notarization ticket inside it.
+          # bundle structure and the ticket the notarytool step stapled into
+          # it. The Linux backend notarizes only after this packing and staples
+          # nothing, which is why config refuses NOTARIZE_ON_LINUX.
           cp -R "$STAGE/KinNotifier.app" "$ARTIFACT/"
           # Words, not just executables. Both arms of the isolated stranger run
           # installed this archive successfully and both scored the packaging
@@ -1115,9 +1125,13 @@ jobs:
   # sign_macos job has already codesigned natively on macOS and uploaded the
   # signed zips. rcodesign calls the same Apple Notary API as notarytool and accepts the
   # same zip of standalone Mach-O binaries, so the resulting ticket (server-side,
-  # keyed by code-signature hash) covers the identical binaries already packaged
-  # into the published .tar.gz, so the published artifacts are unchanged. This job
-  # is a gate: if notarization fails, the release fails.
+  # keyed by code-signature hash) covers the bare binaries already packaged into
+  # the published .tar.gz. It does not cover KinNotifier.app the way the
+  # notarytool path does: that path staples the bundle before packing, while
+  # this job runs after the archive is packed, staples nothing and repacks
+  # nothing, so the bundle would ship without its ticket. config therefore
+  # refuses NOTARIZE_ON_LINUX and this job cannot run until that changes. This
+  # job is a gate: if notarization fails, the release fails.
   notarize_linux:
     name: Notarize macOS binaries (Linux / rcodesign)
     needs: [config, sign_macos]
@@ -1182,8 +1196,11 @@ jobs:
           # One signed zip per macOS leg. --wait blocks on Apple Notary;
           # --max-wait-seconds 1800 mirrors the macOS notarytool 30m cap so a
           # stalled Apple queue fails fast (and a re-run picks up the result).
-          # Bare binaries are not stapled (the ticket validates online), exactly
-          # as the macOS notarytool path does.
+          # Nothing is stapled here. Bare binaries cannot be stapled and
+          # validate online, but the notarytool path also staples
+          # KinNotifier.app, and this job neither staples it nor repacks the
+          # archive sign_macos already packed. config refuses this backend
+          # until it does both.
           shopt -s nullglob
           zips=(*-notarize.zip)
           if [ ${#zips[@]} -eq 0 ]; then
@@ -1349,7 +1366,8 @@ jobs:
       # manifest must name the located run; the Linux and Windows archives must
       # be byte for byte the RC Build archives; every archive a preflight leg
       # judged must be, or for macOS must have been signed from, the archive
-      # with the sha256 the preflight recorded.
+      # with the sha256 the preflight recorded. A leg judges the tarball, which
+      # on Windows is not the primary archive.
       - name: Verify the shipped archives against the RC Build
         env:
           RC_RUN_ID: ${{ needs.locate_rc_build.outputs.run_id }}
@@ -1391,9 +1409,18 @@ jobs:
                   `${shipped.name} is ${shipped.sha256}, not RC Build's ${built.sha256}`);
               }
             }
+            // A preflight leg judges <artifact>.tar.gz, the only archive
+            // kin-release-preflight accepts and the one release-cut.yml hands
+            // it. On Windows that is the additional archive beside the primary
+            // zip, so the judged record is found by that name, the same one
+            // preflightArchive in scripts/locate-rc-build.mjs names.
             if (artifact in preflight) {
-              fail(rc.archive.sha256 === preflight[artifact],
-                `${artifact} came from ${rc.archive.sha256}, but the preflight judged ${preflight[artifact]}`);
+              const judgedName = `${artifact}.tar.gz`;
+              const judged = [rc.archive, ...(rc.additional_archives ?? [])].find(
+                (record) => record?.name === judgedName,
+              );
+              fail(judged?.sha256 === preflight[artifact],
+                `${judgedName} came from ${judged?.sha256 ?? "<absent>"}, but the preflight judged ${preflight[artifact]}`);
             }
             console.log(
               signed

@@ -219,9 +219,11 @@ Notarization uploads the signed binaries to Apple, which scans them and, on
 success, issues a notarization ticket bound to the binaries' code-signing
 identity. The `--wait` makes the job block on the result (capped at 30 minutes so
 a stalled Apple queue fails fast rather than burning the runner), and a
-notarization rejection fails the job. Tagged releases require either the native
-Apple ID credential set or the explicitly selected Linux rcodesign credential
-set; missing credentials fail the release.
+notarization rejection fails the job. Tagged releases require the native Apple
+ID credential set, and missing credentials fail the release. A Linux `rcodesign`
+backend sits behind the `NOTARIZE_ON_LINUX` repository variable, but the release
+refuses that variable for now: the Linux job submits after the archive is packed
+and staples nothing, so `KinNotifier.app` would ship without its ticket.
 
 ### 3. Online ticket validation (no stapling)
 
@@ -229,6 +231,9 @@ The released artifacts are bare CLI binaries inside a `.tar.gz`. Apple's
 `xcrun stapler` can only staple `.app` bundles, `.dmg`, `.pkg`, and `.xip`, so
 the notarization ticket is **not stapled to the artifact**. Instead the ticket
 lives on Apple's servers and is validated **online by Gatekeeper on first run**.
+
+`KinNotifier.app` is the exception. It is a bundle, so the release staples its
+ticket into it before packing the archive, and it verifies offline.
 
 Audit consequence: an end user verifying notarization offline (e.g.
 `stapler validate`) will not find a stapled ticket on the tarball or the bare
