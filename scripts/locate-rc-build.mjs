@@ -98,6 +98,16 @@ export const RC_ARTIFACTS = Object.freeze([...RC_ARCHIVES.map((entry) => entry.a
 // the run's identity, the records it wrote and its attestation, and RC Build
 // installed every archive and smoke-tested the image in that run.
 export const PREFLIGHT_REQUIRED = Object.freeze(["kin-linux-aarch64", "kin-linux-x86_64", "kin-macos-aarch64"]);
+// The archive a preflight leg judges for an artifact, and so the one whose
+// sha256 its record names. kin-release-preflight accepts only a
+// kin-<os>-<arch>.tar.gz and names the leg's target after that file, and
+// release-cut.yml's preflight job hands it <artifact>.tar.gz from the RC Build
+// download. That tarball is the primary archive on every platform but Windows,
+// whose primary archive is the zip and whose tarball is the additional one. So
+// a preflight digest is compared with the record this names, never with
+// whichever archive is primary. release.yml's publish job reads the same name
+// out of each manifest's rc_build records.
+export const preflightArchive = (artifact) => `${artifact}.tar.gz`;
 // Who may have dispatched a candidate-branch run. Release Cut dispatches
 // rc-build.yml with the release App's token when the App holds the Actions
 // permission and with the workflow token otherwise, which GitHub records as
@@ -370,10 +380,10 @@ export function verifyArchiveArtifact(dir, entry, context) {
   );
   const digests = Object.fromEntries(entry.archives.map((name) => [name, judgeSidecar(dir, name)]));
   const judged = context.preflight[entry.artifact];
-  const primaryTarball = `${entry.artifact}.tar.gz`;
-  if (judged !== undefined && digests[primaryTarball] !== judged) {
+  const judgedArchive = preflightArchive(entry.artifact);
+  if (judged !== undefined && digests[judgedArchive] !== judged) {
     throw new Error(
-      `${primaryTarball} downloaded from run ${context.runId} is ${digests[primaryTarball] ?? "<absent>"}, but the ` +
+      `${judgedArchive} downloaded from run ${context.runId} is ${digests[judgedArchive] ?? "<absent>"}, but the ` +
         `preflight judged ${judged}; these are not the bytes the preflight judged`,
     );
   }

@@ -5,10 +5,18 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import tempfile
 
-from .test_helpers import ROOT, expect_assertion, require, workflow_job_blocks
+from .test_helpers import (
+    ROOT,
+    expect_assertion,
+    require,
+    workflow_job_blocks,
+    workflow_step_shell,
+)
 
 
 
@@ -875,16 +883,30 @@ def assert_release_consumes_rc_build(release: str, locator: str) -> None:
         'rc.workflow === ".github/workflows/rc-build.yml"',
         "String(rc.run_id) === process.env.RC_RUN_ID",
         "shipped.sha256 === built.sha256",
-        "rc.archive.sha256 === preflight[artifact]",
+        "const judgedName = `${artifact}.tar.gz`;",
+        "[rc.archive, ...(rc.additional_archives ?? [])].find(",
+        "fail(judged?.sha256 === preflight[artifact],",
         "rc_build: {",
     ):
         require(publish, policy, "publish binds every archive to the located RC Build")
+    # A preflight leg judges <artifact>.tar.gz. The primary archive is that
+    # tarball everywhere but Windows, whose primary archive is the zip, so a
+    # publish job comparing the primary record with the preflight digest
+    # refuses the first release that carries a Windows leg, while locate,
+    # which reads the tarball, admits it.
+    if "rc.archive.sha256 === preflight[artifact]" in publish:
+        raise AssertionError(
+            "publish compares the preflight digest with the primary archive, which is "
+            "not the archive a Windows preflight leg judged"
+        )
 
     for policy in (
         'export const RC_BUILD_WORKFLOW = ".github/workflows/rc-build.yml";',
         "export const MERGE_QUEUE_BRANCH = /^gh-readonly-queue\\/main\\/pr-[1-9][0-9]*-[0-9a-f]{40}$/;",
         'export const RELEASE_AUTOMATION_ACTORS = Object.freeze(["github-actions[bot]", "kin-release-bot[bot]"]);',
         "judgePreflight(record, sha);",
+        "export const preflightArchive = (artifact) => `${artifact}.tar.gz`;",
+        "const judgedArchive = preflightArchive(entry.artifact);",
         '"--signer-workflow", `${repository}/${RC_BUILD_WORKFLOW}`',
         '"--signer-digest", sha',
         '"--source-digest", sha',
@@ -953,6 +975,16 @@ def check_release_consumes_rc_build(release: str) -> None:
                 "String(rc.run_id) === process.env.RC_RUN_ID", "true", 1)),
             "publish binds every archive to the located RC Build",
         ),
+        (
+            "the publish job judges the preflight digest against the primary archive again",
+            lambda text: text.replace(jobs["publish"], jobs["publish"].replace(
+                "            if (artifact in preflight) {\n",
+                "            if (artifact in preflight) {\n"
+                "              fail(rc.archive.sha256 === preflight[artifact], `${artifact} primary`);\n",
+                1,
+            )),
+            "not the archive a Windows preflight leg judged",
+        ),
     ):
         mutated = mutate(release)
         if mutated == release:
@@ -965,6 +997,7 @@ def check_release_consumes_rc_build(release: str) -> None:
     for label, needle in (
         ("the locator admits a run from another workflow", '"--signer-workflow", `${repository}/${RC_BUILD_WORKFLOW}`'),
         ("the locator stops binding attestations to the selected run", "signedBySelectedRun"),
+        ("the locator judges the primary archive instead of the preflight's", "const judgedArchive = preflightArchive(entry.artifact);"),
     ):
         expect_assertion(
             label,
@@ -983,4 +1016,99 @@ def check_release_consumes_rc_build(release: str) -> None:
             "the RC Build to release contract suites failed:\n"
             + completed.stdout[-4000:]
             + completed.stderr[-2000:]
+        )
+
+
+NOTARIZE_BACKEND_STEP = "Resolve notarize backend"
+
+
+def run_notarize_backend(config: str, value: str) -> tuple[int, str, str]:
+    """Run config's backend step as written, with NOTARIZE_ON_LINUX set to `value`."""
+
+    shell = workflow_step_shell(config, NOTARIZE_BACKEND_STEP)
+    with tempfile.TemporaryDirectory(prefix="kin-notarize-backend-") as scratch:
+        output = os.path.join(scratch, "github-output")
+        open(output, "w", encoding="utf-8").close()
+        completed = subprocess.run(
+            ["bash", "-c", shell],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "REPO_VAR": value, "GITHUB_OUTPUT": output},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        with open(output, encoding="utf-8") as handle:
+            written = handle.read()
+    return completed.returncode, written, completed.stdout + completed.stderr
+
+
+def assert_linux_notarization_refused(release: str) -> None:
+    """config refuses NOTARIZE_ON_LINUX until the Linux path staples and repacks.
+
+    sign_macos packs the macOS archive before notarize_linux runs, and
+    notarize_linux only submits to Apple Notary: it never staples
+    KinNotifier.app or repacks the archive, so the bundle would ship without
+    the ticket the notarytool path staples into it. Lift this pin in the change
+    that makes notarize_linux staple the bundle, then repack the archive and
+    regenerate its checksum and provenance manifest, not before.
+    """
+
+    config = workflow_job_blocks(release)["config"]
+    require(
+        config,
+        'REPO_VAR: ${{ vars.NOTARIZE_ON_LINUX }}',
+        "config reads the Linux notarization switch",
+    )
+    code, written, said = run_notarize_backend(config, "true")
+    if code == 0 or "notarize_on_linux=true" in written:
+        raise AssertionError(
+            "config must refuse NOTARIZE_ON_LINUX=true: notarize_linux neither staples "
+            f"KinNotifier.app nor repacks the archive (exit {code}, wrote {written!r})"
+        )
+    if "::error::NOTARIZE_ON_LINUX is true" not in said:
+        raise AssertionError(
+            "config must refuse NOTARIZE_ON_LINUX=true with an error that names the variable"
+        )
+    for value in ("", "false", "TRUE"):
+        code, written, said = run_notarize_backend(config, value)
+        if code != 0 or written != "notarize_on_linux=false\n":
+            raise AssertionError(
+                f"config must select notarytool when NOTARIZE_ON_LINUX is {value!r} "
+                f"(exit {code}, wrote {written!r}): {said}"
+            )
+
+
+def check_linux_notarization_refused(release: str) -> None:
+    assert_linux_notarization_refused(release)
+    config = workflow_job_blocks(release)["config"]
+    refusal = (
+        '            echo "::error::NOTARIZE_ON_LINUX is true, but the Linux notarization path'
+    )
+    start = config.index(refusal)
+    end = config.index("            exit 1\n", start) + len("            exit 1\n")
+    for label, replacement, expected in (
+        (
+            "config selects the Linux backend again",
+            '            echo "notarize_on_linux=true" >> "$GITHUB_OUTPUT"\n'
+            "            exit 0\n",
+            "config must refuse NOTARIZE_ON_LINUX=true",
+        ),
+        (
+            "config only warns about the Linux backend",
+            '            echo "::warning::NOTARIZE_ON_LINUX is true"\n',
+            "config must refuse NOTARIZE_ON_LINUX=true",
+        ),
+        (
+            "config refuses without saying why",
+            "            exit 1\n",
+            "an error that names the variable",
+        ),
+    ):
+        mutated_config = config[:start] + replacement + config[end:]
+        mutated = release.replace(config, mutated_config, 1)
+        if mutated == release:
+            raise AssertionError(f"falsifier anchor moved: {label}")
+        expect_assertion(
+            label,
+            expected,
+            lambda mutated=mutated: assert_linux_notarization_refused(mutated),
         )

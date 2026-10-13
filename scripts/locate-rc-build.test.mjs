@@ -26,6 +26,7 @@ import {
   judgeRun,
   locate,
   main,
+  preflightArchive,
   preflightDigests,
   preflightRun,
   readListing,
@@ -589,4 +590,115 @@ test("the archive table matches rc-build.yml's build matrix and the cut judges e
   for (const artifact of legs) {
     assert.ok(RC_ARCHIVES.some((entry) => entry.artifact === artifact), `release-cut.yml judges ${artifact}, which RC Build does not produce`);
   }
+});
+
+// The script release.yml's publish job runs to bind the shipped archives to the
+// RC Build, read out of the workflow text so this judges what actually runs.
+function publishBindingScript() {
+  const release = fs.readFileSync(path.join(ROOT, ".github/workflows/release.yml"), "utf8");
+  const step = release.indexOf("      - name: Verify the shipped archives against the RC Build\n");
+  assert.ok(step > 0, "release.yml no longer carries the publish job's RC Build binding step");
+  const open = "          node <<'NODE'\n";
+  const start = release.indexOf(open, step);
+  const end = release.indexOf("\n          NODE\n", start);
+  assert.ok(start > step && end > start, "the RC Build binding step no longer runs one node heredoc");
+  const lines = release.slice(start + open.length, end).split("\n");
+  for (const line of lines) {
+    assert.ok(line === "" || line.startsWith("          "), `the binding script has a line outside its heredoc indent: ${line}`);
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kin-publish-binding-script-"));
+  const file = path.join(dir, "bind.cjs");
+  fs.writeFileSync(file, `${lines.map((line) => line.slice(10)).join("\n")}\n`);
+  return file;
+}
+
+// The archives and release manifests the publish job downloads, as the
+// shipping jobs write them: each manifest's rc_build names the RC Build records
+// the bytes came from, the primary archive first and Windows's tarball beside it.
+function shippedArchives() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kin-shipped-"));
+  for (const entry of RC_ARCHIVES) {
+    const records = entry.archives.map((name) => ({ name, sha256: DIGEST[name] }));
+    for (const name of entry.archives) fs.writeFileSync(path.join(dir, name), BYTES[name]);
+    const [primary, ...additional] = records;
+    const extra = additional.length ? { additional_archives: additional } : {};
+    fs.writeFileSync(
+      path.join(dir, `${entry.artifact}.provenance.json`),
+      JSON.stringify({
+        artifact: entry.artifact,
+        archive: primary,
+        ...extra,
+        rc_build: { workflow: RC_BUILD_WORKFLOW, run_id: String(RUN_ID), archive: primary, ...extra },
+      }),
+    );
+  }
+  return dir;
+}
+
+function runPublishBinding(script, dir, preflightDigest) {
+  try {
+    return execFileSync(process.execPath, [script], {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, RC_RUN_ID: String(RUN_ID), RC_PREFLIGHT: JSON.stringify(preflightDigest) },
+    });
+  } catch (error) {
+    throw new Error(`the publish binding refused: ${error.stderr}`);
+  }
+}
+
+// A preflight leg judges the tarball, which on Windows is the additional
+// archive beside the primary zip. locate and publish must read the same record
+// for it, or the first release with a Windows leg refuses in one of them.
+test("locate and publish judge every preflight leg against the archive the preflight judged", () => {
+  const script = publishBindingScript();
+  const rc = downloads();
+  const shipped = shippedArchives();
+  const windows = RC_ARCHIVES.find((entry) => entry.artifact === "kin-windows-x86_64");
+  assert.notEqual(preflightArchive(windows.artifact), windows.archives[0], "Windows's primary archive is the zip");
+  assert.ok(windows.archives.includes(preflightArchive(windows.artifact)), "Windows ships the tarball a leg judges");
+
+  // The digests a passing leg for each archive records, read back the way
+  // locate's select reads a published record.
+  const judgedBy = (entry) => {
+    const legs = PREFLIGHT_REQUIRED.includes(entry.artifact) ? preflight().legs : [...preflight().legs, leg(entry.artifact)];
+    return preflightDigests(preflight(legs), SHA);
+  };
+  for (const entry of RC_ARCHIVES) {
+    const judged = judgedBy(entry);
+    assert.equal(judged[entry.artifact], DIGEST[preflightArchive(entry.artifact)], entry.artifact);
+    verifyArtifact(path.join(rc, entry.artifact), entry.artifact, { ...verifyContext, preflight: judged });
+    assert.match(runPublishBinding(script, shipped, judged), new RegExp(`${entry.artifact}: `));
+  }
+
+  // A digest the leg did not record refuses in both. For Windows that is the
+  // primary zip's, which the publish job once compared instead.
+  for (const entry of RC_ARCHIVES) {
+    const judged = judgedBy(entry);
+    const other = entry.archives.find((name) => name !== preflightArchive(entry.artifact));
+    const wrong = { ...judged, [entry.artifact]: other ? DIGEST[other] : "f".repeat(64) };
+    const judgedName = preflightArchive(entry.artifact).replaceAll(".", "\\.");
+    assert.throws(
+      () => verifyArtifact(path.join(rc, entry.artifact), entry.artifact, { ...verifyContext, preflight: wrong }),
+      new RegExp(`${judgedName} downloaded from run ${RUN_ID} is ${DIGEST[preflightArchive(entry.artifact)]}, but the preflight judged`),
+      entry.artifact,
+    );
+    assert.throws(
+      () => runPublishBinding(script, shipped, wrong),
+      new RegExp(`${judgedName} came from ${DIGEST[preflightArchive(entry.artifact)]}, but the preflight judged`),
+      entry.artifact,
+    );
+  }
+
+  // The name is the preflight's own: release-cut.yml hands each leg the
+  // tarball from the RC Build download, and the driver names the leg's target
+  // after that tarball and accepts nothing else.
+  const cut = fs.readFileSync(path.join(ROOT, ".github/workflows/release-cut.yml"), "utf8");
+  const preflightJob = cut.slice(cut.indexOf("\n  preflight:"), cut.indexOf("\n  publish:"));
+  assert.ok(preflightJob.includes(`archive="$RUNNER_TEMP/rc/$ARTIFACT/${preflightArchive("$ARTIFACT")}"`), "the cut hands the preflight the tarball");
+  assert.ok(preflightJob.includes('--archive "$KIN_RC_ARCHIVE"'), "the cut hands the preflight the archive it downloaded");
+  const driver = fs.readFileSync(path.join(ROOT, "scripts/release-proof/bin/kin-release-preflight"), "utf8");
+  assert.ok(driver.includes('target="${name%.tar.gz}"'), "the preflight names a leg's target after its tarball");
+  assert.ok(driver.includes("--archive must be a release-shaped kin-<os>-<arch>.tar.gz"), "the preflight judges only a tarball");
 });
