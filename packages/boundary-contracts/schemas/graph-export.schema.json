@@ -110,6 +110,10 @@
         "signature": {
           "type": "string",
           "description": "Present only when the request asked for include=signature."
+        },
+        "language": {
+          "type": "string",
+          "description": "The language the entity is written in, by its lowercase wire name. Present only when the request asked for include=language and the graph names one."
         }
       }
     },

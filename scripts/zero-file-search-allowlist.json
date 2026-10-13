@@ -3116,6 +3116,16 @@
       ]
     },
     {
+      "file": "crates/kin-mcp/src/server.rs",
+      "reason": "Stdio server shutdown boundary only. client_input_until_stopped turns a stop signal (SIGTERM, SIGHUP, SIGINT) into the end of the client's input so the loop ends the connection's session as a closed connection does, and exits the process with the signal's code if that cannot finish within three seconds. run_stdio_daemon exits with that code once the session has ended, rather than wait on a pending read of stdin. Neither starts a process, reads source bytes, searches a directory or supplies a semantic answer. No whole-module exemption.",
+      "owner": "kin-mcp",
+      "expiration": "2027-04-13",
+      "allow_fn": [
+        "client_input_until_stopped",
+        "run_stdio_daemon"
+      ]
+    },
+    {
       "file": "crates/kin-cli/src/commands/branch.rs",
       "reason": "The counted metadata() call is AuthorityReadLease graph metadata used to resolve an imported Git commit alias. It is an in-memory persisted-authority accessor, not a filesystem metadata probe. The rest of branch dispatch and all new primitives remain scanned.",
       "owner": "kin-cli",
@@ -3242,6 +3252,16 @@
         "repository_key",
         "catalog",
         "workspace_layout"
+      ]
+    },
+    {
+      "file": "crates/kin-cli/src/commands/workspace_home.rs",
+      "reason": "Local human workspace add-repository boundary. resolve_location canonicalizes only a directory the reader named on the page that lists repositories, so that page shows one location and runs one operation per location. run_child starts the two processes that page may start, each through a kin-io Spawner: this same Kin binary with a fixed init or clone argument vector and the reader's location, so adding a repository is Kin's own conversion, and Git, to count a project's commits before it is added. Neither function reads source bytes, searches a directory or supplies a semantic entity, source, relationship, review or merge answer; all such reads are forwarded to an identity-verified daemon. No whole-module exemption.",
+      "owner": "kin-cli",
+      "expiration": "2027-04-13",
+      "allow_fn": [
+        "resolve_location",
+        "run_child"
       ]
     },
     {

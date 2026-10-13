@@ -236,12 +236,101 @@ const PENDING_ENRICHMENT_PROBE: std::time::Duration = std::time::Duration::from_
 /// How often the phase tail is read while the commit request is outstanding.
 const PHASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// Where a commit that recorded no change stopped.
+///
+/// `kin commit` prints all three the same way. A caller that answers a page
+/// has to tell them apart, because only the last may have written anything.
+enum CommitStop {
+    /// Stopped before the daemon was asked.
+    NotDispatched(anyhow::Error),
+    /// The daemon answered and recorded nothing.
+    Refused {
+        /// Whether its reason was a working copy with nothing new in it.
+        nothing_to_commit: bool,
+        error: anyhow::Error,
+    },
+    /// The request was sent and nothing says how it ended.
+    Indeterminate(anyhow::Error),
+}
+
+impl CommitStop {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::NotDispatched(error)
+            | Self::Refused { error, .. }
+            | Self::Indeterminate(error) => error,
+        }
+    }
+}
+
+/// How a commit the local app asked for ended.
+pub(super) enum AppCommit {
+    Committed {
+        change_id: String,
+    },
+    NothingToCommit,
+    /// Nothing was written. The error is Kin's own sentence.
+    Refused(anyhow::Error),
+    /// The request was sent and its outcome is not known.
+    Unknown(anyhow::Error),
+}
+
+/// Commit the whole working copy for the local app, as `kin commit -m` does.
+///
+/// The author is resolved against `layout`, never taken from the caller, and
+/// the caller's operation id is the one the daemon records. The app is no
+/// agent session, so the process's ambient session is not sent.
+pub(super) async fn commit_for_app(
+    layout: &kin_core::KinLayout,
+    message: &str,
+    operation_id: kin_model::OperationId,
+) -> AppCommit {
+    let _announced = CommitAnnouncement::announce(layout.root());
+    match dispatch_commit(layout, Some(message), true, false, operation_id, None).await {
+        Ok(result) => AppCommit::Committed {
+            change_id: result.change_id,
+        },
+        Err(CommitStop::Refused {
+            nothing_to_commit: true,
+            ..
+        }) => AppCommit::NothingToCommit,
+        Err(CommitStop::NotDispatched(error) | CommitStop::Refused { error, .. }) => {
+            AppCommit::Refused(error)
+        }
+        Err(CommitStop::Indeterminate(error)) => AppCommit::Unknown(error),
+    }
+}
+
 async fn run_daemon_commit(
     layout: &kin_core::KinLayout,
     message: Option<&str>,
     quiet: bool,
     amend: bool,
 ) -> Result<DaemonCommitResult> {
+    // Created once per CLI invocation so transport retry logic can reuse the
+    // byte-identical repository transaction.
+    let operation_id = kin_model::OperationId::new();
+    dispatch_commit(
+        layout,
+        message,
+        quiet,
+        amend,
+        operation_id,
+        commit_session_header(),
+    )
+    .await
+    .map_err(CommitStop::into_error)
+}
+
+/// What a commit needs before the daemon is asked.
+struct PreparedCommit {
+    author: kin_model::AuthorId,
+    expected_head: Option<kin_model::SemanticChangeId>,
+    daemon_url: String,
+    client: reqwest::Client,
+}
+
+async fn prepare_commit(layout: &kin_core::KinLayout, amend: bool) -> Result<PreparedCommit> {
     // Resolved here, in the caller's own environment and working directory,
     // rather than inside the daemon. The daemon is spawned with every `GIT_*`
     // variable scrubbed and does not share the caller's shell, so an identity it
@@ -263,10 +352,81 @@ async fn run_daemon_commit(
         .ok_or_else(|| crate::daemon_client::daemon_required_error("commit", layout))?;
 
     let client = build_commit_client(commit_reply_deadline())?;
-    // Create these once per CLI invocation so transport retry logic can reuse
-    // the byte-identical repository transaction.
-    let operation_id = kin_model::OperationId::new();
+    Ok(PreparedCommit {
+        author,
+        expected_head,
+        daemon_url,
+        client,
+    })
+}
+
+/// Send one commit and, when it lands, note the change in this machine's
+/// registry. Every commit made through this CLI or the local app passes here.
+async fn dispatch_commit(
+    layout: &kin_core::KinLayout,
+    message: Option<&str>,
+    quiet: bool,
+    amend: bool,
+    operation_id: kin_model::OperationId,
+    session: Option<String>,
+) -> std::result::Result<DaemonCommitResult, CommitStop> {
     let timestamp = kin_model::Timestamp::now();
+    let landed = send_commit(
+        layout,
+        message,
+        quiet,
+        amend,
+        operation_id,
+        session,
+        &timestamp,
+    )
+    .await?;
+    note_change_in_registry(layout, &timestamp);
+    Ok(landed)
+}
+
+/// Record in this machine's registry that the repository at `layout` changed
+/// at `at`.
+///
+/// The registry's time is what a list of this machine's repositories shows
+/// and sorts by when no daemon is running to ask, and nothing but
+/// registration used to move it, so a repository committed to a minute ago
+/// read as last changed on the day it was converted. Best effort: a commit
+/// that landed is not undone by a registry that could not be written, and a
+/// repository the registry does not name is left unnamed rather than
+/// registered as a side effect of committing.
+fn note_change_in_registry(layout: &kin_core::KinLayout, at: &kin_model::Timestamp) {
+    let here = layout.working_dir();
+    let named = kin_core::registry::KinRegistry::load()
+        .is_ok_and(|registry| registry.repos.iter().any(|row| row.path == here));
+    if !named {
+        return;
+    }
+    let at = at.to_string();
+    let _ = kin_core::registry::KinRegistry::update(|registry| {
+        for row in registry.repos.iter_mut().filter(|row| row.path == here) {
+            row.last_commit.clone_from(&at);
+        }
+    });
+}
+
+async fn send_commit(
+    layout: &kin_core::KinLayout,
+    message: Option<&str>,
+    quiet: bool,
+    amend: bool,
+    operation_id: kin_model::OperationId,
+    session: Option<String>,
+    timestamp: &kin_model::Timestamp,
+) -> std::result::Result<DaemonCommitResult, CommitStop> {
+    let PreparedCommit {
+        author,
+        expected_head,
+        daemon_url,
+        client,
+    } = prepare_commit(layout, amend)
+        .await
+        .map_err(CommitStop::NotDispatched)?;
     let mut payload = serde_json::json!({
         "operation_id": operation_id,
         "timestamp": timestamp,
@@ -283,10 +443,13 @@ async fn run_daemon_commit(
             daemon_url.trim_end_matches('/')
         ))
         .json(&payload);
-    if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
+    // Read from the layout this commit names. The local app commits for a
+    // repository that is not its working directory, and for `kin commit` the
+    // two are the same repository.
+    if let Some(token) = crate::daemon_client::resolve_daemon_auth_token_for_layout(layout) {
         request = request.bearer_auth(token);
     }
-    if let Some(session_id) = commit_session_header() {
+    if let Some(session_id) = session {
         request = request.header("X-Kin-Session", session_id);
     }
 
@@ -312,21 +475,44 @@ async fn run_daemon_commit(
                 error,
                 quiet,
                 memory_baseline,
-            );
+            )
+            .map_err(CommitStop::Indeterminate);
         }
     };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if let Some(refusal) = commit_refusal_message(&body) {
-            anyhow::bail!(refusal);
+            return Err(CommitStop::Refused {
+                nothing_to_commit: refuses_nothing_to_commit(&body),
+                error: anyhow::anyhow!(refusal),
+            });
         }
-        anyhow::bail!("daemon native commit failed (HTTP {status}): {body}");
+        let error = anyhow::anyhow!("daemon native commit failed (HTTP {status}): {body}");
+        // A request the daemon turned away is settled. A fault inside it is
+        // not: the answer does not say how far the commit got.
+        return Err(if status.is_client_error() {
+            CommitStop::Refused {
+                nothing_to_commit: false,
+                error,
+            }
+        } else {
+            CommitStop::Indeterminate(error)
+        });
     }
     response
         .json()
         .await
         .context("decode daemon native commit response")
+        .map_err(CommitStop::Indeterminate)
+}
+
+/// Whether a refusal body is the daemon's own "nothing to commit", read from
+/// the kind it names and never from its sentence.
+fn refuses_nothing_to_commit(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|parsed| parsed["error"] == "nothing_to_commit")
 }
 
 /// How long the CLI waits for the daemon to answer a commit.

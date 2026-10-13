@@ -186,11 +186,12 @@ crates/kin-cli/src/commands/init.rs	exclude_store_from_git	std::fs::write
 crates/kin-cli/src/commands/init.rs	git_commit_count	std::process::Command::new
 crates/kin-cli/src/commands/init.rs	git_common_dir	std::fs::read_to_string
 crates/kin-cli/src/commands/init.rs	git_common_dir	std::fs::symlink_metadata
+crates/kin-cli/src/commands/init.rs	native_directory_holds_work	std::fs::read_dir
+crates/kin-cli/src/commands/init.rs	never_a_project	std::path::Path::canonicalize
 crates/kin-cli/src/commands/init.rs	path_exists	std::fs::symlink_metadata
 crates/kin-cli/src/commands/init.rs	read_optional_text	std::fs::read
 crates/kin-cli/src/commands/init.rs	reattach_moved_store	std::path::Path::canonicalize
 crates/kin-cli/src/commands/init.rs	repository_name	std::path::Path::canonicalize
-crates/kin-cli/src/commands/init.rs	require_empty_native_boundary	std::fs::read_dir
 crates/kin-cli/src/commands/init.rs	reserve_default_store	std::path::Path::canonicalize
 crates/kin-cli/src/commands/init.rs	reserve_external_store	std::fs::create_dir_all
 crates/kin-cli/src/commands/init.rs	reserve_external_store	std::fs::read_dir
@@ -586,6 +587,9 @@ crates/kin-cli/src/commands/upgrade.rs	rewrite_upgrade_sidecar	std::fs::File::op
 crates/kin-cli/src/commands/upgrade.rs	rewrite_upgrade_sidecar	tempfile::NamedTempFile::new_in
 crates/kin-cli/src/commands/verify.rs	verification_command	std::process::Command::new
 crates/kin-cli/src/commands/workspace_graph.rs	make_editor_uri	std::path::Path::canonicalize
+crates/kin-cli/src/commands/workspace_home.rs	look_at	kin_blobs::authority::Grant::ambient
+crates/kin-cli/src/commands/workspace_home.rs	resolve_location	std::path::Path::canonicalize
+crates/kin-cli/src/commands/workspace_home.rs	run_child	kin_blobs::authority::Grant::ambient
 crates/kin-cli/src/commands/workspace_ui.rs	catalog	std::path::Path::canonicalize
 crates/kin-cli/src/commands/workspace_ui.rs	catalog	std::path::Path::is_dir
 crates/kin-cli/src/commands/workspace_ui.rs	repository_key	std::path::Path::canonicalize

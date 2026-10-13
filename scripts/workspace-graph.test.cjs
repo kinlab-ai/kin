@@ -1,67 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const test = require('node:test');
-const { graphData, neighborRows, editorUri, mapFromGraph, mapFromContainers, layoutClusters, layoutFocus, placeLabels, createMap } = require('../crates/kin-cli/assets/workspace_ui/graph.js');
+const vm = require('node:vm');
+const graphPath = path.resolve(__dirname, '../crates/kin-cli/assets/workspace_ui/graph.js');
+const { editorUri, joinColumns, joinEdges } = require(graphPath);
 
 const first = '11111111-1111-4111-8111-111111111111';
 const second = '22222222-2222-4222-8222-222222222222';
 const third = '33333333-3333-4333-8333-333333333333';
-const row = (id, name = id) => ({ id, name, kind: 'Function' });
-function graph() {
-  return {
-    schema: 'kin.workspace.graph.v1', scope: 'workspace', repository_id: 'team/repo', workspace_id: third,
-    graph: { root_hash: 'a'.repeat(64), seq: 3, nodes: [row(first, 'First'), row(second, 'Second')], links: [{ source: first, target: second, kind: 'Calls' }], entity_count: 12, relation_count: 20, unresolved_links: 4, filtered_links: 19, sampled: true },
-    inventory: { repo_id: 'team/repo', total: 12, entities: [row(first, 'First'), row(second, 'Second')] },
-    offset: 0, page_size: 50, read_at: 1, reconciliation_status: 'idle',
-  };
-}
 const intentPrefix = 'vscode://firelock.kin-editor/open-entity?';
 const encodeQuery = value => encodeURIComponent(value).replace(/[!'()*]/g,
   character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 const transportIntent = raw => intentPrefix + encodeQuery(raw.slice(intentPrefix.length));
 const intent = `${intentPrefix}v=1&repository=team%2Frepo&workspace=${third}&root=%2Frepo&entity=${first}&scope=workspace`;
-
-test('graph keeps sample, withheld links and full inventory counts distinct', () => {
-  const value = graphData(graph());
-  assert.equal(value.graph.nodes.length, 2);
-  assert.equal(value.graph.entity_count, 12);
-  assert.equal(value.graph.unresolved_links, 4);
-  assert.equal(value.inventory.total, 12);
-  assert.equal(value.graph.sampled, true);
-});
-
-test('graph refuses mismatched repository, incomplete counts and absent endpoints', () => {
-  const wrongRepo = graph(); wrongRepo.inventory.repo_id = 'another/repo';
-  assert.throws(() => graphData(wrongRepo), /left out/);
-  const badScope = graph(); badScope.scope = 'at';
-  assert.throws(() => graphData(badScope), /form this page/);
-  const unknown = graph(); unknown.graph.links[0].target = third;
-  assert.throws(() => graphData(unknown), /both of its entities/);
-  const noCounts = graph(); delete noCounts.graph.unresolved_links;
-  assert.throws(() => graphData(noCounts), /left out its counts/);
-  const duplicate = graph(); duplicate.graph.nodes.push(row(first));
-  assert.throws(() => graphData(duplicate), /identities/);
-});
-
-test('neighborhood keeps only direct edges and discloses external and candidate endpoints', () => {
-  const rows = neighborRows({
-    focal_id: first, truncated: true, entities: [row(first), row(second, 'Callee'), row(third)],
-    relations: [
-      { src: { Entity: first }, dst: { Entity: second }, kind: 'Calls', resolution: 'name_only' },
-      { src: { Entity: second }, dst: { Entity: third }, kind: 'Calls' },
-      { src: { External: 'outside' }, dst: { Entity: first }, kind: 'Imports' },
-    ],
-  }, first);
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].name, 'Callee');
-  assert.equal(rows[0].resolution, 'name_only');
-  assert.equal(rows[0].direction, 'outgoing');
-  assert.equal(rows[1].name, 'External');
-  assert.equal(rows[1].id, undefined);
-  assert.equal(rows[1].direction, 'incoming');
-  assert.throws(() => neighborRows({ focal_id: second, entities: [], relations: [], truncated: false }, first), /different entity/);
-});
 
 test('editor anchor accepts only one current-entity intent for the selected UUID', () => {
   assert.equal(editorUri(intent, first), transportIntent(intent));
@@ -137,145 +91,236 @@ test('editor transport refuses malformed, ambiguous and historical selectors at 
 });
 
 
-// ── Map model ──────────────────────────────────────────────────────────────
+// ── Lines ──────────────────────────────────────────────────────────────────
 
-const uuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
-const node = (n, name, kind, degree = 1) => ({ id: uuid(n), name, kind, degree, file: 'never shown' });
-
-test('the graph sample clusters entities by the module that contains them and never draws a module as a dot', () => {
-  const graph = {
-    nodes: [node(1, 'signer', 'Module'), node(2, 'Signer', 'Class', 30), node(3, 'Signer.sign', 'Method', 9), node(4, 'want_bytes', 'Function', 20),
-      node(5, 'encoding', 'Module'), node(6, 'loose', 'Function', 2)],
-    links: [
-      { source: uuid(1), target: uuid(2), kind: 'Contains' }, { source: uuid(3), target: uuid(2), kind: 'Contains' },
-      { source: uuid(4), target: uuid(5), kind: 'Contains' }, { source: uuid(3), target: uuid(4), kind: 'Calls' },
-      { source: uuid(4), target: uuid(3), kind: 'Calls' }, { source: uuid(2), target: uuid(5), kind: 'Imports' },
-    ],
-  };
-  const model = mapFromGraph(graph);
-  assert.deepEqual(model.nodes.map((row) => row.name), ['Signer', 'want_bytes', 'Signer.sign', 'loose']);
-  const group = (name) => model.nodes.find((row) => row.name === name).group;
-  assert.equal(group('Signer'), uuid(1));
-  assert.equal(group('Signer.sign'), uuid(1), 'a method reaches its module through its class');
-  assert.equal(group('want_bytes'), uuid(5));
-  assert.equal(group('loose'), '');
-  assert.deepEqual(model.groups.find((row) => row.id === uuid(1)), { id: uuid(1), name: 'signer', size: 2 });
-  assert.equal(model.edges.length, 1, 'containment is closeness, and a pair is drawn once');
-  assert.ok(!JSON.stringify(model).includes('never shown'), 'no location reaches the drawable model');
-});
-
-test('the server map turns top-level containers into named clusters and their edges into ties', () => {
-  const map = {
-    schema: 'kin.workspace.map.v1',
-    nodes: [
-      { id: uuid(1), name: 'signer', kind: 'module', role: 'container', size: 30, degree: 11, parent: null, group: uuid(1) },
-      { id: uuid(2), name: 'Signer', kind: 'class', role: 'entity', degree: 34, parent: uuid(1), group: uuid(1) },
-      { id: uuid(3), name: 'exc', kind: 'module', role: 'container', size: 12, degree: 6, parent: null, group: uuid(3) },
-      { id: uuid(4), name: 'want_bytes', kind: 'function', role: 'entity', degree: 20, parent: null, group: uuid(5) },
-      { id: uuid(5), name: 'encoding', kind: 'module', role: 'container', size: 6, degree: 3, parent: null, group: uuid(5) },
-    ],
-    edges: [
-      { source: uuid(1), target: uuid(5), level: 'container', weight: 14, kinds: { calls: 14 } },
-      { source: uuid(2), target: uuid(4), level: 'entity', weight: 1, kinds: { calls: 1 } },
-      { source: uuid(2), target: uuid(9), level: 'entity', weight: 1, kinds: { calls: 1 } },
-    ],
-  };
-  const model = mapFromContainers(map);
-  assert.deepEqual(model.nodes.filter((row) => !row.container).map((row) => row.name), ['Signer', 'want_bytes']);
-  const lone = model.nodes.find((row) => row.container);
-  assert.equal(lone.name, 'exc', 'a container with no entity shown still has a place');
-  assert.deepEqual(model.groups.map((row) => [row.name, row.size]).sort(), [['encoding', 1], ['exc', 1], ['signer', 1]]);
-  assert.deepEqual(model.ties, [{ source: uuid(1), target: uuid(5), weight: 14 }]);
-  assert.equal(model.edges.length, 1, 'an edge to an entity that is not drawn is dropped');
-});
-
-function overlaps(groups) {
-  for (let i = 0; i < groups.length; i++) for (let j = i + 1; j < groups.length; j++) {
-    const a = groups[i], b = groups[j];
-    if (Math.hypot(a.x - b.x, a.y - b.y) < a.r + b.r - 1e-6) return [a.id, b.id];
-  }
-  return null;
-}
-
-test('clusters fill a wide stage without overlapping and lay out the same way every time', () => {
-  const nodes = [], edges = [];
-  const sizes = [26, 20, 20, 16, 14, 11, 10, 6, 6, 5, 3, 3];
-  let n = 1;
-  sizes.forEach((size, g) => { for (let i = 0; i < size; i++) nodes.push({ id: uuid(n++), name: `e${n}`, kind: 'method', weight: size - i, group: `g${g}` }); });
-  for (let i = 1; i < nodes.length; i += 3) edges.push({ source: nodes[i].id, target: nodes[(i * 7) % nodes.length].id });
-  const model = { nodes, edges };
-  const one = layoutClusters(model, 2.5);
-  const two = layoutClusters(model, 2.5);
-  assert.deepEqual([...one.positions], [...two.positions]);
-  assert.equal(overlaps(one.groups), null);
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const g of one.groups) { minX = Math.min(minX, g.x - g.r); maxX = Math.max(maxX, g.x + g.r); minY = Math.min(minY, g.y - g.r); maxY = Math.max(maxY, g.y + g.r); }
-  assert.ok((maxX - minX) / (maxY - minY) >= 2.5 * 0.85, `aspect ${(maxX - minX) / (maxY - minY)}`);
-  for (const g of one.groups) {
-    for (const member of nodes.filter((row) => row.group === g.id)) {
-      const p = one.positions.get(member.id);
-      assert.ok(Math.hypot(p.x - g.x, p.y - g.y) <= g.r + 1e-6, 'every entity sits inside its own cluster');
-    }
-  }
-});
-
-test('the focus layout puts what relies on an entity left, what it relies on right, and bounds each side', () => {
-  const focal = uuid(1);
-  const nodes = [{ id: focal, name: 'Focal', role: 'focal', weight: 0 }];
-  for (let i = 0; i < 15; i++) nodes.push({ id: uuid(100 + i), name: `caller${i}`, role: i < 10 ? 'test' : 'in', weight: 0 });
-  nodes.push({ id: uuid(200), name: 'callee', role: 'out', weight: 0 });
-  const { positions } = layoutFocus({ nodes }, focal, 12);
-  assert.deepEqual(positions.get(focal), { x: 0, y: 0 });
-  const left = [...positions].filter(([id, p]) => id !== focal && p.x < 0);
-  assert.equal(left.length, 12);
-  assert.ok(positions.get(uuid(200)).x > 0);
-  assert.ok(!positions.has(uuid(113)) && positions.has(uuid(111)), 'the caller decides which twelve are shown');
-  for (let i = 0; i < 10; i++) assert.ok(positions.get(uuid(110)).y < positions.get(uuid(100 + i)).y, 'entities other than tests sit above tests');
-  const ys = left.map(([, p]) => p.y).sort((a, b) => a - b);
-  for (let i = 1; i < ys.length; i++) assert.ok(ys[i] - ys[i - 1] >= 29, 'rows keep room for their names');
-});
-
-test('labels are kept in priority order, inside the bounds and clear of each other', () => {
-  const bounds = { left: 0, top: 0, right: 300, bottom: 200 };
-  const box = (id, left, top, extra = {}) => ({ id, left, top, right: left + 80, bottom: top + 20, ...extra });
-  const shown = placeLabels([box('a', 10, 10), box('b', 50, 15), box('c', 10, 60), box('d', 260, 60), box('e', 50, 12, { force: true })], bounds);
-  assert.deepEqual([...shown], ['a', 'c', 'e']);
-});
-
-class Fake {
-  constructor(tag, doc) { this.tagName = tag.toUpperCase(); this.ownerDocument = doc; this.children = []; this.attributes = {}; this.dataset = {}; this.events = {}; this.style = {}; this.text = ''; this.parentNode = null; }
-  set className(value) { this.attributes.class = value; }
-  get className() { return this.attributes.class || ''; }
-  set textContent(value) { this.text = String(value); this.children = []; }
-  get textContent() { return this.text + this.children.map((child) => child.textContent).join(''); }
+/** A box with a place on the page, for a picture that measures the boxes it is given. */
+class Box {
+  constructor(tag, place = null) { this.tagName = tag; this.place = place; this.children = []; this.attributes = {}; this.isConnected = true; }
   setAttribute(key, value) { this.attributes[key] = String(value); }
   getAttribute(key) { return this.attributes[key] ?? null; }
-  append(...children) { for (const child of children) { child.parentNode = this; this.children.push(child); } }
-  replaceChildren(...children) { this.children = []; this.append(...children); }
-  remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((child) => child !== this); this.parentNode = null; }
-  addEventListener(type, handler) { (this.events[type] ||= []).push(handler); }
-  removeEventListener() {}
-  emit(type, values = {}) { for (const handler of this.events[type] || []) handler({ type, ...values }); }
-  getBoundingClientRect() { return { left: 0, top: 0, width: 1000, height: 420 }; }
+  prepend(...children) { this.children.unshift(...children); }
+  replaceChildren(...children) { this.children = children; }
+  getBoundingClientRect() { const { left, top, width, height } = this.place; return { left, top, width, height, right: left + width, bottom: top + height }; }
+}
+const SVG = 'http://www.w3.org/2000/svg';
+
+/**
+ * graph.js in a page of its own: a document that makes boxes, an observer the
+ * test fires, and frames that wait until the test runs them. A page may lack
+ * either, as an older browser does.
+ */
+function page({ frames = true, observer = true, timers = true } = {}) {
+  const observers = [];
+  const waiting = [];
+  const later = new Map();
+  const context = { document: { createElementNS: (namespace, tag) => Object.assign(new Box(tag), { namespace }) } };
+  if (observer) context.ResizeObserver = class { constructor(redraw) { this.redraw = redraw; this.watched = []; observers.push(this); } observe(node) { this.watched.push(node); } disconnect() { this.disconnected = true; } };
+  if (frames) context.requestAnimationFrame = (run) => { waiting.push(run); };
+  if (timers) { let next = 0; context.setTimeout = (run, delay) => { later.set(++next, { run, delay }); return next; }; context.clearTimeout = (id) => later.delete(id); }
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(graphPath, 'utf8'), context, { filename: 'graph.js' });
+  return { api: context.KinWorkspaceGraph, observers, later, frame() { for (const run of waiting.splice(0)) run(); },
+    /** Let every timer the picture set run, as if its time had come. */
+    wait() { for (const [id, { run }] of [...later]) { later.delete(id); run(); } } };
 }
 
-test('the map renderer names entities with real buttons, opens them, and cleans up after itself', () => {
-  const doc = { createElement: (tag) => new Fake(tag, doc), addEventListener() {}, removeEventListener() {} };
-  const host = new Fake('div', doc);
-  doc.defaultView = { devicePixelRatio: 1, innerWidth: 1200, innerHeight: 800 };
-  const nodes = [];
-  for (let i = 1; i <= 30; i++) nodes.push({ id: uuid(i), name: `entity_${i}`, kind: 'function', weight: 31 - i, group: i % 3 ? 'a' : 'b' });
-  const opened = [];
-  const controller = createMap(host, { nodes, edges: [{ source: uuid(1), target: uuid(2) }], groups: [{ id: 'a', name: 'alpha' }, { id: 'b', name: 'beta' }] },
-    { labelCount: 4, labelIds: [uuid(30)], onOpen: (id) => opened.push(id) });
-  const layer = host.children.find((child) => child.className === 'map-labels');
-  const buttons = layer.children.filter((child) => child.tagName === 'BUTTON');
-  assert.ok(buttons.length > 0 && buttons.length <= 4);
-  assert.equal(buttons[0].textContent, 'entity_30', 'the most relied-on list decides which names are shown first');
-  assert.match(buttons[0].getAttribute('aria-label'), /entity_30, function\. Open\./);
-  buttons[0].emit('click');
-  assert.deepEqual(opened, [uuid(30)]);
-  assert.equal(host.children.find((child) => child.tagName === 'CANVAS').getAttribute('role'), 'img');
-  controller.dispose();
-  assert.equal(host.children.length, 0);
+/** Three columns side by side inside a picture that starts 100 across and 50 down the page. */
+function picture() {
+  const host = new Box('div', { left: 100, top: 50, width: 800, height: 200 });
+  const focus = new Box('div', { left: 450, top: 130, width: 100, height: 40 });
+  const left = [new Box('a', { left: 100, top: 60, width: 200, height: 20 }), new Box('a', { left: 100, top: 100, width: 200, height: 20 })];
+  const right = [new Box('a', { left: 700, top: 60, width: 200, height: 20 })];
+  return { host, focus, left, right, lines: () => host.children[0].children.map((line) => line.getAttribute('d')) };
+}
+
+test('the workspace picture is offered to the page and to a script that requires it', () => {
+  assert.equal(typeof editorUri, 'function');
+  assert.equal(typeof joinColumns, 'function');
+  assert.equal(typeof joinEdges, 'function');
+  const { api } = page();
+  assert.equal(typeof api.editorUri, 'function');
+  assert.equal(typeof api.joinColumns, 'function');
+  assert.equal(typeof api.joinEdges, 'function');
+});
+
+test('one line joins each box on the left to the entity, and the entity to each box on the right', () => {
+  const { api, frame } = page();
+  const { host, focus, left, right, lines } = picture();
+  api.joinColumns(host, { left, focus, right });
+  const svg = host.children[0];
+  assert.equal(svg.tagName, 'svg', 'the lines go in before the boxes, so they sit behind them');
+  assert.equal(svg.namespace, SVG);
+  assert.equal(svg.getAttribute('aria-hidden'), 'true', 'the boxes say what is connected; the lines are for the eye');
+  assert.deepEqual(lines(), [], 'nothing is measured until the boxes are laid out');
+  frame();
+  // Every point is inside the picture: the page's own offsets are taken out.
+  assert.deepEqual(lines(), [
+    'M200.0 20.0C275.0 20.0 275.0 100.0 350.0 100.0',
+    'M200.0 60.0C275.0 60.0 275.0 100.0 350.0 100.0',
+    'M450.0 100.0C525.0 100.0 525.0 20.0 600.0 20.0']);
+  assert.equal(svg.getAttribute('viewBox'), '0 0 800.0 200.0');
+  assert.ok(svg.children.every((line) => line.tagName === 'path' && line.namespace === SVG));
+  // A side with nothing on it draws nothing for that side.
+  const alone = picture();
+  api.joinColumns(alone.host, { left: [], focus: alone.focus, right: alone.right });
+  frame();
+  assert.deepEqual(alone.lines(), ['M450.0 100.0C525.0 100.0 525.0 20.0 600.0 20.0']);
+});
+
+test('the lines are measured again when the picture changes size', () => {
+  const { api, observers, frame } = page();
+  const { host, focus, left, right, lines } = picture();
+  api.joinColumns(host, { left, focus, right });
+  frame();
+  assert.equal(observers.length, 1);
+  assert.deepEqual(observers[0].watched, [host]);
+  host.place = { left: 100, top: 50, width: 1000, height: 200 };
+  focus.place = { left: 550, top: 130, width: 100, height: 40 };
+  right[0].place = { left: 900, top: 100, width: 200, height: 20 };
+  observers[0].redraw();
+  assert.deepEqual(lines(), [
+    'M200.0 20.0C325.0 20.0 325.0 100.0 450.0 100.0',
+    'M200.0 60.0C325.0 60.0 325.0 100.0 450.0 100.0',
+    'M550.0 100.0C675.0 100.0 675.0 60.0 800.0 60.0']);
+  assert.equal(host.children[0].getAttribute('viewBox'), '0 0 1000.0 200.0');
+  assert.equal(host.children.length, 1, 'the same drawing is used again');
+});
+
+test('columns stacked one above another get no lines', () => {
+  const { api, observers, frame } = page();
+  const { host, focus, left, right, lines } = picture();
+  api.joinColumns(host, { left, focus, right });
+  frame();
+  assert.equal(lines().length, 3);
+  // On a narrow window the columns stack: a box on the left now reaches past the entity's left edge.
+  host.place = { left: 0, top: 0, width: 300, height: 400 };
+  focus.place = { left: 0, top: 120, width: 300, height: 40 };
+  for (const [at, box] of [...left, ...right].entries()) box.place = { left: 0, top: at * 40, width: 300, height: 20 };
+  observers[0].redraw();
+  assert.deepEqual(lines(), [], 'the lines drawn for the wide layout are taken away');
+  // The same holds when only the right column has dropped under the entity.
+  left.forEach((box, at) => { box.place = { left: 0, top: at * 40, width: 100, height: 20 }; });
+  focus.place = { left: 150, top: 0, width: 100, height: 40 };
+  right[0].place = { left: 150, top: 80, width: 100, height: 20 };
+  observers[0].redraw();
+  assert.deepEqual(lines(), []);
+  // Side by side again, they come back.
+  right[0].place = { left: 280, top: 0, width: 20, height: 20 };
+  observers[0].redraw();
+  assert.equal(lines().length, 3);
+});
+
+test('nothing is drawn for a picture with no width or an entity that has left the page', () => {
+  const { api, observers, frame } = page();
+  const hidden = picture();
+  hidden.host.place = { left: 0, top: 0, width: 0, height: 0 };
+  api.joinColumns(hidden.host, hidden);
+  frame();
+  assert.deepEqual(hidden.lines(), []);
+  assert.equal(hidden.host.children[0].getAttribute('viewBox'), null);
+  const gone = picture();
+  api.joinColumns(gone.host, gone);
+  frame();
+  assert.equal(gone.lines().length, 3);
+  gone.focus.isConnected = false;
+  gone.focus.place = null;
+  assert.doesNotThrow(() => observers[1].redraw(), 'a late measurement of a page that moved on is ignored');
+});
+
+test('what joining returns stops the measuring', () => {
+  const { api, observers, frame } = page();
+  const { host, focus, left, right } = picture();
+  const stop = api.joinColumns(host, { left, focus, right });
+  frame();
+  assert.notEqual(observers[0].disconnected, true);
+  stop();
+  assert.equal(observers[0].disconnected, true);
+  // A browser with neither an observer nor frames still draws, once, and stopping is safe.
+  const plain = page({ frames: false, observer: false });
+  const still = picture();
+  const stopPlain = plain.api.joinColumns(still.host, still);
+  assert.equal(still.lines().length, 3, 'drawn at once');
+  assert.doesNotThrow(stopPlain);
+});
+
+/** Two columns of a piece of work inside a picture that starts 100 across and 50 down: what changed on the left, what relies on it on the right. */
+function work() {
+  const host = new Box('div', { left: 100, top: 50, width: 800, height: 200 });
+  const changed = [new Box('a', { left: 100, top: 60, width: 200, height: 20 }), new Box('a', { left: 100, top: 100, width: 200, height: 20 })];
+  const reliers = [new Box('a', { left: 700, top: 60, width: 200, height: 20 }), new Box('a', { left: 700, top: 140, width: 200, height: 20 })];
+  return { host, changed, reliers, lines: () => host.children[0].children.map((line) => [line.getAttribute('d'), line.getAttribute('data-tone')]) };
+}
+
+test('each pair in a piece of work is joined by one curve, in the tone the pair carries', () => {
+  const { api, frame } = page();
+  const { host, changed, reliers, lines } = work();
+  api.joinEdges(host, [{ from: changed[0], to: reliers[0], tone: 'bad' }, { from: changed[0], to: reliers[1], tone: 'bad' }, { from: changed[1], to: reliers[0], tone: 'quiet' }, { from: changed[1], to: reliers[1] }]);
+  const svg = host.children[0];
+  assert.equal(svg.tagName, 'svg', 'the lines go in before the boxes, so they sit behind them');
+  assert.equal(svg.namespace, SVG);
+  assert.equal(svg.getAttribute('aria-hidden'), 'true');
+  assert.deepEqual(lines(), [], 'nothing is measured until the boxes are laid out');
+  frame();
+  // From a box's right edge at its middle to the other's left edge at its middle, inside the picture.
+  assert.deepEqual(lines(), [
+    ['M200.0 20.0C400.0 20.0 400.0 20.0 600.0 20.0', 'bad'], ['M200.0 20.0C400.0 20.0 400.0 100.0 600.0 100.0', 'bad'],
+    ['M200.0 60.0C400.0 60.0 400.0 20.0 600.0 20.0', 'quiet'], ['M200.0 60.0C400.0 60.0 400.0 100.0 600.0 100.0', null]], 'a pair with no tone is drawn plain');
+  assert.equal(svg.getAttribute('viewBox'), '0 0 800.0 200.0');
+  assert.ok(svg.children.every((line) => line.namespace === SVG && line.getAttribute('pathLength') === '1'), 'each line is measured as one length, so it can draw itself in');
+});
+
+test('a pair whose box has left the page is not joined, and stacked columns are joined by nothing', () => {
+  const { api, observers, frame } = page();
+  const { host, changed, reliers, lines } = work();
+  api.joinEdges(host, [{ from: changed[0], to: reliers[0], tone: 'bad' }, { from: changed[1], to: reliers[1], tone: 'warn' }]);
+  frame();
+  assert.equal(lines().length, 2);
+  reliers[1].isConnected = false;
+  observers[0].redraw();
+  assert.deepEqual(lines().map(([, tone]) => tone), ['bad']);
+  // On a narrow window the right column drops under the left: a box on the left now reaches past one on the right.
+  reliers[0].place = { left: 100, top: 160, width: 200, height: 20 };
+  observers[0].redraw();
+  assert.deepEqual(lines(), []);
+  reliers[0].place = { left: 700, top: 60, width: 200, height: 20 };
+  observers[0].redraw();
+  assert.equal(lines().length, 1, 'side by side again, the line comes back');
+  // A picture with no width yet is not measured.
+  const hidden = work();
+  hidden.host.place = { left: 0, top: 0, width: 0, height: 0 };
+  api.joinEdges(hidden.host, [{ from: hidden.changed[0], to: hidden.reliers[0] }]);
+  frame();
+  assert.deepEqual(hidden.lines(), []);
+  assert.equal(hidden.host.children[0].getAttribute('viewBox'), null);
+});
+
+test('the lines of a piece of work draw themselves in once, follow the picture as it changes size, and stop when asked', () => {
+  const { api, observers, later, frame, wait } = page();
+  const { host, changed, reliers, lines } = work();
+  const stop = api.joinEdges(host, [{ from: changed[0], to: reliers[0], tone: 'bad' }]);
+  frame();
+  assert.deepEqual(observers[0].watched, [host]);
+  assert.equal(host.children[0].getAttribute('data-drawn'), null);
+  assert.deepEqual([...later.values()].map(({ delay }) => delay), [900]);
+  wait();
+  assert.equal(host.children[0].getAttribute('data-drawn'), '', 'once drawn in, the lines are marked so, and are not drawn in again');
+  host.place = { left: 100, top: 50, width: 1000, height: 200 };
+  reliers[0].place = { left: 900, top: 60, width: 200, height: 20 };
+  observers[0].redraw();
+  assert.deepEqual(lines(), [['M200.0 20.0C500.0 20.0 500.0 20.0 800.0 20.0', 'bad']]);
+  assert.equal(host.children.length, 1, 'the same drawing is used again');
+  stop();
+  assert.equal(observers[0].disconnected, true);
+  // Stopping before the lines have drawn themselves in cancels the mark.
+  const early = work();
+  const stopEarly = api.joinEdges(early.host, [{ from: early.changed[0], to: early.reliers[0] }]);
+  stopEarly();
+  assert.equal(later.size, 0);
+  // A browser with no observer, frames or timers still draws, once, and stopping is safe.
+  const plain = page({ frames: false, observer: false, timers: false });
+  const still = work();
+  const stopPlain = plain.api.joinEdges(still.host, [{ from: still.changed[0], to: still.reliers[0], tone: 'warn' }]);
+  assert.deepEqual(still.lines(), [['M200.0 20.0C400.0 20.0 400.0 20.0 600.0 20.0', 'warn']], 'drawn at once');
+  assert.doesNotThrow(stopPlain);
 });

@@ -269,8 +269,9 @@ cd my-app
 
 In an empty directory with no `.git/`, `kin init` creates an unborn native
 repository-v6 authority with an empty exact workspace and no synthetic commit.
-It refuses a non-empty non-Git directory rather than silently treating
-filesystem contents as graph truth.
+In a directory with no `.git/` that already holds something, it starts the same
+unborn repository and takes what the directory holds in as uncommitted work.
+Nothing is recorded until you commit.
 
 Convert an existing Git repository or folder:
 

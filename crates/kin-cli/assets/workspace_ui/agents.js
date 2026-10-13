@@ -83,7 +83,7 @@
     if (call?.is_error) parts.push(", but Kin could not answer");
     return parts.filter((part) => part !== "");
   }
-  const plainText = (parts) => parts.map((part) => typeof part === "string" ? part : part.label).join("");
+  const plainText = (parts) => parts.map((part) => typeof part === "string" ? part : shortLabel(part.label)).join("");
 
   /** Calls in a row that did the same thing to the same entity, read as one. */
   function group(calls) {
@@ -130,17 +130,6 @@
     return here ? `Connected for ${here}` : "Connected";
   }
 
-  /** The entities an agent's calls were about, newest first and each once: what it asked about, then what the answers named. */
-  function lookedAt(agent, names) {
-    const reads = array(agent.recent_calls).filter((call) => READS.has(family(call.tool)));
-    const seen = new Set();
-    const ids = [];
-    const take = (id) => { if (UUID.test(text(id)) && !seen.has(id)) { seen.add(id); ids.push(id); } };
-    for (const call of reads) take(array(call.entity_ids)[0]);
-    for (const call of reads) array(call.entity_ids).forEach(take);
-    return { named: ids.filter((id) => text(names[id]?.label)), total: ids.length };
-  }
-
   /** The Agents lede: who is connected now, in a sentence of real counts. */
   function headline(data) {
     const agents = array(data?.agents);
@@ -168,18 +157,7 @@
   }
 
   function sentence(ctx, parts) {
-    return parts.map((part) => typeof part === "string" ? part : ctx.h("a", { class: "agent-entity", href: ctx.entityHref(part.id) }, part.label));
-  }
-
-  function chips(ctx, ids, names, total, label) {
-    const SHOWN = 6;
-    if (!ids.length) return null;
-    const shown = ids.slice(0, SHOWN);
-    const more = total - shown.length;
-    return ctx.h("div", { class: "agent-chips", "aria-label": label },
-      ctx.h("span", { class: "agent-chips-label" }, label),
-      shown.map((id) => ctx.h("a", { class: "chip", href: ctx.entityHref(id), title: names[id]?.kind ? ctx.kindWord(names[id].kind) : undefined }, names[id].label)),
-      more > 0 ? ctx.h("span", { class: "chip chip-more" }, `${count(more)} more`) : null);
+    return parts.map((part) => typeof part === "string" ? part : ctx.h("a", { class: "agent-entity", href: ctx.entityHref(part.id), title: part.label }, shortLabel(part.label)));
   }
 
   /** What an agent has open: a change it is staging, and the work it said it is doing. */
@@ -201,100 +179,8 @@
     return rows.length ? ctx.h("div", { class: "agent-open-list" }, rows) : null;
   }
 
-  // The guide of each agent's latest change, read once: a recorded change
-  // never changes, so its review sentence never does either.
-  const guides = new Map();
-  function guideOf(ctx, id) {
-    const known = guides.get(id);
-    if (known) return known;
-    const entry = { guide: null, error: null };
-    guides.set(id, entry);
-    if (guides.size > 32) guides.delete(guides.keys().next().value);
-    ctx.fetchJSON(`/api/guide?change=${encodeURIComponent(id)}`)
-      .then((guide) => { entry.guide = guide; })
-      .catch((error) => { entry.error = error.message || "unreadable"; })
-      .finally(() => ctx.repaintAgents());
-    return entry;
-  }
-
-  function latestChange(ctx, agent) {
-    const change = array(agent.changes)[0];
-    if (!change || !text(change.id)) return null;
-    const read = guideOf(ctx, change.id);
-    const said = read.guide ? ctx.workSentence(read.guide) : null;
-    const counted = ctx.changedCount?.(change.id);
-    const fallback = isCount(counted) ? (counted ? `${plural(counted, "entity", "entities")} changed.` : "No entity changed.") : null;
-    const when = ctx.ago(change.time);
-    return ctx.h("div", { class: "agent-change" },
-      ctx.h("div", { class: "agent-change-text" },
-        ctx.h("span", { class: "agent-change-label" }, agent.changes_total > 1 ? `Latest of ${count(agent.changes_total)} changes` : "Its change"),
-        ctx.h("p", { class: "agent-change-title" }, text(change.title) || "Untitled change"),
-        said ? ctx.h("p", { class: "agent-change-sentence" }, said)
-          : read.error || !read.guide ? (read.error ? (fallback ? ctx.h("p", { class: "agent-change-sentence" }, fallback) : null) : ctx.skeleton("skeleton-line")) : fallback ? ctx.h("p", { class: "agent-change-sentence" }, fallback) : null,
-        when ? ctx.h("time", { class: "agent-quiet", datetime: change.time }, when) : null),
-      ctx.link("Review", ctx.changeURL(change.id), true, { "aria-label": `Review ${text(change.title) || "this change"}` }));
-  }
-
-  function nowRows(ctx, agent, names, shown = 3) {
-    const groups = group(agent.recent_calls).slice(0, shown);
-    if (!groups.length) return ctx.h("p", { class: "agent-quiet agent-none" }, "Connected. It has not asked Kin anything yet.");
-    return ctx.h("ol", { class: "agent-now", "aria-label": "What it did last" }, groups.map((entry, index) =>
-      ctx.h("li", { class: index === 0 && agent.state === "active" ? "agent-now-latest" : "" },
-        ctx.h("span", { class: "agent-now-text" }, sentence(ctx, describe(entry.call, names)), entry.times > 1 ? ctx.h("span", { class: "agent-quiet" }, ` ×${entry.times}`) : null),
-        ctx.h("time", { class: "agent-quiet", datetime: text(entry.call.at) || undefined }, ctx.ago(entry.call.at)))));
-  }
-
-  /** One agent as a card: who, what it is doing now, what it looked at, what it has open, what it changed. */
-  function card(ctx, agent, data, { compact = false } = {}) {
-    const names = data?.names || {};
-    const [word, tone] = stateWords(agent);
-    const looked = lookedAt(agent, names);
-    return ctx.h("article", { class: `agent-card agent-${tone}`, "aria-label": `${agent.name}, ${word.toLowerCase()}` },
-      ctx.h("header", { class: "agent-head" },
-        ctx.h("span", { class: "agent-avatar", "aria-hidden": "true" }, mark(18)),
-        ctx.h("div", { class: "agent-who" },
-          ctx.h("a", { class: "agent-name", href: `#/agents/${agent.key}` }, agent.name),
-          ctx.h("span", { class: "agent-presence" }, presence(agent))),
-        ctx.h("span", { class: `agent-state agent-state-${tone}` }, ctx.h("span", { class: "agent-state-dot", "aria-hidden": "true" }), word)),
-      nowRows(ctx, agent, names, compact ? 3 : 4),
-      chips(ctx, looked.named, names, looked.total, "Looked at"),
-      openWork(ctx, agent, names),
-      latestChange(ctx, agent));
-  }
-
   function connectHint(ctx) {
-    return ctx.h("p", { class: "agent-hint" }, "Coding agents such as Claude Code, Codex and Cursor connect through Kin’s MCP server once you add them in Kin for Mac or with ", ctx.h("code", {}, "kin setup"), ".");
-  }
-
-  /** Home's panel: the agents connected now, above the repository map. */
-  function panel(ctx) {
-    const resource = ctx.read();
-    const head = (extra) => ctx.h("div", { class: "section-head agents-head" },
-      ctx.h("h2", { id: "home-agents-title" }, "Agents", liveBadge(ctx)), extra);
-    if (resource.missing) return null;
-    if (!resource.data) {
-      if (resource.error) return ctx.h("section", { class: "agents-panel", "aria-labelledby": "home-agents-title" }, head(), ctx.failed("Kin couldn't load which agents are connected.", () => ctx.refresh(["agents"])));
-      return ctx.h("section", { class: "agents-panel", "aria-labelledby": "home-agents-title", "aria-busy": "true" }, head(), ctx.h("div", { class: "agent-card agent-skeleton" }, ctx.skeleton("skeleton-line"), ctx.skeleton("skeleton-line"), ctx.skeleton("skeleton-line")));
-    }
-    const data = resource.data;
-    const agents = array(data.agents);
-    const earlier = array(data.earlier);
-    const SHOWN = 4;
-    if (!agents.length) {
-      const last = earlier[0];
-      return ctx.h("section", { class: "agents-panel agents-panel-empty", "aria-labelledby": "home-agents-title" }, head(earlier.length ? ctx.moreLink("See what agents did", `#/agents`) : null),
-        ctx.h("div", { class: "agent-empty" },
-          ctx.h("span", { class: "agent-avatar agent-avatar-quiet", "aria-hidden": "true" }, mark(18)),
-          ctx.h("div", {},
-            ctx.h("p", { class: "agent-empty-title" }, "No agent is working in this repository right now."),
-            last ? ctx.h("p", { class: "agent-quiet" }, `${last.name} was here ${span(last.last_activity_at) ? `${span(last.last_activity_at)} ago` : "earlier"}. `, ctx.h("a", { href: `#/agents/${last.key}` }, "See what it did"), ".") : null,
-            connectHint(ctx))),
-        resource.error ? ctx.h("p", { class: "agent-quiet" }, "Showing what Kin last saw.") : null);
-    }
-    return ctx.h("section", { class: "agents-panel", "aria-labelledby": "home-agents-title" },
-      head(ctx.moreLink(agents.length > SHOWN ? `See the other ${count(agents.length - SHOWN)}` : "Open the timeline", "#/agents")),
-      ctx.h("div", { class: `agent-cards agent-cards-${Math.min(agents.length, 2)}` }, agents.slice(0, SHOWN).map((agent) => card(ctx, agent, data, { compact: true }))),
-      resource.error ? ctx.h("p", { class: "agent-quiet" }, "Showing what Kin last saw. ", ctx.button("Refresh", () => ctx.refresh(["agents"]), { class: "button button-small" })) : null);
+    return ctx.h("p", { class: "agent-hint" }, "Coding agents such as Claude Code, Codex and Cursor work here through Kin once they are connected. ", ctx.h("a", { href: "/#/agents" }, "Connect an agent"), ".");
   }
 
   // ── The Agents page ──────────────────────────────────────────────────────
@@ -318,6 +204,11 @@
   }
 
   function everyAgent(data) { return [...array(data?.agents), ...array(data?.earlier)]; }
+  /** When a session started, as a time of day, so two sessions of one agent can be told apart. */
+  function started(agent) {
+    const date = new Date(agent?.started_at);
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  }
 
   function selectedKey(ctx, data) {
     const wanted = text(ctx.params().agent);
@@ -325,21 +216,62 @@
     return everyAgent(data)[0]?.key || null;
   }
 
-  function agentList(ctx, data, selected) {
+  /** The entities an agent has been looking at lately, each once, newest first. */
+  function touching(agent, names) {
+    const seen = new Map();
+    for (const call of array(agent.recent_calls).slice(0, 4)) {
+      for (const id of array(call.entity_ids).slice(0, 6)) {
+        const label = shortLabel(names[id]?.label);
+        // Two entities that read the same here are one chip; the first leads to its page.
+        if (label && !seen.has(label.toLowerCase())) seen.set(label.toLowerCase(), { id, label });
+      }
+      if (seen.size >= 8) break;
+    }
+    return [...seen.values()].slice(0, 8);
+  }
+  /** A name as a reader would say it: a local inside a function is named for itself. */
+  function shortLabel(label) { return text(label).replace(/^.*<locals>\./, ""); }
+
+  /**
+   * One lane to an agent. A connected agent's lane shows what it has open, the
+   * entities it is looking at and the last things it did; the open lane holds
+   * everything it did. An agent that has gone is a line until it is opened.
+   */
+  function lanes(ctx, data, selected) {
     const rows = everyAgent(data);
     if (!rows.length) return ctx.h("div", { class: "agent-empty agent-empty-page" },
-      ctx.h("span", { class: "agent-avatar agent-avatar-quiet", "aria-hidden": "true" }, mark(18)),
       ctx.h("div", {}, ctx.h("p", { class: "agent-empty-title" }, "No agent has worked here since this page started."), connectHint(ctx)));
-    return ctx.h("ul", { class: "agent-roster", "aria-label": "Agents" }, rows.slice(0, 12).map((agent) => {
+    const names = data.names || {};
+    const lane = (agent) => {
       const [word, tone] = stateWords(agent);
-      const last = array(agent.recent_calls)[0];
-      return ctx.h("li", {}, ctx.h("a", { class: `agent-roster-row${agent.key === selected ? " is-selected" : ""}`, href: `#/agents/${agent.key}`, "aria-current": agent.key === selected ? "true" : undefined },
-        ctx.h("span", { class: "agent-avatar", "aria-hidden": "true" }, mark(16)),
-        ctx.h("span", { class: "agent-roster-text" },
-          ctx.h("span", { class: "agent-roster-name" }, agent.name),
-          ctx.h("span", { class: "agent-quiet" }, [plural(agent.calls_total || 0, "call"), agent.changes_total ? plural(agent.changes_total, "change") : null, last ? ctx.ago(last.at) : null].filter(Boolean).join(" · "))),
-        ctx.h("span", { class: `agent-state agent-state-${tone}` }, ctx.h("span", { class: "agent-state-dot", "aria-hidden": "true" }), word)));
-    }));
+      const open = agent.key === selected;
+      const here = agent.state !== "ended";
+      const calls = array(agent.recent_calls);
+      const looking = here || open ? touching(agent, names) : [];
+      const last = calls[0];
+      return ctx.h("li", { class: `lane${open ? " is-open" : ""}`, "data-state": agent.state === "active" ? "working" : here ? "idle" : "ended" },
+        ctx.h("a", { class: "lane-head", href: `#/agents/${agent.key}`, "aria-current": open ? "true" : undefined, "aria-expanded": String(open) },
+          ctx.h("span", { class: "pulse", "aria-hidden": "true" }),
+          ctx.h("span", { class: "lane-name" }, agent.name),
+          ctx.h("span", { class: "lane-when" }, [started(agent) ? `since ${started(agent)}` : "", plural(agent.calls_total || 0, "call"), agent.changes_total ? `${plural(agent.changes_total, "change")} committed` : "", !here && last ? ctx.ago(last.at) : ""].filter(Boolean).join(" · ")),
+          here ? ctx.h("span", { class: `state${tone === "live" ? " state-good" : ""}` }, word) : null),
+        here || open ? ctx.h("div", { class: "lane-body" },
+          openWork(ctx, agent, names),
+          looking.length ? ctx.h("div", { class: "lane-row" }, ctx.h("span", { class: "lane-label" }, here ? "Looking at" : "Looked at"),
+            ctx.h("span", { class: "lane-chips" }, looking.map((held) => ctx.h("a", { class: "lane-chip", href: ctx.entityHref(held.id), title: names[held.id]?.label }, held.label)))) : null,
+          !open && last ? ctx.h("div", { class: "lane-row" }, ctx.h("span", { class: "lane-label" }, "Last"),
+            ctx.h("span", { class: "lane-last" }, sentence(ctx, describe(last, names)), ctx.h("span", { class: "agent-quiet" }, ` · ${ctx.ago(last.at)}`))) : null,
+          !open && !last ? ctx.h("p", { class: "agent-quiet" }, "Connected. It has not asked Kin for anything yet.") : null,
+          open ? ctx.section("agents-detail", [], () => detail(ctx, agent.key), { class: "lane-detail" }) : null) : null);
+    };
+    const live = array(data.agents);
+    const earlier = array(data.earlier).slice(0, 12);
+    return [
+      live.length ? ctx.h("ul", { class: "lanes", "aria-label": "Connected now" }, live.map(lane)) : null,
+      earlier.length ? ctx.h("section", { class: live.length ? "section" : "" },
+        live.length ? ctx.h("div", { class: "section-head" }, ctx.h("h2", {}, "Earlier")) : null,
+        ctx.h("ul", { class: "lanes lanes-earlier", "aria-label": "Earlier sessions" }, earlier.map(lane))) : null,
+      ctx.h("p", { class: "agent-quiet agent-privacy" }, "Kin records which of its tools an agent called and which entities came back. It does not keep the agent's prompts.")];
   }
 
   function timelineRows(ctx, calls, names) {
@@ -355,8 +287,7 @@
       const unnamed = listed.length - ids.length;
       const meta = [];
       if (entry.times > 1) meta.push(`${count(entry.times)} times`);
-      if (READS.has(kind) && kind !== "source" && isCount(call.result_count)) meta.push(call.result_count ? `answer named ${plural(call.result_count, "entity", "entities")}` : "answer named no entity");
-      if (isCount(call.duration_ms) && call.duration_ms >= 1000) meta.push(`took ${(call.duration_ms / 1000).toFixed(call.duration_ms < 10_000 ? 1 : 0)} s`);
+      if (READS.has(kind) && kind !== "source" && isCount(call.result_count)) meta.push(call.result_count ? `${plural(call.result_count, "entity", "entities")} returned` : "No entity returned");
       return ctx.h("li", { class: `agent-step agent-step-${kind}${call.is_error ? " agent-step-error" : ""}` },
         ctx.h("time", { class: "agent-step-time", datetime: text(call.at) || undefined }, stamp(call.at)),
         ctx.h("span", { class: "agent-step-dot", "aria-hidden": "true" }),
@@ -407,43 +338,33 @@
       agent.changes_total ? plural(agent.changes_total, "change") + " committed" : "no change committed",
     ].filter(Boolean).join(", ");
     return ctx.h("div", { class: "agent-detail" },
-      ctx.h("header", { class: "agent-detail-head" },
-        ctx.h("span", { class: "agent-avatar agent-avatar-large", "aria-hidden": "true" }, mark(22)),
-        ctx.h("div", {}, ctx.h("h2", { class: "agent-detail-name" }, agent.name || "Agent"),
-          ctx.h("p", { class: "agent-presence" }, [presence(agent), agent.through === "mcp" ? "through Kin’s MCP server" : null].filter(Boolean).join(" · "))),
-        ctx.h("span", { class: `agent-state agent-state-${tone}` }, ctx.h("span", { class: "agent-state-dot", "aria-hidden": "true" }), word)),
-      ctx.h("p", { class: "lede lede-soft agent-summary" }, `${summary.charAt(0).toUpperCase()}${summary.slice(1)}.`),
-      openWork(ctx, agent, names),
+      ctx.h("p", { class: "agent-summary" }, `${summary.charAt(0).toUpperCase()}${summary.slice(1)}. `,
+        ctx.h("span", { class: "agent-quiet" }, [presence(agent), agent.through === "mcp" ? "through Kin’s MCP server" : null].filter(Boolean).join(" · "))),
       array(agent.changes).length ? ctx.h("section", { class: "section", "aria-labelledby": "agent-changes-title" }, ctx.h("div", { class: "section-head" }, ctx.h("h2", { id: "agent-changes-title" }, agent.changes_total === 1 ? "The change it committed" : "Changes it committed")), changeRows(ctx, array(agent.changes))) : null,
       ctx.h("section", { class: "section", "aria-labelledby": "agent-steps-title" },
         ctx.h("div", { class: "section-head" }, ctx.h("h2", { id: "agent-steps-title" }, "What it did"), ctx.h("span", { class: "agent-quiet" }, "Newest first")),
         timelineRows(ctx, calls, names),
-        ctx.h("p", { class: "agent-quiet agent-foot" }, kept < total ? `Showing its latest ${count(kept)} of ${count(total)} calls. Kin keeps a bounded record of each agent's calls.` : total === 1 ? "Its one call since it connected." : `Its ${count(total)} calls since it connected.`),
+        kept < total ? ctx.h("p", { class: "agent-quiet agent-foot" }, `Showing its latest ${count(kept)} of ${count(total)} calls. Kin keeps a bounded record of each agent's calls.`) : null,
         timeline.error ? ctx.h("p", { class: "agent-quiet" }, "Showing what Kin last saw. ", ctx.button("Refresh", () => loadTimeline(ctx, selected), { class: "button button-small" })) : null));
   }
 
   function view(ctx) {
     return [
-      ctx.h("header", {}, ctx.h("h1", {}, "Agents"),
+      ctx.h("header", { class: "page-head" },
+        ctx.h("div", { class: "page-title-row" }, ctx.h("h1", {}, "Agents"), ctx.h("div", { class: "page-actions" }, ctx.h("a", { class: "button", href: "/#/agents" }, "Connect an agent"))),
         ctx.section("agents-lede", ["agents"], () => {
           const resource = ctx.read();
-          if (resource.missing) return ctx.h("p", { class: "lede lede-soft" }, "This version of Kin does not report agent activity.");
+          if (resource.missing) return ctx.h("p", { class: "lede" }, "This version of Kin does not report agent activity.");
           if (!resource.data) return resource.error ? null : ctx.skeleton("skeleton-lede");
-          return ctx.h("p", { class: "lede lede-soft" }, liveBadge(ctx), headline(resource.data));
+          return ctx.h("p", { class: "lede" }, headline(resource.data), " ", liveBadge(ctx));
         })),
-      ctx.h("div", { class: "agents-layout" },
-        ctx.h("section", { class: "agents-roster-wrap", "aria-label": "Agents now and earlier" }, ctx.section("agents-list", ["agents"], () => {
-          const resource = ctx.read();
-          if (resource.missing) return null;
-          if (!resource.data) return resource.error ? ctx.failed("Kin couldn't load which agents are connected.", () => ctx.refresh(["agents"])) : ctx.skeletonLines(3);
-          return [agentList(ctx, resource.data, selectedKey(ctx, resource.data)),
-            ctx.h("p", { class: "agent-quiet agent-privacy" }, "Kin records which tools each agent uses and the entities they were about. It never keeps the words an agent asks with.")];
-        })),
-        ctx.section("agents-detail", ["agents"], () => {
-          const resource = ctx.read();
-          if (!resource.data) return null;
-          return detail(ctx, selectedKey(ctx, resource.data));
-        }, { class: "agents-detail-wrap" }))];
+      ctx.section("agents-meets", ["agents", "working"], () => ctx.overlaps?.() || null),
+      ctx.section("agents-list", ["agents"], () => {
+        const resource = ctx.read();
+        if (resource.missing) return null;
+        if (!resource.data) return resource.error ? ctx.failed("Kin couldn't load which agents are connected.", () => ctx.refresh(["agents"])) : ctx.skeletonLines(3);
+        return lanes(ctx, resource.data, selectedKey(ctx, resource.data));
+      }, { class: "agents-lanes" })];
   }
 
   // ── Following Kin live ───────────────────────────────────────────────────
@@ -452,7 +373,7 @@
 
   function liveBadge(ctx) {
     if (live.state === "off") return null;
-    const words = { on: "Live", waiting: "Reconnecting", polling: "Checking every 15 seconds" }[live.state] || "";
+    const words = { on: "Updates live", waiting: "Reconnecting", polling: "Checking every 15 seconds" }[live.state] || "";
     return ctx.h("span", { class: `live-badge live-${live.state}`, title: live.state === "on" ? "This updates as agents work." : "The live feed is not connected. The page reads again on its own." }, ctx.h("span", { class: "live-dot", "aria-hidden": "true" }), words);
   }
 
@@ -510,39 +431,6 @@
   function startPolling(ctx) { if (!live.poll) live.poll = setInterval(() => { if (!document.hidden) ctx.pulse(["agents"]); }, 15_000); }
   function stopPolling() { if (live.poll) { clearInterval(live.poll); live.poll = null; } }
 
-  // ── On the map ───────────────────────────────────────────────────────────
-
-  /**
-   * What the connected agents are touching, for the repository map: what an
-   * agent is editing or just committed, then what it read most recently.
-   */
-  function marks(data, limit = 12) {
-    const tones = new Map();
-    for (const agent of array(data?.agents)) {
-      for (const call of array(agent.recent_calls)) {
-        const kind = family(call.tool);
-        const tone = ["stage", "commit", "mutate"].includes(kind) ? "changing" : READS.has(kind) ? "looked" : null;
-        if (!tone) continue;
-        for (const id of array(call.entity_ids).slice(0, tone === "changing" ? 1 : 3)) {
-          if (!UUID.test(text(id))) continue;
-          if (tone === "changing" || !tones.has(id)) tones.set(id, tone);
-        }
-      }
-    }
-    return [...tones].sort((a, b) => (a[1] === "changing" ? 0 : 1) - (b[1] === "changing" ? 0 : 1)).slice(0, limit);
-  }
-
-  /** A line under the map saying what its rings mean, when any are drawn. */
-  function legend(ctx, data, shown) {
-    const agents = array(data?.agents);
-    if (!shown || !agents.length) return null;
-    const who = agents.length === 1 ? agents[0].name : "Agents";
-    const tones = new Set(marks(data).map(([, tone]) => tone));
-    return ctx.h("p", { class: "map-agent-legend" },
-      ctx.h("span", { class: "map-agent-key map-agent-key-looked", "aria-hidden": "true" }), `What ${who} looked at`,
-      tones.has("changing") ? [ctx.h("span", { class: "map-agent-key map-agent-key-changing", "aria-hidden": "true" }), `what ${agents.length === 1 ? "it is" : "they are"} changing`] : null);
-  }
-
   // ── Who made a change ────────────────────────────────────────────────────
 
   /** A change's author: an agent with its mark, or a person by name. */
@@ -552,5 +440,5 @@
     return name ? ctx.h("span", {}, name) : null;
   }
 
-  globalThis.KinWorkspaceAgents = { describe, plainText, group, family, span, presence, headline, panel, view, follow, author, mark, marks, legend, timeline, live };
+  globalThis.KinWorkspaceAgents = { describe, plainText, shortLabel, group, family, span, presence, headline, view, follow, author, mark, timeline, live };
 })();

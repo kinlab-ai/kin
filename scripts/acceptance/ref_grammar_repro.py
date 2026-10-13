@@ -606,8 +606,8 @@ class Suite(object):
         path = os.path.realpath(os.path.join(self.workdir, "ledger"))
         os.makedirs(path)
         self._repo = path
-        # `kin init` refuses a non-empty directory for a non-Git repository, so
-        # the store comes first and the files are written into it.
+        # The store comes first, on an empty directory, and the content is
+        # written into it afterwards.
         rc, out, err = run([self.kin, "init"], cwd=path, env=self.env, timeout=600)
         if rc != 0:
             raise RuntimeError("kin init failed: %s" % failure_excerpt(err or out))

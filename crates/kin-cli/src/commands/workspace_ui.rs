@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! A local, repository-bound human workspace. Every URL names its repository;
-//! changing the selection never changes the authority of an in-flight request.
+//! The local human workspace. One server answers for every Kin repository on
+//! this machine: the page at `/` lists them, and each repository's own pages
+//! live under a URL that names it. Changing the selection never changes the
+//! authority of an in-flight request.
+//!
+//! Repositories are found per request, not at startup. One that is added
+//! while the server runs, from its own page or by `kin init` in a terminal,
+//! answers at its URL without a restart.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::handler::Handler;
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post, MethodRouter};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,21 +36,140 @@ const AGENTS_APP: &str = include_str!("../../assets/workspace_ui/agents.js");
 const AGENTS_STYLE: &str = include_str!("../../assets/workspace_ui/agents.css");
 const MARK: &str = include_str!("../../assets/review_ui/mark.svg");
 
+/// How long a repository's name is kept before its records are read again. A
+/// list that a page polls would otherwise reopen every repository's
+/// configuration on every read.
+const IDENTITY_KEPT: Duration = Duration::from_secs(30);
+
+/// The longest message a commit made from the page carries, in characters.
+const COMMIT_MESSAGE_MAX_CHARS: usize = 4000;
+
+/// The longest name a branch made from the page carries, in characters.
+const BRANCH_NAME_MAX_CHARS: usize = 200;
+
 #[derive(Clone, Serialize)]
 pub(super) struct RepositoryEntry {
-    key: String,
-    name: String,
+    pub(super) key: String,
+    pub(super) name: String,
     /// Who holds the repository on its host, from its recorded Git remote.
     #[serde(skip_serializing_if = "Option::is_none")]
-    owner: Option<String>,
+    pub(super) owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    host: Option<String>,
-    url: String,
+    pub(super) host: Option<String>,
+    pub(super) url: String,
 }
 
+/// One repository this machine can open, with what the registry records
+/// about it.
+pub(super) struct Listed {
+    pub(super) entry: RepositoryEntry,
+    pub(super) layout: kin_core::KinLayout,
+    /// The registry's record. Absent for a repository this server opened
+    /// that the registry does not name.
+    pub(super) record: Option<Recorded>,
+}
+
+/// What the registry last recorded about a repository.
+pub(super) struct Recorded {
+    pub(super) entities: usize,
+    pub(super) at: String,
+}
+
+/// One reading of the repositories this machine can open.
+pub(super) struct Listing {
+    pub(super) repositories: Vec<Listed>,
+    /// Registered locations that no longer hold a Kin repository.
+    pub(super) unavailable: usize,
+    pub(super) warning: Option<String>,
+}
+
+/// The repositories this server can show. It holds no list of its own: every
+/// reading comes from the registry as it is when asked.
 pub(super) struct Catalog {
-    repositories: Vec<RepositoryEntry>,
-    warning: Option<String>,
+    /// False for a test that serves one repository and reads no registry.
+    reads_registry: bool,
+    /// Repositories this server opened itself, which the registry may not
+    /// name: one given on the command line, or one opened from the page.
+    opened: RwLock<Vec<kin_core::KinLayout>>,
+    names: Mutex<HashMap<String, (Instant, RepositoryEntry)>>,
+}
+
+impl Catalog {
+    pub(super) fn live() -> Arc<Self> {
+        Arc::new(Self {
+            reads_registry: true,
+            opened: RwLock::default(),
+            names: Mutex::default(),
+        })
+    }
+
+    fn remember(&self, layout: &kin_core::KinLayout) {
+        let mut opened = self
+            .opened
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !opened
+            .iter()
+            .any(|known| known.working_dir() == layout.working_dir())
+        {
+            opened.push(layout.clone());
+        }
+    }
+
+    /// The entry a repository is listed by, reading its name at most once
+    /// per [`IDENTITY_KEPT`].
+    fn named(&self, layout: &kin_core::KinLayout) -> RepositoryEntry {
+        let key = repository_key(layout.working_dir());
+        let names = || {
+            self.names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some((read, entry)) = names().get(&key) {
+            if read.elapsed() < IDENTITY_KEPT {
+                return entry.clone();
+            }
+        }
+        // Read outside the lock, so one slow repository holds up no other.
+        let entry = entry(layout);
+        names().insert(key, (Instant::now(), entry.clone()));
+        entry
+    }
+
+    /// Whether the registry names exactly this location. Blocking.
+    pub(super) fn registered_at(&self, location: &Path) -> bool {
+        let wanted = repository_key(location);
+        self.reads_registry
+            && kin_core::registry::KinRegistry::load().is_ok_and(|registry| {
+                registry
+                    .repos
+                    .iter()
+                    .any(|row| repository_key(&row.path) == wanted)
+            })
+    }
+
+    /// Read the registry and name what it holds. Blocking: it reads the
+    /// registry and each repository's own records.
+    pub(super) fn read(&self) -> Listing {
+        let opened = self
+            .opened
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let (found, unavailable, warning) = catalog(self.reads_registry, opened);
+        Listing {
+            repositories: found
+                .into_iter()
+                .map(|(layout, record)| Listed {
+                    entry: self.named(&layout),
+                    layout,
+                    record,
+                })
+                .collect(),
+            unavailable,
+            warning,
+        }
+    }
 }
 
 /// A routing/storage key, not repository authority. The daemon still verifies
@@ -74,7 +201,7 @@ pub(super) fn display_identity(
     (name, origin)
 }
 
-fn entry(layout: &kin_core::KinLayout) -> RepositoryEntry {
+pub(super) fn entry(layout: &kin_core::KinLayout) -> RepositoryEntry {
     let key = repository_key(layout.working_dir());
     let (name, origin) = display_identity(layout);
     RepositoryEntry {
@@ -86,47 +213,72 @@ fn entry(layout: &kin_core::KinLayout) -> RepositoryEntry {
     }
 }
 
-fn catalog(selected: kin_core::KinLayout) -> (Arc<Catalog>, Vec<kin_core::KinLayout>) {
-    let mut layouts = vec![selected];
+/// Each repository found, with the registry's record of it when it has one.
+type Found = Vec<(kin_core::KinLayout, Option<Recorded>)>;
+
+/// The repositories this machine can open now: every registered location
+/// that still holds one, then any of `opened` the registry does not name,
+/// with how many registered locations hold none and a warning to show. No
+/// repository is initialized and no daemon is started to answer.
+fn catalog(
+    reads_registry: bool,
+    opened: Vec<kin_core::KinLayout>,
+) -> (Found, usize, Option<String>) {
+    // The repository at exactly `path`, or nothing. A stale child
+    // registration must not silently become its parent.
+    let held_at = |path: &Path| {
+        let layout = kin_core::KinLayout::discover(path)?;
+        (layout.working_dir().canonicalize().ok() == path.canonicalize().ok() && path.is_dir())
+            .then_some(layout)
+    };
+    let mut found: Vec<(String, kin_core::KinLayout, Option<Recorded>)> = Vec::new();
+    let mut unavailable = 0;
     let mut warning = None;
-    match kin_core::registry::KinRegistry::load() {
-        Ok(registry) => {
-            let mut unavailable = 0;
-            for repository in registry.repos {
-                let Some(layout) = kin_core::KinLayout::discover(&repository.path) else {
-                    unavailable += 1;
-                    continue;
+    if reads_registry {
+        match kin_core::registry::KinRegistry::load() {
+            Ok(registry) => {
+                for repository in registry.repos {
+                    let Some(layout) = held_at(&repository.path) else {
+                        unavailable += 1;
+                        continue;
+                    };
+                    let key = repository_key(layout.working_dir());
+                    if found.iter().all(|(known, _, _)| *known != key) {
+                        let record = Recorded {
+                            entities: repository.entities,
+                            at: repository.last_commit,
+                        };
+                        found.push((key, layout, Some(record)));
+                    }
+                }
+                warning = match unavailable {
+                    0 => None,
+                    1 => Some("1 registered repository is unavailable on this machine.".into()),
+                    count => Some(format!(
+                        "{count} registered repositories are unavailable on this machine."
+                    )),
                 };
-                // A stale child registration must not silently become its parent.
-                if layout.working_dir().canonicalize().ok() != repository.path.canonicalize().ok()
-                    || !repository.path.is_dir()
-                {
-                    unavailable += 1;
-                    continue;
-                }
-                let key = repository_key(layout.working_dir());
-                if !layouts
-                    .iter()
-                    .any(|existing| repository_key(existing.working_dir()) == key)
-                {
-                    layouts.push(layout);
-                }
             }
-            if unavailable > 0 {
-                warning = Some(format!(
-                    "{unavailable} registered repositories are unavailable on this machine."
-                ));
+            Err(error) => {
+                warning = Some(format!("Could not read the repository registry: {error}"))
             }
         }
-        Err(error) => warning = Some(format!("Could not read the repository registry: {error}")),
     }
-    let entries = layouts.iter().map(entry).collect();
+    for layout in opened {
+        let key = repository_key(layout.working_dir());
+        if found.iter().all(|(known, _, _)| *known != key)
+            && (!reads_registry || held_at(layout.working_dir()).is_some())
+        {
+            found.push((key, layout, None));
+        }
+    }
     (
-        Arc::new(Catalog {
-            repositories: entries,
-            warning,
-        }),
-        layouts,
+        found
+            .into_iter()
+            .map(|(_, layout, record)| (layout, record))
+            .collect(),
+        unavailable,
+        warning,
     )
 }
 
@@ -134,13 +286,19 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
     ([(axum::http::header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
-async fn index(State(state): State<Arc<UiState>>) -> Response {
-    Html(INDEX.replace("__KIN_BASE__", &state.base_path)).into_response()
+/// The one page, told where its own scope begins: a repository's base path,
+/// or nothing for the page that lists them.
+fn page(base: &str) -> Response {
+    Html(INDEX.replace("__KIN_BASE__", base)).into_response()
 }
 
-pub(super) fn routes() -> Router<Arc<UiState>> {
+async fn index(State(state): State<Arc<UiState>>) -> Response {
+    page(&state.base_path)
+}
+
+/// What the page loads, the same bytes in every scope that serves it.
+fn page_assets<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route("/workspace/", get(index))
         .route(
             "/workspace/style.css",
             get(|| async { asset(STYLE, "text/css; charset=utf-8") }),
@@ -165,6 +323,12 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
             "/workspace/mark.svg",
             get(|| async { asset(MARK, "image/svg+xml") }),
         )
+}
+
+pub(super) fn routes() -> Router<Arc<UiState>> {
+    Router::new()
+        .route("/workspace/", get(index))
+        .merge(page_assets())
         .route("/api/workspace/session", get(session))
         .route("/api/workspace/branches", get(branches))
         .route("/api/workspace/branch/preview", post(branch_preview))
@@ -174,7 +338,13 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
             get(super::workspace_conflicts::serve_conflicts),
         )
         .route("/api/workspace/merge/preview", post(merge_preview))
+        .route(
+            "/api/workspace/conflicts/settle",
+            post(super::workspace_conflicts::settle),
+        )
+        .route("/api/workspace/branch/create", post(branch_create))
         .route("/api/workspace/merge/confirm", post(merge_confirm))
+        .route("/api/workspace/commit", post(commit))
         .merge(super::workspace_explore::routes())
         .merge(super::workspace_agents::routes())
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -184,8 +354,9 @@ pub(super) fn routes() -> Router<Arc<UiState>> {
 #[cfg(test)]
 pub(super) fn empty_catalog() -> Arc<Catalog> {
     Arc::new(Catalog {
-        repositories: Vec::new(),
-        warning: None,
+        reads_registry: false,
+        opened: RwLock::default(),
+        names: Mutex::default(),
     })
 }
 
@@ -290,6 +461,114 @@ async fn branch_confirm(
         Err(error) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
             "error":format!("{error:#}"),"outcome":"unknown","operation_id":operation_id,
             "remedy":"The switch may have committed. Refresh repository and branch state before another attempt. This request was not retried.",
+        }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BranchCreateBody {
+    name: String,
+    operation_id: kin_model::OperationId,
+}
+
+/// The branch a reader named, as the ref it will be.
+fn new_branch(name: &str) -> Result<kin_model::RefName> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a branch needs a name");
+    anyhow::ensure!(
+        name.chars().count() <= BRANCH_NAME_MAX_CHARS,
+        "a branch name is at most {BRANCH_NAME_MAX_CHARS} characters"
+    );
+    let name = super::repository_authority::parse_ref_name(name)?;
+    anyhow::ensure!(name.is_branch(), "choose a name below refs/heads/");
+    Ok(name)
+}
+
+/// Nothing was created: the request stopped before the daemon was asked, or
+/// the daemon refused and the branch list shows no such branch.
+fn branch_not_created(operation_id: kin_model::OperationId, error: &anyhow::Error) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error":format!("{error:#}"),"outcome":"refused","operation_id":operation_id,
+            "remedy":"No branch was created. Correct what is reported, then create it again.",
+        })),
+    )
+        .into_response()
+}
+
+/// Create a branch at the current branch's head, as `kin branch create` does.
+async fn branch_create(
+    State(state): State<Arc<UiState>>,
+    headers: HeaderMap,
+    Json(body): Json<BranchCreateBody>,
+) -> Response {
+    if !review_ui::may_write(&headers, &state) {
+        return review_ui::write_refused();
+    }
+    let operation_id = body.operation_id;
+    let prepared = (|| {
+        anyhow::ensure!(
+            !operation_id.0.is_nil(),
+            "a nonempty operation ID is required"
+        );
+        let name = new_branch(&body.name)?;
+        // Attribution resolves against this URL's repository, never the
+        // process working directory or a caller-supplied actor.
+        let actor = super::require_commit_author_for(&state.layout)?;
+        Ok::<_, anyhow::Error>((name, actor))
+    })();
+    let (name, actor) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return branch_not_created(operation_id, &error),
+    };
+    let client = match review_ui::daemon(&state).await {
+        Ok(client) => client,
+        Err(error) => return branch_not_created(operation_id, &error),
+    };
+    // Whether a branch of this name exists, read from the daemon's own list.
+    // The create request is answered through a transport that reports a
+    // refusal and a lost answer alike, so this list is what tells them apart.
+    let exists = || async {
+        let report = client
+            .branch(&super::branch::BranchRequest::List)
+            .await?
+            .report
+            .context("daemon branch list omitted its authority report")?;
+        Ok::<_, anyhow::Error>(report.branches.iter().any(|branch| branch.name == name))
+    };
+    match exists().await {
+        Ok(false) => {}
+        Ok(true) => {
+            return branch_not_created(
+                operation_id,
+                &anyhow::anyhow!("a branch named {name} already exists"),
+            )
+        }
+        Err(error) => return branch_not_created(operation_id, &error),
+    }
+    let request = super::branch::BranchRequest::Create {
+        name: name.clone(),
+        operation_id,
+        actor,
+    };
+    let Err(error) = client.branch(&request).await else {
+        return Json(serde_json::json!({
+            "operation_id":operation_id, "outcome":"created", "name":name.to_string(),
+        }))
+        .into_response();
+    };
+    match exists().await {
+        Ok(false) => (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error":format!("{error:#}"),"outcome":"refused","operation_id":operation_id,
+            "remedy":"The daemon refused and no branch of this name exists. Correct what is reported, then create it again.",
+        }))).into_response(),
+        // The branch is there, or the list could not be read. Either way the
+        // answer that would have said how this request ended was lost.
+        _ => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error":format!("{error:#}"),"outcome":"unknown","operation_id":operation_id,
+            "remedy":"The branch may have been created. Read the branches again before creating it again. This request was not retried.",
         }))).into_response(),
     }
 }
@@ -413,6 +692,119 @@ async fn merge_confirm(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitBody {
+    message: String,
+    operation_id: kin_model::OperationId,
+}
+
+/// This attempt recorded nothing: it stopped before the daemon was asked, or
+/// the daemon refused before publication.
+fn commit_refused(operation_id: kin_model::OperationId, error: &anyhow::Error) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error":format!("{error:#}"), "outcome":"refused",
+            "operation_id":operation_id,
+            "remedy":"Nothing was recorded. Resolve what is reported, then commit again.",
+        })),
+    )
+        .into_response()
+}
+
+/// Commit the whole working copy, as `kin commit -m` does.
+async fn commit(
+    State(state): State<Arc<UiState>>,
+    headers: HeaderMap,
+    Json(body): Json<CommitBody>,
+) -> Response {
+    if !review_ui::may_write(&headers, &state) {
+        return review_ui::write_refused();
+    }
+    let operation_id = body.operation_id;
+    let message = body.message.trim().to_string();
+    let checked = (|| {
+        anyhow::ensure!(
+            !operation_id.0.is_nil(),
+            "a nonempty operation ID is required"
+        );
+        anyhow::ensure!(!message.is_empty(), "a commit needs a message");
+        anyhow::ensure!(
+            message.chars().count() <= COMMIT_MESSAGE_MAX_CHARS,
+            "a commit message is at most {COMMIT_MESSAGE_MAX_CHARS} characters"
+        );
+        Ok(())
+    })();
+    if let Err(error) = checked {
+        return commit_refused(operation_id, &error);
+    }
+    let title = message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // Run to its end whatever becomes of this request. A page that closes
+    // mid-commit must not leave the daemon's answer unread, and attribution
+    // resolves against this URL's repository, never a caller-supplied actor.
+    let committing = tokio::spawn(async move {
+        super::commit::commit_for_app(&state.layout, &message, operation_id).await
+    });
+    let outcome = committing.await.unwrap_or_else(|error| {
+        super::commit::AppCommit::Unknown(anyhow::anyhow!("the commit did not finish: {error}"))
+    });
+    match outcome {
+        super::commit::AppCommit::Committed { change_id } => Json(serde_json::json!({
+            "operation_id":operation_id, "outcome":"committed",
+            "change_id":change_id, "title":title,
+        }))
+        .into_response(),
+        super::commit::AppCommit::NothingToCommit => Json(serde_json::json!({
+            "operation_id":operation_id, "outcome":"nothing_to_commit",
+        }))
+        .into_response(),
+        super::commit::AppCommit::Refused(error) => commit_refused(operation_id, &error),
+        // A lost answer can follow a recorded change. Return its identity for
+        // reconciliation and never replay it behind the page.
+        super::commit::AppCommit::Unknown(error) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error":format!("{error:#}"), "outcome":"unknown",
+            "operation_id":operation_id,
+            "remedy":"The commit may have been recorded. Refresh recent changes before committing again. This request was not retried.",
+        }))).into_response(),
+    }
+}
+
+/// How much of a repository's history its store holds, from the store's own
+/// record of it. `complete` is a store with its whole history, which a
+/// repository that began in Kin always is. `partial` is a converted project
+/// whose one admitted commit is being followed by the rest in the background.
+/// `none` is a store that holds that one commit and derives no more: it was
+/// asked not to, or the project it came from has no more to give.
+pub(super) fn history_json(
+    standing: &kin_core::history_state::HistoryStanding,
+) -> serde_json::Value {
+    use kin_core::history_state::{HistoryMode, HistoryStanding};
+    match standing {
+        HistoryStanding::Complete => serde_json::json!({"state":"complete"}),
+        // A record that cannot be read is treated as incomplete, as every
+        // other surface treats it, and no count is claimed for it.
+        HistoryStanding::Unreadable { .. } => serde_json::json!({"state":"partial"}),
+        HistoryStanding::Partial { record, .. } => {
+            let filling = record.mode == HistoryMode::Background && record.underivable.is_none();
+            let mut history = serde_json::json!({
+                "state": if filling { "partial" } else { "none" },
+                "admitted": record.admitted_commits,
+                "deriving": super::daemon_activity::running_history(standing).is_some(),
+            });
+            if let Some(total) = record.reachable_commits {
+                history["total"] = serde_json::json!(total);
+            }
+            history
+        }
+    }
+}
+
 /// A repository's identity for the page: its remote's owner, name and host
 /// when Kin has a remote for it, otherwise its working tree's name alone.
 /// `fields` carries whatever else the answer names it by.
@@ -470,15 +862,32 @@ async fn session(State(state): State<Arc<UiState>>) -> Response {
         ),
     };
     let key = repository_key(state.layout.working_dir());
-    let repositories: Vec<_> = state.catalog.as_ref().map(|catalog| catalog.repositories.iter().map(|item| {
+    // Read for this answer, so a repository added since the server started
+    // is in the list the page switches between.
+    let (listing, history) = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            (
+                state.catalog.as_ref().map(|catalog| catalog.read()),
+                // The store's own record of its history, so the page can say
+                // when the record of changes is still filling in.
+                history_json(&kin_core::history_state::standing(&state.layout)),
+            )
+        })
+        .await
+        .unwrap_or((None, serde_json::Value::Null))
+    };
+    let repositories: Vec<_> = listing.iter().flat_map(|listing| &listing.repositories).map(|listed| {
+        let item = &listed.entry;
         serde_json::json!({"key":item.key,"name":item.name,"owner":item.owner,"host":item.host,"url":item.url,"selected":item.key == key})
-    }).collect()).unwrap_or_default();
+    }).collect();
     Json(serde_json::json!({
         "repository":repository_identity(&state, serde_json::json!({"key":key,"repository_id":repository_id,"workspace_id":workspace_id})),
         "repositories":repositories,
-        "registry_warning":state.catalog.as_ref().and_then(|catalog| catalog.warning.as_deref()),
-        "catalog_basis":"Registered repositories available when this workspace started. Restart kin ui to reload the list.",
-        "capabilities":{"graph":true,"review":true,"merge":true,"editor":true,"branch_switch":true,"branch_switch_unavailable_reason":null,"conflict_details":true},
+        "registry_warning":listing.as_ref().and_then(|listing| listing.warning.as_deref()),
+        "catalog_basis":"Repositories registered on this machine, read for this answer.",
+        "capabilities":{"graph":true,"review":true,"merge":true,"commit":true,"editor":true,"branch_switch":true,"branch_switch_unavailable_reason":null,"branch_create":true,"conflict_details":true,"conflict_settle":true},
+        "history":history,
         "runtime":runtime,"version":env!("CARGO_PKG_VERSION"),"actor":state.actor,"token":state.token,
         "review_url":format!("{}/review/",state.base_path),
         "graph_url":format!("{}/workspace/#/entities",state.base_path),
@@ -494,49 +903,214 @@ fn workspace_layout(path: &Path) -> Result<kin_core::KinLayout> {
     super::require_repository_layout_at(&canonical)
 }
 
-/// Serve the selected and registered repositories on a single local origin.
-/// No repository is initialized and no daemon is started during enumeration.
-pub async fn run(path: Option<PathBuf>, port: Option<u16>, open_browser: bool) -> Result<()> {
-    let selected = if let Some(path) = path {
-        workspace_layout(&path)?
-    } else {
-        super::require_repository_layout()?
-    };
-    let selected_key = repository_key(selected.working_dir());
-    let (catalog, layouts) = catalog(selected);
-    let listener = review_ui::bind(port).await?;
-    let port = listener.local_addr()?.port();
-    let selected_url = format!("/repositories/{selected_key}/workspace/");
-    let redirect_url = selected_url.clone();
-    let mut router = Router::new().route(
-        "/",
-        get(move || {
-            let location = redirect_url.clone();
-            async move { Redirect::temporary(&location) }
-        }),
-    );
-    let mut selected_state = None;
-    for layout in layouts {
+/// One repository as this server serves it: its state, and its routes.
+///
+/// The routes are held as a `MethodRouter` because that is the form axum
+/// itself calls with a request and a state. A router nested at startup is
+/// fixed for the life of the server; one called this way is chosen per
+/// request, so a repository can be served the first time it is asked for.
+struct Mounted {
+    state: Arc<UiState>,
+    service: MethodRouter,
+}
+
+/// Everything one `kin ui` server answers for: the page that lists this
+/// machine's repositories, and each repository it has been asked to show.
+pub(super) struct Hub {
+    pub(super) port: u16,
+    /// Minted once per run for the page that lists repositories. A
+    /// repository's own token is separate, so neither scope can write in the
+    /// other.
+    pub(super) token: String,
+    /// Who the listing page shows its reader as.
+    pub(super) actor: Option<String>,
+    pub(super) catalog: Arc<Catalog>,
+    mounted: RwLock<HashMap<String, Mounted>>,
+    pub(super) home: super::workspace_home::Home,
+}
+
+impl Hub {
+    pub(super) fn new(port: u16, catalog: Arc<Catalog>, actor: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            port,
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            actor,
+            catalog,
+            mounted: RwLock::default(),
+            home: Default::default(),
+        })
+    }
+
+    fn mounted(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Mounted>> {
+        self.mounted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Serve `state` under `key`. A repository already served keeps the state
+    /// it has, so its write token and what it remembers survive.
+    fn mount(&self, key: String, state: Arc<UiState>) -> Arc<UiState> {
+        let mut mounted = self
+            .mounted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mounted
+            .entry(key)
+            .or_insert_with(|| Mounted {
+                service: axum::routing::any_service(review_ui::workspace_router(state.clone())),
+                state,
+            })
+            .state
+            .clone()
+    }
+
+    /// Serve the repository at `layout` under its own key, and list it.
+    /// Blocking: naming the reader reads the repository's configuration.
+    pub(super) fn open(&self, layout: kin_core::KinLayout) -> Arc<UiState> {
         let key = repository_key(layout.working_dir());
-        let base = format!("/repositories/{key}");
+        if let Some(state) = self.state(&key) {
+            return state;
+        }
+        self.catalog.remember(&layout);
         let state = Arc::new(UiState::workspace(
             layout,
-            port,
-            base.clone(),
-            catalog.clone(),
+            self.port,
+            format!("/repositories/{key}"),
+            self.catalog.clone(),
         ));
-        if key == selected_key {
-            selected_state = Some(state.clone());
-        }
-        router = router.nest(&base, review_ui::workspace_router(state));
+        self.mount(key, state)
     }
-    let selected_state =
-        selected_state.context("selected repository was not registered in this workspace")?;
-    router = router.layer(axum::middleware::from_fn_with_state(
-        selected_state,
-        review_ui::local_only,
-    ));
-    let url = format!("http://127.0.0.1:{port}{selected_url}");
+
+    /// The state serving `key`, when this server has been asked for it.
+    pub(super) fn state(&self, key: &str) -> Option<Arc<UiState>> {
+        self.mounted().get(key).map(|mounted| mounted.state.clone())
+    }
+
+    /// The routes for `key`. A repository this server has not served yet is
+    /// looked for in the registry as it is now, which is how one added after
+    /// startup answers without a restart.
+    async fn service(self: &Arc<Self>, key: &str) -> Option<MethodRouter> {
+        let served = |hub: &Self| {
+            hub.mounted()
+                .get(key)
+                .map(|mounted| mounted.service.clone())
+        };
+        if let Some(service) = served(self) {
+            return Some(service);
+        }
+        // A key is the hex of a digest. Anything else names no repository,
+        // and is refused before the registry is read for it.
+        if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let hub = self.clone();
+        let wanted = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let listed = hub
+                .catalog
+                .read()
+                .repositories
+                .into_iter()
+                .find(|listed| listed.entry.key == wanted)?;
+            Some(hub.open(listed.layout))
+        })
+        .await
+        .ok()
+        .flatten()?;
+        served(self)
+    }
+}
+
+/// Split `/repositories/<key>/<rest>` into the key and the request the
+/// repository's own routes see.
+fn repository_scope(uri: &Uri) -> Option<(&str, Uri)> {
+    let scoped = uri.path().strip_prefix("/repositories/")?;
+    let (key, rest) = scoped.split_once('/').unwrap_or((scoped, ""));
+    if key.is_empty() {
+        return None;
+    }
+    let mut inner = format!("/{rest}");
+    if let Some(query) = uri.query() {
+        inner.push('?');
+        inner.push_str(query);
+    }
+    Some((key, inner.parse().ok()?))
+}
+
+/// Hand a request under `/repositories/<key>` to that repository's routes.
+async fn serve_repository(State(hub): State<Arc<Hub>>, mut request: Request) -> Response {
+    let unknown = || {
+        (
+            StatusCode::NOT_FOUND,
+            "no repository on this machine answers at this address\n",
+        )
+            .into_response()
+    };
+    let Some((key, inner)) = repository_scope(request.uri()) else {
+        return unknown();
+    };
+    let Some(service) = hub.service(key).await else {
+        return unknown();
+    };
+    *request.uri_mut() = inner;
+    service.call(request, ()).await
+}
+
+async fn serve_hub_page() -> Response {
+    page("")
+}
+
+/// Every route of one server: the listing page and its API at the root, and
+/// each repository below its own key. The host check and the page headers
+/// cover all of them.
+pub(super) fn hub_router(hub: Arc<Hub>) -> Router {
+    Router::new()
+        .route("/", get(serve_hub_page))
+        .route("/review/highlight.js", get(review_ui::serve_highlight_js))
+        .merge(page_assets())
+        .merge(super::workspace_home::routes())
+        .fallback(serve_repository)
+        .layer(axum::middleware::from_fn_with_state(
+            hub.port,
+            review_ui::loopback_only,
+        ))
+        .with_state(hub)
+}
+
+/// The repository this command was run in, when it was run in one.
+fn current_repository() -> Option<kin_core::KinLayout> {
+    match super::require_repository_layout() {
+        Ok(layout) => Some(layout),
+        Err(error) => {
+            // Outside any repository is the ordinary case and needs no words:
+            // the listing page opens. Any other reason is one the reader can
+            // act on, so it is said before that page opens.
+            if error.to_string() != super::NOT_A_KIN_REPOSITORY {
+                eprintln!("kin: {error:#}");
+            }
+            None
+        }
+    }
+}
+
+/// Serve this machine's repositories on a single local origin. Run in a
+/// repository, or given one, its workspace opens; anywhere else the page that
+/// lists them does. No repository is initialized and no daemon is started to
+/// list them.
+pub async fn run(path: Option<PathBuf>, port: Option<u16>, open_browser: bool) -> Result<()> {
+    let selected = match path {
+        Some(path) => Some(workspace_layout(&path)?),
+        None => current_repository(),
+    };
+    let listener = review_ui::bind(port).await?;
+    let port = listener.local_addr()?.port();
+    let actor = super::workspace_home::reader(selected.as_ref());
+    let hub = Hub::new(port, Catalog::live(), actor);
+    let opening = match selected {
+        Some(layout) => format!("{}/workspace/", hub.open(layout).base_path),
+        None => "/".to_string(),
+    };
+    let url = format!("http://127.0.0.1:{port}{opening}");
     println!("Kin workspace at {url}");
     println!("Served from this machine only. Press Ctrl-C to stop this page server.");
     if open_browser {
@@ -548,7 +1122,7 @@ pub async fn run(path: Option<PathBuf>, port: Option<u16>, open_browser: bool) -
             }
         });
     }
-    axum::serve(listener, router)
+    axum::serve(listener, hub_router(hub))
         .await
         .context("Kin workspace server error")
 }
@@ -566,31 +1140,324 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// One server with two repositories mounted, the way `run` composes it,
+    /// and no registry behind it. Neither layout holds a repository, so every
+    /// route under test answers before any daemon is looked for.
+    async fn serve_two() -> (String, Vec<String>, Arc<Hub>, tokio::task::JoinHandle<()>) {
+        let listener = review_ui::bind(Some(0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let catalog = empty_catalog();
+        let hub = Hub::new(port, catalog.clone(), Some("ada".into()));
+        let mut tokens = Vec::new();
+        for key in ["first", "second"] {
+            let state = Arc::new(UiState::workspace(
+                kin_core::KinLayout::new(std::env::temp_dir().join(format!("kin-ui-{key}/.kin"))),
+                port,
+                format!("/repositories/{key}"),
+                catalog.clone(),
+            ));
+            tokens.push(state.token.clone());
+            hub.mount(key.to_string(), state);
+        }
+        let router = hub_router(hub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://127.0.0.1:{port}"), tokens, hub, server)
+    }
+
+    #[test]
+    fn a_repository_request_is_split_into_its_key_and_its_own_address() {
+        let split = |address: &str| {
+            let uri: Uri = address.parse().unwrap();
+            repository_scope(&uri).map(|(key, inner)| (key.to_string(), inner.to_string()))
+        };
+        assert_eq!(
+            split("/repositories/abc/api/workspace/entity?id=a%2Fb&x=1"),
+            Some(("abc".into(), "/api/workspace/entity?id=a%2Fb&x=1".into()))
+        );
+        assert_eq!(
+            split("/repositories/abc/workspace/"),
+            Some(("abc".into(), "/workspace/".into()))
+        );
+        assert_eq!(split("/repositories/abc"), Some(("abc".into(), "/".into())));
+        assert_eq!(split("/repositories/"), None);
+        assert_eq!(split("/repositories//workspace/"), None);
+        assert_eq!(split("/elsewhere/abc/workspace/"), None);
+    }
+
+    /// The page at the root belongs to no repository: it is the same page
+    /// with an empty base, under the same host check and headers, and its
+    /// write authority is its own.
+    #[tokio::test]
+    async fn the_listing_page_is_served_at_the_root_with_its_own_scope_and_token() {
+        let (origin, tokens, hub, server) = serve_two().await;
+        let port = hub.port;
+        let client = reqwest::Client::new();
+        let page = client.get(format!("{origin}/")).send().await.unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(page.headers()["cache-control"], "no-store");
+        assert!(page.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
+        let page = page.text().await.unwrap();
+        assert_eq!(page, INDEX.replace("__KIN_BASE__", ""));
+        assert!(!page.contains("__KIN_BASE__"));
+        for asset in [
+            "/workspace/style.css",
+            "/workspace/workspace.js",
+            "/workspace/graph.js",
+            "/workspace/agents.js",
+            "/workspace/agents.css",
+            "/workspace/mark.svg",
+            "/review/highlight.js",
+        ] {
+            let served = client.get(format!("{origin}{asset}")).send().await.unwrap();
+            assert_eq!(served.status(), StatusCode::OK, "{asset}");
+            assert_eq!(served.headers()["x-content-type-options"], "nosniff");
+            let scoped = client
+                .get(format!("{origin}/repositories/first{asset}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                served.text().await.unwrap(),
+                scoped.text().await.unwrap(),
+                "{asset}"
+            );
+        }
+        // The host check covers the root, its API and an address that names
+        // no repository alike, before any of them is looked up.
+        for path in [
+            "/",
+            "/api/home",
+            "/api/home/session",
+            "/repositories/unknown/workspace/",
+        ] {
+            let refused = client
+                .get(format!("{origin}{path}"))
+                .header("host", format!("foreign.example:{port}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        for unknown in [
+            "/repositories/unknown/workspace/".to_string(),
+            format!("/repositories/{}/workspace/", "0".repeat(64)),
+            "/repositories/".to_string(),
+            "/elsewhere".to_string(),
+        ] {
+            let missing = client
+                .get(format!("{origin}{unknown}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND, "{unknown}");
+        }
+
+        let session: serde_json::Value = client
+            .get(format!("{origin}/api/home/session"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(session["schema"], "kin.workspace.home-session.v1");
+        assert_eq!(session["actor"], "ada");
+        assert_eq!(session["version"], env!("CARGO_PKG_VERSION"));
+        let token = session["token"].as_str().unwrap().to_string();
+        assert_eq!(token, hub.token);
+        assert!(!tokens.contains(&token));
+
+        let home: serde_json::Value = client
+            .get(format!("{origin}/api/home"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(home["schema"], "kin.workspace.home.v1");
+        assert_eq!(home["repositories"], serde_json::json!([]));
+        assert_eq!(home["unavailable"], 0);
+        assert_eq!(home["warning"], serde_json::Value::Null);
+
+        // Adding a repository is a write in the listing page's scope: it
+        // needs that page's token and its own origin, and a repository's
+        // token carries no authority there.
+        let add = format!("{origin}/api/home/repositories");
+        let absent = std::env::temp_dir().join(format!("kin-ui-absent-{}", uuid::Uuid::new_v4()));
+        let body = serde_json::json!({"action":"open","path":absent});
+        for (sent, request_origin) in [
+            ("", origin.as_str()),
+            (tokens[0].as_str(), origin.as_str()),
+            (token.as_str(), "https://foreign.example"),
+        ] {
+            let refused = client
+                .post(&add)
+                .header("x-kin-review-token", sent)
+                .header("origin", request_origin)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
+        // With authority, a request that cannot be met is refused in words
+        // before anything is started.
+        let nothing_there = client
+            .post(&add)
+            .header("x-kin-review-token", &token)
+            .header("origin", &origin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(nothing_there.status(), StatusCode::CONFLICT);
+        let refusal: serde_json::Value = nothing_there.json().await.unwrap();
+        assert_eq!(refusal["error"], "Nothing is at this location.");
+        let relative = client
+            .post(&add)
+            .header("x-kin-review-token", &token)
+            .header("origin", &origin)
+            .json(&serde_json::json!({"action":"convert","path":"project"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(relative.status(), StatusCode::BAD_REQUEST);
+        let injected = client
+            .post(&add)
+            .header("x-kin-review-token", &token)
+            .header("origin", &origin)
+            .json(&serde_json::json!({"action":"open","path":absent,"actor":"caller"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // And the listing page's token writes nothing in a repository.
+        let crossed = client
+            .post(format!("{origin}/repositories/first/api/workspace/commit"))
+            .header("x-kin-review-token", &token)
+            .header("origin", &origin)
+            .json(&serde_json::json!({
+                "message":"work", "operation_id":kin_model::OperationId::new(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(crossed.status(), StatusCode::FORBIDDEN);
+
+        let inspected: serde_json::Value = client
+            .post(format!("{origin}/api/home/inspect"))
+            .json(&serde_json::json!({"path":absent}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(inspected["kind"], "missing");
+        assert_eq!(inspected["exists"], false);
+        assert_eq!(inspected["registered"], false);
+        assert!(inspected["repository"].is_null());
+        assert!(inspected["note"]
+            .as_str()
+            .unwrap()
+            .contains("Nothing is at"));
+        let operations: serde_json::Value = client
+            .get(format!("{origin}/api/home/operations"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(operations["operations"], serde_json::json!([]));
+        let unknown = client
+            .get(format!(
+                "{origin}/api/home/operations/{}",
+                uuid::Uuid::new_v4()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    /// A commit from the page is refused in words, with nothing dispatched,
+    /// when its preconditions fail.
+    #[tokio::test]
+    async fn a_commit_needs_authority_a_message_and_an_operation_before_anything_is_asked() {
+        let (origin, tokens, _hub, server) = serve_two().await;
+        let client = reqwest::Client::new();
+        let url = format!("{origin}/repositories/second/api/workspace/commit");
+        let operation_id = kin_model::OperationId::new();
+        for (token, request_origin) in [
+            (tokens[0].as_str(), origin.as_str()),
+            (tokens[1].as_str(), "https://foreign.example"),
+            ("", origin.as_str()),
+        ] {
+            let refused = client
+                .post(&url)
+                .header("x-kin-review-token", token)
+                .header("origin", request_origin)
+                .json(&serde_json::json!({"message":"work","operation_id":operation_id}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        }
+        let long = "x".repeat(COMMIT_MESSAGE_MAX_CHARS + 1);
+        for (message, id, reason) in [
+            ("  \n ", serde_json::json!(operation_id), "needs a message"),
+            (long.as_str(), serde_json::json!(operation_id), "at most"),
+            (
+                "work",
+                serde_json::json!(uuid::Uuid::nil()),
+                "operation ID is required",
+            ),
+        ] {
+            let refused = client
+                .post(&url)
+                .header("x-kin-review-token", &tokens[1])
+                .header("origin", &origin)
+                .json(&serde_json::json!({"message":message,"operation_id":id}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::CONFLICT);
+            let body: serde_json::Value = refused.json().await.unwrap();
+            assert_eq!(body["outcome"], "refused");
+            assert_eq!(body["operation_id"], id);
+            assert!(body["error"].as_str().unwrap().contains(reason), "{body}");
+            assert!(body["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing was recorded"));
+        }
+        // A caller never names who a commit is by.
+        let injected = client
+            .post(&url)
+            .header("x-kin-review-token", &tokens[1])
+            .header("origin", &origin)
+            .json(&serde_json::json!({
+                "message":"work","operation_id":operation_id,"actor":"caller",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        server.abort();
+    }
+
     /// The server's boundaries can be tested without starting a repository
     /// daemon or admitting any content. Tokens belong to URL scopes.
     #[tokio::test]
     async fn scoped_pages_keep_assets_api_and_write_authority_in_the_selected_repository() {
-        let listener = review_ui::bind(Some(0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let catalog = Arc::new(Catalog {
-            repositories: Vec::new(),
-            warning: None,
-        });
-        let mut router = Router::new();
-        let mut tokens = Vec::new();
-        for key in ["first", "second"] {
-            let base = format!("/repositories/{key}");
-            let state = Arc::new(UiState::workspace(
-                kin_core::KinLayout::new(std::env::temp_dir().join(format!("kin-ui-{key}/.kin"))),
-                port,
-                base.clone(),
-                catalog.clone(),
-            ));
-            tokens.push(state.token.clone());
-            router = router.nest(&base, review_ui::workspace_router(state));
-        }
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let origin = format!("http://127.0.0.1:{port}");
+        let (origin, tokens, hub, server) = serve_two().await;
+        let port = hub.port;
         let client = reqwest::Client::new();
         for key in ["first", "second"] {
             let base = format!("/repositories/{key}");

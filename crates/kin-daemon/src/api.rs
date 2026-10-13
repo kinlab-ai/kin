@@ -52984,6 +52984,42 @@ pub(crate) mod tests {
         );
     }
 
+    /// A pass that admits nothing writes nothing to the graph.
+    ///
+    /// A page that follows the working copy admits it ahead of every read, and
+    /// a reader that keeps what it derived from the graph keeps it until the
+    /// graph's count of completed writes moves. A pass that found the tree as
+    /// it had left it used to move that count twice, once looking for a proof
+    /// to restore and once qualifying a transition that had not happened, so
+    /// every such reader redid its work on every read of an unchanged
+    /// working copy.
+    ///
+    /// Falsify by dropping the unchanged-count return from the binding-history
+    /// derivation's drop: the second pass moves the count.
+    #[tokio::test]
+    async fn an_admission_that_finds_nothing_leaves_the_graph_truth_where_it_was() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        install_working_copy_file(&state, "docs/design.md", b"# design\n", false);
+        let app = router(Arc::clone(&state));
+        let (_, first) = admit_through_api(&app).await;
+        assert_eq!(first["mutated"], json!(true));
+
+        let settled = state.graph.truth_epoch();
+        for _ in 0..2 {
+            let (_, replay) = admit_through_api(&app).await;
+            assert_eq!(replay["report"]["admitted"], json!(true));
+            assert_eq!(replay["mutated"], json!(false));
+        }
+        assert_eq!(
+            state.graph.truth_epoch(),
+            settled,
+            "a pass that admitted nothing must not read as a write to the graph"
+        );
+    }
+
     /// A request that hangs up mid-pass must never become a retry that reports a
     /// complete admission.
     ///

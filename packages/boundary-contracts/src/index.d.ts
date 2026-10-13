@@ -1112,6 +1112,11 @@ export interface GraphExportNode {
   line?: number;
   /** Present only when the request asked for include=signature. */
   signature?: string;
+  /**
+   * The language the entity is written in, by its lowercase wire name. Present
+   * only when the request asked for include=language and the graph names one.
+   */
+  language?: string;
 }
 
 export interface GraphExportLink {

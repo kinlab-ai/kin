@@ -13,11 +13,16 @@
 //! - `--history full` captures the worktree by [`kin_core::init_from_git`] as
 //!   exact reachable history, refs, raw objects, workspace state, and admission
 //!   policy before the store is published;
-//! - an empty non-Git directory is initialized as an unborn Kin-native repository.
+//! - a directory with no Git history is initialized as an unborn Kin-native
+//!   repository, and nothing is committed. What the directory already holds
+//!   is taken in afterwards by the admission every working copy gets, so it is
+//!   that repository's uncommitted work until a person commits it.
 //!
 //! This command deliberately does not parse a checkout or rebuild an existing
 //! repository from raw filesystem contents. The snapshot of the first path is
-//! derived from the commit's Git objects, never from the files on disk.
+//! derived from the commit's Git objects, never from the files on disk, and
+//! the third path records no authority from what it finds: recording is the
+//! commit's to do.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -212,6 +217,11 @@ struct InitResultPayload<'a> {
     /// what was admitted. Absent when the source carried none.
     #[serde(skip_serializing_if = "Option::is_none")]
     uncommitted_worktree: Option<UncommittedWorktreePayload>,
+    /// What a directory with no Git history already held, now this
+    /// repository's uncommitted work. Absent for a Git project and for a
+    /// directory that held nothing. Additive to this schema version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncommitted_work: Option<&'a WaitingWork>,
     /// The embedding model the first embed pass will need, and whether this
     /// machine already has it. This command starts that pass, so on a fresh
     /// machine the download is work `kin init` does rather than work it defers.
@@ -538,6 +548,9 @@ pub async fn run(
         Some(mode) => mode,
         None => history_mode_from_environment()?,
     };
+    // Whether a directory with no Git history already holds anything. Its
+    // repository starts unborn either way; what it holds is taken in below.
+    let mut holds_work = false;
     let boundary = if path_exists(&dir.join(".git"))? {
         if mode.starts_partial() {
             InitBoundary::ExactGitCheckedOut
@@ -545,7 +558,12 @@ pub async fn run(
             InitBoundary::ExactGit
         }
     } else {
-        require_empty_native_boundary(&dir)?;
+        holds_work = native_directory_holds_work(&dir)?;
+        if holds_work {
+            if let Some(reason) = never_a_project(&dir) {
+                bail!("{reason} Run `kin init` in the project's own directory.");
+            }
+        }
         InitBoundary::NativeUnborn
     };
 
@@ -633,7 +651,27 @@ pub async fn run(
     if boundary == InitBoundary::ExactGitCheckedOut {
         start_background_history(&result.layout);
     }
-    let after = after_admission(&result, setting, view.clone()).await;
+    // What a directory with no Git history already held is taken in before
+    // the phase below, so that phase links references across it exactly as
+    // it does across a converted project.
+    let waiting = if holds_work {
+        take_in_waiting_work(&result.layout, view.as_deref()).await
+    } else {
+        None
+    };
+    let mut after = after_admission(&result, setting, view.clone()).await;
+    if waiting.as_ref().is_some_and(|waiting| waiting.taken_in) {
+        // Admission's own values describe a store that held nothing, and
+        // registration recorded that count. Read the store again so the
+        // result and this machine's registry describe the one the reader has.
+        if let Ok(reported) = ReportedAuthority::read(&result.layout) {
+            after.reported = reported;
+        }
+        record_entities_in_registry(
+            &result.layout,
+            after.reported.semantic_enrichment.entity_count,
+        );
+    }
 
     if json {
         print_json_result(
@@ -643,6 +681,7 @@ pub async fn run(
             after.cross_file.payload(after.enrichment_elapsed),
             &after.graph_section_materialization,
             after.daemon_death.as_ref(),
+            waiting.as_ref(),
         )?;
     } else if let Some(screen) = &view {
         print_short_result(screen, &result, &after, None);
@@ -655,9 +694,207 @@ pub async fn run(
             &after.graph_section_materialization,
             &model_before,
             after.daemon_death.as_ref(),
+            waiting.as_ref(),
         )?;
     }
     Ok(after.exit_code())
+}
+
+/// What a directory already held when a repository was started in it, as
+/// that repository's uncommitted work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WaitingWork {
+    /// Whether the working copy has been taken in. False when no daemon could
+    /// be started to take it in, in which case the counts are not known.
+    taken_in: bool,
+    /// Tracked artifacts the working copy holds.
+    artifacts: usize,
+    /// Entities Kin read out of them.
+    entities: usize,
+}
+
+impl WaitingWork {
+    /// One sentence for the full record. Nothing here is recorded history,
+    /// and the sentence says what records it.
+    fn sentence(&self) -> String {
+        if !self.taken_in {
+            return "what this directory already holds, which Kin reads when the repository is \
+                    first opened; nothing is recorded until you commit"
+                .to_string();
+        }
+        format!(
+            "{} and {}, taken in from what this directory already held; nothing is recorded \
+             until you commit",
+            counted(self.entities, "entity", "entities"),
+            counted(self.artifacts, "artifact", "artifacts"),
+        )
+    }
+
+    /// The short form's row.
+    fn short(&self) -> String {
+        if !self.taken_in {
+            return "read when the repository is first opened · commit records it".to_string();
+        }
+        format!(
+            "{} · commit records them",
+            counted(self.entities, "entity", "entities")
+        )
+    }
+}
+
+fn counted(count: usize, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        crate::screen::count(count as u64),
+        if count == 1 { one } else { many }
+    )
+}
+
+/// What `kin init` says while it takes in what a directory already held. The
+/// local app reads a conversion's progress from these words, so they have one
+/// home.
+pub(crate) const TAKING_IN_WAITING_WORK: &str = "Reading what this directory already holds";
+
+/// How often the wait for a working copy to be taken in says it is still
+/// going. A directory of any size can be handed to `kin init`, and a command
+/// that prints nothing for minutes reads as hung.
+const TAKING_IN_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Take in what a directory already held as its new repository's uncommitted
+/// work, by the admission every working copy gets: the daemon's own complete
+/// pass, under the ignore rules that pass applies. Nothing is committed.
+///
+/// Never fails the command. The repository exists either way, and whatever
+/// could not be taken in now is taken in the next time its daemon admits the
+/// working copy.
+async fn take_in_waiting_work(
+    layout: &kin_core::KinLayout,
+    view: Option<&crate::first_run::Screen>,
+) -> Option<WaitingWork> {
+    let unread = WaitingWork {
+        taken_in: false,
+        artifacts: 0,
+        entities: 0,
+    };
+    if crate::daemon_client::daemon_spawns_are_disabled() {
+        return Some(unread);
+    }
+    // Whether a daemon was already serving this repository. If not, the one
+    // the admission starts is this command's to stop again, so the phase
+    // after this one opens the store as it does after any admission.
+    let borrowed_existing = crate::daemon_client::resolve_daemon_url_if_running_async(layout)
+        .await
+        .is_some();
+    match view {
+        Some(screen) => {
+            crate::first_run::quiet_daemon_start();
+            screen.start("Reading work");
+            screen.note("what this directory already holds");
+        }
+        None => note!("{TAKING_IN_WAITING_WORK}, as uncommitted work..."),
+    }
+    let started = std::time::Instant::now();
+    let admission = super::admit::admit_working_copy(layout, layout.working_dir());
+    tokio::pin!(admission);
+    let answer = loop {
+        tokio::select! {
+            answer = &mut admission => break answer,
+            () = tokio::time::sleep(TAKING_IN_HEARTBEAT) => {
+                if view.is_none() {
+                    note!(
+                        "  {TAKING_IN_WAITING_WORK} ({}s so far)",
+                        started.elapsed().as_secs()
+                    );
+                }
+            }
+        }
+    };
+    let failed = |cause: String| {
+        let line =
+            format!("what this directory holds was not taken in as uncommitted work: {cause}");
+        match view {
+            Some(screen) => screen.finish_row(crate::screen::Status::Warn, "Uncommitted", &line),
+            None => note!("note: {line}"),
+        }
+    };
+    let report = match answer {
+        Ok(response) => match super::admit::admission_failure(&response) {
+            None => response.report,
+            Some(cause) => {
+                failed(cause);
+                None
+            }
+        },
+        Err(error) => {
+            failed(format!("{error:#}"));
+            None
+        }
+    };
+    if !borrowed_existing {
+        if let Err(error) = crate::commands::daemon::stop_current_repo_quiet(layout.root()).await {
+            note!("note: the daemon that read this directory could not be stopped: {error:#}");
+        }
+    }
+    let Some(report) = report else {
+        return Some(unread);
+    };
+    let waiting = WaitingWork {
+        taken_in: true,
+        artifacts: report.tracked_after,
+        entities: report.entities_after,
+    };
+    if let Some(screen) = view {
+        screen.finish_row(crate::screen::Status::Off, "Uncommitted", &waiting.short());
+    }
+    Some(waiting)
+}
+
+/// Correct the entity count this machine's registry holds for the repository
+/// at `layout`. Registration happens before a working copy is taken in, so
+/// it recorded the count of a store that held nothing. Best effort, like the
+/// registration it corrects.
+fn record_entities_in_registry(layout: &kin_core::KinLayout, entities: usize) {
+    let here = layout.working_dir();
+    let _ = kin_core::registry::KinRegistry::update(|registry| {
+        for row in registry.repos.iter_mut().filter(|row| row.path == here) {
+            row.entities = entities;
+        }
+    });
+}
+
+const ROOT_IS_NO_PROJECT: &str = "Kin does not start a repository at the top of the filesystem, \
+     because everything on this machine would become its uncommitted work.";
+const HOME_IS_NO_PROJECT: &str = "Kin does not start a repository in your home directory itself, \
+     because everything you keep there would become its uncommitted work.";
+const KIN_HOME_IS_NO_PROJECT: &str =
+    "Kin does not start a repository in the directory where it keeps its own data.";
+
+/// Why `dir` is no place for a project, when it is one of the places that
+/// never is.
+///
+/// A repository started in a directory that holds work takes all of it as
+/// uncommitted work. In a project's own directory that is the point. In a
+/// home directory or at the top of a filesystem it would sweep in everything
+/// a person keeps, and in Kin's own home it would sweep in Kin's records.
+pub(crate) fn never_a_project(dir: &Path) -> Option<&'static str> {
+    let resolved = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let home = super::setup::home_dir().ok().map(|home| resolved(&home));
+    let kin_home = resolved(&kin_core::registry::managed_kin_home());
+    never_a_project_among(&resolved(dir), home.as_deref(), &kin_home)
+}
+
+/// [`never_a_project`] over paths already resolved.
+fn never_a_project_among(dir: &Path, home: Option<&Path>, kin_home: &Path) -> Option<&'static str> {
+    if dir.parent().is_none() {
+        return Some(ROOT_IS_NO_PROJECT);
+    }
+    if home == Some(dir) {
+        return Some(HOME_IS_NO_PROJECT);
+    }
+    if dir.starts_with(kin_home) {
+        return Some(KIN_HOME_IS_NO_PROJECT);
+    }
+    None
 }
 
 /// Reuse a prepared store for the Git checkout at `dir` and finish it the way
@@ -3986,38 +4223,19 @@ fn existing_repository_refusal(dir: &Path) -> String {
     )
 }
 
-fn require_empty_native_boundary(dir: &Path) -> Result<()> {
+/// Whether a directory with no Git history already holds anything.
+///
+/// It decides nothing about whether a repository may start here: one starts
+/// either way, unborn and with nothing committed. It decides only whether
+/// there is work to take in afterwards.
+fn native_directory_holds_work(dir: &Path) -> Result<bool> {
     let mut entries = std::fs::read_dir(dir)
         .with_context(|| format!("inspect native repository boundary {}", dir.display()))?;
-    if entries
+    Ok(entries
         .next()
         .transpose()
         .with_context(|| format!("inspect native repository boundary {}", dir.display()))?
-        .is_some()
-    {
-        anyhow::bail!(
-            "non-Git repository admission currently requires an empty directory: {}; Kin will \
-             not silently ignore or derive authority from existing filesystem contents. Commit \
-             the exact files to Git and retry, or initialize an empty Kin-native repository.{}",
-            dir.display(),
-            git_prerequisite_note(which::which("git").is_ok())
-        );
-    }
-    Ok(())
-}
-
-/// The suffix naming Git as a prerequisite of the remedy above.
-///
-/// Kin reads a repository's history through `gix` and never needs the host
-/// binary to admit one, so this error is reachable on a host with no Git at
-/// all — and the first remedy it offers is a `git commit`. Say that the tool
-/// is missing rather than sending the reader to a command they do not have.
-fn git_prerequisite_note(git_on_path: bool) -> &'static str {
-    if git_on_path {
-        ""
-    } else {
-        " Git is not installed on this host, so committing to Git needs `git` installed first."
-    }
+        .is_some())
 }
 
 /// The rule `kin init` adds so the store stays out of `git status`.
@@ -4403,6 +4621,7 @@ fn print_json_result(
     cross_file_enrichment: CrossFileEnrichmentPayload<'_>,
     graph_section_materialization: &InitGraphSectionMaterialization,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    waiting: Option<&WaitingWork>,
 ) -> Result<()> {
     let default_ref = initialized_default_ref(result);
     let payload = InitResultPayload {
@@ -4433,6 +4652,7 @@ fn print_json_result(
         )),
         store_footprint: StoreFootprint::measure(&result.layout),
         uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
+        uncommitted_work: waiting,
         embedding_model: crate::embed_model::EmbedModelFetch::probe(false),
         daemon_killed: daemon_death.map(|record| DaemonKilledPayload {
             summary: record.summary_in(kin_core::enrichment_setting::state_for(&result.layout)),
@@ -4473,6 +4693,7 @@ fn print_human_result(
     graph_section_materialization: &InitGraphSectionMaterialization,
     model_before: &crate::embed_model::EmbedModelFetch,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    waiting: Option<&WaitingWork>,
 ) -> Result<()> {
     emit(&crate::plain_words::text(&render_human_result(
         result,
@@ -4482,6 +4703,7 @@ fn print_human_result(
         graph_section_materialization,
         model_before,
         daemon_death,
+        waiting,
     )?))
 }
 
@@ -4512,6 +4734,7 @@ fn render_human_result(
     graph_section_materialization: &InitGraphSectionMaterialization,
     model_before: &crate::embed_model::EmbedModelFetch,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    waiting: Option<&WaitingWork>,
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
     let mut out = String::new();
@@ -4592,7 +4815,10 @@ fn render_human_result(
         }
         InitBoundary::NativeUnborn => {
             writeln!(out, "  History: unborn (no synthetic commit)")?;
-            writeln!(out, "  Workspace: empty exact tree")?;
+            match waiting {
+                Some(waiting) => writeln!(out, "  Uncommitted work: {}", waiting.sentence())?,
+                None => writeln!(out, "  Workspace: empty exact tree")?,
+            }
         }
     }
     // The reading that explains a fetch that did not happen, selected by the
@@ -4636,7 +4862,7 @@ fn render_human_result(
     for line in uncommitted_worktree_disclosure(&result.workspace_divergence) {
         writeln!(out, "{line}")?;
     }
-    for line in next_step_lines() {
+    for line in next_step_lines_after(waiting.is_some()) {
         writeln!(out, "{line}")?;
     }
     Ok(out)
@@ -4676,17 +4902,34 @@ fn workspace_head_line(head: &kin_model::WorkspaceHead) -> String {
 /// ranks by words alone, so the product's first nudge was its weakest answer.
 /// The same question closes `kin setup` and leads an MCP client's first answer
 /// after `kin_init`.
+#[cfg(test)]
 fn next_step_lines() -> Vec<String> {
+    next_step_lines_after(false)
+}
+
+/// [`next_step_lines`], led by the commit when the repository was started
+/// over work nothing has recorded yet: until that commit, the repository has
+/// no history at all.
+fn next_step_lines_after(work_is_waiting: bool) -> Vec<String> {
     // Padded from the commands themselves rather than by hand. Written out, the
     // two descriptions landed a column apart, and the kind of drift nobody
     // notices in a diff is exactly the kind a reader sees straight away.
-    let steps = [
+    let mut steps = vec![
         ("kin status", "what this repository holds now"),
         (
             FIRST_QUESTION_COMMAND,
             "ask what calls a function you know; check the answer in the source",
         ),
     ];
+    if work_is_waiting {
+        steps.insert(
+            0,
+            (
+                "kin commit -m \"<message>\"",
+                "record what this directory holds as its first change",
+            ),
+        );
+    }
     let widest = steps
         .iter()
         .map(|(command, _)| command.chars().count())
@@ -6551,23 +6794,115 @@ mod tests {
         );
     }
 
-    /// The non-empty-directory refusal offers "commit the exact files to Git"
-    /// as its first remedy. Measured on a fresh ubuntu:24.04 curl install, that
-    /// host has no git at all, so the remedy names a command the reader does
-    /// not have and the error dead-ends.
+    /// A repository started over work takes all of it as uncommitted work,
+    /// so the three places that are never one project are refused, each with
+    /// its own reason, and a project's own directory is not.
     #[test]
-    fn the_non_git_refusal_names_git_as_a_prerequisite_only_when_it_is_absent() {
+    fn a_home_directory_a_filesystem_root_and_kins_own_home_are_never_a_project() {
+        let home = Path::new("/home/ada");
+        let kin_home = Path::new("/home/ada/.kin");
+        let among = |dir: &str| never_a_project_among(Path::new(dir), Some(home), kin_home);
+        assert_eq!(among("/"), Some(ROOT_IS_NO_PROJECT));
+        assert_eq!(among("/home/ada"), Some(HOME_IS_NO_PROJECT));
+        assert_eq!(among("/home/ada/.kin"), Some(KIN_HOME_IS_NO_PROJECT));
         assert_eq!(
-            git_prerequisite_note(true),
-            "",
-            "a host that has git needs no extra instruction"
+            among("/home/ada/.kin/stores/app"),
+            Some(KIN_HOME_IS_NO_PROJECT)
         );
+        assert_eq!(among("/home/ada/code/app"), None);
+        assert_eq!(among("/home"), None);
+        // A Kin home kept elsewhere is refused where it is, and a home that
+        // cannot be resolved refuses nothing by mistake.
+        assert_eq!(
+            never_a_project_among(Path::new("/srv/kin"), None, Path::new("/srv/kin")),
+            Some(KIN_HOME_IS_NO_PROJECT)
+        );
+        assert_eq!(
+            never_a_project_among(Path::new("/home/ada"), None, kin_home),
+            None
+        );
+        for sentence in [
+            ROOT_IS_NO_PROJECT,
+            HOME_IS_NO_PROJECT,
+            KIN_HOME_IS_NO_PROJECT,
+        ] {
+            assert!(sentence.ends_with('.') && sentence.matches(". ").count() == 0);
+        }
+    }
 
-        let absent = git_prerequisite_note(false);
+    #[test]
+    fn a_directory_holds_work_as_soon_as_it_holds_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!native_directory_holds_work(dir.path()).unwrap());
+        std::fs::write(dir.path().join("notes.md"), "work").unwrap();
+        assert!(native_directory_holds_work(dir.path()).unwrap());
+        assert!(native_directory_holds_work(&dir.path().join("absent")).is_err());
+    }
+
+    /// What a directory already held is reported as work nothing has
+    /// recorded, in entities and never as what it is stored as.
+    #[test]
+    fn waiting_work_is_reported_as_uncommitted_and_names_what_records_it() {
+        let taken = WaitingWork {
+            taken_in: true,
+            artifacts: 8,
+            entities: 124,
+        };
+        let one = WaitingWork {
+            taken_in: true,
+            artifacts: 1,
+            entities: 1,
+        };
+        let unread = WaitingWork {
+            taken_in: false,
+            artifacts: 0,
+            entities: 0,
+        };
+        assert!(taken
+            .sentence()
+            .starts_with("124 entities and 8 artifacts, "));
+        assert!(one.sentence().starts_with("1 entity and 1 artifact, "));
+        for waiting in [&taken, &one, &unread] {
+            let said = format!("{} {}", waiting.sentence(), waiting.short());
+            assert!(said.contains("commit"), "{said}");
+            assert!(!said.to_lowercase().contains("file"), "{said}");
+        }
+        // Work Kin has not read yet claims no count.
+        assert!(!unread.sentence().chars().any(|c| c.is_ascii_digit()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = kin_core::init(dir.path()).unwrap();
+        let render = |waiting: Option<&WaitingWork>| {
+            render_human_result(
+                &result,
+                InitBoundary::NativeUnborn,
+                &ReportedAuthority::admission(&result, AuthorityAsOf::Admission),
+                &CrossFileEnrichment::Produced,
+                &InitGraphSectionMaterialization::failed(&anyhow::anyhow!("not under test")),
+                &crate::embed_model::EmbedModelFetch::default(),
+                None,
+                waiting,
+            )
+            .unwrap()
+        };
+        let over_work = render(Some(&taken));
         assert!(
-            absent.contains("not installed") && absent.contains("git"),
-            "a host without git must be told before being sent to a git commit: {absent}"
+            over_work.contains("  Uncommitted work: 124 entities and 8 artifacts, "),
+            "{over_work}"
         );
+        assert!(!over_work.contains("Workspace: empty"), "{over_work}");
+        let commit = over_work
+            .find("kin commit -m")
+            .expect("the commit is a next step");
+        assert!(
+            commit < over_work.find("kin status").unwrap(),
+            "{over_work}"
+        );
+        // A directory that held nothing reads exactly as it did.
+        let empty = render(None);
+        assert!(empty.contains("  Workspace: empty exact tree\n"), "{empty}");
+        assert!(!empty.contains("Uncommitted work") && !empty.contains("kin commit"));
+        assert_eq!(next_step_lines(), next_step_lines_after(false));
     }
 
     /// The store wall and this refusal are read in sequence by one reader, so
@@ -7981,6 +8316,7 @@ mod tests {
                     &CrossFileEnrichment::Produced,
                     &InitGraphSectionMaterialization::failed(&anyhow::anyhow!("not under test")),
                     &crate::embed_model::EmbedModelFetch::default(),
+                    None,
                     None,
                 )
                 .unwrap()

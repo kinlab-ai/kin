@@ -193,9 +193,22 @@ import path from "node:path";
 // answer from the graph with embeddings unused. proof-flow.sh beside this file
 // reads the daemon endpoint from the store `kin store path` names and drives
 // the same refusal.
+//
+// Moved for the populated-directory contract in the Windows admission step,
+// with nothing to port. `kin init` now admits a directory that holds something
+// and has no Git history, so that step takes either the admission or the
+// refusal of a release built before it and holds the binary to the whole of
+// the one it gave. Every hunk between 8de379f6 and b7ec0ce7 falls at old lines
+// 507 to 719, inside the "Windows admission contract proof" step and the
+// comment above it. That step runs only on Windows, and this preflight's legs
+// are macOS and Linux, so proof-flow.sh beside this file carries no part of
+// it. The mirrored step sits at old lines 1943 to 2337 and new lines 1976 to
+// 2370, and its 395 lines hash to
+// 1e96f2ef35554d78a31dcd28d9ec8640a27a86b2eeaa9af7c4095e0509b1f5d1 at both, so
+// no assertion moved.
 export const PORTED_FROM = {
   file: ".github/workflows/install-proof.yml",
-  sha256: "8de379f6aead1fde8c85bb1563346e818b687ecd681954f1f6a05dc6db43070a",
+  sha256: "b7ec0ce75f717d238463a3385c5efadf541e072f25ecd21d86e6c3da03386eac",
 };
 
 class Unreadable extends Error {}

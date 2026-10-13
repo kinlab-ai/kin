@@ -9,9 +9,11 @@
 
 (() => {
   const { diff, map } = globalThis.kinReview;
-  const { nameNodes } = map;
+  const { nameNodes, kindGlyph, changeGlyph } = map;
 
   const POLL_MS = 5000;
+  /** The width at which the rail folds into a bar across the top, as the workspace's does. */
+  const NARROW = "(max-width: 760px)";
   /** How many changes the list shows first, and the most one read asks for. */
   const CHANGES_FIRST = 60;
   const CHANGES_PAGE_MAX = 500;
@@ -146,10 +148,12 @@
   // ── Words ────────────────────────────────────────────────────────────────
 
   const short = (id) => (id || "").slice(0, 12);
-  const plural = (count, one, many) => (count === 1 ? `1 ${one}` : `${count} ${many}`);
+  /** A count as a person writes it: 1,084 and not 1084. */
+  const amount = (count) => (typeof count === "number" && Number.isFinite(count) ? count.toLocaleString() : String(count));
+  const plural = (count, one, many) => (count === 1 ? `1 ${one}` : `${amount(count)} ${many}`);
   const words = (label) => (label || "").replace(/_/g, " ");
   const NUMBER_WORD = ["No", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve"];
-  const spoken = (count) => (count < NUMBER_WORD.length ? NUMBER_WORD[count] : String(count));
+  const spoken = (count) => (count < NUMBER_WORD.length ? NUMBER_WORD[count] : amount(count));
 
   const CHANGE_WORD = { added: "Added", modified: "Modified", removed: "Removed" };
   const RISK_WORD = { low: "Low risk", medium: "Medium risk", high: "High risk", critical: "Critical risk" };
@@ -229,9 +233,27 @@
       tag,
       { class: "problem", role: "status" },
       h("p", { class: "problem-line" }, line),
-      action ? h("button", { class: "write-button problem-action", type: "button", on: { click: action.run } }, action.label) : null,
+      action ? h("button", { class: "button button-small problem-action", type: "button", on: { click: action.run } }, action.label) : null,
       detail ? h("details", { class: "problem-details" }, h("summary", {}, "Show details"), h("p", { class: "problem-text" }, detail)) : null,
     );
+  }
+
+  // ── Identifiers ──────────────────────────────────────────────────────────
+  // An entity or a change is said by its name. Its identifier is never shown
+  // as something to read: it sits behind a Copy control or Show details.
+
+  const RAW_ENTITY = /\bentity:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
+  const RAW_ID = /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{40,64})\b/i;
+
+  /** Whether a line Kin wrote names an entity only by its identifier. */
+  const namesNoEntity = (text) => RAW_ENTITY.test(String(text || ""));
+
+  /** The same line with each identifier said in words, for where it must stay in view. */
+  const withoutRawEntities = (text) => String(text || "").replace(new RegExp(RAW_ENTITY.source, "gi"), "an entity Kin could not name");
+
+  /** A small control that copies an identifier without showing it. */
+  function copyControl(label, value, what) {
+    return h("button", { class: "id-copy", type: "button", title: value, on: { click: () => copy(value, what) } }, label);
   }
 
   // The SVG namespace is a name, not a place the page loads from. It is
@@ -596,7 +618,7 @@
         redraw = () => views.changes.replaceChildren(state.split ? diff.splitView(rows, side) : diff.unifiedView(rows, side));
         redraw();
         const panelId = `source-${++sourcePanelNumber}`;
-        const tabs = h("div", { class: "tabs", role: "tablist", "aria-label": `Source views for ${step.name}` });
+        const tabs = h("div", { class: "tabs segmented", role: "tablist", "aria-label": `Source views for ${step.name}` });
         const show = (name) => {
           for (const [key, view] of Object.entries(views)) view.hidden = key !== name;
           for (const tab of tabs.children) {
@@ -639,13 +661,14 @@
             h(
               "span",
               { class: "source-tools" },
-              h("span", { class: "tally" }, h("span", { class: "minus" }, `-${removed}`), " ", h("span", { class: "plus" }, `+${added}`)),
+              h("span", { class: "tally", role: "img", "aria-label": `${plural(removed, "line", "lines")} removed, ${plural(added, "line", "lines")} added` },
+                h("span", { class: "minus" }, `−${removed}`), " ", h("span", { class: "plus" }, `+${added}`)),
               h(
                 "button",
-                { class: "split-toggle layout-toggle", type: "button", "aria-pressed": String(state.split), title: "Side by side (s)", on: { click: toggleSplit } },
+                { class: "button button-small split-toggle layout-toggle", type: "button", "aria-pressed": String(state.split), title: "Side by side (s)", on: { click: toggleSplit } },
                 "Side by side",
               ),
-              h("button", { class: "split-toggle wrap-toggle", type: "button", "aria-pressed": String(state.wrap),
+              h("button", { class: "button button-small split-toggle wrap-toggle", type: "button", "aria-pressed": String(state.wrap),
                 on: { click: toggleWrap } }, "Wrap lines"),
             ),
           ),
@@ -890,19 +913,23 @@
     const behind = kind === "consumer" && !connection.changed_here && (verdict ? step.consumer_verdict.verdict === "not_updated" : step.findings.some((finding) => finding.severity === "error"));
     const standing = connection.changed_here ? "Changed here" : verdict ? verdict[0] : behind ? "Not updated" : "Unchanged";
     const folded = declarations > 1;
+    // How Kin knows is said in words. The identifiers behind it are copied, never read.
     const proof = h(
       "dl",
       { class: "proof" },
-      h("dt", {}, "Connection"),
-      h("dd", {}, h("code", {}, connection.relation_id)),
       h("dt", {}, "How Kin knows"),
       h("dd", {}, `${ORIGIN_WORD[connection.origin] || words(connection.origin)}, confidence ${Number(connection.confidence).toFixed(2)}`),
       connection.recorded_in ? h("dt", {}, "First seen in") : null,
       connection.recorded_in
         ? h("dd", {}, h("a", { href: `#/c/${connection.recorded_in}` }, "that change"))
         : null,
-      h("dt", {}, members.length > 1 ? "Entities" : "Entity"),
-      h("dd", {}, members.map((member, index) => [index ? ", " : null, h("code", {}, member.entity.id)])),
+      h("dt", {}, "Identifiers"),
+      h(
+        "dd",
+        { class: "proof-ids" },
+        connection.relation_id ? copyControl("Copy connection ID", connection.relation_id, "Connection ID") : null,
+        copyControl(members.length > 1 ? "Copy entity IDs" : "Copy entity ID", members.map((member) => member.entity.id).join("\n"), members.length > 1 ? "Entity IDs" : "Entity ID"),
+      ),
     );
     const row = h(
       "details",
@@ -912,14 +939,24 @@
         {},
         h(
           "span",
-          { class: "who" },
-          // Folded rows drop the signatures: the count says what they share.
-          h("code", {}, folded ? nameNodes(connection.entity.name) : nameWithParameters(connection.entity)),
-          folded ? h("span", { class: "does overloads", title: "Declarations of one callable, such as its overloads, read as one row" }, `${declarations} overloads`) : null,
-          h("span", { class: "does" }, REACH_WORD[connection.relation] || words(connection.relation)),
+          { class: "conn-main" },
+          h(
+            "span",
+            { class: "who" },
+            // The glyph stays beside the name it belongs to when a long name wraps.
+            h(
+              "span",
+              { class: "who-name" },
+              kindGlyph(connection.entity.kind, kind === "test"),
+              // Folded rows drop the signatures: the count says what they share.
+              h("code", {}, folded ? nameNodes(connection.entity.name) : nameWithParameters(connection.entity)),
+            ),
+            folded ? h("span", { class: "does overloads", title: "Declarations of one callable, such as its overloads, read as one row" }, `${declarations} overloads`) : null,
+            h("span", { class: "does" }, REACH_WORD[connection.relation] || words(connection.relation)),
+          ),
+          placeNode(connection.entity, "where", false),
         ),
-        placeNode(connection.entity, "where", false),
-        h("span", { class: `tag ${connection.changed_here ? "tag-changed" : verdict ? verdict[1] : behind ? "tag-behind" : ""}` }, standing),
+        h("span", { class: `tag ${connection.changed_here ? "tag-changed tag-here" : verdict ? verdict[1] : behind ? "tag-behind" : ""}` }, standing),
       ),
       text,
       proof,
@@ -964,9 +1001,10 @@
     if (!connections.relation_changes_total) return null;
     const list = h("ul", { class: "edges" });
     for (const edge of connections.relation_changes) {
-      const sentence =
-        edge.direction === "inbound" ? `${edge.other} ${words(edge.relation)} this` : `this ${words(edge.relation)} ${edge.other}`;
-      list.append(h("li", { class: `edge edge-${edge.change}` }, h("span", { class: "edge-change" }, CHANGE_WORD[edge.change] || edge.change), h("code", {}, sentence)));
+      // The other end is said by its name, and in words when Kin has only its identifier.
+      const other = withoutRawEntities(edge.other).replace(/`/g, "");
+      const sentence = edge.direction === "inbound" ? `${other} ${words(edge.relation)} this` : `this ${words(edge.relation)} ${other}`;
+      list.append(h("li", { class: `edge edge-${edge.change}` }, changeGlyph(edge.change), h("code", {}, sentence)));
     }
     const more = connections.relation_changes_total - connections.relation_changes.length;
     return h(
@@ -980,6 +1018,7 @@
 
   function evidence(step) {
     const proof = step.evidence;
+    // Identifiers are this panel's whole content, so it stays closed until asked for.
     const rows = h("dl", { class: "proof" });
     rows.append(h("dt", {}, "Entity"), h("dd", {}, h("code", {}, step.entity_id)));
     if (proof.base_change) rows.append(h("dt", {}, "Before read at"), h("dd", {}, h("code", {}, proof.base_change)));
@@ -1101,15 +1140,25 @@
     return panel;
   }
 
+  /**
+   * One finding as a row. An entity Kin has only an identifier for is said in
+   * words, and the line as Kin wrote it stays behind Show details.
+   */
+  function findingItem(message, tone) {
+    const unnamed = namesNoEntity(message);
+    return h(
+      "li",
+      { class: `finding finding-${tone}` },
+      prose(unnamed ? withoutRawEntities(message) : message),
+      unnamed ? h("details", { class: "problem-details" }, h("summary", {}, "Show details"), h("p", { class: "problem-text" }, message)) : null,
+    );
+  }
+
   function findings(step) {
     // The step's own first line already says an entity is new.
     const shown = step.findings.filter((finding) => finding.kind !== "added");
     if (!shown.length) return null;
-    const list = h("ul", { class: "findings" });
-    for (const finding of shown) {
-      list.append(h("li", { class: `finding finding-${finding.severity}` }, prose(finding.message)));
-    }
-    return list;
+    return h("ul", { class: "findings step-findings" }, shown.map((finding) => findingItem(finding.message, finding.severity)));
   }
 
   /**
@@ -1129,7 +1178,7 @@
 
   function stepCard(step, number) {
     const index = state.steps.length;
-    const toggle = h("button", { class: "read", type: "button", "aria-pressed": "false" }, "Mark read");
+    const toggle = h("button", { class: "button button-small read", type: "button", "aria-pressed": "false" }, "Mark read");
     toggle.addEventListener("click", (event) => {
       event.stopPropagation();
       toggleRead(index);
@@ -1139,30 +1188,35 @@
     const form = noteForm(step.entity_id, `Note on ${step.name}`);
     const notes = isWorking() ? null : h("section", { class: "group step-notes" }, h("h4", {}, "Notes", notesCount), notesList, form.nodes);
     const source = sourcePanel(step);
+    const tone = { added: "good", removed: "bad" }[step.change] || "warn";
     const card = h(
       "article",
       { class: "step", id: `step-${index}`, tabindex: "-1", "data-entity": step.entity_id },
       h(
-        "header",
-        { class: "step-head" },
-        h("span", { class: "step-no" }, number),
+        "div",
+        { class: "step-top" },
         h(
-          "div",
-          { class: "step-id" },
-          h("h3", {}, h("code", {}, nameWithParameters(step))),
+          "header",
+          { class: "step-head" },
+          h("span", { class: "step-no" }, number),
           h(
-            "p",
-            { class: "step-meta" },
-            h("span", { class: `badge badge-${step.change}` }, CHANGE_WORD[step.change] || step.change),
-            h("span", {}, words(step.kind)),
-            placeNode(step, "where", step.change === "removed"),
-            step.risk !== "low" ? riskPill(step.risk, step.connections.consumers_total) : null,
+            "div",
+            { class: "step-id" },
+            h("div", { class: "step-name" }, kindGlyph(step.kind, false), h("h3", {}, h("code", {}, nameWithParameters(step)))),
+            h(
+              "p",
+              { class: "step-meta" },
+              h("span", { class: `pill pill-${tone} step-change` }, CHANGE_WORD[step.change] || step.change),
+              h("span", {}, words(step.kind)),
+              placeNode(step, "where", step.change === "removed"),
+              step.risk !== "low" ? riskPill(step.risk, step.connections.consumers_total) : null,
+            ),
           ),
+          toggle,
         ),
-        toggle,
+        h("p", { class: "narration" }, prose(step.narration)),
+        fieldRows(step),
       ),
-      h("p", { class: "narration" }, prose(step.narration)),
-      fieldRows(step),
       source.node,
       findings(step),
       h(
@@ -1186,6 +1240,7 @@
       redraw: source.redraw,
       entity: step.entity_id,
       name: step.name,
+      kind: step.kind,
       number,
       change: step.change,
     });
@@ -1312,6 +1367,19 @@
   /** The scopes this page shows under a step, so every other note stays with the change. */
   const walkedScopes = () => new Set(state.steps.map((step) => `entity:${step.entity}`));
 
+  /**
+   * What a note is about, when it is not the whole change. An entity this
+   * page does not walk is said in words, with its identifier behind Copy.
+   */
+  function scopeNodes(scope) {
+    if (!RAW_ID.test(scope)) return [h("span", { class: "note-scope" }, scope)];
+    const about = /^entity:/i.test(scope) ? "On an entity outside this walk" : "On one part of it";
+    return [h("span", { class: "note-scope" }, about), copyControl("Copy ID", scope.replace(/^entity:/i, ""), "ID")];
+  }
+
+  /** Which of a change's reviews an entry belongs to, said by its age and never by its identifier. */
+  const reviewWords = (review) => (state.reviews[0] === review ? "Newest review" : "Earlier review");
+
   /** One decision or note. `showScope` names what a note is about; `review` names its review. */
   function eventItem(event, showScope, review) {
     const isDecision = event.kind === "decision";
@@ -1321,8 +1389,8 @@
       isDecision ? h("span", { class: `pill standing-${event.state}` }, STANDING_WORD[event.state] || event.state) : null,
       h("span", { class: "note-by" }, event.by),
       h("time", { class: "note-at", datetime: event.at, title: when(event.at) }, ago(event.at)),
-      review ? h("code", { class: "note-scope" }, `review ${review.review_id.slice(0, 8)}`) : null,
-      showScope && event.scope ? h("code", { class: "note-scope" }, event.scope) : null,
+      review ? h("span", { class: "note-scope" }, reviewWords(review)) : null,
+      showScope && event.scope ? scopeNodes(String(event.scope)) : null,
       event.text || event.text_cut
         ? h("span", { class: "note-body" }, event.text || "", event.text_cut ? h("span", { class: "none" }, " (cut short here)") : null)
         : null,
@@ -1340,7 +1408,7 @@
       "aria-label": prompt,
     });
     bindDraft(text, entity ? `entity:${entity}` : "change-note", status);
-    const save = h("button", { class: "write-button", type: "button" }, "Add note");
+    const save = h("button", { class: "button", type: "button" }, "Add note");
     const send = () => {
       if (!text.value.trim()) {
         text.focus();
@@ -1365,14 +1433,14 @@
       state.panel = null;
       return h(
         "section",
-        { class: "review-panel", id: "review-panel", "aria-label": "Review record" },
+        { class: "review-panel review-panel-working", id: "review-panel", "aria-label": "Review record" },
         h("div", { class: "review-head" }, h("h2", {}, "Not committed yet")),
         h("p", { class: "caveat" }, "Commit this work to approve it or ask for changes."),
       );
     }
     const standing = h("span", { class: "pill standing-pending" });
     const history = h("div", { class: "review-history" });
-    const footer = h("p", { class: "caveat" });
+    const footer = h("p", { class: "caveat review-foot" });
     const form = noteForm(null, `Note on this ${nounOf(state.guide)}`);
     state.panel = { standing, history, footer };
     return h(
@@ -1381,7 +1449,8 @@
       h(
         "div",
         { class: "review-head" },
-        h("h2", {}, "Review record"),
+        // A fixed phrase, so it can take the page's section-label style.
+        h("h2", { class: "outline-head" }, "Review record"),
         standing,
         state.session.actor ? h("span", { class: "recorded-as" }, `Signed as ${state.session.actor}`) : null,
       ),
@@ -1412,7 +1481,9 @@
     const buttons = {};
     const actions = h("div", { class: "decide" });
     for (const [value, title] of DECISIONS) {
-      const button = h("button", { class: `write-button decide-${value}`, type: "button" }, title);
+      // Approve is the page's one primary button.
+      const look = value === "approved" ? "button-primary" : value === "blocked" ? "button-danger" : "";
+      const button = h("button", { class: `button ${look} decide-${value}`, type: "button" }, title);
       button.addEventListener("click", () => record("/api/decide", { state: value, comment: comment.value }, status, button, comment));
       buttons[value] = button;
       actions.append(button);
@@ -1421,11 +1492,11 @@
       // Nothing to decide on work that is not a change. The bar keeps what
       // still applies: how far the reader is, where to start, and a refresh.
       state.bar = { label, meter, standing: null, comment: null, buttons: {} };
-      const refresh = h("button", { class: "bar-icon", type: "button", "aria-label": "Refresh", title: "Refresh" }, refreshIcon());
+      const refresh = h("button", { class: "icon-button bar-icon", type: "button", "aria-label": "Refresh", title: "Refresh" }, refreshIcon());
       refresh.addEventListener("click", () => refreshWorking(true));
       const first = state.steps[0];
       const startButton = first
-        ? h("button", { class: "write-button decide-approved bar-start", type: "button", on: { click: () => setCurrent(0, true) } }, "Start with ", h("code", {}, first.name))
+        ? h("button", { class: "button button-primary bar-start", type: "button", on: { click: () => setCurrent(0, true) } }, "Start with ", h("code", {}, first.name))
         : null;
       return h(
         "div",
@@ -1440,7 +1511,7 @@
         ),
       );
     }
-    const toggle = h("button", { class: "review-decision-toggle write-button", type: "button", "aria-expanded": "false",
+    const toggle = h("button", { class: "button review-decision-toggle", type: "button", "aria-expanded": "false",
       "aria-controls": "decision-comment decision-actions" }, "Leave a decision");
     comment.setAttribute("id", "decision-comment");
     actions.setAttribute("id", "decision-actions");
@@ -1486,13 +1557,18 @@
           ? h(
               "p",
               { class: "review-block-head" },
-              h("code", {}, review.review_id.slice(0, 8)),
+              h("span", { class: "review-block-which" }, reviewWords(review)),
               h("span", { class: `pill standing-${review.state}` }, STANDING_WORD[review.state] || review.state),
               h("span", {}, review.title),
               index === 0 ? h("span", { class: "joins" }, "New decisions and notes join this one") : null,
+              copyControl("Copy ID", review.review_id, "Review ID"),
             )
           : null,
-        earlier > 0 ? h("p", { class: "none" }, `${earlier} earlier entries are in `, h("code", {}, `kin review show ${review.review_id}`), ".") : null,
+        // The command names the review by its identifier, so it is copied whole and not read.
+        earlier > 0
+          ? h("p", { class: "none" }, `${earlier} earlier entries are in `, h("code", {}, "kin review show"), ". ",
+              copyControl("Copy command", `kin review show ${review.review_id}`, "Command"))
+          : null,
         entries.length
           ? h("ul", { class: "notes" }, entries.map((event) => eventItem(event, true, null)))
           : several
@@ -1609,13 +1685,37 @@
     state.steps.forEach((step) => state.observer.observe(step.card));
   }
 
+  /** How many notes a section shows before the rest go behind one line. */
+  const NOTES_SHOWN = 12;
+
+  /**
+   * One titled list of what Kin found across the whole change. A breaking
+   * change or a missing test always stays in view. Notes read differently:
+   * past the first dozen they wait behind one line, and a note that names an
+   * entity only by its identifier is not something a person can read, so
+   * those are counted in one closed line at the end with what Kin wrote inside.
+   */
   function findingList(title, items, tone) {
     if (!items.length) return null;
+    const quiet = tone === "info";
+    const unnamed = quiet ? items.filter(namesNoEntity) : [];
+    const readable = quiet ? items.filter((item) => !namesNoEntity(item)) : items;
+    const first = quiet ? readable.slice(0, NOTES_SHOWN) : readable;
+    const rest = readable.slice(first.length);
+    const rows = (some) => h("ul", { class: "findings" }, some.map((item) => findingItem(item, tone)));
+    const connections = unnamed.length > 0 && unnamed.every((item) => /^relation\b/i.test(item));
+    const counted = connections
+      ? `${plural(unnamed.length, "connection note", "connection notes")} Kin could not name`
+      : `${plural(unnamed.length, "note", "notes")} about entities Kin could not name`;
     return h(
       "section",
       { class: "group" },
       h("h4", {}, title, h("span", { class: "count" }, items.length)),
-      h("ul", { class: "findings" }, items.map((item) => h("li", { class: `finding finding-${tone}` }, prose(item)))),
+      first.length ? rows(first) : null,
+      rest.length ? h("details", { class: "more-notes" }, h("summary", {}, `Show ${rest.length} more`), rows(rest)) : null,
+      unnamed.length
+        ? h("details", { class: "unnamed-notes" }, h("summary", {}, counted), h("div", { class: "unnamed-list" }, unnamed.map((item) => h("p", { class: "detail-text" }, prose(item)))))
+        : null,
     );
   }
 
@@ -1663,7 +1763,8 @@
                 },
               },
             },
-            h("span", { class: `dot dot-${step.change}`, "aria-hidden": "true" }),
+            changeGlyph(step.change),
+            kindGlyph(step.kind, false),
             h("code", {}, nameWithParameters(step)),
           ),
         );
@@ -1918,7 +2019,25 @@
         {},
         "Everything is committed. Edit something and this page walks it as you go: what changed, what relies on it, and what you haven't updated yet.",
       ),
-      base ? h("p", {}, h("a", { class: "write-button", href: `#/c/${base}` }, "Open your last commit")) : null,
+      base ? h("p", {}, h("a", { class: "button", href: `#/c/${base}` }, "Open your last commit")) : null,
+    );
+  }
+
+  /**
+   * A change's own message, under its title. A long one shows its first
+   * paragraph and keeps the rest one line away, so what the change touches
+   * and what relies on it stay on the first screen.
+   */
+  function messageNode(rest) {
+    const lines = rest.split("\n");
+    const first = rest.split(/\n\s*\n/)[0].split("\n").slice(0, 4).join("\n");
+    const more = rest.slice(first.length).replace(/^\s+/, "");
+    if (!more || (rest.length <= 360 && lines.length <= 5)) return h("p", { class: "message" }, rest);
+    return h(
+      "div",
+      { class: "message" },
+      h("p", {}, first),
+      h("details", { class: "problem-details" }, h("summary", {}, "Show the rest of the message"), h("p", {}, more)),
     );
   }
 
@@ -1942,9 +2061,9 @@
     // Uncommitted work is said in the page's own words, not the server's.
     const rest = guide.kind === "working" ? "Changes you haven't committed yet." : change.message.split("\n").slice(1).join("\n").trim();
     const counts = [
-      summary.modified ? `${summary.modified} modified` : null,
-      summary.added ? `${summary.added} added` : null,
-      summary.removed ? `${summary.removed} removed` : null,
+      summary.modified ? `${amount(summary.modified)} modified` : null,
+      summary.added ? `${amount(summary.added)} added` : null,
+      summary.removed ? `${amount(summary.removed)} removed` : null,
     ].filter(Boolean);
 
     const working = guide.kind === "working";
@@ -1959,18 +2078,19 @@
     // its visibility whenever the current head's ancestry is read again.
     const since =
       guide.kind === "change"
-        ? h("a", { class: "fact fact-link since-change", hidden: !canWalkSince(guide), href: `#/r/${change.id}..`, title: "Review everything after this change together" }, "Everything since this change")
+        ? h("a", { class: "button button-small since-change", hidden: !canWalkSince(guide), href: `#/r/${change.id}..`, title: "Review everything after this change together" }, "Everything since this change")
         : null;
     const lede = headline(guide, drawn ? drawn.counts : null);
-    const copySummary = h("button", { class: "fact fact-link", type: "button", title: "Copy this walk as Markdown, for a pull request or a message" }, "Copy summary");
+    const copySummary = h("button", { class: "button button-small", type: "button", title: "Copy this walk as Markdown, for a pull request or a message" }, "Copy summary");
     copySummary.addEventListener("click", () => copy(summaryMarkdown(guide, lede), "Summary"));
     const head = h(
       "header",
       { class: "change-head" },
       eyebrow(guide),
       agentLine(guide),
-      h("h1", {}, titleOf(guide)),
-      rest ? h("p", { class: "message" }, rest) : null,
+      // The title, with what acts on the whole walk at its right as the workspace has it.
+      h("div", { class: "title-row" }, h("h1", {}, titleOf(guide)), noEntity ? null : h("div", { class: "head-actions" }, since, copySummary)),
+      rest ? messageNode(rest) : null,
       noEntity ? null : h("p", { class: "lede" }, lede),
       noEntity
         ? null
@@ -1983,8 +2103,6 @@
             RISK_WORD[summary.risk] && summary.recorded_consumers ? null : h("span", { class: "fact" }, relyWords(summary.recorded_consumers, it)),
             h("span", { class: "fact" }, testWords(summary.recorded_tests, it)),
             summary.relation_changes ? h("span", { class: "fact" }, plural(summary.relation_changes, "connection changed", "connections changed")) : null,
-            since,
-            copySummary,
           ),
       guide.kind === "range" && guide.range ? rangeChanges(guide.range) : null,
     );
@@ -2027,12 +2145,14 @@
         ? [head, noEntityChanged(guide), caveats]
         : [
           head,
-          drawn ? drawn.node : h("p", { class: "notice" }, `This ${nounOf(guide)} holds no entity a review can act on.`),
+          // What qualifies the counts sits right under them, as it does on the workspace's Work page.
           caveats,
+          drawn ? drawn.node : h("p", { class: "notice" }, `This ${nounOf(guide)} holds no entity a review can act on.`),
           buildReviewPanel(),
           chapters,
           guide.not_walked ? h("p", { class: "notice" }, prose(guide.not_walked.message)) : null,
-          overall.length ? h("section", { class: "overall" }, h("h2", {}, "Also worth checking"), overall) : null,
+          // A fixed phrase, so it can take the page's section-label style.
+          overall.length ? h("section", { class: "overall" }, h("h2", { class: "outline-head" }, "Also worth checking"), overall) : null,
           h(
             "footer",
             { class: "foot" },
@@ -2115,8 +2235,12 @@
     return h(
       "a",
       { class: `change change-branch ${selected ? "is-selected" : ""}`, href, "aria-current": selected ? "page" : false },
-      h("span", { class: "change-title" }, "This branch"),
-      h("span", { class: "change-meta" }, h("code", {}, on.active.name), h("span", {}, `against ${on.base.name}`)),
+      h(
+        "span",
+        { class: "change-text" },
+        h("span", { class: "change-title" }, "This branch"),
+        h("span", { class: "change-meta" }, h("code", {}, on.active.name), h("span", {}, `against ${on.base.name}`)),
+      ),
     );
   }
 
@@ -2128,7 +2252,12 @@
       state.branches = [];
     }
     const context = byId("review-branch");
-    if (context) context.textContent = state.branches.find((branch) => branch.active)?.name || "Branch unknown";
+    if (context) {
+      const on = state.branches.find((branch) => branch.active)?.name || "";
+      context.textContent = on || "Branch unknown";
+      // The row has room for a short name; a long one is whole one hover away.
+      context.setAttribute("title", on ? `On ${on}` : "Kin couldn't tell which branch this is.");
+    }
     renderRail();
     retitle();
   }
@@ -2166,12 +2295,16 @@
         href: "#/w",
         "aria-current": selected ? "page" : false,
       },
-      h("span", { class: "change-title" }, h("span", { class: "work-dot", "aria-hidden": "true" }), "Uncommitted work"),
       h(
         "span",
-        { class: "change-meta" },
-        h("span", {}, meta),
-        state.workingRead.error ? h("span", { class: "caveat-warn" }, held ? "Couldn't refresh" : "Couldn't load") : null,
+        { class: "change-text" },
+        h("span", { class: "change-title" }, h("span", { class: "work-dot", "aria-hidden": "true" }), "Uncommitted work"),
+        h(
+          "span",
+          { class: "change-meta" },
+          h("span", {}, meta),
+          state.workingRead.error ? h("span", { class: "caveat-warn" }, held ? "Couldn't refresh" : "Couldn't load") : null,
+        ),
       ),
     );
   }
@@ -2191,19 +2324,25 @@
           class: `change ${change.id === selected ? "is-selected" : ""} ${inRange.has(change.id) ? "in-range" : ""} ${checkpoint ? "is-checkpoint" : ""}`,
           href: `#/c/${change.id}`,
           "aria-current": change.id === selected ? "page" : false,
+          // The row shows two lines of a title; the whole of it is one hover away.
+          title: untitled(change),
         },
-        h("span", { class: "change-title" }, untitled(change)),
         h(
           "span",
-          { class: "change-meta" },
-          dotted(
-            byline(change).map((part) => h("span", {}, part)),
-            // The count the change's own guide walks, once the server has
-            // said it. The history's delta count also holds module containers
-            // and classes read through their members, so it is never shown here.
-            checkpoint ? h("span", { title: "Kin made this for itself. It changes no code." }, "Kin update") : countWords(change),
+          { class: "change-text" },
+          h("span", { class: "change-title" }, untitled(change)),
+          h(
+            "span",
+            { class: "change-meta" },
+            dotted(
+              byline(change).map((part) => h("span", {}, part)),
+              // The count the change's own guide walks, once the server has
+              // said it. The history's delta count also holds module containers
+              // and classes read through their members, so it is never shown here.
+              checkpoint ? h("span", { title: "Kin made this for itself. It changes no code." }, "Kin update") : countWords(change),
+            ),
+            where && where !== "pending" ? h("span", { class: `change-standing standing-${where}` }, STANDING_WORD[where]) : null,
           ),
-          where && where !== "pending" ? h("span", { class: `standing-dot standing-${where}` }, STANDING_WORD[where]) : null,
         ),
       );
     });
@@ -2216,12 +2355,16 @@
       rows.push(
         h(
           "button",
-          { class: "more", type: "button", disabled: state.loadingOlder, on: { click: loadOlder } },
+          { class: "button button-small more", type: "button", disabled: state.loadingOlder, on: { click: loadOlder } },
           state.loadingOlder ? "Loading older changes" : "Older changes",
         ),
       );
     }
-    list.replaceChildren(...[workingEntry(), branchEntry(), ...rows].filter(Boolean));
+    // The repository's dot says there is uncommitted work, as it does in the workspace.
+    const dot = byId("repo-dot");
+    if (dot) dot.setAttribute("data-state", state.working && (state.working.changed || state.working.differs) ? "work" : "open");
+    // What is not a recorded change yet stays above a rule, apart from history.
+    list.replaceChildren(...[workingEntry(), branchEntry(), h("div", { class: "rail-rule", role: "separator" }), ...rows].filter(Boolean));
   }
 
   /** Open the newest change, or what the server opens first when no list is read yet. */
@@ -2283,9 +2426,33 @@
       ...(where && where !== "github.com"
         ? [h("span", { class: "repo-host" }, ` · ${where}`)]
         : "host" in session && !where
-          ? [h("span", { class: "pill-local" }, "Local")]
+          ? [h("span", { class: "pill pill-local" }, "Local")]
           : []),
     );
+  }
+
+  /**
+   * The ways back to the workspace, when this review is opened from one: the
+   * brand, as on every workspace page, and a row that names the repository.
+   * A review opened on its own has no workspace, so neither is a link.
+   */
+  function renderWayBack(session) {
+    const workspace = document.body.dataset.workspaceUrl;
+    const version = byId("rail-version");
+    if (version && typeof session.version === "string" && session.version) version.textContent = `Kin ${session.version}`;
+    if (!workspace) return;
+    const name = typeof session.repository === "string" && session.repository.trim() ? session.repository.trim() : "the";
+    const brand = byId("brand");
+    if (brand) {
+      brand.setAttribute("href", workspace);
+      brand.setAttribute("aria-label", "Kin, back to the workspace");
+    }
+    const back = byId("rail-back");
+    if (!back) return;
+    back.setAttribute("href", `${workspace}#/work`);
+    const label = byId("rail-back-label");
+    if (label) label.textContent = `Back to ${name} work`;
+    back.hidden = false;
   }
 
   /** Where the listed changes stand, when this server can say. An older one cannot. */
@@ -2728,6 +2895,7 @@
     state.steps.forEach((step, index) => {
       items.push({
         kind: "Step",
+        entityKind: step.kind,
         label: step.name,
         detail: `${step.number} · ${CHANGE_WORD[step.change] || step.change}`,
         run: () => setCurrent(index, true),
@@ -2846,7 +3014,10 @@
                 },
               },
               h("span", { class: "palette-kind" }, item.kind),
-              h("span", { class: "palette-label" }, item.label),
+              // A step is an entity, so it reads as one: its kind glyph and its name in the mono face.
+              item.kind === "Step"
+                ? h("span", { class: "palette-label palette-entity" }, kindGlyph(item.entityKind, false), h("code", {}, item.label))
+                : h("span", { class: "palette-label" }, item.label),
               h("span", { class: "palette-detail" }, item.detail),
             ),
           )
@@ -3022,9 +3193,9 @@
   window.addEventListener("hashchange", () => {
     const wasInRail = byId("rail").contains(document.activeElement);
     byId("rail").classList.remove("is-expanded");
-    if (wasInRail && window.matchMedia("(max-width: 920px)").matches) byId("main").focus({ preventScroll: true });
+    if (wasInRail && window.matchMedia(NARROW).matches) byId("main").focus({ preventScroll: true });
     byId("rail-toggle")?.setAttribute("aria-expanded", "false");
-    if (byId("rail-toggle")) byId("rail-toggle").textContent = "Browse changes";
+    byId("rail-toggle")?.setAttribute("aria-label", "Browse changes");
     if (!state.session) return;
     const route = routeFromHash();
     if (route && (!state.guide || location.hash !== hashOf(state.guide))) loadGuide(route);
@@ -3032,7 +3203,8 @@
   byId("rail-toggle")?.addEventListener("click", () => {
     const expanded = byId("rail").classList.toggle("is-expanded");
     byId("rail-toggle").setAttribute("aria-expanded", String(expanded));
-    byId("rail-toggle").textContent = expanded ? "Hide changes" : "Browse changes";
+    // The toggle is an icon, so what it does is said by its label.
+    byId("rail-toggle").setAttribute("aria-label", expanded ? "Hide changes" : "Browse changes");
   });
   byId("theme").addEventListener("click", cycleTheme);
   byId("editor").addEventListener("click", cycleEditor);
@@ -3074,10 +3246,7 @@
       return;
     }
     renderRepository(state.session);
-    const workspaceUrl = document.body.dataset.workspaceUrl;
-    if (workspaceUrl && !byId("workspace-back")) {
-      byId("repo").parentNode.append(h("a", { id: "workspace-back", class: "workspace-back", href: workspaceUrl }, "Back to workspace"));
-    }
+    renderWayBack(state.session);
     // The reader's own choice wins. Without one, the editor the shell names.
     applyEditor(store.get("kin.review.editor", state.session.editor || "off"));
     renderFilters();

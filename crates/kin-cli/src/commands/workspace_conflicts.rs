@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Human inspection of a parked merge and fixed CLI handoffs. No resolution is
-//! dispatched here. The durable record stays intact; only source display text
-//! may be shortened, with explicit byte counts.
+//! Human inspection of a parked merge, and settling it one step at a time.
+//!
+//! The page is shown the steps this merge offers now, each under a stable
+//! id, and sends back one id with the identity of the record it was looking
+//! at. The server derives the steps again from the record as it is, refuses
+//! an id it does not derive or a record that has moved, and performs that one
+//! step through the daemon's resolve path, the path `kin resolve` takes. A
+//! caller never supplies what is done, only which offered step to take. The
+//! durable record stays intact; only source display text may be shortened,
+//! with explicit byte counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -12,13 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use kin_model::{MergeConflictEntry, MergeConflictSubject, MergeDivergence};
-use serde::Serialize;
+use axum::Json;
+use kin_model::{MergeConflictEntry, MergeConflictSubject, MergeDivergence, MergeSide};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::conflicts::{ConflictsReport, ConflictsRequest, CONFLICTS_REPORT_SCHEMA};
+use super::resolve::{ResolveAction, ResolveChoice, ResolveDirective, ResolveRequest};
 use super::review_ui::{self, UiState};
 
 const BODY_LIMIT: usize = 16 * 1024;
@@ -31,17 +40,9 @@ const RESPONSE_LIMIT: usize = 1024 * 1024;
 pub(super) async fn serve_conflicts(State(state): State<Arc<UiState>>) -> Response {
     let answer = async {
         let client = review_ui::daemon(&state).await?;
-        let health = client.health().await?;
-        let repository = health.repo_id.context("The daemon omitted its repository identity.")?;
-        let workspace = health.workspace_id.context("The daemon omitted its workspace identity.")?;
-        let report = client
-            .conflicts(&ConflictsRequest { bodies: true })
-            .await?
-            .report
-            .context("The daemon omitted its conflict report.")?;
-        let value = present(report, &repository, &workspace)?;
+        let value = details(&client).await?;
         bounded_json(&value, RESPONSE_LIMIT)
-            .context("Conflict details exceed the UI response limit; inspect them with kin conflicts --json --show.")
+            .context("The conflict details are larger than this page can show.")
     }
     .await;
     match answer {
@@ -62,6 +63,31 @@ pub(super) async fn serve_conflicts(State(state): State<Arc<UiState>>) -> Respon
             review_ui::refusal(StatusCode::BAD_GATEWAY, &anyhow::anyhow!("{message}"))
         }
     }
+}
+
+/// The daemon's repository and workspace identity, which every report it
+/// answers with has to carry.
+async fn identity(client: &crate::daemon_client::DaemonClient) -> Result<(String, String)> {
+    let health = client.health().await?;
+    Ok((
+        health
+            .repo_id
+            .context("The daemon omitted its repository identity.")?,
+        health
+            .workspace_id
+            .context("The daemon omitted its workspace identity.")?,
+    ))
+}
+
+/// The conflict details as the page reads them, from the merge as it is now.
+async fn details(client: &crate::daemon_client::DaemonClient) -> Result<Value> {
+    let (repository, workspace) = identity(client).await?;
+    let report = client
+        .conflicts(&ConflictsRequest { bodies: true })
+        .await?
+        .report
+        .context("The daemon omitted its conflict report.")?;
+    present(report, &repository, &workspace)
 }
 
 /// Fail on oversized authority rather than silently deleting entries or
@@ -147,7 +173,10 @@ fn safe_selector(entry: &MergeConflictEntry, entries: &[MergeConflictEntry]) -> 
             == 1
 }
 
-fn validate_report(report: &ConflictsReport, repository: &str, workspace: &str) -> Result<()> {
+/// Check that a report is this repository's, and that its record is the one
+/// its hash and counts describe. Everything a step is derived from passes
+/// here first, whether or not the report carries source bodies.
+fn validate_record(report: &ConflictsReport, repository: &str, workspace: &str) -> Result<()> {
     anyhow::ensure!(
         report.schema == CONFLICTS_REPORT_SCHEMA && report.authority == "repository-v6",
         "The daemon returned an unsupported conflict report."
@@ -156,8 +185,9 @@ fn validate_report(report: &ConflictsReport, repository: &str, workspace: &str) 
         report.repository_id.as_str() == repository && report.workspace_id.to_string() == workspace,
         "The conflict report belongs to another repository or workspace."
     );
-    bounded_json(&report.record, RECORD_LIMIT)
-        .context("The merge record exceeds the UI limit; use kin conflicts --json. No authority entries were omitted.")?;
+    bounded_json(&report.record, RECORD_LIMIT).context(
+        "The merge record is larger than this page can show. No authority entries were omitted.",
+    )?;
     let Some(record) = &report.record else {
         anyhow::ensure!(
             report.record_hash.is_none()
@@ -187,6 +217,14 @@ fn validate_report(report: &ConflictsReport, repository: &str, workspace: &str) 
             && report.resolved_count == record.entries.len() - unresolved,
         "The reported conflict counts differ from the durable record."
     );
+    Ok(())
+}
+
+fn validate_report(report: &ConflictsReport, repository: &str, workspace: &str) -> Result<()> {
+    validate_record(report, repository, workspace)?;
+    let Some(record) = &report.record else {
+        return Ok(());
+    };
     let expected: BTreeMap<_, _> = record
         .entries
         .iter()
@@ -266,27 +304,46 @@ fn display_bodies(report: &mut ConflictsReport) -> Value {
     })
 }
 
-fn command(
+/// One step this merge offers now: what the page shows of it, and exactly
+/// what taking it does. The action is derived here from the record and is
+/// never read back from a caller.
+struct Step {
     id: String,
-    label: &str,
-    hash: &str,
-    selector: Option<&str>,
-    args: Vec<String>,
-) -> Value {
-    let mut argv = vec![
-        "kin".to_string(),
-        "resolve".to_string(),
-        "--expect".to_string(),
-        hash.to_string(),
-    ];
-    argv.extend(args);
-    json!({"id":id, "label":label, "argv":argv, "modifies":true, "selector":selector})
+    label: &'static str,
+    /// The conflict the step settles. Publishing and abandoning name none.
+    selector: Option<String>,
+    action: ResolveAction,
 }
 
-/// What the page offers for settling the merge in a terminal. It names no
-/// directory: the commands run in this repository, and the page says so.
-fn handoff(report: &ConflictsReport) -> Value {
-    let mut commands = Vec::new();
+impl Step {
+    fn settling(id: String, label: &'static str, selector: &str, choice: ResolveChoice) -> Self {
+        Self {
+            id,
+            label,
+            selector: Some(selector.to_string()),
+            action: ResolveAction::Settle {
+                directives: vec![ResolveDirective {
+                    selector: selector.to_string(),
+                    choice,
+                }],
+                all: None,
+            },
+        }
+    }
+}
+
+/// What the merge in `report` offers.
+struct Offered {
+    steps: Vec<Step>,
+    /// Conflicts no step can name without ambiguity, each with why.
+    unavailable_subjects: Vec<Value>,
+    /// Why no step is offered at all, when none is.
+    unavailable: Option<&'static str>,
+}
+
+/// The steps the merge in `report` offers now, each bound to that record.
+fn offered(report: &ConflictsReport) -> Offered {
+    let mut steps = Vec::new();
     let mut unavailable_subjects = Vec::new();
     let unavailable = match (&report.record, report.record_hash.as_deref()) {
         (None, _) => Some("No merge is parked in this workspace."),
@@ -296,84 +353,230 @@ fn handoff(report: &ConflictsReport) -> Value {
         (Some(_), None) => {
             Some("The daemon omitted the expected record hash. Refresh before resolving.")
         }
-        (Some(record), Some(hash)) => {
+        (Some(record), Some(_)) => {
             for entry in record.unresolved() {
                 let selected = selector(&entry.subject);
                 if !safe_selector(entry, &record.entries) {
                     unavailable_subjects.push(json!({
                         "selector":selected,
-                        "reason":"The existing CLI cannot address this subject unambiguously with its exact identity.",
+                        "reason":"Kin cannot name this conflict unambiguously by its exact identity, so it cannot be settled here.",
                     }));
                     continue;
                 }
                 if let MergeDivergence::PathCollision { artifacts } = &entry.divergence {
                     for artifact in artifacts {
-                        commands.push(command(
+                        steps.push(Step::settling(
                             format!("keep-path:{selected}:{}", artifact.0),
-                            "Keep this artifact at the contested path",
-                            hash,
-                            Some(&selected),
-                            vec![format!("--keep-path={selected}={}", artifact.0)],
+                            "Keep this claimant at the contested place",
+                            &selected,
+                            ResolveChoice::PathOwner {
+                                artifact: artifact.0.to_string(),
+                            },
                         ));
                     }
                     continue;
                 }
-                for (side, label) in [
-                    ("ours", "Use the recorded target side"),
-                    ("theirs", "Use the recorded incoming side"),
-                    ("base", "Use the recorded base side"),
+                for (name, side, label) in [
+                    ("ours", MergeSide::Ours, "Use the recorded target side"),
+                    (
+                        "theirs",
+                        MergeSide::Theirs,
+                        "Use the recorded incoming side",
+                    ),
+                    ("base", MergeSide::Base, "Use the recorded base side"),
                 ] {
-                    if side == "base" && !entry.base.is_present() {
+                    if side == MergeSide::Base && !entry.base.is_present() {
                         continue;
                     }
-                    commands.push(command(
-                        format!("{side}:{selected}"),
+                    steps.push(Step::settling(
+                        format!("{name}:{selected}"),
                         label,
-                        hash,
-                        Some(&selected),
-                        vec![format!("--{side}"), selected.clone()],
+                        &selected,
+                        ResolveChoice::Side { side },
                     ));
                 }
-                commands.push(command(
+                steps.push(Step::settling(
                     format!("remove:{selected}"),
                     "Remove this identity from the merge",
-                    hash,
-                    Some(&selected),
-                    vec!["--remove".into(), selected.clone()],
+                    &selected,
+                    ResolveChoice::Remove,
                 ));
             }
             if record.is_fully_resolved() {
-                commands.push(command(
-                    "continue".into(),
-                    "Publish the recorded resolutions",
-                    hash,
-                    None,
-                    vec!["--continue".into()],
-                ));
+                steps.push(Step {
+                    id: "continue".into(),
+                    label: "Publish the recorded resolutions",
+                    selector: None,
+                    action: ResolveAction::Continue,
+                });
             }
-            commands.push(command(
-                "abort".into(),
-                "Abandon the merge; keep current workspace files",
-                hash,
-                None,
-                vec!["--abort".into()],
-            ));
+            steps.push(Step {
+                id: "abort".into(),
+                label: "Abandon the merge and keep the working copy as it is",
+                selector: None,
+                action: ResolveAction::Abort,
+            });
             None
         }
     };
+    Offered {
+        steps,
+        unavailable_subjects,
+        unavailable,
+    }
+}
+
+/// What the page is shown of the steps: each one's id, label and the
+/// conflict it settles. What a step does stays on this side.
+fn handoff(report: &ConflictsReport) -> Value {
+    let offered = offered(report);
+    let commands: Vec<Value> = offered
+        .steps
+        .iter()
+        .map(|step| {
+            json!({"id":step.id, "label":step.label, "modifies":true, "selector":step.selector})
+        })
+        .collect();
     json!({
-        "commands":commands, "unavailable_subjects":unavailable_subjects,
-        "unavailable":unavailable,
+        "commands":commands, "unavailable_subjects":offered.unavailable_subjects,
+        "unavailable":offered.unavailable,
         "instructions":[
-            "Run at most one chosen command in this repository's working tree. This page does not execute commands.",
-            "argv contains separate arguments, not a shell command. Quote each argument correctly before pasting into a shell.",
-            "After every settlement, refresh conflict details and use the new record hash. Do not reuse a previous handoff for continue or abort.",
+            "Take one step at a time. After each one this page reads the merge again, and the next step is taken against the record as it is then.",
             "A side choice can remove an identity when that recorded side is absent. Base, target and incoming source are historical display text, not current editing authority.",
-            "Custom complete-artifact bytes use the existing --file resolution form with a fresh --expect record hash; a source snippet is not a complete artifact.",
-            "Abandoning a merge discards its conflict state and leaves current workspace files untouched. Publishing remains a separate guarded action.",
-            "If a command's outcome is uncertain, inspect repository and conflict state before another action; do not retry automatically."
+            "Abandoning a merge discards its conflict state and leaves the working copy untouched. Publishing remains a separate guarded step.",
+            "If a step's outcome is uncertain, read the repository and conflict state again before another step. Nothing is retried automatically."
         ],
     })
+}
+
+/// The longest step id a request may carry. An id is a selector and at most
+/// one claimant's identity, both bounded by the record.
+const STEP_ID_LIMIT: usize = 8 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SettleBody {
+    /// The id of one step, as the conflict details listed it.
+    command: String,
+    /// The identity of the record the page was looking at.
+    record_hash: String,
+    operation_id: kin_model::OperationId,
+}
+
+/// A 32-byte record identity from its hex, or nothing when it is not one.
+fn record_identity(hex_text: &str) -> Option<kin_model::Hash256> {
+    let bytes: [u8; 32] = hex::decode(hex_text.trim()).ok()?.try_into().ok()?;
+    Some(kin_model::Hash256::from_bytes(bytes))
+}
+
+/// The step was not taken: nothing reached the daemon's resolve path.
+fn settle_refused(operation_id: kin_model::OperationId, error: &anyhow::Error) -> Response {
+    (StatusCode::CONFLICT, Json(json!({
+        "error":format!("{error:#}"), "outcome":"refused",
+        "operation_id":operation_id,
+        "remedy":"Nothing was recorded. Read the conflicts again, then take a step the merge offers now.",
+    }))).into_response()
+}
+
+/// Take one step of a parked merge: settle one conflict, publish the merge
+/// or abandon it.
+pub(super) async fn settle(
+    State(state): State<Arc<UiState>>,
+    headers: HeaderMap,
+    Json(body): Json<SettleBody>,
+) -> Response {
+    if !review_ui::may_write(&headers, &state) {
+        return review_ui::write_refused();
+    }
+    let operation_id = body.operation_id;
+    let prepared = async {
+        anyhow::ensure!(
+            !operation_id.0.is_nil(),
+            "a nonempty operation ID is required"
+        );
+        anyhow::ensure!(
+            body.command.len() <= STEP_ID_LIMIT,
+            "this step is not one the merge offers"
+        );
+        let expected = record_identity(&body.record_hash)
+            .context("the record identity is not one a merge carries")?;
+        // Attribution resolves against this URL's repository, never the
+        // process working directory or a caller-supplied actor.
+        let actor = crate::commands::require_commit_author_for(&state.layout)?;
+        let client = review_ui::daemon(&state).await?;
+        let (repository, workspace) = identity(&client).await?;
+        // Read the merge as it is now. The step is derived from this record,
+        // and only its id came from the caller.
+        let report = client
+            .conflicts(&ConflictsRequest { bodies: false })
+            .await?
+            .report
+            .context("The daemon omitted its conflict report.")?;
+        validate_record(&report, &repository, &workspace)?;
+        anyhow::ensure!(
+            report.record_hash.as_deref() == Some(expected.to_string().as_str()),
+            "the merge has moved since this page read it"
+        );
+        let step = offered(&report)
+            .steps
+            .into_iter()
+            .find(|step| step.id == body.command)
+            .context("this step is not one the merge offers now")?;
+        Ok::<_, anyhow::Error>((
+            client,
+            ResolveRequest {
+                operation_id,
+                actor,
+                action: step.action,
+                expected_record: Some(expected),
+            },
+        ))
+    }
+    .await;
+    let (client, request) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return settle_refused(operation_id, &error),
+    };
+    let outcome = match request.action {
+        ResolveAction::Settle { .. } => "settled",
+        ResolveAction::Continue => "continued",
+        ResolveAction::Abort => "aborted",
+    };
+    match client.resolve(&request).await {
+        Ok(answer) => {
+            // Read again after the step, so the page shows the record the
+            // next step is taken against. The step stands whatever becomes
+            // of this read.
+            let (after, unread) = match details(&client).await {
+                Ok(after) => (after, None),
+                Err(error) => (Value::Null, Some(format!("{error:#}"))),
+            };
+            let mut body = json!({
+                "operation_id":operation_id, "outcome":outcome, "details":after,
+            });
+            if let Some(unread) = unread {
+                body["details_error"] = json!(unread);
+            }
+            if let Some(change) = answer.report.and_then(|report| report.merge_change) {
+                body["merge_change"] = json!(change.to_string());
+            }
+            Json(body).into_response()
+        }
+        Err(error) if error.downcast_ref::<crate::daemon_client::RefusedBeforeWriteError>().is_some() => {
+            (StatusCode::CONFLICT, Json(json!({
+                "error":format!("{error:#}"), "outcome":"refused",
+                "operation_id":operation_id,
+                "remedy":"The daemon refused before recording anything. Read the conflicts again before another step.",
+            }))).into_response()
+        }
+        // A lost answer can follow a recorded step. Return its identity for
+        // reconciliation and never replay it behind the page.
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({
+            "error":format!("{error:#}"), "outcome":"unknown",
+            "operation_id":operation_id,
+            "remedy":"The step may have been recorded. Read the repository and its conflicts again before another step. This request was not retried.",
+        }))).into_response(),
+    }
 }
 
 fn present(mut report: ConflictsReport, repository: &str, workspace: &str) -> Result<Value> {
@@ -536,36 +739,96 @@ mod tests {
         report
     }
 
+    /// The one directive a settling step carries.
+    fn directive(step: &Step) -> &ResolveDirective {
+        match &step.action {
+            ResolveAction::Settle {
+                directives,
+                all: None,
+            } if directives.len() == 1 => &directives[0],
+            other => panic!(
+                "{} does not settle exactly one conflict: {other:?}",
+                step.id
+            ),
+        }
+    }
+
     #[test]
-    fn modifying_handoffs_are_fixed_arguments_bound_to_the_exact_record() {
+    fn every_offered_step_is_derived_from_the_record_and_shown_without_what_it_does() {
         let report = fixture();
-        let hash = report.record_hash.clone().unwrap();
         let selected = selector(&report.record.as_ref().unwrap().entries[0].subject);
-        let body_name = report.bodies[0].subject.clone();
+        let offered = offered(&report);
+        assert!(offered.unavailable.is_none());
+        let ids: Vec<&str> = offered.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                format!("ours:{selected}"),
+                format!("theirs:{selected}"),
+                format!("base:{selected}"),
+                format!("remove:{selected}"),
+                "abort".to_string(),
+            ]
+        );
+        for (step, choice) in offered.steps.iter().zip([
+            ResolveChoice::Side {
+                side: MergeSide::Ours,
+            },
+            ResolveChoice::Side {
+                side: MergeSide::Theirs,
+            },
+            ResolveChoice::Side {
+                side: MergeSide::Base,
+            },
+            ResolveChoice::Remove,
+        ]) {
+            assert_eq!(directive(step).selector, selected);
+            assert_eq!(directive(step).choice, choice);
+            assert_eq!(step.selector.as_deref(), Some(selected.as_str()));
+        }
+        assert_eq!(offered.steps[4].action, ResolveAction::Abort);
+
+        // The page is told which steps exist, and nothing of how one is
+        // carried out: no arguments, and no words for a terminal.
         let value = view(report).unwrap();
         assert_eq!(value["state"]["active"], true);
         assert_eq!(value["provenance"]["editable"], false);
-        for command in value["handoff"]["commands"].as_array().unwrap() {
-            let argv = command["argv"].as_array().unwrap();
-            assert_eq!(
-                &argv[..4],
-                &json!(["kin", "resolve", "--expect", hash])
-                    .as_array()
-                    .unwrap()[..]
-            );
-            assert!(!argv
-                .iter()
-                .any(|arg| arg.as_str() == Some(body_name.as_str())));
-            if command["selector"].is_string() {
-                assert_eq!(command["selector"], selected);
-                assert_eq!(argv.last().unwrap(), &json!(selected));
-            }
+        let commands = value["handoff"]["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 5);
+        for (command, step) in commands.iter().zip(&offered.steps) {
+            let shown: Vec<&String> = command.as_object().unwrap().keys().collect();
+            assert_eq!(shown, ["id", "label", "modifies", "selector"]);
+            assert_eq!(command["id"], step.id);
+            assert_eq!(command["modifies"], true);
         }
-        assert!(!value["handoff"]["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|command| command["id"] == "continue"));
+        let said = value["handoff"].to_string().to_lowercase();
+        for word in ["argv", "shell", "terminal", "kin resolve", "--", " file"] {
+            assert!(!said.contains(word), "{word:?} in {said}");
+        }
+        assert!(!commands.iter().any(|command| command["id"] == "continue"));
+    }
+
+    #[test]
+    fn a_record_identity_is_thirty_two_bytes_of_hex_and_nothing_else() {
+        let hash = fixture().record_hash.unwrap();
+        assert_eq!(record_identity(&hash).unwrap().to_string(), hash);
+        assert_eq!(
+            record_identity(&format!(" {hash} ")).unwrap().to_string(),
+            hash
+        );
+        assert!(record_identity(&hash[..62]).is_none());
+        assert!(record_identity("continue").is_none());
+        assert!(record_identity("").is_none());
+        // A request names one offered step and the record it read, and can
+        // say nothing of what the step does or who takes it.
+        let body = |value: Value| serde_json::from_value::<SettleBody>(value);
+        let id = kin_model::OperationId::new();
+        assert!(body(json!({"command":"abort","record_hash":hash,"operation_id":id})).is_ok());
+        for extra in ["actor", "action", "argv", "selector", "expected_record"] {
+            let mut request = json!({"command":"abort","record_hash":hash,"operation_id":id});
+            request[extra] = json!("caller");
+            assert!(body(request).is_err(), "{extra}");
+        }
     }
 
     #[test]
@@ -604,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_uses_the_resolved_successor_hash() {
+    fn publishing_is_offered_only_on_the_fully_resolved_successor_record() {
         let mut report = fixture();
         let before = report.record_hash.clone().unwrap();
         let record = report.record.as_ref().unwrap();
@@ -625,16 +888,20 @@ mod tests {
         report.record = Some(successor);
         report.unresolved_count = 0;
         report.resolved_count = 1;
+        let offered = offered(&report);
+        let ids: Vec<&str> = offered.steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["continue", "abort"]);
+        assert_eq!(offered.steps[0].action, ResolveAction::Continue);
+        // Publishing is taken against the record that carries the
+        // resolution, which is not the record the conflict was settled on.
         let value = view(report).unwrap();
         assert_eq!(value["state"]["all_resolved"], true);
-        let command = value["handoff"]["commands"]
+        assert_ne!(value["provenance"]["record_hash"], before);
+        assert!(value["handoff"]["commands"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|command| command["id"] == "continue")
-            .unwrap();
-        assert_ne!(command["argv"][3], before);
-        assert_eq!(command["argv"][3], value["provenance"]["record_hash"]);
+            .any(|command| command["id"] == "continue"));
     }
 
     #[test]
@@ -699,25 +966,25 @@ mod tests {
     }
 
     #[test]
-    fn absent_base_is_not_offered_and_removal_keeps_its_record_guard() {
+    fn an_absent_base_is_not_offered_and_removal_still_is() {
         let mut entry = fixture().record.unwrap().entries.remove(0);
         entry.base = MergeSideValue::Absent;
         entry.divergence = MergeDivergence::AddedBothSides;
-        let value = view(fixture_with_entry(entry)).unwrap();
-        let commands = value["handoff"]["commands"].as_array().unwrap();
-        assert!(!commands
+        let offered = offered(&fixture_with_entry(entry));
+        assert!(!offered
+            .steps
             .iter()
-            .any(|command| command["argv"][4] == "--base"));
-        let remove = commands
+            .any(|step| step.id.starts_with("base:")));
+        let remove = offered
+            .steps
             .iter()
-            .find(|command| command["argv"][4] == "--remove")
+            .find(|step| step.id.starts_with("remove:"))
             .unwrap();
-        assert_eq!(remove["argv"][2], "--expect");
-        assert_eq!(remove["argv"][3], value["provenance"]["record_hash"]);
+        assert_eq!(directive(remove).choice, ResolveChoice::Remove);
     }
 
     #[test]
-    fn contested_path_claims_are_single_guarded_arguments_without_side_choices() {
+    fn a_contested_place_is_settled_by_naming_its_keeper_and_offers_no_side() {
         let mut entry = fixture().record.unwrap().entries.remove(0);
         let path = "-contested=path.txt";
         entry.subject = MergeConflictSubject::Path {
@@ -729,26 +996,24 @@ mod tests {
         entry.base = MergeSideValue::Absent;
         entry.ours = MergeSideValue::Absent;
         entry.theirs = MergeSideValue::Absent;
-        let value = view(fixture_with_entry(entry)).unwrap();
-        let commands = value["handoff"]["commands"].as_array().unwrap();
-        let claims: Vec<_> = commands
+        let offered = offered(&fixture_with_entry(entry));
+        let claims: Vec<&Step> = offered
+            .steps
             .iter()
-            .filter(|command| command["selector"] == path)
+            .filter(|step| step.selector.as_deref() == Some(path))
             .collect();
         assert_eq!(claims.len(), 2);
         for claim in claims {
-            let argv = claim["argv"].as_array().unwrap();
-            assert_eq!(argv.len(), 5);
-            assert_eq!(argv[2], "--expect");
-            assert_eq!(argv[3], value["provenance"]["record_hash"]);
-            let argument = argv[4]
-                .as_str()
-                .unwrap()
-                .strip_prefix("--keep-path=")
-                .unwrap();
-            let (selected, artifact) = argument.rsplit_once('=').unwrap();
-            assert_eq!(selected, path);
+            let directive = directive(claim);
+            assert_eq!(directive.selector, path);
+            let ResolveChoice::PathOwner { artifact } = &directive.choice else {
+                panic!("a contested place is settled by naming who keeps it");
+            };
             assert!(uuid::Uuid::parse_str(artifact).is_ok());
+            assert_eq!(claim.id, format!("keep-path:{path}:{artifact}"));
         }
+        // A contested place has no side to take.
+        assert_eq!(offered.steps.len(), 3);
+        assert_eq!(offered.steps[2].id, "abort");
     }
 }

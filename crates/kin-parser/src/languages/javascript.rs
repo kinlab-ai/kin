@@ -2503,24 +2503,42 @@ fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
     crate::adapter::declaration_signature(node, source)
 }
 
+/// What the comment written directly above `node` says, as one line of prose.
 pub(super) fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     let prev = node.prev_sibling()?;
-    if prev.kind() == "comment" {
-        let text = prev.utf8_text(source).ok()?;
-        let cleaned = text
-            .lines()
-            .map(|l| l.trim_start_matches('/').trim_start_matches('*').trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if cleaned.is_empty() {
-            None
-        } else {
-            Some(cleaned)
-        }
-    } else {
-        None
+    if prev.kind() != "comment" {
+        return None;
     }
+    comment_prose(prev.utf8_text(source).ok()?)
+}
+
+/// The prose of one comment, or `None` when it holds none.
+///
+/// A doc block reads as its description. The comment's own punctuation and
+/// the `*` that leads each of its lines are not part of what it says, and
+/// neither is anything from its first block tag on: `@param`, `@returns` and
+/// the rest describe the declaration to a tool. A block that holds only tags
+/// says nothing in prose, and so does a directive such as `// @ts-ignore`.
+/// Either leaves no summary rather than its own markup as one.
+fn comment_prose(comment: &str) -> Option<String> {
+    let block = comment.strip_prefix("/*");
+    let body = block.map_or(comment, |body| body.strip_suffix("*/").unwrap_or(body));
+    let mut prose: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let line = if block.is_some() {
+            line.trim().trim_start_matches('*').trim_end_matches('*')
+        } else {
+            line.trim().trim_start_matches('/')
+        }
+        .trim();
+        if line.starts_with('@') {
+            break;
+        }
+        if !line.is_empty() {
+            prose.push(line);
+        }
+    }
+    (!prose.is_empty()).then(|| prose.join(" "))
 }
 
 /// Whether a member call's receiver is provably the enclosing owner: `this.m()`
@@ -4281,6 +4299,65 @@ const run = (a) => a + 1;
             .filter(|e| e.kind == EntityKind::Method)
             .collect();
         assert_eq!(methods.len(), 2);
+    }
+
+    /// A doc block is summarized by what it says in prose. Its `*` line
+    /// leaders, its closing `*/` and its block tags are markup, so a block of
+    /// tags alone, like a directive comment, leaves no summary at all.
+    ///
+    /// Falsify by trimming `/` and `*` from each untrimmed line, as this once
+    /// did: every line of an indented block keeps its `*`, the tags follow the
+    /// prose, and the tag-only block is summarized as `* @param {string} name
+    /// * @returns {string} */`.
+    #[test]
+    fn a_doc_block_is_summarized_by_its_prose_and_not_its_markup() {
+        let adapter = JavaScriptAdapter;
+        let source = br#"/**
+ * Normalize the given `type`, for example "html"
+ * becomes "text/html".
+ *
+ * @param {String} type
+ * @return {Object}
+ * @api private
+ */
+function normalizeType(type) { return type; }
+
+/**
+ * @param {string} name
+ * @returns {string}
+ */
+function tagged(name) { return name; }
+
+// @ts-ignore
+function directed() {}
+
+/** Signs the given string. **/
+function sign(value) { return value; }
+
+// Reads one line.
+function plain() {}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("lib/utils.js"))
+            .unwrap();
+        let summary = |name: &str| {
+            output
+                .entities
+                .iter()
+                .find(|entity| entity.name == name)
+                .unwrap_or_else(|| panic!("{name} was not extracted"))
+                .doc_summary
+                .clone()
+        };
+        assert_eq!(
+            summary("normalizeType").as_deref(),
+            Some(r#"Normalize the given `type`, for example "html" becomes "text/html"."#)
+        );
+        assert_eq!(summary("tagged"), None);
+        assert_eq!(summary("directed"), None);
+        assert_eq!(summary("sign").as_deref(), Some("Signs the given string."));
+        assert_eq!(summary("plain").as_deref(), Some("Reads one line."));
     }
 
     #[test]

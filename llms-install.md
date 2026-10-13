@@ -123,9 +123,10 @@ kin init .
 
 In a Git repository this admits the complete reachable history, refs, raw objects, the
 exact workspace tree, and the derived semantic entity and relation layer. Uncommitted work
-is safe: `kin init` admits the committed state and reports what it did not admit. In an
-empty directory with no `.git/`, it creates a new native repository instead, and it refuses
-a non-empty non-Git directory rather than treating loose files as graph truth.
+is safe: `kin init` admits the committed state and reports what it did not admit. In a
+directory with no `.git/`, it creates a new native repository instead, with nothing
+committed. What the directory already holds is taken in as that repository's uncommitted
+work, and nothing is recorded until someone commits it.
 
 Two things to tell the user before running it on a large repository. Time scales with
 history depth rather than checkout size, so it takes seconds on a small repository and
