@@ -734,6 +734,16 @@ jobs:
           done
           export PATH="$fake_agent_bin:$PATH"
 
+          # Kin records an author with every change, so health reports the
+          # author row missing on a host with no Git identity, and a fresh
+          # runner has none. A developer's machine does. The Unix legs
+          # configure one in the repository they prove; this leg runs outside
+          # any repository, so it configures the host scope, before setup reads
+          # it. Without this the install reads `failing` over a fact about the
+          # runner rather than the install, which is what stopped v0.8.5.
+          git config --global user.email ci@firelock.ai
+          git config --global user.name ci
+
           kin setup --no-interactive --intent agent --shell "$PROOF_SHELL" \
             2>&1 | tee kin-windows-setup.txt
           kin setup status --json | tee kin-windows-health.json
@@ -850,6 +860,8 @@ jobs:
             ["kin_daemon_binary", "healthy"],
             ["shell_path", "healthy"],
             ["setup_ledger", "healthy"],
+            // Resolved from the host Git identity configured above.
+            ["commit_author", "healthy"],
             ["registry_authority", "unsupported"],
             ["vfs_projection", "unsupported"],
             ["semantic_query_readiness", "unsupported"],
