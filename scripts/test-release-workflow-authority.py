@@ -222,7 +222,8 @@ def main() -> None:
 
     from release_rehearsal_contract import check_contract
     check_contract()
-    from release_authority.test_release_rehearsal import check_protected_rehearsal_boundary
+    from release_authority.test_release_rehearsal import check_protected_rehearsal_boundary, check_rehearsal_context_boundary
+    check_rehearsal_context_boundary()
     check_protected_rehearsal_boundary(release_tag)
 
     print(

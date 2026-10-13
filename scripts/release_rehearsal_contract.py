@@ -3,11 +3,32 @@
 """Pin the pre-tag rehearsal to real steps, native runners and exact receipts."""
 from pathlib import Path
 import importlib.util
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('rehearsal_generator', ROOT / 'scripts/generate-release-rehearsal.py')
 generator = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(generator)
+
+CONTEXT_GUARD = '      - name: Require the workflow context candidate before checkout\n'
+
+
+def check_context_checkout(workflow: str) -> None:
+    for job in re.split(r'(?m)^  [A-Za-z0-9_-]+:\n', workflow):
+        checkouts = job.count('uses: actions/checkout@')
+        if not checkouts:
+            continue
+        if job.count('ref: ${{ github.sha }}') != checkouts or 'ref: ${{ inputs.' in job:
+            raise AssertionError('rehearsal checkout must use the actual workflow context SHA')
+        if '    steps:\n' + CONTEXT_GUARD not in job:
+            raise AssertionError('rehearsal context guard must precede checkout and candidate execution')
+        guard = job.split(CONTEXT_GUARD, 1)[1].split('\n      - name:', 1)[0]
+        for contract in ('shell: bash', 'CANDIDATE: ${{ inputs.candidate_sha }}',
+                         'CONTEXT_SHA: ${{ github.sha }}', 'set -euo pipefail',
+                         'if [[ ! "$CONTEXT_SHA" =~ ^[0-9a-f]{40}$ || "$CANDIDATE" != "$CONTEXT_SHA" ]]; then',
+                         'exit 1'):
+            if contract not in guard:
+                raise AssertionError(f'rehearsal pre-checkout context guard lost {contract}')
 
 
 def check_contract(root: Path = ROOT) -> None:
@@ -22,6 +43,8 @@ def check_contract(root: Path = ROOT) -> None:
     if windows != generator.render((workflows / 'install-proof.yml').read_text()):
         raise AssertionError('the Windows rehearsal must be generated from the actual install proof')
     rehearsal = (workflows / 'release-rehearsal.yml').read_text()
+    check_context_checkout(rehearsal)
+    check_context_checkout(windows)
     for contract in ('needs: [windows, tooling]', 'runs-on: ubuntu-latest',
                      'name: kin-release-rehearsal', 'if-no-files-found: error',
                      'scripts/release-rehearsal.py" environment',

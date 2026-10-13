@@ -37,13 +37,24 @@ jobs:
       matrix:
         include: [{"os":"windows-latest","setup-shell":"powershell"}]
     steps:
+      - name: Require the workflow context candidate before checkout
+        shell: bash
+        env:
+          CANDIDATE: ${{ inputs.candidate_sha }}
+          CONTEXT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CONTEXT_SHA" =~ ^[0-9a-f]{40}$ || "$CANDIDATE" != "$CONTEXT_SHA" ]]; then
+            echo "::error::Rehearsal candidate must equal the actual workflow context SHA"
+            exit 1
+          fi
       - name: Preserve canonical candidate source bytes
         shell: bash
         run: git config --global core.autocrlf false
       - name: Checkout the exact rehearsal source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.candidate_sha }}
+          ref: ${{ github.sha }}
           path: rehearsal-source
           fetch-depth: 1
           persist-credentials: false
